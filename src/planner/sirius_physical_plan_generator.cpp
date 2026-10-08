@@ -462,6 +462,11 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!spaces.empty()) decision = ledger->admit(envelopes, spaces.front()->get_id());
   }
+  std::string_view route_reason = !qualified           ? "unqualified_envelope"
+                                  : !route_allowed     ? "statement_dv_limit"
+                                  : envelopes.empty()  ? "no_deferred_dv_work"
+                                  : !decision.deferred ? "host_admission"
+                                                       : "deferred";
   std::shared_ptr<preparation_admission> admission;
   if (decision.deferred) {
     // Construct all arenas before consuming the plan's one owning admission.
@@ -479,14 +484,24 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       }
       admission = std::make_shared<preparation_admission>(std::move(ledger), decision);
     } catch (preparation_resource_error const&) {
+      route_reason = "arena_allocation";
       for (auto& c : scans)
         c.info->deferred.reset();
       ledger.reset();
     } catch (std::bad_alloc const&) {
+      route_reason = "arena_allocation";
       for (auto& c : scans)
         c.info->deferred.reset();
       ledger.reset();
     }
+  }
+  if (counters->track_units && counters->iceberg_statement_route_for_testing)
+    counters->iceberg_statement_route_for_testing(route_reason);
+  for (auto const& c : scans) {
+    if (!c.info->deferred)
+      counters->preparation_legacy_route.fetch_add(1, std::memory_order_relaxed);
+    if (counters->track_units && counters->iceberg_preparation_route_for_testing)
+      counters->iceberg_preparation_route_for_testing(c.scan->contract_id, bool(c.info->deferred));
   }
   for (auto& c : scans) {
     if (c.info->deferred) {
@@ -504,8 +519,6 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       c.scan->read_views->record_delete_preparation(c.scan->contract_id, us);
       sirius_ctx->record_delete_preparation(us);
     }
-    if (counters->track_units && counters->iceberg_preparation_route_for_testing)
-      counters->iceberg_preparation_route_for_testing(c.scan->contract_id, bool(c.info->deferred));
     c.scan->prepared_iceberg_info = std::move(c.info);
   }
 }
@@ -1915,6 +1928,9 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_iceberg_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
+  if (auto counters = read_views->profiles->counters;
+      counters && counters->track_units && counters->scan_plan_complete_for_testing)
+    counters->scan_plan_complete_for_testing();
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(

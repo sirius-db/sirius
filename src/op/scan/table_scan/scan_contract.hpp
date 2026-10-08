@@ -34,6 +34,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -198,6 +199,13 @@ struct scan_publication_observation {
   uint64_t prefetcher_conversions = 0;
   std::thread::id execute_owner, preparation_owner, preparation_runner, preparation_publisher;
   uint64_t preparation_runs = 0;
+  size_t jobs_peak = 0, results_peak = 0, output_peak = 0, partial_emissions = 0;
+  std::chrono::microseconds max_residence{0}, max_deadline_lateness{0};
+  std::optional<std::chrono::steady_clock::time_point> first_ready, first_publication;
+};
+
+struct puffin_read_statistics {
+  uint64_t opens = 0, requests = 0, bytes_requested = 0, bytes_returned = 0, failures = 0;
 };
 
 struct physical_check_counters {
@@ -206,6 +214,7 @@ struct physical_check_counters {
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
   std::atomic<uint64_t> iceberg_inventory_bytes_peak{0};
+  std::atomic<uint64_t> preparation_legacy_route{0};
 
   // Installed before a test query, cleared only after its workers have joined.
   // true = before footer processing, false = after successful cuDF decode.
@@ -213,7 +222,13 @@ struct physical_check_counters {
   std::function<void(std::string const&, bool)> parquet_metadata_for_testing;
   std::function<void()> after_certify_for_testing;
   std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
+  std::function<void(std::string const&, bool, puffin_read_statistics const&)>
+    puffin_reads_for_testing;
+  std::function<void(std::string const&, io::sirius_datasource&)> parquet_datasource_for_testing;
   std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
+  std::function<void(std::string_view)> iceberg_statement_route_for_testing;
+  std::function<void()> scan_plan_complete_for_testing;
+  bool preparation_timing_for_testing = false;
   std::shared_ptr<scan_manager::reservation_provider> preparation_provider_for_testing;
   std::optional<uint64_t> statement_dv_limit_for_testing;
   void parquet_phase(std::string const& file, bool footer) const

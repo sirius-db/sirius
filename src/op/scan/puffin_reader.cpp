@@ -274,6 +274,22 @@ std::string_view property_or_empty(duckdb_yyjson::yyjson_val* properties, char c
   return str == nullptr ? std::string_view{} : std::string_view{str};
 }
 
+void read_puffin_bytes(std::ifstream& file,
+                       char* destination,
+                       std::streamsize bytes,
+                       puffin_read_statistics* stats)
+{
+  if (stats) {
+    ++stats->requests;
+    stats->bytes_requested += bytes;
+  }
+  file.read(destination, bytes);
+  if (stats) {
+    stats->bytes_returned += file.gcount();
+    stats->failures += !file;
+  }
+}
+
 /// Reads the footer and returns the blob descriptor whose `offset` equals @p content_offset,
 /// checking every property the spec fixes for `deletion-vector-v1`.
 ///
@@ -287,12 +303,12 @@ std::string_view property_or_empty(duckdb_yyjson::yyjson_val* properties, char c
 /// caller bounds the blob read against it: a manifest and footer are free to agree on a size that
 /// the FILE cannot hold, and believing them is a value-initialized allocation of whatever they say.
 template <typename Ref>
-std::streamoff validate_footer_descriptor(
-  std::ifstream& f,
-  std::streamoff file_size,
-  Ref const& ref,
-  char const (&puffin_magic)[4],
-  sirius::scan_manager::charging_allocator* allocator = nullptr)
+std::streamoff validate_footer_descriptor(std::ifstream& f,
+                                          std::streamoff file_size,
+                                          Ref const& ref,
+                                          char const (&puffin_magic)[4],
+                                          sirius::scan_manager::charging_allocator* allocator,
+                                          puffin_read_statistics* stats)
 {
   // Footer = Magic | Payload | PayloadSize(4, LE) | Flags(4) | Magic
   static constexpr std::streamoff kFooterTail = 12;  // PayloadSize + Flags + trailing Magic
@@ -302,7 +318,7 @@ std::streamoff validate_footer_descriptor(
 
   f.seekg(file_size - kFooterTail);
   uint8_t tail[kFooterTail];
-  f.read(reinterpret_cast<char*>(tail), kFooterTail);
+  read_puffin_bytes(f, reinterpret_cast<char*>(tail), kFooterTail, stats);
   if (!f) {
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
@@ -325,7 +341,7 @@ std::streamoff validate_footer_descriptor(
   auto const footer_start = file_size - kFooterTail - payload_size - 4;
   f.seekg(footer_start);
   char magic[4];
-  f.read(magic, 4);
+  read_puffin_bytes(f, magic, 4, stats);
   if (!f || std::memcmp(magic, puffin_magic, 4) != 0) {
     throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
   }
@@ -350,7 +366,7 @@ std::streamoff validate_footer_descriptor(
     legacy_payload.resize(size);
     payload = legacy_payload.data();
   }
-  f.read(payload, payload_size);
+  read_puffin_bytes(f, payload, payload_size, stats);
   if (!f) {
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
@@ -493,8 +509,29 @@ struct decoded_positions {
 };
 template <typename Ref>
 decoded_positions read_deletion_vector_impl(Ref const& ref,
-                                            sirius::scan_manager::charging_allocator* allocator)
+                                            sirius::scan_manager::charging_allocator* allocator,
+                                            physical_check_counters const* counters)
 {
+  struct read_report {
+    physical_check_counters const* counters;
+    std::string const& file;
+    bool charged;
+    puffin_read_statistics statistics;
+    ~read_report()
+    {
+      if (!counters) return;
+      try {
+        counters->puffin_reads_for_testing(file, charged, statistics);
+      } catch (...) {
+        // Test diagnostics must not replace a reader error during stack unwinding.
+      }
+    }
+  } report{
+    counters && counters->track_units && counters->puffin_reads_for_testing ? counters : nullptr,
+    ref.puffin_path,
+    allocator != nullptr,
+    {}};
+  auto* stats                      = report.counters ? &report.statistics : nullptr;
   auto const& puffin_path          = ref.puffin_path;
   auto const content_offset        = ref.content_offset;
   auto const content_size_in_bytes = ref.content_size_in_bytes;
@@ -526,8 +563,10 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
   // Apache manifests record URIs; this reader bypasses ioctx, so nothing else strips them.
   std::string_view local_view(puffin_path);
   if (local_view.starts_with("file://")) local_view.remove_prefix(7);
+  if (stats) ++stats->opens;
   std::ifstream f(local_view.data(), std::ios::binary);
   if (!f) {
+    if (stats) ++stats->failures;
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Cannot open file: " + std::string(local_view) +
@@ -538,14 +577,14 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
   // wrong offset would silently yield wrong deletes. Check the framing first.
   static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
   char magic[4];
-  f.read(magic, 4);
+  read_puffin_bytes(f, magic, 4, stats);
   if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
     throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + puffin_path);
   }
   f.seekg(0, std::ios::end);
   auto const file_size = static_cast<std::streamoff>(f.tellg());
   f.seekg(file_size - 4);
-  f.read(magic, 4);
+  read_puffin_bytes(f, magic, 4, stats);
   if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
     throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + puffin_path);
   }
@@ -553,7 +592,8 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
   if (allocator && (ref.file_size_in_bytes < 0 || file_size > ref.file_size_in_bytes))
     throw sirius::scan_manager::preparation_resource_error(
       "Puffin container exceeds the lowering-time envelope", true);
-  auto const footer_start = validate_footer_descriptor(f, file_size, ref, kPuffinMagic, allocator);
+  auto const footer_start =
+    validate_footer_descriptor(f, file_size, ref, kPuffinMagic, allocator, stats);
 
   // The blob must lie entirely between the leading magic and the footer. Both bounds are compared
   // by SUBTRACTION against a length the file actually has: `content_offset + content_size` is a
@@ -589,7 +629,7 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
     legacy_blob.resize(content_size_in_bytes);
     blob = legacy_blob;
   }
-  f.read(reinterpret_cast<char*>(blob.data()), content_size_in_bytes);
+  read_puffin_bytes(f, reinterpret_cast<char*>(blob.data()), content_size_in_bytes, stats);
   if (!f) {
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
@@ -716,9 +756,10 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
 }
 }  // namespace
 
-std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
+std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref,
+                                          physical_check_counters const* counters)
 {
-  return read_deletion_vector_impl(ref, nullptr).legacy;
+  return read_deletion_vector_impl(ref, nullptr, counters).legacy;
 }
 
 namespace {
@@ -736,10 +777,11 @@ void check_count(Ref const& ref, size_t count)
 template <typename Ref>
 decoded_positions read_charged_checked(Ref const& ref,
                                        sirius::scan_manager::charging_allocator& allocator,
-                                       scan_contract_id contract)
+                                       scan_contract_id contract,
+                                       physical_check_counters const* counters)
 {
   try {
-    auto result = read_deletion_vector_impl(ref, &allocator);
+    auto result = read_deletion_vector_impl(ref, &allocator, counters);
     check_count(ref, result.count);
     return result;
   } catch (sirius::transparent::classified_execution_error const&) {
@@ -751,9 +793,11 @@ decoded_positions read_charged_checked(Ref const& ref,
 }
 }  // namespace
 std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
-  DeletionVectorRef const& ref, sirius::scan_manager::charging_allocator& allocator)
+  DeletionVectorRef const& ref,
+  sirius::scan_manager::charging_allocator& allocator,
+  physical_check_counters const* counters)
 {
-  auto result     = read_charged_checked(ref, allocator, 0);
+  auto result     = read_charged_checked(ref, allocator, 0, counters);
   auto* positions = reinterpret_cast<int64_t*>(result.backing.data());
   // Repeated high keys are permitted by the legacy reader. Deduplicate only after
   // checking the encoded count, so the immutable result has set semantics.
@@ -767,9 +811,10 @@ std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
   sirius::scan_manager::charging_allocator& allocator,
   std::string_view canonical_path,
   std::shared_ptr<void const> path_owner,
-  scan_contract_id contract)
+  scan_contract_id contract,
+  physical_check_counters const* counters)
 {
-  auto result     = read_charged_checked(ref, allocator, contract);
+  auto result     = read_charged_checked(ref, allocator, contract, counters);
   auto* positions = reinterpret_cast<int64_t*>(result.backing.data());
   if (result.count) result.count = std::unique(positions, positions + result.count) - positions;
   return std::make_shared<iceberg_delete_set const>(

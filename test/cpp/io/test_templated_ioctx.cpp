@@ -16,9 +16,11 @@
 
 #include "catch.hpp"
 #include "io/cache/types.hpp"
+#include "io/sirius_datasource.hpp"
 #include "io/templated_ioctx.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -117,6 +119,107 @@ void complete_request(sirius::io::grouped_io_request& request)
 }
 
 }  // namespace
+
+TEST_CASE("Datasource counters survive async completion and separate split reads",
+          "[io][datasource][observation]")
+{
+  using namespace sirius::io;
+  auto enabled = GENERATE(false, true);
+  auto failed  = GENERATE(false, true);
+  std::vector<std::unique_ptr<fake_reactor>> reactors;
+  reactors.push_back(std::make_unique<fake_reactor>());
+  auto* reactor    = reactors.front().get();
+  auto context     = std::make_shared<fake_context>(std::move(reactors));
+  auto object      = std::make_shared<fake_object>("observed", 4096);
+  auto preparation = std::make_shared<sirius_datasource::read_statistics>();
+  auto execution   = std::make_shared<sirius_datasource::read_statistics>();
+  std::weak_ptr<sirius_datasource::read_statistics> lifetime = preparation;
+  auto footer = std::make_unique<sirius_datasource>(context, object);
+  if (enabled) footer->read_statistics_for_testing(preparation, execution);
+  auto data = footer->duplicate();
+  uint8_t bytes[24]{};
+  auto prepared = footer->host_read_async(0, 16, bytes);
+  auto executed = data->host_read_async(16, 8, bytes + 16);
+  REQUIRE(reactor->requests.size() == 2);
+  CHECK(preparation->bytes_returned == 0);
+  footer.reset();
+  data.reset();
+  preparation.reset();
+  CHECK(lifetime.expired() == !enabled);
+  auto retained = lifetime.lock();
+  if (failed)
+    reactor->requests[0]->cancel_remaining(
+      std::make_exception_ptr(std::runtime_error("held datasource failure")));
+  else
+    complete_request(*reactor->requests[0]);
+  complete_request(*reactor->requests[1]);
+  reactor->requests.clear();
+  if (enabled) {
+    CHECK(retained->requests == 1);
+    CHECK(retained->bytes_requested == 16);
+    CHECK(retained->bytes_returned == (failed ? 0 : 16));
+    CHECK(retained->failures == (failed ? 1 : 0));
+  }
+  CHECK(execution->requests == (enabled ? 1 : 0));
+  CHECK(execution->bytes_returned == (enabled ? 8 : 0));
+  CHECK(execution->failures == 0);
+  CHECK(executed.get() == 8);
+  if (failed)
+    CHECK_THROWS_WITH(prepared.get(), "held datasource failure");
+  else
+    CHECK(prepared.get() == 16);
+  retained.reset();
+  CHECK(lifetime.expired());
+}
+
+TEST_CASE("Datasource counters distinguish requested bytes from returned bytes",
+          "[io][datasource][observation]")
+{
+  using namespace sirius::io;
+  auto vectored = GENERATE(false, true);
+  std::vector<std::unique_ptr<fake_reactor>> reactors;
+  reactors.push_back(std::make_unique<fake_reactor>());
+  auto* reactor = reactors.front().get();
+  auto context  = std::make_shared<fake_context>(std::move(reactors));
+  auto object   = std::make_shared<fake_object>("observed", 4096);
+  auto counts   = std::make_shared<sirius_datasource::read_statistics>();
+  sirius_datasource datasource(context, object);
+  datasource.read_statistics_for_testing(counts, {});
+  uint8_t bytes[24]{};
+  std::array<slice, 2> ranges{slice{0, 16, bytes}, slice{16, 8, bytes + 16}};
+  auto result = vectored ? datasource.host_read_ranges_async(ranges)
+                         : datasource.host_read_async(4090, 16, bytes);
+  for (auto const& request : reactor->requests)
+    complete_request(*request);
+  CHECK(counts->requests == 1);
+  CHECK(counts->bytes_requested == (vectored ? 24 : 16));
+  CHECK(counts->bytes_returned == (vectored ? 24 : 6));
+  CHECK(counts->failures == 0);
+  CHECK(result.get() == counts->bytes_returned);
+}
+
+TEST_CASE("Datasource counters preserve immediate results and synchronous read errors",
+          "[io][datasource][observation]")
+{
+  using namespace sirius::io;
+  auto enabled      = GENERATE(false, true);
+  auto asynchronous = GENERATE(false, true);
+  auto context      = std::make_shared<fake_context>(std::vector<std::unique_ptr<fake_reactor>>{});
+  auto object       = std::make_shared<fake_object>("observed", 4096);
+  sirius_datasource datasource(context, object);
+  auto counts = std::make_shared<sirius_datasource::read_statistics>();
+  if (enabled) datasource.read_statistics_for_testing(counts, {});
+  auto read = [&](size_t bytes) {
+    return asynchronous ? datasource.host_read_async(0, bytes, nullptr).get()
+                        : datasource.host_read(0, bytes, nullptr);
+  };
+  CHECK(read(0) == 0);
+  CHECK_THROWS_WITH(read(16), "host read destination is null");
+  CHECK(counts->requests == (enabled ? 2 : 0));
+  CHECK(counts->bytes_requested == (enabled ? 16 : 0));
+  CHECK(counts->bytes_returned == 0);
+  CHECK(counts->failures == (enabled ? 1 : 0));
+}
 
 TEST_CASE("mixed dispatch selects two least-busy reactors and shares one coordinator",
           "[io][ioctx]")

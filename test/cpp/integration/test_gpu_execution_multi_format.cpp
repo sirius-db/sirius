@@ -23,7 +23,9 @@
  * generic duckdb_scan path) is currently disabled.
  */
 
+#include "io/sirius_datasource.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
+#include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "yyjson.hpp"
 
@@ -32,7 +34,10 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <duckdb/common/string_util.hpp>
 #include <duckdb/common/types/blob.hpp>
+#include <duckdb/logging/log_manager.hpp>
+#include <duckdb/parser/sql_statement.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
@@ -46,7 +51,9 @@
 #include <planner/sirius_physical_plan_generator.hpp>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <transparent/read_view_registry.hpp>
 #include <unistd.h>
 #include <utils/child_process_environment.hpp>
@@ -70,11 +77,138 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 
 namespace fs = std::filesystem;
+
+namespace {
+struct sql_file_counts {
+  uint64_t opens = 0, reads = 0, bytes = 0;
+};
+struct scoped_sql_file_logs {
+  explicit scoped_sql_file_logs(duckdb::Connection& connection)
+    : con(connection), manager(duckdb::LogManager::Get(*con.context)), saved(manager.GetConfig())
+  {
+    REQUIRE(saved.storage == duckdb::LogConfig::IN_MEMORY_STORAGE_NAME);
+    duckdb::vector<duckdb::string> types{"FileSystem"};
+    manager.SetEnableStructuredLoggers(types);
+  }
+  ~scoped_sql_file_logs() { manager.SetConfig(*con.context->db, saved); }
+  sql_file_counts metadata_reads(std::string const& table)
+  {
+    manager.Flush();
+    duckdb::SiriusContext::InternalQueryGuard guard(*con.context);
+    auto prefix = duckdb::StringUtil::Replace(table + "/metadata/", "'", "''");
+    auto result = con.Query(
+      "SELECT count(*) FILTER (WHERE op='OPEN'), count(*) FILTER (WHERE op='READ'), "
+      "coalesce(sum(bytes) FILTER (WHERE op='READ'), 0) "
+      "FROM duckdb_logs_parsed('FileSystem') WHERE starts_with(path, '" +
+      prefix + "')");
+    REQUIRE(result);
+    INFO(result->HasError() ? result->GetError() : "");
+    REQUIRE_FALSE(result->HasError());
+    return {result->GetValue(0, 0).GetValue<uint64_t>(),
+            result->GetValue(1, 0).GetValue<uint64_t>(),
+            result->GetValue(2, 0).GetValue<uint64_t>()};
+  }
+  duckdb::Connection& con;
+  duckdb::LogManager& manager;
+  duckdb::LogConfig saved;
+};
+
+struct preparation_measurement {
+  using clock           = std::chrono::steady_clock;
+  using counters_type   = sirius::op::scan::physical_check_counters;
+  using read_statistics = sirius::io::sirius_datasource::read_statistics;
+  explicit preparation_measurement(std::shared_ptr<counters_type> counters,
+                                   std::optional<bool> deferred = std::nullopt)
+    : counters(std::move(counters))
+  {
+    if (deferred.has_value()) {
+      provider->grant_bytes                            = 1024 * 1024;
+      provider->return_null                            = !*deferred;
+      this->counters->preparation_provider_for_testing = provider;
+    }
+    this->counters->preparation_timing_for_testing        = true;
+    this->counters->iceberg_preparation_route_for_testing = [this](auto id, bool route) {
+      routes.emplace_back(id, route);
+    };
+    this->counters->iceberg_statement_route_for_testing = [this](auto reason) {
+      statement_reasons.emplace_back(reason);
+    };
+    this->counters->scan_plan_complete_for_testing = [this] { plan_end = clock::now(); };
+    this->counters->puffin_reads_for_testing = [this](auto const& path, bool charged, auto stats) {
+      std::lock_guard lock(mutex);
+      puffin.emplace_back(path, charged, stats);
+    };
+    this->counters->parquet_datasource_for_testing = [this](auto const&, auto& datasource) {
+      datasource.read_statistics_for_testing(preparation, execution);
+      ++datasources;
+    };
+    this->counters->parquet_metadata_for_testing = [this](auto const&, bool hit) {
+      if (hit)
+        ++footer_hits;
+      else
+        ++footer_misses;
+    };
+    std::lock_guard lock(this->counters->units_mutex);
+    for (auto const& [id, value] : this->counters->publications_by_query)
+      previous_queries.insert(id);
+  }
+  ~preparation_measurement()
+  {
+    counters->preparation_provider_for_testing.reset();
+    counters->preparation_timing_for_testing        = false;
+    counters->iceberg_preparation_route_for_testing = {};
+    counters->iceberg_statement_route_for_testing   = {};
+    counters->scan_plan_complete_for_testing        = {};
+    counters->puffin_reads_for_testing              = {};
+    counters->parquet_datasource_for_testing        = {};
+    counters->parquet_metadata_for_testing          = {};
+  }
+  std::vector<std::vector<std::string>> fetch(duckdb::QueryResult& result)
+  {
+    std::vector<std::vector<std::string>> rows;
+    while (auto chunk = result.Fetch()) {
+      if (chunk->size() && !first_client_row) first_client_row = clock::now();
+      for (duckdb::idx_t r = 0; r < chunk->size(); ++r) {
+        std::vector<std::string> row;
+        for (duckdb::idx_t c = 0; c < chunk->ColumnCount(); ++c)
+          row.push_back(chunk->GetValue(c, r).ToString());
+        rows.push_back(std::move(row));
+      }
+    }
+    complete = clock::now();
+    REQUIRE_FALSE(result.HasError());
+    std::sort(rows.begin(), rows.end());
+    return rows;
+  }
+  sirius::op::scan::scan_publication_observation publication()
+  {
+    std::lock_guard lock(counters->units_mutex);
+    for (auto const& [id, value] : counters->publications_by_query)
+      if (!previous_queries.contains(id)) return value;
+    FAIL("no publication statistics for this query");
+    return {};
+  }
+  std::shared_ptr<counters_type> counters;
+  std::shared_ptr<sirius::scan_manager::test::test_reservation_provider> provider =
+    std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  std::shared_ptr<read_statistics> preparation = std::make_shared<read_statistics>();
+  std::shared_ptr<read_statistics> execution   = std::make_shared<read_statistics>();
+  std::atomic<size_t> datasources{0}, footer_hits{0}, footer_misses{0};
+  std::mutex mutex;
+  std::vector<std::tuple<std::string, bool, sirius::op::scan::puffin_read_statistics>> puffin;
+  std::vector<std::pair<uint64_t, bool>> routes;
+  std::vector<std::string> statement_reasons;
+  std::set<uint64_t> previous_queries;
+  std::optional<clock::time_point> plan_end, first_client_row, complete;
+};
+}  // namespace
 
 static fs::path get_project_root()
 {
@@ -3428,11 +3562,14 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     ++legacy;
     CHECK(provider->outstanding() == 0);
   };
-  auto table = inventory_fixture("dv_bounded");
+  auto table  = inventory_fixture("dv_bounded");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
   expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(table),
                       gpu_route::gpu,
                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
   CHECK(legacy > 0);
+  CHECK(sirius::test::get_transparent_execution_stats(*con).preparation_legacy_route ==
+        before.preparation_legacy_route + legacy);
   CHECK(provider->seen->requests == legacy);
   CHECK(provider->outstanding() == 0);
 }
@@ -3598,6 +3735,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   };
   visit(*root);
   CHECK(found == 2);
+  CHECK(sirius::test::get_transparent_execution_stats(*con).preparation_legacy_route ==
+        before.preparation_legacy_route + (limit == 8 ? 0 : 2));
   CHECK(provider->seen->requests == (limit == 8 ? 1 : 0));
   CHECK(provider->outstanding() == (limit == 8 ? 1 : 0));
   admission.reset();
@@ -3726,10 +3865,11 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "Connection interruption drains a held DV read without new preparation or replay",
+                 "Connection interruption preserves cancellation and drains owned DV reads",
                  "[integration][scan_preparation][iceberg][interrupt]")
 {
   auto fallback = GENERATE(false, true);
+  auto deferred = GENERATE(false, true);
   sirius::test::scoped_setting fallback_setting(*con, "enable_duckdb_fallback", fallback);
   struct exact_provider : sirius::scan_manager::reservation_provider {
     sirius::scan_manager::test::test_reservation_provider provider;
@@ -3744,22 +3884,30 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       return provider.request(space, bytes);
     }
   };
-  auto provider = std::make_shared<exact_provider>();
-  auto state    = sirius::test::get_registered_sirius_context(*con);
-  auto counters = state->physical_counters();
+  auto provider                  = std::make_shared<exact_provider>();
+  provider->provider.return_null = !deferred;
+  auto state                     = sirius::test::get_registered_sirius_context(*con);
+  auto counters                  = state->physical_counters();
   struct reset_hooks {
     decltype(counters) value;
     ~reset_hooks()
     {
       value->preparation_provider_for_testing.reset();
-      value->iceberg_dv_phase_for_testing = {};
-      value->parquet_phase_for_testing    = {};
+      value->iceberg_dv_phase_for_testing          = {};
+      value->parquet_phase_for_testing             = {};
+      value->iceberg_preparation_route_for_testing = {};
     }
   } reset{counters};
   std::mutex mutex;
   std::condition_variable changed;
   bool entered = false, release = false;
   std::atomic<unsigned> started{0}, finished{0}, footers{0}, decoded{0};
+  std::atomic<unsigned> routes{0};
+  std::atomic<bool> actual_route_matches{true};
+  counters->iceberg_preparation_route_for_testing = [&](auto, bool actual) {
+    if (actual != deferred) actual_route_matches = false;
+    ++routes;
+  };
   counters->preparation_provider_for_testing = provider;
   counters->iceberg_dv_phase_for_testing     = [&](auto const&, bool start) {
     if (!start) {
@@ -3792,10 +3940,14 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE(changed.wait_for(lock, std::chrono::seconds(2), [&] { return entered; }));
   }
   con->Interrupt();
-  CHECK(state->get_scan_manager().wait_for_preparation_error_for_testing(std::chrono::seconds(1)));
+  CHECK(routes > 0);
+  CHECK(actual_route_matches);
+  if (deferred)
+    CHECK(
+      state->get_scan_manager().wait_for_preparation_error_for_testing(std::chrono::seconds(1)));
   CHECK(query.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
-  CHECK(provider->provider.outstanding() == 1);
-  CHECK(state->get_scan_manager().num_active_queries() == 1);
+  CHECK(provider->provider.outstanding() == (deferred ? 1 : 0));
+  CHECK(state->get_scan_manager().num_active_queries() == (deferred ? 1 : 0));
   CHECK(started == 1);
   cleanup.reset();
   REQUIRE(query.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
@@ -3803,15 +3955,17 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   REQUIRE(result);
   REQUIRE(result->HasError());
   CHECK(result->GetErrorType() == duckdb::ExceptionType::INTERRUPT);
-  CHECK(started == 1);
-  CHECK(finished == 1);
-  CHECK(footers == 1);
+  CHECK(started == (deferred ? 1 : 3));
+  CHECK(finished == (deferred ? 1 : 3));
+  CHECK(footers == (deferred ? 1 : 0));
   CHECK(decoded == 0);
   CHECK(provider->provider.outstanding() == 0);
   CHECK(provider->provider.seen->allocated_bytes == 0);
   CHECK(state->get_scan_manager().num_active_queries() == 0);
   auto after = sirius::test::get_transparent_execution_stats(*con);
-  CHECK(after.executions == before.executions + 1);
+  if (deferred) CHECK(after.executions == before.executions + 1);
+  CHECK(after.preparation_legacy_route ==
+        before.preparation_legacy_route + (deferred ? 0 : routes.load()));
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
   CHECK(after.fallbacks == before.fallbacks);
   for (size_t cause = 0; cause < before.late_replays.size(); ++cause)
@@ -3829,4 +3983,323 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                        {"apple", "1"},
                        {"cherry", "3"},
                        {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Corrupt and missing DV inputs preserve diagnostics across preparation routes",
+                 "[integration][scan_preparation][iceberg][route_parity]")
+{
+  auto missing  = GENERATE(false, true);
+  auto fallback = GENERATE(false, true);
+  auto table    = inventory_fixture(missing ? "dv_missing_payload" : "dv_corrupt_crc");
+  auto sidecar  = table + "/data/a.puffin";
+  std::string diagnostic;
+  try {
+    (void)sirius::op::scan::read_deletion_vector({.puffin_path           = sidecar,
+                                                  .content_offset        = 4,
+                                                  .content_size_in_bytes = 44,
+                                                  .referenced_data_file = table + "/data/a.parquet",
+                                                  .record_count         = 2});
+  } catch (std::exception const& error) {
+    diagnostic = error.what();
+  }
+  REQUIRE_FALSE(diagnostic.empty());
+  CHECK(diagnostic.find(missing ? "Cannot open file" : "CRC-32 mismatch") != std::string::npos);
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto sql      = "SELECT fruit, count FROM " + pinned_scan(table);
+  std::optional<std::string> cpu_error;
+  std::vector<std::vector<std::string>> cpu_rows;
+  if (fallback) {
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    auto reference = con->Query(sql);
+    REQUIRE(reference);
+    if (reference->HasError())
+      cpu_error = reference->GetError();
+    else
+      cpu_rows = collect_rows(*reference);
+  }
+  for (bool deferred : {false, true}) {
+    preparation_measurement observed(counters, deferred);
+    sirius::test::scoped_setting fallback_setting(*con, "enable_duckdb_fallback", fallback);
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::scoped_recording_log_sink logs;
+    auto result = con->Query(sql);
+    REQUIRE(result);
+    REQUIRE(observed.routes.size() == 1);
+    CHECK(observed.routes.front().second == deferred);
+    if (!fallback) {
+      REQUIRE(result->HasError());
+      CHECK(result->GetError().find(diagnostic) != std::string::npos);
+    } else {
+      REQUIRE(result->HasError() == bool(cpu_error));
+      if (cpu_error)
+        CHECK(result->GetError().find(*cpu_error) != std::string::npos);
+      else
+        CHECK(observed.fetch(*result) == cpu_rows);
+      bool retained = false;
+      for (auto const& log : logs.records())
+        retained |= log.message.find(diagnostic) != std::string::npos;
+      CHECK(retained);
+    }
+    REQUIRE(observed.puffin.size() == 1);
+    CHECK(std::get<1>(observed.puffin.front()) == deferred);
+    CHECK(std::get<2>(observed.puffin.front()).opens == 1);
+    CHECK(bool(observed.first_client_row) == (fallback && !cpu_error && !cpu_rows.empty()));
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    auto cause =
+      static_cast<size_t>(missing ? sirius::transparent::late_failure_cause::reader_io
+                                  : sirius::transparent::late_failure_cause::physical_input);
+    CHECK(after.preparation_legacy_route == before.preparation_legacy_route + (deferred ? 0 : 1));
+    CHECK(after.late_failures[cause] == before.late_failures[cause] + (deferred ? 1 : 0));
+    CHECK(after.late_replays[cause] == before.late_replays[cause] + (deferred && fallback ? 1 : 0));
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks + (deferred && fallback ? 1 : 0));
+    CHECK(after.fallbacks == before.fallbacks + (!deferred && fallback ? 1 : 0));
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Preparation routes preserve rows and expose phase-specific read evidence",
+                 "[integration][scan_preparation][iceberg][route_parity]")
+{
+  auto three    = GENERATE(false, true);
+  auto empty    = GENERATE(false, true);
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto table    = inventory_fixture(three ? "dv_three" : "dv_bounded");
+  auto sql = "SELECT fruit, count FROM " + pinned_scan(table) + (empty ? " WHERE count%2=0" : "");
+  std::vector<std::vector<std::string>> expected;
+  if (!empty)
+    for (int i = 0; i < (three ? 3 : 1); ++i)
+      for (auto const& row : std::vector<std::vector<std::string>>{
+             {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}})
+        expected.push_back(row);
+  std::sort(expected.begin(), expected.end());
+  std::optional<sirius::op::scan::puffin_read_statistics> legacy_puffin;
+  scoped_sql_file_logs sql_logs(*con);
+  for (bool deferred : {false, true}) {
+    preparation_measurement observed(counters, deferred);
+    sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+    auto before     = sirius::test::get_transparent_execution_stats(*con);
+    auto sql_before = sql_logs.metadata_reads(table);
+    auto result     = con->SendQuery(sql);
+    REQUIRE(result);
+    INFO(result->HasError() ? result->GetError() : "");
+    REQUIRE_FALSE(result->HasError());
+    CHECK(observed.fetch(*result) == expected);
+    REQUIRE(observed.routes.size() == 1);
+    CHECK(observed.routes.front().second == deferred);
+    REQUIRE(observed.statement_reasons.size() == 1);
+    CHECK(observed.statement_reasons.front() == (deferred ? "deferred" : "host_admission"));
+    auto publication = observed.publication();
+    REQUIRE(observed.plan_end);
+    REQUIRE(publication.first_ready);
+    REQUIRE(publication.first_publication);
+    REQUIRE(observed.complete);
+    CHECK(*observed.plan_end <= *publication.first_ready);
+    CHECK(*publication.first_ready <= *publication.first_publication);
+    CHECK(*publication.first_publication <= *observed.complete);
+    CHECK(bool(observed.first_client_row) == !empty);
+    if (!empty) {
+      CHECK(*publication.first_publication <= *observed.first_client_row);
+      CHECK(*observed.first_client_row <= *observed.complete);
+    }
+    auto sql_after = sql_logs.metadata_reads(table);
+    INFO("SQL metadata opens=" << sql_after.opens - sql_before.opens
+                               << " reads=" << sql_after.reads - sql_before.reads
+                               << " bytes=" << sql_after.bytes - sql_before.bytes);
+    CHECK(sql_after.opens > sql_before.opens);
+    CHECK(sql_after.reads > sql_before.reads);
+    CHECK(sql_after.bytes > sql_before.bytes);
+    CHECK(observed.datasources > 0);
+    if (observed.footer_misses.load()) {
+      CHECK(observed.preparation->requests > 0);
+      CHECK(observed.preparation->bytes_returned > 0);
+    } else
+      CHECK(observed.footer_hits > 0);
+    CHECK(observed.execution->requests > 0);
+    CHECK(observed.execution->bytes_returned > 0);
+    CHECK(observed.preparation->failures == 0);
+    CHECK(observed.execution->failures == 0);
+    REQUIRE(observed.puffin.size() == (three ? 3 : 1));
+    sirius::op::scan::puffin_read_statistics puffin;
+    for (auto const& [path, charged, stats] : observed.puffin) {
+      CAPTURE(path);
+      CHECK(charged == deferred);
+      puffin.opens += stats.opens;
+      puffin.requests += stats.requests;
+      puffin.bytes_requested += stats.bytes_requested;
+      puffin.bytes_returned += stats.bytes_returned;
+      puffin.failures += stats.failures;
+    }
+    CHECK(puffin.opens == (three ? 3 : 1));
+    CHECK(puffin.requests == 6 * puffin.opens);
+    CHECK(puffin.bytes_returned == puffin.bytes_requested);
+    CHECK(puffin.failures == 0);
+    if (legacy_puffin) {
+      CHECK(puffin.requests == legacy_puffin->requests);
+      CHECK(puffin.bytes_returned == legacy_puffin->bytes_returned);
+    } else
+      legacy_puffin = puffin;
+    INFO("datasource preparation requests="
+         << observed.preparation->requests.load()
+         << " bytes=" << observed.preparation->bytes_returned.load()
+         << "; execution requests=" << observed.execution->requests.load()
+         << " bytes=" << observed.execution->bytes_returned.load()
+         << "; jobs peak=" << publication.jobs_peak << " results peak=" << publication.results_peak
+         << " output peak=" << publication.output_peak);
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    require_route(before, after, gpu_route::gpu);
+    CHECK(after.preparation_legacy_route == before.preparation_legacy_route + (deferred ? 0 : 1));
+    CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
+    CHECK(after.iceberg_dv_manifest_reads > before.iceberg_dv_manifest_reads);
+    CHECK(after.iceberg_delete_payload_loads ==
+          before.iceberg_delete_payload_loads + (three ? 3 : 1));
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Warm fixed SQL cost and preparation observations",
+                 "[.][integration][scan_preparation][preparation_cost]")
+{
+  auto const* sql_path = std::getenv("SIRIUS_TEST_PREPARATION_COST_SQL_FILE");
+  if (!sql_path || !*sql_path) SKIP("set SIRIUS_TEST_PREPARATION_COST_SQL_FILE to measure a query");
+  std::ifstream input(sql_path);
+  REQUIRE(input.good());
+  std::string sql{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+  REQUIRE_FALSE(sql.empty());
+  auto statements = con->ExtractStatements(sql);
+  REQUIRE(statements.size() == 1);
+  REQUIRE(statements.front()->type == duckdb::StatementType::SELECT_STATEMENT);
+  auto const observe = GENERATE(false, true);
+  auto counters      = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  REQUIRE_FALSE(counters->preparation_provider_for_testing);
+  sirius::util::env_guard test_options{"SIRIUS_ENABLE_TEST_OPTIONS", "0"};
+  auto previous_tracking = counters->track_units.exchange(observe);
+  auto restore_tracking  = std::shared_ptr<void>(
+    nullptr, [counters, previous_tracking](void*) { counters->track_units = previous_tracking; });
+  duckdb::unique_ptr<duckdb::MaterializedQueryResult> reference;
+  {
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    reference = con->Query(sql);
+    REQUIRE(reference);
+    INFO(reference->HasError() ? reference->GetError() : "");
+    REQUIRE_FALSE(reference->HasError());
+  }
+  auto expected = collect_rows(*reference);
+  sirius::test::scoped_setting gpu(*con, "gpu_execution", true);
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  constexpr int warmups = 8, samples = 40;
+  using clock = preparation_measurement::clock;
+  auto micros = [](auto duration) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+  };
+  auto thread_cpu = [] {
+    timespec value{};
+    REQUIRE(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0);
+    return int64_t{value.tv_sec} * 1000000 + value.tv_nsec / 1000;
+  };
+  auto process_cpu = [](rusage const& value) {
+    return int64_t{value.ru_utime.tv_sec + value.ru_stime.tv_sec} * 1000000 +
+           value.ru_utime.tv_usec + value.ru_stime.tv_usec;
+  };
+  auto const* table = std::getenv("SIRIUS_TEST_PREPARATION_COST_TABLE");
+  std::unique_ptr<scoped_sql_file_logs> sql_logs;
+  if (observe && table && *table) sql_logs = std::make_unique<scoped_sql_file_logs>(*con);
+  std::vector<int64_t> totals;
+  for (int sample = -warmups; sample < samples; ++sample) {
+    {
+      std::lock_guard lock(counters->units_mutex);
+      counters->publications_by_query.clear();
+      counters->parquet_reader_calls.clear();
+      counters->native_decoder_calls.clear();
+    }
+    std::unique_ptr<preparation_measurement> observed;
+    if (observe) observed = std::make_unique<preparation_measurement>(counters);
+    auto sql_before = sql_logs ? sql_logs->metadata_reads(table) : sql_file_counts{};
+    auto before     = sirius::test::get_transparent_execution_stats(*con);
+    rusage usage_begin{}, usage_end{};
+    REQUIRE(getrusage(RUSAGE_SELF, &usage_begin) == 0);
+    auto cpu_begin  = thread_cpu();
+    auto wall_begin = micros(std::chrono::system_clock::now().time_since_epoch());
+    auto begin      = clock::now();
+    auto result     = con->Query(sql);
+    auto end        = clock::now();
+    auto wall_end   = micros(std::chrono::system_clock::now().time_since_epoch());
+    auto cpu_us     = thread_cpu() - cpu_begin;
+    REQUIRE(getrusage(RUSAGE_SELF, &usage_end) == 0);
+    REQUIRE(result);
+    INFO(result->HasError() ? result->GetError() : "");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->names == reference->names);
+    REQUIRE(result->types == reference->types);
+    REQUIRE((observed ? observed->fetch(*result) : collect_rows(*result)) == expected);
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    require_route(before, after, gpu_route::gpu);
+    if (sample < 0) continue;
+    auto total = micros(end - begin);
+    totals.push_back(total);
+    std::cout << "PREPARATION_COST_SAMPLE sample=" << sample << " cache=warm"
+              << " observations=" << (observe ? "enabled" : "disabled") << " total_us=" << total
+              << " wall_begin_us=" << wall_begin << " wall_end_us=" << wall_end
+              << " query_thread_cpu_us=" << cpu_us
+              << " process_cpu_us=" << process_cpu(usage_end) - process_cpu(usage_begin)
+              << " voluntary_switches=" << usage_end.ru_nvcsw - usage_begin.ru_nvcsw
+              << " involuntary_switches=" << usage_end.ru_nivcsw - usage_begin.ru_nivcsw
+              << " legacy_scans="
+              << after.preparation_legacy_route - before.preparation_legacy_route
+              << " manifest_walks=" << after.iceberg_manifest_walks - before.iceberg_manifest_walks
+              << " payload_loads="
+              << after.iceberg_delete_payload_loads - before.iceberg_delete_payload_loads;
+    if (observed) {
+      auto publication = observed->publication();
+      auto event       = [&](char const* name, auto value) {
+        std::cout << ' ' << name << '=';
+        if (value)
+          std::cout << micros(*value - begin);
+        else
+          std::cout << "unobserved";
+      };
+      event("plan_end_us", observed->plan_end);
+      event("first_ready_us", publication.first_ready);
+      event("first_internal_publish_us", publication.first_publication);
+      event("first_client_row_us", observed->first_client_row);
+      event("client_complete_us", observed->complete);
+      size_t deferred = 0;
+      for (auto const& [id, route] : observed->routes)
+        deferred += route;
+      std::cout << " deferred_scans=" << deferred << " statement_routes=";
+      for (auto const& reason : observed->statement_reasons)
+        std::cout << reason << ',';
+      std::cout << " jobs_peak=" << publication.jobs_peak
+                << " results_peak=" << publication.results_peak
+                << " output_peak=" << publication.output_peak
+                << " partial_emissions=" << publication.partial_emissions
+                << " max_residence_us=" << publication.max_residence.count()
+                << " deadline_lateness_us=" << publication.max_deadline_lateness.count()
+                << " footer_hits=" << observed->footer_hits.load()
+                << " footer_misses=" << observed->footer_misses.load();
+      for (auto const& [path, charged, stats] : observed->puffin)
+        std::cout << " puffin=" << (charged ? "preparation" : "planning") << ':' << stats.opens
+                  << ':' << stats.requests << ':' << stats.bytes_requested << ':'
+                  << stats.bytes_returned << ':' << stats.failures;
+      for (auto const& [phase, reads] : {std::pair{"preparation", observed->preparation},
+                                         std::pair{"execution", observed->execution}})
+        std::cout << " datasource_" << phase << '=' << reads->requests.load() << ':'
+                  << reads->bytes_requested.load() << ':' << reads->bytes_returned.load() << ':'
+                  << reads->failures.load();
+      if (sql_logs) {
+        auto sql_after = sql_logs->metadata_reads(table);
+        std::cout << " sql_metadata=" << sql_after.opens - sql_before.opens << ':'
+                  << sql_after.reads - sql_before.reads << ':'
+                  << sql_after.bytes - sql_before.bytes;
+      } else
+        std::cout << " sql_metadata=unobserved";
+    } else
+      std::cout << " deferred_scans=unobserved";
+    std::cout << " backend_io=unobserved reservation_peak=unobserved\n";
+  }
+  std::sort(totals.begin(), totals.end());
+  std::cout << "PREPARATION_COST_SUMMARY cache=warm samples=" << samples << " warmups=" << warmups
+            << " observations=" << (observe ? "enabled" : "disabled") << " percentile=nearest_rank"
+            << " total_p50_us=" << totals[samples / 2 - 1]
+            << " total_p95_us=" << totals[(samples * 95 + 99) / 100 - 1] << '\n';
 }

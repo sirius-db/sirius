@@ -82,15 +82,19 @@ struct DeletionVectorRef {
  * @throws std::runtime_error on I/O errors, a descriptor that contradicts @p ref, magic mismatch,
  *         or CRC failure.
  */
-std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref);
+std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref,
+                                          physical_check_counters const* counters = nullptr);
 std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
-  DeletionVectorRef const&, sirius::scan_manager::charging_allocator&);
+  DeletionVectorRef const&,
+  sirius::scan_manager::charging_allocator&,
+  physical_check_counters const* counters = nullptr);
 
 std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
   DeletionVectorRefView const&,
   sirius::scan_manager::charging_allocator&,
   std::string_view canonical_path,
   std::shared_ptr<void const> path_owner,
-  scan_contract_id contract = 0);
+  scan_contract_id contract               = 0,
+  physical_check_counters const* counters = nullptr);
 
 }  // namespace sirius::op::scan

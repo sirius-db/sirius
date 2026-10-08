@@ -61,6 +61,44 @@ std::future<size_t> bridge_semi_to_std(Producer&& producer)
   return fut;
 }
 
+template <typename Producer>
+std::future<size_t> bridge_semi_to_std(
+  Producer&& producer,
+  std::shared_ptr<sirius_datasource::read_statistics> const& stats,
+  size_t bytes,
+  std::span<const slice> ranges = {})
+{
+  if (!stats) return bridge_semi_to_std(std::forward<Producer>(producer));
+  struct measured_promise {
+    std::promise<size_t> promise;
+    std::shared_ptr<sirius_datasource::read_statistics> counters;
+  };
+  auto state          = std::make_shared<measured_promise>();
+  state->counters     = stats;
+  auto future         = state->promise.get_future();
+  using terminal_type = exec::invocable<void(exec::try_t<size_t>&&) &&>;
+  terminal_type terminal{[state = std::move(state)](exec::try_t<size_t>&& result) mutable {
+    if (result.has_exception()) {
+      state->counters->completed(0, true);
+      state->promise.set_exception(std::move(result).exception());
+    } else {
+      state->counters->completed(result.value());
+      state->promise.set_value(std::move(result).value());
+    }
+  }};
+  for (auto const& range : ranges)
+    bytes += range.size();
+  stats->requested(bytes);
+  try {
+    auto pending = std::forward<Producer>(producer)();
+    std::move(pending).install_callback(std::move(terminal));
+  } catch (...) {
+    stats->completed(0, true);
+    throw;
+  }
+  return future;
+}
+
 }  // namespace
 
 sirius_datasource::sirius_datasource(std::shared_ptr<ioctx> io_ctx,
@@ -102,11 +140,21 @@ bool sirius_datasource::is_device_read_preferred(size_t) const
 
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
-  if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    return cache->host_read(*_io_object, offset, size, dst, &_cache_handle);
+  if (_read_statistics) _read_statistics->requested(size);
+  try {
+    auto n = [&] {
+      if (uses_prefetching_cache()) {
+        auto* cache = _io_ctx->cache();
+        return cache->host_read(*_io_object, offset, size, dst, &_cache_handle);
+      }
+      return std::move(_io_ctx->host_read_async_io(*_io_object, offset, size, dst)).get();
+    }();
+    if (_read_statistics) _read_statistics->completed(n);
+    return n;
+  } catch (...) {
+    if (_read_statistics) _read_statistics->completed(0, true);
+    throw;
   }
-  return std::move(_io_ctx->host_read_async_io(*_io_object, offset, size, dst)).get();
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_t offset,
@@ -120,13 +168,16 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  return bridge_semi_to_std([&] {
-    if (uses_prefetching_cache()) {
-      auto* cache = _io_ctx->cache();
-      return cache->host_read_async(*_io_object, offset, size, dst, &_cache_handle);
-    }
-    return _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
-  });
+  return bridge_semi_to_std(
+    [&] {
+      if (uses_prefetching_cache()) {
+        auto* cache = _io_ctx->cache();
+        return cache->host_read_async(*_io_object, offset, size, dst, &_cache_handle);
+      }
+      return _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
+    },
+    _read_statistics,
+    size);
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
@@ -172,36 +223,47 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          cudf_datasource_stream_t stream_arg)
 {
   ::cuda::stream_ref stream{stream_arg};
-  return bridge_semi_to_std([&] {
-    if (uses_prefetching_cache()) {
-      auto* cache = _io_ctx->cache();
-      return cache->device_read_async(*_io_object, offset, size, dst, stream, &_cache_handle);
-    }
-    return _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
-  });
+  return bridge_semi_to_std(
+    [&] {
+      if (uses_prefetching_cache()) {
+        auto* cache = _io_ctx->cache();
+        return cache->device_read_async(*_io_object, offset, size, dst, stream, &_cache_handle);
+      }
+      return _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
+    },
+    _read_statistics,
+    size);
 }
 
 std::future<size_t> sirius_datasource::device_read_ranges_async(std::span<const slice> ranges,
                                                                 ::cuda::stream_ref stream)
 {
-  return bridge_semi_to_std([&] {
-    if (uses_prefetching_cache()) {
-      auto* cache = _io_ctx->cache();
-      return cache->device_read_ranges_async(*_io_object, ranges, stream, &_cache_handle);
-    }
-    return _io_ctx->device_readv_async_io(*_io_object, ranges, stream);
-  });
+  return bridge_semi_to_std(
+    [&] {
+      if (uses_prefetching_cache()) {
+        auto* cache = _io_ctx->cache();
+        return cache->device_read_ranges_async(*_io_object, ranges, stream, &_cache_handle);
+      }
+      return _io_ctx->device_readv_async_io(*_io_object, ranges, stream);
+    },
+    _read_statistics,
+    0,
+    ranges);
 }
 
 std::future<size_t> sirius_datasource::host_read_ranges_async(std::span<const slice> ranges)
 {
-  return bridge_semi_to_std([&] {
-    if (uses_prefetching_cache()) {
-      auto* cache = _io_ctx->cache();
-      return cache->host_read_ranges_async(*_io_object, ranges, &_cache_handle);
-    }
-    return _io_ctx->host_readv_async_io(*_io_object, ranges);
-  });
+  return bridge_semi_to_std(
+    [&] {
+      if (uses_prefetching_cache()) {
+        auto* cache = _io_ctx->cache();
+        return cache->host_read_ranges_async(*_io_object, ranges, &_cache_handle);
+      }
+      return _io_ctx->host_readv_async_io(*_io_object, ranges);
+    },
+    _read_statistics,
+    0,
+    ranges);
 }
 
 std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
@@ -210,7 +272,9 @@ std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
   // deliberately reused across splits of the same file.  The new
   // datasource starts with a default-constructed cache_handle so
   // its fadvise() calls can't accidentally cancel the original's work.
-  return std::make_unique<sirius_datasource>(_io_ctx, _io_object);
+  auto result = std::make_unique<sirius_datasource>(_io_ctx, _io_object);
+  result->read_statistics_for_testing(_split_statistics, _split_statistics);
+  return result;
 }
 
 void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges,

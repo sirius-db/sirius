@@ -145,12 +145,14 @@ struct fixture {
   std::vector<std::shared_ptr<hold>> holds;
   explicit fixture(size_t workers                               = 2,
                    size_t slots                                 = 4,
-                   std::chrono::milliseconds interrupt_interval = k_interrupt_check_interval)
+                   std::chrono::milliseconds interrupt_interval = k_interrupt_check_interval,
+                   bool collect_timing                          = false)
     : pool(static_cast<int>(workers)),
       dispatcher(pool),
       coordinator(completion,
                   dispatcher,
-                  preparation_options{workers, slots, slots, workers, 1, 20ms, interrupt_interval})
+                  preparation_options{
+                    workers, slots, slots, workers, 1, 20ms, interrupt_interval, collect_timing})
   {
   }
   std::thread owner;
@@ -372,7 +374,7 @@ TEST_CASE("Publication is refused after cancellation wins during input construct
 TEST_CASE("Unresolved typed input forbids scan input construction until the whole unit is ready",
           "[scan_preparation][coordinator]")
 {
-  fixture f;
+  fixture f(2, 4, k_interrupt_check_interval, true);
   auto out = std::make_shared<sink>();
   required_input_set required;
   required.set(2);
@@ -397,10 +399,14 @@ TEST_CASE("Unresolved typed input forbids scan input construction until the whol
   REQUIRE(stage.wait_for(1s) == std::future_status::ready);
   CHECK(f.coordinator.unit_state_snapshot({3, 1})->state == unit_state::pending);
   CHECK(out->count() == 0);
+  CHECK_FALSE(f.coordinator.snapshot().first_ready);
+  CHECK_FALSE(f.coordinator.snapshot().first_publication);
   REQUIRE(unit->complete_input(
     delete_set_input{std::make_shared<sirius::op::scan::iceberg_delete_set const>("file")}));
   REQUIRE(out->await(1));
   CHECK(unit->record().state == unit_state::ready);
+  CHECK(f.coordinator.snapshot().first_ready.has_value());
+  CHECK(f.coordinator.snapshot().first_publication.has_value());
   f.coordinator.request_stop(stop_reason::normal_eos);
   CHECK_FALSE(f.coordinator.admit_unit({3, 2}, required));
   CHECK(unit->record().state == unit_state::ready);
@@ -1215,4 +1221,39 @@ TEST_CASE("Observed interruption stops claims and publication while owned work d
   CHECK(reads == (interruption == point::submitting_work ? 0 : 1));
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
   CHECK_THROWS_AS(f.coordinator.set_interrupt_check({}), std::logic_error);
+}
+
+TEST_CASE("Optional preparation timestamps retain the first ready input and publication",
+          "[scan_preparation][coordinator][observation]")
+{
+  auto enabled = GENERATE(false, true);
+  fixture f(1, 4, k_interrupt_check_interval, enabled);
+  auto out  = std::make_shared<sink>();
+  auto held = f.make_hold();
+  int next  = 0;
+  f.source(
+    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
+      int id = next++;
+      if (id >= 2) return {};
+      return preparation_coordinator::job{[=] {
+                                            if (id == 1) held->wait();
+                                            return std::make_unique<tagged>(id);
+                                          },
+                                          {}};
+    });
+  auto guard = f.shutdown_guard();
+  CHECK_FALSE(f.coordinator.snapshot().first_ready);
+  CHECK_FALSE(f.coordinator.snapshot().first_publication);
+  f.start();
+  REQUIRE(out->await(1));
+  REQUIRE(held->await());
+  auto first = f.coordinator.snapshot();
+  CHECK(bool(first.first_ready) == enabled);
+  CHECK(bool(first.first_publication) == enabled);
+  if (enabled) CHECK(*first.first_ready <= *first.first_publication);
+  held->release();
+  REQUIRE(out->await(2));
+  auto last = f.coordinator.snapshot();
+  CHECK(last.first_ready == first.first_ready);
+  CHECK(last.first_publication == first.first_publication);
 }

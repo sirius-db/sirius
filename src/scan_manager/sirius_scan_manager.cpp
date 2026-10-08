@@ -1994,6 +1994,9 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
     }
     info->deferred->ledger = state.ledger;
   }
+  state.preparation.collect_timing = state.physical_counters &&
+                                     state.physical_counters->track_units &&
+                                     state.physical_counters->preparation_timing_for_testing;
   state.coordinator = std::make_unique<preparation_coordinator>(
     *state.completion, *state.dispatcher, state.preparation);
   for (auto& scan : state.scans)
@@ -2022,6 +2025,14 @@ void sirius_scan_manager::run_preparation_on_query_thread(sirius::query_id_t id)
     observation.preparation_runner    = stats.runner;
     observation.preparation_publisher = stats.publisher;
     observation.preparation_runs      = stats.runs;
+    observation.jobs_peak             = stats.jobs_peak;
+    observation.results_peak          = stats.results_peak;
+    observation.output_peak           = stats.output_peak;
+    observation.partial_emissions     = stats.partial_emissions;
+    observation.max_residence         = stats.max_residence;
+    observation.max_deadline_lateness = stats.max_deadline_lateness;
+    observation.first_ready           = stats.first_ready;
+    observation.first_publication     = stats.first_publication;
   }
 }
 

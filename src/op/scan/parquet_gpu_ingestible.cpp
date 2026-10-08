@@ -993,6 +993,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   {
     sirius_ds = io_ctx->open_datasource(
       file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
+    if (auto counters = _info->profiles->counters;
+        sirius_ds && counters && counters->track_units && counters->parquet_datasource_for_testing)
+      counters->parquet_datasource_for_testing(file_path, *sirius_ds);
   }
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);

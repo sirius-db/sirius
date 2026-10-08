@@ -365,6 +365,7 @@ class SiriusContext : public ClientContextState {
     uint64_t prefetcher_conversions = 0;
     std::map<uint64_t, sirius::op::scan::scan_publication_observation> publications_by_query;
     uint64_t iceberg_manifest_walks       = 0;
+    uint64_t preparation_legacy_route     = 0;
     uint64_t iceberg_dv_manifest_reads    = 0;
     uint64_t iceberg_delete_payload_loads = 0;
     uint64_t iceberg_inventory_bytes_peak = 0;

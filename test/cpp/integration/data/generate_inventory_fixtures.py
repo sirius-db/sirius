@@ -137,7 +137,12 @@ meta["location"] = str(dest)
 
 # Three independent DV/data-file pairs exercise preparation/GPU overlap without a
 # multi-scan read-view correspondence dependency. Footer references are absolute.
-for variant, names in (("dv_bounded", ("a",)), ("dv_three", ("a", "b", "c"))):
+for variant, names in (
+    ("dv_bounded", ("a",)),
+    ("dv_three", ("a", "b", "c")),
+    ("dv_corrupt_crc", ("a",)),
+    ("dv_missing_payload", ("a",)),
+):
     dest = out / variant
     (dest / "metadata").mkdir(parents=True, exist_ok=True)
     (dest / "data").mkdir(parents=True, exist_ok=True)
@@ -196,6 +201,10 @@ for variant, names in (("dv_bounded", ("a",)), ("dv_three", ("a", "b", "c"))):
                         sidecar.write_bytes(
                             source_puffin[: 4 + df["content_size_in_bytes"]] + framing
                         )
+                        if variant == "dv_corrupt_crc":
+                            encoded = bytearray(sidecar.read_bytes())
+                            encoded[4 + df["content_size_in_bytes"] - 1] ^= 1
+                            sidecar.write_bytes(encoded)
                         df["file_path"] = str(sidecar)
                         df["referenced_data_file"] = str(data)
                         df["file_size_in_bytes"] = sidecar.stat().st_size
@@ -209,5 +218,7 @@ for variant, names in (("dv_bounded", ("a",)), ("dv_three", ("a", "b", "c"))):
         write(path, schema, metadata, rows)
     (dest / "metadata/v1.metadata.json").write_text(json.dumps(meta, indent=2))
     (dest / "metadata/version-hint.text").write_text("1")
+    if variant == "dv_missing_payload":
+        (dest / "data/a.puffin").unlink()
 
 print(out)

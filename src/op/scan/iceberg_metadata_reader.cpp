@@ -547,13 +547,19 @@ void materialize_positional_deletes(duckdb::ClientContext& context,
           "'); which one applies would depend on manifest order, which Iceberg does not define");
       }
 
-      if (auto counters = iceberg_counters(context)) ++counters->iceberg_delete_payload_loads;
+      auto counters = iceberg_counters(context);
+      if (counters) ++counters->iceberg_delete_payload_loads;
+      if (counters && counters->track_units && counters->iceberg_dv_phase_for_testing)
+        counters->iceberg_dv_phase_for_testing(dv_entry.file_path, true);
       auto positions =
         read_deletion_vector({.puffin_path           = dv_entry.file_path,
                               .content_offset        = dv_entry.content_offset,
                               .content_size_in_bytes = dv_entry.content_size_in_bytes,
                               .referenced_data_file  = dv_entry.referenced_data_file,
-                              .record_count          = dv_entry.record_count});
+                              .record_count          = dv_entry.record_count},
+                             counters.get());
+      if (counters && counters->track_units && counters->iceberg_dv_phase_for_testing)
+        counters->iceberg_dv_phase_for_testing(dv_entry.file_path, false);
 
       // The footer check above ties the blob to this entry; this ties the decoded bitmap to the
       // count both of them declare, which is the one thing the footer cannot vouch for.
