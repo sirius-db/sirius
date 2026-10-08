@@ -46,9 +46,11 @@ CACHE_EVICTION="${CACHE_EVICTION:-idle}"
 # spills and REST staging. The code default (0.8 = 80 GB of 100 GB) starved
 # both at SF3000; 0.2 = 20 GB.
 CACHE_MAX_FRACTION="${CACHE_MAX_FRACTION:-0.2}"
-# Bytes the readahead may hold prefetched but not yet consumed. Unset: derived
+# Bytes the readahead may hold prefetched but not yet consumed. Empty: derived
 # from the cache budget (CACHE_MAX_FRACTION of the host tier); 0: unlimited.
-READAHEAD_BYTES="${READAHEAD_BYTES:-}"
+# 4 GB measured best (2026-10-07, after the cache cap): SF3000 q5 28.7 s / q14
+# 23.2 s vs 33.0 / 31.8 s at 32 GB, while SF1000 q1/q6 scan time moved < 0.6 s.
+READAHEAD_BYTES="${READAHEAD_BYTES-4GB}"
 SPILL_COMPRESSION="${SPILL_COMPRESSION:-0}"
 DEVICE_POOL_BYTES="${DEVICE_POOL_BYTES:-3GiB}"
 NAME="${NAME:-default}"

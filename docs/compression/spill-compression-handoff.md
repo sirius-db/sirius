@@ -106,6 +106,16 @@ default, i.e. 80 GB of 100. At SF1000 that pushed q9's spills to disk; at SF3000
 exhausted REST staging and failed q9/q10. The template caps it at 0.2
 (`CACHE_MAX_FRACTION`); `CACHE_MODE=none` turns it off.
 
+**Update (after 1fe7c4c1 / c0139f4e): the cache works at SF3000.** The cache is now
+hard-capped at its budget (demand reads over the cap go through REST staging,
+uncached) and the readahead is bounded by resident bytes and host pressure. With
+the cap, q3/q5/q13/q14/q17/q21 all complete with the cache on (q3 351 s vs 312 s
+cache off; q13 29.8 s, q17 31.5 s, q21 48.0 s match or beat cache off). A
+`max_readahead_bytes` sweep (4/8/16/32 GB) found 4 GB best: SF3000 q5 28.7 s and
+q14 23.2 s (= cache off) vs 33.0 / 31.8 s at 32 GB, with SF1000 q1/q6 scan time
+within 0.6 s -- prefetching only needs a few GB. The bench defaults to 4 GB
+(`READAHEAD_BYTES`). The rest of this paragraph is the pre-fix diagnosis.
+
 **Use `CACHE_MODE=none` at SF3000.** The cap does not bound the cache's real
 footprint: with it at 20 GB the host tier still peaked at 100 of 100 GB, spills
 went to disk (q5: 41 GB to disk capped vs 0 with the cache off), and five queries
