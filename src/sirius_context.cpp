@@ -1838,11 +1838,19 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
 
   try {
-    // Plan-generation window: create_plan below reads the scan manager's pin
-    // registry, which requires single-flight discipline, so the validation is
-    // serialized against execution windows. Placed after the replan block so
-    // its nested bind never re-enters the slot, and inside this try so a
-    // runtime-unavailable error takes the existing fallback split below.
+    // Copy can rebind table functions, whose bind callbacks may acquire maintenance access.
+    // Finish it before taking a planning permit so maintenance cannot wait on our own permit.
+    duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
+    bool plan_is_copyable = true;
+    try {
+      validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
+    } catch (NotImplementedException&) {
+      plan_is_copyable = false;
+    }
+
+    // Protect pin-registry reads and GPU plan validation against maintenance. Both SQL
+    // replanning and logical-plan copying must finish before entering this window.
+    // Keep acquisition inside this try so runtime-unavailable errors use the fallback below.
     SlotGuard plan_window(*this, context, sirius::exec::query_admission::access::planning);
     auto physical_original_views =
       prepared.physical_plan
@@ -1862,13 +1870,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                          sirius::planner::scan_contract_provenance{
                            std::nullopt, conn_state->planning_generation()})
                      : std::make_unique<sirius::planner::sirius_physical_plan_generator>(context);
-    duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
-    bool plan_is_copyable = true;
-    try {
-      validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
-    } catch (NotImplementedException&) {
-      plan_is_copyable = false;
-    }
     // Hand the validated plan over instead of discarding it, so the first execution can skip
     // an identical rebuild. Stamp the pinned-registry epoch the plan was built against: the
     // execution window re-checks it and rebuilds if a pin or unpin landed in between.
