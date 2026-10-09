@@ -22,6 +22,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 
@@ -192,6 +193,27 @@ TEST_CASE_METHOD(SetOpAllFixture,
   compare_gpu_vs_cpu(
     "SELECT count(*) FROM (SELECT k, v FROM shot INTERSECT ALL "
     "SELECT k, v FROM shot WHERE k = 7 OR k < 10) t");
+}
+
+TEST_CASE_METHOD(
+  SetOpAllFixture,
+  "gpu_execution EXCEPT ALL and INTERSECT ALL under a selective join filter each arm",
+  "[integration][gpu_execution][setop_all][dynamic_filter]")
+{
+  run_ok("CREATE TABLE sjoin_a AS SELECT (i % 5000)::BIGINT AS k FROM range(100000) t(i);");
+  run_ok("CREATE TABLE sjoin_b AS SELECT (i % 7000)::BIGINT AS k FROM range(80000) t(i);");
+  run_ok("CREATE TABLE sjoin_build AS SELECT i::BIGINT AS k, i % 100 AS g FROM range(10000) t(i);");
+  run_ok("CHECKPOINT;");
+  for (std::string const form : {"INTERSECT ALL", "EXCEPT ALL"}) {
+    INFO(form);
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+    compare_gpu_vs_cpu("SELECT t.k, count(*) FROM (SELECT k FROM sjoin_a " + form +
+                       " SELECT k FROM sjoin_b) t JOIN sjoin_build b ON t.k = b.k "
+                       "WHERE b.g = 7 GROUP BY t.k");
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+    // Two pushes for one key: one per arm's scan, which only descent through REPLICATE reaches.
+    REQUIRE(after.filters_pushed - before.filters_pushed >= 2);
+  }
 }
 
 TEST_CASE_METHOD(SetOpAllFixture,
