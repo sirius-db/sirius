@@ -7,7 +7,7 @@
 
 use starrocks_plan_translator::{ExchangeInput, PlanTranslator, TranslateError, TranslatedPlan};
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
-use starrocks_thrift::plan_nodes::{TJoinOp, TPlanNodeType};
+use starrocks_thrift::plan_nodes::{TAggregationNode, TJoinOp, TPlanNodeType};
 use substrait::proto::join_rel::JoinType;
 use thrift::protocol::{TBinaryInputProtocol, TSerializable};
 
@@ -16,6 +16,8 @@ use thrift::protocol::{TBinaryInputProtocol, TSerializable};
 const TWO_PHASE_AGG: &str = "tpch-sf1000-two-phase-agg";
 /// Fragments with RIGHT SEMI joins, which used to fail with "hash join type is unsupported".
 const SEMI_ANTI_JOIN: &str = "tpch-sf1000-semi-anti-join";
+/// Aggregation fragments whose tuples pin the FE's column-order contract.
+const AGG_COLUMN_ORDER: &str = "tpch-sf1000-agg-column-order";
 
 /// Reads a recorded fragment from a fixture directory.
 fn load(dir: &str, name: &str) -> TExecPlanFragmentParams {
@@ -286,4 +288,238 @@ fn q21_semi_and_anti_joins_keep_their_other_conjuncts() {
         );
     }
     assert!(function_names(&plan).contains(&"is_null".to_string()));
+}
+
+/// The aggregation node `node_id` of a recorded fragment.
+fn aggregation(params: &TExecPlanFragmentParams, node_id: i32) -> &TAggregationNode {
+    params
+        .fragment
+        .as_ref()
+        .and_then(|fragment| fragment.plan.as_ref())
+        .unwrap()
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .and_then(|node| node.agg_node.as_ref())
+        .unwrap_or_else(|| panic!("no aggregation node {node_id}"))
+}
+
+/// A tuple's materialized slot ids in descriptor (wire) order.
+fn descriptor_order(params: &TExecPlanFragmentParams, tuple_id: i32) -> Vec<i32> {
+    params
+        .desc_tbl
+        .as_ref()
+        .and_then(|desc| desc.slot_descriptors.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter(|slot| slot.parent == Some(tuple_id) && slot.is_materialized != Some(false))
+        .map(|slot| slot.id.unwrap())
+        .collect()
+}
+
+/// Column `slot` lands in when a tuple's columns follow `order`.
+fn column_of(order: &[i32], slot: i32) -> usize {
+    order.iter().position(|id| *id == slot).unwrap()
+}
+
+/// Every relation of the plan, outermost first.
+fn rels(plan: &TranslatedPlan) -> Vec<&substrait::proto::Rel> {
+    use substrait::proto::{Rel, plan_rel, rel};
+    fn walk<'a>(rel: &'a Rel, out: &mut Vec<&'a Rel>) {
+        out.push(rel);
+        let inputs: Vec<&Rel> = match rel.rel_type.as_ref().unwrap() {
+            rel::RelType::Join(join) => vec![
+                join.left.as_deref().unwrap(),
+                join.right.as_deref().unwrap(),
+            ],
+            rel::RelType::Project(project) => vec![project.input.as_deref().unwrap()],
+            rel::RelType::Filter(filter) => vec![filter.input.as_deref().unwrap()],
+            rel::RelType::Aggregate(aggregate) => vec![aggregate.input.as_deref().unwrap()],
+            rel::RelType::Sort(sort) => vec![sort.input.as_deref().unwrap()],
+            rel::RelType::Fetch(fetch) => vec![fetch.input.as_deref().unwrap()],
+            _ => Vec::new(),
+        };
+        for input in inputs {
+            walk(input, out);
+        }
+    }
+    let Some(plan_rel::RelType::Root(root)) = plan.plan.relations[0].rel_type.as_ref() else {
+        panic!("expected a root relation");
+    };
+    let mut found = Vec::new();
+    walk(root.input.as_ref().unwrap(), &mut found);
+    found
+}
+
+/// The plan's outermost aggregate relation.
+fn top_aggregate(plan: &TranslatedPlan) -> &substrait::proto::AggregateRel {
+    use substrait::proto::rel;
+    rels(plan)
+        .into_iter()
+        .find_map(|rel| match rel.rel_type.as_ref() {
+            Some(rel::RelType::Aggregate(aggregate)) => Some(aggregate.as_ref()),
+            _ => None,
+        })
+        .expect("no aggregate relation")
+}
+
+/// The input field a field-reference expression reads, looking through a cast (a decimal sum's
+/// argument is cast to FP64).
+fn field(expr: &substrait::proto::Expression) -> usize {
+    use substrait::proto::expression::{self, field_reference, reference_segment};
+    let selection = match expr.rex_type.as_ref() {
+        Some(expression::RexType::Selection(selection)) => selection,
+        Some(expression::RexType::Cast(cast)) => return field(cast.input.as_ref().unwrap()),
+        _ => panic!("expected a field reference, got {expr:?}"),
+    };
+    let Some(field_reference::ReferenceType::DirectReference(segment)) =
+        selection.reference_type.as_ref()
+    else {
+        panic!("expected a direct reference");
+    };
+    let Some(reference_segment::ReferenceType::StructField(field)) =
+        segment.reference_type.as_ref()
+    else {
+        panic!("expected a struct field reference");
+    };
+    field.field as usize
+}
+
+/// The input field each measure of an aggregate reads.
+fn measure_fields(aggregate: &substrait::proto::AggregateRel) -> Vec<usize> {
+    use substrait::proto::function_argument::ArgType;
+    aggregate
+        .measures
+        .iter()
+        .map(|measure| {
+            let Some(ArgType::Value(argument)) =
+                &measure.measure.as_ref().unwrap().arguments[0].arg_type
+            else {
+                panic!("expected a value argument");
+            };
+            field(argument)
+        })
+        .collect()
+}
+
+/// The type kind of each measure's output, as a short name.
+fn measure_kinds(aggregate: &substrait::proto::AggregateRel) -> Vec<&'static str> {
+    use substrait::proto::r#type::Kind;
+    aggregate
+        .measures
+        .iter()
+        .map(|measure| {
+            let output = measure.measure.as_ref().unwrap().output_type.as_ref();
+            match output.and_then(|ty| ty.kind.as_ref()) {
+                Some(Kind::I64(_)) => "i64",
+                Some(Kind::Fp64(_)) => "fp64",
+                Some(Kind::Decimal(_)) => "decimal",
+                other => panic!("unexpected measure type {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// The FE's column-order contract for an aggregation that doesn't finalize: grouping key i is
+/// slot i of its intermediate tuple and aggregate i slot `keys + i`, in descriptor order. q10's
+/// partial aggregation lists its seven keys out of slot-id order, and its sink hash-partitions
+/// on them by slot, so the columns they resolve to show which order the translator used.
+#[test]
+fn q10_partial_aggregation_follows_its_intermediate_tuple_order() {
+    let params = load(AGG_COLUMN_ORDER, "q10-partial");
+    let agg = aggregation(&params, 17);
+    assert!(!agg.need_finalize);
+    let order = descriptor_order(&params, agg.intermediate_tuple_id);
+    assert_eq!(order, [1, 2, 6, 5, 35, 3, 8, 39]);
+
+    let plan = translate(AGG_COLUMN_ORDER, "q10-partial").unwrap();
+    // The sink partitions on slots 1, 2, 6, 5, 35, 3, 8, which are columns 0..7 in descriptor
+    // order (by slot id they would be 0, 1, 4, 3, 6, 2, 5).
+    assert_eq!(plan.output_partition_columns, Some((0..7).collect()));
+    // The one aggregate, the revenue sum, is column 7 = slot 39, sent as FP64.
+    assert_eq!(plan.output_names.len(), 8);
+    assert_eq!(measure_kinds(top_aggregate(&plan)), ["fp64"]);
+}
+
+/// q22's partial aggregation emits `count(*)` and then `sum(c_acctbal)` after its one key,
+/// typed by the partial-state rule as BIGINT and FP64, in aggregate order.
+#[test]
+fn q22_partial_aggregates_follow_their_intermediate_tuple_order() {
+    let params = load(AGG_COLUMN_ORDER, "q22-partial");
+    let agg = aggregation(&params, 14);
+    assert!(!agg.need_finalize);
+    assert_eq!(
+        descriptor_order(&params, agg.intermediate_tuple_id),
+        [37, 38, 39]
+    );
+
+    let plan = translate(AGG_COLUMN_ORDER, "q22-partial").unwrap();
+    assert_eq!(plan.output_partition_columns, Some(vec![0]));
+    assert_eq!(measure_kinds(top_aggregate(&plan)), ["i64", "fp64"]);
+}
+
+/// The contract for a finalizing aggregation, on its output tuple. q10's merge aggregation reads
+/// the exchange in the order its partial step sends (the same descriptor order), and the sort
+/// above it reads the output tuple's slots 39, 1, 2, 3, 5, 6, 8, 35, which resolve to their
+/// positions in descriptor order.
+#[test]
+fn q10_merge_aggregation_follows_its_output_tuple_order() {
+    use substrait::proto::rel;
+    let params = load(AGG_COLUMN_ORDER, "q10-merge");
+    let agg = aggregation(&params, 19);
+    assert!(agg.need_finalize);
+    let order = descriptor_order(&params, agg.output_tuple_id);
+    assert_eq!(order, [1, 2, 6, 5, 35, 3, 8, 39]);
+
+    let plan = translate(AGG_COLUMN_ORDER, "q10-merge").unwrap();
+    let aggregate = top_aggregate(&plan);
+    // The keys and the revenue sum read the exchange in descriptor order.
+    let keys: Vec<_> = aggregate.grouping_expressions.iter().map(field).collect();
+    assert_eq!(keys, (0..7).collect::<Vec<_>>());
+    assert_eq!(measure_fields(aggregate), [7]);
+    assert_eq!(
+        stream_types(&plan, 18),
+        [
+            "INTEGER",
+            "VARCHAR",
+            "DECIMAL(15,2)",
+            "VARCHAR",
+            "VARCHAR",
+            "VARCHAR",
+            "VARCHAR",
+            "DOUBLE"
+        ]
+    );
+
+    let projection = rels(&plan)
+        .into_iter()
+        .find_map(|rel| match rel.rel_type.as_ref() {
+            Some(rel::RelType::Sort(sort)) => match sort.input.as_ref()?.rel_type.as_ref() {
+                Some(rel::RelType::Project(project)) => Some(project.as_ref()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("a sort over its sort-tuple projection");
+    let read: Vec<_> = projection.expressions.iter().map(field).collect();
+    let expected: Vec<_> = [39, 1, 2, 3, 5, 6, 8, 35]
+        .into_iter()
+        .map(|slot| column_of(&order, slot))
+        .collect();
+    assert_eq!(expected, [7, 0, 1, 5, 3, 2, 6, 4]);
+    assert_eq!(read, expected);
+}
+
+/// q22's merge aggregation reads aggregate i's partial state from exchange column `keys + i`:
+/// the count sum from column 1 and the balance sum from column 2.
+#[test]
+fn q22_merge_aggregates_read_their_partial_states_in_order() {
+    let params = load(AGG_COLUMN_ORDER, "q22-merge");
+    let agg = aggregation(&params, 16);
+    assert!(agg.need_finalize);
+    assert_eq!(descriptor_order(&params, agg.output_tuple_id), [37, 38, 39]);
+
+    let plan = translate(AGG_COLUMN_ORDER, "q22-merge").unwrap();
+    assert_eq!(stream_types(&plan, 15), ["VARCHAR", "BIGINT", "DOUBLE"]);
+    assert_eq!(measure_fields(top_aggregate(&plan)), [1, 2]);
 }
