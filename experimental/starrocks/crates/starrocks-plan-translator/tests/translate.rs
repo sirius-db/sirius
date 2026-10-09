@@ -3257,6 +3257,141 @@ fn left_semi_join_keeps_probe_layout() {
     );
 }
 
+/// Two-column sides for right semi/anti tests: tuple 0 = probe(`a`, `b`), tuple 1 =
+/// build(`c`, `d`). The build side starts at field 2 of the concatenated row and at field 0 of
+/// the join's output.
+fn two_by_two_join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "b", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "c", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 1, "d", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Builds a `join_op` hash join on `a = c` with the extra join conjunct `b <> d`, the shape of
+/// q21's EXISTS / NOT EXISTS (`l2.l_suppkey <> l1.l_suppkey`).
+fn join_with_other_conjunct(join_op: TJoinOp) -> TPlanNode {
+    let bigint = || scalar_type(TPrimitiveType::BIGINT);
+    let mut join = hash_join_node(join_op);
+    join.hash_join_node.as_mut().unwrap().other_join_conjuncts = Some(vec![binary_pred(
+        TExprOpcode::NE,
+        slot_ref(2, 0, bigint()),
+        slot_ref(2, 1, bigint()),
+    )]);
+    join
+}
+
+/// Asserts a join condition is `equal(a, c) AND not_equal(b, d)` over the concatenated
+/// probe-then-build row.
+fn assert_eq_and_ne_condition(
+    plan: &substrait::proto::Plan,
+    condition: &substrait::proto::Expression,
+) {
+    let conjunction = scalar_fn(condition);
+    assert_eq!(
+        resolved_function(plan, conjunction.function_reference).1,
+        "and"
+    );
+    let operands: Vec<_> = conjunction
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(value) => scalar_fn(value),
+            other => panic!("unexpected argument {other:?}"),
+        })
+        .collect();
+    let names: Vec<_> = operands
+        .iter()
+        .map(|operand| resolved_function(plan, operand.function_reference).1)
+        .collect();
+    assert_eq!(names, vec!["equal", "not_equal"]);
+    assert_eq!(argument_field_indices(operands[0]), vec![0, 2]);
+    assert_eq!(argument_field_indices(operands[1]), vec![1, 3]);
+}
+
+/// A right semi join (the FE's EXISTS / IN) is a Substrait RIGHT_SEMI join that keeps only the
+/// build side's columns, with the extra join conjunct inside the join condition: as a filter
+/// after the join it would test one arbitrary match instead of asking whether any match exists.
+/// Slots above the join resolve against the build-side layout.
+#[test]
+fn right_semi_join_keeps_build_layout_and_other_conjuncts() {
+    let mut join = join_with_other_conjunct(TJoinOp::RIGHT_SEMI_JOIN);
+    join.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated =
+        translate_fragment(&params(Some(plan), Some(two_by_two_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["c", "d"]);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the node conjunct's filter over the join");
+    };
+    // `d` is field 1 of the join's build-only output, not field 3 of the concatenated row.
+    let greater = scalar_fn(filter.condition.as_deref().unwrap());
+    let substrait::proto::function_argument::ArgType::Value(d) =
+        greater.arguments[0].arg_type.as_ref().unwrap()
+    else {
+        panic!("expected a value argument");
+    };
+    assert_eq!(field_index(d), 1);
+
+    let rel::RelType::Join(join) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the join under the filter");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::RightSemi as i32
+    );
+    assert_eq_and_ne_condition(&translated.plan, join.expression.as_ref().unwrap());
+}
+
+/// A right anti join (the FE's NOT EXISTS) keeps its extra join conjunct inside the RIGHT join's
+/// condition, so a build row survives the `is_null(probe key)` filter only when no probe row
+/// satisfies the whole condition. The output is the build side's columns.
+#[test]
+fn right_anti_join_keeps_other_conjuncts_in_the_join_condition() {
+    let plan = TPlan::new(vec![
+        join_with_other_conjunct(TJoinOp::RIGHT_ANTI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated =
+        translate_fragment(&params(Some(plan), Some(two_by_two_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["c", "d"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the output projection under the root");
+    };
+    assert_eq!(emit_mapping(project.common.as_ref()), vec![2, 3]);
+    let rel::RelType::Filter(filter) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the anti-join filter under the projection");
+    };
+    assert_eq!(
+        scalar_function_name(&translated.plan, filter.condition.as_ref().unwrap()),
+        "is_null"
+    );
+    let rel::RelType::Join(join) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the join under the filter");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Right as i32
+    );
+    assert_eq_and_ne_condition(&translated.plan, join.expression.as_ref().unwrap());
+}
+
 /// Builds a nested-loop join plan node carrying `conjuncts` as its join predicate.
 fn nestloop_join_node(join_op: TJoinOp, conjuncts: Vec<TExpr>) -> TPlanNode {
     let mut join = base_plan_node(2, TPlanNodeType::NESTLOOP_JOIN_NODE, 2, vec![0, 1]);

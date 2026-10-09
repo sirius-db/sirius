@@ -34,7 +34,7 @@
 //! | `AGGREGATION_NODE`   | `AggregateRel` (one-phase, or two-phase `SUM`/`COUNT`/`MIN`/`MAX` via `agg_phase`) |
 //! | `EXCHANGE_NODE`      | `ReadRel` (named table = the engine's `sirius_stream_<node_id>` view) |
 //! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
-//! | `HASH_JOIN_NODE`      | `JoinRel` (inner/outer/left-semi; left/right anti as outer join + `is_null` filter, null-aware left anti as mark join + `not`) |
+//! | `HASH_JOIN_NODE`      | `JoinRel` (inner/outer/left-semi/right-semi; left/right anti as outer join + `is_null` filter, null-aware left anti as mark join + `not`) |
 //! | `NESTLOOP_JOIN_NODE` | `JoinRel` (constant-key inner) + optional `FilterRel`, inner/cross only |
 //!
 //! Node-level `conjuncts` (scan/filter predicates, HAVING, post-join filters) become a
