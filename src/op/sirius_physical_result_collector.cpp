@@ -19,6 +19,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
+#include <memory/reservation_wait.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 #include <op/sirius_physical_result_collector.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
@@ -42,6 +43,7 @@
 // standard library
 #include <algorithm>
 #include <cassert>
+#include <thread>
 
 namespace sirius {
 namespace op {
@@ -153,42 +155,50 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           "[GPUPhysicalMaterializedCollector] No HOST memory space available for result "
           "collection");
       }
-      // Pick the host space with the most available memory.
-      /// TODO: prefer the NUMA-closest host space to the source GPU for locality.
-      auto const* mem_space =
-        *std::max_element(host_spaces.begin(), host_spaces.end(), [](auto const* a, auto const* b) {
-          return a->get_available_memory() < b->get_available_memory();
-        });
-
+      // Retry this batch before appending any of its rows. Earlier batches remain committed;
+      // replaying the whole sink on a transient miss would duplicate those rows. No collector
+      // mutex is held while waiting, so other collectors can finish and release HOST buffers.
+      std::unique_ptr<cucascade::memory::reservation> host_reservation;
+      memory::reservation_wait wait;
+      while (!host_reservation) {
+        auto pipe = get_pipeline();
+        if (_client_ctx.IsInterrupted() ||
+            (pipe &&
+             !sirius_ctx->get_query_lifecycle_registry().accepts_work(pipe->get_query_id()))) {
+          throw duckdb::InterruptException();
+        }
+        if (sirius_ctx->get_runtime_health() != duckdb::SiriusContext::runtime_health::OK) {
+          throw std::runtime_error("Result collection stopped: Sirius runtime unavailable");
+        }
+        size_t available = 0;
+        for (auto const* candidate : host_spaces) {
+          host_reservation =
+            const_cast<cucascade::memory::memory_space*>(candidate)->make_reservation_or_null(
+              data->get_size_in_bytes());
+          if (host_reservation) { break; }
+          available = std::max(available, candidate->get_available_memory());
+        }
+        if (host_reservation) { break; }
+        if (!wait.waiting()) {
+          SIRIUS_LOG_DEBUG("Result collection waiting for HOST reservation of {} bytes",
+                           data->get_size_in_bytes());
+        }
+        auto timeout = sirius_ctx->get_config().memory_reservation_timeout();
+        if (!wait.retry(memory::reservation_wait::clock::now(), available, 0, timeout)) {
+          throw std::runtime_error(
+            "Result collection exhausted its HOST memory-wait retry budget (" +
+            std::to_string(timeout.count()) + " ms without observed progress)");
+        }
+        std::this_thread::sleep_until(wait.retry_at());
+      }
       auto& registry     = sirius::converter_registry::get();
       auto next_batch_id = sirius::get_next_batch_id();
-
-      auto host_reservation =
-        const_cast<cucascade::memory::memory_space*>(mem_space)->make_reservation_or_null(
-          data->get_size_in_bytes());
-
-      // clone_to: creates new batch with data converted to host_data_representation
-      if (host_reservation == nullptr) {
-        SIRIUS_LOG_WARN(
-          "sirius_physical_materialized_collector: host reservation failed for batch {} ({} "
-          "bytes) — proceeding without reservation, converter may OOM",
-          ro.get_batch_id(),
-          data->get_size_in_bytes());
-      }
-      auto result_batch =
-        host_reservation != nullptr
-          ? ro.clone_to<cucascade::host_data_representation>(
-              registry,
-              next_batch_id,
-              *host_reservation,
-              stream,
-              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id))
-          : ro.clone_to<cucascade::host_data_representation>(
-              registry,
-              next_batch_id,
-              mem_space,
-              stream,
-              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
+      auto result_batch  = ro.clone_to<cucascade::host_data_representation>(
+        registry,
+        next_batch_id,
+        *host_reservation,
+        stream,
+        telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives
       // the branch — data points into it and must not dangle when we reach the assert below.

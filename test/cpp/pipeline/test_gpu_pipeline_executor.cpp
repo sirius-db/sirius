@@ -376,3 +376,50 @@ TEST_CASE("GPU pipeline executor schedules GPU tasks directly (push-model)",
     }
   }
 }
+
+TEST_CASE("reservation wait excludes scheduler delay and refreshes on progress", "[memory_wait]")
+{
+  using namespace std::chrono_literals;
+  using wait_type = sirius::memory::reservation_wait;
+  wait_type wait;
+  auto now = wait_type::clock::time_point{};
+  REQUIRE(wait.retry(now, 0, 0, 20ms));
+  CHECK(wait.retry_at() == now + 5ms);
+  // An hour queued behind other work charges only the requested 5 ms backoff.
+  now += 1h;
+  REQUIRE(wait.retry(now, 0, 0, 20ms));
+  CHECK(wait.retry_at() == now + 10ms);
+  now = wait.retry_at();
+  REQUIRE(wait.retry(now, 0, 0, 20ms));
+  SECTION("persistent exhaustion consumes the retry budget")
+  {
+    CHECK_FALSE(wait.retry(wait.retry_at(), 0, 0, 20ms));
+  }
+  SECTION("released capacity refreshes the budget")
+  {
+    CHECK(wait.retry(wait.retry_at(), 1, 0, 20ms));
+  }
+  SECTION("completed work refreshes it even if another task took the freed memory")
+  {
+    CHECK(wait.retry(wait.retry_at(), 0, 1, 20ms));
+  }
+  SECTION("moving to another device starts a new pressure episode")
+  {
+    CHECK(wait.retry(wait.retry_at(), 0, 0, 20ms, 1));
+  }
+  wait.reset();
+  CHECK_FALSE(wait.waiting());
+  CHECK(wait.retry(now + 2h, 0, 0, 20ms));
+}
+
+TEST_CASE("reservation retries back off without exceeding fifty milliseconds", "[memory_wait]")
+{
+  using namespace std::chrono_literals;
+  sirius::memory::reservation_wait wait;
+  auto now = sirius::memory::reservation_wait::clock::time_point{};
+  for (auto delay : {5ms, 10ms, 20ms, 40ms, 50ms, 50ms}) {
+    REQUIRE(wait.retry(now, 0, 0, 1s));
+    CHECK(wait.retry_at() - now == delay);
+    now = wait.retry_at();
+  }
+}

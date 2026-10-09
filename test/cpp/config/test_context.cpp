@@ -2393,6 +2393,27 @@ TEST_CASE("Sirius configuration enables dense count join by default and accepts 
       Catch::Matchers::ContainsSubstring("remove this key"));
 }
 
+TEST_CASE("memory reservation retry timeout is configurable and positive",
+          "[sirius][config][memory_wait]")
+{
+  auto path = fs::temp_directory_path() / "sirius_memory_wait_config.yaml";
+  finally remove{[&] { fs::remove(path); }};
+  auto load = [&](const char* yaml) {
+    {
+      std::ofstream out(path);
+      out << yaml;
+    }
+    sirius::sirius_config config;
+    config.load_from_file(path);
+    return config;
+  };
+  CHECK(load("sirius: {}").memory_reservation_timeout() == std::chrono::seconds{30});
+  CHECK(load("sirius: {memory_reservation_timeout_ms: 120000}").memory_reservation_timeout() ==
+        std::chrono::seconds{120});
+  REQUIRE_THROWS(load("sirius: {memory_reservation_timeout_ms: 0}"));
+  REQUIRE_THROWS(load("sirius: {memory_reservation_timeout_ms: -1}"));
+}
+
 TEST_CASE("Sirius query options stay local and snapshots remain immutable",
           "[sirius][config][isolated_context][query_options]")
 {

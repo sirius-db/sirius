@@ -2102,7 +2102,9 @@ void run_concurrent_admission(std::string const& variant,
   unsigned const limit = variant == "concurrent_4" ? 4 : 2;
   bool const fail      = variant == "concurrent_failure" || variant == "concurrent_two_failures";
   bool const both_fail = variant == "concurrent_two_failures";
-  bool const active_cancel = variant == "concurrent_active_cancel";
+  bool const memory_cancel  = variant == "concurrent_memory_cancel";
+  bool const memory_timeout = variant == "concurrent_memory_timeout";
+  bool const active_cancel  = variant == "concurrent_active_cancel";
   bool const compressed_pin =
     variant == "concurrent_compressed_host" || variant == "concurrent_compressed_gpu";
   bool const pins = variant == "concurrent_host_pin" || variant == "concurrent_gpu_pin" ||
@@ -2220,6 +2222,20 @@ void run_concurrent_admission(std::string const& variant,
     }
     current_sum = cpu->GetValue(0, 0).ToString();
   }
+  std::vector<std::unique_ptr<cucascade::memory::reservation>> pressure;
+  if (memory_cancel || memory_timeout) {
+    for (auto const* space :
+         runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      auto* gpu = runtime->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU,
+                                                                 space->get_device_id());
+      auto reservation = gpu->make_reservation_or_null(gpu->get_available_memory());
+      if (!reservation) {
+        out.error = "could not reserve every GPU for memory-wait test";
+        return;
+      }
+      pressure.push_back(std::move(reservation));
+    }
+  }
   auto before        = runtime->get_transparent_execution_stats();
   auto previous_sink = sirius::log::get_sink();
   auto gate          = std::make_shared<concurrent_window_sink>(limit);
@@ -2285,14 +2301,31 @@ void run_concurrent_admission(std::string const& variant,
   }
   if (active_cancel) connections[0]->Interrupt();
   gate->release();
+  bool memory_wait_observed = true;
+  bool memory_cancel_prompt = true;
+  if (memory_cancel || memory_timeout) {
+    memory_wait_observed = await([&] {
+      std::size_t waiting = 0;
+      for (auto const& d : runtime->get_query_lifecycle_registry().diagnostics())
+        if (d.memory_waiters) ++waiting;
+      return waiting == limit;
+    });
+    if (memory_cancel) connections[0]->Interrupt();
+    memory_cancel_prompt = queries[0].wait_for(std::chrono::seconds(memory_timeout ? 38 : 5)) ==
+                           std::future_status::ready;
+    pressure.clear();
+  }
   for (unsigned i = 0; i < limit; ++i) {
     auto error = queries[i].get();
-    if (active_cancel && i == 0) {
+    if ((active_cancel || memory_cancel || memory_timeout) && i == 0) {
       if (error.empty()) out.error = "active cancellation unexpectedly succeeded";
     } else if (fail && (i == 0 || both_fail)) {
       if (error.find("isolated failure") == std::string::npos)
         out.error = "expected query-local injected failure: " + error;
-    } else if (!error.empty())
+    } else if (!error.empty() &&
+               !(memory_timeout &&
+                 error.find("GPU reservation exhausted its memory-wait retry budget") !=
+                   std::string::npos))
       out.error = error;
   }
   if (mvcc) { run_statement(*connections[0], "COMMIT", "close old snapshot", out.error); }
@@ -2303,6 +2336,8 @@ void run_concurrent_admission(std::string const& variant,
     auto error = maintenance.get();
     if (!error.empty()) out.error = error;
   }
+  if (!memory_wait_observed || !memory_cancel_prompt)
+    out.error = "memory wait was not observable or cancellation/timeout did not settle";
   if (!overlapping || !queued || !cancelled_promptly || !maintenance_waiting)
     out.error = "admission overlap/queue/cancellation/maintenance invariant failed";
   auto counts = runtime->admission_counts();
@@ -2654,6 +2689,8 @@ TEST_CASE_METHOD(QueryLifecycleSlotFixture,
                               "concurrent_host_pin",
                               "concurrent_gpu_pin",
                               "concurrent_mvcc",
+                              "concurrent_memory_cancel",
+                              "concurrent_memory_timeout",
                               "concurrent_compressed_host",
                               "concurrent_compressed_gpu",
                               "concurrent_cache",
@@ -2685,6 +2722,8 @@ TEST_CASE_METHOD(QueryLifecycleSlotFixture,
                               "concurrent_compressed_host",
                               "concurrent_compressed_gpu",
                               "concurrent_cache",
+                              "concurrent_memory_cancel",
+                              "concurrent_memory_timeout",
                               "concurrent_cycles"}) {
     require_variant_succeeds(variant);
   }

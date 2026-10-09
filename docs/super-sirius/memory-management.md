@@ -72,7 +72,7 @@ memory_capacity = 1TB;          // total spill capacity
 
 Pipeline tasks acquire memory reservations before execution to prevent GPU OOM:
 
-1. GPU executor's `manager_loop()` calls `memory_space.make_reservation(estimated_size)`
+1. GPU executor's manager makes a nonblocking `make_reservation_or_null(estimated_size)` attempt; insufficient capacity returns the task to the scheduler and releases its worker slot
 2. The reservation is attached to the task's local state via `set_reservation()`
 3. During execution, operators allocate within the reservation
 4. Reservations are released when the task completes
@@ -88,7 +88,13 @@ Wraps RMM device memory resource. On each allocation:
 
 ### Caller reservations for HOST conversions
 
-Conversions that land data on the HOST tier draw down a caller-owned reservation instead of double-committing host capacity: the caller obtains a reservation with `make_reservation_or_null(size)` and passes it to the reservation-taking `convert_to`/`clone_to` overloads, so the converter's allocation is charged against capacity the caller already holds. If the reservation cannot be made, the call falls back — with a warning — to the `memory_space*` overload (no reservation; the converter may OOM). Call sites: `lock_or_prepare_batch` in `src/pipeline/batch_lock_utils.hpp` and the materialized result collector (`src/op/sirius_physical_result_collector.cpp`). The `memory_space*` overloads remain the path for GPU/DISK targets and viability probes.
+HOST conversions use caller-owned reservations. Materialized result transfer retries a transient
+HOST reservation miss on the current batch before appending its rows. Earlier batches are not
+replayed. The wait holds no collector mutex, checks query interruption/retirement and runtime
+health, and uses the configurable memory reservation retry budget. It retains the executing
+worker and input batch while waiting; exhausting the budget fails only its query. Batch preparation
+and spill paths retain their conversion/viability protocols. Reservations belong to the work
+using them, while query work leases protect the underlying repositories and plans.
 
 ## Downgrade Executor
 
@@ -124,7 +130,16 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 
 **Monitor spill sizing:** crossing the *trigger* threshold starts a monitor-issued request sized to reach the *stop* threshold. The request also observes live pressure and stops once usage reaches that threshold, preserving the trigger→stop hysteresis band.
 
-**Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds -- single request, no over-freeing.
+**Pipeline integration:** The GPU manager never blocks on reservation or downgrade futures.
+It keeps at most one reclamation request outstanding per GPU and requests only the shortfall
+between the reservation size and current reservation headroom. Requests recheck headroom before
+dispatching more spills, so concurrent releases can satisfy them. Waiting tasks return to the
+scheduler with backoff growing from 5 to 50 ms. The configurable
+`sirius.memory_reservation_timeout_ms` retry budget (default 30000) counts that requested backoff,
+excluding additional scheduler delay, and resets on observed memory availability increases or
+successful task execution on the device. Exhaustion fails only the waiting query.
+Spill candidates borrow their actual victim query until conversion settles. Query
+retirement does not cancel other queries' or monitor-owned reclamation requests.
 
 ### Spill Copy Granularity
 

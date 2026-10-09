@@ -782,6 +782,10 @@ try {
 
   yaml::reader r(*sirius_node, "sirius");
 
+  r.optional("memory_reservation_timeout_ms",
+             settings._memory_reservation_timeout_ms,
+             yaml::greater_than<int64_t>{0});
+
   // Topology
   r.optional("topology", topo);
   settings._gpus_per_query = topo.gpus_per_query;
