@@ -9,9 +9,11 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <regex>
 #include <string_view>
 #include <utility>
@@ -26,6 +28,9 @@ constexpr std::size_t header_size   = digest_offset + Digest{}.size();
 // Corrupt lengths must not cause unbounded allocation. Larger kernels still
 // compile and remain reusable in memory; only their persistence is skipped.
 constexpr uint64_t max_cubin_bytes = 256ULL * 1024 * 1024;
+// Retention policy from #2088, applied to input-environment namespaces.
+constexpr std::size_t kept_environments = 4;
+constexpr auto environment_grace        = std::chrono::hours(1);
 
 class Descriptor {
  public:
@@ -75,16 +80,23 @@ bool write_all(int fd, const char* bytes, std::size_t count)
   return true;
 }
 
-template <class Visit>
-void visit_directory(const std::filesystem::path& path, Visit visit)
+bool is_directory_no_follow(const std::filesystem::path& path)
 {
   std::error_code error;
-  if (!std::filesystem::is_directory(std::filesystem::symlink_status(path, error))) return;
+  return std::filesystem::is_directory(std::filesystem::symlink_status(path, error));
+}
+
+template <class Visit>
+bool visit_directory(const std::filesystem::path& path, Visit visit)
+{
+  if (!is_directory_no_follow(path)) return false;
+  std::error_code error;
   std::filesystem::directory_iterator current(path, error), end;
   while (!error && current != end) {
     visit(*current);
     current.increment(error);
   }
+  return !error;
 }
 
 bool is_regular(const std::filesystem::directory_entry& entry)
@@ -97,6 +109,36 @@ void remove_entry(const std::filesystem::path& path)
 {
   std::error_code error;
   std::filesystem::remove(path, error);  // Directories are removed only if empty.
+}
+
+bool is_environment(const std::filesystem::directory_entry& entry)
+{
+  if (!is_directory_no_follow(entry.path())) return false;
+  const auto name = entry.path().filename().string();
+  return name.size() == Digest{}.size() * 2 &&
+         std::all_of(name.begin(), name.end(), [](char value) {
+           return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+         });
+}
+
+void clear_legacy_files(const std::filesystem::path& root)
+{
+  const std::regex legacy("[0-9a-f]{16}_a[0-9]+_c[0-9]+_d[0-9]+\\.cubin(\\.tmp\\.[0-9]+)?");
+  visit_directory(root, [&](const auto& entry) {
+    if (is_regular(entry) && std::regex_match(entry.path().filename().string(), legacy))
+      remove_entry(entry.path());
+  });
+}
+
+void clear_environment(const std::filesystem::path& path)
+{
+  const auto hex = "[0-9a-f]{" + std::to_string(Digest{}.size() * 2) + "}";
+  const std::regex request(hex + "\\.cubin(\\.tmp\\.[A-Za-z0-9]{6})?");
+  visit_directory(path, [&](const auto& file) {
+    if (is_regular(file) && std::regex_match(file.path().filename().string(), request))
+      remove_entry(file.path());
+  });
+  if (is_directory_no_follow(path)) remove_entry(path);
 }
 
 }  // namespace
@@ -166,34 +208,59 @@ void write_cubin_file_atomic(const std::string& path, const std::vector<char>& b
   }
 }
 
+void prune_disk_cache(const std::string& root, const Digest& current_environment) noexcept
+{
+  if (root.empty()) return;
+  try {
+    namespace fs        = std::filesystem;
+    const fs::path base = root;
+    const auto spaces   = base / "v2";
+    const auto current  = spaces / hex_digest(current_environment);
+    std::error_code error;
+    // Check each level separately so a root, v2, or environment symlink is
+    // neither traversed nor touched by automatic maintenance.
+    for (const auto& directory : {base, spaces, current}) {
+      fs::create_directories(directory, error);
+      if (error || !is_directory_no_follow(directory)) return;
+    }
+    const auto now = fs::file_time_type::clock::now();
+    fs::last_write_time(current, now, error);
+    if (error) return;
+    clear_legacy_files(base);
+
+    std::vector<std::pair<fs::file_time_type, fs::path>> others;
+    if (!visit_directory(spaces, [&](const auto& entry) {
+          if (entry.path() == current || !is_environment(entry)) return;
+          const auto modified = entry.last_write_time(error);
+          if (!error) others.emplace_back(modified, entry.path());
+        }))
+      return;
+    std::sort(others.begin(), others.end(), std::greater<>{});
+    const auto cutoff = now - environment_grace;
+    for (std::size_t index = kept_environments - 1; index < others.size(); ++index) {
+      const auto& [modified, path] = others[index];
+      if (modified >= cutoff || !is_directory_no_follow(path)) continue;
+      // Another process may have started using this environment during the
+      // scan. Recheck its timestamp, without claiming a lease or a strict cap.
+      const auto latest = fs::last_write_time(path, error);
+      if (!error && latest < cutoff) clear_environment(path);
+    }
+  } catch (...) {
+    // Retention must never prevent cache lookup, compilation or publication.
+  }
+}
+
 void clear_disk_cache(const std::string& root) noexcept
 {
   if (root.empty()) return;
   try {
-    const std::regex legacy("[0-9a-f]{16}_a[0-9]+_c[0-9]+_d[0-9]+\\.cubin(\\.tmp\\.[0-9]+)?");
-    const auto hex = "[0-9a-f]{" + std::to_string(Digest{}.size() * 2) + "}";
-    const std::regex environment(hex);
-    const std::regex request(hex + "\\.cubin(\\.tmp\\.[A-Za-z0-9]{6})?");
-    visit_directory(root, [&](const auto& entry) {
-      const auto name = entry.path().filename().string();
-      if (is_regular(entry) && std::regex_match(name, legacy)) {
-        remove_entry(entry.path());
-      } else if (name == "v2") {
-        visit_directory(entry.path(), [&](const auto& space) {
-          if (!std::regex_match(space.path().filename().string(), environment)) return;
-          // Check the directory separately: never unlink or traverse a symlink.
-          std::error_code error;
-          if (!std::filesystem::is_directory(space.symlink_status(error))) return;
-          visit_directory(space.path(), [&](const auto& file) {
-            if (is_regular(file) && std::regex_match(file.path().filename().string(), request))
-              remove_entry(file.path());
-          });
-          remove_entry(space.path());
-        });
-        std::error_code error;
-        if (std::filesystem::is_directory(entry.symlink_status(error))) remove_entry(entry.path());
-      }
+    if (!is_directory_no_follow(root)) return;
+    clear_legacy_files(root);
+    const auto spaces = std::filesystem::path(root) / "v2";
+    visit_directory(spaces, [&](const auto& entry) {
+      if (is_environment(entry)) clear_environment(entry.path());
     });
+    if (is_directory_no_follow(spaces)) remove_entry(spaces);
   } catch (...) {
     // An unavailable root or individual entry is not fatal.
   }

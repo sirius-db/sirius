@@ -20,7 +20,8 @@ namespace codegen::jit {
 //
 // clear_jit_disk_cache() removes recognized legacy/v2 records and abandoned
 // temporaries (best-effort, without following symlinks). Stop writers first.
-// No automatic eviction: other-build namespaces persist until explicit cleanup.
+// First disk use also prunes old environments: keep current + three newest
+// others and a one-hour grace period. This is best effort, not an activity lease.
 void clear_jit_disk_cache();
 
 class KernelCache {

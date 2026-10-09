@@ -10,6 +10,7 @@
 #include <atomic>
 #include <barrier>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -320,6 +321,144 @@ void cleanup(const fs::path& root)
   cache::clear_disk_cache((root / "missing").string());
 }
 
+fs::path seed_environment(const fs::path& root, std::string_view label, fs::file_time_type modified)
+{
+  const auto path = root / "v2" / cache::hex_digest(cache::content_identity(label));
+  touch(path / (std::string(hex_size, 'b') + ".cubin"));
+  fs::last_write_time(path, modified);
+  return path;
+}
+
+void pruning(const fs::path& root)
+{
+  using namespace std::chrono;
+  const auto location = root / "pruning";
+  const auto now      = fs::file_time_type::clock::now();
+  const auto current  = seed_environment(location, "current", now - hours(24));
+  const auto request  = std::string(hex_size, 'b') + ".cubin";
+  std::vector<fs::path> others;
+  for (int index = 0; index < 5; ++index)
+    others.push_back(
+      seed_environment(location, "other-" + std::to_string(index), now - hours(2 + index)));
+
+  // Even stale recognized environments retain unknown files, nested content,
+  // and symlinks. Such leftovers can prevent removing their directory.
+  const auto preserved = others.back();
+  const auto outside   = root / "prune-outside";
+  touch(outside / request);
+  touch(preserved / "keep.txt");
+  touch(preserved / "nested" / request);
+  touch(preserved / (request + ".tmp.Abc123"));
+  fs::create_symlink(outside / request, preserved / (std::string(hex_size, 'd') + ".cubin"));
+  fs::create_directory_symlink(outside, location / "v2" / std::string(hex_size, 'c'));
+  touch(location / "v2" / "unknown-namespace" / request);
+  touch(location / "v3" / std::string(hex_size, 'e') / request);
+  touch(location / "unrelated.cubin");
+  const auto legacy = location / "0123456789abcdef_a120_c13030_d13030.cubin";
+  touch(legacy);
+  touch(legacy.string() + ".tmp.123");
+  const auto legacy_link = location / "0123456789abcdef_a121_c13030_d13030.cubin";
+  fs::create_symlink(outside / request, legacy_link);
+  fs::last_write_time(preserved, now - hours(6));
+
+  cache::prune_disk_cache(location.string(), cache::content_identity("current"));
+  require(fs::exists(current / request), "pruned the current environment");
+  require(fs::last_write_time(current) >= now, "first use did not refresh the current environment");
+  for (std::size_t index = 0; index < others.size(); ++index)
+    require(fs::exists(others[index] / request) == (index < 3), "incorrect environment retention");
+  require(!fs::exists(others[3]), "empty stale environment directory retained");
+  require(!fs::exists(preserved / (request + ".tmp.Abc123")), "stale temporary retained");
+  require(!fs::exists(legacy) && !fs::exists(legacy.string() + ".tmp.123"),
+          "automatic maintenance retained legacy records");
+  for (const auto& path : {preserved / "keep.txt",
+                           preserved / "nested" / request,
+                           outside / request,
+                           location / "v2" / "unknown-namespace" / request,
+                           location / "v3" / std::string(hex_size, 'e') / request,
+                           location / "unrelated.cubin"})
+    require(fs::exists(path), "automatic pruning removed unrelated content");
+  for (const auto& path : {legacy_link,
+                           location / "v2" / std::string(hex_size, 'c'),
+                           preserved / (std::string(hex_size, 'd') + ".cubin")})
+    require(fs::is_symlink(path), "automatic pruning removed a symlink");
+
+  // Grace extends retention past four directories, including future timestamps.
+  const auto grace_root = root / "grace";
+  std::vector<fs::path> recent;
+  for (const int age : {-60, 5, 10, 15, 59, 61})
+    recent.push_back(seed_environment(grace_root, std::to_string(age), now - minutes(age)));
+  cache::prune_disk_cache(grace_root.string(), cache::content_identity("current"));
+  for (std::size_t index = 0; index < recent.size(); ++index)
+    require(fs::exists(recent[index] / request) == (index < recent.size() - 1),
+            "one-hour grace or future timestamp not respected");
+
+  // Configured paths are also checked without following their final symlinks.
+  fs::last_write_time(outside, now - hours(24));
+  const auto outside_time = fs::last_write_time(outside);
+  const auto root_link    = root / "root-link";
+  fs::create_directory_symlink(outside, root_link);
+  fs::create_directories(root / "version-link");
+  fs::create_directory_symlink(outside, root / "version-link" / "v2");
+  fs::create_directories(root / "current-link" / "v2");
+  fs::create_directory_symlink(
+    outside, root / "current-link" / "v2" / cache::hex_digest(cache::content_identity("current")));
+  for (const auto& path : {root_link, root / "version-link", root / "current-link"})
+    cache::prune_disk_cache(path.string(), cache::content_identity("current"));
+  require(fs::last_write_time(outside) == outside_time, "maintenance touched a symlink target");
+  require(std::distance(fs::directory_iterator(outside), fs::directory_iterator{}) == 1,
+          "maintenance created content through a symlink");
+  touch(root / "prune-not-a-directory");
+  cache::prune_disk_cache((root / "prune-not-a-directory").string(), cache::Digest{});
+  require(fs::is_regular_file(root / "prune-not-a-directory"), "modified unusable cache root");
+  cache::prune_disk_cache("", cache::Digest{});
+}
+
+void concurrent_pruning(const fs::path& root)
+{
+  const auto location = root / "concurrent-pruning";
+  const auto now      = fs::file_time_type::clock::now();
+  const auto old      = seed_environment(location, "old", now - std::chrono::hours(24));
+  const auto path     = (old / (std::string(hex_size, 'b') + ".cubin")).string();
+  for (int index = 0; index < 3; ++index)
+    seed_environment(location, std::to_string(index), now - std::chrono::hours(2 + index));
+  cache::write_cubin_file_atomic(path, std::vector<char>(65536, 'a'));
+  std::barrier start(3);
+  std::atomic<int> remaining{2};
+  std::atomic<bool> bad{false};
+  std::thread writer([&] {
+    start.arrive_and_wait();
+    for (int index = 0; index < 100; ++index)
+      cache::write_cubin_file_atomic(path, std::vector<char>(65536, 'a' + index % 2));
+    --remaining;
+  });
+  std::thread pruner([&] {
+    start.arrive_and_wait();
+    for (int index = 0; index < 100; ++index) {
+      // Force eligibility to exercise pruning even as publication refreshes
+      // directory mtime. A miss/failed publication is allowed; a partial hit is not.
+      std::error_code error;
+      fs::last_write_time(old, now - std::chrono::hours(24), error);
+      cache::prune_disk_cache(location.string(), cache::content_identity("current"));
+    }
+    --remaining;
+  });
+  start.arrive_and_wait();
+  while (remaining) {
+    std::vector<char> bytes;
+    if (cache::read_cubin_file(path, bytes) &&
+        (bytes.size() != 65536 || !std::all_of(bytes.begin(), bytes.end(), [&](char value) {
+           return value == bytes.front();
+         })))
+      bad = true;
+  }
+  writer.join();
+  pruner.join();
+  require(!bad, "concurrent pruning exposed a partial/mixed record");
+  const std::vector<char> repaired(65536, 'z');
+  cache::write_cubin_file_atomic(path, repaired);
+  require(read(path) == repaired, "publication did not recover after pruning");
+}
+
 int main()
 {
   try {
@@ -328,7 +467,9 @@ int main()
     concurrent_writers(root.path);
     environment_namespaces(root.path);
     cleanup(root.path);
-    std::puts("disk cache: publication, faults, concurrency, cleanup passed");
+    pruning(root.path);
+    concurrent_pruning(root.path);
+    std::puts("disk cache: publication, faults, concurrency, cleanup, pruning passed");
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());

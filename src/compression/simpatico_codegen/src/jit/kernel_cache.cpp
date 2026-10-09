@@ -103,6 +103,13 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
     // Do not swallow an NVRTC version error in the storage-miss fallback.
     const detail::CompilationIdentity identity{detail::cache_environment(), key};
     try {
+      // One best-effort maintenance pass per process, including first-use disk
+      // hits. The static initializer serializes concurrent cold callers.
+      static const bool maintained = [&] {
+        detail::prune_disk_cache(*cdir, identity.environment);
+        return true;
+      }();
+      (void)maintained;
       path = *cdir + "/" + identity.relative_path();
       std::vector<char> bytes;
       if (detail::read_cubin_file(path, bytes)) {

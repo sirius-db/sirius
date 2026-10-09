@@ -130,8 +130,7 @@ The payload checksum does not bind a record to its request/environment filename:
 moving a complete valid record to another request path still passes validation.
 There is no record-binding or authentication guarantee.
 
-There is no automatic eviction, startup cleanup, or retention bound. With all
-writers stopped, `clear_jit_disk_cache()` best-effort removes these regular files
+Automatic retention and explicit cleanup recognize only these regular files
 under the configured root:
 
 - Legacy `<16 lowercase hex>_a<digits>_c<digits>_d<digits>.cubin`, and their
@@ -139,16 +138,39 @@ under the configured root:
 - `v2/<32 lowercase hex>/<32 lowercase hex>.cubin`, and their
   `.tmp.<six alphanumeric characters>` remnants.
 
-It prunes empty recognized directories but never removes the configured root,
-follows symlinks, traverses arbitrary nested directories, or removes unknown
-versions/unrelated names. Explicit cleanup removes other environments' recognized
-entries too; ordinary cache use never does. Cleanup is not a concurrent maintenance
-or security boundary against a process actively replacing directories.
+Both prune empty recognized directories but never remove the configured root,
+follow symlinks, traverse arbitrary nested directories, or remove unknown
+versions/unrelated names. Maintenance assumes a trusted directory, not a security
+boundary against a process actively replacing directories.
+
+Automatic pruning runs once per process on first disk-cache use, including a
+first-use disk hit. It creates/touches the current environment directory, removes
+recognized legacy flat files, and keeps the current environment plus the three
+newest other environments by directory modification time. Other environments
+also survive while their timestamp is within one hour (or in the future). Only
+older environments beyond that retained set have their recognized entries removed.
+A candidate's timestamp is checked again before deletion. Failures are best effort
+and do not prevent compilation or disk reuse. Disabled caching performs no scan.
+
+This is not a live-process lease or a strict directory/byte cap. Memory hits and
+later disk hits do not refresh timestamps or rerun pruning; publication normally
+updates directory timestamps through file creation/rename. A long-running older
+process can lose disk reuse or a pending publication if another process prunes its
+environment. Such races are misses or skipped writes, not partial cache records;
+already-loaded kernels remain usable. Grace periods and unrelated files can keep
+more than four directories, and there is no per-environment size bound.
+
+With writers stopped, `clear_jit_disk_cache()` explicitly removes recognized
+entries across all environments, including the current one, regardless of age.
+It does not query NVRTC and can also remove abandoned temporary files left after
+automatic maintenance. Unlike automatic retention, this is a quiescent operation.
 
 The host storage suite links the same implementation as production. Linker-level
 syscall fault injection tests partial/zero/interrupted writes, close and rename
 failures without adding production test hooks. Threads and child processes stress
-same-key publication; cleanup tests operate only in owned temporary directories.
+same-key publication. Pruning tests cover retention/grace, future timestamps,
+unrelated files/symlinks, and concurrent publication/read/prune races. All
+maintenance tests operate only in owned temporary directories.
 
 ## Coverage
 
@@ -176,5 +198,7 @@ or builtins-loading probe.
 The storage suite also uses real `CompilationIdentity` paths for changed project
 headers, CCCL headers and both NVRTC version components. It checks record isolation
 and narrow explicit cleanup across those environments. The fresh-process tests
-verify that ordinary reuse retains other environments and that explicit cleanup
-does not need a successful NVRTC version query.
+verify pruning on a first-use disk hit, current-directory refresh, one-time
+scheduling even after clearing memory, and safe reuse/recompilation in an older
+live process whose disk environment another process prunes. Explicit cleanup is
+also tested without a successful NVRTC version query.

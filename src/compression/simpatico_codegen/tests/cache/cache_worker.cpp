@@ -104,9 +104,20 @@ int main(int argc, char** argv)
     const auto& source = mode == "external" ? external_source : embedded_source;
     auto* first        = cache.get_or_compile_plain(source, "cache_test", options);
     const int value    = launch(first);
-    auto* second       = cache.get_or_compile_plain(source, "cache_test", options);
+    if (mode == "prune-once") {
+      // Let the process harness seed stale entries after first-use maintenance.
+      std::puts("READY first lookup");
+      std::fflush(stdout);
+      if (std::getchar() != '\n') throw std::runtime_error("missing test continuation");
+    }
+    auto* second = cache.get_or_compile_plain(source, "cache_test", options);
     if (launch(second) != value) throw std::runtime_error("second launch changed result");
     if (first != second || cache.size() != 1) throw std::runtime_error("unexpected memory reuse");
+    if (mode == "prune-once") {
+      cache.clear();
+      if (launch(cache.get_or_compile_plain(source, "cache_test", options)) != value)
+        throw std::runtime_error("post-maintenance disk lookup changed result");
+    }
     std::printf("RESULT value=%d\n", value);
     return 0;
   } catch (const jit::CompileError& error) {
