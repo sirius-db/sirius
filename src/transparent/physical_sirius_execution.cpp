@@ -136,6 +136,69 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
 {
 }
 
+PhysicalSiriusExecution& PhysicalSiriusExecution::make_cpu_only(
+  duckdb::PhysicalPlan& physical_plan,
+  std::string decline_reason,
+  std::string query_sql,
+  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<std::string> names,
+  duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
+  plan_source_policy source_policy)
+{
+  auto& op =
+    physical_plan.Make<PhysicalSiriusExecution>(nullptr,
+                                                candidate_origin::replan,
+                                                std::nullopt,
+                                                std::vector<sirius::op::scan::bound_read_view>{},
+                                                std::move(query_sql),
+                                                std::move(types),
+                                                std::move(names),
+                                                std::move(cpu_fallback_prepared),
+                                                std::move(source_policy),
+                                                0);
+  auto& root                    = op.Cast<PhysicalSiriusExecution>();
+  root.cpu_only_decline_reason_ = std::move(decline_reason);
+  return root;
+}
+
+void PhysicalSiriusExecution::execute_cpu_only(duckdb::ExecutionContext& context,
+                                               SiriusGlobalSourceState& state) const
+{
+  auto& client = context.client;
+  if (client.interrupted) { throw duckdb::InterruptException(); }
+  if (state.sirius_context && state.sirius_context->get_runtime_health() ==
+                                duckdb::SiriusContext::runtime_health::UNAVAILABLE) {
+    state.sirius_context->throw_runtime_unavailable();
+  }
+  auto const& reason = *cpu_only_decline_reason_;
+  // This root exists only because the plan reads Sirius-owned S3 (by bound
+  // source or by SQL text at prepare), so a false decision refuses outright —
+  // the retained policy may no longer show the scan once the optimizer folded
+  // it into metadata.
+  cpu_replay_decision const decision{duckdb::s3_cpu_fallback_enabled(client)};
+  if (!decision.s3_allowed) {
+    throw duckdb::ExecutorException(
+      "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, and "
+      "Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
+      reason);
+  }
+  if (!duckdb::duckdb_fallback_enabled(client)) {
+    throw duckdb::ExecutorException("GPU plan generation failed: " + reason);
+  }
+  try {
+    require_non_s3_cpu_replay(source_policy_, decision, reason);
+  } catch (std::runtime_error const& error) {
+    throw duckdb::ExecutorException(error.what());
+  }
+  SIRIUS_LOG_INFO(
+    "Transparent execution: GPU planning declined; running the CPU plan under "
+    "the S3 CPU fallback admission. Reason: {}",
+    reason);
+  if (state.sirius_context) { state.sirius_context->record_cpu_only_execution(); }
+  duckdb::SiriusContext::CpuFallbackGuard fallback_guard(client, decision);
+  state.result = run_cpu_fallback_plan(client, *cpu_fallback_prepared_, state.cpu_executor);
+}
+
 // ---------------------------------------------------------------------------
 // Source interface
 // ---------------------------------------------------------------------------
@@ -167,6 +230,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 {
   auto& state = input.global_state.Cast<SiriusGlobalSourceState>();
   if (state.finished) { return duckdb::SourceResultType::FINISHED; }
+
+  if (!state.result && cpu_only_decline_reason_) { execute_cpu_only(context, state); }
 
   // Lazy execution: run the GPU query on first GetData call.
   if (!state.result) {
@@ -409,15 +474,16 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       if (gpu_error.Type() == duckdb::ExceptionType::INTERRUPT) { gpu_error.Throw(); }
 
       // A pre-existing-unavailable error on an S3 query keeps its stable typed
-      // message — the S3 branch below must not rewrite it (S3 has no CPU
-      // fallback either way, so propagate as-is).
+      // message whatever the fallback setting says — the S3 branch below must
+      // not rewrite it.
       if (runtime_unavailable_error && (source_policy_.reads_sirius_owned_s3() ||
                                         sirius::references_sirius_owned_s3_parquet(query_sql_))) {
         gpu_error.Throw();
       }
 
+      cpu_replay_decision const decision{duckdb::s3_cpu_fallback_enabled(context.client)};
       try {
-        require_s3_cpu_replay(source_policy_, query_sql_, gpu_msg);
+        require_s3_cpu_replay(source_policy_, decision, query_sql_, gpu_msg);
       } catch (std::runtime_error const& error) {
         throw duckdb::ExecutorException(error.what());
       }
@@ -434,7 +500,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       }
 
       try {
-        require_non_s3_cpu_replay(source_policy_, gpu_msg);
+        require_non_s3_cpu_replay(source_policy_, decision, gpu_msg);
       } catch (std::runtime_error const& error) {
         throw duckdb::ExecutorException(error.what());
       }
@@ -478,10 +544,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         gpu_msg);
       if (state.sirius_context) { state.sirius_context->record_transparent_runtime_fallback(); }
 
-      // CpuFallbackGuard marks the replay so sirius_httpfs refuses to serve s3://
-      // reached indirectly (e.g. through a view) to the CPU plan. Binds to the
-      // TARGET executing connection's state.
-      duckdb::SiriusContext::CpuFallbackGuard fallback_guard(context.client);
+      // Binds to the TARGET executing connection's state.
+      duckdb::SiriusContext::CpuFallbackGuard fallback_guard(context.client, decision);
       state.result =
         run_cpu_fallback_plan(context.client, *cpu_fallback_prepared_, state.cpu_executor);
     }

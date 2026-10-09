@@ -29,10 +29,22 @@
 #include <stdexcept>
 
 namespace sirius::transparent {
+namespace {
+bool permits(scan_source_policy const& scan, cpu_replay_decision decision) noexcept
+{
+  return scan.permits_cpu_replay ||
+         (scan.source == byte_source_class::sirius_owned_s3 && decision.s3_allowed);
+}
+}  // namespace
+
 bool plan_source_policy::cpu_replay_permitted() const noexcept
 {
-  return discovery_complete && std::all_of(scans.begin(), scans.end(), [](auto const& scan) {
-           return scan.permits_cpu_replay;
+  return cpu_replay_permitted(cpu_replay_decision{});
+}
+bool plan_source_policy::cpu_replay_permitted(cpu_replay_decision decision) const noexcept
+{
+  return discovery_complete && std::all_of(scans.begin(), scans.end(), [&](auto const& scan) {
+           return permits(scan, decision);
          });
 }
 bool plan_source_policy::reads_sirius_owned_s3() const noexcept
@@ -41,10 +53,11 @@ bool plan_source_policy::reads_sirius_owned_s3() const noexcept
     return scan.source == byte_source_class::sirius_owned_s3;
   });
 }
-std::string plan_source_policy::reason() const
+std::string plan_source_policy::reason() const { return reason(cpu_replay_decision{}); }
+std::string plan_source_policy::reason(cpu_replay_decision decision) const
 {
   for (auto const& scan : scans) {
-    if (!scan.permits_cpu_replay) return scan.function_name + ": " + scan.reason;
+    if (!permits(scan, decision)) return scan.function_name + ": " + scan.reason;
   }
   return discovery_complete ? "" : "source discovery incomplete";
 }
@@ -155,6 +168,15 @@ void require_s3_cpu_replay(plan_source_policy const& policy,
                            std::string const& sql,
                            std::string const& gpu_error)
 {
+  require_s3_cpu_replay(policy, cpu_replay_decision{}, sql, gpu_error);
+}
+
+void require_s3_cpu_replay(plan_source_policy const& policy,
+                           cpu_replay_decision decision,
+                           std::string const& sql,
+                           std::string const& gpu_error)
+{
+  if (decision.s3_allowed) { return; }
   if (policy.reads_sirius_owned_s3() || sirius::references_sirius_owned_s3_parquet(sql)) {
     throw std::runtime_error(
       "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, and "
@@ -167,14 +189,29 @@ void require_cpu_replay(plan_source_policy const& policy,
                         std::string const& sql,
                         std::string const& gpu_error)
 {
-  require_s3_cpu_replay(policy, sql, gpu_error);
-  require_non_s3_cpu_replay(policy, gpu_error);
+  require_cpu_replay(policy, cpu_replay_decision{}, sql, gpu_error);
+}
+
+void require_cpu_replay(plan_source_policy const& policy,
+                        cpu_replay_decision decision,
+                        std::string const& sql,
+                        std::string const& gpu_error)
+{
+  require_s3_cpu_replay(policy, decision, sql, gpu_error);
+  require_non_s3_cpu_replay(policy, decision, gpu_error);
 }
 
 void require_non_s3_cpu_replay(plan_source_policy const& policy, std::string const& gpu_error)
 {
-  if (!policy.cpu_replay_permitted()) {
-    throw std::runtime_error("CPU fallback is not supported: " + policy.reason() +
+  require_non_s3_cpu_replay(policy, cpu_replay_decision{}, gpu_error);
+}
+
+void require_non_s3_cpu_replay(plan_source_policy const& policy,
+                               cpu_replay_decision decision,
+                               std::string const& gpu_error)
+{
+  if (!policy.cpu_replay_permitted(decision)) {
+    throw std::runtime_error("CPU fallback is not supported: " + policy.reason(decision) +
                              ". Underlying GPU error: " + gpu_error);
   }
 }

@@ -95,6 +95,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_required_null_scan.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
+    test/cpp/integration/test_query_log_redaction.cpp
     test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
@@ -311,6 +312,7 @@ set(TEST_SOURCES
     test/cpp/io/cache/test_cache_object_identity.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
+    test/cpp/integration/test_s3_cpu_fallback.cpp
     test/cpp/integration/test_s3_tpch.cpp)
 # cmake-format: on
 

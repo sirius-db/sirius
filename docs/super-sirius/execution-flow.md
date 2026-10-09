@@ -48,7 +48,7 @@ This path is still supported but is no longer the primary way to use Sirius.
 
 For transparent execution, DuckDB's executor calls `PhysicalSiriusExecution::GetData()` which lazily triggers the Sirius GPU engine on the first call. It creates a `sirius_interface`, wraps the Sirius physical plan in a `sirius_prepared_statement_data`, and calls `sirius_execute_query()`.
 
-If GPU execution fails at runtime (and `enable_duckdb_fallback` is true), the operator runs the stashed DuckDB CPU plan on a private `duckdb::Executor` bound to the same `ClientContext` — so the fallback executes under the same transaction and MVCC snapshot as the failed attempt, including that transaction's own uncommitted writes. The GPU result is fully materialized before any row is emitted, so the fallback cannot duplicate rows. S3-reading queries have no CPU path and surface a clear error instead of falling back. A `runtime_fallbacks` counter and a WARN log record each occurrence.
+If GPU execution fails at runtime (and `enable_duckdb_fallback` is true), the operator runs the stashed DuckDB CPU plan on a private `duckdb::Executor` bound to the same `ClientContext` — so the fallback executes under the same transaction and MVCC snapshot as the failed attempt, including that transaction's own uncommitted writes. The GPU result is fully materialized before any row is emitted, so the fallback cannot duplicate rows. S3-reading queries take this path only when `sirius_s3_cpu_fallback` is on (see [scan.md](scan.md)); otherwise they surface a clear error instead of falling back. A `runtime_fallbacks` counter and a WARN log record each occurrence.
 
 ## Step 3: Query Lifecycle Setup
 
@@ -192,7 +192,7 @@ If any task throws an exception during execution:
    - Restarts the task creator for the next query
 3. The error propagates through the future to the main thread, surfacing as an error-carrying result at `PhysicalSiriusExecution::GetData()`
 
-On the transparent path, that error triggers the runtime CPU fallback described in Step 2 (unless `enable_duckdb_fallback` is false, the error is a user interrupt, or the query reads S3). The fallback runs the stashed DuckDB CPU plan in the same transaction, so a runtime GPU failure completes on CPU rather than failing the query.
+On the transparent path, that error triggers the runtime CPU fallback described in Step 2 (unless `enable_duckdb_fallback` is false, the error is a user interrupt, or the query reads S3 with `sirius_s3_cpu_fallback` off). The fallback runs the stashed DuckDB CPU plan in the same transaction, so a runtime GPU failure completes on CPU rather than failing the query.
 
 ## Sequence Diagram
 
