@@ -2,9 +2,6 @@
 
 #include "compilation_request.hpp"
 
-#include <cuda.h>
-#include <cuda_runtime_api.h>
-
 #include <unistd.h>
 
 #include <atomic>
@@ -126,12 +123,12 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
   }
 
   // On-disk cache: a shape another process/run already compiled loads from its
-  // cubin (skips nvrtc). A corrupt or toolchain-incompatible file just fails
-  // the load and falls through to a fresh compile.
+  // cubin (skips nvrtc). A reported load error falls through to a fresh compile;
+  // raw cubins are not validated here before reaching the CUDA loader.
   const std::string& cdir = disk_cache_dir();
   std::string path;
-  if (!cdir.empty() && detail::cache_environment().persistent) {
-    const detail::CompilationIdentity identity{detail::cache_environment().identity, key};
+  if (!cdir.empty()) {
+    const detail::CompilationIdentity identity{detail::cache_environment(), key};
     path = cdir + "/" + identity.relative_path();
     std::vector<char> bytes;
     if (read_cubin_file(path, bytes)) {

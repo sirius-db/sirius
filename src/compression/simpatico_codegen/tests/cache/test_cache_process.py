@@ -95,7 +95,7 @@ class CacheProcesses(unittest.TestCase):
             re.search(r"^NVRTC (.+)$", result.stdout, re.MULTILINE).group(1)
         ).resolve()
 
-    def test_actual_shared_compiler_artifacts_and_relocated_prefix(self):
+    def test_same_version_compiler_bytes_and_relocated_prefix_reuse(self):
         path = self.compiler_path()
         if not path.name.startswith("libnvrtc.so"):
             self.skipTest(
@@ -122,11 +122,11 @@ class CacheProcesses(unittest.TestCase):
         )
         self.assertEqual(self.worker(), (1, 1, 0))
         self.assertEqual(self.worker(**settings), (0, 1, 1))
-        # An ELF trailer does not change execution, but changes the real compiler
-        # artifact. Keep its name/version unchanged to expose version-only keys.
+        # The chosen policy identifies NVRTC by major/minor, not artifact bytes.
+        # A harmless ELF trailer keeps the reported version and must retain reuse.
         with (relocated / path.name).open("ab") as output:
             output.write(b"\0")
-        self.assertEqual(self.worker(**settings), (1, 1, 0))
+        self.assertEqual(self.worker(**settings), (0, 1, 1))
         self.assertEqual(self.worker(**settings), (0, 1, 1))
         builtin = next(
             candidate
@@ -135,9 +135,47 @@ class CacheProcesses(unittest.TestCase):
         )
         with builtin.open("ab") as output:
             output.write(b"\0")
-        self.assertEqual(self.worker(**settings), (1, 1, 0))
+        self.assertEqual(self.worker(**settings), (0, 1, 1))
+        self.assertEqual(len(list(self.cache.glob("v2/*/*.cubin"))), 1)
+        self.assertEqual(self.worker(), (0, 1, 1))
+
+    def test_nvrtc_major_and_minor_invalidate_disk_reuse(self):
+        if "version" not in WORKERS:
+            self.skipTest("version injection requires the Linux linker wrapper")
+        self.assertEqual(self.worker(), (1, 1, 0))
+        self.assertEqual(self.worker("version"), (0, 1, 1))
+        for component in ("major", "minor"):
+            settings = {"SIMPATICO_TEST_NVRTC_VERSION": component}
+            self.assertEqual(self.worker("version", **settings), (1, 1, 0))
+            self.assertEqual(self.worker("version", **settings), (0, 1, 1))
         self.assertEqual(len(list(self.cache.glob("v2/*/*.cubin"))), 3)
         self.assertEqual(self.worker(), (0, 1, 1))
+
+    def test_version_query_error_is_reported_without_cache_publication(self):
+        if "version" not in WORKERS:
+            self.skipTest("version injection requires the Linux linker wrapper")
+        result = subprocess.run(
+            [WORKERS["version"], "embedded"],
+            env=self.environment | {"SIMPATICO_TEST_NVRTC_VERSION": "error"},
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("nvrtcVersion", result.stderr)
+        self.assertIn("NVRTC_ERROR_INTERNAL_ERROR", result.stderr)
+        self.assertIn("compiles=0 mem_hits=0 disk_hits=0", result.stderr)
+        self.assertFalse(self.cache.exists())
+        self.assertEqual(
+            self.worker(
+                "version",
+                SIMPATICO_JIT_CACHE_DIR="off",
+                SIMPATICO_TEST_NVRTC_VERSION="error",
+            ),
+            (1, 1, 0),
+        )
+        self.assertFalse(self.cache.exists())
 
     def test_untracked_cwd_headers_are_not_inputs(self):
         (self.root / "cache_fallback.cuh").write_text(
@@ -170,10 +208,13 @@ if __name__ == "__main__":
     parser.add_argument("--worker", required=True)
     parser.add_argument("--project-worker", required=True)
     parser.add_argument("--cccl-worker", required=True)
+    parser.add_argument("--version-worker")
     arguments, remaining = parser.parse_known_args()
     WORKERS = {
         "normal": str(Path(arguments.worker).resolve()),
         "project": str(Path(arguments.project_worker).resolve()),
         "cccl": str(Path(arguments.cccl_worker).resolve()),
     }
+    if arguments.version_worker:
+        WORKERS["version"] = str(Path(arguments.version_worker).resolve())
     unittest.main(argv=[__file__, *remaining])

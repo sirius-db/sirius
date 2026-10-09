@@ -29,11 +29,8 @@ struct CompilationRequest {
 
 CompiledKernel compile_request(const CompilationRequest& request);
 
-struct CacheEnvironment {
-  Digest identity{};
-  bool persistent = false;
-};
-
-const CacheEnvironment& cache_environment();
+// Fixed for this process: embedded header digests and NVRTC major/minor.
+// Throws on a failed version query; never silently identifies a version as 0.0.
+const Digest& cache_environment();
 
 }  // namespace codegen::jit::detail
