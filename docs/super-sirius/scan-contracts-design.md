@@ -83,6 +83,14 @@ Unbounded inputs, the statement deletion-vector limit, or insufficient host capa
 
 Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
 
+### Limits and diagnostics
+
+Preparation limits are internal C++ settings derived from the scan worker count. They bound active jobs, units, pending results, and coalescing work. By default, coordinator waits check interruption every 10 ms; draining an active read can take longer. Timed flushing of underfilled batches is disabled by default. These controls add no SQL, YAML, or environment configuration keys.
+
+Optional test observations record planning completion, first ready input, first publication, queue peaks, admission bytes and permits, and legacy/deferred route reasons. Datasource counters separate preparation reads from execution reads; Puffin counters include opens, requested and returned bytes, and failures.
+
+The hidden `[preparation_cost]` test accepts one SELECT through `SIRIUS_TEST_PREPARATION_COST_SQL_FILE`, checks results against CPU execution, and reports warm-query samples with observations enabled and disabled. `test/scripts/compare_query_cost.py` alternates baseline and candidate runs and reports median and P95 latency. `test/scripts/trace_query_io.py` saves file-read syscall evidence separately from timing runs. Missing observations are reported explicitly; datasource bytes and file syscalls are not a complete measure of physical storage traffic.
+
 ## Native checkpoint lease
 
 Native scans and pinning acquire a shared checkpoint lease before inspecting storage layouts. Stored ranges are revalidated before decoding. The lease lasts through cleanup; idle prepared statements hold none.
