@@ -219,11 +219,17 @@ compiler as version zero. Disk-disabled compilation and memory hits do not query
 Storage errors remain best-effort cache misses; they do not suppress a version-query error.
 Replacing the compiler or runtime while a process is running is not supported.
 
-Old flat cache entries are ignored and retained. Invalidation does not reclaim space; other
-builds' namespaces remain reusable. Retention is unbounded until an operator calls
-`codegen::jit::clear_jit_disk_cache()` with writers stopped. It removes recognized
-legacy/v2 records and abandoned cache temporaries only; unrelated files, unknown versions,
-and symlinks are preserved. No startup scan or automatic eviction runs.
+First disk use in each process touches the current environment, removes recognized legacy
+flat entries, and prunes old environments. Keep the current environment plus the three newest
+others, with a one-hour grace period for additional environments. Only recognized v2 records
+and cache temporaries are removed; unrelated files, nested content, unknown versions, and
+symlinks are preserved. Pruning is best effort, not a strict directory/byte cap or live-process
+lease: a long-running older process can lose disk reuse or a pending publication and recompile.
+Memory hits and later disk hits neither refresh timestamps nor rerun pruning.
+
+`codegen::jit::clear_jit_disk_cache()` remains explicit maintenance with writers stopped.
+It removes recognized legacy/v2 records and abandoned temporaries across all environments,
+including the current one, regardless of age. Already-loaded kernels are unaffected.
 
 Disk records carry a length and payload checksum, validated before CUDA loading.
 Publication uses an exclusively created, unique temporary file followed by rename.
