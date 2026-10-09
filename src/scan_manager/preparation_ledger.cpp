@@ -163,7 +163,8 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
   if (space.tier != cucascade::memory::Tier::HOST)
     throw std::invalid_argument("preparation requires HOST");
   try {
-    auto quantum = provider_.allocation_granularity(space);
+    auto quantum             = provider_.allocation_granularity(space);
+    d.allocation_granularity = quantum;
     for (auto const& scan : scans) {
       if (!scan.qualified) return d;
       d.sigma_retained = add(d.sigma_retained, round(scan.retained_descriptors, quantum));
@@ -177,6 +178,7 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
       }
     }
     auto requested = add(d.sigma_retained, d.w);
+    d.c_requested  = requested;
     state_         = std::make_shared<ledger_state>();
     if (requested) {
       auto grant = provider_.request(space, requested);

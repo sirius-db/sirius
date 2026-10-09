@@ -50,6 +50,7 @@ struct scan_envelope {
 struct admission_decision {
   bool deferred           = false;
   uint64_t sigma_retained = 0, w = 0, c_obtained = 0;
+  uint64_t allocation_granularity = 0, c_requested = 0;
   uint32_t n_permits            = 0;
   scan_eligibility route_reason = scan_eligibility::legacy_admission;
   admission_reason reason       = admission_reason::unqualified;

@@ -32,6 +32,9 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/string_util.hpp>
@@ -65,6 +68,7 @@
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -75,6 +79,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -98,22 +103,40 @@ struct scoped_sql_file_logs {
     manager.SetEnableStructuredLoggers(types);
   }
   ~scoped_sql_file_logs() { manager.SetConfig(*con.context->db, saved); }
-  sql_file_counts metadata_reads(std::string const& table)
+  std::map<std::string, sql_file_counts> file_reads(
+    std::string const& root, std::optional<std::array<int64_t, 3>> window = std::nullopt)
   {
     manager.Flush();
     duckdb::SiriusContext::InternalQueryGuard guard(*con.context);
-    auto prefix = duckdb::StringUtil::Replace(table + "/metadata/", "'", "''");
+    auto prefix = duckdb::StringUtil::Replace(root + "/", "'", "''");
+    auto filter = window ? " AND epoch_us(timestamp) >= " + std::to_string((*window)[0]) +
+                             " AND epoch_us(timestamp) < " + std::to_string((*window)[2])
+                         : "";
+    auto phase  = window ? "CASE WHEN epoch_us(timestamp) < " + std::to_string((*window)[1]) +
+                            " THEN 'planning' ELSE 'execution_window' END"
+                         : "'unobserved'";
     auto result = con.Query(
-      "SELECT count(*) FILTER (WHERE op='OPEN'), count(*) FILTER (WHERE op='READ'), "
+      "SELECT CASE WHEN grouping(phase)=1 THEN 'total' ELSE phase END, "
+      "count(*) FILTER (WHERE op='OPEN'), count(*) FILTER (WHERE op='READ'), "
       "coalesce(sum(bytes) FILTER (WHERE op='READ'), 0) "
-      "FROM duckdb_logs_parsed('FileSystem') WHERE starts_with(path, '" +
-      prefix + "')");
+      "FROM (SELECT op, bytes, " +
+      phase + " AS phase FROM duckdb_logs_parsed('FileSystem') WHERE starts_with(path, '" + prefix +
+      "')" + filter + ") GROUP BY GROUPING SETS ((phase), ())");
     REQUIRE(result);
     INFO((result->HasError() ? result->GetError() : ""));
     REQUIRE_FALSE(result->HasError());
-    return {result->GetValue(0, 0).GetValue<uint64_t>(),
-            result->GetValue(1, 0).GetValue<uint64_t>(),
-            result->GetValue(2, 0).GetValue<uint64_t>()};
+    std::map<std::string, sql_file_counts> counts{
+      {"total", {}}, {"planning", {}}, {"execution_window", {}}};
+    for (duckdb::idx_t row = 0; row < result->RowCount(); ++row)
+      counts[result->GetValue(0, row).GetValue<std::string>()] = {
+        result->GetValue(1, row).GetValue<uint64_t>(),
+        result->GetValue(2, row).GetValue<uint64_t>(),
+        result->GetValue(3, row).GetValue<uint64_t>()};
+    return counts;
+  }
+  sql_file_counts metadata_reads(std::string const& table)
+  {
+    return file_reads(table + "/metadata").at("total");
   }
   duckdb::Connection& con;
   duckdb::LogManager& manager;
@@ -137,18 +160,29 @@ struct preparation_measurement {
     this->counters->iceberg_preparation_route_for_testing = [this](auto id, bool route) {
       routes.emplace_back(id, route);
     };
-    this->counters->iceberg_statement_route_for_testing = [this](auto reason) {
-      statement_reasons.emplace_back(reason);
+    this->counters->iceberg_statement_route_for_testing = [this](auto reason,
+                                                                 auto const& decision) {
+      admissions.push_back({std::string(reason), decision});
     };
-    this->counters->scan_plan_complete_for_testing = [this] { plan_end = clock::now(); };
+    this->counters->scan_plan_complete_for_testing = [this] {
+      plan_end      = clock::now();
+      wall_plan_end = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    };
     this->counters->puffin_reads_for_testing = [this](auto const& path, bool charged, auto stats) {
       std::lock_guard lock(mutex);
       puffin.emplace_back(path, charged, stats);
     };
-    this->counters->parquet_datasource_for_testing = [this](auto const&, auto& datasource) {
-      datasource.read_statistics_for_testing(preparation, execution);
-      ++datasources;
-    };
+    this->counters->parquet_datasource_for_testing =
+      [this](auto const&, auto* datasource, bool in_plan) {
+        if (!datasource) {
+          ++(in_plan ? planning_opens : preparation_opens);
+          return;
+        }
+        datasource->read_statistics_for_testing(in_plan ? planning : preparation, execution);
+        ++datasources;
+      };
     this->counters->parquet_metadata_for_testing = [this](auto const&, bool hit) {
       if (hit)
         ++footer_hits;
@@ -199,14 +233,21 @@ struct preparation_measurement {
   std::shared_ptr<sirius::scan_manager::test::test_reservation_provider> provider =
     std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
   std::shared_ptr<read_statistics> preparation = std::make_shared<read_statistics>();
+  std::shared_ptr<read_statistics> planning    = std::make_shared<read_statistics>();
   std::shared_ptr<read_statistics> execution   = std::make_shared<read_statistics>();
   std::atomic<size_t> datasources{0}, footer_hits{0}, footer_misses{0};
+  std::atomic<size_t> planning_opens{0}, preparation_opens{0};
   std::mutex mutex;
   std::vector<std::tuple<std::string, bool, sirius::op::scan::puffin_read_statistics>> puffin;
   std::vector<std::pair<uint64_t, bool>> routes;
-  std::vector<std::string> statement_reasons;
+  struct admission_record {
+    std::string route_reason;
+    sirius::scan_manager::admission_decision decision;
+  };
+  std::vector<admission_record> admissions;
   std::set<uint64_t> previous_queries;
   std::optional<clock::time_point> plan_end, first_client_row, complete;
+  std::optional<int64_t> wall_plan_end;
 };
 }  // namespace
 
@@ -4087,8 +4128,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     CHECK(observed.fetch(*result) == expected);
     REQUIRE(observed.routes.size() == 1);
     CHECK(observed.routes.front().second == deferred);
-    REQUIRE(observed.statement_reasons.size() == 1);
-    CHECK(observed.statement_reasons.front() == (deferred ? "deferred" : "host_admission"));
+    REQUIRE(observed.admissions.size() == 1);
+    CHECK(observed.admissions.front().route_reason == (deferred ? "deferred" : "host_admission"));
     auto publication = observed.publication();
     REQUIRE(observed.plan_end);
     REQUIRE(publication.first_ready);
@@ -4157,6 +4198,65 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Production preparation admission reports its HOST grant and scan route",
+                 "[integration][scan_preparation][iceberg][prepared_admission]")
+{
+  auto scarce   = GENERATE(false, true);
+  auto context  = sirius::test::get_registered_sirius_context(*con);
+  auto counters = context->physical_counters();
+  REQUIRE_FALSE(counters->preparation_provider_for_testing);
+  auto spaces =
+    context->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(spaces.empty());
+  auto* space = context->get_memory_manager().get_memory_space(cucascade::memory::Tier::HOST,
+                                                               spaces.front()->get_id().device_id);
+  auto block  = space->get_memory_resource_of<cucascade::memory::Tier::HOST>()->get_block_size();
+  auto held   = scarce ? space->make_reservation_upto(space->get_max_memory())
+                       : space->make_reservation_or_null(4 * block);
+  REQUIRE(held);
+  REQUIRE(held->size() >= 4 * block);
+  if (!scarce) held.reset();
+  preparation_measurement observed(counters);
+  counters->iceberg_statement_route_for_testing =
+    [&, report = counters->iceberg_statement_route_for_testing](auto reason, auto const& decision) {
+      held.reset();  // Restrict admission, not the subsequent GPU execution.
+      report(reason, decision);
+    };
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT count(*) FROM " + pinned_scan(inventory_fixture("dv_bounded")));
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
+  CHECK(observed.fetch(*result) == std::vector<std::vector<std::string>>{{"3"}});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  require_route(before, after, gpu_route::gpu);
+  REQUIRE(observed.admissions.size() == 1);
+  auto const& record = observed.admissions.front();
+  auto const& d      = record.decision;
+  CHECK(record.route_reason == (scarce ? "host_admission" : "deferred"));
+  CHECK(d.deferred == !scarce);
+  CHECK(d.allocation_granularity == block);
+  CHECK(d.c_requested == 4 * block);
+  CHECK(d.c_requested == d.sigma_retained + d.w);
+  CHECK(d.c_requested % d.allocation_granularity == 0);
+  REQUIRE(observed.routes.size() == 1);
+  CHECK(observed.routes.front().second == !scarce);
+  CHECK(after.preparation_legacy_route - before.preparation_legacy_route == (scarce ? 1 : 0));
+  if (!scarce) {
+    CHECK(d.c_obtained == d.c_requested);
+    REQUIRE(d.w > 0);
+    CHECK(d.n_permits == (d.c_obtained - d.sigma_retained) / d.w);
+  } else {
+    CHECK(d.reason == sirius::scan_manager::admission_reason::no_grant);
+    CHECK(d.c_obtained == 0);
+    CHECK(d.n_permits == 0);
+  }
+  CHECK(observed.preparation_opens > 0);
+  CHECK(observed.datasources > 0);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "Warm fixed SQL cost and preparation observations",
                  "[.][integration][scan_preparation][preparation_cost]")
 {
@@ -4214,8 +4314,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     }
     std::unique_ptr<preparation_measurement> observed;
     if (observe) observed = std::make_unique<preparation_measurement>(counters);
-    auto sql_before = sql_logs ? sql_logs->metadata_reads(table) : sql_file_counts{};
-    auto before     = sirius::test::get_transparent_execution_stats(*con);
+    auto before = sirius::test::get_transparent_execution_stats(*con);
     rusage usage_begin{}, usage_end{};
     REQUIRE(getrusage(RUSAGE_SELF, &usage_begin) == 0);
     auto cpu_begin  = thread_cpu();
@@ -4259,6 +4358,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
           std::cout << "unobserved";
       };
       event("plan_end_us", observed->plan_end);
+      if (observed->wall_plan_end) std::cout << " wall_plan_end_us=" << *observed->wall_plan_end;
       event("first_ready_us", publication.first_ready);
       event("first_internal_publish_us", publication.first_publication);
       event("first_client_row_us", observed->first_client_row);
@@ -4267,8 +4367,17 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       for (auto const& [id, route] : observed->routes)
         deferred += route;
       std::cout << " deferred_scans=" << deferred << " statement_routes=";
-      for (auto const& reason : observed->statement_reasons)
-        std::cout << reason << ',';
+      for (auto const& record : observed->admissions)
+        std::cout << record.route_reason << ',';
+      for (auto const& [id, route] : observed->routes)
+        std::cout << " scan_route=" << id << ':' << (route ? "deferred" : "planning");
+      for (size_t i = 0; i < observed->admissions.size(); ++i) {
+        auto const& record = observed->admissions[i];
+        auto const& d      = record.decision;
+        std::cout << " admission=" << i << ':' << record.route_reason << ':'
+                  << d.allocation_granularity << ':' << d.sigma_retained << ':' << d.w << ':'
+                  << d.c_requested << ':' << d.c_obtained << ':' << d.n_permits;
+      }
       std::cout << " jobs_peak=" << publication.jobs_peak
                 << " results_peak=" << publication.results_peak
                 << " output_peak=" << publication.output_peak
@@ -4281,18 +4390,36 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
         std::cout << " puffin=" << (charged ? "preparation" : "planning") << ':' << stats.opens
                   << ':' << stats.requests << ':' << stats.bytes_requested << ':'
                   << stats.bytes_returned << ':' << stats.failures;
-      for (auto const& [phase, reads] : {std::pair{"preparation", observed->preparation},
+      std::cout << " datasource_planning_open_attempts=" << observed->planning_opens.load()
+                << " datasource_preparation_open_attempts=" << observed->preparation_opens.load();
+      for (auto const& [phase, reads] : {std::pair{"planning", observed->planning},
+                                         std::pair{"preparation", observed->preparation},
                                          std::pair{"execution", observed->execution}})
         std::cout << " datasource_" << phase << '=' << reads->requests.load() << ':'
                   << reads->bytes_requested.load() << ':' << reads->bytes_returned.load() << ':'
                   << reads->failures.load();
       if (sql_logs) {
-        auto sql_after = sql_logs->metadata_reads(table);
-        std::cout << " sql_metadata=" << sql_after.opens - sql_before.opens << ':'
-                  << sql_after.reads - sql_before.reads << ':'
-                  << sql_after.bytes - sql_before.bytes;
+        auto counts = sql_logs->file_reads(
+          table,
+          std::array<int64_t, 3>{
+            wall_begin, observed->wall_plan_end.value_or(wall_begin), wall_end});
+        auto const& total_counts = counts.at("total");
+        std::cout << " sql_files=" << total_counts.opens << ':' << total_counts.reads << ':'
+                  << total_counts.bytes;
+        if (observed->wall_plan_end) {
+          auto const& planning  = counts.at("planning");
+          auto const& execution = counts.at("execution_window");
+          CHECK(total_counts.opens == planning.opens + execution.opens);
+          CHECK(total_counts.reads == planning.reads + execution.reads);
+          CHECK(total_counts.bytes == planning.bytes + execution.bytes);
+          for (auto phase : {"planning", "execution_window"}) {
+            auto const& value = counts.at(phase);
+            std::cout << " sql_files_" << phase << '=' << value.opens << ':' << value.reads << ':'
+                      << value.bytes;
+          }
+        }
       } else
-        std::cout << " sql_metadata=unobserved";
+        std::cout << " sql_files=unobserved";
     } else
       std::cout << " deferred_scans=unobserved";
     std::cout << " backend_io=unobserved reservation_peak=unobserved\n";

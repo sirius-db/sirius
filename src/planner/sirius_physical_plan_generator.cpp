@@ -496,7 +496,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     }
   }
   if (counters->track_units && counters->iceberg_statement_route_for_testing)
-    counters->iceberg_statement_route_for_testing(route_reason);
+    counters->iceberg_statement_route_for_testing(route_reason, decision);
   for (auto const& c : scans) {
     if (!c.info->deferred)
       counters->preparation_legacy_route.fetch_add(1, std::memory_order_relaxed);

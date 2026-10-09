@@ -46,6 +46,8 @@ TEST_CASE("Admission uses the one actual grant and releases all unsuccessful gra
     CHECK(d.deferred);
     CHECK(d.sigma_retained == 20);
     CHECK(d.w == 32);
+    CHECK(d.allocation_granularity == 1);
+    CHECK(d.c_requested == 52);
     CHECK(d.c_obtained == 64);
     CHECK(d.n_permits == 1);
     CHECK(provider.outstanding() == 1);
@@ -89,6 +91,8 @@ TEST_CASE("Admission sums retained results across scans and accounts for allocat
     CHECK_FALSE(d.deferred);
     CHECK(d.sigma_retained == 32);
     CHECK(d.w == 48);
+    CHECK(d.allocation_granularity == 16);
+    CHECK(d.c_requested == 80);
   }
   CHECK(provider.outstanding() == 0);
 }
@@ -278,6 +282,10 @@ TEST_CASE("HOST adapter allocates real reserved blocks and returns them after th
     REQUIRE(d.deferred);
     CHECK(d.sigma_retained == 1024);
     CHECK(d.w == 3072);
+    CHECK(d.allocation_granularity == 1024);
+    CHECK(d.c_requested == 4096);
+    CHECK(d.c_obtained == 4096);
+    CHECK(d.n_permits == 1);
     CHECK(manager.get_active_reservation_count() == 1);
     ledger.register_unit({1, 1}, 20);
     auto permit = ledger.acquire_permit({1, 1});

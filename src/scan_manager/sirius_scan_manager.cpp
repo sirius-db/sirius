@@ -1406,11 +1406,17 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   auto const hint =
     footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
 
+  if (_physical_counters && _physical_counters->track_units &&
+      _physical_counters->parquet_datasource_for_testing)
+    _physical_counters->parquet_datasource_for_testing(uri, nullptr, true);
   auto datasource = create_datasource(uri, hint);
   if (!datasource) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
   }
+  if (_physical_counters && _physical_counters->track_units &&
+      _physical_counters->parquet_datasource_for_testing)
+    _physical_counters->parquet_datasource_for_testing(uri, datasource.get(), true);
 
   // Resolve through the shared path so describe_parquet publishes the same
   // complete footer evidence as scans and pinned parquet tables, including the

@@ -11,7 +11,8 @@ import re
 import subprocess
 
 
-READ = re.compile(r"(read|pread64)\(\d+<([^>]+)>, .*, (\d+)(?:, -?\d+)?\)$")
+READ = re.compile(r"(read)\(\d+<([^>]+)>, .*, (\d+)\)$")
+PREAD = re.compile(r"(pread64)\(\d+<([^>]+)>, .*, (\d+), -?\d+\)$")
 OPEN = re.compile(r'openat\(([^,]+), "([^"\\]*)", .*\)$')
 LINE = re.compile(r"(\d+\.\d+) (.*) = (-?\d+)(.*?) <([\d.]+)>$")
 
@@ -44,7 +45,7 @@ def parse_call(line):
         return None
     timestamp, call, returned, tail, duration = match.groups()
     returned = int(returned)
-    read = READ.fullmatch(call)
+    read = READ.fullmatch(call) or PREAD.fullmatch(call)
     opened = OPEN.fullmatch(call)
     if read:
         name, path, requested = read.groups()
@@ -77,17 +78,63 @@ def parse_call(line):
     }
 
 
+def query_windows(log):
+    windows = []
+    for line in log.splitlines():
+        if "PREPARATION_COST_SAMPLE " not in line:
+            continue
+        fields = dict(
+            token.split("=", 1)
+            for token in line.split("PREPARATION_COST_SAMPLE ", 1)[1].split()
+        )
+        start, end = int(fields["wall_begin_us"]), int(fields["wall_end_us"])
+        plan = fields.get("wall_plan_end_us", "unobserved")
+        plan = None if plan == "unobserved" else int(plan)
+        if end < start or (plan is not None and not start <= plan <= end):
+            raise ValueError("invalid query phase timestamps")
+        windows.append((start, end, plan, fields["observations"], fields["sample"]))
+    return windows
+
+
+def attribute_call(call, windows):
+    matches = [
+        w for w in windows if w[0] <= call["start_us"] and call["end_us"] <= w[1]
+    ]
+    if len(matches) != 1:
+        return {
+            "sample": "unobserved",
+            "observations": "unobserved",
+            "phase": "unobserved",
+        }
+    start, end, plan, mode, sample = matches[0]
+    phase = "unobserved"
+    if plan is not None:
+        phase = (
+            "planning"
+            if call["end_us"] <= plan
+            else "execution_window" if call["start_us"] >= plan else "cross_boundary"
+        )
+    return {"sample": sample, "observations": mode, "phase": phase}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--path-prefix", action="append", required=True)
     parser.add_argument(
+        "--reparse", type=Path, help="existing trace directory; do not run a command"
+    )
+    parser.add_argument(
         "command", nargs=argparse.REMAINDER, help="-- command [arguments]"
     )
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    if not command or any(not prefix.startswith("/") for prefix in args.path_prefix):
-        parser.error("provide a command and absolute --path-prefix values")
+    if bool(command) == bool(args.reparse) or any(
+        not p.startswith("/") for p in args.path_prefix
+    ):
+        parser.error(
+            "provide either a command or --reparse, and absolute --path-prefix values"
+        )
     args.output.mkdir(parents=True, exist_ok=False)
     trace = ["strace", "-ff", "-ttt", "-T", "-yy", "-s", "0"] + [
         "-o",
@@ -95,12 +142,22 @@ def main():
         "-e",
         "trace=openat,read,pread64,readv,preadv,preadv2,mmap,io_uring_setup,io_uring_enter",
     ]
-    with (args.output / "run.log").open("w") as log:
-        result = subprocess.run(
-            trace + command, stdout=log, stderr=subprocess.STDOUT, check=False
-        )
+    source = args.reparse or args.output
+    returncode = None
+    if not args.reparse:
+        with (args.output / "run.log").open("w") as log:
+            result = subprocess.run(
+                trace + command, stdout=log, stderr=subprocess.STDOUT, check=False
+            )
+            returncode = result.returncode
+    elif (source / "summary.json").exists():
+        previous = json.loads((source / "summary.json").read_text())
+        returncode = previous.get("returncode")
+        command = previous.get("command", [])
+    windows = query_windows((source / "run.log").read_text())
     totals = Counter()
-    files = sorted(args.output.glob("trace.*"))
+    phases = {}
+    files = sorted(source.glob("trace.*"))
     if not files:
         raise RuntimeError(
             "no trace files; see run.log; missing evidence cannot be counted as zero"
@@ -108,7 +165,7 @@ def main():
     with (args.output / "calls.csv").open("w", newline="") as output:
         writer = csv.DictWriter(
             output,
-            fieldnames="pid start_us end_us call path requested_bytes returned_bytes status".split(),
+            fieldnames="pid sample observations phase start_us end_us call path requested_bytes returned_bytes status".split(),
         )
         writer.writeheader()
         for file in files:
@@ -132,24 +189,36 @@ def main():
                     ):
                         totals["outside_filter"] += 1
                         continue
-                    writer.writerow(dict(call, pid=file.suffix[1:]))
+                    attribution = attribute_call(call, windows)
+                    writer.writerow(dict(call, pid=file.suffix[1:], **attribution))
+                    key = ":".join(
+                        attribution[k] for k in ("observations", "sample", "phase")
+                    )
+                    phase = phases.setdefault(key, Counter())
+                    phase[call["call"]] += 1
+                    phase[call["status"]] += 1
+                    phase["requested_bytes"] += call["requested_bytes"]
+                    phase["returned_bytes"] += call["returned_bytes"]
                     totals[call["call"]] += 1
                     totals[call["status"]] += 1
                     totals["requested_bytes"] += call["requested_bytes"]
                     totals["returned_bytes"] += call["returned_bytes"]
     report = {
         "command": command,
-        "returncode": result.returncode,
+        "returncode": returncode,
+        "trace_source": str(source.resolve()),
         "path_prefixes": args.path_prefix,
         "file_syscalls": dict(totals),
         "backend_physical_io": "unobserved",
-        "phase_attribution": "unobserved",
+        "file_syscalls_by_sample_phase": phases,
+        "phase_attribution": "query windows; preparation/execution overlap is not separated",
+        "coverage": "openat/read/pread64 only; file syscalls are not storage-device reads",
     }
     (args.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
-    if result.returncode:
+    if returncode:
         raise SystemExit(
-            f"traced command failed ({result.returncode}); retain logs for diagnostics only"
+            f"traced command failed ({returncode}); retain logs for diagnostics only"
         )
 
 

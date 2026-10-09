@@ -49,7 +49,8 @@ class AttachedDatabase;
 }
 namespace sirius::scan_manager {
 class reservation_provider;
-}
+struct admission_decision;
+}  // namespace sirius::scan_manager
 namespace sirius::io {
 class sirius_datasource;
 }
@@ -224,9 +225,12 @@ struct physical_check_counters {
   std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
   std::function<void(std::string const&, bool, puffin_read_statistics const&)>
     puffin_reads_for_testing;
-  std::function<void(std::string const&, io::sirius_datasource&)> parquet_datasource_for_testing;
+  // Null datasource records the open attempt; non-null attaches logical-read counters.
+  std::function<void(std::string const&, io::sirius_datasource*, bool planning)>
+    parquet_datasource_for_testing;
   std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
-  std::function<void(std::string_view)> iceberg_statement_route_for_testing;
+  std::function<void(std::string_view, scan_manager::admission_decision const&)>
+    iceberg_statement_route_for_testing;
   std::function<void()> scan_plan_complete_for_testing;
   bool preparation_timing_for_testing = false;
   std::shared_ptr<scan_manager::reservation_provider> preparation_provider_for_testing;
