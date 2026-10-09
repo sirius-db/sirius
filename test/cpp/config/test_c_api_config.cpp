@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -125,7 +126,7 @@ TEST_CASE("C configuration returns categorized diagnostics", "[c_api_config][con
     expected = SIRIUS_INVALID_CONFIGURATION;
   }
   const auto path          = file.path.string();
-  auto* raw                = reinterpret_cast<sirius_context_config_builder*>(uintptr_t{1});
+  auto* raw                = reinterpret_cast<sirius_context_config_builder*>(std::uintptr_t{1});
   sirius_error* diagnostic = nullptr;
   auto status =
     sirius_context_config_builder_from_yaml(path.data(), path.size(), &raw, &diagnostic);
@@ -143,19 +144,19 @@ TEST_CASE("C configuration rejects invalid arguments and clears outputs", "[c_ap
   CHECK(sirius_context_config_builder_create(nullptr, nullptr) == SIRIUS_INVALID_ARGUMENT);
   CHECK(sirius_context_config_builder_from_yaml("", 0, nullptr, nullptr) ==
         SIRIUS_INVALID_ARGUMENT);
-  auto* builder = reinterpret_cast<sirius_context_config_builder*>(uintptr_t{1});
+  auto* builder = reinterpret_cast<sirius_context_config_builder*>(std::uintptr_t{1});
   CHECK(sirius_context_config_builder_from_yaml(nullptr, 0, &builder, nullptr) ==
         SIRIUS_INVALID_ARGUMENT);
   CHECK(builder == nullptr);
-  builder = reinterpret_cast<sirius_context_config_builder*>(uintptr_t{1});
+  builder = reinterpret_cast<sirius_context_config_builder*>(std::uintptr_t{1});
   CHECK(sirius_context_config_builder_from_yaml("a\0b", 3, &builder, nullptr) ==
         SIRIUS_INVALID_ARGUMENT);
   CHECK(builder == nullptr);
-  auto* config = reinterpret_cast<sirius_context_config*>(uintptr_t{1});
+  auto* config = reinterpret_cast<sirius_context_config*>(std::uintptr_t{1});
   CHECK(sirius_context_config_builder_build(nullptr, &config, nullptr) == SIRIUS_INVALID_ARGUMENT);
   CHECK(config == nullptr);
   CHECK(sirius_context_config_builder_build(nullptr, nullptr, nullptr) == SIRIUS_INVALID_ARGUMENT);
-  auto* error = reinterpret_cast<sirius_error*>(uintptr_t{1});
+  auto* error = reinterpret_cast<sirius_error*>(std::uintptr_t{1});
   REQUIRE(sirius_context_config_builder_create(&builder, &error) == SIRIUS_SUCCESS);
   builder_owner owner(builder, sirius_context_config_builder_release);
   CHECK(error == nullptr);
@@ -189,11 +190,11 @@ TEST_CASE("C configuration supports concurrent builds from immutable settings",
 TEST_CASE("C exception boundary preserves statuses without allocating diagnostics",
           "[c_api_config][config]")
 {
-  auto* error = reinterpret_cast<sirius_error*>(uintptr_t{1});
+  auto* error = reinterpret_cast<sirius_error*>(std::uintptr_t{1});
   CHECK(sirius::c_api::invoke(&error, []() -> sirius_status { throw std::bad_alloc{}; }) ==
         SIRIUS_ALLOCATION_FAILURE);
   CHECK(error == nullptr);
-  error = reinterpret_cast<sirius_error*>(uintptr_t{1});
+  error = reinterpret_cast<sirius_error*>(std::uintptr_t{1});
   CHECK(sirius::c_api::with_diagnostic(SIRIUS_CONFIGURATION_IO, &error, []() -> sirius_error* {
           throw std::bad_alloc{};
         }) == SIRIUS_CONFIGURATION_IO);
