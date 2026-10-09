@@ -12,22 +12,30 @@
 //! | `Alloc` | batch layout | `u64 token, i32 device, u32 n, n x (u64 addr, u64 len)` |
 //! | `Packed` | `u64 token, u64 rows, u32 n, n x (u32 len, utf-8 name)` | empty |
 //! | `Release` | `u64 token` | empty |
+//! | `Topology` | `i64 query hi, i64 query lo, i32 filter id` | see [`encode_topology`] |
+//! | `ShareAbandoned` | `i64 instance hi, i64 instance lo, i32 filter id` | empty |
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use starrocks_thrift::types::TNetworkAddress;
+
 use crate::fragment_executor::{FragmentExecutor, OutputDrain, SenderSlot};
 use crate::proto::starrocks::PTransmitChunkParams;
+use crate::result_store::FragmentInstanceId;
+use crate::runtime_filters::FilterTopology;
 
 const MAGIC: [u8; 4] = *b"SRNX";
 const MD: u8 = 1;
 const ALLOC: u8 = 2;
 const PACKED: u8 = 3;
 const RELEASE: u8 = 4;
+const TOPOLOGY: u8 = 5;
+const SHARE_ABANDONED: u8 = 6;
 
 /// Request attachment after `SRNX`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum NixlEnvelope {
+pub enum NixlEnvelope {
     /// The sender's agent metadata. The receiver replies with its own.
     Md(Vec<u8>),
     /// Allocate receive buffers for a batch with this layout.
@@ -41,6 +49,17 @@ pub(crate) enum NixlEnvelope {
     },
     /// Free a receive token that will never be announced.
     Release(u64),
+    /// Who probes a partitioned join's runtime filter, asked of its merge node.
+    Topology {
+        query: FragmentInstanceId,
+        filter_id: i32,
+    },
+    /// A holder of runtime filter `filter_id` won't send its share to scan `instance`, which
+    /// stops waiting and runs unfiltered.
+    ShareAbandoned {
+        instance: FragmentInstanceId,
+        filter_id: i32,
+    },
 }
 
 impl NixlEnvelope {
@@ -68,6 +87,24 @@ impl NixlEnvelope {
             Self::Release(token) => {
                 out.push(RELEASE);
                 out.extend_from_slice(&token.to_le_bytes());
+            }
+            Self::Topology {
+                query: id,
+                filter_id,
+            }
+            | Self::ShareAbandoned {
+                instance: id,
+                filter_id,
+            } => {
+                out.push(if matches!(self, Self::Topology { .. }) {
+                    TOPOLOGY
+                } else {
+                    SHARE_ABANDONED
+                });
+                let id = id.to_proto();
+                out.extend_from_slice(&id.hi.to_le_bytes());
+                out.extend_from_slice(&id.lo.to_le_bytes());
+                out.extend_from_slice(&filter_id.to_le_bytes());
             }
         }
         out
@@ -100,6 +137,17 @@ impl NixlEnvelope {
                 Self::Packed { token, rows, names }
             }
             RELEASE => Self::Release(reader.u64()?),
+            TOPOLOGY => Self::Topology {
+                query: FragmentInstanceId::from_halves(reader.u64()? as i64, reader.u64()? as i64),
+                filter_id: reader.u32()? as i32,
+            },
+            SHARE_ABANDONED => Self::ShareAbandoned {
+                instance: FragmentInstanceId::from_halves(
+                    reader.u64()? as i64,
+                    reader.u64()? as i64,
+                ),
+                filter_id: reader.u32()? as i32,
+            },
             kind => return Err(format!("unknown SRNX kind {kind}")),
         };
         reader.finish()?;
@@ -151,6 +199,49 @@ impl AllocReply {
             buffers,
         })
     }
+}
+
+/// The `Topology` reply: `u8 known`; when known, `u32 shares, u32 n`, then per prober
+/// `i64 instance hi, i64 instance lo, i32 port, u32 len, utf-8 host`.
+pub(crate) fn encode_topology(topology: Option<&FilterTopology>) -> Vec<u8> {
+    let Some(topology) = topology else {
+        return vec![0];
+    };
+    let mut out = vec![1];
+    out.extend_from_slice(&(topology.shares as u32).to_le_bytes());
+    out.extend_from_slice(&(topology.probers.len() as u32).to_le_bytes());
+    for (instance, address) in &topology.probers {
+        let instance = instance.to_proto();
+        out.extend_from_slice(&instance.hi.to_le_bytes());
+        out.extend_from_slice(&instance.lo.to_le_bytes());
+        out.extend_from_slice(&address.port.to_le_bytes());
+        out.extend_from_slice(&(address.hostname.len() as u32).to_le_bytes());
+        out.extend_from_slice(address.hostname.as_bytes());
+    }
+    out
+}
+
+pub(crate) fn decode_topology(bytes: &[u8]) -> Result<Option<FilterTopology>, String> {
+    let mut reader = Reader(bytes);
+    if reader.take(1)?[0] == 0 {
+        reader.finish()?;
+        return Ok(None);
+    }
+    let shares = reader.u32()? as usize;
+    let count = reader.u32()?;
+    let probers = (0..count)
+        .map(|_| {
+            let instance =
+                FragmentInstanceId::from_halves(reader.u64()? as i64, reader.u64()? as i64);
+            let port = reader.u32()? as i32;
+            let len = reader.u32()? as usize;
+            let host = String::from_utf8(reader.take(len)?.to_vec())
+                .map_err(|err| format!("SRNX Topology host is not utf-8: {err}"))?;
+            Ok((instance, TNetworkAddress::new(host, port)))
+        })
+        .collect::<Result<_, String>>()?;
+    reader.finish()?;
+    Ok(Some(FilterTopology { shares, probers }))
 }
 
 /// Little-endian cursor over an SRNX body.
@@ -220,6 +311,9 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
     /// serving all hops at once, then sends each EOS. Returns once every drain ended, or on the
     /// first error, after which no hop sends its EOS.
     fn stream(&self, hops: Vec<StreamHop>) -> Result<(), String>;
+
+    /// Sends `peer` a control message (`Topology`, `ShareAbandoned`) and returns its reply.
+    fn control(&self, peer: SocketAddr, envelope: &NixlEnvelope) -> Result<Vec<u8>, String>;
 }
 
 /// One remote output streamed while its fragment runs.
@@ -293,6 +387,14 @@ mod tests {
                 names: vec!["eos".into()],
             },
             NixlEnvelope::Release(9),
+            NixlEnvelope::Topology {
+                query: FragmentInstanceId::from_halves(-3, 1 << 40),
+                filter_id: 7,
+            },
+            NixlEnvelope::ShareAbandoned {
+                instance: FragmentInstanceId::from_halves(4, -2),
+                filter_id: 3,
+            },
         ] {
             let encoded = envelope.encode();
             assert_eq!(&encoded[..4], b"SRNX");
@@ -335,6 +437,31 @@ mod tests {
         trailing.push(0);
         for bad in [&bytes[..bytes.len() - 1], trailing.as_slice(), &bytes[..12]] {
             assert!(AllocReply::decode(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_topology_reply_round_trips_and_rejects_trailing_bytes() {
+        let topology = FilterTopology {
+            shares: 4,
+            probers: vec![
+                (
+                    FragmentInstanceId::from_halves(5, -1),
+                    TNetworkAddress::new("127.0.0.1".to_string(), 9102),
+                ),
+                (
+                    FragmentInstanceId::from_halves(5, 2),
+                    TNetworkAddress::new("cn-3".to_string(), 9132),
+                ),
+            ],
+        };
+        let bytes = encode_topology(Some(&topology));
+        assert_eq!(decode_topology(&bytes).unwrap(), Some(topology));
+        assert_eq!(decode_topology(&encode_topology(None)).unwrap(), None);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        for bad in [&bytes[..bytes.len() - 1], trailing.as_slice(), &[][..]] {
+            assert!(decode_topology(bad).is_err(), "{bad:?}");
         }
     }
 

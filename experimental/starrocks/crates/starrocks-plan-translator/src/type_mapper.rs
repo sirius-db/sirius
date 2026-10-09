@@ -232,6 +232,32 @@ pub fn map_scalar_type(scalar: &TScalarType, nullable: bool) -> Result<Type> {
     Ok(Type { kind: Some(kind) })
 }
 
+/// The nullable Substrait integer type with DuckDB name `name`, the inverse of
+/// [`duckdb_type_name`] for integers.
+pub(crate) fn integer_type(name: &str) -> Option<Type> {
+    let nullability = nullability(true);
+    let kind = match name {
+        "TINYINT" => r#type::Kind::I8(r#type::I8 {
+            type_variation_reference: 0,
+            nullability,
+        }),
+        "SMALLINT" => r#type::Kind::I16(r#type::I16 {
+            type_variation_reference: 0,
+            nullability,
+        }),
+        "INTEGER" => r#type::Kind::I32(r#type::I32 {
+            type_variation_reference: 0,
+            nullability,
+        }),
+        "BIGINT" => r#type::Kind::I64(r#type::I64 {
+            type_variation_reference: 0,
+            nullability,
+        }),
+        _ => return None,
+    };
+    Some(Type { kind: Some(kind) })
+}
+
 /// Renders a Substrait type as the DuckDB type name the engine parses when a fragment declares
 /// an input stream's schema.
 pub fn duckdb_type_name(ty: &Type) -> Result<String> {

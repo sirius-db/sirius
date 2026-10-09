@@ -376,6 +376,42 @@ impl PlanTranslator {
     }
 }
 
+impl PlanTranslator {
+    /// The plan a partitioned join's instance runs to send its share of a runtime filter's keys,
+    /// read from the one-column key stream `stream`: its distinct non-null keys, named
+    /// [`runtime_filter::SHARE_KEYS`]; or, given `bounds`, only the keys equal to the smallest
+    /// and largest one, named [`runtime_filter::SHARE_BOUNDS`].
+    pub fn translate_filter_share(
+        &self,
+        stream: &StreamInputSchema,
+        bounds: Option<(i64, i64)>,
+    ) -> Result<TranslatedPlan> {
+        let mut registry = ExtensionRegistry::new();
+        let (rel, name) = node_translator::filter_share(stream, bounds, &mut registry)?;
+        let (extension_urns, extensions) = registry.into_extensions();
+        let output_names = vec![name];
+        Ok(TranslatedPlan {
+            plan: Plan {
+                version: Some(substrait::version::version_with_producer(
+                    self.producer.clone(),
+                )),
+                extension_urns,
+                extensions,
+                relations: vec![PlanRel {
+                    rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                        input: Some(rel),
+                        names: output_names.clone(),
+                    })),
+                }],
+                ..Default::default()
+            },
+            output_names,
+            output_partition_columns: None,
+            stream_inputs: vec![stream.clone()],
+        })
+    }
+}
+
 impl Default for PlanTranslator {
     /// Creates a translator with the default Sirius producer string.
     fn default() -> Self {

@@ -5463,13 +5463,51 @@ fn probing_scan_params() -> TExecPlanFragmentParams {
 fn key_stream(ty: &str) -> starrocks_plan_translator::runtime_filter::FilterInput {
     starrocks_plan_translator::runtime_filter::FilterInput {
         filter_id: 7,
-        node_id: 1_000_007,
-        stream_view: "sirius_stream_1000007".to_string(),
-        column: starrocks_plan_translator::StreamInputColumn {
-            name: "rf_key".to_string(),
-            ty: ty.to_string(),
+        keys: starrocks_plan_translator::runtime_filter::ProbeKeys::Stream {
+            node_id: 1_000_007,
+            stream_view: "sirius_stream_1000007".to_string(),
+            column: starrocks_plan_translator::StreamInputColumn {
+                name: "rf_key".to_string(),
+                ty: ty.to_string(),
+            },
         },
     }
+}
+
+fn key_range(min: i64, max: i64) -> starrocks_plan_translator::runtime_filter::FilterInput {
+    starrocks_plan_translator::runtime_filter::FilterInput {
+        filter_id: 7,
+        keys: starrocks_plan_translator::runtime_filter::ProbeKeys::Range { min, max },
+    }
+}
+
+/// The FE's merge node of the partitioned filters below.
+fn merge_node() -> starrocks_thrift::types::TNetworkAddress {
+    starrocks_thrift::types::TNetworkAddress::new("10.0.0.2".to_string(), 8060)
+}
+
+/// `runtime_filter`, from a partitioned join with `merge_node` and `instances` build instances.
+fn partitioned_filter(
+    filter_id: i32,
+    build_key: TExpr,
+    target: i32,
+    probe: TExpr,
+    instances: i32,
+) -> starrocks_thrift::runtime_filter::TRuntimeFilterDescription {
+    let mut filter = runtime_filter(
+        filter_id,
+        build_key,
+        target,
+        probe,
+        starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED,
+    );
+    filter.runtime_filter_merge_nodes = Some(vec![merge_node()]);
+    filter.layout = Some(starrocks_thrift::runtime_filter::TRuntimeFilterLayout {
+        filter_id: Some(filter_id),
+        num_instances: Some(instances),
+        ..Default::default()
+    });
+    filter
 }
 
 #[test]
@@ -5480,7 +5518,10 @@ fn a_scan_reports_the_runtime_filters_it_probes() {
         vec![starrocks_plan_translator::runtime_filter::ProbedFilter {
             filter_id: 7,
             scan_node_id: 0,
-            broadcast: true,
+            distribution: starrocks_plan_translator::runtime_filter::BuildDistribution::Broadcast,
+            merge_node: None,
+            shares: None,
+            key_type: Some("BIGINT".to_string()),
         }]
     );
     let plain = params(
@@ -5535,10 +5576,13 @@ fn a_bound_runtime_filter_semi_joins_the_scan_with_its_key_stream() {
     // A filter bound to no scan of the fragment changes nothing.
     let mut other = key_stream("BIGINT");
     other.filter_id = 8;
+    let mut other_range = key_range(1, 2);
+    other_range.filter_id = 8;
     let untouched = PlanTranslator::new()
-        .translate_fragment_with_inputs(&params, &[], &[other])
+        .translate_fragment_with_inputs(&params, &[], &[other, other_range])
         .unwrap();
     assert!(untouched.stream_inputs.is_empty());
+    assert_eq!(untouched.plan, unfiltered.plan);
 }
 
 #[test]
@@ -5565,8 +5609,8 @@ fn a_broadcast_join_reports_the_filters_it_builds_from_its_exchange() {
     use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
     join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![
         filter(7, Mode::BROADCAST),
-        // A partitioned build side holds only a slice of the keys on each instance.
-        filter(8, Mode::PARTITIONED),
+        // A colocate join's build side isn't an exchange the CN can read.
+        filter(8, Mode::COLOCATE),
     ]);
     let plan = TPlan::new(vec![
         join,
@@ -5587,6 +5631,8 @@ fn a_broadcast_join_reports_the_filters_it_builds_from_its_exchange() {
             exchange_node_id: 11,
             column: 0,
             column_type: "BIGINT".to_string(),
+            distribution: starrocks_plan_translator::runtime_filter::BuildDistribution::Broadcast,
+            merge_node: None,
         }]
     );
 }
@@ -5679,11 +5725,15 @@ fn filters_a_join_cant_build_are_reported_with_their_reason() {
         slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
         slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
     ));
+    // A partitioned join's filter needs the merge node to find its probers.
+    let mut unmerged = filter(11, Mode::PARTITIONED);
+    unmerged.runtime_filter_merge_nodes = Some(Vec::new());
     join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![
         filter(7, Mode::BROADCAST),
-        filter(8, Mode::PARTITIONED),
+        filter(8, Mode::COLOCATE),
         skew,
         expression_key,
+        unmerged,
     ]);
     let plan = |join| {
         params(
@@ -5707,6 +5757,7 @@ fn filters_a_join_cant_build_are_reported_with_their_reason() {
             skipped(8, SkipReason::NotBroadcast),
             skipped(9, SkipReason::Skew),
             skipped(10, SkipReason::KeyNotSlot),
+            skipped(11, SkipReason::NoMergeNode),
         ]
     );
     // Every filter of a null-safe key is reported as such.
@@ -5760,4 +5811,293 @@ fn probes_no_compute_node_filters_are_reported_with_their_reason() {
     );
     // A leaf scan's filters are decided when it runs.
     assert!(skipped_probes(&probing_scan_params()).is_empty());
+}
+
+#[test]
+fn a_partitioned_join_reports_the_share_each_instance_builds() {
+    use starrocks_plan_translator::runtime_filter::{BuildDistribution, BuiltFilter};
+    use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    let mut bucket = partitioned_filter(
+        8,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        0,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        4,
+    );
+    // A bucket-shuffle join spreads its build side by the probe side's buckets: shares too.
+    bucket.build_join_mode = Some(Mode::SHUFFLE_HASH_BUCKET);
+    join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![
+        partitioned_filter(
+            7,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            4,
+        ),
+        bucket,
+    ]);
+    let plan = TPlan::new(vec![
+        join,
+        exchange_node(10, vec![0]),
+        exchange_node(11, vec![1]),
+    ]);
+    let built = starrocks_plan_translator::runtime_filter::built_filters(&params(
+        Some(plan),
+        Some(join_desc()),
+        None,
+    ))
+    .unwrap();
+    let share = |filter_id| BuiltFilter {
+        filter_id,
+        join_node_id: 2,
+        exchange_node_id: 11,
+        column: 0,
+        column_type: "BIGINT".to_string(),
+        distribution: BuildDistribution::Partitioned,
+        merge_node: Some(merge_node()),
+    };
+    assert_eq!(built, vec![share(7), share(8)]);
+}
+
+#[test]
+fn a_scan_reports_where_a_partitioned_filters_shares_meet() {
+    let mut scan = scan_node(0, 0);
+    scan.probe_runtime_filters = Some(vec![partitioned_filter(
+        7,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        0,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        4,
+    )]);
+    let probed = starrocks_plan_translator::runtime_filter::probed_filters(&params(
+        Some(TPlan::new(vec![scan])),
+        Some(join_desc()),
+        None,
+    ));
+    assert_eq!(
+        probed,
+        vec![starrocks_plan_translator::runtime_filter::ProbedFilter {
+            filter_id: 7,
+            scan_node_id: 0,
+            distribution: starrocks_plan_translator::runtime_filter::BuildDistribution::Partitioned,
+            merge_node: Some(merge_node()),
+            shares: Some(4),
+            key_type: Some("BIGINT".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn a_range_bound_runtime_filter_keeps_the_keys_between_its_bounds() {
+    let params = probing_scan_params();
+    let unfiltered = PlanTranslator::new().translate_fragment(&params).unwrap();
+    let filtered = PlanTranslator::new()
+        .translate_fragment_with_inputs(&params, &[], &[key_range(-5, 1 << 40)])
+        .unwrap();
+    assert_eq!(filtered.output_names, unfiltered.output_names);
+    assert!(filtered.stream_inputs.is_empty(), "bounds read no stream");
+    let rel::RelType::Filter(filter) = root(&filtered.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the scan under a filter");
+    };
+    assert!(matches!(
+        filter.input.as_ref().unwrap().rel_type.as_ref().unwrap(),
+        rel::RelType::Read(_)
+    ));
+    let Some(expression::RexType::ScalarFunction(and)) =
+        filter.condition.as_ref().unwrap().rex_type.as_ref()
+    else {
+        panic!("expected a conjunction");
+    };
+    // `a >= -5 AND a <= 2^40`, with BIGINT literals for the BIGINT key.
+    let bounds: Vec<(u32, Vec<i32>, i64)> = and
+        .arguments
+        .iter()
+        .map(|argument| {
+            let Some(substrait::proto::function_argument::ArgType::Value(value)) =
+                argument.arg_type.as_ref()
+            else {
+                panic!("expected a value argument");
+            };
+            let Some(expression::RexType::ScalarFunction(compare)) = value.rex_type.as_ref() else {
+                panic!("expected a comparison");
+            };
+            let [
+                substrait::proto::FunctionArgument {
+                    arg_type: Some(substrait::proto::function_argument::ArgType::Value(key)),
+                },
+                substrait::proto::FunctionArgument {
+                    arg_type: Some(substrait::proto::function_argument::ArgType::Value(literal)),
+                },
+            ] = compare.arguments.as_slice()
+            else {
+                panic!("expected a key and a bound");
+            };
+            let Some(expression::RexType::Literal(expression::Literal {
+                literal_type: Some(expression::literal::LiteralType::I64(bound)),
+                ..
+            })) = literal.rex_type.as_ref()
+            else {
+                panic!("expected a BIGINT literal: {literal:?}");
+            };
+            (compare.function_reference, vec![field_index(key)], *bound)
+        })
+        .collect();
+    assert_eq!(
+        bounds
+            .into_iter()
+            .map(|(anchor, fields, bound)| (function_name(&filtered.plan, anchor), fields, bound))
+            .collect::<Vec<_>>(),
+        vec![
+            ("gte".to_string(), vec![0], -5),
+            ("lte".to_string(), vec![0], 1 << 40)
+        ]
+    );
+}
+
+#[test]
+fn a_range_bound_that_overflows_the_key_type_is_refused() {
+    let mut scan = scan_node(0, 0);
+    scan.probe_runtime_filters = Some(vec![runtime_filter(
+        7,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::INT)),
+        0,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::INT)),
+        starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED,
+    )]);
+    let params = params(Some(TPlan::new(vec![scan])), Some(join_desc()), None);
+    PlanTranslator::new()
+        .translate_fragment_with_inputs(&params, &[], &[key_range(1, 1 << 20)])
+        .unwrap();
+    let err = PlanTranslator::new()
+        .translate_fragment_with_inputs(&params, &[], &[key_range(1, 1 << 40)])
+        .unwrap_err();
+    assert!(err.to_string().contains("does not fit"), "{err}");
+}
+
+/// The key stream a share plan reads.
+fn share_stream(ty: &str) -> starrocks_plan_translator::StreamInputSchema {
+    starrocks_plan_translator::StreamInputSchema {
+        node_id: 1_000_007,
+        stream_view: "sirius_stream_1000007".to_string(),
+        columns: vec![starrocks_plan_translator::StreamInputColumn {
+            name: "rf_key".to_string(),
+            ty: ty.to_string(),
+        }],
+    }
+}
+
+/// The share plan's distinct keys: the aggregate at its root, and the filter under it.
+fn share_parts(
+    plan: &starrocks_plan_translator::TranslatedPlan,
+) -> (
+    &substrait::proto::AggregateRel,
+    &substrait::proto::FilterRel,
+) {
+    let rel::RelType::Aggregate(distinct) = root(&plan.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the distinct keys at the root");
+    };
+    assert!(distinct.measures.is_empty());
+    assert_eq!(distinct.grouping_expressions.len(), 1);
+    let rel::RelType::Filter(filter) = distinct.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected a filter under the distinct keys");
+    };
+    let rel::RelType::Read(read) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the key stream read");
+    };
+    assert!(matches!(
+        read.read_type.as_ref().unwrap(),
+        read_rel::ReadType::NamedTable(table) if table.names == ["sirius_stream_1000007"]
+    ));
+    (distinct, filter)
+}
+
+#[test]
+fn a_share_sends_its_distinct_non_null_keys() {
+    let plan = PlanTranslator::new()
+        .translate_filter_share(&share_stream("BIGINT"), None)
+        .unwrap();
+    assert_eq!(plan.output_names, vec!["rf_key".to_string()]);
+    assert_eq!(plan.stream_inputs, vec![share_stream("BIGINT")]);
+    assert_eq!(plan.output_partition_columns, None);
+    let (_, filter) = share_parts(&plan);
+    let Some(expression::RexType::ScalarFunction(not_null)) =
+        filter.condition.as_ref().unwrap().rex_type.as_ref()
+    else {
+        panic!("expected a null test");
+    };
+    assert_eq!(
+        function_name(&plan.plan, not_null.function_reference),
+        "is_not_null"
+    );
+}
+
+#[test]
+fn a_share_too_large_to_send_sends_its_bounds() {
+    let plan = PlanTranslator::new()
+        .translate_filter_share(&share_stream("INTEGER"), Some((3, 99)))
+        .unwrap();
+    assert_eq!(plan.output_names, vec!["rf_bound".to_string()]);
+    let (_, filter) = share_parts(&plan);
+    let Some(expression::RexType::ScalarFunction(or)) =
+        filter.condition.as_ref().unwrap().rex_type.as_ref()
+    else {
+        panic!("expected a disjunction");
+    };
+    assert_eq!(function_name(&plan.plan, or.function_reference), "or");
+    // `rf_key = 3 OR rf_key = 99`, with INTEGER literals for the INTEGER key.
+    let bounds: Vec<i32> = or
+        .arguments
+        .iter()
+        .map(|argument| {
+            let Some(substrait::proto::function_argument::ArgType::Value(value)) =
+                argument.arg_type.as_ref()
+            else {
+                panic!("expected a value argument");
+            };
+            let Some(expression::RexType::ScalarFunction(equal)) = value.rex_type.as_ref() else {
+                panic!("expected an equality");
+            };
+            assert_eq!(function_name(&plan.plan, equal.function_reference), "equal");
+            let Some(substrait::proto::function_argument::ArgType::Value(literal)) =
+                equal.arguments[1].arg_type.as_ref()
+            else {
+                panic!("expected a literal bound");
+            };
+            let Some(expression::RexType::Literal(expression::Literal {
+                literal_type: Some(expression::literal::LiteralType::I32(bound)),
+                ..
+            })) = literal.rex_type.as_ref()
+            else {
+                panic!("expected an INTEGER literal: {literal:?}");
+            };
+            *bound
+        })
+        .collect();
+    assert_eq!(bounds, vec![3, 99]);
+    // Only integer keys are sent.
+    assert!(
+        PlanTranslator::new()
+            .translate_filter_share(&share_stream("VARCHAR"), None)
+            .is_err()
+    );
+}
+
+fn function_name(plan: &substrait::proto::Plan, anchor: u32) -> String {
+    resolved_function(plan, anchor).1
 }
