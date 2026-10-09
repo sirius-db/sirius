@@ -829,6 +829,15 @@ fn hops_outcome(
 /// effort: a peer that refuses the frame or does not answer within [`FAILED_TIMEOUT`] is logged,
 /// and past [`FAILED_IN_FLIGHT`] frames in flight the rest are dropped.
 fn send_failed(ends: Vec<(SocketAddr, SenderSlot)>, error: &str) {
+    // Nothing failed when the query ended normally: the receivers end with their own cancel from
+    // the FE, and a failure frame would make a CN that has not had it yet fail a finished query.
+    if crate::recent_queries::is_normal_end(error) {
+        info!(
+            error,
+            "not sending failure frames: the query ended normally"
+        );
+        return;
+    }
     for (peer, slot) in ends {
         let Some(permit) = FailedPermit::take() else {
             warn!(peer = %peer, ?slot, "too many exchange failure frames in flight; dropping one");
