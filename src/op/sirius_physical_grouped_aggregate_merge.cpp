@@ -79,6 +79,8 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 {
   child_op              = grouped_aggregate;
   _hash_partition_bytes = hash_partition_bytes;
+  num_grouping_set_columns =
+    grouped_aggregate->num_output_group_columns() - grouped_aggregate->group_idx.size();
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
@@ -119,13 +121,13 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 {
 }
 
-// expressions is the list of aggregates to be computed. Each aggregates has a bound_ref expression
-// to a column groups_p is the list of group by columns. Each group by column is a bound_ref
-// expression to a column grouping_sets_p is the list of grouping set. Each grouping set is a set of
-// indexes to the group by columns. Seems like DuckDB group the groupby columns into several sets
-// and for every grouping set there is one radix_table grouping_functions_p is a list of indexes to
-// the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
-// grouping set and the second level is the indexes to the groupby expression for that set.
+// The parameters, as for the sirius_physical_grouped_aggregate constructor:
+// - expressions: the aggregates, each over bound_ref expressions to its input columns
+// - groups_p: the group by keys, each a bound_ref expression
+// - grouping_sets_p: the grouping sets, each a set of positions in groups_p
+// - grouping_functions_p: unused
+// This constructor supports a single grouping set. A merge for several grouping sets is
+// constructed from its sirius_physical_grouped_aggregate.
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
@@ -153,7 +155,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
   const partition_sizing_input& in)
 {
-  int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, _num_gpus);
+  int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, num_gpus());
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
   // repository's set_num_partitions contract.
@@ -166,7 +168,12 @@ partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strate
       }
     }
   }
-  return {natural, /*broadcast=*/false, /*build_probe=*/false};
+  return partition_strategy{natural,
+                            /*broadcast=*/false,
+                            /*build_probe=*/false,
+                            natural == 1 ? partition_placement::unpinned(1)
+                                         : partition_placement::round_robin(
+                                             static_cast<std::size_t>(natural), active_gpu_ids())};
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
@@ -188,11 +195,11 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     }
     current_partition_index++;
     if (input_batch.empty()) { return nullptr; }
-    // Tag with the source partition index so the scheduler pins this task to
-    // partition_idx % num_gpus. merge_group_by materializes a cuco hash table
-    // to combine its input batches, so — like hash_join — every task of a
-    // given partition must stay on a single GPU.
-    return std::make_unique<partitioned_operator_data>(std::move(input_batch), this_partition_id);
+    // Each partition is drained into one task; its merge state is task-local. A lone partition
+    // follows input locality, while multiple partitions retain round-robin placement.
+    auto const placement = this->placement();
+    return std::make_unique<partitioned_operator_data>(
+      std::move(input_batch), this_partition_id, *placement);
   } else {
     return nullptr;
   }
@@ -224,7 +231,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
   } else {
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
-                                                     group_idx.size(),
+                                                     static_cast<int>(num_output_group_columns()),
                                                      cudf_aggregates,
                                                      stream,
                                                      *input_batches[0].get_memory_space(),
@@ -245,7 +252,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   auto mr            = space->get_default_allocator();
   auto& gpu_rep      = merged_mut.get_data()->cast<cucascade::gpu_table_representation>();
   auto merged_cols   = gpu_rep.release_table(stream)->release();
-  int num_group_cols = static_cast<int>(group_idx.size());
+  int num_group_cols = static_cast<int>(num_output_group_columns());
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;
 

@@ -24,7 +24,7 @@ Diagnose incorrect query results by comparing Sirius GPU output against DuckDB C
 2. **Establish baseline:**
    Run the query via DuckDB CPU to get the expected correct result:
    ```bash
-   build/release/duckdb <db_path> -c "SELECT ..." > /tmp/claude-1000/baseline_result.txt
+   sirius-duckdb/build/release/duckdb <db_path> -c "SELECT ..." > /tmp/claude-1000/baseline_result.txt
    ```
 
 3. **Run via Sirius GPU:**
@@ -32,7 +32,7 @@ Diagnose incorrect query results by comparing Sirius GPU output against DuckDB C
    export SIRIUS_LOG_LEVEL=trace
    export SIRIUS_LOG_DIR=build/release/log/run_$(date +%s)
    mkdir -p $SIRIUS_LOG_DIR
-   build/release/duckdb <db_path> -c "CALL gpu_execution('SELECT ...');" > /tmp/claude-1000/gpu_result.txt
+   sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <db_path> -c "CALL gpu_execution('SELECT ...');" > /tmp/claude-1000/gpu_result.txt
    ```
    Compare output against baseline (sort both to handle ordering differences).
 
@@ -96,7 +96,7 @@ The most common cause of wrong results in Sirius is **reading garbage data due t
    CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/release --target stream_check
 
    # Run the query with stream_check preloaded
-   LD_PRELOAD=build/release/libstream_check.so build/release/duckdb <db_path> <<'EOF'
+   LD_PRELOAD=build/release/libstream_check.so sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF'
    CALL gpu_execution('<QUERY>');
    EOF
    ```
@@ -107,7 +107,7 @@ The most common cause of wrong results in Sirius is **reading garbage data due t
 
 2. **Check with nsys:** Profile the query with `nsys` and examine the stream IDs:
    ```bash
-   nsys profile --stats=true -o /tmp/claude-1000/validate_profile build/<preset>/duckdb <db_path> <<'EOF'
+   nsys profile --stats=true -o /tmp/claude-1000/validate_profile sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF'
    CALL gpu_execution('<QUERY>');
    EOF
    ```
@@ -199,4 +199,4 @@ sirius::debug_sample(*batch, 20, stream);
 
 ## Scope
 
-Only analyze code in `namespace sirius` plus exceptions listed in shared build-and-query.md. Ignore legacy `namespace duckdb` code.
+Analyze active code in both `namespace sirius` and `namespace duckdb`; see shared build-and-query.md.

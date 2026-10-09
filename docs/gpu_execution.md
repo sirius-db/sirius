@@ -10,13 +10,8 @@ git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 ```
 
-Set up the environment with [Pixi](https://pixi.sh/) and build:
-```
-pixi shell
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-```
-
-Note that if building consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value.
+Follow the [build instructions](building.md) to build Sirius and the separate
+DuckDB wrapper using Pixi.
 
 ## Configuration
 
@@ -26,7 +21,7 @@ Note that if building consumes too much memory, try reducing the `CMAKE_BUILD_PA
 
 ```bash
 export SIRIUS_CONFIG_FILE=/path/to/sirius.yaml
-./build/release/duckdb
+pixi run sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"
 ```
 
 From the DuckDB shell, create views pointing to your Parquet files and run queries with `gpu_execution`:
@@ -114,18 +109,18 @@ CREATE VIEW my_table AS SELECT * FROM read_parquet('/path/to/my_data/*.parquet')
 Run all unit tests:
 ```
 CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make
-build/release/extension/sirius/test/cpp/sirius_unittest
+build/release/test/cpp/sirius_unittest
 ```
 
 Run tests associated with a specific tag or a specific test:
 ```
-build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
-build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
+build/release/test/cpp/sirius_unittest "[uri_parser]"
+build/release/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
 ```
 
 Test logs are saved in:
 ```
-build/release/extension/sirius/test/cpp/log
+build/release/test/cpp/log
 ```
 
 ## Developer Documentation

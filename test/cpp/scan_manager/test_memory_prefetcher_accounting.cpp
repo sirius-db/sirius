@@ -134,6 +134,10 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(prefetcher_env& e,
 }
 
 struct scripted_provider final : databatch_provider {
+  scripted_provider()
+  {
+    validation.identity = validation.layout = validation.structure = {true, true};
+  }
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   std::size_t served{0};
 
@@ -427,4 +431,42 @@ TEST_CASE("prefetcher backs off cleanly when the peak reservation cannot be admi
   REQUIRE(batch_tier(*batches[0]) == cucascade::memory::Tier::HOST);
   REQUIRE(e.gpu_space->get_available_memory() == avail_before);
   REQUIRE(e.gpu_space->get_active_reservation_count() == 0);
+}
+
+TEST_CASE("Resident certificate refusal is invisible to an active memory prefetcher",
+          "[memory_prefetcher][scan_manager][certificate][consumption]")
+{
+  prefetcher_env e;
+  auto refused            = make_host_batch(e, 4096, 17);
+  auto control            = make_host_batch(e, 4096, 29);
+  auto rejected_connector = std::make_shared<split_connector>();
+  auto control_connector  = std::make_shared<split_connector>();
+  memory_prefetcher_config cfg;
+  cfg.enable            = true;
+  cfg.num_threads       = 1;
+  cfg.min_free_fraction = 0.05;
+  cfg.poll_interval_ms  = 1;
+  memory_prefetcher prefetcher(cfg, {rejected_connector, control_connector}, e.gpu_space);
+  scripted_provider invalid;
+  invalid.contract_id            = 81;
+  invalid.validation.query_token = 17;
+  invalid.batches                = {refused};
+  std::stop_source stop;
+  // The latched injection changes only the witness token at admission.
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    invalid, *rejected_connector, stop.get_token(), false, 81, 17, nullptr, true);
+  CHECK(rejected_connector->peek_resident_batches().empty());
+  REQUIRE_THROWS_AS(rejected_connector->get_next_split(), sirius::op::scan::certificate_incomplete);
+  scripted_provider valid;
+  valid.batches = {control};
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    valid, *control_connector, stop.get_token(), false);
+  // Positive control proves a live worker swept the connectors after refusal.
+  REQUIRE(
+    wait_until([&] { return prefetcher.batches_prefetched() == 1; }, std::chrono::seconds(20)));
+  prefetcher.stop();
+  CHECK(prefetcher.batches_prefetched() == 1);
+  CHECK(batch_tier(*control) == cucascade::memory::Tier::GPU);
+  CHECK(batch_tier(*refused) == cucascade::memory::Tier::HOST);
+  CHECK(rejected_connector->peek_resident_batches().empty());
 }

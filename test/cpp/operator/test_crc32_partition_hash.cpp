@@ -74,10 +74,10 @@ uint32_t cpu_fold_string(uint32_t seed, std::string const& value, bool valid)
 
 // DecimalV2 / DecimalV3(27,9) split fold: int64 integer part then int32 fractional part of the
 // int128 value (C++ truncated division), matching StarRocks' DecimalV2Value.
-uint32_t cpu_fold_decimal_split(uint32_t seed, __int128 v)
+uint32_t cpu_fold_decimal_split(uint32_t seed, __int128_t v)
 {
-  int64_t const iv = static_cast<int64_t>(v / static_cast<__int128>(1000000000));
-  int32_t const fv = static_cast<int32_t>(v % static_cast<__int128>(1000000000));
+  int64_t const iv = static_cast<int64_t>(v / static_cast<__int128_t>(1000000000));
+  int32_t const fv = static_cast<int32_t>(v % static_cast<__int128_t>(1000000000));
   uint32_t h       = cpu_crc32(seed, reinterpret_cast<uint8_t const*>(&iv), 8);
   return cpu_crc32(h, reinterpret_cast<uint8_t const*>(&fv), 4);
 }
@@ -88,7 +88,7 @@ uint32_t cpu_fold_decimal_split(uint32_t seed, __int128 v)
 rmm::device_async_resource_ref test_mr() { return cudf::get_current_device_resource_ref(); }
 
 // Build a null mask from a per-row validity vector (empty vector => no mask / all valid).
-rmm::device_buffer make_mask(std::vector<bool> const& valid, cudf::size_type& null_count)
+auto make_mask(std::vector<bool> const& valid, cudf::size_type& null_count)
 {
   auto const n         = static_cast<cudf::size_type>(valid.size());
   auto const num_words = cudf::num_bitmask_words(n);
@@ -103,7 +103,7 @@ rmm::device_buffer make_mask(std::vector<bool> const& valid, cudf::size_type& nu
   }
   // cudf requires the mask buffer to be padded to its allocation size (multiple of 64 bytes).
   auto const buf_size = cudf::bitmask_allocation_size_bytes(n);
-  rmm::device_buffer buf(buf_size, test_stream(), test_mr());
+  auto buf = cudf::create_null_mask(n, cudf::mask_state::UNINITIALIZED, test_stream(), test_mr());
   cudaMemset(buf.data(), 0, buf_size);
   cudaMemcpy(
     buf.data(), words.data(), words.size() * sizeof(cudf::bitmask_type), cudaMemcpyHostToDevice);
@@ -159,7 +159,8 @@ std::unique_ptr<cudf::column> make_strings(std::vector<std::string> const& value
     cudaMemcpy(chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice);
   }
 
-  rmm::device_buffer null_mask{0, test_stream(), test_mr()};
+  auto null_mask =
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, test_stream(), test_mr());
   cudf::size_type null_count = 0;
   if (!valid.empty()) { null_mask = make_mask(valid, null_count); }
 

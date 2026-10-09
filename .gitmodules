@@ -1,5 +1,7 @@
-# When changing the duckdb submodule, also update OVERRIDE_GIT_DESCRIBE
-# in cmake/CMakePresets.json and the DuckDB package in pixi.toml.
+# Keep the engine and wrapper DuckDB gitlinks in sync.
+# When changing DuckDB versions, update cmake/sirius-duckdb-provider.cmake,
+# cmake/CMakePresets.json, pixi.toml, sirius-duckdb/Makefile, and
+# .github/workflows/distribution.yml.
 [submodule "duckdb"]
 	path = duckdb
 	url = https://github.com/duckdb/duckdb.git
@@ -17,8 +19,8 @@
 	path = .claude/claude-tools
 	url = https://github.com/sirius-db/claude-tools.git
 	branch = main
-[submodule "vcpkg"]
-	path = vcpkg
+[submodule "sirius-duckdb/vcpkg"]
+	path = sirius-duckdb/vcpkg
 	url = https://github.com/Microsoft/vcpkg.git
 [submodule "starrocks/starrocks"]
 	path = experimental/starrocks/starrocks
@@ -26,3 +28,13 @@
 [submodule "starrocks/brpc"]
 	path = experimental/starrocks/brpc
 	url = https://github.com/apache/brpc
+[submodule "experimental/doris/doris"]
+	path = experimental/doris/doris
+	url = https://github.com/apache/doris
+	shallow = true
+[submodule "sirius-duckdb/duckdb"]
+	path = sirius-duckdb/duckdb
+	url = https://github.com/duckdb/duckdb.git
+[submodule "sirius-duckdb/extension-ci-tools"]
+	path = sirius-duckdb/extension-ci-tools
+	url = https://github.com/duckdb/extension-ci-tools.git

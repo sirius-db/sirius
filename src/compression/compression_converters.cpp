@@ -22,6 +22,7 @@
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -64,8 +65,8 @@ std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column>
   const auto nc   = col->null_count();
   auto contents   = col->release();
   if (contents.data) { contents.data->set_stream(s); }
-  rmm::device_buffer null_mask =
-    contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
+  auto null_mask = contents.null_mask ? std::move(*contents.null_mask)
+                                      : cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED);
   null_mask.set_stream(s);
   std::vector<std::unique_ptr<cudf::column>> children;
   children.reserve(contents.children.size());

@@ -266,7 +266,12 @@ std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_vie
 
   auto offsets = make_constant_width_offsets(n_rows, static_cast<std::int32_t>(width), stream, mr);
   rmm::device_buffer chars(nbytes, stream, mr);
-  auto output = cudf::make_strings_column(n_rows, std::move(offsets), std::move(chars), 0, {});
+  auto output =
+    cudf::make_strings_column(n_rows,
+                              std::move(offsets),
+                              std::move(chars),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 
   auto* out      = output->mutable_view().head<char>();
   auto const* kc = keys.chars_begin(stream);
@@ -514,13 +519,11 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
   // Only the *row* validity needs carrying: the keys are non-null (checked
   // above), so a matching code is unambiguously true.
   auto const null_count = dict_column->null_count();
-  auto output           = cudf::make_fixed_width_column(
-    bool_t,
-    n_rows,
-    null_count > 0 ? cudf::copy_bitmask(dict_column->view(), stream, mr) : rmm::device_buffer{},
-    null_count,
-    stream,
-    mr);
+  auto null_mask        = null_count > 0
+                            ? cudf::copy_bitmask(dict_column->view(), stream, mr)
+                            : cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto output =
+    cudf::make_fixed_width_column(bool_t, n_rows, std::move(null_mask), null_count, stream, mr);
 
   auto* d_out       = output->mutable_view().data<bool>();
   auto const* d_lut = lut->view().data<bool>();

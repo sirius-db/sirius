@@ -114,8 +114,7 @@ void visit_references(node const& root, Fn&& fn)
  * shares no ownership with @p src.
  *
  * Used by the aggregate copy path (sirius_physical_ungrouped_aggregate's
- * copy_expressions), where an aggregate node must be duplicated and a
- * to_duckdb round-trip is impossible (to_duckdb(aggregate) throws by design).
+ * copy_expressions), where a move-only aggregate tree must be duplicated.
  * See https://github.com/sirius-db/sirius/issues/701.
  */
 std::unique_ptr<node> clone(node const& src);

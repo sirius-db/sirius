@@ -60,6 +60,30 @@ struct parquet_source {
   cudf::io::parquet_reader_options const& options,
   std::vector<cudf::size_type> const& row_group_indices);
 
+/// @ref column_chunk_ranges over many row-group subsets, keeping the reader of
+/// the last file and reader options it was asked about.
+///
+/// Building a reader copies the whole footer, so a file split into many
+/// batches costs one copy instead of one per batch. The kept reader holds that
+/// copy until the next file, or until @ref clear.
+class column_chunk_range_cache {
+ public:
+  /// Same result as @ref column_chunk_ranges for @p metadata, @p options and
+  /// @p row_group_indices.
+  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> ranges(
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> const& metadata,
+    std::shared_ptr<cudf::io::parquet_reader_options const> const& options,
+    std::vector<cudf::size_type> const& row_group_indices);
+
+  /// Release the kept reader and its footer copy.
+  void clear() noexcept;
+
+ private:
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> _metadata;
+  std::shared_ptr<cudf::io::parquet_reader_options const> _options;
+  std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader> _reader;
+};
+
 /// Materialize @p sources into one table.
 ///
 /// Takes one of two routes, picked from what the backend says it wants:
@@ -78,7 +102,8 @@ struct parquet_source {
 ///
 /// Both routes honor @p options' row filter: @c materialize_all_columns applies
 /// it at row level exactly as @c read_parquet does, so the route never changes
-/// which rows come back.
+/// which rows come back.  With the reader options Sirius uses, both routes
+/// also refuse sources whose schemas differ.
 ///
 /// @param ranges  column-chunk ranges, one vector per entry of @p sources and in
 ///                the same order.  Only read on the bulk route; any source whose
@@ -97,5 +122,11 @@ struct parquet_source {
 [[nodiscard]] bool prefers_bulk_materialize(
   std::span<parquet_source const> sources,
   cudf::io::parquet_reader_options const& options) noexcept;
+
+/// Throw unless every entry of @p sources has the same footer schema as the
+/// first, compared as cudf::io::read_parquet compares several sources.  The
+/// multi-file hybrid scan reader skips that check, so the bulk route calls
+/// this first.  Each source must have non-null metadata.
+void require_same_parquet_schema(std::span<parquet_source const> sources);
 
 }  // namespace sirius::op::scan

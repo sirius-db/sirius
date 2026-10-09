@@ -55,7 +55,8 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
-#include <cub/cub.cuh>
+#include <cub/device/device_memcpy.cuh>
+#include <cuda/cmath>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -516,12 +517,12 @@ rmm::device_buffer decode_column_data(gpu_column_decode_input const& col,
 /// Returns an empty buffer when the column has no rows, doesn't carry nulls,
 /// or carries no validity runs (the empty buffer signals "no nulls" downstream
 /// and avoids an unnecessary mask allocation + popcount).
-rmm::device_buffer decode_column_validity(gpu_column_decode_input const& col,
-                                          ::cuda::stream_ref stream,
-                                          rmm::device_async_resource_ref mr)
+auto decode_column_validity(gpu_column_decode_input const& col,
+                            ::cuda::stream_ref stream,
+                            rmm::device_async_resource_ref mr)
 {
   if (!col.has_nulls || col.total_rows == 0 || col.validity.empty()) {
-    return rmm::device_buffer{};
+    return cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   }
   validate_segment_bounds(col.validity, col.total_rows, "validity");
 
@@ -529,10 +530,10 @@ rmm::device_buffer decode_column_validity(gpu_column_decode_input const& col,
   // cudf's bitmask layout (Arrow-compatible 64-byte padding). Validity
   // segments overwrite specific byte ranges below; rows no segment covers
   // remain implicitly valid.
-  rmm::device_buffer null_mask = cudf::create_null_mask(
+  auto null_mask = cudf::create_null_mask(
     static_cast<cudf::size_type>(col.total_rows), cudf::mask_state::ALL_VALID, stream, mr);
   for (auto const& run : col.validity) {
-    dispatch_validity_run(run, static_cast<uint8_t*>(null_mask.data()), stream, mr);
+    dispatch_validity_run(run, reinterpret_cast<uint8_t*>(null_mask.data()), stream, mr);
   }
   return null_mask;
 }
@@ -570,7 +571,7 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_inpu
   }
 
   std::vector<rmm::device_buffer> data_bufs;
-  std::vector<rmm::device_buffer> null_masks;
+  std::vector<decltype(cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED))> null_masks;
   data_bufs.reserve(num_cols);
   null_masks.reserve(num_cols);
   for (size_t ci = 0; ci < num_cols; ++ci) {
@@ -585,7 +586,7 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_inpu
   // building the cudf::table.
   std::vector<cudf::bitmask_type const*> mask_ptrs(num_cols, nullptr);
   for (size_t ci = 0; ci < num_cols; ++ci) {
-    mask_ptrs[ci] = static_cast<cudf::bitmask_type const*>(null_masks[ci].data());
+    mask_ptrs[ci] = reinterpret_cast<cudf::bitmask_type const*>(null_masks[ci].data());
   }
   std::vector<cudf::size_type> null_counts =
     cudf::batch_null_count(mask_ptrs, 0, static_cast<cudf::size_type>(common_rows), stream);

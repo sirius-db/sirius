@@ -86,7 +86,7 @@ std::unique_ptr<compressed_representation> make_simple_payload(
   });
 }
 
-// Assemble the dictionary from its channels without copying. An optional trailing `null_mask`
+// Assemble the dictionary by adopting its channels. An optional trailing `null_mask`
 // channel carries the validity of a nullable column. cuDF's factories retag unsigned indices (for
 // example a narrow field a bitjoin decodes) as the signed type of the same width.
 std::unique_ptr<compressed_representation> make_dictionary(std::vector<std::string> const& names,
@@ -118,6 +118,7 @@ std::unique_ptr<compressed_representation> make_dictionary(std::vector<std::stri
                                                std::int64_t{keys} * *key_width))) {
     reject("dictionary: key width hint does not describe the key channels");
   }
+  auto mask                  = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   cudf::size_type mask_nulls = 0;
   if (has_mask) {
     if (channels[3]->type().id() != cudf::type_id::UINT8 ||
@@ -127,15 +128,27 @@ std::unique_ptr<compressed_representation> make_dictionary(std::vector<std::stri
     // The host null count decides whether the mask belongs on the dictionary parent.
     auto const* bits = static_cast<cudf::bitmask_type const*>(channels[3]->view().head<void>());
     mask_nulls       = rows > 0 ? cudf::null_count(bits, 0, rows, stream) : 0;
+    if (mask_nulls > 0) {
+      auto contents = channels[3]->release();
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+      // Keep the RMM source alive until the copy into cuDF's CUDA mask buffer completes.
+      contents.data->set_stream(stream);
+      mask = cudf::copy_bitmask(bits, 0, rows, stream, mr);
+#else
+      mask = std::move(*contents.data);
+#endif
+    }
   }
-  auto key_strings = cudf::make_strings_column(
-    keys, std::move(channels[0]), std::move(*channels[1]->release().data), 0, rmm::device_buffer{});
+  auto key_strings =
+    cudf::make_strings_column(keys,
+                              std::move(channels[0]),
+                              std::move(*channels[1]->release().data),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
   auto dictionary =
     mask_nulls > 0
-      ? cudf::make_dictionary_column(std::move(key_strings),
-                                     std::move(channels[2]),
-                                     std::move(*channels[3]->release().data),
-                                     mask_nulls)
+      ? cudf::make_dictionary_column(
+          std::move(key_strings), std::move(channels[2]), std::move(mask), mask_nulls)
       : cudf::make_dictionary_column(std::move(key_strings), std::move(channels[2]), stream, mr);
   if (!key_width) {
     return dictionary_compressed_representation::from_encoded_column(

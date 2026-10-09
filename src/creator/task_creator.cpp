@@ -51,6 +51,7 @@ task_creator::task_creator(task_creator_config config,
                            std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _running(false),
     _config(std::move(config)),
+    _mem_res_mgr(mem_res_mgr),
     _task_creation_queue([](const task_creation_request& request) -> exec::index_keys {
       // The request carries its own keys: they are resolved at schedule() time, where the
       // node's pipeline (and therefore its query and priority) is unambiguously alive. The
@@ -62,7 +63,6 @@ task_creator::task_creator(task_creator_config config,
         static_cast<exec::query_key>(sirius::value_of(request.query_id)),
         request.device_id};
     }),
-    _mem_res_mgr(mem_res_mgr),
     _topology_index(std::move(topology_index))
 {
   // NUMA-aware GPU routing (HOST-data locality via gpus_of(numa)) is served by
@@ -588,6 +588,13 @@ void task_creator::manager_loop()
     }
     node = next.op;
 
+    // The discard-count fixture leaves a real published batch in its repository until
+    // the held footer fails. Scan tasks remain runnable so the failure can be delivered.
+    if (auto completion = query_state->completion_handler;
+        completion && completion->injections && completion->injections->hold_published_batch &&
+        dynamic_cast<op::scan::sirius_gpu_scan_operator*>(node) == nullptr) {
+      continue;
+    }
     // Counted before dispatch so drain_pending_tasks(query_id) cannot observe zero in-flight
     // while this task creation is still queued to run.
     query_state->enter_in_flight();
@@ -642,31 +649,11 @@ void task_creator::manager_loop()
               // stamps the chosen device onto the split's operating data. Honor it
               // first so each split's task lands on its assigned GPU; the locality
               // heuristics below only run when no upstream preference was set.
+              // Partitioned inputs arrive stamped the same way: their emitter copies the
+              // partition's device from the exchange's placement, which keeps every task of a
+              // partition on the one GPU its cuco hash table lives on.
               if (local_state->_input_data) {
                 preferred_device_id = local_state->_input_data->get_preferred_device_id();
-              }
-              // Partition affinity: if the input is tagged with a partition
-              // index, pin the task to partition_idx % num_gpus.
-              // Partition-based operators (hash_join, grouped_aggregate_merge,
-              // …) use cuco hash tables under the hood, and cuco tables must
-              // live on a single device — a stream bound to GPU A touching a
-              // counter built under GPU B trips cudaErrorInvalidValue at
-              // counter_storage.cuh. Routing on partition_idx keeps every
-              // task of a given partition on one GPU while still spreading
-              // partitions across GPUs.
-              // Partitioned data with no index asks to be placed by affinity instead: its producer
-              // built a single partition, so no other task shares its device requirement.
-              if (auto* partitioned =
-                    dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
-                  !preferred_device_id.has_value() && partitioned &&
-                  !query_state->active_gpu_ids.empty()) {
-                // Index the active executor set so every task of a partition lands
-                // on the same real GPU (required for cuco tables); the physical
-                // topology would yield phantom pins when num_gpus < physical count.
-                if (auto const partition_idx = partitioned->get_partition_idx()) {
-                  auto idx            = *partition_idx % query_state->active_gpu_ids.size();
-                  preferred_device_id = query_state->active_gpu_ids[idx];
-                }
               }
               if (!preferred_device_id.has_value() && pipelineable_input &&
                   !pipelineable_input->get_data_batches().empty()) {
@@ -762,8 +749,8 @@ void task_creator::manager_loop()
                   }
                 }
               }
-              // Confine the task to the admitted subset. Every preference above except the
-              // partition pin comes from where data lives rather than from the subset, and the
+              // Confine the task to the admitted subset. Scan and partition preferences are drawn
+              // from the subset, but locality preferences come from where data lives, and the
               // scheduler treats a preference as binding — so an excluded id would be honoured.
               // Clamping a residency-derived one costs the locality it encoded, but honouring
               // it would put the query on a GPU it was not admitted to. An unpreferred task

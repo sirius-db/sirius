@@ -31,19 +31,22 @@ Run commands through `pixi run <cmd>` (don't drop into the interactive `pixi she
 command runs in the activated environment:
 
 ```bash
-pixi run make                              # full build (uses all cores)
-pixi run make clean                        # wipe the build dir (after a failed build, before rebuilding)
+pixi run make                              # library, C++ tests, and DuckDB extension (uses all cores)
+pixi run make clean                        # wipe the library and wrapper build dirs
 
-pixi run make test                         # build + run the C++ unit tests (Catch2, what CI runs); make test_debug for debug
+pixi run make test                         # build + run the C++ unit tests (scripts/run_unit_tests.py); make test_debug for debug
 
 pixi run pre-commit run -a                 # all formatting/lint hooks
 ```
 
 Running tests directly (non-obvious invocations):
 ```bash
-pixi run build/release/test/unittest --test-dir . test/sql/tpch-sirius.test    # one SQLLogic file
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"  # by Catch2 tag/test name
+pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"  # by Catch2 tag/test name
 ```
+
+`scripts/run_unit_tests.py` runs the unit tests in parallel shards (2 per GPU), then the
+`[multi_gpu]` and late-materialization tests. Arguments after `--` go to every Catch2 process.
+Logs go to `build/release/test/cpp/log/<process>/`.
 
 **Python API**: the default Pixi environment includes DuckDB's Python package. Load the built
 Sirius extension from Python as shown in [docs/README.md](docs/README.md#python-api).
@@ -58,8 +61,7 @@ Sirius extension from Python as shown in [docs/README.md](docs/README.md#python-
 `src/cuda/` (GPU kernels). **Read `docs/super-sirius/` before modifying Super Sirius code** —
 see its [README](docs/super-sirius/README.md) for reading order.
 
-**Everything under `src/legacy/` is the dead `gpu_processing` path — do not modify it.** All new
-work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
+All new work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
 (`src/downgrade/`, `src/creator/`); see `docs/super-sirius/memory-management.md`.
 
 Before implementing operators / memory / expression / I/O work, run `/module-context <task>` to
@@ -71,7 +73,7 @@ Load the extension and run normal SQL — Sirius intercepts it transparently and
 queries on the GPU (controlled by the `gpu_execution` setting, on by default):
 
 ```sql
-LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';
 SELECT ...;                  -- transparently routed to the GPU
 -- SET gpu_execution = false;  -- to disable interception
 ```

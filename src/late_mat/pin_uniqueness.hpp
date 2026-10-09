@@ -171,7 +171,7 @@ class unique_probe {
  private:
   /// Value domain of the observed ranges. Wide enough to hold INT64 and UINT64
   /// together, so signed and unsigned columns compare without a special case.
-  using value_type = __int128;
+  using value_type = __int128_t;
 
   struct range {
     value_type min{0};

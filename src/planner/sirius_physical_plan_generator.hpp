@@ -20,16 +20,22 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sirius::op {
 class sirius_physical_table_scan;
 }  // namespace sirius::op
+namespace sirius::transparent {
+class read_view_registry;
+}
 
 namespace duckdb {
 class ClientContext;
@@ -37,12 +43,12 @@ class Expression;
 class FunctionData;
 class LogicalType;
 class Value;
-class GPUContext;
 class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
+class LogicalCrossProduct;
 class LogicalDelimGet;
 class LogicalDummyScan;
 class LogicalEmptyResult;
@@ -59,6 +65,22 @@ class LogicalCTERef;
 }  // namespace duckdb
 
 namespace sirius::planner {
+
+/// Attribution attached to every scan contract created by one plan build.
+/// Execution-time plans carry a window id; plans built before an execution
+/// window carry a non-zero planning/finalize generation instead.
+struct scan_contract_provenance {
+  std::optional<uint64_t> window_id;
+  uint64_t finalize_generation = 0;
+  op::scan::certification_budget budget;
+  op::scan::test_injections injections;
+  uint64_t setting_lookups          = 0;
+  uint64_t certification_scan_index = 0;
+  uint64_t lineage_time_us          = 0;
+  std::optional<std::pair<op::scan::verdict_reason, std::string>> first_pre_decline;
+  // A fragment publishes cuDF batches directly; it has no DuckDB host exporter.
+  bool host_export_available = true;
+};
 
 /// Resolved parquet file set identifying a parquet-family scan
 /// ("parquet_scan" / "read_parquet" / "sirius_read_parquet"), derived exactly
@@ -77,6 +99,8 @@ namespace sirius::planner {
 class sirius_physical_plan_generator {
  public:
   explicit sirius_physical_plan_generator(duckdb::ClientContext& context);
+  sirius_physical_plan_generator(duckdb::ClientContext& context,
+                                 scan_contract_provenance provenance);
   ~sirius_physical_plan_generator();
 
   duckdb::LogicalDependencyList dependencies;
@@ -92,8 +116,6 @@ class sirius_physical_plan_generator {
     std::size_t,
     duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>>
     materialized_ctes;
-  // duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::GPUIntermediateRelation>>
-  // gpu_recursive_cte_tables;
 
  public:
   //! Creates a plan from the logical operator. This involves resolving column bindings and
@@ -132,8 +154,8 @@ class sirius_physical_plan_generator {
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalCreateIndex
   // &op); duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   // create_plan(duckdb::LogicalCreateSecret &op);
-  // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
-  // create_plan(duckdb::LogicalCrossProduct &op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
+    duckdb::LogicalCrossProduct& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelete
   // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelimGet& op);
@@ -222,10 +244,12 @@ class sirius_physical_plan_generator {
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
  public:
   std::size_t delim_index = 0;
+  std::shared_ptr<sirius::transparent::read_view_registry> read_views;
+  uint64_t next_scan_node_id = 0;
+  scan_contract_provenance contract_provenance;
 
  public:
   duckdb::ClientContext& context;
-  // duckdb::GPUContext& gpu_context;
 
  public:
   //! Recursive post-pass that derives each operator's `_parent_op` from the final tree after

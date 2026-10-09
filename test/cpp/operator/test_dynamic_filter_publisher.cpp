@@ -208,7 +208,8 @@ struct publisher_fixture {
     auto& source_space = replica_spaces.front().get_gpu_space();
     auto mask          = cudf::create_null_mask(
       column.size(), cudf::mask_state::ALL_VALID, stream, source_space.get_default_allocator());
-    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), begin, end, false, stream);
+    cudf::set_null_mask(
+      reinterpret_cast<cudf::bitmask_type*>(mask.data()), begin, end, false, stream);
     column.set_null_mask(std::move(mask), end - begin);
     stream.sync();
   }
@@ -288,8 +289,11 @@ std::unique_ptr<cudf::column> make_string_values(publisher_fixture const& fixtur
                           fixture.stream.get()) == cudaSuccess);
   rmm::device_buffer chars_buf{chars.data(), chars.size(), fixture.stream, mr};
   fixture.stream.sync();
-  return cudf::make_strings_column(
-    n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+  return cudf::make_strings_column(n,
+                                   std::move(offsets_col),
+                                   std::move(chars_buf),
+                                   0,
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 std::unique_ptr<cudf::column> make_float64_values(publisher_fixture const& fixture,
@@ -450,6 +454,7 @@ void require_published_membership(
   }
 
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.filters_pushed == 1);
 
   auto const snapshot = filters_on_column(*channel, kProbeColumnIndex);
   REQUIRE(snapshot.size() == 1);
@@ -744,7 +749,8 @@ TEST_CASE("dynamic-filter publisher builds exact IN-lists from a nullable build 
                                        cudf::mask_state::ALL_VALID,
                                        fixture.stream,
                                        cudf::get_current_device_resource_ref());
-    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), 0, 1, false, fixture.stream);
+    cudf::set_null_mask(
+      reinterpret_cast<cudf::bitmask_type*>(mask.data()), 0, 1, false, fixture.stream);
     probe->set_null_mask(std::move(mask), 1);
     REQUIRE(membership_mask(*filter, probe->view(), fixture) ==
             std::vector<std::uint8_t>{0, 1, 0, 0, 1, 0});
@@ -1200,7 +1206,6 @@ TEST_CASE("dynamic-filter publisher publishes DECIMAL128 membership only when th
           "[dynamic_filter][publisher]")
 {
   publisher_fixture fixture;
-  auto const mr = cudf::get_current_device_resource_ref();
 
   auto const publish = [&](std::vector<__int128_t> const& build_values) {
     fixture.columns.push_back(make_decimal_values<__int128_t>(fixture, kDecimal128, build_values));
@@ -1518,6 +1523,7 @@ TEST_CASE("dynamic-filter publisher suppresses zone maps per binding on probe-ty
                                    {.emit_zone_map_filters = true}};
 
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.zone_map_filters_built == 1);
 
   auto const matching_snapshot = filters_on_column(*matching_channel, kProbeColumnIndex);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(matching_snapshot) ==
@@ -1560,6 +1566,7 @@ TEST_CASE("dynamic-filter publisher keeps zone maps out of membership-only targe
                                    {.emit_zone_map_filters = true}};
 
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.zone_map_filters_built == 1);
 
   auto const scan_snapshot = filters_on_column(*scan_channel, kProbeColumnIndex);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(scan_snapshot) == 1);
@@ -1587,8 +1594,10 @@ TEST_CASE("dynamic-filter publisher completes on a plan with targets but no admi
   dynamic_filter_publish_plan plan{{}, std::move(targets), std::move(fixture.replica_spaces)};
   REQUIRE(plan.enabled());
 
-  // A producer whose keys were all inadmissible still claims publication and publishes nothing.
+  // A plan with no admitted keys completes and publishes nothing.
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.keys_considered == 0);
+  REQUIRE(outcome.filters_pushed == 0);
   REQUIRE_FALSE(channel->has_filters());
 }
 

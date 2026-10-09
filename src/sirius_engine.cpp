@@ -109,17 +109,17 @@ std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_c
 }  // namespace
 
 sirius_engine::sirius_engine(duckdb::ClientContext& context,
-                             sirius_interface& sirius_iface,
-                             sirius::query_id_t query_id)
+                             sirius::query_id_t query_id,
+                             const std::optional<std::string>& query_label,
+                             const std::optional<std::string>& session_label)
   : context(context),
-    sirius_iface(sirius_iface),
     query_id_(query_id),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
     query_handle_(quent::query::create(
       telemetry_context_->context(),
       quent::query::Init{
-        .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
-        .query_group_id = telemetry_context_->query_group_id_for(sirius_iface.session_label),
+        .instance_name  = query_label.value_or("unnamed_query"),
+        .query_group_id = telemetry_context_->query_group_id_for(session_label),
       }))
 {
 }
@@ -209,19 +209,27 @@ void sirius_engine::execute()
 
   // This query's completion signal. Owned here, shared down to every task via its pipeline's
   // global state, so no cross-query subsystem holds a "current query" handler.
-  completion_handler_ = std::make_shared<pipeline::completion_handler>();
-  auto future         = completion_handler_->get_awaitable();
+  completion_handler_ = sirius_ctx->window_completion(query_id_);
+  if (!completion_handler_) {
+    throw std::logic_error("execution requires a live window completion handler");
+  }
+  auto future = completion_handler_->get_awaitable();
 
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
-  query_ = sirius_ctx->create_query(std::move(new_scheduled),
-                                    query_id_,
-                                    completion_handler_,
-                                    telemetry::query_telemetry_info{
-                                      .telemetry_query_id = telemetry_uuid,
-                                      .worker_id          = telemetry_context_->worker_id(),
-                                      .query_id           = query_id_,
-                                    });
-  sirius_ctx->get_task_scheduler().start_query(*query_);
+  try {
+    query_ = sirius_ctx->create_query(std::move(new_scheduled),
+                                      query_id_,
+                                      completion_handler_,
+                                      telemetry::query_telemetry_info{
+                                        .telemetry_query_id = telemetry_uuid,
+                                        .worker_id          = telemetry_context_->worker_id(),
+                                        .query_id           = query_id_,
+                                      });
+    sirius_ctx->get_task_scheduler().start_query(*query_);
+  } catch (...) {
+    // Prepare/start failures and asynchronous failures compete for the same terminal winner.
+    completion_handler_->report_error(std::current_exception());
+  }
   try {
     future.get();
     sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);

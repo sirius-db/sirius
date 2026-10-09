@@ -58,7 +58,7 @@
 # Environment overrides (all optional):
 #   P22_SANITIZER_LOG  - log output path (default: /tmp/p22_sanitizer.log)
 #   P22_UNITTEST_BIN   - path to sirius_unittest
-#                        (default: build/release/extension/sirius/test/cpp/sirius_unittest)
+#                        (default: build/release/test/cpp/sirius_unittest)
 #   P22_QUERY          - Catch2 test name to run
 #                        (default: 'gpu_execution - TPC-H Query 11 parquet')
 #   P22_TIMEOUT_SEC    - sanitizer wall-clock budget seconds (default: 600)
@@ -73,7 +73,7 @@ if [[ -z "${CUDA_BIN}" ]]; then
 fi
 
 LOG="${P22_SANITIZER_LOG:-/tmp/p22_sanitizer.log}"
-UNIT="${P22_UNITTEST_BIN:-build/release/extension/sirius/test/cpp/sirius_unittest}"
+UNIT="${P22_UNITTEST_BIN:-build/release/test/cpp/sirius_unittest}"
 SF1_QUERY="${P22_QUERY:-gpu_execution - TPC-H Query 11 parquet}"
 TIMEOUT_SEC="${P22_TIMEOUT_SEC:-600}"
 

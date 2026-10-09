@@ -878,7 +878,6 @@ namespace {
 // Defined alongside probe_column below; used by decompress_column's route
 // checks and the dictionary fast path.
 NodeId root_value_producer(PlanTree const& tree);
-bool mask_consume_selection_root(PlanTree const& tree);
 
 // A compacted bitpack decode enumerates survivors from the index list rather than the mask bits.
 bool uses_index_walk(PlanTree const& tree, decode_selection const& sel)
@@ -939,12 +938,13 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
     frame.stream(),
     frame.mr());
   auto* const char_data = out_chars.data();
-  auto output           = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRING},
-                                               survivors,
-                                               std::move(out_chars),
-                                               rmm::device_buffer{},
-                                               0,
-                                               std::move(children));
+  auto output           = std::make_unique<cudf::column>(
+    cudf::data_type{cudf::type_id::STRING},
+    survivors,
+    std::move(out_chars),
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr()),
+    0,
+    std::move(children));
   if (survivors != 0) {
     launch_decode_fused_tree_dict_gather(*region.built.tree,
                                          region.labeled,
@@ -1028,7 +1028,11 @@ std::unique_ptr<cudf::column> decode_str_split_selected(PlanTree const& tree,
   auto* destination = output_chars.data();
   // The output takes the offsets before the copy below reads them through `offset_data`.
   auto output = cudf::make_strings_column(
-    survivors, std::move(offsets), std::move(output_chars), 0, rmm::device_buffer{});
+    survivors,
+    std::move(offsets),
+    std::move(output_chars),
+    0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr()));
   if (survivors > 0 && total_chars > 0) {
     launch_masked_char_copy(chars.head<void>(),
                             static_cast<std::int64_t const*>(source_offsets.data()),
@@ -1255,12 +1259,6 @@ bool delta_selection_root(PlanTree const& tree)
     }
   }
   return false;  // raw-passthrough differences: not a rendered mask_consume shape
-}
-
-// Any root region the mask_consume launcher renders.
-bool mask_consume_selection_root(PlanTree const& tree)
-{
-  return bitpack_selection_root(tree) || delta_selection_root(tree);
 }
 
 std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree)

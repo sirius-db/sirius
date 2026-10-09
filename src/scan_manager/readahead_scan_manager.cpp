@@ -19,6 +19,8 @@
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "planner/query.hpp"
 #include "planner/query_index.hpp"
@@ -40,6 +42,7 @@ readahead_scan_manager::~readahead_scan_manager() { stop(); }
 
 void readahead_scan_manager::prepare_for_query(const sirius::planner::query& query)
 {
+  _query_token     = sirius::value_of(query.query_id());
   auto scan_orders = query.get_scan_operators();
 
   size_t index = 0;
@@ -194,6 +197,19 @@ void readahead_scan_manager::register_scan_task(std::shared_ptr<op::scan::scan_i
   auto op_index        = _operator_id_to_queue_index.at(operator_id);
   auto& prefetch_queue = _ordered_work_queues.at(op_index);
   prefetch_queue->push(task);
+  if (_physical_counters && _physical_counters->track_units) {
+    try {
+      if (auto const* parquet = dynamic_cast<op::scan::parquet_split_info const*>(task.get())) {
+        std::vector<std::string_view> seen;
+        for (auto const& slice : parquet->rg_slices) {
+          if (std::ranges::find(seen, slice.file_path) != seen.end()) continue;
+          seen.emplace_back(slice.file_path);
+          _physical_counters->readahead_registration(_query_token, slice.file_path);
+        }
+      }
+    } catch (...) {  // Test observation must not affect a published split.
+    }
+  }
 }
 
 void readahead_scan_manager::mark_operator_closed(std::size_t operator_id)

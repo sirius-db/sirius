@@ -26,9 +26,7 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 ### `SIRIUS_DISABLE`
 
-`SIRIUS_DISABLE` is a process-startup kill switch for the **Super Sirius runtime**, not a query-fallback setting. Set `SIRIUS_DISABLE=1` before starting DuckDB to prevent that runtime from initializing and transparently routing queries to the GPU. The extension binary still loads and registers its SQL surface; legacy functions therefore remain available in builds that include them. Sirius also skips creating its Quent telemetry context and does not publish an automatic NVTX injection path. A caller-supplied `NVTX_INJECTION64_PATH` remains untouched.
-
-This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks. An unset value or `SIRIUS_DISABLE=0` enables normal Super Sirius initialization; any other set value disables it.
+Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
 
 ```bash
 export SIRIUS_DISABLE=1
@@ -107,6 +105,8 @@ sirius:
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
     enable_dynamic_filter: true    # scan and join-edge runtime filters
+    enable_dynamic_filter_multi_partition: true   # Bloom accumulation for multi-partition builds
+    max_dynamic_filter_bloom_bytes_per_gpu: 256Mi  # accumulated Bloom arrays across keys, per GPU
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip all filters for keys meeting known-domain coverage
     dynamic_filter_inlist_max_l2_fraction: 0.125  # hash-IN-list fraction of known probe-GPU L2 (0 = Bloom for non-small keys; 1.0 = full L2)
@@ -498,6 +498,10 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
 | `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
 
+### Programmatic S3 credentials
+
+S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` for SQL-managed credentials, or set an in-memory `io::object_store_config` through `sirius_config::set_object_store_config()` before initializing the scan manager. A matching secret takes precedence over this programmatic fallback. YAML containing `sirius.executor.scan_manager.object_store` is rejected.
+
 ## Operator Parameters
 
 **File:** `src/include/sirius_config.hpp` — `operator_params` struct
@@ -553,6 +557,7 @@ after that dependency is fixed.
 sirius:
   telemetry:
     enable_quent: true
+    enable_nvtx: false
     output_directory: telemetry_data
     engine_name: siriusDB
 ```
@@ -560,10 +565,11 @@ sirius:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
+| `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
 | `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
-| `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. |
+| `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. Used only when `enable_nvtx` is true. |
 
 Per-query labels are configured separately from YAML. They can be set with the
 `sirius_set_query_label` SQL function or inline with the `query_label` named
@@ -779,9 +785,13 @@ rejected as unknown, and the old `SET` variables no longer exist.
 |----------|---------|-------------|
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
+| `enable_dynamic_filter_multi_partition` | true | Accumulate a Bloom filter for a non-broadcast HASH build with more than one partition. Requires `enable_dynamic_filter`, a build fed through a FULL barrier (an `ORDER BY`-fed build never accumulates), and working peer DMA between every pair of replica GPUs. |
+| `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Cap on the accumulated Bloom arrays of one join on each GPU: the active keys times the array size rounded up to 256 bytes. Must be greater than zero: YAML loading and `SET` reject zero, and `enable_dynamic_filter_multi_partition` is the only switch that disables accumulation. A cap smaller than the required arrays records a size refusal. Whole-build publication is unaffected. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing either a membership filter or zone map, skip the key when the complete build covers at least this fraction of the key's unfiltered base-table row bound. Applies only to build keys proven unique in their base relation, with evidence from DuckDB-native scans. Values above 1.0 disable the gate; exactly 1.0 fires only at full coverage. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
+
+Accumulation holds each GPU's arrays, at most the cap, until safe release after build tasks drain; published filters can remain until query teardown. The arrays are not spillable. Publication also allocates short-lived scratch on the final PARTITION task's allocator: at most two transfer chunks (8 MiB each at most) per contributing non-root GPU. The task's ignore-limit policy may admit that scratch beyond its reservation against global capacity. Initialization admission failure or safely recoverable scratch OOM skips the optional filter. The multi-partition switch and byte cap are YAML settings; like the other switches in this section, their `SET` variables exist only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 
 The direct DuckDB session overrides are registered only when the process
 explicitly enables Sirius test options; they are not part of the normal user
@@ -857,45 +867,22 @@ SET enable_runtime_size_estimation = true;   -- off by default
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus explicit `CALL gpu_execution(...)`. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
 
-## Legacy Config Flags
-
-### Legacy-release DuckDB settings
-
-The following settings only control the legacy `gpu_processing` path. Sirius registers them
-when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset used by
-`make legacy-release`. Normal builds omit them from `duckdb_settings()` and reject attempts to
-`SET` them.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `use_pin_memory` | true | Use pinned memory for legacy CPU↔GPU transfers |
-| `use_pin_memory_for_caching` | false | Use pinned memory for the legacy scan cache |
-| `use_cudf_expr` | true | Use cuDF in the legacy expression executor |
-| `use_custom_top_n` | true | Use the legacy custom top-N kernel |
-| `use_opt_table_scan` | true | Use the legacy optimized table scan |
-| `opt_table_scan_num_streams` | 8 | CUDA streams used by the legacy optimized scan |
-| `opt_table_scan_memcpy_size` | 64 MiB | Copy chunk size used by the legacy optimized scan |
-| `print_gpu_table_max_rows` | 1000 | Maximum rows rendered by the legacy GPU-table printer |
-| `enable_fallback_check` | false | Enable legacy fallback validation |
-| `modified_pipeline` | false | Enable legacy modified-pipeline scheduling |
+## Compile-Time Config Flags
 
 ### Static flags
 
 **File:** `src/include/config.hpp`
 
-Static constants from `namespace duckdb::Config` (used by legacy Sirius) and `namespace sirius::Config`:
+Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 
 | Flag | Value | Namespace |
 |------|-------|-----------|
-| `USE_PIN_MEM_FOR_CPU_PROCESSING` | true | `duckdb::Config` |
-| `USE_PIN_MEM_FOR_CACHING` | false | `duckdb::Config` |
-| `USE_CUDF_EXPR` | true | `duckdb::Config` |
-| `ENABLE_DUCKDB_FALLBACK` | true | `duckdb::Config` |
+| `EXPRESSION_EVALUATOR_STRATEGY` | `ast_interpret` | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |
@@ -906,8 +893,8 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 
 | File | Purpose |
 |------|---------|
-| `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
-| `src/include/config.hpp` | Legacy config flags |
+| `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
+| `src/config.hpp` | Static config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
 | `src/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |

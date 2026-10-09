@@ -87,6 +87,7 @@ struct test_env {
 
 test_env& env()
 {
+  sirius::test::operator_utils::ensure_converter_registry();
   static test_env e;
   return e;
 }
@@ -209,10 +210,19 @@ sirius::op::scan::sirius_gpu_scan_operator make_bigint_scan(
   return sirius::op::scan::sirius_gpu_scan_operator{
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
     /*estimated_cardinality=*/0,
-    std::move(ingestible)};
+    std::move(ingestible),
+    /*contract_id=*/1};
 }
 
 constexpr std::size_t kRows = 8;
+
+void admit_fixture_resident_input(sirius::op::scan::scan_operator_input& input)
+{
+  sirius::op::scan::pin_validation validation;
+  validation.identity = validation.layout = validation.structure = {true, true};
+  input.resident_contract_id                                     = 1;
+  input.resident_validation                                      = validation;
+}
 
 }  // namespace
 
@@ -237,9 +247,10 @@ TEST_CASE("scan construction rejects an incomplete native carrier schema",
   types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
   types.push_back(sirius::logical_type::make_decimal(4, 2));
 
-  REQUIRE_THROWS_WITH(sirius::op::scan::sirius_gpu_scan_operator(std::move(types), 0, nullptr),
-                      Catch::Matchers::ContainsSubstring(
-                        "output column 1 (DECIMAL(4,2)) has no native cuDF carrier"));
+  REQUIRE_THROWS_WITH(
+    sirius::op::scan::sirius_gpu_scan_operator(std::move(types), 0, nullptr, /*contract_id=*/1),
+    Catch::Matchers::ContainsSubstring(
+      "output column 1 (DECIMAL(4,2)) has no native cuDF carrier"));
 }
 
 TEST_CASE("scan execute rejects a materialized column count its output types do not describe",
@@ -258,10 +269,27 @@ TEST_CASE("scan execute rejects a materialized column count its output types do 
 
   sirius::op::scan::scan_operator_input input(batch);
   input.gpu_memory_space = e.gpu_space;
+  admit_fixture_resident_input(input);
   REQUIRE(input.is_resident());
 
   REQUIRE_THROWS_WITH(scan.execute(input, e.stream()),
                       Catch::Matchers::ContainsSubstring("output schema width mismatch"));
+}
+
+TEST_CASE("scan execute rechecks resident query freshness",
+          "[scan_normalization][gpu_scan][certificate]")
+{
+  auto& e    = env();
+  auto batch = make_resident_batch(e, kRows);
+  auto scan  = make_bigint_scan(
+    std::make_shared<stub_ingestible>([] { return std::make_unique<cudf::table>(); }));
+  auto input              = std::make_unique<sirius::op::scan::scan_operator_input>(batch);
+  input->gpu_memory_space = e.gpu_space;
+  admit_fixture_resident_input(*input);
+  input->resident_validation->query_token = 17;
+  scan.set_query_validation(18, {});
+
+  REQUIRE_THROWS_AS(scan.execute(*input, e.stream()), sirius::op::scan::certificate_incomplete);
 }
 
 TEST_CASE("scan execute rejects a native carrier no restoring cast can reach its output type",
@@ -281,6 +309,7 @@ TEST_CASE("scan execute rejects a native carrier no restoring cast can reach its
 
   sirius::op::scan::scan_operator_input input(batch);
   input.gpu_memory_space = e.gpu_space;
+  admit_fixture_resident_input(input);
   REQUIRE(input.is_resident());
 
   REQUIRE_THROWS_WITH(scan.execute(input, e.stream()),
@@ -304,6 +333,7 @@ TEST_CASE("scan execute restores a narrowed resident carrier to its native outpu
 
   sirius::op::scan::scan_operator_input input(batch);
   input.gpu_memory_space = e.gpu_space;
+  admit_fixture_resident_input(input);
   REQUIRE(input.is_resident());
 
   auto output        = scan.execute(input, e.stream());
@@ -335,10 +365,13 @@ TEST_CASE("scan execute transactionally restores a fresh cached conversion",
   duckdb::vector<duckdb::LogicalType> logical_types;
   logical_types.push_back(duckdb::LogicalType::BIGINT);
   logical_types.push_back(duckdb::LogicalType::INTEGER);
-  sirius::op::scan::sirius_gpu_scan_operator scan{
-    sirius::from_duckdb_vec(logical_types), /*estimated_cardinality=*/0, ingestible};
+  sirius::op::scan::sirius_gpu_scan_operator scan{sirius::from_duckdb_vec(logical_types),
+                                                  /*estimated_cardinality=*/0,
+                                                  ingestible,
+                                                  /*contract_id=*/1};
 
   sirius::op::scan::scan_operator_input input(batch);
+  admit_fixture_resident_input(input);
   input.needs_carrier_conversion = true;
   input.prepare_for_processing(e.gpu_space, e.stream());
   REQUIRE(input.converted_table_steal_pending);

@@ -43,11 +43,11 @@ class pipeline_build_context {
   //!        probes.
   //! @param preserve_insertion_order Whether query results must preserve
   //!        insertion order (from DuckDB's PreserveInsertionOrderSetting).
-  //! @param num_gpus Number of GPUs available for partition-floor heuristics when constructing a
-  //!        context without an engine (primarily unit tests).
-  //!        Enables sirius_pipeline_converter::configure_partition_min_partitions
-  //!        to ensure big partition-consuming operators (hash_join,
-  //!        merge_group_by) get at least num_gpus partitions to spread work.
+  //! @param num_gpus Number of GPUs when constructing a context without an engine (primarily unit
+  //!        tests). Carries no GPU ids, so partitions stay unpinned; converting a plan with
+  //!        num_gpus > 1 through this constructor is rejected by
+  //!        sirius_pipeline_converter::configure_partition_consumers, which cannot place
+  //!        partitions without ids.
   //! @param operator_params Immutable per-query operator-policy snapshot. A null value installs a
   //!        fail-closed default snapshot.
   //! @param like_cache Query-owned cache shared by all copied contexts, pipelines, and task-local
@@ -104,9 +104,9 @@ class pipeline_build_context {
 
   [[nodiscard]] int num_gpus() const { return _num_gpus; }
 
-  //! Sorted, deduped device ids of the GPUs the query runs on — the same list task_creator routes
-  //! partitions across. Used by broadcast join partitioning to map a probe batch's residence GPU
-  //! back to its partition slot. Empty only when built through the engine-free test constructor.
+  //! Sorted, deduped device ids of the GPUs the query runs on. Handed to every partition consumer,
+  //! whose partition placements must stay within it. Empty only when built through the engine-free
+  //! test constructor.
   [[nodiscard]] const std::vector<int>& active_gpu_ids() const { return _active_gpu_ids; }
 
   [[nodiscard]] const std::shared_ptr<const telemetry::telemetry_context>& telemetry_context() const

@@ -14,6 +14,7 @@ target_sources(
           rest/rest_reactor.cpp
           rest/s3/list_parser.cpp
           rest/s3/sigv4.cpp
+          s3/duckdb_secret_config.cpp
           s3/sirius_httpfs.cpp
           rest/s3/sigv4_authorizer.cpp
           uring/uring_ioctx.cpp

@@ -22,6 +22,9 @@ TPC-H hot runs on AWS, 22 queries · best Sirius g7e size vs DuckDB on m9g.16xla
 
 ![TPC-H hot-run query time and cost per run on AWS: Sirius versus DuckDB](super-sirius-perf.png)
 
+For the legacy Sirius implementation used for the ClickBench results, see the
+[`legacy-dev` archive (pinned at `f79a6f42`)](https://github.com/sirius-db/sirius/tree/f79a6f423fe69ef892ca0af03bef9c352d88cc79).
+
 ## Requirements
 - Linux on amd64/x86_64 or arm64/aarch64 with `glibc >= 2.28`.
 - NVIDIA Turing or newer, with compute capability 7.5+.
@@ -34,6 +37,16 @@ TPC-H hot runs on AWS, 22 queries · best Sirius g7e size vs DuckDB on m9g.16xla
 - Git (to clone the repo)
 - Pixi (install instructions [here](https://pixi.sh/latest/installation/))
 
+## Installing a Prebuilt Sirius Release
+
+Getting started? Download one of our prebuilt extensions instead of building from source:
+
+- [`stable`](https://github.com/sirius-db/sirius/releases/tag/stable): a maintainer-selected build, promoted manually
+- [`latest`](https://github.com/sirius-db/sirius/releases/tag/latest): tracks the newest successful build on `main` automatically, possible to encounter breaking changes
+
+Both include full install instructions in the release notes: installing a matching DuckDB
+version, downloading the right binary for your platform, and a sample query to try it with.
+
 ## Building and Running Sirius
 
 For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
@@ -43,15 +56,15 @@ Quick start:
 ```bash
 git clone --no-recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
-git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+git submodule update --init --depth=1 --jobs 5 duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run make TEST_BUILD_TARGET=
-./build/release/duckdb
+pixi run duckdb
 ```
 
 Alternatively, load the extension into an existing DuckDB shell:
 
 ```sql
-LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';
 ```
 
 Either way, all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no query rewrites required. Queries with unsupported operators fall back silently to CPU.
@@ -101,7 +114,7 @@ con.execute("""
     SELECT * FROM read_parquet('/path/to/lineitem.parquet')
 """)
 
-con.execute("LOAD 'build/release/extension/sirius/sirius.duckdb_extension'")
+con.execute("LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension'")
 rows = con.execute("""
     SELECT l_returnflag, SUM(l_quantity) AS total_quantity
     FROM lineitem

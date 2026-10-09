@@ -5,7 +5,7 @@ This directory contains benchmarking, profiling, and performance testing tools f
 ## Prerequisites
 
 - Sirius must be built: `pixi run make -j12` (from project root)
-- Binary: `build/release/duckdb` with Sirius extension at `build/release/extension/sirius/sirius.duckdb_extension`
+- Binary: `sirius-duckdb/build/release/duckdb` with Sirius extension at `sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension`
 - Sirius config: `test/cpp/integration/integration.yaml` (set `SIRIUS_CONFIG_FILE` env var)
 - Parquet data must exist in `test_datasets/tpch_parquet_sf<N>/` (auto-generated if missing)
 
@@ -90,7 +90,7 @@ equivalent — which is sound precisely because the base data is byte-identical 
 
 ```bash
 # From project root - generates parquet files with DuckDB's default row groups (122K rows)
-./build/release/duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=100); EXPORT DATABASE 'test_datasets/tpch_parquet_sf100' (FORMAT PARQUET);"
+./sirius-duckdb/build/release/duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=100); EXPORT DATABASE 'test_datasets/tpch_parquet_sf100' (FORMAT PARQUET);"
 ```
 
 ### Rewriting parquet with GPU-optimized settings
@@ -120,7 +120,7 @@ All commands run from the **project root** directory.
 
 ### TPC-H benchmark with performance_test.py (primary runner)
 
-`performance_test.py` is the canonical TPC-H runner shared by the `benchmark` and `profile-analyzer` skills. With `--data-source parquet` (default) it registers TPC-H tables as parquet views over a single in-memory DuckDB connection per engine; with `--data-source duckdb` it opens a `.duckdb` file directly (read-only) and queries its native tables (GPU-native `seq_scan`). Either way it runs each query for N iterations and produces a structured per-query benchmark directory, and pinning works for both sources.
+`performance_test.py` is the canonical TPC-H runner shared by the `benchmark` and `profile-analyzer` skills. Pass `--scale-factor` explicitly so Q11's `FRACTION` parameter is rendered as `0.0001 / SF`; omitting it temporarily defaults to SF1 with a warning for compatibility. With `--data-source parquet` (default) it registers TPC-H tables as parquet views over a single in-memory DuckDB connection per engine; with `--data-source duckdb` it opens a `.duckdb` file directly (read-only) and queries its native tables (GPU-native `seq_scan`). Either way it runs each query for N iterations and produces a structured per-query benchmark directory, and pinning works for both sources.
 
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
@@ -128,32 +128,43 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 # Both engines, 2 iterations, hot cache (the default)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
+    --scale-factor 100 \
     --engine both --iterations 2
+
+# Parquet data on S3 (on EC2, attach an IAM role with ListBucket/GetObject access)
+pixi run python test/tpch_performance/performance_test.py \
+    --input s3://my-bucket/tpch_parquet_sf100/ \
+    --engine gpu --iterations 2
 
 # Sirius vs DuckDB result validation, queries 1/3/6 only
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # Per-query GPU-tier pinning
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
+    --scale-factor 100 \
     --engine gpu --iterations 3 --pin gpu
 
 # DuckDB native source from disk (both engines, validate). --input is a .duckdb FILE.
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf1.duckdb --data-source duckdb \
+    --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # DuckDB native source, pinned into the GPU cache
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf100.duckdb --data-source duckdb \
+    --scale-factor 100 \
     --engine gpu --iterations 3 --pin gpu
 
 # Cold-start measurement (per-query OS cache drop + reset_sirius_cache();
 # requires passwordless sudo)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf10 \
+    --scale-factor 10 \
     --engine gpu --iterations 2 --profile cold
 
 # Warm-but-contended: caches fill and stay filled, LRU retention, round-robin
@@ -164,16 +175,19 @@ pixi run python test/tpch_performance/performance_test.py \
 # nsys profiling (one .nsys-rep + .sqlite per query under <bench>/sirius/q<N>/)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --engine gpu --iterations 2 --precmd nsys --queries 1,3,6
 
 # Batch-mode GDB (one gdb_stdout.txt with an automatic crash backtrace per query)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --engine gpu --iterations 1 --precmd gdb --queries 6
 
 # S3 prefix instead of a local directory (--engine gpu only; see below)
 pixi run python test/tpch_performance/performance_test.py \
     --input s3://<bucket>/datasets/tpch_sf1 \
+    --scale-factor 1 \
     --engine gpu --iterations 2 --config /path/to/sirius_s3.yaml
 ```
 
@@ -242,25 +256,23 @@ is the default in-process benchmark path.
 
 #### Benchmarking over S3
 
-`--input` accepts an `s3://` prefix holding one `<table>/` subdirectory per TPC-H
-table; the views become `read_parquet('s3://…/<table>/*.parquet')` and Sirius's
-`sirius_httpfs` expands the glob with `ListObjectsV2` at bind time.
+`--input` accepts an `s3://bucket/prefix` containing TPC-H Parquet files,
+including per-table subdirectories. Boto3 discovers the exact keys and the
+runner registers views over those keys.
 
-- **GPU only.** S3 has no CPU fallback (`src/sirius_context.cpp`,
-  `throw_if_s3_no_cpu_fallback`), so `--engine cpu|both`, `--validation`, and
-  `--pin` are rejected for an `s3://` input. Validate against a local copy of the
-  same data instead.
-- **Credentials must be in the Sirius YAML.** Sirius does not read the
-  environment, AWS profiles, or IMDS (`docs/super-sirius/scan.md`,
-  "Configuration") — put `endpoint` / `region` / `access_key` / `secret_key`
-  (plus `session_token` for temporary credentials) under
-  `sirius.executor.scan_manager.object_store` and pass the file via `--config`.
-  Endpoint must be the regional form `https://s3.<region>.amazonaws.com`.
-- The harness disables DuckDB's extension autoloading for `s3://` inputs so
-  DuckDB's own `httpfs` cannot claim the scheme ahead of `sirius_httpfs`.
+- Boto3 obtains credentials from the normal AWS chain, including EC2 instance
+  roles. The runner creates a scoped `SIRIUS_S3` secret before GPU view creation
+  and refreshes it between timed queries. No credentials go into YAML or result
+  artifacts.
+- A CPU comparison uses DuckDB's `httpfs` extension and its `S3` secret. This
+  is a benchmark-only requirement, not a Sirius dependency.
+- The GPU connection disables extension autoloading so `httpfs` cannot claim
+  `s3://` ahead of Sirius's filesystem. S3 data has no local OS page cache to
+  evict; the runner skips the OS cache drop for it.
 
 Key flags:
-- `--data-source parquet|duckdb` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works with every runner, and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.)
+- `--scale-factor SF` — dataset scale used to render Q11's `0.0001 / SF` threshold. Pass it explicitly; omission defaults to SF1 with a warning for rollout compatibility.
+- `--data-source parquet|duckdb` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`), and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.)
 - `--engine gpu|cpu|both` — which engine to benchmark.
 - `--iterations N` — per-query iteration count.
 - `--profile cold|lukewarm|hot` (optional) — cache state to measure; see "Profiles" above. When given it overrides `cache.mode` / `cache.eviction` in `--config`; when omitted the config is left alone.
@@ -320,9 +332,7 @@ When passed `--pinning-mode per-query`, the Sirius engine wraps each query block
 
 The per-query column-set is sourced from `tpch_pin_columns.py` (must be a superset of every column the query references, otherwise the scan falls through to disk). The pin path is a glob whose `FileSystem::GlobFiles` expansion must equal the file list of the corresponding `CREATE VIEW … read_parquet([…])` — otherwise `sirius_scan_manager::create_provider_for` will not match and the cache is silently bypassed.
 
-```bash
-echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches
-```
+The OS page cache drop in `performance_test.py` uses `posix_fadvise(DONTNEED)` on the dataset files, so no sudo is needed. (The `run_tpch_*.sh` scripts still use `sudo tee /proc/sys/vm/drop_caches`.)
 
 Output layout (under `--output` root, default `test/tpch_performance/output/`):
 
@@ -354,7 +364,8 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
 ```
 <bench>/                              # tpch_<ts>_<profile-or-precmd>_<engine>_iter<N>[_<name>]
-  metadata.json                       # commit, branch, date, precmd, iterations, engine, data_source, queries, pin
+  metadata.json                       # commit, branch, scale_factor, profile, precmd, engine, queries, pin
+  queries/q<N>.sql                    # effective SQL after scale-aware rendering
   csv/runtimes.csv                    # engine,query,iteration,runtime_s
   log_dir/sirius_<YYYY-MM-DD>.log     # combined Sirius spdlog (non-profile mode)
   <engine>/q<N>/result.txt            # fetched rows, one repr(row) per line (last iter wins)
@@ -378,7 +389,7 @@ Results are saved as one CSV per configuration under a unique timestamped direct
 
 ### Legacy shell runners
 
-The shell runners (`benchmark_and_validate.sh`, `run_tpch_parquet.sh`, `run_tpch_parquet_duckdb.sh`, `run_tpch_legacy.sh`, `profile_tpch_nsys.sh`) remain in the tree for backward compatibility with CI (`.github/workflows/test.yml`) and `.ai-helper/commands.yaml`, but are superseded by `performance_test.py`. New work — and the `benchmark` / `profile-analyzer` / `optimization-advisor` skills — should use the Python runner.
+The shell runners (`benchmark_and_validate.sh`, `run_tpch_parquet.sh`, `run_tpch_parquet_duckdb.sh`, `profile_tpch_nsys.sh`) remain in the tree for backward compatibility with CI (`.github/workflows/test.yml`), but are superseded by `performance_test.py`. New work — and the `benchmark` / `profile-analyzer` / `optimization-advisor` skills — should use the Python runner.
 
 ## Power & Throughput Run (TPC-H refresh functions)
 
@@ -648,6 +659,7 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --engine gpu --iterations 2 --precmd nsys --queries 1,3,6
 ```
 
@@ -744,10 +756,7 @@ The Sirius config file (`test/cpp/integration/integration.yaml`) controls:
 - **Host memory**: `capacity_bytes`, `initial_number_pools`, `pool_size`, `block_size`
   - Initial allocation = `initial_number_pools * pool_size * block_size`
 - **Thread pools**: `pipeline`, `task_creator`, `downgrade` thread counts
-- **Cold-run benchmarking**: pass `--profile cold` to `performance_test.py` to drop the OS filesystem cache and reset Sirius's prefetching cache before every run. Requires one-time passwordless sudo setup:
-  ```bash
-  echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches
-  ```
+- **Cold-run benchmarking**: pass `--profile cold` to `performance_test.py` to drop the OS filesystem cache and reset Sirius's prefetching cache before every run. The page cache is evicted per dataset file with `posix_fadvise(DONTNEED)`; no sudo needed.
 
 ## Parquet Format Notes
 

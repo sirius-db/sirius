@@ -123,16 +123,9 @@ void generate_parquet_surface(fs::path const& tmp_dir, int num_files, int rows_p
 }  // namespace
 
 TEST_CASE("gpu_execution - table_gpu cache warm cross-GPU hazard (follow-up #17)",
-          "[mgpu][followup-17][gpu_execution]")
+          "[mgpu][followup-17][gpu_execution][multi_gpu]")
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN(
-      "follow-up #17 repro requires >=2 GPUs; single-GPU host — skipping "
-      "(per Catch2 WARN+return convention)");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   // The Catch2 listener in unittest.cpp pauses shared envs for TEST_CASEs
   // without [shared_context] or [integration] tags. Be defensive: walk the

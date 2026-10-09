@@ -31,7 +31,7 @@ quote = "1"
 syn = { version = "3", features = ["full", "parsing"] }
 substrait = { version = "0.65.0", features = ["protox"] }
 thiserror = "2"
-thrift = "0.24"
+thrift = "0.25"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }

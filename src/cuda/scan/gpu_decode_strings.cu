@@ -49,7 +49,8 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
-#include <cub/cub.cuh>
+#include <cub/device/device_scan.cuh>
+#include <cuda/cmath>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -366,32 +367,33 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
                           stream);
 
   // All-valid → overlay UNCOMPRESSED validity → fold in DICT_FSST inline NULLs.
-  rmm::device_buffer null_mask{};
+  auto null_mask             = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   cudf::size_type null_count = 0;
   bool need_mask             = col.has_nulls || prep_dict_fsst.any_inline_nulls;
   if (need_mask) {
     null_mask = cudf::create_null_mask(
       static_cast<cudf::size_type>(total_rows), cudf::mask_state::ALL_VALID, stream, mr);
     for (auto const& run : col.validity) {
-      overlay_validity_run(run, static_cast<uint8_t*>(null_mask.data()), stream);
+      overlay_validity_run(run, reinterpret_cast<uint8_t*>(null_mask.data()), stream);
     }
     if (prep_dict_fsst.any_inline_nulls) {
       launch_dict_fsst_mark_nulls(d_dict_fsst_p,
-                                  static_cast<uint8_t*>(null_mask.data()),
+                                  reinterpret_cast<uint8_t*>(null_mask.data()),
                                   static_cast<uint32_t>(prep_dict_fsst.descs.size()),
                                   stream);
     }
-    null_count = cudf::null_count(static_cast<cudf::bitmask_type const*>(null_mask.data()),
+    null_count = cudf::null_count(reinterpret_cast<cudf::bitmask_type const*>(null_mask.data()),
                                   0,
                                   static_cast<cudf::size_type>(total_rows),
                                   stream);
   }
 
-  auto offsets_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
-                                                    static_cast<cudf::size_type>(total_rows + 1u),
-                                                    d_offsets.release(),
-                                                    rmm::device_buffer{0, stream, mr},
-                                                    0);
+  auto offsets_col = std::make_unique<cudf::column>(
+    cudf::data_type{cudf::type_id::INT32},
+    static_cast<cudf::size_type>(total_rows + 1u),
+    d_offsets.release(),
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+    0);
 
   RMM_CUDA_TRY(cudaPeekAtLastError());
   return cudf::make_strings_column(static_cast<cudf::size_type>(total_rows),

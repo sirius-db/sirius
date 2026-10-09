@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "helper/cuda_launch_error.hpp"
 #include "late_mat/port_materialize.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
@@ -463,6 +464,17 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
         .reservation_resource_id     = _reservation_tier_resource_id,
         .reservation_capacity_bytes  = _reservation_bytes,
       });
+      if (auto completion = get_completion_handler(); completion && completion->injections) {
+        auto const& inject = *completion->injections;
+        if (inject.gpu_task_oom &&
+            completion->injected_oom_attempts.fetch_add(1) < inject.gpu_task_oom)
+          throw rmm::out_of_memory("injected GPU task OOM");
+        if (inject.gpu_task_launch_error &&
+            completion->injected_launch_attempts.fetch_add(1) < inject.gpu_task_launch_error)
+          throw thrust::system_error(static_cast<int>(cudaErrorLaunchOutOfResources),
+                                     thrust::cuda_category(),
+                                     "injected GPU task launch failure");
+      }
       operator_input_output_data = run_one_operator(
         op, *operator_input_output_data, stream, pipeline, _task_id, operators.size(), _allocator);
     } catch (const rmm::out_of_memory& oom) {
@@ -527,7 +539,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
         "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
     } catch (const thrust::system_error& cuda_err) {
       auto err = static_cast<cudaError_t>(cuda_err.code().value());
-      if (err == cudaErrorLaunchOutOfResources || err == cudaErrorInvalidValue) {
+      if (is_retryable_launch_error(err)) {
         SIRIUS_LOG_WARN(
           "Pipeline {}: CUDA launch error [{}] {} at operator {} (id={}, index {}/{}), "
           "rescheduling task {}",
@@ -588,7 +600,12 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data,
                                   sink_operators->get_operator_id());
     nvtx_scoped_range nvtx_range{nvtx_label.c_str()};
     auto const sink_start = std::chrono::high_resolution_clock::now();
+    auto completion       = get_completion_handler();
+    const bool observe_publication =
+      completion && completion->injections && completion->injections->hold_footer_index &&
+      (materialized ? *materialized : output_data).get_estimated_size_in_bytes() > 0;
     sink_operators.get()->sink(materialized ? *materialized : output_data, stream);
+    if (observe_publication) completion->record_publication_for_testing();
     auto const sink_end = std::chrono::high_resolution_clock::now();
     auto const sink_duration =
       std::chrono::duration_cast<std::chrono::microseconds>(sink_end - sink_start);
@@ -695,7 +712,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
                      pipeline->get_pipeline_id());
     throw oom_reschedule_exception(
       std::move(local_state._input_data),
-      0,
+      local_state._start_operator_index,
       std::string("OOM while preparing batches for processing: ") + oom.what());
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Unknown error in prepare_for_processing for pipeline {}: {}",
@@ -811,8 +828,9 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
         }
       }
       auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-      // Mid-pipeline retries use intermediate input units and must not affect the aggregate ratio.
-      // An OOM before processing restarts at index 0 with the original input and remains eligible.
+      // A prepare OOM resumes at the attempt's current start index. Only a start index of 0 keeps
+      // the original input and remains ratio-eligible. Mid-pipeline retries use intermediate input
+      // units and must not affect the aggregate ratio.
       bool const ratio_eligible = local_state._start_operator_index == 0;
       global.get_memory_history().record({input_basis, peak_bytes, output_bytes, ratio_eligible});
       SIRIUS_LOG_TRACE(

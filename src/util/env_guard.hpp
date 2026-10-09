@@ -26,8 +26,8 @@ namespace util {
  * @brief RAII guard for a process environment variable.
  *
  * On construction the variable named @p name is set to @p value (overwriting any
- * existing value). On destruction the variable is restored to whatever state it
- * had before this guard was constructed: its previous value if it was set, or
+ * existing value), or unset if @p value is empty. On destruction the variable is restored to
+ * whatever state it had before this guard was constructed: its previous value if it was set, or
  * unset if it was not previously present.
  *
  * Move-only. A moved-from guard is inert and restores nothing.
@@ -39,8 +39,9 @@ namespace util {
  */
 class env_guard {
  public:
-  /// \brief Set \p name to \p value, remembering the prior state for restoration.
-  env_guard(std::string name, const std::string& value);
+  /// \brief Set \p name to \p value, or unset it if \p value is empty, remembering the prior
+  /// state for restoration.
+  env_guard(std::string name, const std::optional<std::string>& value);
 
   /// \brief Restore \p name to its prior state (previous value, or unset).
   ~env_guard();

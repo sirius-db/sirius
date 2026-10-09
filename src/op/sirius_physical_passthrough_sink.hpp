@@ -27,9 +27,9 @@ namespace op {
 //! unchanged into the downstream UNION's per-arm input port. It replaces the join's
 //! `PARTITION -> CONCAT` feeder chain, which a bag union needs neither half of.
 //!
-//! Emitting plain `pipelineable_operator_data` is the load-bearing part: with no `partition_idx`,
-//! `task_creator::create_task` selects a device by data locality rather than
-//! `partition_idx % num_gpus`, so each batch is consumed on the GPU its scan produced it on.
+//! Emitting plain `pipelineable_operator_data` is the load-bearing part: with no partition and no
+//! stamped device, `task_creator::create_task` selects a device by data locality rather than by a
+//! partition placement, so each batch is consumed on the GPU its scan produced it on.
 //! Pushing through the base `sink()` also means the receiving UNION need not be a
 //! `sirius_physical_partition_consumer_operator`.
 class sirius_physical_passthrough_sink : public sirius_physical_operator {

@@ -11,6 +11,7 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/version_config.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -73,6 +74,19 @@ inline std::string type_id_to_name(cudf::data_type const& type)
 namespace simpatico {
 
 class decode_frame;
+
+// cuDF 26.12 changed null masks to CUDA buffers, but column data still uses RMM.
+inline rmm::device_buffer copy_bitmask_as_data(cudf::column_view const& source,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  auto mask = cudf::copy_bitmask(source, stream, mr);
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+  return rmm::device_buffer(mask.data(), mask.size(), stream, mr);
+#else
+  return mask;
+#endif
+}
 
 struct compressible_output {
   std::string name;
@@ -368,12 +382,16 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   void ensure_null_mask_copy(cudf::column_view const& source, ::cuda::stream_ref stream) const
   {
     if (null_mask_copy) return;
-    auto mr                 = rmm::mr::get_current_device_resource_ref();
-    rmm::device_buffer bits = cudf::copy_bitmask(source, stream, mr);
+    auto mr   = rmm::mr::get_current_device_resource_ref();
+    auto bits = copy_bitmask_as_data(source, stream, mr);
     auto const mask_bytes =
       static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(source.size()));
-    null_mask_copy = std::make_unique<cudf::column>(
-      cudf::data_type{cudf::type_id::UINT8}, mask_bytes, std::move(bits), rmm::device_buffer{}, 0);
+    null_mask_copy =
+      std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
+                                     mask_bytes,
+                                     std::move(bits),
+                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                     0);
     cudaStreamSynchronize(stream.get());
   }
 };
@@ -466,7 +484,7 @@ struct nvcomp_payload_rep : standalone_compressed_representation {
       std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
                                      static_cast<cudf::size_type>(comp_sz),
                                      data ? std::move(*data) : rmm::device_buffer{},
-                                     rmm::device_buffer{},
+                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                      0));
   }
 

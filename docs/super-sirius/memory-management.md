@@ -77,6 +77,8 @@ Pipeline tasks acquire memory reservations before execution to prevent GPU OOM:
 3. During execution, operators allocate within the reservation
 4. Reservations are released when the task completes
 
+Multi-partition dynamic filters allocate persistent per-GPU Bloom arrays under exact non-blocking initialization leases on an untracked creator thread. Publication runs inside the final PARTITION task: its bounded scratch uses that task's allocator, reservation accounting, and recorded peak. The existing ignore-limit policy can admit scratch beyond the reservation against global capacity; a safely recoverable refusal skips the optional filter. After build tasks and retries drain, the eligible build PARTITION finalizer closes accumulation before releasing retained arrays and completed wrappers without crediting a task tracker; hash-join finalization repeats this cleanup as a fallback. Input batches may spill and re-upgrade with stable original identity; the raw Bloom arrays cannot spill. See [Dynamic Filters](dynamic-filters.md#multi-partition-build-accumulation).
+
 ### `reservation_aware_resource_adaptor`
 
 Wraps RMM device memory resource. On each allocation:

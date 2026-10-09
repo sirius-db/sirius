@@ -5,6 +5,7 @@
 #include "codegen/util/stream_pool.hpp"
 #include "util/host_observation.hpp"
 
+#include <cudf/null_mask.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <algorithm>
@@ -27,7 +28,8 @@ std::unique_ptr<cudf::column> restore_type(std::unique_ptr<cudf::column> column,
   auto const rows  = column->size();
   auto const nulls = column->null_count();
   auto contents    = column->release();
-  auto mask        = contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
+  auto mask        = contents.null_mask ? std::move(*contents.null_mask)
+                                        : cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED);
   return std::make_unique<cudf::column>(
     stored, rows, std::move(*contents.data), std::move(mask), nulls, std::move(contents.children));
 }

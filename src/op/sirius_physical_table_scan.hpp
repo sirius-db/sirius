@@ -22,11 +22,16 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
+#include <optional>
 
 namespace sirius {
+namespace transparent {
+class read_view_registry;
+}
 namespace op {
 
 class sirius_dynamic_filter_set;
@@ -74,10 +79,13 @@ class sirius_physical_table_scan : public sirius_physical_operator {
                              std::size_t estimated_cardinality,
                              duckdb::ExtraOperatorInfo extra_info,
                              duckdb::vector<duckdb::Value> parameters,
-                             duckdb::virtual_column_map_t virtual_columns);
+                             duckdb::virtual_column_map_t virtual_columns,
+                             duckdb::vector<duckdb::LogicalType> duckdb_types = {});
 
   //! The table function
   duckdb::TableFunction function;
+  //! Exact DuckDB output types, including nested child metadata, for the scan contract.
+  duckdb::vector<duckdb::LogicalType> duckdb_types;
   //! Bind data of the function
   duckdb::unique_ptr<duckdb::FunctionData> bind_data;
   //! The types of ALL columns that can be returned by the table function
@@ -137,8 +145,22 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Host-tier-backed and never-sidecared scans leave it false.
   bool sidecar_from_gpu_tier_pin = false;
 
-  //! A pinned entry serves this scan, so the ingestible's metadata walk can be deferred.
-  bool mvcc_pin_serves_scan = false;
+  //! Candidate binding captured from the exact scan object lowered at S1.
+  std::shared_ptr<sirius::op::scan::bound_read_view const> bound_view;
+  std::vector<std::string> contract_file_paths;
+  scan::leaf_set semantic_columns;
+  uint64_t delete_preparation_time_us = 0;
+  std::shared_ptr<sirius::transparent::read_view_registry> read_views;
+  uint64_t scan_node_id                          = 0;
+  duckdb::idx_t table_index                      = duckdb::DConstants::INVALID_INDEX;
+  sirius::op::scan::scan_contract_id contract_id = 0;
+  // Stamped while building the node so a pre-declined scan can receive a
+  // registry record without resolving or capturing a candidate read view.
+  std::optional<uint64_t> contract_window_id;
+  uint64_t contract_finalize_generation = 0;
+  bool host_export_available            = true;
+  std::optional<scan::pre_decline> pre_declined;
+  std::optional<scan::iceberg_delete_inventory> delete_inventory;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

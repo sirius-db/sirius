@@ -113,6 +113,10 @@ if [ -z "$SF" ] && [ -z "$PROFILE_DIR" ]; then
     usage
 fi
 
+# Dataset labels may include a suffix (e.g. 300_rg2m), but SQL parameters
+# need the numeric scale factor.
+SCALE_FACTOR="${SF%%_*}"
+
 if [ -n "$PROFILE_DIR" ] && [ ! -d "$PROFILE_DIR" ]; then
     echo "ERROR: Profile directory not found: $PROFILE_DIR" >&2
     exit 1
@@ -195,6 +199,7 @@ else
         pixi run python "$PROJECT_DIR/test/tpch_performance/performance_test.py"
         --precmd nsys
         --input "$INPUT"
+        --scale-factor "$SCALE_FACTOR"
         --data-source "$DATA_SOURCE"
         --engine gpu
         --iterations "$ITERATIONS"

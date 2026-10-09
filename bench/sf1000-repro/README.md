@@ -154,7 +154,7 @@ first-iteration cost fell 28.99 s → 10.50 s on a warm cache.
 - **~256 GB GPU.** Peak usage is **251.7 GB of 256 GB**. There is under 2 GB of headroom; this
   will not run on a smaller card without lowering `scan_task_batch_size` and re-tuning.
 - **~470 GB host RAM** for the host memory pool (`capacity_bytes` in the YAML).
-- The pixi environment (`pixi run …`). Do not use a bare `build/release/duckdb` — see *Gotchas*.
+- The pixi environment (`pixi run …`). Do not use a bare `sirius-duckdb/build/release/duckdb` — see *Gotchas*.
 
 ---
 

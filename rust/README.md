@@ -29,7 +29,7 @@ needs a GPU, and the runtime loader must find the linked library; until a
 dedicated `libsirius` is installed, point it at the build tree:
 
 ```bash
-LD_LIBRARY_PATH="$PWD/build/release/extension/sirius:$LD_LIBRARY_PATH" \
+LD_LIBRARY_PATH="$PWD/build/release:$LD_LIBRARY_PATH" \
   pixi run cargo test --manifest-path rust/Cargo.toml -p sirius -p sirius-sys
 ```
 

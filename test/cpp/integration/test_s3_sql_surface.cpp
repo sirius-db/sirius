@@ -11,10 +11,14 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/sirius_httpfs.hpp"
+#include "io/sirius_datasource.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "scan_manager/config.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
-#include "utils/s3_container.hpp"
+#include "utils/isolated_checkpoint_test.hpp"
+#include "utils/parquet_fixture_utils.hpp"
+#include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
@@ -25,6 +29,7 @@
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 
 #include <algorithm>
 #include <array>
@@ -39,7 +44,10 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iomanip>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -140,7 +148,7 @@ struct s3_test_env {
 
 std::optional<s3_test_env> load_s3_test_env()
 {
-  if (!sirius::test::ensure_s3_container_env()) { return std::nullopt; }
+  if (!sirius::test::ensure_s3_test_env()) { return std::nullopt; }
 
   auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
   auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
@@ -255,6 +263,19 @@ std::string read_text_file(fs::path const& path)
   return out.str();
 }
 
+std::vector<std::uint8_t> read_binary_file(fs::path const& path)
+{
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  REQUIRE(in);
+  auto const size = in.tellg();
+  REQUIRE(size >= 0);
+  std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+  in.seekg(0);
+  in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+  REQUIRE(in);
+  return bytes;
+}
+
 void load_sirius_extension(duckdb::DuckDB& db)
 {
   try {
@@ -282,7 +303,7 @@ struct sirius_memory_limits {
 sirius_memory_limits large_sirius_memory_limits(std::string cache_mode)
 {
   sirius_memory_limits limits;
-  limits.gpu_usage     = "5 GiB";
+  limits.gpu_usage     = "3 GiB";
   limits.host_capacity = "8 GiB";
   limits.disk_capacity = "32 GiB";
   limits.cache_mode    = std::move(cache_mode);
@@ -298,6 +319,16 @@ class sirius_config_env_guard {
                                    std::optional<std::string> ca_bundle    = std::nullopt,
                                    std::optional<bool> tls_verify          = std::nullopt)
   {
+    object_store_.endpoint       = endpoint.value_or(env.endpoint);
+    object_store_.region         = env.region;
+    object_store_.access_key     = env.access_key;
+    object_store_.secret_key     = env.secret_key;
+    object_store_.session_token  = env.session_token;
+    object_store_.ca_bundle_path = ca_bundle.value_or("");
+    object_store_.tls_verify     = tls_verify.value_or(false);
+    if (signing_mode.has_value()) {
+      REQUIRE(sirius::io::string_to_enum(*signing_mode, object_store_.s3_signing_mode));
+    }
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
       original_config_env_     = current;
@@ -313,7 +344,6 @@ class sirius_config_env_guard {
     fs::create_directories(dir_);
 
     std::ofstream out(config_path_);
-    auto const object_endpoint = endpoint.value_or(env.endpoint);
     out << "sirius:\n"
            "  space:\n"
            "    gpu:\n"
@@ -355,32 +385,6 @@ class sirius_config_env_guard {
       REQUIRE(sirius::scan_manager::enum_to_string(*limits.backend, backend_name));
       out << "      backend: " << backend_name << "\n";
     }
-    out << "      object_store:\n"
-           "        endpoint: "
-        << yaml_quote(object_endpoint)
-        << "\n"
-           "        region: "
-        << yaml_quote(env.region)
-        << "\n"
-           "        access_key: "
-        << yaml_quote(env.access_key)
-        << "\n"
-           "        secret_key: "
-        << yaml_quote(env.secret_key) << "\n";
-    if (!env.session_token.empty()) {
-      out << "        session_token: " << yaml_quote(env.session_token) << "\n";
-    }
-    if (signing_mode.has_value()) {
-      out << "        signing_mode: " << yaml_quote(*signing_mode) << "\n";
-    }
-    if (ca_bundle.has_value() && !ca_bundle->empty()) {
-      out << "        ca_bundle_path: " << yaml_quote(*ca_bundle) << "\n";
-    }
-    if (tls_verify.has_value()) {
-      out << "        tls_verify: " << (*tls_verify ? "true" : "false") << "\n";
-    } else {
-      out << "        tls_verify: false\n";
-    }
     out << "      rest:\n"
            "        request_timeout_s: 30\n";
     if (limits.rest_footer_probe_bytes.has_value()) {
@@ -413,10 +417,15 @@ class sirius_config_env_guard {
   }
 
   [[nodiscard]] fs::path const& config_path() const noexcept { return config_path_; }
+  [[nodiscard]] sirius::io::object_store_config const& object_store() const noexcept
+  {
+    return object_store_;
+  }
 
  private:
   fs::path dir_;
   fs::path config_path_;
+  sirius::io::object_store_config object_store_;
   std::string original_config_env_;
   std::string original_disable_env_;
   bool had_original_config_env_{false};
@@ -441,7 +450,10 @@ class s3_sql_fixture {
       con(db)
   {
     load_sirius_extension(db);
-    REQUIRE(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"));
+    auto context = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(context);
+    context->get_config().set_object_store_config(config_env.object_store());
+    context->get_scan_manager().install_s3_config("s3://" + env.bucket, config_env.object_store());
     setenv("SIRIUS_DISABLE", "1", 1);
   }
 
@@ -449,6 +461,35 @@ class s3_sql_fixture {
   duckdb::DuckDB db;
   duckdb::Connection con;
 };
+
+// Starts Sirius with no programmatic object-store fallback. Tests using this
+// fixture must make every S3 credential available through DuckDB secrets.
+class s3_secret_only_sql_fixture {
+ public:
+  explicit s3_secret_only_sql_fixture(s3_test_env const& env)
+    : config_env(env), db(nullptr), con(db)
+  {
+    load_sirius_extension(db);
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }
+
+  sirius_config_env_guard config_env;
+  duckdb::DuckDB db;
+  duckdb::Connection con;
+};
+
+std::string create_sirius_s3_secret_sql(s3_test_env const& env,
+                                        std::string_view name,
+                                        std::optional<std::string> scope = std::nullopt)
+{
+  auto sql = "CREATE SECRET " + std::string{name} + " (TYPE SIRIUS_S3";
+  if (scope.has_value()) { sql += ", SCOPE " + sql_quote(*scope); }
+  sql += ", KEY_ID " + sql_quote(env.access_key) + ", SECRET " + sql_quote(env.secret_key) +
+         ", REGION " + sql_quote(env.region) + ", ENDPOINT " + sql_quote(env.endpoint) +
+         ", USE_SSL " + (env.endpoint.rfind("https://", 0) == 0 ? "true" : "false");
+  if (!env.session_token.empty()) { sql += ", SESSION_TOKEN " + sql_quote(env.session_token); }
+  return sql + ")";
+}
 
 std::unique_ptr<duckdb::MaterializedQueryResult> require_query_ok(duckdb::Connection& con,
                                                                   std::string const& sql)
@@ -999,8 +1040,7 @@ TEST_CASE("internal sirius_read_parquet is registered as a one-argument table fu
   CHECK(result->GetValue(1, 0).ToString().find("VARCHAR") != std::string::npos);
 }
 
-TEST_CASE("S3 SQL config guard writes nested object_store options only when configured",
-          "[s3][config]")
+TEST_CASE("S3 SQL config guard keeps object-store credentials out of YAML", "[s3][config]")
 {
   s3_test_env env{"http://127.0.0.1:9000",
                   "",
@@ -1017,7 +1057,9 @@ TEST_CASE("S3 SQL config guard writes nested object_store options only when conf
     auto const yaml = read_text_file(guard.config_path());
     CHECK(yaml.find("executor:") != std::string::npos);
     CHECK(yaml.find("scan_manager:") != std::string::npos);
-    CHECK(yaml.find("object_store:") != std::string::npos);
+    CHECK(yaml.find("object_store:") == std::string::npos);
+    CHECK(yaml.find("temporary-access-key") == std::string::npos);
+    CHECK(yaml.find("temporary-secret-key") == std::string::npos);
     CHECK(yaml.find("session_token:") == std::string::npos);
     CHECK(yaml.find("signing_mode:") == std::string::npos);
   }
@@ -1026,8 +1068,11 @@ TEST_CASE("S3 SQL config guard writes nested object_store options only when conf
   {
     sirius_config_env_guard guard(env, {}, std::string{"header"});
     auto const yaml = read_text_file(guard.config_path());
-    CHECK(yaml.find("session_token: 'temporary-session-token'") != std::string::npos);
-    CHECK(yaml.find("signing_mode: 'header'") != std::string::npos);
+    CHECK(yaml.find("session_token:") == std::string::npos);
+    CHECK(yaml.find("signing_mode:") == std::string::npos);
+    CHECK(guard.object_store().session_token == "temporary-session-token");
+    CHECK(guard.object_store().s3_signing_mode ==
+          sirius::io::object_store_config::signing_mode::header);
   }
 }
 
@@ -1220,6 +1265,129 @@ TEST_CASE("transparent read_parquet over S3 routes to kvikio when backend is kvi
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
 }
 
+TEST_CASE("SIRIUS_S3 CREATE SECRET credentials are scoped and refreshed for Sirius scans",
+          "[s3][integration][sql][gpu_execution][secret]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  auto fixture_env       = *env;
+  fixture_env.access_key = "invalid-fallback-key";
+  fixture_env.secret_key = "invalid-fallback-secret";
+  s3_sql_fixture fixture(fixture_env);
+  set_gpu_execution(fixture.con, true);
+  auto const uri           = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto const scope         = sql_quote("s3://" + env->bucket + "/parquet/");
+  auto const outside_scope = sql_quote("s3://" + env->bucket + "/unrelated/");
+  auto create_secret       = [&](std::string const& name,
+                           std::string const& secret_scope,
+                           std::string const& key_id,
+                           std::string const& secret) {
+    return "CREATE OR REPLACE SECRET " + name + " (TYPE SIRIUS_S3, SCOPE " + secret_scope +
+           ", KEY_ID " + sql_quote(key_id) + ", SECRET " + sql_quote(secret) + ", REGION " +
+           sql_quote(env->region) + ", ENDPOINT " + sql_quote(env->endpoint) + ", USE_SSL " +
+           (env->endpoint.rfind("https://", 0) == 0 ? "true" : "false") + ")";
+  };
+
+  // An invalid credential scoped elsewhere must not shadow the matching
+  // secret. The successful GPU scan proves Sirius's own SIRIUS_S3 secret reaches
+  // its REST IO without relying on DuckDB's httpfs extension.
+  require_query_ok(
+    fixture.con, create_secret("s3_out_of_scope", outside_scope, "invalid-key", "invalid-secret"));
+  require_query_ok(fixture.con,
+                   create_secret("s3_matching", scope, env->access_key, env->secret_key));
+  auto const scan_sql = "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")";
+  auto scan           = require_query_ok(fixture.con, gpu_execution_sql(scan_sql));
+  REQUIRE(scan->RowCount() == 1);
+  CHECK(scan->GetValue(0, 0).GetValue<int64_t>() == 25);
+
+  // CREATE OR REPLACE changes future opens without requiring a new connection.
+  require_query_ok(
+    fixture.con,
+    create_secret("s3_matching", scope, "rotated-invalid-key", "rotated-invalid-secret"));
+  auto failed_scan = fixture.con.Query(gpu_execution_sql(scan_sql));
+  REQUIRE(failed_scan);
+  CHECK(failed_scan->HasError());
+  CHECK(failed_scan->GetError().find("rotated-invalid-secret") == std::string::npos);
+
+  require_query_ok(fixture.con,
+                   create_secret("s3_matching", scope, env->access_key, env->secret_key));
+  auto rescanned = require_query_ok(fixture.con, gpu_execution_sql(scan_sql));
+  CHECK(rescanned->GetValue(0, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("SIRIUS_S3 secret authenticates every file in an explicit parquet list",
+          "[s3][integration][sql][gpu_execution][secret]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_secret_only_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(
+    fixture.con,
+    create_sirius_s3_secret_sql(*env, "explicit_list", "s3://" + env->bucket + "/glob/multi/"));
+
+  auto const first  = sql_quote(s3_uri(env->bucket, "glob/multi/nation_a.parquet"));
+  auto const second = sql_quote(s3_uri(env->bucket, "glob/multi/nation_b.parquet"));
+  auto const scan_sql =
+    "SELECT count(*) FROM read_parquet([" + first + ", " + second + "], union_by_name=false)";
+  auto result = require_query_ok(fixture.con, gpu_execution_sql(scan_sql));
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 50);
+}
+
+TEST_CASE("SIRIUS_S3 secret authenticates an uppercase-scheme parquet glob",
+          "[s3][integration][sql][gpu_execution][secret][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_secret_only_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(
+    fixture.con, create_sirius_s3_secret_sql(*env, "uppercase_glob", "s3://" + env->bucket + "/"));
+
+  auto uri = s3_uri(env->bucket, "root_*.parquet");
+  uri.replace(0, 2, "S3");
+  auto const scan_sql = "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")";
+  auto result         = require_query_ok(fixture.con, scan_sql);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 50);
+}
+
+TEST_CASE("S3 LIST keeps its REST context alive while credentials rotate",
+          "[s3][integration][filesystem][secret][rotation]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& manager      = sirius_ctx->get_scan_manager();
+  auto const scope   = "s3://" + env->bucket;
+  auto const prefix  = scope + "/glob/multi/";
+  auto rotated       = fixture.config_env.object_store();
+  rotated.tls_verify = !rotated.tls_verify;
+
+  std::size_t pages = 0;
+  manager.list_objects_paged(prefix,
+                             /*page_size=*/1,
+                             [&](sirius::io::rest::s3::list_objects_v2_page const&) {
+                               ++pages;
+                               if (pages == 1) {
+                                 // Replacing the final scope retires the registry's owner of the
+                                 // old context. The LIST call must retain its own shared owner
+                                 // until all pages have been consumed.
+                                 manager.install_s3_config(scope, rotated);
+                               }
+                               return true;
+                             });
+  CHECK(pages >= 2);
+}
+
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
           "[s3][integration][sql][transparent][glob]")
 {
@@ -1240,6 +1408,56 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
   sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
+}
+
+TEST_CASE("transparent S3 glob refuses semantic type drift before decoding",
+          "[s3][integration][sql][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  sirius::test::scratch_dir dir("s3_schema_drift");
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  require_query_ok(con,
+                   "COPY (SELECT 1::INTEGER AS x UNION ALL SELECT 2) TO " +
+                     dir.file_literal("a.parquet") + " (FORMAT PARQUET)");
+  require_query_ok(con,
+                   "COPY (SELECT 2.5::DOUBLE AS x UNION ALL SELECT 17.5) TO " +
+                     dir.file_literal("b.parquet") + " (FORMAT PARQUET)");
+
+  auto read_bytes = [](std::string const& path) {
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE(in.is_open());
+    std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>{in},
+                                    std::istreambuf_iterator<char>{}};
+    REQUIRE_FALSE(in.bad());
+    REQUIRE_FALSE(bytes.empty());
+    return bytes;
+  };
+  auto const bytes_a = read_bytes(dir.file("a.parquet"));
+  auto const bytes_b = read_bytes(dir.file("b.parquet"));
+  if (!sirius::test::put_s3_test_object("schema-drift/a.parquet", bytes_a)) {
+    SUCCEED("managed SeaweedFS is required for the schema drift test");
+    return;
+  }
+  REQUIRE(sirius::test::put_s3_test_object("schema-drift/b.parquet", bytes_b));
+
+  auto before = sirius::test::get_transparent_execution_stats(fixture.con);
+  auto result =
+    fixture.con.Query("SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "schema-drift/*.parquet"));
+  REQUIRE(result);
+  INFO(result->ToString());
+  REQUIRE(result->HasError());
+  auto const error = result->GetError();
+  CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+  CHECK(error.find("Parquet column 'x' has unqualified type drift") != std::string::npos);
+  auto after = sirius::test::get_transparent_execution_stats(fixture.con);
+  CHECK(after.parquet_type_refusals == before.parquet_type_refusals + 1);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
 }
 
 TEST_CASE("transparent S3 glob opens the literal percent key instead of its slash decoy",
@@ -2408,6 +2626,178 @@ TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU"
   CHECK(error.find("no filesystem") == std::string::npos);
 }
 
+TEST_CASE("transparent S3 read-view mismatch preserves the source veto",
+          "[s3][integration][sql][transparent][fallback]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  REQUIRE_FALSE(fixture.con
+                  .Query("CREATE VIEW v_s3_read_view AS SELECT n_nationkey FROM " +
+                         s3_parquet_scan(*env, "nation"))
+                  ->HasError());
+  REQUIRE_FALSE(
+    fixture.con.Query("SET sirius_test_inject_read_view_mismatch = 'finalize'")->HasError());
+  for (auto const fallback : {true, false}) {
+    REQUIRE_FALSE(
+      fixture.con
+        .Query(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"))
+        ->HasError());
+    auto const before = sirius::test::get_transparent_execution_stats(fixture.con);
+
+    auto result = fixture.con.Query("SELECT sum(n_nationkey) FROM v_s3_read_view");
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+    CHECK(error.find("read-view mismatch") != std::string::npos);
+
+    auto const after = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
+    CHECK(after.fallbacks == before.fallbacks);
+    CHECK(after.executions == before.executions);
+  }
+}
+
+TEST_CASE("transparent S3 eligibility covers copy and SQL-replan correspondence",
+          "[s3][integration][sql][transparent][fallback]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  REQUIRE_FALSE(fixture.con
+                  .Query("CREATE VIEW v_s3_matrix AS SELECT n_nationkey FROM " +
+                         s3_parquet_scan(*env, "nation"))
+                  ->HasError());
+  auto const single = "SELECT sum(n_nationkey) FROM v_s3_matrix";
+  auto const multi =
+    "SELECT sum(a.n_nationkey + b.n_nationkey) "
+    "FROM v_s3_matrix a JOIN v_s3_matrix b USING (n_nationkey)";
+  struct optimizer_reset {
+    duckdb::Connection& connection;
+    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
+  } reset{fixture.con};
+
+  for (auto const fallback : {true, false}) {
+    CAPTURE(fallback);
+    REQUIRE_FALSE(
+      fixture.con
+        .Query(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"))
+        ->HasError());
+    for (auto const& query : {single, multi}) {
+      auto const before = sirius::test::get_transparent_execution_stats(fixture.con);
+      auto result       = fixture.con.Query(query);
+      REQUIRE(result);
+      REQUIRE_FALSE(result->HasError());
+      REQUIRE(result->GetValue(0, 0).ToString() == (query == single ? "300" : "600"));
+      auto const after = sirius::test::get_transparent_execution_stats(fixture.con);
+      sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+      CHECK(after.read_view_mismatches == before.read_view_mismatches);
+    }
+  }
+
+  REQUIRE_FALSE(fixture.con.Query("SET disabled_optimizers = 'extension'")->HasError());
+  for (auto const fallback : {true, false}) {
+    CAPTURE(fallback);
+    REQUIRE_FALSE(
+      fixture.con
+        .Query(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"))
+        ->HasError());
+
+    auto before = sirius::test::get_transparent_execution_stats(fixture.con);
+    auto result = fixture.con.Query(single);
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0).ToString() == "300");
+    auto after = sirius::test::get_transparent_execution_stats(fixture.con);
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    CHECK(after.read_view_mismatches == before.read_view_mismatches);
+
+    before = after;
+    result = fixture.con.Query(multi);
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+    CHECK(error.find("reason=no_correspondence") != std::string::npos);
+    CHECK(error.find("correspondence=none") != std::string::npos);
+    after = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
+    sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
+  }
+}
+
+TEST_CASE("transparent S3 execution rebuild preserves template origin and source veto",
+          "[s3][integration][sql][transparent][fallback]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  s3_sql_fixture fixture(*env);
+  auto& con = fixture.con;
+  set_gpu_execution(con, true);
+  REQUIRE_FALSE(con
+                  .Query("CREATE VIEW v_s3_rebuild AS SELECT n_nationkey FROM " +
+                         s3_parquet_scan(*env, "nation"))
+                  ->HasError());
+  struct restore_settings {
+    duckdb::Connection& con;
+    ~restore_settings()
+    {
+      con.Query("RESET disabled_optimizers");
+      con.Query("SET sirius_test_inject_read_view_mismatch = 'off'");
+      con.Query("SET sirius_test_inject_pin_registry_change = false");
+      con.Query("SET enable_duckdb_fallback = true");
+    }
+  } restore{con};
+  REQUIRE_FALSE(con.Query("SET sirius_test_inject_pin_registry_change = true")->HasError());
+  for (bool hooks : {false, true}) {
+    REQUIRE_FALSE(
+      con.Query(hooks ? "RESET disabled_optimizers" : "SET disabled_optimizers = 'extension'")
+        ->HasError());
+    REQUIRE_FALSE(con
+                    .Query(hooks
+                             ? "SET sirius_test_inject_read_view_mismatch = 'execute_copy_fails'"
+                             : "SET sirius_test_inject_read_view_mismatch = 'off'")
+                    ->HasError());
+    for (bool fallback : {true, false}) {
+      REQUIRE_FALSE(
+        con.Query(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"))
+          ->HasError());
+      for (bool multi : {false, true}) {
+        // Hooks-off multi-scan queries decline at finalize, already covered above.
+        if (!hooks && multi) continue;
+        CAPTURE(hooks, fallback, multi);
+        auto const before = sirius::test::get_transparent_execution_stats(con);
+        auto result =
+          con.Query(multi ? "SELECT sum(a.n_nationkey + b.n_nationkey) FROM v_s3_rebuild a "
+                            "JOIN v_s3_rebuild b USING (n_nationkey)"
+                          : "SELECT sum(n_nationkey) FROM v_s3_rebuild");
+        REQUIRE(result);
+        INFO((result->HasError() ? result->GetError() : "success"));
+        if (multi) {
+          REQUIRE(result->HasError());
+          CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+          CHECK(result->GetError().find("reason=no_correspondence") != std::string::npos);
+          CHECK(result->GetError().find("correspondence=none") != std::string::npos);
+        } else {
+          REQUIRE_FALSE(result->HasError());
+          CHECK(result->GetValue(0, 0).ToString() == "300");
+        }
+        auto const after = sirius::test::get_transparent_execution_stats(con);
+        CHECK(after.execution_rebuilds == before.execution_rebuilds + 1);
+        CHECK(after.read_view_mismatches == before.read_view_mismatches + (multi ? 1 : 0));
+        sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+      }
+    }
+  }
+}
+
 TEST_CASE("S3 read_parquet is rejected when transparent GPU execution is disabled",
           "[s3][integration][sql][transparent]")
 {
@@ -2451,6 +2841,8 @@ TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for card
   CHECK(typed->total_num_rows == expected_orders_rows);
   CHECK_FALSE(return_types.empty());
   CHECK_FALSE(names.empty());
+  CHECK(typed->bound_types == return_types);
+  CHECK(typed->bound_names == names);
   REQUIRE(table_function.cardinality != nullptr);
 
   auto stats = table_function.cardinality(*fixture.con.context, bind_data.get());
@@ -2459,6 +2851,79 @@ TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for card
   CHECK(stats->estimated_cardinality == expected_orders_rows);
   CHECK(stats->has_max_cardinality);
   CHECK(stats->max_cardinality == expected_orders_rows);
+}
+
+TEST_CASE("Sirius S3 capture uses the fresh schema from a name-only rebind",
+          "[s3][integration][sql][footerbind]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  sirius::test::scratch_dir scratch{"s3_name_only_rebind"};
+  auto const first_path  = scratch.path() / "first.parquet";
+  auto const second_path = scratch.path() / "second.parquet";
+  require_query_ok(fixture.con,
+                   "COPY (SELECT 1::INTEGER AS original_name) TO " +
+                     sql_quote(first_path.string()) + " (FORMAT PARQUET)");
+  require_query_ok(fixture.con,
+                   "COPY (SELECT 1::INTEGER AS rebound_name) TO " +
+                     sql_quote(second_path.string()) + " (FORMAT PARQUET)");
+
+  auto const first_key  = "rebind/name-only-first.parquet";
+  auto const second_key = "rebind/name-only-second.parquet";
+  if (!sirius::test::put_s3_test_object(first_key, read_binary_file(first_path))) {
+    SUCCEED("managed SeaweedFS is required for the name-only rebind test");
+    return;
+  }
+  REQUIRE(sirius::test::put_s3_test_object(second_key, read_binary_file(second_path)));
+
+  auto const first_uri  = s3_uri(env->bucket, first_key);
+  auto const second_uri = s3_uri(env->bucket, second_key);
+  duckdb::TableFunction first_function;
+  duckdb::vector<duckdb::LogicalType> first_types;
+  duckdb::vector<std::string> first_names;
+  auto first_bind = bind_sirius_read_parquet(
+    *fixture.con.context, first_uri, first_function, first_types, first_names);
+  REQUIRE(first_bind != nullptr);
+  REQUIRE(first_names == duckdb::vector<std::string>{"original_name"});
+  duckdb::LogicalGet first_get(
+    /*table_index=*/91, std::move(first_function), std::move(first_bind), first_types, first_names);
+  first_get.parameters.emplace_back(first_uri);
+  sirius::op::scan::bound_read_view first_captured;
+  fixture.con.context->RunFunctionInTransaction([&] {
+    first_captured = sirius::op::scan::capture_bound_read_view(first_get, *fixture.con.context);
+  });
+  REQUIRE(first_captured.identity != nullptr);
+  REQUIRE(first_captured.identity->bound_names == first_names);
+
+  duckdb::TableFunction rebound_function;
+  duckdb::vector<duckdb::LogicalType> rebound_types;
+  duckdb::vector<std::string> rebound_names;
+  auto rebound_bind = bind_sirius_read_parquet(
+    *fixture.con.context, second_uri, rebound_function, rebound_types, rebound_names);
+  REQUIRE(rebound_bind != nullptr);
+  REQUIRE(rebound_types == first_types);
+  REQUIRE(rebound_names == duckdb::vector<std::string>{"rebound_name"});
+
+  // Model the node state that makes B1 important: a rebind has replaced the
+  // bind payload, while LogicalGet::names still reflects the previous bind.
+  duckdb::LogicalGet rebound_get(/*table_index=*/91,
+                                 std::move(rebound_function),
+                                 std::move(rebound_bind),
+                                 rebound_types,
+                                 first_names);
+  rebound_get.parameters.emplace_back(second_uri);
+  REQUIRE(rebound_get.names == first_names);
+
+  sirius::op::scan::bound_read_view captured;
+  fixture.con.context->RunFunctionInTransaction([&] {
+    captured = sirius::op::scan::capture_bound_read_view(rebound_get, *fixture.con.context);
+  });
+  REQUIRE(captured.identity != nullptr);
+  CHECK(captured.identity->bound_types == rebound_types);
+  CHECK(captured.identity->bound_names == rebound_names);
+  CHECK(captured.identity->bound_names != rebound_get.names);
 }
 
 TEST_CASE("internal sirius_read_parquet exposes S3 row count to DuckDB EXPLAIN",
@@ -2734,4 +3199,351 @@ TEST_CASE("gpu_execution large S3 lineitem join matches local CPU with cache.mod
     large_lineitem_orders_join_query(s3_large_lineitem_scan(*env), s3_parquet_scan(*env, "orders")),
     large_lineitem_orders_join_query(local_parquet_file_scan(large->local_path),
                                      local_parquet_scan(*env, "orders")));
+}
+
+TEST_CASE("native walk failure in a mixed S3 plan preserves execution-time source veto",
+          "[s3][integration][sql][transparent][fallback]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  if (sirius::test::run_isolated()) { return; }
+  for (bool explicit_path : {false, true}) {
+    s3_sql_fixture fixture(*env);
+    set_gpu_execution(fixture.con, true);
+    auto path = fs::temp_directory_path() / ("sirius_native_s3_" + std::to_string(::getpid()) +
+                                             (explicit_path ? "_explicit.db" : "_transparent.db"));
+    REQUIRE_FALSE(fs::exists(path));
+    require_query_ok(fixture.con, "ATTACH '" + path.string() + "' AS lease_native");
+    require_query_ok(fixture.con,
+                     "CREATE TABLE lease_native.main.native_lease_t AS SELECT range::BIGINT i "
+                     "FROM range(300000)");
+    require_query_ok(fixture.con, "CHECKPOINT lease_native");
+    require_query_ok(fixture.con, "SET enable_duckdb_fallback = true");
+    require_query_ok(fixture.con, "SET sirius_test_inject_native_walk_failure = 'native_lease_t'");
+    auto context = sirius::test::get_registered_sirius_context(fixture.con);
+    auto before  = context->get_transparent_execution_stats();
+    auto sql     = "SELECT count(*) FROM lease_native.main.native_lease_t n JOIN " +
+               s3_parquet_scan(*env, "nation") + " s ON n.i = s.n_nationkey";
+    auto result = fixture.con.Query(explicit_path ? gpu_execution_sql(sql) : sql);
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+    CHECK(result->GetError().find("injected native metadata walk failure") != std::string::npos);
+    CHECK(result->GetError().find("GPU plan generation failed:") == std::string::npos);
+    auto after = context->get_transparent_execution_stats();
+    CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.lease_held_at_replay == before.lease_held_at_replay);
+    if (!explicit_path) {
+      CHECK(after.successful_rebinds == before.successful_rebinds + 1);
+      CHECK(after.fallbacks == before.fallbacks);
+      CHECK(after.executions == before.executions + 1);
+    }
+    require_query_ok(fixture.con, "DETACH lease_native");
+    fs::remove(path);
+  }
+}
+
+TEST_CASE("never-entered native and S3 windows preserve the runtime-unavailable error",
+          "[s3][integration][sql][transparent][fallback]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  if (sirius::test::run_isolated()) { return; }
+  for (bool explicit_path : {false, true}) {
+    s3_sql_fixture fixture(*env);
+    set_gpu_execution(fixture.con, true);
+    auto path = fs::temp_directory_path() / ("sirius_unavailable_s3_" + std::to_string(::getpid()) +
+                                             (explicit_path ? "_explicit.db" : "_transparent.db"));
+    REQUIRE_FALSE(fs::exists(path));
+    require_query_ok(fixture.con, "ATTACH '" + path.string() + "' AS lease_native");
+    require_query_ok(fixture.con,
+                     "CREATE TABLE lease_native.main.native_lease_t AS SELECT range::BIGINT i "
+                     "FROM range(300000)");
+    require_query_ok(fixture.con, "CHECKPOINT lease_native");
+    require_query_ok(fixture.con, "SET enable_duckdb_fallback = true");
+    require_query_ok(fixture.con, "SET sirius_test_mark_runtime_unavailable_before_window = true");
+    auto context = sirius::test::get_registered_sirius_context(fixture.con);
+    auto before  = context->get_transparent_execution_stats();
+    auto sql     = "SELECT count(*) FROM lease_native.main.native_lease_t n JOIN " +
+               s3_parquet_scan(*env, "nation") + " s ON n.i = s.n_nationkey";
+    auto result = fixture.con.Query(explicit_path ? gpu_execution_sql(sql) : sql);
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(result->GetErrorType() == duckdb::ExceptionType::EXECUTOR);
+    CHECK(result->GetError().find("Sirius GPU runtime is unavailable") != std::string::npos);
+    CHECK(result->GetError().find("S3 CPU fallback is not supported") == std::string::npos);
+    CHECK(context->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE);
+    CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+    auto after = context->get_transparent_execution_stats();
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.lease_held_at_replay == before.lease_held_at_replay);
+    if (!explicit_path) {
+      CHECK(after.successful_rebinds == before.successful_rebinds + 1);
+      CHECK(after.fallbacks == before.fallbacks);
+      CHECK(after.executions == before.executions + 1);
+    }
+    // The poisoned runtime is destroyed with this fixture. Files are unique to this child.
+    fs::remove(path);
+  }
+}
+
+TEST_CASE("Explicit replay rejects S3 behind a view before CPU replay starts",
+          "[s3][integration][sql][fallback]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  if (sirius::test::run_isolated()) return;
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con,
+                   "CREATE VIEW explicit_remote_view AS SELECT n_nationkey FROM " +
+                     s3_parquet_scan(*env, "nation"));
+  require_query_ok(fixture.con, "SET enable_duckdb_fallback = true");
+  require_query_ok(fixture.con, "SET sirius_test_sync_cpu_replay = true");
+  auto context                         = sirius::test::get_registered_sirius_context(fixture.con);
+  unsigned replays                     = 0;
+  context->cpu_replay_hook_for_testing = [&] { ++replays; };
+  struct reset_hook {
+    duckdb::SiriusContext& context;
+    ~reset_hook() { context.cpu_replay_hook_for_testing = {}; }
+  } reset{*context};
+
+  auto const query =
+    "SELECT n_nationkey, row_number() OVER (ORDER BY n_nationkey) "
+    "FROM explicit_remote_view";
+  SECTION("plan generation fails") {}
+  SECTION("window entry fails")
+  {
+    require_query_ok(fixture.con, "SET sirius_test_mark_runtime_unavailable_before_window = true");
+  }
+  auto result = fixture.con.Query(gpu_execution_sql(query));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  INFO(result->GetError());
+  CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+  CHECK(result->GetError().find("Underlying GPU error:") != std::string::npos);
+  CHECK(replays == 0);
+  CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+}
+
+TEST_CASE("R2a S3 semantic verdict keeps the source replay veto",
+          "[s3][integration][transparent][verdict]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  s3_sql_fixture fixture(*env);
+  auto& con = fixture.con;
+  set_gpu_execution(con, true);
+  REQUIRE_FALSE(con.Query("SET sirius_test_inject_scan_verdict='unsupported'")->HasError());
+  auto before = sirius::test::get_transparent_execution_stats(con);
+  auto result = con.Query("SELECT n_nationkey FROM " + s3_parquet_scan(*env, "nation"));
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+  auto after = sirius::test::get_transparent_execution_stats(con);
+  CHECK(after.semantic_verdicts[1] == before.semantic_verdicts[1] + 1);
+  CHECK(after.fallbacks == before.fallbacks);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  CHECK(after.scan_lowerings == before.scan_lowerings);
+  CHECK(after.window_tasks_started == before.window_tasks_started);
+}
+
+TEST_CASE("S3 late physical refusal follows a published GPU batch and never replays",
+          "[s3][integration][transparent][late_failure]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("sirius"));
+  sirius::test::scratch_dir directory("s3_late_physical");
+  set_gpu_execution(fixture.con, false);
+  require_query_ok(fixture.con,
+                   "COPY (SELECT i::INTEGER x FROM range(4096) t(i)) TO " +
+                     directory.file_literal("a.parquet") +
+                     " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+  require_query_ok(fixture.con,
+                   "COPY (SELECT x::DOUBLE x FROM (VALUES (1.2),(2.0)) t(x)) TO " +
+                     directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
+  for (auto file : {"a.parquet", "b.parquet"}) {
+    if (!sirius::test::put_s3_test_object(std::string("r2a-late/") + file,
+                                          read_binary_file(directory.path() / file))) {
+      SUCCEED("managed MinIO is required to upload the late-failure fixture");
+      return;
+    }
+  }
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET scan_task_batch_size=1");
+  require_query_ok(fixture.con, "SET sirius_test_hold_footer_index=2");
+  auto& context = require_sirius_context(fixture);
+  auto sql      = "SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "r2a-late/*.parquet");
+  // The explicit SQL rewriter accepts a single S3 URI, not a glob. The view
+  // preserves this same two-file bound scan without rewriting the glob as an object key.
+  require_query_ok(fixture.con,
+                   "CREATE VIEW late_s3_input AS SELECT * FROM " +
+                     s3_parquet_glob_scan(*env, "r2a-late/*.parquet"));
+  for (bool explicit_entry : {false, true}) {
+    auto before = context.get_transparent_execution_stats();
+    std::promise<void> footer_started;
+    auto started = footer_started.get_future();
+    std::atomic<bool> notified{false};
+    auto counters                       = context.physical_counters();
+    counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+      if (footer && !notified.exchange(true)) footer_started.set_value();
+    };
+    auto pending   = std::async(std::launch::async, [&] {
+      return fixture.con.Query(
+        explicit_entry ? "CALL gpu_execution('SELECT sum(x) FROM late_s3_input')" : sql);
+    });
+    auto ready     = started.wait_for(std::chrono::seconds(20)) == std::future_status::ready;
+    auto published = ready && context.get_scan_manager().wait_for_publication_for_testing(
+                                std::chrono::seconds(20));
+    context.get_scan_manager().release_footer_hold_for_testing(2);
+    auto result                         = pending.get();
+    counters->parquet_phase_for_testing = {};
+    INFO("explicit=" << explicit_entry);
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE(ready);
+    REQUIRE(published);
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+    auto after = context.get_transparent_execution_stats();
+    auto cause = static_cast<size_t>(sirius::transparent::late_failure_cause::physical_input);
+    CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+    CHECK(after.late_replays == before.late_replays);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.lease_held_at_replay == before.lease_held_at_replay);
+    std::vector<sirius::op::scan::scan_publication_observation> observations;
+    for (auto const& [query, observation] : after.publications_by_query) {
+      if (!before.publications_by_query.contains(query)) observations.push_back(observation);
+    }
+    REQUIRE(observations.size() == 1);
+    auto const& registrations = observations.front().readahead_registrations;
+    CHECK(registrations.contains(s3_uri(env->bucket, "r2a-late/a.parquet")));
+    CHECK_FALSE(registrations.contains(s3_uri(env->bucket, "r2a-late/b.parquet")));
+  }
+}
+
+TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated reads",
+          "[s3][integration][sql][transparent][glob][d7]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  auto limits = large_sirius_memory_limits("sirius");
+  bool bulk   = true;
+  SECTION("REST bulk") {}
+  SECTION("kvikIO general")
+  {
+    limits.backend    = sirius::scan_manager::io_backend::kvikio;
+    limits.cache_mode = "none";
+    bulk              = false;
+  }
+  s3_sql_fixture fixture(*env, limits);
+  sirius::test::scratch_dir directory("s3_d7_mixed");
+  set_gpu_execution(fixture.con, false);
+  require_query_ok(
+    fixture.con,
+    "COPY (SELECT 10::INTEGER x) TO " + directory.file_literal("a.parquet") + " (FORMAT PARQUET)");
+  require_query_ok(
+    fixture.con,
+    "COPY (SELECT 20::DOUBLE x) TO " + directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
+  for (auto file : {"a.parquet", "b.parquet"}) {
+    REQUIRE(sirius::test::put_s3_test_object(std::string("r2a-d7/") + file,
+                                             read_binary_file(directory.path() / file)));
+  }
+  auto local = require_query_ok(
+    fixture.con, "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ")");
+  auto expected = collect_rows(*local);
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(expected.size() == 2);
+  CHECK(expected[0][0] == "10");
+  CHECK(expected[1][0] == "20");
+  set_gpu_execution(fixture.con, true);
+  auto local_query = "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ")";
+  for (int attempt = 0; attempt != 2; ++attempt) {
+    auto before = sirius::test::get_transparent_execution_stats(fixture.con);
+    auto result = require_query_ok(fixture.con, local_query);
+    auto rows   = collect_rows(*result);
+    std::sort(rows.begin(), rows.end());
+    CHECK(rows == expected);
+    CHECK(result->types == local->types);
+    auto after = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(after.successful_rebinds == before.successful_rebinds + 1);
+    CHECK(after.split_flushed_for_schema == before.split_flushed_for_schema + 1);
+  }
+  auto& manager     = require_sirius_context(fixture).get_scan_manager();
+  auto local_source = manager.create_datasource((directory.path() / "a.parquet").string());
+  REQUIRE(local_source);
+  CHECK_FALSE(local_source->prefers_bulk_io());
+  if (bulk) {
+    // Give pin_table pristine paths. The ordinary local scan above has warmed
+    // a.parquet and b.parquet, so using those paths would only exercise a
+    // metadata cache hit rather than the pin-first footer producer.
+    for (auto file : {"a.parquet", "b.parquet"}) {
+      std::filesystem::copy_file(directory.path() / file,
+                                 directory.path() / (std::string("pin-") + file));
+    }
+    auto pin_glob    = directory.file_literal("pin-*.parquet");
+    auto cold_source = manager.create_datasource(directory.file("pin-a.parquet"));
+    REQUIRE(cold_source);
+    CHECK(cold_source->metadata() == nullptr);
+    require_query_ok(
+      fixture.con,
+      "CALL pin_table(" + pin_glob + ", name='r2a_d7_pin', format='parquet', tier='parquet')");
+    CHECK(cold_source->metadata() != nullptr);
+    auto local_before = sirius::test::get_transparent_execution_stats(fixture.con);
+    auto pinned = require_query_ok(fixture.con, "SELECT x FROM read_parquet(" + pin_glob + ")");
+    auto pinned_rows = collect_rows(*pinned);
+    std::sort(pinned_rows.begin(), pinned_rows.end());
+    CHECK(pinned_rows == expected);
+    CHECK(pinned->types == local->types);
+    auto local_after = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(local_after.successful_rebinds == local_before.successful_rebinds + 1);
+    CHECK(local_after.executions == local_before.executions + 1);
+    CHECK(local_after.runtime_fallbacks == local_before.runtime_fallbacks);
+    CHECK(local_after.split_physical_rejections == local_before.split_physical_rejections);
+  }
+  auto query    = "SELECT x FROM " + s3_parquet_glob_scan(*env, "r2a-d7/*.parquet");
+  auto counters = require_sirius_context(fixture).physical_counters();
+  std::mutex hits_mutex;
+  std::map<std::string, int> hits;
+  counters->parquet_metadata_for_testing = [&](std::string const& file, bool hit) {
+    if (hit) {
+      std::lock_guard lock(hits_mutex);
+      ++hits[file];
+    }
+  };
+  struct reset_metadata_hook {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_metadata_hook() { counters->parquet_metadata_for_testing = {}; }
+  } reset_hook{counters};
+  for (int attempt = 0; attempt != 2; ++attempt) {
+    {
+      std::lock_guard lock(hits_mutex);
+      hits.clear();
+    }
+    auto before = sirius::test::get_transparent_execution_stats(fixture.con);
+    auto result = require_query_ok(fixture.con, query);
+    auto rows   = collect_rows(*result);
+    std::sort(rows.begin(), rows.end());
+    CHECK(rows == expected);
+    CHECK(result->types == local->types);
+    auto after = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(after.successful_rebinds == before.successful_rebinds + 1);
+    CHECK(after.executions == before.executions + 1);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.split_flushed_for_schema == before.split_flushed_for_schema + 1);
+    CHECK(after.budget_exceeded == before.budget_exceeded);
+    for (auto file : {"a.parquet", "b.parquet"}) {
+      auto uri    = s3_uri(env->bucket, std::string("r2a-d7/") + file);
+      auto source = manager.create_datasource(uri);
+      REQUIRE(source);
+      CHECK(source->prefers_bulk_io() == bulk);
+      if (bulk) CHECK(source->metadata() != nullptr);
+      if (attempt == 1 && bulk) {
+        std::lock_guard lock(hits_mutex);
+        CHECK(hits[uri] > 0);
+      }
+    }
+  }
 }

@@ -22,6 +22,7 @@
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
+#include <op/scan/table_scan/parquet_physical_profile.hpp>
 #include <sirius_config.hpp>
 
 // duckdb
@@ -42,6 +43,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -50,6 +52,9 @@
 namespace sirius::scan_manager {
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
+namespace sirius::transparent {
+class read_view_registry;
+}
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;
@@ -68,6 +73,10 @@ namespace sirius::op::scan {
  */
 class parquet_ingestible_table_info : public ingestible_table_info {
  public:
+  duckdb::vector<duckdb::LogicalType> bound_types;      // Full nested bind schema, in P-space.
+  std::optional<iceberg_table_schema> physical_schema;  // Populated by the S3 Iceberg lowering.
+  bound_table_scan physical_contract;
+  leaf_set semantic_columns;
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
@@ -80,6 +89,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// wired. The ingestible uses AST-capable filters for row-group pruning; the downstream
   /// dynamic-filter operator applies membership filters post-decode.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
+  /// Query-local contract registry. After read-view comparison it exposes the physical
+  /// original's evidence record without copying it or issuing planning-time I/O.
+  std::shared_ptr<sirius::transparent::read_view_registry> read_views;
 
   /// Target decoded column-buffer budget for one data-batch split. Consumed
   /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
@@ -252,6 +264,8 @@ class parquet_file_scan_info : public scan_info {
 
   /// Parsed footer metadata for this file.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::vector<uint8_t> original_schema;
+  std::string arrow_schema;
   /// File path (also the datasource cache key).
   std::string file_path;
   /// Stable position in DuckDB's bound file list.
@@ -396,6 +410,9 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   [[nodiscard]] bool can_project_during_filter() const noexcept;
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
+  // Built only when physical evidence is consumed, after finalize has published it.
+  std::once_flag _evidence_index_once;
+  std::vector<std::size_t> _evidence_index_by_file;
 
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.
@@ -436,6 +453,15 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // partially filtered, so the scan must NOT be reported ROW_FILTERED or the
   // dropped conjuncts would never be applied.
   bool _static_pushdown_is_complete = true;
+
+  // The part of _static_pushdown_expression pushed into the per-task reader:
+  // minus any top-level AND conjunct with an equality on a column whose bloom
+  // filter probe cuDF before 26.12 gets wrong (has_unreliable_bloom_filter_probe).
+  // The reader probes bloom filters, the row-group stats filter does not.
+  std::shared_ptr<duckdb::Expression> _reader_pushdown_expression;
+  // False when the reader filter is a strict subset of _duckdb_filter_expression,
+  // like _static_pushdown_is_complete.
+  bool _reader_pushdown_is_complete = true;
 
   // Only the simple `IS [NOT] NULL` over a bare column reference shape is
   // recorded; anything compound is left to the post-decode filter. Empty when

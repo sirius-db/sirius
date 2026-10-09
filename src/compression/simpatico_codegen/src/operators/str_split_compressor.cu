@@ -37,15 +37,12 @@ std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
   rmm::device_buffer chars_buf(chars->view().head<void>(), chars_bytes, stream, mr);
 
   cudf::size_type nc = 0;
-  rmm::device_buffer mask_buf(0, stream, mr);
+  auto mask_buf      = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   if (null_mask) {
     auto const* bits =
       reinterpret_cast<cudf::bitmask_type const*>(null_mask->view().data<std::uint8_t>());
     nc = cudf::null_count(bits, 0, num_rows, stream);
-    if (nc > 0) {
-      mask_buf = rmm::device_buffer(
-        null_mask->view().head<void>(), static_cast<std::size_t>(null_mask->size()), stream, mr);
-    }
+    if (nc > 0) { mask_buf = cudf::copy_bitmask(bits, 0, num_rows, stream, mr); }
   }
   auto offsets_copy = std::make_unique<cudf::column>(*offsets, stream, mr);
   return cudf::make_strings_column(
@@ -130,10 +127,14 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
   // A non-null column gets NO mask channel (2-channel str_split).
   std::unique_ptr<cudf::column> null_mask;
   if (src.null_count() > 0) {
-    rmm::device_buffer mbuf = cudf::copy_bitmask(src, stream, mr);
-    auto const mbytes       = static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(n));
-    null_mask               = std::make_unique<cudf::column>(
-      cudf::data_type{cudf::type_id::UINT8}, mbytes, std::move(mbuf), rmm::device_buffer{}, 0);
+    auto mbuf         = copy_bitmask_as_data(src, stream, mr);
+    auto const mbytes = static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(n));
+    null_mask =
+      std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
+                                     mbytes,
+                                     std::move(mbuf),
+                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                     0);
   }
   cudaStreamSynchronize(stream.get());
 

@@ -30,6 +30,7 @@
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -103,18 +104,22 @@ std::vector<T> download(void const* device, std::size_t count)
   return host;
 }
 
-/// Build on device and require it to equal the host reference in every array.
+/// Build on device and require it to equal the host reference in every array. `int_offset` shifts
+/// the id list that many int32s into its allocation, to exercise the unaligned-input paths.
 void check_against_reference(char const* what,
                              std::vector<std::int32_t> const& ids,
-                             std::int64_t num_rows)
+                             std::int64_t num_rows,
+                             std::size_t int_offset = 0)
 {
   auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
-  device_ids d_ids(ids);
+  std::vector<std::int32_t> padded(int_offset, 0);
+  padded.insert(padded.end(), ids.begin(), ids.end());
+  device_ids d_ids(padded);
   REQUIRE_MSG(ids.empty() || d_ids.ptr != nullptr, "[%s] could not upload the ids", what);
 
-  chunk_row_set_owner built =
-    build_chunk_row_set(d_ids.ptr, static_cast<std::int64_t>(ids.size()), num_rows, stream, mr);
+  chunk_row_set_owner built = build_chunk_row_set(
+    d_ids.ptr + int_offset, static_cast<std::int64_t>(ids.size()), num_rows, stream, mr);
   cudaStreamSynchronize(stream.get());
 
   host_csr const ref = reference(ids, num_rows);
@@ -158,6 +163,25 @@ void test_sparse()
     }
   }
   check_against_reference("sparse", ids, num_rows);
+}
+
+// The 4-ids-per-thread paths need a 16-byte aligned id list and finish a sub-quad tail one id at a
+// time. Sweep id counts around a multiple of 4 and the base alignment, with ids that straddle chunk
+// boundaries so a quad can open a chunk at any of its four positions.
+void test_vector_layouts()
+{
+  std::int64_t const num_rows = 64 * kChunk;
+  for (std::size_t n : {1, 3, 4, 5, 7, 8, 13, 1021, 1023, 1024, 1025, 4099}) {
+    std::vector<std::int32_t> ids;
+    for (std::size_t k = 0; k < n; ++k) {
+      ids.push_back(static_cast<std::int32_t>(k * 509 % (num_rows - 1)));
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    for (std::size_t off : {0, 1, 2, 3}) {
+      check_against_reference("vector layouts", ids, num_rows, off);
+    }
+  }
 }
 
 // One survivor per touched chunk (S/T == 1.0), which is what sf1000 q17 and q19
@@ -258,6 +282,7 @@ int main()
 
   try {
     test_sparse();
+    test_vector_layouts();
     test_one_per_chunk();
     test_chunk_boundaries();
     test_all_rows();

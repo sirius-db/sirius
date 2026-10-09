@@ -15,6 +15,7 @@
  */
 
 #include "op/sirius_physical_partition.hpp"
+#include "util/env_guard.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -69,26 +70,30 @@ static fs::path get_tpch_db_path()
   return db_path;
 }
 
-struct sirius_config_env_guard {
-  sirius_config_env_guard(const std::string& config_path)
+struct sirius_config_env_guard : sirius::util::env_guard {
+  explicit sirius_config_env_guard(const std::string& config_path)
+    : env_guard("SIRIUS_CONFIG_FILE", config_path)
   {
-    setenv("SIRIUS_CONFIG_FILE", config_path.c_str(), 1);
   }
-
-  ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
 };
 
 class GPUExecutionFixtureBase {
  public:
   GPUExecutionFixtureBase()
   {
-    if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+      // Use the 2-GPU environment managed by the test listener.
+      connected_env_ = sirius::test::g_integration_env_2gpu;
+      con            = std::make_unique<duckdb::Connection>(
+        sirius::test::g_integration_env_2gpu->make_connection());
+    } else if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
       // Use the shared DuckDB instance managed by the test listener
+      connected_env_ = sirius::test::g_integration_env;
       con =
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     } else {
       // Fallback: create an isolated DuckDB (e.g. when running a single test directly)
-      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.yaml";
+      auto cfg_path = sirius::test::integration_config_path();
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
 
@@ -115,12 +120,29 @@ class GPUExecutionFixtureBase {
    */
   bool bind_env(int num_gpus)
   {
-    release_env();
     auto* env = sirius::test::acquire_integration_env_for(num_gpus);
     if (env == nullptr) { return false; }
-    if (!env->is_active()) { env->resume(); }
-    active_env_ = env;
-    con         = std::make_unique<duckdb::Connection>(env->make_connection());
+    if (num_gpus == 2 && active_env_ == nullptr && connected_env_ == env && env->is_active()) {
+      return true;
+    }
+    release_env();
+    if (env != sirius::test::g_integration_env && sirius::test::g_integration_env != nullptr &&
+        sirius::test::g_integration_env->is_active()) {
+      sirius::test::g_integration_env->pause();
+    }
+    if (env != sirius::test::g_integration_env_2gpu &&
+        sirius::test::g_integration_env_2gpu != nullptr &&
+        sirius::test::g_integration_env_2gpu->is_active()) {
+      sirius::test::g_integration_env_2gpu->pause();
+    }
+    if (!env->is_active()) {
+      env->resume();
+      active_env_ = env;
+    } else if (num_gpus == 1) {
+      active_env_ = env;
+    }
+    connected_env_ = env;
+    con            = std::make_unique<duckdb::Connection>(env->make_connection());
     setup_schema();
     return true;
   }
@@ -132,6 +154,7 @@ class GPUExecutionFixtureBase {
   void release_env()
   {
     con.reset();
+    connected_env_ = nullptr;
     if (active_env_ != nullptr) {
       active_env_->pause();
       active_env_ = nullptr;
@@ -148,6 +171,39 @@ class GPUExecutionFixtureBase {
   {
     if (!bind_env(num_gpus)) { return false; }
     compare_gpu_vs_cpu(query, float_tolerance);
+    return true;
+  }
+
+  /**
+   * @brief compare_gpu_vs_cpu_for, retried once on an exception. Only for TPC-H Q4, whose
+   * intermittent flake is accepted policy (retry once, not treated as a regression).
+   */
+  bool compare_gpu_vs_cpu_for_retrying_once(int num_gpus, const std::string& query)
+  {
+    try {
+      return compare_gpu_vs_cpu_for(num_gpus, query);
+    } catch (std::exception const& first_err) {
+      release_env();
+      WARN("first attempt failed (known intermittent flake); retrying once: " << first_err.what());
+      return compare_gpu_vs_cpu_for(num_gpus, query);
+    }
+  }
+
+  /**
+   * @brief compare_gpu_vs_cpu_for, also checking that no warn-level log contains any of
+   * @p forbidden.
+   */
+  bool compare_gpu_vs_cpu_for_without_warnings(int num_gpus,
+                                               const std::string& query,
+                                               std::vector<std::string> const& forbidden)
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    if (!compare_gpu_vs_cpu_for(num_gpus, query)) { return false; }
+    for (auto const& record : logs.records()) {
+      for (auto const& text : forbidden) {
+        CHECK(record.message.find(text) == std::string::npos);
+      }
+    }
     return true;
   }
 
@@ -308,7 +364,8 @@ class GPUExecutionFixtureBase {
   std::unique_ptr<duckdb::DuckDB> db;
   std::unique_ptr<duckdb::Connection> con;
   std::unique_ptr<sirius_config_env_guard> config_guard;
-  sirius::test::shared_test_env* active_env_ = nullptr;
+  sirius::test::shared_test_env* connected_env_ = nullptr;
+  sirius::test::shared_test_env* active_env_    = nullptr;
 };
 
 /**
@@ -332,25 +389,6 @@ class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
   }
-
-  // // Disabled: these tests scan native (DuckDB-storage) tables via seq_scan. The
-  // // legacy duckdb_scan path was removed and GPU native scan has no IO backend
-  // // wired in this harness ("missing io_ctx, io_obj"), so every query throws
-  // // "Unsupported scan function: seq_scan" and poisons the shared integration
-  // // DB. Shadow the comparison helpers to skip until native scan is supported.
-  // void compare_gpu_vs_cpu(const std::string& /*query*/,
-  //                         std::optional<float> /*float_tolerance*/ = std::nullopt)
-  // {
-  //   WARN("duckdb-native tpch scan skipped — legacy duckdb_scan path removed");
-  // }
-
-  // bool compare_gpu_vs_cpu_for(int /*num_gpus*/,
-  //                             const std::string& /*query*/,
-  //                             std::optional<float> /*float_tolerance*/ = std::nullopt)
-  // {
-  //   WARN("duckdb-native tpch scan skipped — legacy duckdb_scan path removed");
-  //   return false;  // RUN_TPCH_MGPU returns out of the test on false
-  // }
 };
 
 /**
@@ -764,6 +802,24 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "[integration][gpu_execution][limit][limit_multi_batch]")
 {
   compare_gpu_vs_cpu("select l_orderkey, l_partkey from lineitem limit 50 offset 200;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - ungrouped aggregate over a limit that passes no rows",
+                 "[integration][gpu_execution][limit]")
+{
+  // The aggregate must still return its single row.
+  SECTION("empty input")
+  {
+    compare_gpu_vs_cpu(
+      "select count(*), sum(n_nationkey) from "
+      "(select * from nation where n_regionkey > 10 limit 1);");
+  }
+  SECTION("offset past the end")
+  {
+    compare_gpu_vs_cpu(
+      "select count(*), sum(n_nationkey) from (select * from nation limit 1 offset 100);");
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -4103,361 +4159,306 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 //===----------------------------------------------------------------------===//
 // TPC-H queries
 //
-// TEST-01/02 (v1.2): each TPC-H TEST_CASE is parameterized on num_gpus ∈ {1, 2}
-// via Catch2's GENERATE. The RUN_TPCH_MGPU macro:
-//   - picks num_gpus = 1 then 2 (two Catch2 sections per TEST_CASE)
-//   - CAPTUREs num_gpus so failures report which variant failed
-//   - acquires the matching shared_test_env (integration.yaml for 1,
-//     integration-2gpu.yaml for 2) via compare_gpu_vs_cpu_for()
-//   - WARN+returns when num_gpus == 2 on a single-GPU host
-// This expands each TEST_CASE to run twice; per AUDIT-03, the 2-GPU variant
-// MUST execute in the default unit-tests run, so no [.] hide-tag is applied.
+// Each query is a 1-GPU TEST_CASE plus an "on 2 GPUs" [multi_gpu] TEST_CASE (integration.yaml
+// vs integration-2gpu.yaml, via the fixture runner), so CI can run the former in its per-GPU
+// shards. The 2-GPU variant WARN+returns on a single-GPU host.
 //===----------------------------------------------------------------------===//
-#define RUN_TPCH_MGPU(...)                                          \
-  do {                                                              \
-    auto const num_gpus = GENERATE(1, 2);                           \
-    CAPTURE(num_gpus);                                              \
-    if (!compare_gpu_vs_cpu_for(num_gpus, __VA_ARGS__)) { return; } \
-  } while (0)
+#define TPCH_TEST_CASES(runner, fixture, name, tags, ...)           \
+  TEST_CASE_METHOD(fixture, name, tags) { runner(1, __VA_ARGS__); } \
+  TEST_CASE_METHOD(fixture, name " on 2 GPUs", tags "[multi_gpu]") { runner(2, __VA_ARGS__); }
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 1",
-                 "[integration][gpu_execution][TPC-H][Q1]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ1, sirius::test::kTpchQueries[0].float_tolerance);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 1",
+                "[integration][gpu_execution][TPC-H][Q1]",
+                sirius::test::kTpchQ1,
+                sirius::test::kTpchQueries[0].float_tolerance)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 1 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q1]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ1, sirius::test::kTpchQueries[0].float_tolerance);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 1 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q1]",
+                sirius::test::kTpchQ1,
+                sirius::test::kTpchQueries[0].float_tolerance)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 2",
-                 "[integration][gpu_execution][TPC-H][Q2]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ2);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 2",
+                "[integration][gpu_execution][TPC-H][Q2]",
+                sirius::test::kTpchQ2)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 2 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q2]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ2);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 2 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q2]",
+                sirius::test::kTpchQ2)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 3",
-                 "[integration][gpu_execution][TPC-H][Q3]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ3);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 3",
+                "[integration][gpu_execution][TPC-H][Q3]",
+                sirius::test::kTpchQ3)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 3 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q3]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ3);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 3 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q3]",
+                sirius::test::kTpchQ3)
 
-// TPC-H Q4 parquet has a pre-existing intermittent flake (see ROADMAP Phase 8
-// Success Criterion 2: "Q4 parquet flake policy: retry once per v1.1 precedent,
-// not treated as regression"). The retry is scoped to Q4 ONLY — real regressions
-// on other queries must fail loudly. We wrap the SAME body shape as RUN_TPCH_MGPU
-// but handle any std::exception from compare_gpu_vs_cpu by retrying once with
-// a fresh bind_env.
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 4",
-                 "[integration][gpu_execution][TPC-H][Q4]")
-{
-  auto const num_gpus = GENERATE(1, 2);
-  CAPTURE(num_gpus);
-  try {
-    if (!compare_gpu_vs_cpu_for(num_gpus, sirius::test::kTpchQ4)) { return; }
-  } catch (std::exception const& first_err) {
-    WARN(
-      "tpch_q4 first attempt failed (pre-existing flake per ROADMAP Phase 8 "
-      "Success Criterion 2); retrying once: "
-      << first_err.what());
-    if (!compare_gpu_vs_cpu_for(num_gpus, sirius::test::kTpchQ4)) { return; }
-  }
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for_retrying_once,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 4",
+                "[integration][gpu_execution][TPC-H][Q4]",
+                sirius::test::kTpchQ4)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 4 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q4]")
-{
-  auto const num_gpus = GENERATE(1, 2);
-  CAPTURE(num_gpus);
-  try {
-    if (!compare_gpu_vs_cpu_for(num_gpus, sirius::test::kTpchQ4)) { return; }
-  } catch (std::exception const& first_err) {
-    WARN(
-      "tpch_q4 parquet first attempt failed (pre-existing flake per ROADMAP "
-      "Phase 8 Success Criterion 2); retrying once: "
-      << first_err.what());
-    if (!compare_gpu_vs_cpu_for(num_gpus, sirius::test::kTpchQ4)) { return; }
-  }
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for_retrying_once,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 4 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q4]",
+                sirius::test::kTpchQ4)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 5",
-                 "[integration][gpu_execution][TPC-H][Q5]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ5);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 5",
+                "[integration][gpu_execution][TPC-H][Q5]",
+                sirius::test::kTpchQ5)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 5 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q5]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ5);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 5 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q5]",
+                sirius::test::kTpchQ5)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 6",
-                 "[integration][gpu_execution][TPC-H][Q6]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ6);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 6",
+                "[integration][gpu_execution][TPC-H][Q6]",
+                sirius::test::kTpchQ6)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 6 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q6]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ6);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 6 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q6]",
+                sirius::test::kTpchQ6)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 7",
-                 "[integration][gpu_execution][TPC-H][Q7]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ7);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 7",
+                "[integration][gpu_execution][TPC-H][Q7]",
+                sirius::test::kTpchQ7)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 7 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q7]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ7);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 7 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q7]",
+                sirius::test::kTpchQ7)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 8",
-                 "[integration][gpu_execution][TPC-H][Q8]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ8);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 8",
+                "[integration][gpu_execution][TPC-H][Q8]",
+                sirius::test::kTpchQ8)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 8 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q8]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ8);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 8 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q8]",
+                sirius::test::kTpchQ8)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 9",
-                 "[integration][gpu_execution][TPC-H][Q9]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ9);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 9",
+                "[integration][gpu_execution][TPC-H][Q9]",
+                sirius::test::kTpchQ9)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 9 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q9]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ9);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 9 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q9]",
+                sirius::test::kTpchQ9)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 10",
-                 "[integration][gpu_execution][TPC-H][Q10]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ10);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 10",
+                "[integration][gpu_execution][TPC-H][Q10]",
+                sirius::test::kTpchQ10)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 10 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q10]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ10);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 10 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q10]",
+                sirius::test::kTpchQ10)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 11",
-                 "[integration][gpu_execution][TPC-H][Q11]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ11);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 11",
+                "[integration][gpu_execution][TPC-H][Q11]",
+                sirius::test::kTpchQ11)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 11 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q11]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ11);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 11 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q11]",
+                sirius::test::kTpchQ11)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 12",
-                 "[integration][gpu_execution][TPC-H][Q12]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ12);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 12",
+                "[integration][gpu_execution][TPC-H][Q12]",
+                sirius::test::kTpchQ12)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 12 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q12]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ12);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 12 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q12]",
+                sirius::test::kTpchQ12)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 13",
-                 "[integration][gpu_execution][TPC-H][Q13]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ13);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 13",
+                "[integration][gpu_execution][TPC-H][Q13]",
+                sirius::test::kTpchQ13)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 13 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q13]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ13);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 13 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q13]",
+                sirius::test::kTpchQ13)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 14",
-                 "[integration][gpu_execution][TPC-H][Q14]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ14);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 14",
+                "[integration][gpu_execution][TPC-H][Q14]",
+                sirius::test::kTpchQ14)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 14 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q14]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ14);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 14 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q14]",
+                sirius::test::kTpchQ14)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 15",
-                 "[integration][gpu_execution][TPC-H][Q15]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ15);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 15",
+                "[integration][gpu_execution][TPC-H][Q15]",
+                sirius::test::kTpchQ15)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 15 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q15]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ15);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 15 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q15]",
+                sirius::test::kTpchQ15)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 16",
-                 "[integration][gpu_execution][TPC-H][Q16]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ16);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 16",
+                "[integration][gpu_execution][TPC-H][Q16]",
+                sirius::test::kTpchQ16)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 16 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q16]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ16);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 16 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q16]",
+                sirius::test::kTpchQ16)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 17",
-                 "[integration][gpu_execution][TPC-H][Q17]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ17);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 17",
+                "[integration][gpu_execution][TPC-H][Q17]",
+                sirius::test::kTpchQ17)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 17 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q17]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ17);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 17 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q17]",
+                sirius::test::kTpchQ17)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 18",
-                 "[integration][gpu_execution][TPC-H][Q18]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ18);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 18",
+                "[integration][gpu_execution][TPC-H][Q18]",
+                sirius::test::kTpchQ18)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 18 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q18]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ18);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 18 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q18]",
+                sirius::test::kTpchQ18)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 19",
-                 "[integration][gpu_execution][TPC-H][Q19]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ19);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 19",
+                "[integration][gpu_execution][TPC-H][Q19]",
+                sirius::test::kTpchQ19)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 19 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q19]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ19);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 19 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q19]",
+                sirius::test::kTpchQ19)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 20",
-                 "[integration][gpu_execution][TPC-H][Q20]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ20);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 20",
+                "[integration][gpu_execution][TPC-H][Q20]",
+                sirius::test::kTpchQ20)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 20 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q20]")
-{
-  sirius::test::scoped_recording_log_sink logs{"warn"};
-  RUN_TPCH_MGPU(sirius::test::kTpchQ20);
-  for (auto const& record : logs.records()) {
-    CHECK(record.message.find("RIGHT_DELIM_JOIN") == std::string::npos);
-    CHECK(record.message.find("output batch") == std::string::npos);
-  }
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for_without_warnings,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 20 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q20]",
+                sirius::test::kTpchQ20,
+                {"RIGHT_DELIM_JOIN", "output batch"})
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 21",
-                 "[integration][gpu_execution][TPC-H][Q21]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ21);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 21",
+                "[integration][gpu_execution][TPC-H][Q21]",
+                sirius::test::kTpchQ21)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 21 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q21]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ21);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 21 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q21]",
+                sirius::test::kTpchQ21)
 
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - TPC-H Query 22",
-                 "[integration][gpu_execution][TPC-H][Q22]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ22);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H Query 22",
+                "[integration][gpu_execution][TPC-H][Q22]",
+                sirius::test::kTpchQ22)
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - TPC-H Query 22 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q22]")
-{
-  RUN_TPCH_MGPU(sirius::test::kTpchQ22);
-}
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionParquetFixture,
+                "gpu_execution - TPC-H Query 22 parquet",
+                "[integration][gpu_execution][parquet][TPC-H][Q22]",
+                sirius::test::kTpchQ22)
+
+TPCH_TEST_CASES(
+  compare_gpu_vs_cpu_for,
+  GPUExecutionDuckDBFixture,
+  "gpu_execution - ROLLUP over lineitem",
+  "[integration][gpu_execution][grouping_sets]",
+  "select l_returnflag, l_linestatus, l_shipmode, grouping(l_returnflag, l_shipmode) g, "
+  "count(*) n, sum(l_quantity) q, avg(l_extendedprice) p, min(l_shipdate) d "
+  "from lineitem group by rollup(l_returnflag, l_linestatus, l_shipmode);",
+  1e-9f)
+
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - CUBE with COUNT(DISTINCT) over lineitem",
+                "[integration][gpu_execution][grouping_sets]",
+                "select l_returnflag, l_linestatus, count(distinct l_suppkey) s, count(*) n "
+                "from lineitem group by cube(l_returnflag, l_linestatus);")
+
+// Cross products of two tables and of single-row aggregates, the shape of TPC-DS Q88 and Q90.
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H tables cross product",
+                "[integration][gpu_execution][TPC-H][cross_product]",
+                "SELECT n_name, r_name, c, m FROM nation, region, "
+                "(SELECT count(*) c FROM lineitem WHERE l_quantity < 10), "
+                "(SELECT max(o_totalprice) m FROM orders);")
 
 //===----------------------------------------------------------------------===//
 // TPC-H SF10 smoke variants (TEST-04)
@@ -4471,18 +4472,13 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - tpch_q1_sf10_2gpu",
-                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q1]")
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q1][multi_gpu]")
 {
   if (sf10_path().empty()) {
     WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q1 variant (TEST-04 gate)");
     return;
   }
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("tpch_q1_sf10_2gpu requires >=2 GPUs; skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!compare_gpu_vs_cpu_sf10_for(
         /*num_gpus=*/2,
         "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, "
@@ -4502,18 +4498,13 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - tpch_q6_sf10_2gpu",
-                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q6]")
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q6][multi_gpu]")
 {
   if (sf10_path().empty()) {
     WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q6 variant (TEST-04 gate)");
     return;
   }
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("tpch_q6_sf10_2gpu requires >=2 GPUs; skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!compare_gpu_vs_cpu_sf10_for(
         /*num_gpus=*/2,
         "select sum(l_extendedprice * l_discount) as revenue "
@@ -4529,18 +4520,13 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - tpch_q12_sf10_2gpu",
-                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q12]")
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q12][multi_gpu]")
 {
   if (sf10_path().empty()) {
     WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q12 variant (TEST-04 gate)");
     return;
   }
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("tpch_q12_sf10_2gpu requires >=2 GPUs; skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!compare_gpu_vs_cpu_sf10_for(
         /*num_gpus=*/2,
         "select l_shipmode, "
@@ -4572,18 +4558,13 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 // NESTED_LOOP_JOIN downstream of the CTE.
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - tpch_q11_sf10_2gpu",
-                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q11]")
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q11][multi_gpu]")
 {
   if (sf10_path().empty()) {
     WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q11 variant (TEST-04 gate)");
     return;
   }
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("tpch_q11_sf10_2gpu requires >=2 GPUs; skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!compare_gpu_vs_cpu_sf10_for(
         /*num_gpus=*/2,
         "select ps_partkey, "

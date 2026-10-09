@@ -968,6 +968,9 @@ TEST_CASE("a join key records whether its condition is a bare column equality",
 
   auto const is_bare_equality = [&stub](sirius::comparison_type comparison,
                                         std::unique_ptr<sirius::ast::node> lhs_side) {
+    bool const materialized = !lhs_side->holds<sirius::ast::reference>();
+    auto left               = duckdb::make_uniq<wide_scan>(3);
+    auto* lhs_scan          = left.get();
     duckdb::vector<sirius::join_condition> conditions;
     sirius::join_condition condition;
     condition.left  = std::move(lhs_side);
@@ -976,7 +979,7 @@ TEST_CASE("a join key records whether its condition is a bare column equality",
     conditions.push_back(std::move(condition));
 
     test_join join(stub,
-                   duckdb::make_uniq<wide_scan>(3),
+                   std::move(left),
                    duckdb::make_uniq<wide_scan>(3),
                    std::move(conditions),
                    duckdb::JoinType::INNER,
@@ -984,9 +987,20 @@ TEST_CASE("a join key records whether its condition is a bare column equality",
                    /*right_projection_map=*/{},
                    /*delim_types=*/{},
                    /*estimated_cardinality=*/1);
-    auto* lhs_scan = static_cast<wide_scan*>(join.children[0].get());
-    lhs_scan->link(&join);
+    auto* projection =
+      dynamic_cast<sirius::op::sirius_physical_projection*>(join.children[0].get());
+    lhs_scan->link(projection ? static_cast<sirius::op::sirius_physical_operator*>(projection)
+                              : &join);
     auto const lives = analyze_column_lifetimes(*lhs_scan);
+    if (materialized) {
+      // The original value is consumed by the key projection. It must not acquire the
+      // synthetic key's bare-equality role or inherit a distinctness proof for that key.
+      REQUIRE(projection);
+      REQUIRE(lives[1].first_reader == projection);
+      REQUIRE(lives[1].join_key_at.empty());
+      return false;
+    }
+    REQUIRE_FALSE(projection);
     REQUIRE(lives[1].join_key_at.size() == 1);
     return lives[1].join_key_at.front().bare_column_equality;
   };

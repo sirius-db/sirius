@@ -49,12 +49,6 @@ constexpr std::string_view tier_name(cucascade::memory::Tier tier)
   }
 }
 
-constexpr std::array<cucascade::memory::Tier, 3> kTiers = {
-  cucascade::memory::Tier::GPU,
-  cucascade::memory::Tier::HOST,
-  cucascade::memory::Tier::DISK,
-};
-
 /// Read tier + size; nullopt for batches with no data.
 struct batch_snapshot {
   uint64_t batch_id;

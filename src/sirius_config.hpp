@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -26,7 +27,13 @@
 
 #include <cmath>
 #include <filesystem>
+#include <memory>
+#include <stdexcept>
 #include <string>
+
+namespace YAML {
+class Node;
+}
 
 namespace sirius {
 
@@ -39,8 +46,8 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 
 /// Shared operator batch default: 2.5% of the smallest visible GPU's total memory,
 /// clamped to [512 MiB, 5 GiB]; DEFAULT_BATCH_SIZE when no GPU is visible. Queried
-/// once per process (memoized). operator_params derives its batch members from this,
-/// so every default-constructed instance agrees. When YAML explicitly configures an
+/// once per process (memoized). Hardware resolution derives operator batch sizes
+/// from this value. When YAML explicitly configures an
 /// effective GPU capacity, sirius_config narrows the shared defaults from the resolved
 /// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
@@ -118,13 +125,17 @@ constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 10
 /// Parameters controlling operator-level resource sizing.
 /// Fields are YAML-configurable unless documented as engine-owned; runtime test hooks require
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
+/// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
+  /// Construct defaults with a shared batch size and twice that size for hash builds.
+  static operator_params with_batch_size(uint64_t batch_size);
+
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
   bool like_swar_fastpath = false;
 
   /// Target batch size (bytes) for DuckDB scan tasks.
-  uint64_t scan_task_batch_size = config::derived_default_batch_size();
+  uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
@@ -133,18 +144,18 @@ struct operator_params {
   double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
-  uint64_t hash_partition_bytes = config::derived_default_batch_size();
+  uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
 
   /// Target size (bytes) for the concat operator output batch.
-  uint64_t concat_batch_bytes = config::derived_default_batch_size();
+  uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
-  uint64_t sort_sample_bytes = config::derived_default_batch_size();
+  uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
   /// Maximum build-side bytes for switching to BUILD_PROBE join mode: 2x the shared
   /// batch default. May be larger than concat_batch_bytes; build-side batches will be
   /// concatenated if needed.
-  uint64_t max_build_hash_table_bytes = 2 * config::derived_default_batch_size();
+  uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
 
   /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
   /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is
@@ -169,6 +180,13 @@ struct operator_params {
 
   /// Enable dynamic filters for eligible hash joins.
   bool enable_dynamic_filter = true;
+
+  /// Enable Bloom accumulation for non-broadcast hash builds with more than one partition.
+  bool enable_dynamic_filter_multi_partition = true;
+
+  /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
+  uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
+    sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
@@ -235,6 +253,9 @@ struct telemetry_config {
   /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
   /// Roughly doubles telemetry volume; no-op when enable_quent is false.
   bool enable_batch_events{true};
+  /// Capture NVTX ranges (Sirius and libcudf) into Quent; no-op when
+  /// enable_quent is false.
+  bool enable_nvtx{false};
   std::string exporter{"ndjson"};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
@@ -275,10 +296,19 @@ struct compression_config {
   std::string input_plan_dir{};
 };
 
+class configuration_input_error : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+class parsed_sirius_config;
+
 struct sirius_config {
-  sirius_config();
+  sirius_config()  = default;
   ~sirius_config() = default;
 
+  // Explicit hardware-resolving helpers for internal configuration consumers.
+  // Runtime startup takes parsed_sirius_config instead.
   void load_from_file(const std::filesystem::path& config_path);
   void apply_defaults();
 
@@ -307,6 +337,10 @@ struct sirius_config {
   /// SiriusContext::initialize()) to persist runtime-derived wiring so a later
   /// get_scan_manager_config() reflects the actual scan_manager state.
   void set_scan_manager_config(scan_manager::scan_manager_config config) noexcept;
+
+  /// Set the in-memory S3 fallback. Credentials are never loaded from YAML.
+  /// Set this before initializing consumers of the scan-manager configuration.
+  void set_object_store_config(io::object_store_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
@@ -341,11 +375,12 @@ struct sirius_config {
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
+  friend class parsed_sirius_config;
+
   /// Apply the knobs derived from the rest of the configuration: the readahead
   /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called from the end of both @ref load_from_file
-  /// and @ref apply_defaults so a missing config file derives the same values
-  /// an empty one does; each step is idempotent.
+  /// override, in that order. Called by parsed_sirius_config::resolve after
+  /// memory capacities and operator defaults are resolved.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
@@ -354,13 +389,6 @@ struct sirius_config {
   /// the override takes effect. Called from @ref finalize_derived_config.
   void enforce_sirius_backend_for_multi_gpu();
 
-  /// Re-default @c _scan_manager_config.uring.n_max_concurrent_scans to the
-  /// CONFIGURED pipeline pool size. The struct default can only use the
-  /// compile-time thread count, so resizing the pipeline in config would
-  /// otherwise leave the readahead budget behind. Called from
-  /// @ref finalize_derived_config; an explicit config value is left alone.
-  void derive_uring_scan_budget();
-
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
   /// latency-bound, so the readahead needs several splits in flight per pipeline
@@ -368,7 +396,7 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
-  cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
+  cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
@@ -379,6 +407,26 @@ struct sirius_config {
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
+};
+
+/// Validated configuration intent. Construction and parsing never discover hardware.
+/// Resolution produces a separate value and leaves the specification unchanged.
+class parsed_sirius_config {
+ public:
+  parsed_sirius_config();
+  static parsed_sirius_config from_file(const std::filesystem::path& path);
+  static parsed_sirius_config from_node(const YAML::Node& root,
+                                        const std::filesystem::path& source_path = {});
+  [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
+  [[nodiscard]] const operator_params& get_operator_params() const noexcept;
+  [[nodiscard]] const compression_config& get_compression_config() const noexcept;
+  [[nodiscard]] sirius_config resolve(
+    const cucascade::memory::system_topology_info& topology) const;
+
+ private:
+  struct Impl;
+  explicit parsed_sirius_config(std::shared_ptr<const Impl> impl);
+  std::shared_ptr<const Impl> impl_;
 };
 
 }  // namespace sirius

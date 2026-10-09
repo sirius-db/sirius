@@ -104,7 +104,7 @@ Scripts are in `test/tpch_performance/`.
 
 ## TPC-H Query Files
 
-- **Sirius and DuckDB runners:** queries are defined in `test/tpch_performance/queries.py` (the `QUERIES` dict, keyed `q1`..`q22`) — imported by `performance_test.py`.
+- **Sirius and DuckDB runners:** queries are defined in `test/tpch_performance/queries.py`; `performance_test.py` renders the scale-dependent Q11 fraction from `--scale-factor`.
 - Plain SQL files at `test/tpch_performance/tpch_queries/orig/q*.sql` are kept for reference but are no longer wired into the recommended Python runner.
 
 ## Workflow H-A: Generate TPC-H Data
@@ -132,11 +132,12 @@ pixi run bash generate_tpch_data.sh <scale_factor> --format parquet|duckdb [--cl
 ```bash
 export SIRIUS_CONFIG_FILE=/path/to/config.yaml
 pixi run python test/tpch_performance/performance_test.py \
-    --input <parquet_dir> [options]
+    --input <parquet_dir> --scale-factor <SF> [options]
 ```
 
 **Required:**
 - `--input <path>` — the dataset. A **parquet directory** (with `--data-source parquet`, default) or a single **`.duckdb` file** (with `--data-source duckdb`).
+- `--scale-factor <SF>` — the dataset scale used to render Q11 as `0.0001 / SF`. Always pass it explicitly; omission defaults to SF1 with a warning only for rollout compatibility.
 
 **Most-used flags** — the complete reference lives in `test/tpch_performance/CLAUDE.md` and `performance_test.py --help`; consult it rather than re-deriving flags here:
 - `--data-source {parquet,duckdb}` (default `parquet`) — input source/format. `parquet`: `--input` is a parquet directory (`read_parquet` scan). `duckdb`: `--input` is a single `.duckdb` file (GPU-native `seq_scan`). Works in all modes; `--pin` works for both.
@@ -156,21 +157,25 @@ The CLAUDE.md is the source of truth for the rest of the surface (`--config`, `-
 # SF1, hot cache, both engines, 2 iterations (parquet directory)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --iterations 2 --engine both
 
 # Validate GPU vs CPU after timing (queries 1/3/6)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # DuckDB source (a .duckdb FILE) from disk, both engines, validate
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf1.duckdb --data-source duckdb \
+    --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # DuckDB source pinned into the GPU cache
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf100.duckdb --data-source duckdb \
+    --scale-factor 100 \
     --engine gpu --iterations 3 --pin gpu
 ```
 
@@ -193,7 +198,7 @@ echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | su
 
 ### Output Layout
 
-A timestamped benchmark dir `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/` (or `<output>/<NAME>/`) containing `metadata.json`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
+A timestamped benchmark dir `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/` (or `<output>/<NAME>/`) containing `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
 
 ---
 
@@ -270,8 +275,9 @@ Ask in ~3 grouped rounds (`AskUserQuestion` allows up to 4 questions per call). 
 **Round 1 — data & engine**
 1. **Data source** (`--data-source`) — `parquet` or `duckdb`.
 2. **Dataset** (`--input`) — the parquet **directory** or `.duckdb` **file** path. ALWAYS ask the user where the dataset lives — never assume a path, and never treat a missing path as "needs generating": the dataset may already exist at a different location (see the generation gate in Workflow H-A). If the given path doesn't exist, report that and ask for the correct location; offer generation via `/dataset-manager` only after the user confirms no existing dataset is available (generation can take significant time and disk at large scale factors — **never auto-generate**). For duckdb, clarify plain vs `--cluster` (sorted) if generating.
-3. **Config** (`--config` / `SIRIUS_CONFIG_FILE`) — which Sirius config YAML to use (required for any GPU engine). Do not guess the path; confirm it.
-4. **Engine** (`--engine`) — `gpu`, `cpu`, or `both` (default `both`).
+3. **Scale factor** (`--scale-factor`) — the dataset's scale factor; this must match the input because it controls Q11's threshold.
+4. **Config** (`--config` / `SIRIUS_CONFIG_FILE`) — which Sirius config YAML to use (required for any GPU engine). Do not guess the path; confirm it.
+5. **Engine** (`--engine`) — `gpu`, `cpu`, or `both` (default `both`).
 
 **Round 2 — execution shape**
 1. **Execution profile** (`--execution`, optional — omitted leaves the config untouched and runs iterations back-to-back) — `hot`, `lukewarm` (OS cache dropped once, LRU retention, round-robin), or `cold` (per-query OS cache drop + `reset_sirius_cache()`; needs the sudo setup below). `--precmd nsys|gdb` selects a separate GPU-only external runner; Nsight is owned by the `profile-analyzer` skill.
@@ -287,7 +293,7 @@ Ask in ~3 grouped rounds (`AskUserQuestion` allows up to 4 questions per call). 
 After confirming, echo the final `performance_test.py` command back to the user before running it.
 
 **Environment prerequisites** (verify these yourself; they are not user questions):
-- Sirius extension built: `pixi run -e clang make release` (the runner loads `build/release/extension/sirius/sirius.duckdb_extension` for any GPU engine).
+- Sirius extension built: `pixi run -e clang make release` (the runner loads `sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension` for any GPU engine).
 - For Super Sirius: `SIRIUS_CONFIG_FILE` set, or `--config <yaml>` passed (confirmed in Round 1).
 
 ---
@@ -349,6 +355,6 @@ After confirming, echo the final command(s), including any `generate_tpch_refres
 if generation was confirmed), before running.
 
 **Environment prerequisites** (verify yourself; not user questions):
-- Sirius extension built (`build/release/extension/sirius/sirius.duckdb_extension`).
+- Sirius extension built (`sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension`).
 - `tpch-dbgen` available for refresh and query generation (`test_datasets/tpch-dbgen/`; both
   scripts auto-unzip and build `dbgen`/`qgen` from `test_datasets/tpch-dbgen.zip` if missing).

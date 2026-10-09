@@ -55,6 +55,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -62,6 +63,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -71,7 +73,9 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "transparent/plan_source_policy.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include <cudf/types.hpp>
@@ -82,14 +86,10 @@ extern "C" int cudaProfilerStop();
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 // #include "from_substrait.hpp"
-#ifdef SIRIUS_ENABLE_LEGACY
-#include "gpu_buffer_manager.hpp"
-#include "gpu_context.hpp"
-#include "gpu_physical_plan_generator.hpp"
-#endif
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
@@ -108,7 +108,6 @@ extern "C" int cudaProfilerStop();
 #include "sirius_interface.hpp"
 #include "sirius_registration.hpp"
 #include "sirius_sql_rewrite.hpp"
-#include "telemetry/nvtx_injection.hpp"
 #include "util/segfault_backtrace.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
@@ -132,6 +131,7 @@ extern "C" int cudaProfilerStop();
 // <blockingconcurrentqueue.h> (used by pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
+#include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
 #include "io/types.hpp"                // sirius::io::ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
@@ -149,11 +149,6 @@ extern "C" int cudaProfilerStop();
 #include <utility>
 
 namespace duckdb {
-
-const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
-#ifdef SIRIUS_ENABLE_LEGACY
-bool SiriusRegistration::buffer_is_initialized = false;
-#endif
 
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
@@ -191,10 +186,52 @@ std::uint64_t count_narrowed_columns(
   return count;
 }
 
-unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
-                                                        Connection& connection,
-                                                        const string& query,
-                                                        const string& gpu_error = "")
+// SQL replay binds again on another connection. Validate that connection's final
+// CPU plan, including when optimization is disabled, before any source executes.
+struct cpu_replay_policy_validator final : ClientContextState {
+  cpu_replay_policy_validator(std::string error, std::shared_ptr<bool> refused)
+    : gpu_error(std::move(error)), policy_refused(std::move(refused))
+  {
+  }
+
+  bool CanRequestRebind() override { return true; }
+
+  RebindQueryInfo OnFinalizePrepare(ClientContext& context,
+                                    PreparedStatementData& prepared,
+                                    PreparedStatementMode) override
+  {
+    auto policy = prepared.physical_plan ? sirius::transparent::derive_plan_source_policy(
+                                             prepared.physical_plan->Root(), context)
+                                         : sirius::transparent::plan_source_policy{{}, false};
+    try {
+      sirius::transparent::require_cpu_replay(policy, "", gpu_error);
+    } catch (...) {
+      *policy_refused = true;
+      throw;
+    }
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+
+ private:
+  std::string gpu_error;
+  std::shared_ptr<bool> policy_refused;
+};
+
+struct cpu_replay_result {
+  unique_ptr<QueryResult> result;
+  bool policy_refused = false;
+  std::exception_ptr thrown;
+  unique_ptr<QueryResult> take()
+  {
+    if (thrown) std::rethrow_exception(thrown);
+    return std::move(result);
+  }
+};
+cpu_replay_result run_internal_cpu_fallback_query(ClientContext& context,
+                                                  Connection& connection,
+                                                  const string& query,
+                                                  const string& gpu_error             = "",
+                                                  duckdb::SiriusContext* test_context = nullptr)
 {
   // S3 CPU fallback is not supported. Sirius reads s3:// only on the GPU path
   // (sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx); DuckDB's CPU
@@ -218,7 +255,20 @@ unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
   // per-connection state there.
   duckdb::SiriusContext::InternalQueryGuard guard(*connection.context);
   duckdb::SiriusContext::CpuFallbackGuard cpu_fallback_guard(*connection.context);
-  return connection.Query(query);
+  auto& states                 = *connection.context->registered_state;
+  constexpr auto validator_key = "sirius_cpu_replay_policy";
+  auto policy_refused          = std::make_shared<bool>(false);
+  states.Insert(validator_key,
+                make_shared_ptr<cpu_replay_policy_validator>(gpu_error, policy_refused));
+  absl::Cleanup remove_validator = [&] { states.Remove(validator_key); };
+  try {
+    if (test_context && test_context->cpu_replay_query_hook_for_testing)
+      test_context->cpu_replay_query_hook_for_testing();
+    auto result = connection.Query(query);
+    return {std::move(result), *policy_refused, {}};
+  } catch (...) {
+    return {{}, *policy_refused, std::current_exception()};
+  }
 }
 
 // Bind callback for the sirius_read_parquet table function — a thin forwarder.
@@ -247,10 +297,16 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
     sirius_ctx->throw_runtime_unavailable();
   }
 
+  if (sirius::io::s3::is_s3_path(uri)) {
+    auto s3_config = sirius::io::s3::resolve_duckdb_s3_secret(
+      context, uri, sirius_ctx->get_config().get_scan_manager_config().object_store);
+    sirius_ctx->get_scan_manager().install_s3_config(uri, std::move(s3_config));
+  }
+
   auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
   return_types     = std::move(bind_result.return_types);
   names            = std::move(bind_result.names);
-  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows);
+  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows, return_types, names);
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the
@@ -278,11 +334,24 @@ unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
   return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
 }
 
+TableFunction GetSiriusReadParquetFunction()
+{
+  TableFunction sirius_read_parquet("sirius_read_parquet",
+                                    {LogicalType::VARCHAR},
+                                    SiriusReadParquetFunction,
+                                    SiriusReadParquetBind);
+  sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
+  sirius_read_parquet.projection_pushdown = true;
+  sirius_read_parquet.filter_pushdown     = true;
+  sirius_read_parquet.filter_prune        = true;
+  return sirius_read_parquet;
+}
+
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
-  // Bind data carries ONLY re-executable input (the SQL template, schema and
-  // label). The physical plan, interface, connection and result are
-  // per-execution state (SiriusExecutionGlobalState): a plan built at bind time
+  // Bind data carries only re-executable input: the SQL template, schema,
+  // query label and bound source policy. The physical plan, interface, connection
+  // and result are per-execution state (SiriusExecutionGlobalState): a plan built at bind time
   // would cache pin-registry pointers that a later unpin invalidates, and a
   // bind-held result cannot serve a prepared statement's second execution.
   string query;
@@ -294,7 +363,11 @@ struct SiriusTableFunctionData : public TableFunctionData {
   // queries there is no CPU fallback: run_internal_cpu_fallback_query detects the
   // s3:// read and raises a clear "S3 CPU fallback is not supported" error.
   string cpu_fallback_query;
+  // Bind-time discovery survives failures before execution can rebuild a plan.
+  // A missing plan must never grant permission to replay.
+  sirius::transparent::plan_source_policy source_policy{{}, false};
   bool enable_optimizer;
+  bool statement_read_only = true;
   // Schema captured at bind time; each execution rebuilds its
   // PreparedStatementData from these (parameterized execution is not
   // supported on this path, so no value_map is needed — same as the
@@ -324,7 +397,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
   // Reset configuration
   void CleanupConnection(ClientContext& context) const { context.config = original_config; }
 
-  unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context)
+  unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context, bool* read_only = nullptr)
   {
     PrepareConnection(context);
     unique_ptr<LogicalOperator> plan;
@@ -335,6 +408,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
       Planner planner(context);
       planner.CreatePlan(std::move(parser.statements[0]));
       D_ASSERT(planner.plan);
+      if (read_only) *read_only = planner.properties.IsReadOnly();
 
       plan = std::move(planner.plan);
 
@@ -359,233 +433,12 @@ struct SiriusTableFunctionData : public TableFunctionData {
     return plan;
   }
 };
-
-#ifdef SIRIUS_ENABLE_LEGACY
-struct GPUTableFunctionData : public TableFunctionData {
-  GPUTableFunctionData() = default;
-  shared_ptr<Relation> plan;
-  shared_ptr<GPUPreparedStatementData> gpu_prepared;
-  unique_ptr<QueryResult> res;
-  unique_ptr<Connection> conn;
-  unique_ptr<GPUContext> gpu_context;
-  string query;
-  bool enable_optimizer;
-  bool finished   = false;
-  bool plan_error = false;
-  //! Original options from the connection
-  ClientConfig original_config;
-  set<OptimizerType> original_disabled_optimizers;
-
-  void PrepareConnection(ClientContext& context)
-  {
-    // First collect original options
-    original_config              = context.config;
-    original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
-
-    // The user might want to disable the optimizer of the new connection
-    context.config.enable_optimizer = enable_optimizer;
-    // We want for sure to disable the internal compression optimizations.
-    // These are DuckDB specific, no other system implements these. Also,
-    // respect the user's settings if they chose to disable any specific optimizers.
-    //
-    // The InClauseRewriter optimization converts large `IN` clauses to a
-    // "mark join" against a `ColumnDataCollection`, which may not make
-    // sense in other systems and would complicate the conversion to Substrait.
-    set<OptimizerType> disabled_optimizers =
-      DBConfig::GetConfig(context).options.disabled_optimizers;
-    disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
-    disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
-    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
-    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
-    // to keep the query on the scan -> aggregate path where the GPU can execute it.
-    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
-#ifdef DEBUG
-    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
-#endif
-    // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
-    // If error(varchar) gets implemented in substrait this can be removed
-    // context.config.scalar_subquery_error_on_multiple_rows = false;
-    DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
-  }
-
-  // Reset configuration
-  void CleanupConnection(ClientContext& context) const
-  {
-    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled_optimizers;
-    context.config                                           = original_config;
-  }
-
-  unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context)
-  {
-    PrepareConnection(context);
-    unique_ptr<LogicalOperator> plan;
-    try {
-      Parser parser(context.GetParserOptions());
-      parser.ParseQuery(query);
-
-      Planner planner(context);
-      planner.CreatePlan(std::move(parser.statements[0]));
-      D_ASSERT(planner.plan);
-
-      plan = std::move(planner.plan);
-
-      if (context.config.enable_optimizer) {
-        Optimizer optimizer(*planner.binder, context);
-        plan = optimizer.Optimize(std::move(plan));
-      }
-
-      // After optimization, refresh types before column binding resolution
-      // to ensure types are consistent (some optimizers may have set stale types)
-      plan->ResolveOperatorTypes();
-
-      ColumnBindingResolver resolver;
-      ColumnBindingResolver::Verify(*plan);
-      resolver.VisitOperator(*plan);
-    } catch (...) {
-      CleanupConnection(context);
-      throw;
-    }
-
-    CleanupConnection(context);
-    return plan;
-  }
-};
-
-void do_nothing_context(ClientContext*) {}
-
-static unique_ptr<GPUPhysicalOperator> GPUGeneratePhysicalPlan(
-  ClientContext& context,
-  GPUContext& gpu_context,
-  unique_ptr<LogicalOperator>& logical_plan,
-  Connection& new_conn)
-{
-  GPUPhysicalPlanGenerator physical_planner = GPUPhysicalPlanGenerator(context, gpu_context);
-  auto physical_plan                        = physical_planner.CreatePlan(std::move(logical_plan));
-  return physical_plan;
-}
-
-// The result of the GPUProcessingBind function is a unique pointer to a FunctionData object.
-// This result of this function is used as an argument to the GPUProcessingFunction function (data_p
-// argument), which is called to execute the table function.
-unique_ptr<FunctionData> SiriusRegistration::GPUProcessingBind(ClientContext& context,
-                                                               TableFunctionBindInput& input,
-                                                               vector<LogicalType>& return_types,
-                                                               vector<string>& names)
-{
-  auto result              = make_uniq<GPUTableFunctionData>();
-  result->conn             = make_uniq<Connection>(*context.db);
-  result->query            = input.inputs[0].ToString();
-  result->enable_optimizer = true;
-  result->gpu_context      = make_uniq<GPUContext>(context);
-  if (input.inputs[0].IsNull()) {
-    throw BinderException("gpu_processing cannot be called with a NULL parameter");
-  }
-
-  // Parse the query just to get the result type information and to create preparedstatmement data
-  auto statements = result->conn->context->ParseStatements(result->query);
-  Planner planner(context);
-  auto statement_type = statements[0]->type;
-  planner.CreatePlan(std::move(statements[0]));
-  D_ASSERT(planner.plan);
-
-  auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
-  prepared->names     = planner.names;
-  prepared->types     = planner.types;
-  prepared->value_map = std::move(planner.value_map);
-
-  // generate physical plan from the logical plan
-  unique_ptr<LogicalOperator> query_plan = result->ExtractPlan(context);
-  SIRIUS_LOG_DEBUG("Query plan:\n{}", query_plan->ToString());
-  if (buffer_is_initialized) {
-    try {
-      auto gpu_physical_plan =
-        GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
-      auto gpu_prepared    = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared),
-                                                                    std::move(gpu_physical_plan));
-      result->gpu_prepared = gpu_prepared;
-    } catch (std::exception& e) {
-      ErrorData error(e);
-      SIRIUS_LOG_ERROR("Error in GPUGeneratePhysicalPlan: {}", error.RawMessage());
-      result->plan_error = true;
-    }
-  } else {
-    result->gpu_prepared = nullptr;
-  }
-
-  for (auto& column : planner.names) {
-    names.emplace_back(column);
-  }
-  for (auto& type : planner.types) {
-    return_types.emplace_back(type);
-  }
-
-  return std::move(result);
-}
-
-void SiriusRegistration::GPUProcessingFunction(ClientContext& context,
-                                               TableFunctionInput& data_p,
-                                               DataChunk& output)
-{
-  auto& data = (GPUTableFunctionData&)*data_p.bind_data;
-  if (data.finished) { return; }
-
-  if (!data.res) {
-    auto start = std::chrono::high_resolution_clock::now();
-    if (!buffer_is_initialized) {
-      printf("\033[1;31m");
-      printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n");
-      printf("\033[0m");
-      printf(
-        "=============================================\nError in GPUExecuteQuery, fallback to "
-        "DuckDB\n=============================================\n");
-      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
-    } else if (data.plan_error) {
-      printf(
-        "=============================================\nError in GPUExecuteQuery, fallback to "
-        "DuckDB\n=============================================\n");
-      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
-    } else {
-      data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
-      if (data.res->HasError()) {
-        printf(
-          "=============================================\nError in GPUExecuteQuery, fallback to "
-          "DuckDB\n=============================================\n");
-        data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
-      }
-    }
-    auto end      = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    SIRIUS_LOG_INFO("Execute query time: {:.2f} ms", duration.count() / 1000.0);
-  }
-
-  auto result_chunk = data.res->Fetch();
-  if (result_chunk == nullptr) {
-    output.SetCardinality(0);
-    return;
-  }
-
-  output.Reference(*result_chunk);
-  return;
-}
-
-static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog& catalog)
-{
-  TableFunction gpu_processing("gpu_processing",
-                               {LogicalType::VARCHAR},
-                               SiriusRegistration::GPUProcessingFunction,
-                               SiriusRegistration::GPUProcessingBind);
-  gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
-  CreateTableFunctionInfo gpu_processing_info(gpu_processing);
-  catalog.CreateTableFunction(transaction, gpu_processing_info);
-}
-#endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPlan(
-  ClientContext& context, unique_ptr<LogicalOperator>& logical_plan)
+  ClientContext& context, unique_ptr<LogicalOperator>& logical_plan, sirius::query_id_t query_id)
 {
   sirius::planner::sirius_physical_plan_generator physical_planner =
-    sirius::planner::sirius_physical_plan_generator(context);
+    sirius::planner::sirius_physical_plan_generator(context, {{sirius::value_of(query_id)}, 0});
   auto physical_plan = physical_planner.create_plan(std::move(logical_plan));
   return physical_plan;
 }
@@ -644,9 +497,13 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
   Planner planner(context);
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
+  if (planner.plan) {
+    result->source_policy = sirius::transparent::derive_plan_source_policy(*planner.plan, context);
+  }
 
-  result->bind_names = planner.names;
-  result->bind_types = planner.types;
+  result->statement_read_only = planner.properties.IsReadOnly();
+  result->bind_names          = planner.names;
+  result->bind_types          = planner.types;
 
   for (auto& column : planner.names) {
     names.emplace_back(column);
@@ -691,8 +548,14 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
     auto start         = std::chrono::high_resolution_clock::now();
     auto sirius_ctx    = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     ErrorData gpu_error;
+    bool statement_read_only       = data.statement_read_only;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
+    sirius::transparent::failure_cause failure;
+    sirius::transparent::late_failure_trace failure_trace;
+    bool non_rollbackable_state = false;
+    std::shared_ptr<sirius::op::scan::test_injections const> injections;
+    auto lease_release = duckdb::SiriusContext::StandaloneQueryScope::lease_release_result{};
 
     // The execution window: fresh plan extraction, Sirius physical plan
     // generation, execution and mandatory cleanup all happen inside one scope
@@ -701,16 +564,25 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
     {
       std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
       try {
-        if (sirius_ctx) { window.emplace(*sirius_ctx, context, "gpu_execution"); }
+        if (sirius_ctx) {
+          Value mark_unavailable;
+          if (context.TryGetCurrentSetting("sirius_test_mark_runtime_unavailable_before_window",
+                                           mark_unavailable) &&
+              !mark_unavailable.IsNull() && mark_unavailable.GetValue<bool>()) {
+            sirius_ctx->mark_runtime_unavailable();
+          }
+          window.emplace(*sirius_ctx, context, "gpu_execution");
+        }
 
         unique_ptr<LogicalOperator> query_plan;
         {
           // Suppress the optimizer hooks for this nested planning pass.
           duckdb::SiriusContext::InternalQueryGuard guard(context);
-          query_plan = data.ExtractPlan(context);
+          query_plan = data.ExtractPlan(context, &statement_read_only);
         }
         SIRIUS_LOG_DEBUG("Query plan:\n{}", query_plan->ToString());
-        auto sirius_physical_plan = SiriusGeneratePhysicalPlan(context, query_plan);
+        auto sirius_physical_plan =
+          SiriusGeneratePhysicalPlan(context, query_plan, window->query_id());
         SIRIUS_LOG_DEBUG("Done generating sirius physical plan");
 
         auto prepared     = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
@@ -736,6 +608,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
         gpu_failed                = true;
         runtime_unavailable_error = true;
       } catch (std::exception& e) {
+        if (window) window->report_failure(std::current_exception());
         gpu_error  = ErrorData(e);
         gpu_failed = true;
       }
@@ -743,12 +616,23 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
       // exit may skip it; a non-std exception is handled by the window's
       // destructor backstop.
       if (window) {
+        injections = window->injections();
+        failure    = window->failure();
+        if (gpu_failed) failure_trace.cause = failure.cause;
+        non_rollbackable_state = window->non_rollbackable_state();
+        if (gpu_failed && sirius_ctx) sirius_ctx->record_late_failure(failure.cause);
         window->finish();
+        lease_release = window->lease_release();
         window.reset();
       }
     }
 
     if (gpu_failed) {
+      failure_trace.cause = failure.cause;
+      if (lease_release.state ==
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::not_entered &&
+          sirius_ctx)
+        sirius_ctx->record_late_failure(failure.cause);
       // Cancellation is never a fallback candidate; a pre-existing-unavailable
       // error on an S3 query keeps its stable typed message (no CPU fallback
       // exists for S3, so the S3 rewrite inside the fallback helper must not
@@ -761,10 +645,52 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
       if (!duckdb_fallback_enabled(context)) {
         throw std::runtime_error("SiriusExecuteQuery error: " + gpu_error.RawMessage());
       }
+      // Check the bound sources before entering CPU replay. The helper below
+      // retains its existing SQL-text check as an additional S3 signal.
+      sirius::transparent::require_cpu_replay(data.source_policy, "", gpu_error.RawMessage());
+      if (sirius_ctx) { sirius_ctx->before_cpu_replay_for_testing(context); }
+      if (lease_release.state !=
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::released &&
+          lease_release.state !=
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::not_entered) {
+        if (sirius_ctx) { sirius_ctx->record_lease_held_at_replay(); }
+        throw std::runtime_error(
+          "SiriusExecuteQuery error: checkpoint-lease cleanup did not complete before CPU replay");
+      }
+      // The retained helper also vetoes S3 mentioned only in SQL text (for example
+      // an unused CTE omitted from the bound plan). Count replay only after this
+      // final source guard; keep its existing position after the lease check.
+      sirius::transparent::require_s3_cpu_replay(
+        data.source_policy, data.cpu_fallback_query, gpu_error.RawMessage());
+      D_ASSERT(!gstate.res && !gstate.finished);
+      if (injections && injections->interrupt_before_replay) context.interrupted = true;
+      auto const read_only = injections && injections->override_read_only
+                               ? *injections->override_read_only
+                               : statement_read_only;
+      auto admission       = sirius::transparent::admit_cpu_replay(
+        context, read_only, std::nullopt, non_rollbackable_state, false);
+      failure_trace.replay     = false;
+      failure_trace.refused_by = admission.refused_by;
+      if (!admission.admitted) {
+        if (sirius_ctx) sirius_ctx->record_late_refusal(*admission.refused_by);
+        throw std::runtime_error("Sirius CPU replay refused: " + gpu_error.RawMessage());
+      }
       SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", gpu_error.RawMessage());
       print_cpu_fallback_banner();
-      gstate.res = run_internal_cpu_fallback_query(
-        context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage());
+      auto cpu_replay = run_internal_cpu_fallback_query(
+        context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage(), sirius_ctx.get());
+      if (cpu_replay.policy_refused) {
+        failure_trace.refused_by =
+          sirius::transparent::late_failure_condition::policy_refused_in_replay;
+        if (sirius_ctx) sirius_ctx->record_late_refusal(*failure_trace.refused_by);
+      } else {
+        failure_trace.replay = true;
+        if (sirius_ctx) {
+          sirius_ctx->record_late_replay(failure.cause, read_only);
+          sirius_ctx->record_transparent_runtime_fallback();
+        }
+      }
+      gstate.res = cpu_replay.take();
     }
     auto end      = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -801,120 +727,6 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
 
   return plan;
 }
-
-#ifdef SIRIUS_ENABLE_LEGACY
-struct GPUBufferInitFunctionData : public TableFunctionData {
-  GPUBufferInitFunctionData() {}
-  bool finished = false;
-  size_t cache_size;
-  size_t processing_size;
-  size_t pinned_memory_size;
-};
-
-unique_ptr<FunctionData> SiriusRegistration::GPUBufferInitBind(ClientContext& context,
-                                                               TableFunctionBindInput& input,
-                                                               vector<LogicalType>& return_types,
-                                                               vector<string>& names)
-{
-  auto result = make_uniq<GPUBufferInitFunctionData>();
-
-  string gpu_cache_size      = input.inputs[0].ToString();
-  string gpu_processing_size = input.inputs[1].ToString();
-  string pinned_memory_size("0 GB");  // Default size of pinned memory
-  if (input.named_parameters.find(PINNED_MEMORY_PARAM_KEY) != input.named_parameters.end()) {
-    // If the pinned memory size is specified in the arguments then use that
-    pinned_memory_size = input.named_parameters[PINNED_MEMORY_PARAM_KEY].ToString();
-  }
-
-  // parsing 2GB or 2GiB to size_t
-  //  Function to parse size strings like "2GB" or "2GiB" to size_t
-  auto parse_size = [](const string& size_str) -> size_t {
-    size_t result     = 0;
-    size_t multiplier = 1;
-    string num_part;
-    string unit_part;
-
-    size_t i = 0;
-    // Skip any whitespace between number and unit
-    while (i < size_str.length() && isspace(size_str[i])) {
-      i++;
-    }
-
-    // Find where the number ends and unit begins
-    while (i < size_str.length() && (isdigit(size_str[i]) || size_str[i] == '.')) {
-      num_part += size_str[i];
-      i++;
-    }
-
-    // Skip any whitespace between number and unit
-    while (i < size_str.length() && isspace(size_str[i])) {
-      i++;
-    }
-
-    // Extract unit part
-    unit_part = size_str.substr(i);
-
-    // Convert number part to double
-    double num_value = stod(num_part);
-
-    // Determine multiplier based on unit
-    if (unit_part == "B") {
-      multiplier = 1;
-    } else if (unit_part == "KB" || unit_part == "KiB") {
-      multiplier = 1024;
-    } else if (unit_part == "MB" || unit_part == "MiB") {
-      multiplier = 1024 * 1024;
-    } else if (unit_part == "GB" || unit_part == "GiB") {
-      multiplier = 1024 * 1024 * 1024;
-    } else if (unit_part == "TB" || unit_part == "TiB") {
-      multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
-    } else {
-      throw InvalidInputException("Invalid format");
-    }
-
-    result = (size_t)(num_value * multiplier);
-    return result;
-  };
-
-  // Parse the input sizes
-  result->cache_size         = parse_size(gpu_cache_size);
-  result->processing_size    = parse_size(gpu_processing_size);
-  result->pinned_memory_size = parse_size(pinned_memory_size);
-
-  auto type = LogicalType(LogicalTypeId::BOOLEAN);
-  return_types.emplace_back(type);
-  names.emplace_back("Success");
-  return std::move(result);
-}
-
-void SiriusRegistration::GPUBufferInitFunction(ClientContext& context,
-                                               TableFunctionInput& data_p,
-                                               DataChunk& output)
-{
-  auto& data = data_p.bind_data->CastNoConst<GPUBufferInitFunctionData>();
-  if (data.finished) { return; }
-
-  size_t cache_size         = data.cache_size;
-  size_t processing_size    = data.processing_size;
-  size_t pinned_memory_size = data.pinned_memory_size;
-  if (pinned_memory_size == 0) { pinned_memory_size = std::max(cache_size, processing_size); }
-
-  if (!buffer_is_initialized) {
-    SIRIUS_LOG_DEBUG(
-      "GPU Buffer Manager initialized with args: Cache Size - {}, Processing Size - {}, Pinned Mem "
-      "Size - {}\n",
-      cache_size,
-      processing_size,
-      pinned_memory_size);
-    GPUBufferManager* gpuBufferManager =
-      &(GPUBufferManager::GetInstance(cache_size, processing_size, pinned_memory_size));
-    buffer_is_initialized = true;
-  } else {
-    SIRIUS_LOG_WARN("GPUBufferManager already initialized");
-  }
-  data.finished = true;
-}
-#endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
                                              TableFunctionBindInput& input,
@@ -982,6 +794,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
 
   auto info                 = std::make_unique<parquet_ingestible_table_info>();
   info->resolved_file_paths = file_paths;
+  info->bound_types         = desc.return_types;
   info->returned_types      = sirius::from_duckdb_vec(desc.return_types);  // full schema
   info->names               = desc.names;                                  // full schema
   for (auto idx : keep) {
@@ -1108,11 +921,11 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   info->storage = &storage;
   info->context = &context;
   info->db_path = canonical;
-  // Qualified-name identity for the pin cache — derived from the resolved
-  // DuckTableEntry so it matches the query-side derivation (the pipeline converter).
+  // Match the scan path by deriving the cache identity from the resolved entry.
   info->catalog_name           = entry.ParentCatalog().GetName();
   info->schema_name            = entry.ParentSchema().name;
   info->table_name             = entry.name;
+  info->table_identity         = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
   info->approximate_batch_size = batch_size;
   // Full-schema names (logical order) so column_names() can derive the
   // column_ids-aligned view; the decoder itself ignores names.
@@ -1336,13 +1149,23 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // DuckTransaction.
     auto& pinned_catalog      = Catalog::GetCatalog(context, info->catalog_name);
     duckdb_pin_v_base         = DuckTransaction::Get(context, pinned_catalog).start_time;
+    auto& attached_database   = info->storage->GetAttached();
     auto const* block_manager = dynamic_cast<SingleFileBlockManager const*>(
-      &info->storage->GetAttached().GetStorageManager().GetBlockManager());
+      &attached_database.GetStorageManager().GetBlockManager());
     if (block_manager == nullptr) {
       throw InvalidInputException("pin_table: DuckDB-native pins require a single-file database");
     }
-    duckdb_pin_checkpoint_iteration = block_manager->GetCheckpointIteration();
-    ingestible                      = sirius::op::scan::make_ingestible(std::move(info));
+    ingestible = sirius::op::scan::make_ingestible(std::move(info));
+    scan_mgr.acquire_checkpoint_key(window.query_id(), attached_database);
+    ingestible->ensure_metadata_prepared();
+    sirius_ctx->observe_native_checkpoint_for_testing(
+      context,
+      "pin_prepared",
+      std::static_pointer_cast<sirius::op::scan::duckdb_native_gpu_ingestible>(ingestible)
+        ->checkpoint_iteration());
+    duckdb_pin_checkpoint_iteration =
+      std::static_pointer_cast<sirius::op::scan::duckdb_native_gpu_ingestible>(ingestible)
+        ->checkpoint_iteration();
   } else {  // parquet
     auto& fs   = FileSystem::GetFileSystem(context);
     auto files = fs.GlobFiles(data.args.path);
@@ -1923,7 +1746,11 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   // build, so pin_owner must outlive it — a concurrent unpin on another connection must not
   // invalidate the entry mid-build.
   std::shared_ptr<sirius::scan_manager::pinned_entry const> pin_owner =
-    scan_mgr.find_pinned_entry_for_duckdb_table(entry_catalog, entry_schema, entry.name);
+    scan_mgr.find_pinned_entry_for_duckdb_table(
+      entry_catalog,
+      entry_schema,
+      entry.name,
+      {entry.oid, entry.GetStorage().GetRowGroupCollection()});
   sirius::scan_manager::pinned_entry const* pin = pin_owner.get();
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
     throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
@@ -2065,15 +1892,17 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   }
 
   sirius::vss::index_metadata meta;
-  meta.kind         = ann_index_kind_from_type(data.index_type);
-  meta.catalog_name = entry_catalog;
-  meta.schema_name  = entry_schema;
-  meta.table_name   = entry.name;
-  meta.column_name  = data.column_name;
-  meta.dim          = dim;
-  meta.num_rows     = n_rows;
-  meta.n_lists      = static_cast<int64_t>(n_lists);
-  meta.metric       = metric;
+  meta.kind           = ann_index_kind_from_type(data.index_type);
+  meta.catalog_name   = entry_catalog;
+  meta.schema_name    = entry_schema;
+  meta.table_name     = entry.name;
+  meta.table_identity = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
+  meta.pin_snapshot   = pin->snapshot_identity;
+  meta.column_name    = data.column_name;
+  meta.dim            = dim;
+  meta.num_rows       = n_rows;
+  meta.n_lists        = static_cast<int64_t>(n_lists);
+  meta.metric         = metric;
   // Resident index footprint, read while the reservation still tracks the arena.
   meta.resident_bytes = allocator->get_allocated_bytes(build_stream);
   [[maybe_unused]] std::size_t const build_peak_bytes =
@@ -2319,6 +2148,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   req.catalog             = entry.ParentCatalog().GetName();
   req.schema              = entry.ParentSchema().name;
   req.table_name          = entry.name;  // catalog-resolved name (matches query-side derivation)
+  req.table_identity      = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
   auto const& columns     = entry.GetColumns();
   auto const schema_names = columns.GetColumnNames();
   auto const schema_types = columns.GetColumnTypes();
@@ -2333,7 +2163,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   // must not invalidate it mid-search.
   duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
   auto pin_owner = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
-    req.catalog, req.schema, req.table_name);
+    req.catalog, req.schema, req.table_name, req.table_identity);
   const auto* pin = pin_owner.get();
   if (pin == nullptr) {
     throw BinderException("sirius_knn_search: table '" + req.table_name +
@@ -2421,6 +2251,21 @@ static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext
   // non-owning. The slot also serializes the current-device-resource swap the build does.
   duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
 
+  // A prepared table function can retain its bind data across DDL: the table
+  // name is a string argument, not a bound table scan dependency. Compare with
+  // the catalog visible to this execution before looking up either cache.
+  // Do not just refresh req's identity: its output types and vector dimension
+  // were also fixed at bind time and may no longer describe the current table.
+  auto const& req = bind_data.req;
+  auto& entry =
+    Catalog::GetEntry<TableCatalogEntry>(context, req.catalog, req.schema, req.table_name);
+  if (!entry.IsDuckTable() ||
+      !req.table_identity.matches({entry.oid, entry.GetStorage().GetRowGroupCollection()})) {
+    throw InvalidInputException(
+      "sirius_knn_search: table '" + req.table_name +
+      "' changed since the query was bound; re-pin the table and prepare the query again");
+  }
+
   auto state       = make_uniq<SiriusVectorSearchGlobalState>();
   state->host_repr = sirius::vss::run_vector_search(*sirius_ctx, bind_data.req);
   state->reader    = std::make_unique<sirius::op::result::host_table_chunk_reader>(
@@ -2479,18 +2324,6 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
 
-#ifdef SIRIUS_ENABLE_LEGACY
-  TableFunction gpu_buffer_init("gpu_buffer_init",
-                                {LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                GPUBufferInitFunction,
-                                GPUBufferInitBind);
-  gpu_buffer_init.named_parameters[PINNED_MEMORY_PARAM_KEY] = LogicalType::VARCHAR;
-  CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
-  catalog.CreateTableFunction(transaction, gpu_buffer_init_info);
-
-  RegisterLegacyGPUFunctions(transaction, catalog);
-#endif
-
   TableFunction gpu_execution("gpu_execution",
                               {LogicalType::VARCHAR},
                               GPUExecutionFunction,
@@ -2506,14 +2339,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   // Sirius's footer-only S3 path instead of DuckDB's native read_parquet.
   // Registered so the rewrite's output binds, but INTERNAL — not a public
   // surface: users query S3 Parquet with read_parquet('s3://...'), not this.
-  TableFunction sirius_read_parquet("sirius_read_parquet",
-                                    {LogicalType::VARCHAR},
-                                    SiriusReadParquetFunction,
-                                    SiriusReadParquetBind);
-  sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
-  sirius_read_parquet.projection_pushdown = true;
-  sirius_read_parquet.filter_pushdown     = true;
-  sirius_read_parquet.filter_prune        = true;
+  auto sirius_read_parquet = GetSiriusReadParquetFunction();
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 
@@ -2629,30 +2455,6 @@ static void throw_if_sirius_runtime_unavailable(ClientContext& context)
   }
 }
 
-#ifdef SIRIUS_ENABLE_LEGACY
-static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::USE_PIN_MEM_FOR_CPU_PROCESSING = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CPU_PROCESSING to {}",
-                   Config::USE_PIN_MEM_FOR_CPU_PROCESSING);
-}
-
-static void SetUsePinMemoryForCaching(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::USE_PIN_MEM_FOR_CACHING = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CACHING to {}", Config::USE_PIN_MEM_FOR_CACHING);
-}
-
-static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::USE_CUDF_EXPR = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
-}
-#endif
-
 static void ApplyExpressionEvaluatorStrategy(const std::string& value)
 {
   sirius::expression_evaluator_strategy parsed;
@@ -2688,53 +2490,6 @@ static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
   ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
 }
 
-#ifdef SIRIUS_ENABLE_LEGACY
-static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::USE_CUSTOM_TOP_N = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config USE_CUSTOM_TOP_N to {}", Config::USE_CUSTOM_TOP_N);
-}
-
-static void SetUseOptTableScan(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::USE_OPT_TABLE_SCAN = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config USE_OPT_TABLE_SCAN to {}", Config::USE_OPT_TABLE_SCAN);
-}
-
-static void SetOptTableScanNumStreams(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS = IntegerValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config OPT_TABLE_SCAN_NUM_CUDA_STREAMS to {}",
-                   Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS);
-}
-
-static void SetOptTableScanMemcpySize(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE to {}",
-                   Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE);
-}
-
-static void SetPrintGPUTableMaxRows(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::PRINT_GPU_TABLE_MAX_ROWS = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config PRINT_GPU_TABLE_MAX_ROWS to {}",
-                   Config::PRINT_GPU_TABLE_MAX_ROWS);
-}
-
-static void SetEnableFallbackCheck(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::ENABLE_FALLBACK_CHECK = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
-}
-#endif
-
 static void SetEnableDuckdbFallback(ClientContext& /*context*/,
                                     SetScope /*scope*/,
                                     Value& /*parameter*/)
@@ -2759,15 +2514,6 @@ static void SetEnableLikeSwarFastpath(ClientContext& /*context*/,
 {
   // DuckDB stores this setting in the client context.
 }
-
-#ifdef SIRIUS_ENABLE_LEGACY
-static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::MODIFIED_PIPELINE = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
-}
-#endif
 
 static void SetFuseMergePipelines(ClientContext& /*context*/,
                                   SetScope /*scope*/,
@@ -3092,6 +2838,36 @@ static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope
                    params->enable_dynamic_zone_map_filter);
 }
 
+static void SetEnableDynamicFilterMultiPartition(ClientContext& context,
+                                                 SetScope scope,
+                                                 Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                     = lock_operator_params_slot(context);
+  params->enable_dynamic_filter_multi_partition = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_MULTI_PARTITION to {}",
+                   params->enable_dynamic_filter_multi_partition);
+}
+
+static void SetMaxDynamicFilterBloomBytesPerGpu(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) {
+    throw InvalidInputException(
+      "max_dynamic_filter_bloom_bytes_per_gpu must be greater than zero; set "
+      "enable_dynamic_filter_multi_partition = false to disable Bloom accumulation");
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                      = lock_operator_params_slot(context);
+  params->max_dynamic_filter_bloom_bytes_per_gpu = bytes;
+  SIRIUS_LOG_DEBUG("Updated config MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU to {}",
+                   params->max_dynamic_filter_bloom_bytes_per_gpu);
+}
+
 static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
@@ -3206,34 +2982,10 @@ static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scop
                    params->enable_runtime_size_estimation);
 }
 
-void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
+void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
+                                           const sirius::operator_params& operator_defaults,
+                                           const sirius::compression_config& compression_defaults)
 {
-  auto const& operator_defaults    = defaults.get_operator_params();
-  auto const& compression_defaults = defaults.get_compression_config();
-
-#ifdef SIRIUS_ENABLE_LEGACY
-  // Add in config option for gpu buffer manager
-  config.AddExtensionOption("use_pin_memory",
-                            "Whether or not the buffer manager is initialized with pinned memory",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CPU_PROCESSING),
-                            SetUsePinMemory);
-
-  config.AddExtensionOption(
-    "use_pin_memory_for_caching",
-    "Whether or not the cache buffer is allocated with pinned host memory instead of GPU memory",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CACHING),
-    SetUsePinMemoryForCaching);
-
-  // Add in config option for expression executor
-  config.AddExtensionOption("use_cudf_expr",
-                            "Whether or not cudf is used to evaluate expressions",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(Config::USE_CUDF_EXPR),
-                            SetUseCudfExpr);
-#endif
-
   config.AddExtensionOption(
     "expression_evaluator_strategy",
     "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', or "
@@ -3251,46 +3003,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
     Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
     SetExpressionExecutorStrategyDeprecated);
 
-#ifdef SIRIUS_ENABLE_LEGACY
-  // Add in config option for top-N
-  config.AddExtensionOption("use_custom_top_n",
-                            "Whether or not custom kernel is used to evalaute top n",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(Config::USE_CUSTOM_TOP_N),
-                            SetUseCustomTopN);
-
-  // Add in config options for custom table scan
-  config.AddExtensionOption("use_opt_table_scan",
-                            "Whether or not the optional table scan is used",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(Config::USE_OPT_TABLE_SCAN),
-                            SetUseOptTableScan);
-  config.AddExtensionOption("opt_table_scan_num_streams",
-                            "The number of cuda streams to use in the optional table scan",
-                            LogicalType::INTEGER,
-                            Value::INTEGER(Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS),
-                            SetOptTableScanNumStreams);
-  config.AddExtensionOption("opt_table_scan_memcpy_size",
-                            "The memcpy size (in bytes) used by the optional table scan",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE),
-                            SetOptTableScanMemcpySize);
-
-  // Add in config options for printing gpu table
-  config.AddExtensionOption("print_gpu_table_max_rows",
-                            "Maximal amount of rows to render when printing gpu table",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(Config::PRINT_GPU_TABLE_MAX_ROWS),
-                            SetPrintGPUTableMaxRows);
-
-  // Add in config options for duckdb fallback checking
-  config.AddExtensionOption("enable_fallback_check",
-                            "Whether to enable fallback checking",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK),
-                            SetEnableFallbackCheck);
-#endif
-
   add_sirius_option(
     config,
     option_visibility::user,
@@ -3302,9 +3014,136 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                            // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_gpu_task_oom",
+                    "latched execution test injection",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_gpu_task_launch_error",
+                    "latched execution test injection",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_gpu_task_retry_limit",
+                    "latched execution test injection",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(100));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_gpu_task_retry_backoff_ms",
+                    "latched execution test injection",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(50));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_override_read_only",
+                    "latched execution test injection",
+                    LogicalType::BOOLEAN,
+                    Value());
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_transaction_mismatch",
+                    "latched execution test injection",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_interrupt_before_replay",
+                    "latched execution test injection",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_non_rollbackable_state",
+                    "latched execution test injection",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_hold_footer_index",
+                    "latched execution test injection",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_hold_published_batch",
+                    "latched execution test injection",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+
   // Keep internal policy and test hooks out of the normal duckdb_settings() surface. The
   // unittest harness opts in before constructing a database. Centralizing visibility here keeps
   // option registration from growing scattered environment checks.
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_certification_delay_ms",
+                    "R2a test-only inject_certification_delay_ms",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_certification_bytes",
+                    "R2a test-only inject_certification_bytes",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_budget_declines",
+                    "R2a test-only budget_declines",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_scan_verdict",
+                    "R2a test-only inject_scan_verdict",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_iceberg_discovery",
+                    "R2a test-only inject_iceberg_discovery",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_pause_after_certify_ms",
+                    "R2a test-only pause_after_certify_ms",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_lineage_unmodelled",
+                    "R2a test-only lineage_unmodelled",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_synthetic_parquet_codec",
+                    "R2a test-only synthetic_parquet_codec",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_synthetic_native_segment",
+                    "R2a test-only synthetic_native_segment",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_invalidate_pin_witness",
+                    "R2a test-only invalidate resident query token before publication",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_strip_encryption_evidence",
+                    "R2a test-only strip_encryption_evidence",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
   add_sirius_option(config,
                     option_visibility::internal,
                     "sirius_test_inject_pin_registry_change",
@@ -3315,6 +3154,66 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                     option_visibility::internal,
                     "sirius_test_inject_transparent_gpu_error",
                     "force transparent GPU execution to fail at runtime with this message",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_read_view_mismatch",
+                    "inject finalize/execute read-view comparison failures",
+                    LogicalType::VARCHAR,
+                    Value("off"));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_pause_native_after_prepare_ms",
+                    "pause before a native execution window is entered",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_pause_native_decode_ms",
+                    "pause after native metadata preparation while its checkpoint key is held",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_native_walk_failure",
+                    "fail a native metadata walk for '*' or the named table",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_native_decode_failure",
+                    "fail native decode for '*' or the named table after its lease is taken",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_sync_native_checkpoint",
+                    "enable the native checkpoint test observer for this session",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_sync_cpu_replay",
+                    "wait at the CPU replay test rendezvous after this window releases its slot",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_checkpoint_cleanup_failure",
+                    "fail cleanup before scan-manager reset while checkpoint keys remain held",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_mark_runtime_unavailable_before_window",
+                    "latch runtime unavailability immediately before execution-window entry",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_read_view_churn_path",
+                    "path used by read-view churn integration tests",
                     LogicalType::VARCHAR,
                     Value(""));
   add_sirius_option(config,
@@ -3412,15 +3311,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),
     SetEnableLikeSwarFastpath);
-
-#ifdef SIRIUS_ENABLE_LEGACY
-  // Add in config options for modified pipeline
-  config.AddExtensionOption("modified_pipeline",
-                            "Whether to use modified pipeline for GPU execution",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(Config::MODIFIED_PIPELINE),
-                            SetModifiedPipeline);
-#endif
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
@@ -3537,6 +3427,26 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
 
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "enable_dynamic_filter_multi_partition",
+    "Enable Bloom accumulation for eligible non-broadcast hash builds with more than one "
+    "partition; requires enable_dynamic_filter",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_dynamic_filter_multi_partition),
+    SetEnableDynamicFilterMultiPartition);
+
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "max_dynamic_filter_bloom_bytes_per_gpu",
+    "Aggregate aligned Bloom-array budget in bytes per GPU for multi-partition accumulation; "
+    "must be greater than zero",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.max_dynamic_filter_bloom_bytes_per_gpu),
+    SetMaxDynamicFilterBloomBytesPerGpu);
+
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",
     "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
@@ -3652,11 +3562,8 @@ static void LoadInternal(ExtensionLoader& loader)
   bool const sirius_disabled = callback_ptr->is_disabled();
 
   if (!sirius_disabled) {
-    // Config loading above must remain NVTX-free. Publish discovery after its
-    // validation, but before SiriusContext can make any NVTX call.
-    auto const& telemetry = callback_ptr->get_loaded_config().get_telemetry_config();
-    sirius::telemetry::detail::configure_nvtx_injection(telemetry.enable_quent,
-                                                        telemetry.nvtx_injection_lib);
+    // Config parsing above must remain NVTX-free. initialize_context creates Quent
+    // before resolving hardware or constructing any instrumented runtime objects.
     callback_ptr->initialize_context();
   }
   config.GetCallbackManager().Register(std::move(callback));
@@ -3668,8 +3575,14 @@ static void LoadInternal(ExtensionLoader& loader)
 
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
-  SiriusRegistration::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
+  SiriusRegistration::InitialGPUConfigs(
+    config, callback_ptr->get_operator_defaults(), callback_ptr->get_compression_defaults());
   SiriusRegistration::RegisterGPUFunctions(db);
+  if (!sirius_disabled) { sirius::planner::register_scan_source_callbacks(db); }
+
+  // SIRIUS_S3 is Sirius's S3 secret type. Registering it here lets clients use
+  // CREATE SECRET without installing DuckDB's httpfs extension.
+  sirius::io::s3::register_sirius_s3_secret(SecretManager::Get(db));
 
   // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds
   // by reading the parquet footer through Sirius's routed REST ioctx. This makes

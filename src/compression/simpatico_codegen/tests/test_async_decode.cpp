@@ -12,6 +12,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -869,10 +870,17 @@ void test_identity_owned_children(rmm::device_async_resource_ref upstream)
   };
   auto strings = make_strings_column(
     {"aa", "b", "ccc", "ignored"}, {true, true, true, false}, input_stream.view());
-  auto inner =
-    cudf::make_lists_column(2, offsets({0, 1, 4}), std::move(strings), 0, rmm::device_buffer{});
+  auto inner = cudf::make_lists_column(2,
+                                       offsets({0, 1, 4}),
+                                       std::move(strings),
+                                       0,
+                                       cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   inputs.push_back(
-    cudf::make_lists_column(2, offsets({0, 1, 2}), std::move(inner), 0, rmm::device_buffer{}));
+    cudf::make_lists_column(2,
+                            offsets({0, 1, 2}),
+                            std::move(inner),
+                            0,
+                            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED)));
 
   for (auto& input : inputs) {
     auto expected = std::make_unique<cudf::column>(*input, input_stream.view(), upstream);
@@ -1515,8 +1523,12 @@ void test_dictionary_width_large_keys(rmm::device_async_resource_ref mr)
       rmm::device_buffer keys_chars(chars.size(), stream.view(), mr);
       cuda_check(cudaMemcpyAsync(
         keys_chars.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.value()));
-      auto keys = cudf::make_strings_column(
-        key_count, std::move(keys_offsets), std::move(keys_chars), 0, rmm::device_buffer{});
+      auto keys =
+        cudf::make_strings_column(key_count,
+                                  std::move(keys_offsets),
+                                  std::move(keys_chars),
+                                  0,
+                                  cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
       auto indices = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                                codes.size(),
                                                cudf::mask_state::UNALLOCATED,
@@ -1528,7 +1540,10 @@ void test_dictionary_width_large_keys(rmm::device_async_resource_ref mr)
                                  cudaMemcpyHostToDevice,
                                  stream.value()));
       auto dictionary =
-        cudf::make_dictionary_column(std::move(keys), std::move(indices), rmm::device_buffer{}, 0);
+        cudf::make_dictionary_column(std::move(keys),
+                                     std::move(indices),
+                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                     0);
       auto prepared = simpatico::dictionary_compressed_representation::from_encoded_column(
         std::move(dictionary), stream.view(), mr);
       auto const expected_width = shape == key_shape::fixed ? 7 : 0;
