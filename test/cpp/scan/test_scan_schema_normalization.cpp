@@ -486,6 +486,7 @@ TEST_CASE("scan execute steals a decode-filtered batch that dropped its pure-fil
   auto const decode_filtered_input = [](std::shared_ptr<cucascade::data_batch> batch,
                                         bool dropped) {
     auto input = std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch));
+    admit_fixture_resident_input(*input);
     input->row_filter_pending                   = true;
     input->pushdown_row_filtered                = true;
     input->pushdown_filter_only_columns_dropped = dropped;
