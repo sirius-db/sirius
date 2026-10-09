@@ -196,6 +196,10 @@ impl NixlEndpoint for NixlTransport {
                 .collect(),
         )
     }
+
+    fn control(&self, peer: SocketAddr, envelope: &NixlEnvelope) -> Result<Vec<u8>, String> {
+        call(peer, control_params(), envelope)
+    }
 }
 
 impl NixlTransport {

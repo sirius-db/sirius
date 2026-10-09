@@ -19,7 +19,7 @@ use crate::descriptor_table::{DescriptorTable, SlotKey};
 use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
 use crate::row_layout::RowLayout;
-use crate::runtime_filter::FilterInput;
+use crate::runtime_filter::{FilterInput, ProbeKeys, SHARE_BOUNDS, SHARE_KEYS};
 use crate::scan_paths::ScanFilePaths;
 use crate::type_mapper;
 use crate::{
@@ -304,9 +304,9 @@ fn translate_scan(
     apply_runtime_filters(filtered, node, ctx)
 }
 
-/// Keeps only the scan rows whose probe key appears in a bound runtime filter's key stream: a
-/// left semi join per bound filter the scan probes. The join that built the filter is exact
-/// anyway, so dropping rows it would reject changes nothing but the work.
+/// Keeps only the scan rows whose probe key a bound runtime filter admits: a left semi join
+/// against the filter's key stream, or a range predicate on the key. The join that built the
+/// filter is exact anyway, so dropping rows it would reject changes nothing but the work.
 fn apply_runtime_filters(
     mut input: TranslatedRel,
     node: &TPlanNode,
@@ -329,51 +329,171 @@ fn apply_runtime_filters(
                     bound.filter_id, node.node_id
                 ))
             })?;
-        let key_type = type_mapper::map_type_desc(
-            &probe
-                .nodes
-                .first()
-                .ok_or_else(|| TranslateError::malformed("empty runtime filter probe expression"))?
-                .type_,
-            true,
-        )?;
-        let key_type_name = type_mapper::duckdb_type_name(&key_type)?;
-        if key_type_name != bound.column.ty {
-            return Err(TranslateError::malformed(format!(
-                "runtime filter {} probes a {key_type_name} key but its key stream carries {}",
-                bound.filter_id, bound.column.ty
-            )));
-        }
+        let probe_type = &probe
+            .nodes
+            .first()
+            .ok_or_else(|| TranslateError::malformed("empty runtime filter probe expression"))?
+            .type_;
+        let key_type = type_mapper::map_type_desc(probe_type, true)?;
         let mut expr_ctx = ctx.expr_context(&input.layout);
         let probe = probe.translate(&mut expr_ctx)?;
-        let anchor = ctx.registry.register_function(URN_COMPARISON, "equal");
-        let condition = expr_translator::scalar_function(
-            anchor,
-            vec![probe, field_selection(input.layout.len() as i32)],
-            type_mapper::bool_type(),
-        );
-        let keys = TranslatedRel {
-            rel: stream_read_rel(
-                substrait::proto::NamedStruct {
-                    names: vec![bound.column.name.clone()],
-                    r#struct: Some(substrait::proto::r#type::Struct {
-                        types: vec![key_type],
-                        nullability: substrait::proto::r#type::Nullability::Required as i32,
-                        ..Default::default()
-                    }),
-                },
-                &bound.stream_view,
-            ),
-            layout: RowLayout::new([None]),
+        input = match &bound.keys {
+            ProbeKeys::Stream {
+                node_id,
+                stream_view,
+                column,
+            } => {
+                let key_type_name = type_mapper::duckdb_type_name(&key_type)?;
+                if key_type_name != column.ty {
+                    return Err(TranslateError::malformed(format!(
+                        "runtime filter {} probes a {key_type_name} key but its key stream \
+                         carries {}",
+                        bound.filter_id, column.ty
+                    )));
+                }
+                let anchor = ctx.registry.register_function(URN_COMPARISON, "equal");
+                let condition = expr_translator::scalar_function(
+                    anchor,
+                    vec![probe, field_selection(input.layout.len() as i32)],
+                    type_mapper::bool_type(),
+                );
+                let keys = TranslatedRel {
+                    rel: stream_read_rel(key_stream_schema(&column.name, key_type), stream_view),
+                    layout: RowLayout::new([None]),
+                };
+                ctx.stream_inputs.push(StreamInputSchema {
+                    node_id: *node_id,
+                    stream_view: stream_view.clone(),
+                    columns: vec![column.clone()],
+                });
+                join_rel(input, keys, condition, join_rel::JoinType::LeftSemi)?
+            }
+            ProbeKeys::Range { min, max } => {
+                let primitive = type_mapper::scalar_primitive(probe_type)?;
+                let bound_literal = |value: i64| {
+                    expr_translator::integer_literal(value, primitive).map_err(|_| {
+                        TranslateError::malformed(format!(
+                            "runtime filter {} bound {value} does not fit its {primitive:?} key",
+                            bound.filter_id
+                        ))
+                    })
+                };
+                let condition = between(probe, bound_literal(*min)?, bound_literal(*max)?, ctx);
+                filter_rel(input, condition)
+            }
         };
-        ctx.stream_inputs.push(StreamInputSchema {
-            node_id: bound.node_id,
-            stream_view: bound.stream_view.clone(),
-            columns: vec![bound.column.clone()],
-        });
-        input = join_rel(input, keys, condition, join_rel::JoinType::LeftSemi)?;
     }
     Ok(input)
+}
+
+/// `value >= low AND value <= high`.
+fn between(
+    value: Expression,
+    low: Expression,
+    high: Expression,
+    ctx: &mut PlanContext<'_>,
+) -> Expression {
+    let gte = ctx.registry.register_function(URN_COMPARISON, "gte");
+    let lte = ctx.registry.register_function(URN_COMPARISON, "lte");
+    let and = ctx.registry.register_function(URN_BOOLEAN, "and");
+    expr_translator::scalar_function(
+        and,
+        vec![
+            expr_translator::scalar_function(
+                gte,
+                vec![value.clone(), low],
+                type_mapper::bool_type(),
+            ),
+            expr_translator::scalar_function(lte, vec![value, high], type_mapper::bool_type()),
+        ],
+        type_mapper::bool_type(),
+    )
+}
+
+/// The schema of a one-column key stream.
+fn key_stream_schema(
+    name: &str,
+    key_type: substrait::proto::Type,
+) -> substrait::proto::NamedStruct {
+    substrait::proto::NamedStruct {
+        names: vec![name.to_string()],
+        r#struct: Some(substrait::proto::r#type::Struct {
+            types: vec![key_type],
+            nullability: substrait::proto::r#type::Nullability::Required as i32,
+            ..Default::default()
+        }),
+    }
+}
+
+/// The plan a partitioned join's instance runs to send its share of filter keys: the distinct
+/// non-null keys of `stream`, named [`SHARE_KEYS`]; or, given `bounds`, only the keys equal to
+/// either bound, named [`SHARE_BOUNDS`].
+pub(crate) fn filter_share(
+    stream: &StreamInputSchema,
+    bounds: Option<(i64, i64)>,
+    registry: &mut ExtensionRegistry,
+) -> Result<(Rel, String)> {
+    let [column] = stream.columns.as_slice() else {
+        return Err(TranslateError::malformed(
+            "a runtime filter share reads one key column",
+        ));
+    };
+    let key_type = type_mapper::integer_type(&column.ty).ok_or_else(|| {
+        TranslateError::malformed(format!(
+            "runtime filter shares carry integer keys, not {}",
+            column.ty
+        ))
+    })?;
+    let keys = TranslatedRel {
+        rel: stream_read_rel(
+            key_stream_schema(&column.name, key_type.clone()),
+            &stream.stream_view,
+        ),
+        layout: RowLayout::new([None]),
+    };
+    let (condition, name) = match bounds {
+        None => {
+            let anchor = registry.register_function(URN_COMPARISON, "is_not_null");
+            let condition = expr_translator::scalar_function(
+                anchor,
+                vec![field_selection(0)],
+                type_mapper::bool_type(),
+            );
+            (condition, SHARE_KEYS)
+        }
+        Some((min, max)) => {
+            let literal = |value| expr_translator::integer_literal_of(value, &key_type);
+            let equal = registry.register_function(URN_COMPARISON, "equal");
+            let or = registry.register_function(URN_BOOLEAN, "or");
+            let is = |value| {
+                Ok::<_, TranslateError>(expr_translator::scalar_function(
+                    equal,
+                    vec![field_selection(0), literal(value)?],
+                    type_mapper::bool_type(),
+                ))
+            };
+            let condition = expr_translator::scalar_function(
+                or,
+                vec![is(min)?, is(max)?],
+                type_mapper::bool_type(),
+            );
+            (condition, SHARE_BOUNDS)
+        }
+    };
+    let filtered = filter_rel(keys, condition);
+    #[allow(deprecated)]
+    let grouping = aggregate_rel::Grouping {
+        expression_references: vec![0],
+    };
+    let distinct = Rel {
+        rel_type: Some(rel::RelType::Aggregate(Box::new(AggregateRel {
+            input: Some(Box::new(filtered.rel)),
+            groupings: vec![grouping],
+            grouping_expressions: vec![field_selection(0)],
+            ..Default::default()
+        }))),
+    };
+    Ok((distinct, name.to_string()))
 }
 
 /// Refuses a node whose `common_slot_map` this translator does not materialize.

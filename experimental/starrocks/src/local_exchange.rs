@@ -7,7 +7,7 @@
 //! the root.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
@@ -64,6 +64,16 @@ impl SenderSource {
         }
     }
 
+    /// Where this sender's batches sit, for reading a key column in place.
+    pub(crate) fn key_source(&self) -> KeySource {
+        match self {
+            Self::LocalParked { slot, .. } => KeySource::Parked(*slot),
+            Self::Remote { batches, .. } => {
+                KeySource::Received(batches.iter().map(|batch| batch.token).collect())
+            }
+        }
+    }
+
     /// Whether this sender has finished producing (a parked local sender always has).
     fn is_complete(&self) -> bool {
         match self {
@@ -106,6 +116,17 @@ pub(crate) struct Purged {
     pub(crate) tokens: Vec<u64>,
 }
 
+impl Purged {
+    fn add(&mut self, source: SenderSource) {
+        match source {
+            SenderSource::LocalParked { slot, .. } => self.slots.push(slot),
+            SenderSource::Remote { batches, .. } => {
+                self.tokens.extend(batches.iter().map(|batch| batch.token))
+            }
+        }
+    }
+}
+
 /// What the rendezvous holds right now. All zero on an idle CN.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExchangeCounts {
@@ -129,6 +150,9 @@ struct ExchangeState {
     /// one is refused, with that error, instead of rebuilding state that would never complete.
     purged: HashMap<u64, String>,
     purged_order: VecDeque<u64>,
+    /// Runtime filter exchanges whose scan no longer reads them: a share arriving at one is not
+    /// kept. Checked under the same lock as the push, so a share can't slip in after the close.
+    closed_shares: HashSet<ExchangeKey>,
 }
 
 impl ExchangeState {
@@ -197,13 +221,22 @@ impl LocalExchange {
         source: SenderSource,
     ) -> Result<Option<ReadyFragment>, String> {
         let mut state = self.lock();
+        Self::push_sender_locked(&mut state, key, sender_id, source)
+    }
+
+    fn push_sender_locked(
+        state: &mut ExchangeState,
+        key: ExchangeKey,
+        sender_id: i32,
+        source: SenderSource,
+    ) -> Result<Option<ReadyFragment>, String> {
         state.refuse_purged(key.fragment_instance_id)?;
         let senders = state.sources.entry(key).or_default();
         if senders.contains_key(&sender_id) {
             return Err(format!("duplicate sender {sender_id} for exchange {key:?}"));
         }
         senders.insert(sender_id, source);
-        Self::take_ready(&mut state, key.fragment_instance_id)
+        Self::take_ready(state, key.fragment_instance_id)
     }
 
     /// Records one frame from a remote sender: a batch, eos, or both.
@@ -229,6 +262,19 @@ impl LocalExchange {
             ));
         }
         let mut state = self.lock();
+        Self::push_frame_locked(&mut state, key, sender_id, seq, eos, names, batch)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_frame_locked(
+        state: &mut ExchangeState,
+        key: ExchangeKey,
+        sender_id: i32,
+        seq: i64,
+        eos: bool,
+        names: Vec<String>,
+        batch: Option<RemoteBatch>,
+    ) -> Result<Option<ReadyFragment>, String> {
         state.refuse_purged(key.fragment_instance_id)?;
         let expected_seq = state.remote_seq.entry((key, sender_id)).or_insert(0);
         if seq < *expected_seq {
@@ -280,7 +326,42 @@ impl LocalExchange {
         }
         batches.extend(batch);
         *closed = eos;
-        Self::take_ready(&mut state, key.fragment_instance_id)
+        Self::take_ready(state, key.fragment_instance_id)
+    }
+
+    /// [`Self::push_sender`] for a runtime filter exchange. A closed one doesn't keep the share:
+    /// it comes back for the caller to free.
+    pub(crate) fn push_share_sender(
+        &self,
+        key: ExchangeKey,
+        sender_id: i32,
+        source: SenderSource,
+    ) -> Result<Option<SenderSource>, String> {
+        let mut state = self.lock();
+        if state.closed_shares.contains(&key) {
+            return Ok(Some(source));
+        }
+        Self::push_sender_locked(&mut state, key, sender_id, source)?;
+        Ok(None)
+    }
+
+    /// [`Self::push_remote_frame`] for a runtime filter exchange. A closed one doesn't keep the
+    /// frame (`false`): the caller frees its batch.
+    pub(crate) fn push_share_frame(
+        &self,
+        key: ExchangeKey,
+        sender_id: i32,
+        seq: i64,
+        eos: bool,
+        names: Vec<String>,
+        batch: Option<RemoteBatch>,
+    ) -> Result<bool, String> {
+        let mut state = self.lock();
+        if state.closed_shares.contains(&key) {
+            return Ok(false);
+        }
+        Self::push_frame_locked(&mut state, key, sender_id, seq, eos, names, batch)?;
+        Ok(true)
     }
 
     /// Where exchange `key`'s batches sit, once every expected sender completed it, left in place
@@ -293,6 +374,56 @@ impl LocalExchange {
             .get(&key.fragment_instance_id)?
             .expected_senders
             .get(&key.node_id)?;
+        Self::completed(&state, key, expected)
+    }
+
+    /// Every share that reached runtime filter exchange `key` so far, in sender-id order: where
+    /// its batches sit, its column names, and whether its sender finished. Left in place.
+    pub(crate) fn shares(&self, key: ExchangeKey) -> Vec<(KeySource, Vec<String>, bool)> {
+        let state = self.lock();
+        let mut ordered = state
+            .sources
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|(sender_id, _)| **sender_id);
+        ordered
+            .into_iter()
+            .map(|(_, source)| {
+                (
+                    source.key_source(),
+                    source.names().to_vec(),
+                    source.is_complete(),
+                )
+            })
+            .collect()
+    }
+
+    /// Closes runtime filter exchange `key`, and returns what its shares held for the caller to
+    /// free. Later shares are not kept.
+    pub(crate) fn close_shares(&self, key: ExchangeKey) -> Purged {
+        let mut state = self.lock();
+        state.closed_shares.insert(key);
+        state.remote_seq.retain(|(seq_key, _), _| *seq_key != key);
+        let mut taken = Purged::default();
+        for source in state
+            .sources
+            .remove(&key)
+            .into_iter()
+            .flat_map(HashMap::into_values)
+        {
+            taken.add(source);
+        }
+        taken
+    }
+
+    /// Exchange `key`'s sources in sender-id order, once exactly `expected` senders completed it.
+    fn completed(
+        state: &ExchangeState,
+        key: ExchangeKey,
+        expected: usize,
+    ) -> Option<Vec<KeySource>> {
         let senders = state.sources.get(&key)?;
         if senders.len() != expected || !senders.values().all(SenderSource::is_complete) {
             return None;
@@ -302,12 +433,7 @@ impl LocalExchange {
         Some(
             ordered
                 .into_iter()
-                .map(|(_, source)| match source {
-                    SenderSource::LocalParked { slot, .. } => KeySource::Parked(*slot),
-                    SenderSource::Remote { batches, .. } => {
-                        KeySource::Received(batches.iter().map(|batch| batch.token).collect())
-                    }
-                })
+                .map(|(_, source)| source.key_source())
                 .collect(),
         )
     }
@@ -397,6 +523,9 @@ impl LocalExchange {
         }
         state.receivers.retain(|id, _| !ours(id));
         state
+            .closed_shares
+            .retain(|key| !ours(&key.fragment_instance_id));
+        state
             .remote_seq
             .retain(|(key, _), _| !ours(&key.fragment_instance_id));
         let keys: Vec<ExchangeKey> = state
@@ -413,12 +542,7 @@ impl LocalExchange {
                 .into_iter()
                 .flat_map(HashMap::into_values)
             {
-                match source {
-                    SenderSource::LocalParked { slot, .. } => purged.slots.push(slot),
-                    SenderSource::Remote { batches, .. } => purged
-                        .tokens
-                        .extend(batches.iter().map(|batch| batch.token)),
-                }
+                purged.add(source);
             }
         }
         purged
@@ -885,5 +1009,39 @@ mod tests {
             "the oldest purge is forgotten first"
         );
         assert!(state.purged.contains_key(&(PURGED_QUERIES as u64)));
+    }
+
+    #[test]
+    fn a_closed_filter_exchange_keeps_no_share() {
+        let exchange = LocalExchange::default();
+        let share = key(3, 1_000_000);
+        // A share that arrived before the close comes back to be freed.
+        exchange
+            .push_share_frame(share, 0, 0, true, names(), Some(remote(5)))
+            .unwrap();
+        assert_eq!(exchange.shares(share).len(), 1);
+        let closed = exchange.close_shares(share);
+        assert_eq!(closed.tokens, vec![5]);
+        // Later ones are not kept, whichever side they come from.
+        assert!(
+            !exchange
+                .push_share_frame(share, 1, 0, true, names(), Some(remote(6)))
+                .unwrap()
+        );
+        assert!(
+            exchange
+                .push_share_sender(share, 2, local(share, 2))
+                .unwrap()
+                .is_some()
+        );
+        assert!(exchange.shares(share).is_empty());
+        assert_eq!(exchange.counts(), ExchangeCounts::default());
+        // Another filter exchange is open.
+        assert!(
+            exchange
+                .push_share_sender(key(4, 1_000_000), 2, local(key(4, 1_000_000), 2))
+                .unwrap()
+                .is_none()
+        );
     }
 }
