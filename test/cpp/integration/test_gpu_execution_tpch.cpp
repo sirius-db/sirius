@@ -4434,6 +4434,23 @@ TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
                 "[integration][gpu_execution][parquet][TPC-H][Q22]",
                 sirius::test::kTpchQ22)
 
+TPCH_TEST_CASES(
+  compare_gpu_vs_cpu_for,
+  GPUExecutionDuckDBFixture,
+  "gpu_execution - ROLLUP over lineitem",
+  "[integration][gpu_execution][grouping_sets]",
+  "select l_returnflag, l_linestatus, l_shipmode, grouping(l_returnflag, l_shipmode) g, "
+  "count(*) n, sum(l_quantity) q, avg(l_extendedprice) p, min(l_shipdate) d "
+  "from lineitem group by rollup(l_returnflag, l_linestatus, l_shipmode);",
+  1e-9f)
+
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - CUBE with COUNT(DISTINCT) over lineitem",
+                "[integration][gpu_execution][grouping_sets]",
+                "select l_returnflag, l_linestatus, count(distinct l_suppkey) s, count(*) n "
+                "from lineitem group by cube(l_returnflag, l_linestatus);")
+
 // Cross products of two tables and of single-row aggregates, the shape of TPC-DS Q88 and Q90.
 TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
                 GPUExecutionDuckDBFixture,

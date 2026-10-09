@@ -370,7 +370,8 @@ TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][s
   auto coalescer = ingestible.create_batch_coalescer();
 
   auto file = std::make_unique<scan::parquet_file_scan_info>();
-  file->set_contract_payload(1, {{1, 0, "sizing.parquet", "parquet", "footer"}}, {{}});
+  file->set_contract_payload(
+    1, {{.contract_id = 1, .split_id = 0, .input_identity = "sizing.parquet"}}, {{}});
   file->row_groups.push_back({0, 20, 60, 10, 1});
   file->row_groups.push_back({1, 20, 60, 10, 1});
 
@@ -416,7 +417,8 @@ TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
   };
   auto make_file = [] {
     auto file = std::make_unique<scan::parquet_file_scan_info>();
-    file->set_contract_payload(1, {{1, 0, "sizing.parquet", "parquet", "footer"}}, {{}});
+    file->set_contract_payload(
+      1, {{.contract_id = 1, .split_id = 0, .input_identity = "sizing.parquet"}}, {{}});
     file->row_groups.push_back({0, 20, 60, 10, 1});
     file->row_groups.push_back({1, 20, 60, 10, 1});
     return file;

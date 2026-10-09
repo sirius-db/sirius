@@ -41,13 +41,14 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 {
 }
 
-// expressions is the list of aggregates to be computed. Each aggregates has a bound_ref expression
-// to a column groups_p is the list of group by columns. Each group by column is a bound_ref
-// expression to a column grouping_sets_p is the list of grouping set. Each grouping set is a set of
-// indexes to the group by columns. Seems like DuckDB group the groupby columns into several sets
-// and for every grouping set there is one radix_table grouping_functions_p is a list of indexes to
-// the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
-// grouping set and the second level is the indexes to the groupby expression for that set.
+// The parameters for `SELECT a, b, sum(v), GROUPING(a) ... GROUP BY ROLLUP(a, b)`:
+// - expressions: the aggregates, each over bound_ref expressions to its input columns.
+//   Here `sum(v)`
+// - groups_p: the group by keys, each a bound_ref expression. Here `a` and `b`
+// - grouping_sets_p: the grouping sets, each a set of positions in groups_p.
+//   Here `{0, 1}`, `{0}` and `{}`. A plain GROUP BY has one set with all keys
+// - grouping_functions_p: the GROUPING() functions, each the list of its arguments as
+//   positions in groups_p. Here `[0]`. Empty when the query has no GROUPING()
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
@@ -61,6 +62,12 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
       SiriusPhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
+  for (auto const& set : grouping_sets) {
+    grouping_set_keys.emplace_back(set.begin(), set.end());
+  }
+  for (auto const& function : grouping_functions_p) {
+    grouping_functions.emplace_back(function.begin(), function.end());
+  }
   auto cudf_defs                    = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
   group_idx                         = std::move(cudf_defs.group_idx);
   cudf_aggregates                   = std::move(cudf_defs.cudf_aggregates);
@@ -74,7 +81,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 duckdb::vector<sirius::logical_type>
 sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 {
-  auto const aggregate_offset = group_idx.size();
+  auto const aggregate_offset = num_output_group_columns();
   if (!has_count_distinct || has_avg || types.size() != aggregate_offset + aggregate_slots.size()) {
     throw std::runtime_error(
       "COUNT(DISTINCT) local schema requires a non-AVG one-slot-per-aggregate layout");
@@ -99,6 +106,20 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
+    if (has_grouping_sets()) {
+      results.push_back(
+        gpu_aggregate_impl::local_grouping_sets_aggregate(input_batch,
+                                                          group_idx,
+                                                          cudf_aggregates,
+                                                          cudf_aggregate_idx,
+                                                          cudf_aggregate_struct_col_indices,
+                                                          grouping_set_keys,
+                                                          grouping_functions,
+                                                          stream,
+                                                          *space,
+                                                          batch_telemetry()));
+      continue;
+    }
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,
                                                               cudf_aggregates,

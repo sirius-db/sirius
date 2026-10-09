@@ -47,6 +47,30 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
     options);
 }
 
+std::vector<cudf::io::text::byte_range_info> column_chunk_range_cache::ranges(
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> const& metadata,
+  std::shared_ptr<cudf::io::parquet_reader_options const> const& options,
+  std::vector<cudf::size_type> const& row_group_indices)
+{
+  if (row_group_indices.empty()) { return {}; }
+  if (!_reader || _metadata != metadata || _options != options) {
+    _reader.reset();
+    _reader   = std::make_unique<hybrid_scan_reader>(*metadata, *options);
+    _metadata = metadata;
+    _options  = options;
+  }
+  return _reader->all_column_chunks_byte_ranges(
+    cudf::host_span<cudf::size_type const>(row_group_indices.data(), row_group_indices.size()),
+    *options);
+}
+
+void column_chunk_range_cache::clear() noexcept
+{
+  _reader.reset();
+  _metadata.reset();
+  _options.reset();
+}
+
 bool prefers_bulk_materialize(std::span<parquet_source const> sources,
                               cudf::io::parquet_reader_options const& options) noexcept
 {

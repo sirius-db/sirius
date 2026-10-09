@@ -19,9 +19,6 @@
 #include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression/ast/to_duckdb.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
@@ -37,25 +34,13 @@
 
 #include <algorithm>
 #include <mutex>
+#include <optional>
+#include <string_view>
 
 namespace sirius {
 namespace op {
 
 namespace {
-
-std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& expr)
-{
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    return expr.Cast<duckdb::BoundReferenceExpression>().index;
-  }
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-    auto& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
-    if (cast_expr.child->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-      return cast_expr.child->Cast<duckdb::BoundReferenceExpression>().index;
-    }
-  }
-  return std::nullopt;
-}
 
 constexpr bool producer_requires_full_partition_input(SiriusPhysicalOperatorType type) noexcept
 {
@@ -125,35 +110,9 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     _downstream_consumer_op = op;
     _partition_type         = PartitionType::HASH;
     auto& hash_join_op      = op->Cast<sirius_physical_hash_join>();
-    for (std::size_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
-      auto& condition = hash_join_op.conditions[cond_idx];
-      if (condition.comparison != sirius::comparison_type::equal &&
-          condition.comparison != sirius::comparison_type::not_distinct_from) {
-        continue;
-      }
-      auto left_owned  = sirius::ast::to_duckdb(*hash_join_op.conditions[cond_idx].left);
-      auto right_owned = sirius::ast::to_duckdb(*hash_join_op.conditions[cond_idx].right);
-      std::optional<std::size_t> left_index  = extract_bound_ref_index(*left_owned);
-      std::optional<std::size_t> right_index = extract_bound_ref_index(*right_owned);
-      if (left_index.has_value() && right_index.has_value()) {
-        // Determine if a type cast is needed for hash alignment.
-        // When the join condition has a BOUND_CAST on one side, the two sides have different
-        // physical column types (e.g. INT32 vs INT64). cuDF's murmur3 produces different hash
-        // values for the same integer in different representations, so without a cast, matching
-        // keys would land in different partitions. We apply the same cast used by the join
-        // condition so both sides hash identically.
-        const auto& key_expr = is_build ? *right_owned : *left_owned;
-        if (is_build) {
-          _partition_keys.push_back(right_index.value());
-        } else {
-          _partition_keys.push_back(left_index.value());
-        }
-        if (key_expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-          _partition_key_cast_types.push_back(duckdb::GetCudfType(key_expr.return_type));
-        } else {
-          _partition_key_cast_types.push_back(cudf::data_type{cudf::type_id::EMPTY});
-        }
-      }
+    for (auto const& key : hash_join_op.prepared_keys()) {
+      _partition_keys.push_back(is_build ? key.right_index : key.left_index);
+      _partition_key_cast_types.push_back(key.type);
     }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     // NLJ is the downstream sizing consumer too; it always reports a single partition.
@@ -163,18 +122,6 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
     _partition_keys            = grouped_aggregate_op.get_output_grouping_indices();
-
-    // WSM TODO: this is the original code for getting the partition keys from the grouped aggregate
-    // operator which may be what we want to use when we care about grouping sets for (std::size_t
-    // i = 0; i < grouped_aggregate_op.groupings.size(); i++) {
-    //   auto& grouping = grouped_aggregate_op.groupings[i];
-    //   for (auto& group_idx : grouped_aggregate_op.grouping_sets[i]) {
-    //     auto& group = grouped_aggregate_op.grouped_aggregate_data.groups[group_idx];
-    //     if (group->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    //       _partition_keys.push_back(group->Cast<duckdb::BoundReferenceExpression>().index);
-    //     }
-    //   }
-    // }
   } else if (op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN) {
     // The fused count-join is both the key source and the downstream sizing consumer. Its two
     // inputs partition on their respective join keys so equal keys co-locate.
@@ -267,6 +214,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
+  auto* const accumulating = _accumulating_join.load(std::memory_order_acquire);
+  std::optional<std::uint64_t> publication_id;
   switch (_partition_type) {
     case PartitionType::HASH:
       // Narrow-passthrough observability: count input columns whose actual carrier is narrower
@@ -292,6 +241,11 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
               narrow_columns);
           }
         }
+      }
+      // Contribute to the accumulated filter before scattering to partitions.
+      if (accumulating != nullptr) {
+        publication_id =
+          contribute_to_accumulated_filter(*accumulating, input, input_batch_ro, stream);
       }
       partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
                                                                _partition_keys,
@@ -322,6 +276,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                partition_type_to_string(_partition_type));
   }
   auto result = std::make_unique<pipelineable_operator_data>(partitioned_results);
+  if (publication_id) {
+    accumulating->dynamic_filter_session().publish_if_final(*publication_id, *space, stream);
+  }
   record_actual_bytes();
   return result;
 }
@@ -450,6 +407,9 @@ void sirius_physical_partition::set_num_partitions(int num_partitions)
 
 void sirius_physical_partition::on_finalize_operator()
 {
+  if (auto* const join = accumulated_filter_join(); join != nullptr) {
+    join->dynamic_filter_session().finalize_input();
+  }
   if (!_enable_size_estimation) { return; }
   std::lock_guard<std::mutex> guard(lock);
   auto const actual = _actual_bytes.load(std::memory_order_relaxed);
@@ -723,7 +683,104 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         strategy.placement.to_string());
     }
   }
+  if (!decide_accumulation()) {
+    // The build input's source pipeline is not finished.
+    // (This does not fire in production; exits for test callers)
+    return nullptr;
+  }
   return sirius_physical_operator::get_next_task_input_data();
+}
+
+std::optional<std::uint64_t> sirius_physical_partition::contribute_to_accumulated_filter(
+  sirius_physical_hash_join& join,
+  pipelineable_operator_data const& input,
+  cucascade::read_only_data_batch const& batch,
+  ::cuda::stream_ref stream)
+{
+  auto& session           = join.dynamic_filter_session();
+  auto const original_ids = input.original_batch_ids();
+  // clang-format off
+  if (!port_directive().empty() ||            // Cannot have late materialization directive
+      input.get_data_batches().size() != 1 || // Must have exactly one readable batch
+      original_ids.size() != 1) {             // Must have exactly one original batch ID
+    // clang-format on
+    session.decline_accumulation();
+    return std::nullopt;
+  }
+  session.contribute(original_ids.front(), batch, stream);
+  return original_ids.front();
+}
+
+void sirius_physical_partition::on_input_batch_pushed(std::string_view port_id,
+                                                      ::cucascade::data_batch& batch)
+{
+  if (port_id != "default" || !_is_build || _partition_type != PartitionType::HASH) { return; }
+  auto const* join = dynamic_cast<sirius_physical_hash_join const*>(_downstream_consumer_op);
+  if (join == nullptr || !join->dynamic_filter_plan().multi_partition_enabled()) { return; }
+  auto const* port = try_get_port(port_id);
+  if (port == nullptr || port->type != MemoryBarrierType::FULL) { return; }
+  _arrival_ledger.record(batch);
+}
+
+sirius_physical_hash_join* sirius_physical_partition::accumulated_filter_join() const noexcept
+{
+  // clang-format off
+  if (!_is_build ||
+      _partition_type != PartitionType::HASH ||
+      _broadcast ||
+      !_num_partitions ||
+      *_num_partitions <= 1 ||
+      _partition_keys.empty()) {
+    // clang-format on
+    return nullptr;
+  }
+  auto* join = dynamic_cast<sirius_physical_hash_join*>(_downstream_consumer_op);
+  return join != nullptr && join->dynamic_filter_plan().multi_partition_enabled() ? join : nullptr;
+}
+
+bool sirius_physical_partition::decide_accumulation()
+{
+  std::scoped_lock guard(_accumulation_mutex);
+  if (_accumulation_decided) { return true; }
+  if (auto* const join = accumulated_filter_join(); join != nullptr) {
+    auto& session          = join->dynamic_filter_session();
+    port const* input      = nullptr;
+    std::size_t data_ports = 0;
+    for (auto const& candidate : _ports_list) {
+      if (candidate->repo != nullptr) {
+        ++data_ports;
+        input = candidate.get();
+      }
+    }
+    std::string_view declined;
+    if (data_ports != 1 || try_get_port("default") != input || input->repo->num_partitions() != 1) {
+      declined = "the build input is not one single-partition default port";
+    } else if (input->type != MemoryBarrierType::FULL) {
+      declined = "the build input is not a FULL barrier";
+    } else if (!input->src_pipeline) {
+      declined = "the build input has no source pipeline";
+    } else if (!input->src_pipeline->is_pipeline_finished()) {
+      return false;
+    } else if (auto inventory = _arrival_ledger.certify(
+                 {.repository_batches = input->repo->size(0),
+                  .partition_count    = static_cast<std::size_t>(*_num_partitions)});
+               !inventory) {
+      declined = "the arrival ledger does not match the build input";
+    } else if (session.try_begin_accumulation(std::move(inventory))) {
+      _accumulating_join.store(join, std::memory_order_release);
+    }
+    if (!declined.empty()) {
+      (void)session.try_begin_accumulation(std::nullopt);
+      SIRIUS_LOG_INFO(
+        "[sirius_physical_partition] partition (id={}) has no accumulated dynamic filter: {}.",
+        get_operator_id(),
+        declined);
+    }
+  }
+  // Without an accumulation no filter can be published, so a later arrival must not fail the query.
+  if (_accumulating_join.load(std::memory_order_relaxed) == nullptr) { _arrival_ledger.abandon(); }
+  _accumulation_decided = true;
+  return true;
 }
 
 std::size_t sirius_physical_partition::no_history_peak_memory_estimate(

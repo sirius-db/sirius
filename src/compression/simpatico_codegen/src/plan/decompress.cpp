@@ -1040,7 +1040,6 @@ namespace {
 // Defined alongside probe_column below; used by decompress_column's route
 // checks and the dictionary fast path.
 NodeId root_value_producer(PlanTree const& tree);
-bool mask_consume_selection_root(PlanTree const& tree);
 
 struct str_split_shape {
   compressed_representation const* chars_rep = nullptr;
@@ -1488,12 +1487,6 @@ bool delta_selection_root(PlanTree const& tree)
     }
   }
   return false;  // raw-passthrough differences: not a rendered mask_consume shape
-}
-
-// Any root region the mask_consume launcher renders.
-bool mask_consume_selection_root(PlanTree const& tree)
-{
-  return bitpack_selection_root(tree) || delta_selection_root(tree);
 }
 
 std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree)

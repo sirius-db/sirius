@@ -74,10 +74,10 @@ uint32_t cpu_fold_string(uint32_t seed, std::string const& value, bool valid)
 
 // DecimalV2 / DecimalV3(27,9) split fold: int64 integer part then int32 fractional part of the
 // int128 value (C++ truncated division), matching StarRocks' DecimalV2Value.
-uint32_t cpu_fold_decimal_split(uint32_t seed, __int128 v)
+uint32_t cpu_fold_decimal_split(uint32_t seed, __int128_t v)
 {
-  int64_t const iv = static_cast<int64_t>(v / static_cast<__int128>(1000000000));
-  int32_t const fv = static_cast<int32_t>(v % static_cast<__int128>(1000000000));
+  int64_t const iv = static_cast<int64_t>(v / static_cast<__int128_t>(1000000000));
+  int32_t const fv = static_cast<int32_t>(v % static_cast<__int128_t>(1000000000));
   uint32_t h       = cpu_crc32(seed, reinterpret_cast<uint8_t const*>(&iv), 8);
   return cpu_crc32(h, reinterpret_cast<uint8_t const*>(&fv), 4);
 }
