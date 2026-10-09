@@ -86,12 +86,12 @@ void downgrade_executor::start()
 
   _request_queue.reactivate();
 
-  sirius::exec::invocable<void() noexcept> per_thread_init = nullptr;
+  sirius::exec::invocable<void()> per_thread_init = nullptr;
   if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
     auto device_id  = _memory_space->get_device_id();
-    per_thread_init = [device_id]() noexcept {
+    per_thread_init = [device_id]() {
       // Pin each worker to its GPU; silent failure leaks downgrade memcpys
-      // across contexts. Lambda is noexcept, so check inline.
+      // across contexts.
       cudaError_t err = cudaSetDevice(device_id);
       if (err != cudaSuccess) {
         SIRIUS_LOG_ERROR("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",

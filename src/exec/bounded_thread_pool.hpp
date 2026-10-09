@@ -21,6 +21,7 @@
 #include "log/logging.hpp"
 
 #include <condition_variable>
+#include <exception>
 #include <latch>
 #include <mutex>
 #include <queue>
@@ -92,13 +93,14 @@ class bounded_thread_pool {
   };
 
   explicit bounded_thread_pool(int capacity,
-                               const std::string& name                                  = "btp",
-                               std::vector<int> cpu_ids                                 = {},
-                               sirius::exec::invocable<void() noexcept> per_thread_init = nullptr)
+                               const std::string& name                         = "btp",
+                               std::vector<int> cpu_ids                        = {},
+                               sirius::exec::invocable<void()> per_thread_init = nullptr)
     : capacity_(capacity)
   {
     threads_.reserve(capacity);
 
+    std::vector<std::exception_ptr> init_errors(per_thread_init ? capacity : 0);
     std::unique_ptr<std::latch> init_latch;
     if (per_thread_init) { init_latch = std::make_unique<std::latch>(capacity); }
 
@@ -107,9 +109,15 @@ class bounded_thread_pool {
 
     try {
       for (int i = 0; i < capacity; ++i) {
-        auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
+        auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr, &init_errors, i]() {
           if (init_fn_ptr) {
-            (*init_fn_ptr)();
+            try {
+              (*init_fn_ptr)();
+            } catch (...) {
+              init_errors[i] = std::current_exception();
+              latch_ptr->count_down();
+              return;
+            }
             latch_ptr->count_down();
           }
           work_loop();
@@ -123,9 +131,14 @@ class bounded_thread_pool {
         }
       }
 
-      if (init_latch) { init_latch->wait(); }
+      if (init_latch) {
+        init_latch->wait();
+        for (const auto& error : init_errors) {
+          if (error) { std::rethrow_exception(error); }
+        }
+      }
     } catch (...) {
-      // Join workers before the callback and initialization latch leave scope.
+      // Join workers before the callback, errors, and initialization latch leave scope.
       stop();
       throw;
     }
