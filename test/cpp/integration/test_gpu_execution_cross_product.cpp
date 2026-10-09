@@ -28,6 +28,7 @@
 #include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 
 #include <string>
 
@@ -142,6 +143,26 @@ TEST_CASE_METHOD(CrossProductFixture,
   sirius::test::scoped_setting const task_bytes{*con, "cross_join_task_bytes", 65536};
   compare_gpu_vs_cpu(
     "SELECT count(*) c, count(s) cs, sum(x * y) xy, min(s) mn, max(s) mx FROM cp_left, cp_right;");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - pairs of several batches on both sides are split",
+                 "[integration][gpu_execution][cross_product]")
+{
+  // Both sides span several batches, and each batch pair runs as several tasks over row ranges of
+  // its left batch. Every pair must contribute exactly once, after which its batches are released.
+  sirius::test::scratch_dir const dir{"cross_product_batches"};
+  run_ok("COPY (SELECT i::INTEGER x FROM range(20000) r(i)) TO " + dir.file_literal("l.parquet") +
+         " (FORMAT PARQUET, ROW_GROUP_SIZE 4096);");
+  run_ok("COPY (SELECT i::INTEGER y FROM range(17000) r(i)) TO " + dir.file_literal("r.parquet") +
+         " (FORMAT PARQUET, ROW_GROUP_SIZE 4096);");
+  sirius::test::scoped_setting const scan_batch{*con, "scan_task_batch_size", 16384};
+  sirius::test::scoped_setting const concat_batch{*con, "concat_batch_bytes", 16384};
+  sirius::test::scoped_setting const task_bytes{*con, "cross_join_task_bytes", 64ULL << 20};
+  compare_gpu_vs_cpu(
+    "SELECT count(*) c, sum(x) sx, sum(y) sy, sum(x::BIGINT * y) xy FROM "
+    "read_parquet(" +
+    dir.file_literal("l.parquet") + "), read_parquet(" + dir.file_literal("r.parquet") + ");");
 }
 
 TEST_CASE_METHOD(CrossProductFixture,
