@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::ComputeNodeConfig;
+use crate::fe_report::ExecReports;
 /// Remote outputs ship while their fragment runs unless `SIRIUS_CN_STREAM_OUTPUT` is `0`, which
 /// ships them from parked output after the run, as before.
 fn stream_output_enabled() -> bool {
@@ -80,6 +81,10 @@ pub(crate) struct SiriusComputeNodeService {
     nixl: Option<Arc<dyn NixlEndpoint>>,
     /// Runtime filters this CN builds from broadcast joins, and the scans waiting for them.
     filters: Arc<RuntimeFilters>,
+    /// The final `reportExecStatus` each dispatched instance still owes the FE.
+    reports: Arc<ExecReports>,
+    /// Survey mode (`SIRIUS_CN_TRANSLATE_ONLY`): accept and translate every fragment, run none.
+    translate_only: bool,
 }
 
 /// The runtime filters a fragment run applies, and the plan to run instead if their keys cannot
@@ -145,7 +150,15 @@ impl SiriusComputeNodeService {
             ),
             nixl,
             filters: Arc::new(RuntimeFilters::default()),
+            reports: Arc::new(ExecReports::default()),
+            translate_only: std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some(),
         }
+    }
+
+    /// Reports instances' ends only to coordinators on `frontend_host`, the configured FE.
+    pub(crate) fn reporting_to(mut self, frontend_host: Option<crate::Host>) -> Self {
+        self.reports = Arc::new(ExecReports::new(frontend_host));
+        self
     }
 }
 
@@ -231,6 +244,9 @@ impl PInternalService for SiriusComputeNodeService {
                 return Ok(Self::fetch_data_result(Self::internal_error(err), 0, true).into());
             }
         };
+        if outcome.eos {
+            self.reports.delivered(id);
+        }
         match outcome.batch {
             Some(batch) => match batch.to_binary() {
                 Ok(bytes) => Ok(crate::prpc::Reply::with_attachment(
@@ -315,6 +331,8 @@ impl PInternalService for SiriusComputeNodeService {
         let reason = request
             .error_message
             .unwrap_or_else(|| "the FE cancelled the query".to_string());
+        // Before the purge, so an instance that fails because of it reports CANCELLED too.
+        self.reports.cancel_query(query, &reason);
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
             service.fail_and_purge(query, &format!("query cancelled: {reason}"));
@@ -441,10 +459,28 @@ impl SiriusComputeNodeService {
         &self,
         params: &TExecPlanFragmentParams,
     ) -> std::result::Result<(), String> {
-        let result = self
-            .run_or_register(params)
-            .map_err(|failure| self.end_hops(params, failure))
-            .and_then(|ready| self.drain_ready(ready));
+        self.reports.expect(params);
+        let run = || {
+            self.run_or_register(params)
+                .map_err(|failure| {
+                    // The dispatch reply tells the FE.
+                    self.reports.settled_by_reply(params);
+                    self.end_hops(params, failure)
+                })
+                .and_then(|ready| self.drain_ready(ready))
+        };
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|panic| {
+                let error = format!("a fragment panicked: {}", panic_message(panic.as_ref()));
+                warn!(error, "failing the panicked fragment's query");
+                // The dispatch reply carries the panic; the query's other instances here report
+                // it, since whatever ran them unwound.
+                self.reports.settled_by_reply(params);
+                if let Some(query) = Self::query_id(params) {
+                    self.reports.fail_query(query, &error);
+                }
+                Err(error)
+            });
         if let Err(err) = &result
             && let Some(query) = Self::query_id(params)
         {
@@ -464,10 +500,12 @@ impl SiriusComputeNodeService {
         let dump_seq = Self::dump_fragment(&params);
         // Survey mode: accept every fragment so the FE dispatches (and we dump) the whole
         // plan even when translation fails. Queries still fail at fetch_data.
-        if std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some() {
+        if self.translate_only {
             if let Err(err) = self.translate_fragment_logged(&params, &[], dump_seq) {
                 tracing::warn!(error = %err, "translate-only mode: accepting untranslatable fragment");
             }
+            // Never run, so done as far as the FE is concerned.
+            self.reports.finish(&params, Ok(()));
             return Ok(Vec::new());
         }
         let expected_senders = Self::receiver_exchanges(&params)?;
@@ -502,13 +540,15 @@ impl SiriusComputeNodeService {
             return Ok(Vec::new());
         }
         let translated = self.translate_fragment_logged(&params, &[], dump_seq)?;
-        self.execute_fragment(
+        let ready = self.execute_fragment(
             &params,
             &translated,
             Vec::new(),
             Vec::new(),
             FilterPlan::default(),
-        )
+        )?;
+        self.reports.finish(&params, Ok(()));
+        Ok(ready)
     }
 
     /// Defers a leaf fragment whose scans probe runtime filters that a receiver on this CN builds
@@ -579,10 +619,17 @@ impl SiriusComputeNodeService {
     /// Runs a deferred scan with the filters whose keys are worth applying, or unfiltered.
     fn run_deferred(&self, scan: DeferredScan, filtered: bool) {
         let query = Self::query_id(&scan.params);
-        let result = self
+        self.contain_panic(query, || self.run_deferred_scan(scan, filtered));
+    }
+
+    fn run_deferred_scan(&self, scan: DeferredScan, filtered: bool) {
+        let query = Self::query_id(&scan.params);
+        let ran = self
             .run_with_filters(&scan, filtered)
-            .map_err(|failure| self.end_hops(&scan.params, failure))
-            .and_then(|ready| self.drain_ready(ready));
+            .map_err(|failure| self.end_hops(&scan.params, failure));
+        self.reports
+            .finish(&scan.params, ran.as_ref().map(drop).map_err(String::as_str));
+        let result = ran.and_then(|ready| self.drain_ready(ready));
         if let Err(err) = result {
             warn!(error = %err, "a scan deferred for runtime filters failed");
             if let Some(query) = query {
@@ -830,10 +877,29 @@ impl SiriusComputeNodeService {
         let _ = std::thread::Builder::new()
             .name("exchange-receiver".to_string())
             .spawn(move || {
-                if let Err(err) = service.drain_ready(vec![ready]) {
-                    tracing::warn!(error = %err, "a receiver fed by a remote sender failed");
-                }
+                let query = Self::query_id(&ready.params);
+                service.contain_panic(query, || {
+                    if let Err(err) = service.drain_ready(vec![ready]) {
+                        tracing::warn!(error = %err, "a receiver fed by a remote sender failed");
+                    }
+                });
             });
+    }
+
+    /// Runs `work` off the dispatch path for `query`. A panic in it fails the query on this CN as
+    /// an error would: every instance of it still owed reports the panic, and what it holds is
+    /// freed. Otherwise the instances it unwound past would never send their final report.
+    fn contain_panic(&self, query: Option<FragmentInstanceId>, work: impl FnOnce()) {
+        let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) else {
+            return;
+        };
+        let error = format!("a fragment panicked: {}", panic_message(panic.as_ref()));
+        warn!(error, "failing the panicked fragment's query");
+        if let Some(query) = query {
+            self.reports.fail_query(query, &error);
+            self.fail_and_purge(query, &error);
+        }
+        self.log_leak_counters("panic");
     }
 
     /// Restores descriptor tables omitted by StarRocks's per-query cache protocol.
@@ -1190,9 +1256,13 @@ impl SiriusComputeNodeService {
         let mut first_error = None;
         while let Some(ReadyFragment { params, inputs }) = queue.pop() {
             match self.execute_ready_fragment(&params, inputs) {
-                Ok(next) => queue.extend(next),
+                Ok(next) => {
+                    self.reports.finish(&params, Ok(()));
+                    queue.extend(next);
+                }
                 Err(failure) => {
                     let err = self.end_hops(&params, failure);
+                    self.reports.finish(&params, Err(&err));
                     if let Some(query) = Self::query_id(&params) {
                         self.fail_and_purge(query, &err);
                     }
@@ -1221,6 +1291,7 @@ impl SiriusComputeNodeService {
             .chain(&purged.receivers)
         {
             self.fail_remote_hops(params, error);
+            self.reports.finish(params, Err(error));
         }
         if let Some(nixl) = &self.nixl {
             for &token in &purged.tokens {
@@ -1301,6 +1372,7 @@ impl SiriusComputeNodeService {
             parked_fragments = self.executor.parked_fragments(),
             direct_buffers = self.nixl.as_ref().map_or(0, |nixl| nixl.outstanding()),
             deferred_scans = self.filters.deferred(),
+            owed_reports = self.reports.owed(),
             "leak counters"
         );
     }
@@ -1456,6 +1528,9 @@ impl SiriusComputeNodeService {
             }
             if params.resource_info.is_none() {
                 params.resource_info = common.resource_info.clone();
+            }
+            if params.coord.is_none() {
+                params.coord = common.coord.clone();
             }
 
             self.process_fragment(&params)
@@ -1670,6 +1745,15 @@ impl SiriusComputeNodeService {
             error_msgs: vec![message.into()],
         }
     }
+}
+
+/// What a panic said, when it said it with a string.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 /// Frees a ready receiver's inputs when dropped, whichever step failed: translation, a pre-run
@@ -3055,9 +3139,11 @@ mod tests {
         [(a, a_nixl), (b, b_nixl)]
     }
 
-    /// Whether `service` holds nothing of any query.
+    /// Whether `service` holds nothing of any query, and owes the FE no report.
     fn idle(service: &SiriusComputeNodeService) -> bool {
-        service.exchanges.counts() == ExchangeCounts::default() && service.filters.deferred() == 0
+        service.exchanges.counts() == ExchangeCounts::default()
+            && service.filters.deferred() == 0
+            && service.reports.owed() == 0
     }
 
     /// Waits for `done`, which another thread makes true.
@@ -3278,6 +3364,240 @@ mod tests {
             "the receiver never ran"
         );
         assert_eq!(*b_nixl.released.lock().unwrap(), [5]);
+    }
+
+    /// Makes `params` report to `frontend` as backend `backend_num`, as the FE dispatches it.
+    fn reports_to(
+        params: &mut TExecPlanFragmentParams,
+        frontend: &crate::fe_report::fake_frontend::FakeFrontend,
+        backend_num: i32,
+    ) {
+        params.coord = Some(frontend.address.clone());
+        params.backend_num = Some(backend_num);
+    }
+
+    /// Each report's backend number, status and message, by backend number. Every one is final.
+    fn report_ends(
+        reports: &[starrocks_thrift::frontend_service::TReportExecStatusParams],
+    ) -> Vec<(i32, TStatusCode, String)> {
+        let mut ends: Vec<_> = reports
+            .iter()
+            .map(|report| {
+                assert_eq!(report.done, Some(true), "{report:?}");
+                let status = report.status.clone().unwrap();
+                (
+                    report.backend_num.unwrap(),
+                    status.status_code,
+                    status.error_msgs.unwrap_or_default().join("; "),
+                )
+            })
+            .collect();
+        ends.sort_unstable_by_key(|(backend_num, ..)| *backend_num);
+        ends
+    }
+
+    #[test]
+    fn every_instance_reports_ok_once_it_finished() {
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let service = SiriusComputeNodeService::new();
+        let mut result = query_fragment(50, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        reports_to(&mut result, &frontend, 1);
+        exec_ok(&service, &result);
+        let mut sender = query_fragment(50, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 8060);
+        reports_to(&mut sender, &frontend, 2);
+        exec_ok(&service, &sender);
+        for _ in 0..2 {
+            route(
+                &service,
+                methods::FETCH_DATA,
+                fetch_request(50, 10),
+                Vec::new(),
+            );
+        }
+        // The FE's cancel after a successful query finds nothing left to report.
+        assert_eq!(cancel(&service, 50).status_code, TStatusCode::OK.0);
+        assert_eq!(
+            report_ends(&frontend.wait_for(2)),
+            [
+                (1, TStatusCode::OK, String::new()),
+                (2, TStatusCode::OK, String::new())
+            ]
+        );
+        assert_eq!(service.reports.owed(), 0);
+    }
+
+    #[test]
+    fn a_failed_instance_reports_its_error_once_unless_its_dispatch_reply_did() {
+        // A sender on CN a fails mid-stream. Its own dispatch reply carries the error, so it sends
+        // no report; b's result receiver, which replied OK long ago, fails on the failure frame
+        // and reports the sender's error. The FE's cancel afterwards adds nothing.
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let failing = Arc::new(StreamingExecutor {
+            rows: 1,
+            fail_with: Some("scan exploded".to_string()),
+            ..Default::default()
+        });
+        let [(a, _), (b, _)] = two_cns(failing, Arc::new(StubExecutor));
+        let mut result = query_fragment(51, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        reports_to(&mut result, &frontend, 1);
+        exec_ok(&b, &result);
+        let mut sender = query_fragment(51, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 18060);
+        reports_to(&mut sender, &frontend, 2);
+        assert_eq!(exec(&a, &sender).error_msgs, ["scan exploded"]);
+        eventually("b to free the failed query", || idle(&b));
+        for service in [&a, &b] {
+            assert_eq!(cancel(service, 51).status_code, TStatusCode::OK.0);
+        }
+        assert_eq!(
+            report_ends(&frontend.wait_for(1)),
+            [(1, TStatusCode::INTERNAL_ERROR, "scan exploded".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_receiver_that_fails_off_the_dispatch_path_reports_its_error() {
+        // The receiver runs on the exchange-receiver thread once a remote sender's EOS arrives;
+        // no RPC reply carries its failure, so only its report tells the FE.
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let (service, _) = nixl_service(Arc::new(FailingReceivers));
+        let mut result = query_fragment(52, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        reports_to(&mut result, &frontend, 3);
+        exec_ok(&service, &result);
+        for (seq, token) in [(0, 5), (1, 0)] {
+            let (params, envelope) = packed(52, seq, token);
+            assert_eq!(
+                transmit(&service, params, envelope).0.status_code,
+                TStatusCode::OK.0
+            );
+        }
+        assert_eq!(
+            report_ends(&frontend.wait_for(1)),
+            [(
+                3,
+                TStatusCode::INTERNAL_ERROR,
+                "receiver exploded".to_string()
+            )]
+        );
+        assert_eq!(service.reports.owed(), 0);
+    }
+
+    /// Runs leaf fragments like the stub, and panics in every fragment fed by an exchange.
+    #[derive(Debug)]
+    struct PanickingReceivers;
+
+    impl FragmentExecutor for PanickingReceivers {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            if run.inputs.is_empty() && run.remote_inputs.is_empty() {
+                return StubExecutor.run_fragment(run);
+            }
+            panic!("receiver blew up");
+        }
+    }
+
+    #[test]
+    fn a_panicking_fragment_still_ends_every_instance_of_its_query() {
+        // Off the dispatch path: a receiver run by a remote sender's EOS panics on the
+        // exchange-receiver thread. Its instance reports the panic, and the query is purged.
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let (service, _) = nixl_service(Arc::new(PanickingReceivers));
+        let mut result = query_fragment(54, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        reports_to(&mut result, &frontend, 1);
+        exec_ok(&service, &result);
+        for (seq, token) in [(0, 5), (1, 0)] {
+            let (params, envelope) = packed(54, seq, token);
+            transmit(&service, params, envelope);
+        }
+        let ends = report_ends(&frontend.wait_for(1));
+        assert_eq!(ends.len(), 1);
+        assert_eq!((ends[0].0, ends[0].1), (1, TStatusCode::INTERNAL_ERROR));
+        assert!(ends[0].2.contains("receiver blew up"), "{ends:?}");
+        eventually("the panicked query's purge", || idle(&service));
+
+        // On the dispatch path: the local sender's dispatch runs the receiver, which panics. The
+        // reply carries the panic, so the sender sends no report; the receiver reports it.
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(PanickingReceivers),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        let mut result = query_fragment(55, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        reports_to(&mut result, &frontend, 1);
+        exec_ok(&service, &result);
+        let mut sender = query_fragment(55, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 8060);
+        reports_to(&mut sender, &frontend, 2);
+        let status = exec(&service, &sender);
+        assert!(
+            status.error_msgs[0].contains("receiver blew up"),
+            "{status:?}"
+        );
+        // The sender finished before the receiver panicked.
+        let ends = report_ends(&frontend.wait_for(2));
+        assert_eq!(
+            ends.iter()
+                .map(|(backend, code, _)| (*backend, *code))
+                .collect::<Vec<_>>(),
+            [(1, TStatusCode::INTERNAL_ERROR), (2, TStatusCode::OK)]
+        );
+        assert!(idle(&service));
+    }
+
+    #[test]
+    fn translate_only_mode_ends_each_instance_it_accepts() {
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let mut service = SiriusComputeNodeService::new();
+        service.translate_only = true;
+        let mut scan = query_fragment(56, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut scan, 10, 8060);
+        reports_to(&mut scan, &frontend, 4);
+        exec_ok(&service, &scan);
+        assert_eq!(
+            report_ends(&frontend.wait_for(1)),
+            [(4, TStatusCode::OK, String::new())]
+        );
+        assert_eq!(service.reports.owed(), 0);
+    }
+
+    #[test]
+    fn a_cancel_reports_every_instance_still_owed_as_cancelled() {
+        // Query 53 has a receiver waiting for its senders and a scan deferred for a runtime filter
+        // when the FE cancels it: each reports CANCELLED at once, and nothing follows.
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FilterRecorder::new(sparse_keys())),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        let mut builder = filter_builder(53);
+        reports_to(&mut builder, &frontend, 1);
+        exec_ok(&service, &builder);
+        let mut scan = probing_scan(53);
+        reports_to(&mut scan, &frontend, 2);
+        exec_ok(&service, &scan);
+        assert_eq!(service.filters.deferred(), 1);
+
+        assert_eq!(cancel(&service, 53).status_code, TStatusCode::OK.0);
+        eventually("the cancel's purge", || idle(&service));
+        assert_eq!(cancel(&service, 53).status_code, TStatusCode::OK.0);
+        assert_eq!(
+            report_ends(&frontend.wait_for(2)),
+            [
+                (1, TStatusCode::CANCELLED, "injected".to_string()),
+                (2, TStatusCode::CANCELLED, "injected".to_string())
+            ]
+        );
     }
 
     #[test]

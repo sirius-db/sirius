@@ -49,6 +49,7 @@ mod brpc;
 mod compute_node_service;
 #[cfg(feature = "sirius-engine")]
 mod engine;
+mod fe_report;
 mod file_schema;
 mod fragment_executor;
 mod local_exchange;
@@ -1076,9 +1077,37 @@ pub fn report_to_frontend_once(
     };
 
     // FE thrift address comes from TMasterInfo.network_address in heartbeat.
-    let frontend = report.frontend_address.clone();
-    // Resolve and connect with bounded timeouts so an unreachable or accept-but-never-reply FE
-    // cannot wedge this blocking call — and therefore the whole report loop — indefinitely.
+    let mut client = frontend_client(&report.frontend_address)?;
+    let result = client
+        .report(report.request)
+        .map_err(|err| anyhow!("failed to report compute node inventory to FE: {err}"))?;
+    // The Thrift round-trip succeeding does not mean the FE accepted the report; a non-OK
+    // status (e.g. unrecognized node or malformed payload) must surface as an error instead of
+    // being silently logged as success by the caller.
+    if result.status.status_code != TStatusCode::OK {
+        bail!(
+            "FE rejected compute node report (status {:?}): {}",
+            result.status.status_code,
+            result
+                .status
+                .error_msgs
+                .as_ref()
+                .map(|messages| messages.join("; "))
+                .unwrap_or_default()
+        );
+    }
+    Ok(Some(result))
+}
+
+/// A `FrontendService` client on a strict binary protocol, as the FE serves it.
+pub(crate) type FrontendClient = FrontendServiceSyncClient<
+    TBinaryInputProtocol<TBufferedReadTransport<thrift::transport::ReadHalf<TTcpChannel>>>,
+    TBinaryOutputProtocol<TBufferedWriteTransport<thrift::transport::WriteHalf<TTcpChannel>>>,
+>;
+
+/// Connects to the FE's thrift service at `frontend` with bounded timeouts, so an unreachable
+/// or accept-but-never-reply FE cannot wedge the blocking caller indefinitely.
+pub(crate) fn frontend_client(frontend: &types::TNetworkAddress) -> Result<FrontendClient> {
     let socket_addrs: Vec<SocketAddr> = (frontend.hostname.as_str(), frontend.port as u16)
         .to_socket_addrs()
         .with_context(|| {
@@ -1090,7 +1119,7 @@ pub fn report_to_frontend_once(
         .collect();
     // Try every resolved address (e.g. an IPv4/IPv6 dual-stack or round-robin host) with a
     // bounded connect, matching TcpStream::connect's multi-address behavior while still
-    // enforcing a timeout so an unresponsive FE cannot wedge the report loop.
+    // enforcing a timeout.
     let mut stream = None;
     let mut last_err: Option<std::io::Error> = None;
     for socket_addr in &socket_addrs {
@@ -1128,27 +1157,10 @@ pub fn report_to_frontend_once(
     let write_transport = TBufferedWriteTransport::new(write_channel);
     let input_protocol = TBinaryInputProtocol::new(read_transport, true);
     let output_protocol = TBinaryOutputProtocol::new(write_transport, true);
-    let mut client = FrontendServiceSyncClient::new(input_protocol, output_protocol);
-
-    let result = client
-        .report(report.request)
-        .map_err(|err| anyhow!("failed to report compute node inventory to FE: {err}"))?;
-    // The Thrift round-trip succeeding does not mean the FE accepted the report; a non-OK
-    // status (e.g. unrecognized node or malformed payload) must surface as an error instead of
-    // being silently logged as success by the caller.
-    if result.status.status_code != TStatusCode::OK {
-        bail!(
-            "FE rejected compute node report (status {:?}): {}",
-            result.status.status_code,
-            result
-                .status
-                .error_msgs
-                .as_ref()
-                .map(|messages| messages.join("; "))
-                .unwrap_or_default()
-        );
-    }
-    Ok(Some(result))
+    Ok(FrontendServiceSyncClient::new(
+        input_protocol,
+        output_protocol,
+    ))
 }
 
 /// Builds the truthful "empty CN" report payload expected by `FrontendService.report`.
@@ -1337,7 +1349,7 @@ fn resolve_host_ips(host: &str) -> Vec<IpAddr> {
 /// shared IP is required. Resolution failure on either side is treated as inconclusive and
 /// trusted, so a transient DNS hiccup never drops a legitimate FE address; only a confident
 /// mismatch (both resolve, no shared IP) is rejected.
-fn frontend_host_trusted(expected_host: &str, advertised_host: &str) -> bool {
+pub(crate) fn frontend_host_trusted(expected_host: &str, advertised_host: &str) -> bool {
     if expected_host == advertised_host {
         return true;
     }
