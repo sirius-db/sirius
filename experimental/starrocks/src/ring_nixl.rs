@@ -5,17 +5,19 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use nixl_sys::{
     Agent, MemType, MemoryRegion, NixlDescriptor, NotificationMap, OptArgs, RegistrationHandle,
     XferDescList, XferOp, XferRequest, XferStatus,
 };
 use prost::Message;
-use tracing::info;
+use starrocks_thrift::status_code::TStatusCode;
+use tracing::{info, warn};
 
 use crate::fragment_executor::SenderSlot;
-use crate::nixl_chunk::{NixlEndpoint, NixlEnvelope};
+use crate::nixl_chunk::{NixlEndpoint, NixlEnvelope, failed_params};
 use crate::proto::starrocks::{
     PTransmitChunkParams, PTransmitChunkResult,
     p_internal_service_brpc::{SERVICE_NAME, methods},
@@ -31,6 +33,13 @@ const ENV_HINT: &str = "source experimental/starrocks/scripts/cn-env.sh (NIXL_PR
                         UCX_TLS=cuda_copy,cuda_ipc,tcp,self";
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bounds a failure frame, from connecting to its reply, which a sender sends while its query is
+/// already failing: a peer that does not answer by then is likely the cause.
+const FAILED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// At most this many failure frames are in flight at once, each on its own thread.
+const FAILED_IN_FLIGHT: usize = 64;
 
 /// The engine's ring sizes for the ring exchange, from the environment.
 ///
@@ -434,8 +443,63 @@ impl Control for PrpcControl {
     }
 
     fn fail(&self, ends: Vec<(SocketAddr, SenderSlot)>, error: &str) {
-        // No failure frames yet: a receiver learns of its sender's failure from the FE's cancel.
-        tracing::warn!(hops = ends.len(), error, "a ring sender failed");
+        send_failed(ends, error);
+    }
+}
+
+/// Sends each hop's receiver in `ends` a failure frame in place of its EOS, each from its own
+/// thread, so a peer that does not answer holds up neither the caller nor the other hops. Best
+/// effort: a peer that refuses the frame or does not answer within [`FAILED_TIMEOUT`] is logged,
+/// and past [`FAILED_IN_FLIGHT`] frames in flight the rest are dropped.
+fn send_failed(ends: Vec<(SocketAddr, SenderSlot)>, error: &str) {
+    for (peer, slot) in ends {
+        let Some(permit) = FailedPermit::take() else {
+            warn!(peer = %peer, ?slot, "too many exchange failure frames in flight; dropping one");
+            continue;
+        };
+        let failed = NixlEnvelope::Failed {
+            error: error.to_string(),
+        };
+        let spawned = std::thread::Builder::new()
+            .name("exchange-failed".to_string())
+            .spawn(move || {
+                let _permit = permit;
+                let deadline = Instant::now() + FAILED_TIMEOUT;
+                match call_by(peer, failed_params(slot), &failed, deadline) {
+                    Ok(_) => info!(peer = %peer, ?slot, "sent an exchange failure frame"),
+                    Err(err) => warn!(
+                        peer = %peer,
+                        ?slot,
+                        error = %err,
+                        "failed to send an exchange failure frame"
+                    ),
+                }
+            });
+        if let Err(err) = spawned {
+            warn!(peer = %peer, ?slot, error = %err, "cannot spawn an exchange failure frame");
+        }
+    }
+}
+
+/// One of the [`FAILED_IN_FLIGHT`] failure frames that may be in flight; returned when dropped.
+struct FailedPermit;
+
+static FAILED_IN_FLIGHT_NOW: AtomicUsize = AtomicUsize::new(0);
+
+impl FailedPermit {
+    fn take() -> Option<Self> {
+        FAILED_IN_FLIGHT_NOW
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |now| {
+                (now < FAILED_IN_FLIGHT).then_some(now + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for FailedPermit {
+    fn drop(&mut self) {
+        FAILED_IN_FLIGHT_NOW.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -444,19 +508,50 @@ pub(crate) fn call(
     params: PTransmitChunkParams,
     envelope: &NixlEnvelope,
 ) -> Result<Vec<u8>, String> {
-    let (body, attachment) = prpc::call_blocking(
+    let reply = prpc::call_blocking(
         peer,
         SERVICE_NAME,
         methods::TRANSMIT_CHUNK,
         params.encode_to_vec(),
         envelope.encode(),
         RPC_TIMEOUT,
-    )
-    .map_err(|err| format!("transmit_chunk to {peer}: {err:#}"))?;
+    );
+    transmit_reply(peer, reply)
+}
+
+/// [`call`] that gives up once `deadline` passes.
+fn call_by(
+    peer: SocketAddr,
+    params: PTransmitChunkParams,
+    envelope: &NixlEnvelope,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let reply = prpc::call_blocking_by(
+        peer,
+        SERVICE_NAME,
+        methods::TRANSMIT_CHUNK,
+        params.encode_to_vec(),
+        envelope.encode(),
+        deadline,
+    );
+    transmit_reply(peer, reply)
+}
+
+/// The attachment of `peer`'s `transmit_chunk` reply, or why it failed.
+fn transmit_reply(
+    peer: SocketAddr,
+    reply: anyhow::Result<(Vec<u8>, Vec<u8>)>,
+) -> Result<Vec<u8>, String> {
+    let (body, attachment) = reply.map_err(|err| format!("transmit_chunk to {peer}: {err:#}"))?;
     let status = PTransmitChunkResult::decode(body.as_slice())
         .map_err(|err| format!("transmit_chunk reply from {peer}: {err}"))?
         .status
         .ok_or_else(|| format!("transmit_chunk reply from {peer} carries no status"))?;
+    // The peer already failed the query: its message is that failure's cause, which is what the
+    // FE should report rather than this refusal.
+    if status.status_code == TStatusCode::CANCELLED.0 {
+        return Err(status.error_msgs.join("; "));
+    }
     if status.status_code != 0 {
         return Err(format!(
             "{peer} refused transmit_chunk: {}",
@@ -483,7 +578,18 @@ pub(crate) fn check_single_visible_device(visible: Option<&str>) -> Result<(), S
 
 #[cfg(test)]
 mod tests {
-    use super::{check_single_visible_device, parse_bytes};
+    use super::{FAILED_IN_FLIGHT, FailedPermit, check_single_visible_device, parse_bytes};
+
+    #[test]
+    fn failure_frames_in_flight_are_capped() {
+        let permits: Vec<_> = std::iter::from_fn(FailedPermit::take)
+            .take(FAILED_IN_FLIGHT + 1)
+            .collect();
+        assert_eq!(permits.len(), FAILED_IN_FLIGHT);
+        assert!(FailedPermit::take().is_none());
+        drop(permits);
+        assert!(FailedPermit::take().is_some());
+    }
 
     #[test]
     fn one_cn_sees_one_gpu() {

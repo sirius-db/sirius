@@ -439,6 +439,10 @@ impl NixlEndpoint for RingTransport {
         self.ship(hops)
     }
 
+    fn fail(&self, peer: SocketAddr, slot: SenderSlot, error: &str) {
+        self.shared.control.fail(vec![(peer, slot)], error);
+    }
+
     fn ring_open(&self, request: &PTransmitChunkParams, body: &[u8]) -> Result<Vec<u8>, String> {
         let open = LaneOpen::decode(body)?;
         // Before granting: the first credit goes back to this sender as a notification.
