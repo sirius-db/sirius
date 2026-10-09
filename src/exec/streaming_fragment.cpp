@@ -48,6 +48,9 @@ constexpr const char* kFragmentQueryLabel = "sirius_streaming_fragment";
 // Per-key cuDF cast type so independently planned senders hash the same logical value.
 // Planners may bind a column to INT32 in one fragment and INT64 in another, and cuDF murmur3
 // hashes bytes, so matching keys would otherwise land in different partitions.
+// DATE and (microsecond) TIMESTAMP hash as they are: each has one cuDF type, TIMESTAMP_DAYS and
+// TIMESTAMP_MICROSECONDS. The other TIMESTAMP units stay refused, since a sender holding one of
+// them would hash the same instant differently.
 cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
 {
   switch (t.id()) {
@@ -56,12 +59,14 @@ cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
     case sirius::type_id::INTEGER: return cudf::data_type{cudf::type_id::INT64};
     case sirius::type_id::BIGINT:
     case sirius::type_id::BOOLEAN:
-    case sirius::type_id::VARCHAR: return cudf::data_type{cudf::type_id::EMPTY};
+    case sirius::type_id::VARCHAR:
+    case sirius::type_id::DATE:
+    case sirius::type_id::TIMESTAMP: return cudf::data_type{cudf::type_id::EMPTY};
     case sirius::type_id::DECIMAL: return cudf::data_type{cudf::type_id::FLOAT64};
     default:
       throw sirius::invalid_input_exception(
-        "streaming_fragment: unsupported partition key type — only integer, boolean, varchar, and "
-        "decimal columns may be used as hash partition keys");
+        "streaming_fragment: unsupported partition key type — only integer, boolean, varchar, "
+        "decimal, date and timestamp columns may be used as hash partition keys");
   }
 }
 
