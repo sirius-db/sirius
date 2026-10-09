@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "memory/runtime_stream_pool.hpp"
+
 #include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime.h>
@@ -114,7 +116,8 @@ replica_transfer_route enqueue_replica_copy(
     offset += copy_bytes;
   }
 
-  auto const source_stream = source_space.acquire_stream();
+  auto source_lease        = sirius::memory::runtime_stream_pool::acquire(source_space);
+  auto const source_stream = source_lease.get();
   {
     rmm::cuda_set_device_raii guard{source_device};
     if (d2h_sizes.size() == 1) {
