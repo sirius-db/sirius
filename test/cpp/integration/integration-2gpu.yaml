@@ -25,3 +25,4 @@ sirius:
     hash_partition_bytes: 100000000
     concat_batch_bytes: 100000000
     max_build_hash_table_bytes: 90000000
+    admission_bytes_per_gpu: 0   # off: the multi-GPU tests expect every GPU to take part
