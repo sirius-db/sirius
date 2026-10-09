@@ -36,7 +36,8 @@ void create_regexp_replace_table(RegexpReplaceFixture& fx)
     " (12, 'aba aba aba'), (13, 'aa'), (14, 'baaa'), (15, '123-456-789'),"
     " (16, 'éabaéaba'), (17, 'first' || chr(10) || 'aba aba'),"
     " (18, 'https://www.example.com/a/b'), (19, 'http://other.example/x'),"
-    " (20, 'APPLE Orange APPLE'), (21, 'a' || chr(10) || 'a');");
+    " (20, 'APPLE Orange APPLE'), (21, 'a' || chr(10) || 'a'),"
+    " (22, 'ab' || chr(10)), (23, 'a' || chr(10));");
   fx.run_ok("CHECKPOINT;");
 }
 
@@ -83,7 +84,6 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
          "regexp_replace(s, 'aba', 'X')",
          "regexp_replace(s, 'a', '')",
          "regexp_replace(s, '^a', 'X')",
-         "regexp_replace(s, 'a$', 'X')",
          "regexp_replace(s, '[0-9]+', '#')",
          "regexp_replace(s, 'a*', 'X')",
          "regexp_replace(s, 'a?', 'X')",
@@ -110,15 +110,49 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
          R"(regexp_replace(s, '[A-Z]', '\0\0'))",
          R"(regexp_replace(s, '[ \t\r\n\f]', '\0\0'))",
          R"(regexp_replace(s, '^(a)', '<\1>'))",
-         R"(regexp_replace(s, '(a)$', '<\1>'))",
          R"(regexp_replace(s, '([0-9]+)', '<\1>'))",
          R"(regexp_replace(s, '(a*)', '<\1>'))",
          R"(regexp_replace(s, '(a?)', '<\1>'))",
          R"(regexp_replace(s, '(a)|(b)', '<\1><\2>'))",
-         R"(regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1'))",
        }) {
     INFO(expression);
     compare_gpu_vs_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "regexp_replace dollar anchors fall back during planning",
+                 "[integration][gpu_execution][regexp_replace][regexp_replace_anchors]")
+{
+  create_regexp_replace_table(*this);
+  run_ok(R"(INSERT INTO regex_t VALUES (24, 'ab\' || chr(10)), (25, 'ab\');)");
+  run_ok("CHECKPOINT;");
+  for (auto const* expression : {
+         "regexp_replace(s, 'b$', 'X')",
+         "regexp_replace(s, 'a$', 'X')",
+         R"(regexp_replace(s, '(b)$', '<\1>'))",
+         R"(regexp_replace(s, '(a)$', '<\1>'))",
+         R"(regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1'))",
+         R"(regexp_replace(s, '\\$', 'X'))",
+       }) {
+    INFO(expression);
+    expect_plan_fallback_matches_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "regexp_replace escaped dollars remain literal on GPU",
+                 "[integration][gpu_execution][regexp_replace][regexp_replace_anchors]")
+{
+  run_ok("CREATE TABLE regex_t(s VARCHAR);");
+  run_ok(R"(INSERT INTO regex_t VALUES ('$'), ('a$b$'), ('\$'), ('$' || chr(10)), (''), (NULL);)");
+  run_ok("CHECKPOINT;");
+  for (auto const* pattern : {R"(\$)", R"(\\\$)"}) {
+    INFO(pattern);
+    compare_gpu_vs_cpu(std::string{"SELECT regexp_replace(s, '"} + pattern +
+                       "', 'X') FROM regex_t");
+    compare_gpu_vs_cpu(std::string{"SELECT regexp_replace(s, '("} + pattern +
+                       R"()', '<\1>') FROM regex_t)");
   }
 }
 

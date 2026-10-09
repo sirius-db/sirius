@@ -307,6 +307,10 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
         }
       } else if (pattern.compare(i, 2, "[:") == 0) {
         return nullptr;
+      } else if (pattern[i] == '$') {
+        // cuDF also matches $ before a trailing newline; RE2's default is end-of-text only.
+        // Conservatively reject every unescaped $, including literals in character classes.
+        return nullptr;
       }
     }
     duckdb_re2::RE2::Options options;
