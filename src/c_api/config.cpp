@@ -1,6 +1,7 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "c_api/config_internal.hpp"
 #include "c_api/error_internal.hpp"
+#include "config_loading.hpp"
 
 #include <sirius/c/context/config_builder.h>
 #include <sirius/c/version.h>
@@ -14,14 +15,7 @@ struct sirius_error {
 namespace sirius::c_api {
 sirius_status fail(sirius_status status, const char* message, sirius_error** error) noexcept
 {
-  if (error) {
-    try {
-      *error = new sirius_error{message};
-    } catch (...) {
-      *error = nullptr;
-    }
-  }
-  return status;
+  return with_diagnostic(status, error, [&] { return new sirius_error{message}; });
 }
 }  // namespace sirius::c_api
 
@@ -48,39 +42,59 @@ size_t sirius_error_message_size(const sirius_error* error) noexcept
   return error ? error->message.size() : 0;
 }
 void sirius_error_destroy(sirius_error* error) noexcept { delete error; }
-void sirius_config_retain(sirius_config* config) noexcept { retain(config); }
-void sirius_config_release(sirius_config* config) noexcept { release(config); }
-void sirius_config_builder_retain(sirius_config_builder* builder) noexcept { retain(builder); }
-void sirius_config_builder_release(sirius_config_builder* builder) noexcept { release(builder); }
+void sirius_context_config_retain(sirius_context_config* config) noexcept { retain(config); }
+void sirius_context_config_release(sirius_context_config* config) noexcept { release(config); }
+void sirius_context_config_builder_retain(sirius_context_config_builder* builder) noexcept
+{
+  retain(builder);
+}
+void sirius_context_config_builder_release(sirius_context_config_builder* builder) noexcept
+{
+  release(builder);
+}
 
-sirius_status sirius_config_builder_create(sirius_config_builder** out,
-                                           sirius_error** error) noexcept
+sirius_status sirius_context_config_builder_create(sirius_context_config_builder** out,
+                                                   sirius_error** error) noexcept
 {
   if (out) { *out = nullptr; }
   return sirius::c_api::invoke(error, [&] {
     if (!out) { return sirius::c_api::fail(SIRIUS_INVALID_ARGUMENT, "out_builder is NULL", error); }
-    *out = new sirius_config_builder;
+    *out = new sirius_context_config_builder;
     return sirius_status{SIRIUS_SUCCESS};
   });
 }
-sirius_status sirius_config_builder_from_yaml(const char* path,
-                                              size_t size,
-                                              sirius_config_builder** out,
-                                              sirius_error** error) noexcept
+sirius_status sirius_context_config_builder_from_yaml(const char* path,
+                                                      size_t size,
+                                                      sirius_context_config_builder** out,
+                                                      sirius_error** error) noexcept
 {
   if (out) { *out = nullptr; }
   return sirius::c_api::invoke(error, [&] {
     if (!out || !path || std::string_view(path, size).find('\0') != std::string_view::npos) {
       return sirius::c_api::fail(SIRIUS_INVALID_ARGUMENT, "Invalid path or output pointer", error);
     }
-    *out = new sirius_config_builder(
-      sirius::load_configuration(std::filesystem::path(std::string(path, size))));
+    try {
+      *out = new sirius_context_config_builder(
+        sirius::load_configuration(std::filesystem::path(std::string(path, size))));
+    } catch (const sirius::configuration_load_error& e) {
+      sirius_status status = SIRIUS_INTERNAL_ERROR;
+      switch (e.code) {
+        case sirius::configuration_load_error_code::io: status = SIRIUS_CONFIGURATION_IO; break;
+        case sirius::configuration_load_error_code::malformed_yaml:
+          status = SIRIUS_MALFORMED_YAML;
+          break;
+        case sirius::configuration_load_error_code::invalid_configuration:
+          status = SIRIUS_INVALID_CONFIGURATION;
+          break;
+      }
+      return sirius::c_api::fail(status, e.what(), error);
+    }
     return sirius_status{SIRIUS_SUCCESS};
   });
 }
-sirius_status sirius_config_builder_build(const sirius_config_builder* builder,
-                                          sirius_config** out,
-                                          sirius_error** error) noexcept
+sirius_status sirius_context_config_builder_build(const sirius_context_config_builder* builder,
+                                                  sirius_context_config** out,
+                                                  sirius_error** error) noexcept
 {
   if (out) { *out = nullptr; }
   return sirius::c_api::invoke(error, [&] {
@@ -88,7 +102,7 @@ sirius_status sirius_config_builder_build(const sirius_config_builder* builder,
       return sirius::c_api::fail(
         SIRIUS_INVALID_ARGUMENT, "Builder or output pointer is NULL", error);
     }
-    *out = new sirius_config(builder->config);
+    *out = new sirius_context_config(builder->config);
     return sirius_status{SIRIUS_SUCCESS};
   });
 }

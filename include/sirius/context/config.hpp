@@ -31,6 +31,12 @@ namespace sirius {
 /**
  * @brief An immutable, validated configuration produced by ContextConfigBuilder::build().
  *
+ * @par Thread safety
+ * Objects may be transferred between threads, including for destruction.
+ * Const operations and copying may run concurrently while the source stays alive.
+ * Assignment and destruction require exclusive access to that object; separate
+ * copies may be used independently on different threads.
+ *
  * A snapshot retains its values independently of builder reassignment and
  * changes to the source YAML file. Copies share immutable storage and remain
  * valid after the original snapshot or builder is destroyed. Copying from an
@@ -55,7 +61,7 @@ class ContextConfig {
   /// @endcode
   ContextConfig(const ContextConfig& other) noexcept : handle_(other.handle_)
   {
-    sirius_config_retain(handle_);
+    sirius_context_config_retain(handle_);
   }
   /// Replace this snapshot with another configuration's snapshot.
   ///
@@ -71,8 +77,8 @@ class ContextConfig {
   /// @endcode
   ContextConfig& operator=(const ContextConfig& other) noexcept
   {
-    sirius_config_retain(other.handle_);
-    sirius_config_release(handle_);
+    sirius_context_config_retain(other.handle_);
+    sirius_context_config_release(handle_);
     handle_ = other.handle_;
     return *this;
   }
@@ -85,11 +91,11 @@ class ContextConfig {
   ///   auto config = sirius::ContextConfigBuilder{}.build();
   /// } // A successfully built configuration is released at the end of the scope.
   /// @endcode
-  ~ContextConfig() noexcept { sirius_config_release(handle_); }
+  ~ContextConfig() noexcept { sirius_context_config_release(handle_); }
 
  private:
-  explicit ContextConfig(::sirius_config* handle) noexcept : handle_(handle) {}
-  ::sirius_config* handle_;
+  explicit ContextConfig(::sirius_context_config* handle) noexcept : handle_(handle) {}
+  ::sirius_context_config* handle_;
 
   friend class ContextConfigBuilder;
 };
