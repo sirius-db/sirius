@@ -697,11 +697,12 @@ TEST_CASE("compute_hash_join_partition_strategy - probe-driven joins size from t
   REQUIRE(s.num_partitions == 8);
   CHECK(s.placement == partition_placement::round_robin(8, {0}));
 
-  // A lone probe-driven partition stays unpinned when the build is not larger.
+  // A lone probe-driven partition stays unpinned when the build is not larger. One GPU: above the
+  // small-table threshold the natural count floors to the GPU count, which is not what this checks.
   auto const lone = strategy(k100MB,
                              false,
                              true,
-                             4,
+                             1,
                              duckdb::JoinType::RIGHT,
                              HASH_JOIN_MODE::STANDARD,
                              kBigPartitionBytes,
