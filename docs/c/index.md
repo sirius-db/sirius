@@ -45,9 +45,9 @@ Hardware availability and capacity are checked when initializing an engine.
   an owned diagnostic. Pass empty output slots; release previous results before reusing them.
 - Diagnostics are best effort. A nonzero status is a failure even if no message is available.
 - No C++ exception crosses the C interface. Treat unknown nonzero status codes as failures.
-- Immutable configuration handles support concurrent reads, builds, and ownership transfer
-  between threads. Keep a live reference throughout each call and give output slots exclusive access.
-- Keep borrowed handles alive for each call. Do not release a reference concurrently with its use.
+- Keep every borrowed handle alive throughout each call; do not release it concurrently with
+  its use. Immutable builders and configurations support concurrent reads, builds, and ownership
+  transfer between threads. Give output slots exclusive access.
 
 ## Compatibility
 

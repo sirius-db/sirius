@@ -8,17 +8,6 @@
 
 #include <string_view>
 
-struct sirius_error {
-  std::string message;
-};
-
-namespace sirius::c_api {
-sirius_status fail(sirius_status status, const char* message, sirius_error** error) noexcept
-{
-  return with_diagnostic(status, error, [&] { return new sirius_error{message}; });
-}
-}  // namespace sirius::c_api
-
 namespace {
 template <typename T>
 void retain(T* value) noexcept
@@ -33,15 +22,6 @@ void release(T* value) noexcept
 }  // namespace
 
 uint32_t sirius_abi_version() noexcept { return SIRIUS_ABI_VERSION; }
-const char* sirius_error_message(const sirius_error* error) noexcept
-{
-  return error ? error->message.c_str() : "";
-}
-size_t sirius_error_message_size(const sirius_error* error) noexcept
-{
-  return error ? error->message.size() : 0;
-}
-void sirius_error_destroy(sirius_error* error) noexcept { delete error; }
 void sirius_context_config_retain(sirius_context_config* config) noexcept { retain(config); }
 void sirius_context_config_release(sirius_context_config* config) noexcept { release(config); }
 void sirius_context_config_builder_retain(sirius_context_config_builder* builder) noexcept
