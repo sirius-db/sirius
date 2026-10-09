@@ -4,13 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-quent-analyzer = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
-quent-events = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc", features = ["serde"] }
-quent-store = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
+quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b", features = ["serde"] }
+quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
 serde = { version = "1", features = ["derive"] }
 smallvec = "1"
 
 [build-dependencies]
-quent-build-info = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
-quent-store-build = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
-quent-yaml = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
+quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
+quent-store-build = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
