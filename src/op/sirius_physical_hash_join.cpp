@@ -1005,8 +1005,16 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
   // Larger-side sizing: the other side's total. Measured or projected by PARTITION when it can
   // be, else planner rows x estimated row width of that child's output; never below the bytes the
   // other side has already delivered.
+  // A build that lands in one partition and publishes a dynamic filter does so from the whole
+  // build (exact IN-list / Bloom / zone map for every key type). Raising it to several partitions
+  // would leave only Bloom accumulation (integer keys, peer DMA) or nothing, and M4a measured the
+  // probe-side filter as worth more than the rebuilt tables (Q21: 73 GB probed vs 4.3 GB). Keep
+  // such a build whole; the rebuild saving is forfeited only for this case.
+  bool const keep_whole_build_filter =
+    publishes_dynamic_filters() &&
+    natural_num_partitions(in.total_bytes, _hash_partition_bytes, num_gpus()) == 1;
   std::optional<uint64_t> other_side_estimate;
-  if (larger_side_partitioning) {
+  if (larger_side_partitioning && !keep_whole_build_filter) {
     uint64_t const other_measured =
       in.combined_total_bytes > in.total_bytes ? in.combined_total_bytes - in.total_bytes : 0;
     uint64_t estimate = 0;
@@ -1087,7 +1095,9 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
     (strategy.broadcast ? " [broadcast]" : ""),
     build_card_est,
     probe_card_est,
-    other_side_estimate.has_value() ? std::to_string(*other_side_estimate) : std::string{"-"},
+    other_side_estimate.has_value()                         ? std::to_string(*other_side_estimate)
+    : (larger_side_partitioning && keep_whole_build_filter) ? std::string{"kept-whole-for-filter"}
+                                                            : std::string{"-"},
     strategy.placement.to_string());
   return strategy;
 }
