@@ -50,7 +50,8 @@ memory_context::memory_context(
       .label     = mem_space->to_string(),
       .bounds    = {.bytes = mem_space->get_max_memory()},
       .worker_id = worker_id,
-      .gpu_id    = gpu_handles.contains(mem_space->get_device_id())
+      .gpu_id    = mem_space->get_tier() == cucascade::memory::Tier::GPU &&
+                    gpu_handles.contains(mem_space->get_device_id())
                      ? std::optional(gpu_handles.at(mem_space->get_device_id()))
                      : std::nullopt,
     });

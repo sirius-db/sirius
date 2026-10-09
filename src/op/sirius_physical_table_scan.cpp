@@ -32,6 +32,7 @@
 #include <cucascade/data/data_batch.hpp>
 
 #include <format>
+#include <utility>
 
 namespace sirius {
 namespace op {
@@ -243,7 +244,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     referenced_indices.reserve(expected_output_columns);
     for (std::size_t i = 0; i < expected_output_columns; i++) {
       auto const& batch_idx_opt = batch_column_map[projection_ids[i]];
-      if (!batch_idx_opt.has_value() || *batch_idx_opt >= input_view.num_columns()) {
+      if (!batch_idx_opt.has_value() ||
+          std::cmp_greater_equal(*batch_idx_opt, input_view.num_columns())) {
         throw std::runtime_error(
           std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
                       "input_view.num_columns()={}",

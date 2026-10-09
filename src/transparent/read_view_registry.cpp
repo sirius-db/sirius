@@ -154,14 +154,6 @@ bool compare_multiset(std::span<op::scan::read_view_fingerprint const* const> or
   return true;
 }
 
-bool same_identity(std::shared_ptr<op::scan::bound_read_view const> const& left,
-                   std::shared_ptr<op::scan::bound_read_view const> const& right)
-{
-  return left && right && left->identity && right->identity &&
-         (left->identity == right->identity ||
-          same_fingerprint(left->identity->fingerprint, right->identity->fingerprint));
-}
-
 bool same_identity(op::scan::bound_read_view const* left,
                    std::shared_ptr<op::scan::bound_read_view const> const& right)
 {
