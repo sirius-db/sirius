@@ -84,9 +84,11 @@ class exchange_inbox {
   /// @throws sirius::invalid_input_exception on a token that holds no received batch.
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> peek_batch(std::uint64_t token) const;
 
-  /// Non-null rows, minimum and maximum of one integer column.
+  /// Non-null rows, distinct keys, minimum and maximum of one integer column. `distinct` is
+  /// counted per batch and summed: exact for one batch, at least the true count across batches.
   struct key_stats {
     std::uint64_t rows{0};
+    std::uint64_t distinct{0};
     std::int64_t min{std::numeric_limits<std::int64_t>::max()};
     std::int64_t max{std::numeric_limits<std::int64_t>::min()};
   };
