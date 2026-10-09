@@ -30,6 +30,7 @@
 #include <duckdb/transaction/meta_transaction.hpp>
 
 #include <barrier>
+#include <chrono>
 #include <future>
 #include <thread>
 
@@ -421,4 +422,45 @@ TEST_CASE("late failure classification uses exception types rather than message 
   CHECK(classify_failure(text_only).cause == late_failure_cause::other);
   CHECK(classify_failure(text_only, late_failure_cause::gpu_error).cause ==
         late_failure_cause::gpu_error);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "an interrupt stops a query retrying out-of-memory and the next query runs",
+                 "[integration][transparent][interrupt]")
+{
+  sirius::test::scratch_dir directory("interrupt_oom_retry");
+  run_ok("SET gpu_execution=false");
+  run_ok("COPY (SELECT i::INTEGER x FROM range(128) t(i)) TO " +
+         directory.file_literal("data.parquet") + " (FORMAT PARQUET)");
+  auto sql = "SELECT sum(x) FROM read_parquet(" + directory.file_literal("data.parquet") + ")";
+  run_ok("SET gpu_execution=true");
+  // Uninterrupted, the query would retry for about 20 s before giving up.
+  run_ok("SET sirius_test_inject_gpu_task_oom=1000000");
+  run_ok("SET sirius_test_gpu_task_retry_limit=2000");
+  run_ok("SET sirius_test_gpu_task_retry_backoff_ms=10");
+
+  auto tasks_started = sirius::test::get_registered_sirius_context(*con)->window_task_counter();
+  auto const tasks_before = tasks_started->load();
+  auto query              = std::async(std::launch::async, [&] { return con->Query(sql); });
+  auto const deadline     = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (tasks_started->load() < tasks_before + 3 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  CHECK(tasks_started->load() >= tasks_before + 3);  // retrying out-of-memory
+
+  auto const interrupted_at = std::chrono::steady_clock::now();
+  con->Interrupt();
+  REQUIRE(query.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+  auto const stopped_after = std::chrono::steady_clock::now() - interrupted_at;
+  auto result              = query.get();
+  REQUIRE(result->HasError());
+  INFO(result->GetError());
+  CHECK(result->GetErrorType() == duckdb::ExceptionType::INTERRUPT);
+  CHECK(stopped_after < std::chrono::seconds(2));
+
+  run_ok("SET sirius_test_inject_gpu_task_oom=0");
+  auto next = con->Query(sql);
+  if (next->HasError()) INFO(next->GetError());
+  REQUIRE_FALSE(next->HasError());
+  CHECK(next->GetValue(0, 0).ToString() == "8128");
 }

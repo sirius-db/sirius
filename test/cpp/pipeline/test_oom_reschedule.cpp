@@ -15,8 +15,10 @@
  */
 
 #include "catch.hpp"
+#include "duckdb/common/exception.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -32,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -536,4 +539,115 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   INFO("Max-retry OOM test passed: " << global_state->oom_count.load() << " OOM events, "
                                      << global_state->completed_count.load()
                                      << " small tasks completed, error correctly reported");
+}
+
+namespace {
+
+// Waits up to `timeout` for `done`, polling.
+template <typename Predicate>
+bool wait_until(Predicate done, std::chrono::seconds timeout)
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (!done()) {
+    if (std::chrono::steady_clock::now() > deadline) { return false; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return true;
+}
+
+std::unique_ptr<sirius::pipeline::gpu_pipeline_task_local_state> empty_local_state()
+{
+  return std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+    std::make_unique<sirius::op::pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{}));
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Test: an XL task that would retry out-of-memory for minutes stops within one attempt of its
+// query being interrupted, and the query fails with DuckDB's interrupt error.
+// ---------------------------------------------------------------------------
+TEST_CASE("GPU pipeline executor stops an interrupted query's OOM retries",
+          "[gpu_pipeline_executor][oom][interrupt]")
+{
+  oom_test_fixture f;
+  if (!f.setup(1, "oom-interrupt")) {
+    WARN("Skipping OOM interrupt test — no GPU available.");
+    return;
+  }
+
+  auto injections                       = std::make_shared<sirius::op::scan::test_injections>();
+  injections->gpu_task_retry_limit      = 100000;
+  injections->gpu_task_retry_backoff_ms = 5;
+  f.completion->injections              = injections;
+  std::atomic<bool> interrupted{false};
+  f.completion->interrupt_check = [&interrupted] { return interrupted.load(); };
+  auto outcome                  = f.completion->get_awaitable();
+
+  auto global_state = std::make_shared<oom_test_global_state>();
+  global_state->set_completion_handler(f.completion);
+  f.executor->start();
+  f.executor->schedule(std::make_unique<xl_task>(0, empty_local_state(), global_state));
+
+  REQUIRE(
+    wait_until([&] { return global_state->oom_count.load() >= 3; }, std::chrono::seconds(30)));
+  interrupted                 = true;
+  auto const ooms_interrupted = global_state->oom_count.load();
+
+  REQUIRE(outcome.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+  REQUIRE_THROWS_AS(outcome.get(), duckdb::InterruptException);
+  CHECK(f.completion->failure().cause == sirius::transparent::late_failure_cause::other);
+
+  f.executor->drain_and_wait();
+  f.request_channel.close();
+  f.executor->stop();
+
+  // At most the attempt already in flight when the flag was set.
+  CHECK(global_state->oom_count.load() <= ooms_interrupted + 1);
+  CHECK(f.executor->is_task_queue_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Test: an interrupted query's queued tasks are dropped before they reserve memory or run, and
+// the executor keeps serving the next query.
+// ---------------------------------------------------------------------------
+TEST_CASE("GPU pipeline executor drops an interrupted query's tasks and serves the next query",
+          "[gpu_pipeline_executor][interrupt]")
+{
+  oom_test_fixture f;
+  if (!f.setup(2, "interrupt-drop")) {
+    WARN("Skipping interrupt drop test — no GPU available.");
+    return;
+  }
+
+  f.completion->interrupt_check = [] { return true; };
+  auto outcome                  = f.completion->get_awaitable();
+  auto cancelled                = std::make_shared<oom_test_global_state>();
+  cancelled->set_completion_handler(f.completion);
+
+  f.executor->start();
+  constexpr int kCancelledTasks = 3;
+  for (int id = 0; id < kCancelledTasks; ++id) {
+    f.executor->schedule(
+      std::make_unique<small_task>(static_cast<uint64_t>(id), empty_local_state(), cancelled));
+  }
+  REQUIRE(outcome.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+  REQUIRE_THROWS_AS(outcome.get(), duckdb::InterruptException);
+  // Every dropped task destroys itself and releases the global state.
+  REQUIRE(wait_until([&] { return cancelled.use_count() == 1; }, std::chrono::seconds(10)));
+  CHECK(cancelled->completed_count.load() == 0);
+  CHECK(f.executor->get_metrics().tasks_executed == 0);
+
+  // The next query, on the same executor, is not interrupted.
+  auto next_completion = std::make_shared<sirius::pipeline::completion_handler>();
+  auto next            = std::make_shared<oom_test_global_state>();
+  next->set_completion_handler(next_completion);
+  f.executor->schedule(std::make_unique<small_task>(kCancelledTasks, empty_local_state(), next));
+  REQUIRE(wait_until([&] { return next->completed_count.load() == 1; }, std::chrono::seconds(10)));
+  CHECK_FALSE(next_completion->has_error());
+
+  f.executor->stop();
+  f.request_channel.close();
+  CHECK(next->error_count.load() == 0);
 }
