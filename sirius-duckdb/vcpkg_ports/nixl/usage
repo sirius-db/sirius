@@ -1,0 +1,7 @@
+NIXL is built as static archives with its UCX transport built in.
+
+    find_package(nixl 1.5 CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE nixl::nixl)
+
+The version-specific patches and nixl-targets.cmake are also used by Sirius's
+development build, where UCX and CUDA may remain shared environment dependencies.

@@ -1,0 +1,10 @@
+include(CMakeFindDependencyMacro)
+find_dependency(ucx CONFIG)
+find_dependency(absl CONFIG)
+find_dependency(Threads)
+find_dependency(CUDAToolkit)
+
+get_filename_component(_nixl_prefix "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+include("${CMAKE_CURRENT_LIST_DIR}/nixl-targets.cmake")
+nixl_import_targets("${_nixl_prefix}" ucx::ucx CUDA::cudart_static)
+unset(_nixl_prefix)

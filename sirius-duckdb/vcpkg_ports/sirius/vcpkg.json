@@ -5,6 +5,7 @@
     "raft",
     "cuco",
     "nvrtc",
+    "nixl",
     "yaml-cpp",
     "abseil",
     "numactl",
