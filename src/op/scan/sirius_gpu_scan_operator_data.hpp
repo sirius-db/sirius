@@ -252,14 +252,16 @@ class scan_operator_input : public op::operator_data {
   /// copy). Stamped by drain_cached_provider on resident splits; scan_info
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
-  /// True when prepare_for_processing's conversion came back as a
-  /// pushdown_outcome::row_filtered: the decode already applied the split's whole
-  /// table-filter conjunction and every column is compacted to the surviving
-  /// rows. materialize_table then returns filter_state::ROW_FILTERED so
-  /// post_filter_and_project skips filter evaluation and only projects. Never
-  /// set while the gate is off — the converters then always produce the plain
-  /// representation.
+  /// True when the recorded outcome is a pushdown_outcome::row_filtered: the decode already applied
+  /// the split's whole table-filter conjunction and every column is compacted to the surviving
+  /// rows. materialize_table then returns filter_state::ROW_FILTERED so post_filter_and_project
+  /// skips filter evaluation and only projects. Never set while the gate is off — the converters
+  /// then always produce the plain representation.
   bool pushdown_row_filtered{false};
+  /// True when the recorded outcome is a pushdown_outcome::filter_only_columns_dropped: the decoded
+  /// batch holds only the leading columns the output reads. materialize_table refuses to serve it
+  /// unless it is also row-filtered and exactly as wide as the ingestible's output_prefix_width().
+  bool pushdown_filter_only_columns_dropped{false};
   /// Positions in the decoded batch delivered as a BOOL8 predicate result
   /// rather than values (pushdown_outcome::predicate_columns), stamped by
   /// prepare_for_processing. materialize_table forwards it to
@@ -322,6 +324,13 @@ class scan_operator_input : public op::operator_data {
   std::size_t conversion_destination_bytes{0};
 
  private:
+  /// Stamps the pushdown_* fields and the unprofitable-selection latch from @p data when it is a
+  /// decompression_pushdown_batch_representation, whichever converter decoded it, and drops a
+  /// keep-mask that decode consumed.
+  ///
+  /// @throws std::runtime_error if the decode compacted rows but left an mvcc keep-mask unconsumed.
+  void record_decode_outcome(::cucascade::idata_representation const* data);
+
   /// Per-query readahead bookkeeping this split reports into; null when the
   /// producer does not track readahead.
   std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;

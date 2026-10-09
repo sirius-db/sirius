@@ -563,7 +563,8 @@ scan_filter_analysis analyze_scan_filters(
 }
 
 sirius::pushdown_request build_pushdown_request(scan_filter_analysis const& analysis,
-                                                std::span<const std::size_t> primary_index_by_slot)
+                                                std::span<const std::size_t> primary_index_by_slot,
+                                                std::optional<std::size_t> output_prefix_width)
 {
   sirius::pushdown_request request;
   if (analysis.equality_sets.empty() && analysis.ranges.empty()) { return request; }
@@ -591,6 +592,10 @@ sirius::pushdown_request build_pushdown_request(scan_filter_analysis const& anal
       return std::find(primary_index_by_slot.begin(), primary_index_by_slot.end(), entry.first) !=
              primary_index_by_slot.end();
     });
+  if (output_prefix_width && *output_prefix_width >= 1 &&
+      *output_prefix_width < primary_index_by_slot.size()) {
+    request.output_prefix_width = output_prefix_width;
+  }
   return request;
 }
 

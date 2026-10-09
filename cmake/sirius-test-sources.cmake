@@ -268,6 +268,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_fused_membership_mask.cpp
+    test/cpp/scan/test_fused_scan_filter_delivery.cpp
     test/cpp/scan/test_iceberg_batch_layout.cpp
     test/cpp/scan/test_iceberg_equality_delete.cpp
     test/cpp/scan/test_puffin_reader.cpp
