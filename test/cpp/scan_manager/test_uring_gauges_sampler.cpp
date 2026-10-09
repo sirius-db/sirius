@@ -50,51 +50,55 @@ TEST_CASE("uring gauges: the first window reports depth but no rate",
   g.pending_ops             = 2;
   g.active_remaining_slices = 1;
   g.queued_requests         = 4;
+  g.queued_low_requests     = 1;
   g.queued_bytes            = std::size_t{3} << 20;
   g.requests_started        = 10;
   g.bytes_submitted         = std::size_t{64} << 20;
+  g.preemptions             = 7;
 
   // Without a previous window the cumulative counters have no delta to report.
   auto const line = format_gauges_line(2, g, nullptr, 0.5);
   REQUIRE(line.has_value());
   CHECK(*line ==
         "[uring_gauges] reactor=2 inflight=3 max_inflight=5 pending_ops=2 active_slices=1 "
-        "queued_requests=4 queued_MiB=3 started=0 MiB_s=0"
-        " dq_n=0 dq_sum_ms=0.0 dq_max_ms=0.0 dq_hist=-"
-        " pq_n=0 pq_sum_ms=0.0 pq_max_ms=0.0 pq_hist=-");
+        "queued_requests=4 queued_low=1 queued_MiB=3 started=0 preemptions=0 MiB_s=0"
+        " hq_n=0 hq_sum_ms=0.0 hq_max_ms=0.0 hq_hist=-"
+        " lq_n=0 lq_sum_ms=0.0 lq_max_ms=0.0 lq_hist=-");
 }
 
-TEST_CASE("uring gauges: deltas, rate and per-class queue delay", "[scan_manager][uring_gauges]")
+TEST_CASE("uring gauges: deltas, rate and per-tier queue delay", "[scan_manager][uring_gauges]")
 {
   gauges previous{};
   previous.requests_started = 4;
   previous.bytes_submitted  = std::size_t{10} << 20;
+  previous.preemptions      = 1;
 
   gauges g{};
   g.requests_started = 10;
   g.bytes_submitted  = std::size_t{110} << 20;
+  g.preemptions      = 3;
 
-  auto& demand         = g.queue_delay[0];
-  demand.count         = 3;
-  demand.sum_ns        = 4'500'000;
-  demand.max_ns        = 2'000'000;
-  demand.histogram[3]  = 1;
-  demand.histogram[11] = 2;
+  auto& high         = g.queue_delay[0];
+  high.count         = 3;
+  high.sum_ns        = 4'500'000;
+  high.max_ns        = 2'000'000;
+  high.histogram[3]  = 1;
+  high.histogram[11] = 2;
 
-  auto& prefetch        = g.queue_delay[1];
-  prefetch.count        = 1;
-  prefetch.sum_ns       = 300'000;
-  prefetch.max_ns       = 300'000;
-  prefetch.histogram[9] = 1;
+  auto& low        = g.queue_delay[1];
+  low.count        = 1;
+  low.sum_ns       = 300'000;
+  low.max_ns       = 300'000;
+  low.histogram[9] = 1;
 
-  // 100 MiB over 2 s; histogram buckets render as bucket:count.
+  // 100 MiB over 2 s; preemptions is a delta; histogram buckets render as bucket:count.
   auto const line = format_gauges_line(0, g, &previous, 2.0);
   REQUIRE(line.has_value());
   CHECK(*line ==
         "[uring_gauges] reactor=0 inflight=0 max_inflight=0 pending_ops=0 active_slices=0 "
-        "queued_requests=0 queued_MiB=0 started=6 MiB_s=50"
-        " dq_n=3 dq_sum_ms=4.5 dq_max_ms=2.0 dq_hist=3:1,11:2"
-        " pq_n=1 pq_sum_ms=0.3 pq_max_ms=0.3 pq_hist=9:1");
+        "queued_requests=0 queued_low=0 queued_MiB=0 started=6 preemptions=2 MiB_s=50"
+        " hq_n=3 hq_sum_ms=4.5 hq_max_ms=2.0 hq_hist=3:1,11:2"
+        " lq_n=1 lq_sum_ms=0.3 lq_max_ms=0.3 lq_hist=9:1");
 
   // A queue-delay record alone (no movement otherwise) is not idle.
   gauges delayed_only{};
