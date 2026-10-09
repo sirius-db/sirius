@@ -25,6 +25,8 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -465,6 +467,103 @@ std::shared_ptr<cucascade::data_batch> direct_exchange::take_batch(std::uint64_t
   }
   auto table = take(token);
   return sirius::make_data_batch(std::move(*table), _gpu, _gpu.acquire_stream(), {});
+}
+
+std::shared_ptr<cucascade::data_batch> direct_exchange::peek_batch(std::uint64_t token) const
+{
+  std::lock_guard const lock{_mutex};
+  require_open();
+  auto const sealed = _sealed_ids.find(token);
+  auto batch =
+    sealed == _sealed_ids.end() ? nullptr : _sealed->get_data_batch_by_id(sealed->second);
+  if (!batch) {
+    throw sirius::invalid_input_exception("direct exchange: token {} holds no sealed batch", token);
+  }
+  return batch;
+}
+
+namespace {
+
+/// The column at @p column of a GPU-resident batch's view.
+cudf::column_view key_column(cudf::table_view const& view, int column)
+{
+  if (column < 0 || column >= view.num_columns()) {
+    throw sirius::invalid_input_exception(
+      "direct exchange: key column {} is out of range for a {}-column batch",
+      column,
+      view.num_columns());
+  }
+  return view.column(column);
+}
+
+std::int64_t integer_value(cudf::scalar const& value, rmm::cuda_stream_view stream)
+{
+  switch (value.type().id()) {
+    case cudf::type_id::INT8:
+      return static_cast<cudf::numeric_scalar<std::int8_t> const&>(value).value(stream);
+    case cudf::type_id::INT16:
+      return static_cast<cudf::numeric_scalar<std::int16_t> const&>(value).value(stream);
+    case cudf::type_id::INT32:
+      return static_cast<cudf::numeric_scalar<std::int32_t> const&>(value).value(stream);
+    case cudf::type_id::INT64:
+      return static_cast<cudf::numeric_scalar<std::int64_t> const&>(value).value(stream);
+    default:
+      throw sirius::invalid_input_exception(
+        "direct exchange: key column of type {} is not a "
+        "signed integer",
+        cudf::type_to_name(value.type()));
+  }
+}
+
+}  // namespace
+
+void direct_exchange::add_key_stats(cucascade::data_batch& batch, int column, key_stats& stats)
+{
+  bring_to_gpu(batch);
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  auto const ro = batch.to_read_only();
+  if (ro.get_current_tier() != cucascade::memory::Tier::GPU) {
+    throw sirius::invalid_input_exception("direct exchange: the batch is not on the GPU");
+  }
+  auto const col = key_column(get_cudf_table_view(ro), column);
+  if (!cudf::is_integral(col.type()) || cudf::is_unsigned(col.type())) {
+    throw sirius::invalid_input_exception(
+      "direct exchange: key column of type {} is not a "
+      "signed integer",
+      cudf::type_to_name(col.type()));
+  }
+  auto const valid = col.size() - col.null_count();
+  if (valid == 0) { return; }
+  rmm::cuda_stream_view const stream{_gpu.acquire_stream()};
+  if (cudaEvent_t writer = ro.get_writer_event()) {
+    RMM_CUDA_TRY(cudaStreamWaitEvent(stream.value(), writer, 0));
+  }
+  auto const [lo, hi] = cudf::minmax(col, stream, _gpu.get_default_allocator());
+  stats.rows += static_cast<std::uint64_t>(valid);
+  stats.min = std::min(stats.min, integer_value(*lo, stream));
+  stats.max = std::max(stats.max, integer_value(*hi, stream));
+}
+
+std::shared_ptr<cucascade::data_batch> direct_exchange::copy_column(cucascade::data_batch& batch,
+                                                                    int column)
+{
+  bring_to_gpu(batch);
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  rmm::cuda_stream_view const stream{_gpu.acquire_stream()};
+  std::unique_ptr<cudf::table> copy;
+  {
+    auto const ro = batch.to_read_only();
+    if (ro.get_current_tier() != cucascade::memory::Tier::GPU) {
+      throw sirius::invalid_input_exception("direct exchange: the batch is not on the GPU");
+    }
+    auto const col = key_column(get_cudf_table_view(ro), column);
+    if (cudaEvent_t writer = ro.get_writer_event()) {
+      RMM_CUDA_TRY(cudaStreamWaitEvent(stream.value(), writer, 0));
+    }
+    copy = std::make_unique<cudf::table>(
+      cudf::table_view{std::vector<cudf::column_view>{col}}, stream, _gpu.get_default_allocator());
+  }
+  return sirius::make_data_batch(std::move(copy), _gpu, stream, {});
 }
 
 std::unique_ptr<cucascade::memory::reservation> direct_exchange::reserve(std::size_t bytes)

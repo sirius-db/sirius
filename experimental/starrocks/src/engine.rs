@@ -26,8 +26,8 @@ use starrocks_plan_translator::{StreamInputSchema, TranslatedPlan};
 use tracing::{info, warn};
 
 use crate::fragment_executor::{
-    DrainHandoff, DrainNext, ExportedBatch, FragmentExecutor, FragmentResult, FragmentRun,
-    OutputDrain, PinTableSpec, SenderSlot,
+    DrainHandoff, DrainNext, ExportedBatch, FilterKeys, FilterRun, FragmentExecutor,
+    FragmentResult, FragmentRun, KeySource, KeyStats, OutputDrain, PinTableSpec, SenderSlot,
 };
 use crate::local_exchange::RemoteBatch;
 use crate::parked_registry::ParkedRegistry;
@@ -50,6 +50,11 @@ struct ExecuteRequest {
     hash_keys: Vec<usize>,
     /// Outputs to hand out as drains just before the run, so they ship while it runs.
     drains: Option<DrainHandoff>,
+    /// Runtime filters whose key streams `plan` reads.
+    filters: Vec<FilterRun>,
+    /// The plan and stream schemas without the runtime filters, run instead when their keys
+    /// cannot be copied.
+    fallback: Option<(Vec<u8>, Vec<StreamInputSchema>)>,
     /// Channel the engine thread sends the result (or a flattened error) back on.
     respond: Sender<Result<Option<FragmentResult>, String>>,
 }
@@ -61,6 +66,11 @@ enum EngineRequest {
     ExportDirect {
         slot: SenderSlot,
         respond: Sender<Result<Option<ExportedBatch>, String>>,
+    },
+    /// Rows, minimum and maximum of a runtime filter's keys, read in place.
+    KeyStats {
+        keys: FilterKeys,
+        respond: Sender<Result<KeyStats, String>>,
     },
     /// Drop one destination's claim on parked output.
     DropParked {
@@ -182,7 +192,28 @@ fn engine_thread(
     while let Ok(request) = requests.recv() {
         match request {
             EngineRequest::Run(request) => {
-                let result = run_fragment(&context, &mut parked, &request);
+                let planned = PlanToRun {
+                    bytes: &request.plan,
+                    stream_inputs: &request.stream_inputs,
+                    filters: &request.filters,
+                };
+                let result = match (
+                    run_fragment(&context, &mut parked, &request, planned),
+                    &request.fallback,
+                ) {
+                    (Err(RunError::Filter(err)), Some((bytes, stream_inputs))) => {
+                        // Nothing was consumed yet: the keys are copied before any input moves.
+                        warn!(error = %err, "runtime filter keys unavailable; running unfiltered");
+                        let unfiltered = PlanToRun {
+                            bytes,
+                            stream_inputs,
+                            filters: &[],
+                        };
+                        run_fragment(&context, &mut parked, &request, unfiltered)
+                    }
+                    (result, _) => result,
+                }
+                .map_err(String::from);
                 if result.is_err() {
                     // A failed fragment may stop before relaying every input; release them all so
                     // the senders' GPU batches are freed. An input already relayed is gone and
@@ -195,6 +226,9 @@ fn engine_thread(
             }
             EngineRequest::ExportDirect { slot, respond } => {
                 let _ = respond.send(export_direct(&mut parked, &slot));
+            }
+            EngineRequest::KeyStats { keys, respond } => {
+                let _ = respond.send(key_stats(&context, &mut parked, &keys));
             }
             EngineRequest::DropParked { slot, respond } => {
                 let _ = respond.send(parked.release(&slot));
@@ -249,21 +283,129 @@ fn export_direct(
     }))
 }
 
+/// The plan one attempt at a fragment runs, with the runtime filters it reads.
+#[derive(Clone, Copy)]
+struct PlanToRun<'r> {
+    bytes: &'r [u8],
+    stream_inputs: &'r [StreamInputSchema],
+    filters: &'r [FilterRun],
+}
+
+/// Why a fragment did not run.
+enum RunError {
+    /// A runtime filter's keys could not be copied. Nothing else was consumed, so the fragment can
+    /// still run without its filters.
+    Filter(String),
+    Failed(String),
+}
+
+impl From<String> for RunError {
+    fn from(err: String) -> Self {
+        Self::Failed(err)
+    }
+}
+
+impl From<RunError> for String {
+    fn from(err: RunError) -> Self {
+        match err {
+            RunError::Filter(err) | RunError::Failed(err) => err,
+        }
+    }
+}
+
+/// Rows, minimum and maximum of `keys`, read where they sit.
+fn key_stats(
+    context: &SiriusContext,
+    parked: &mut ParkedRegistry<sirius::Fragment<'_>>,
+    keys: &FilterKeys,
+) -> Result<KeyStats, String> {
+    let column =
+        u32::try_from(keys.column).map_err(|_| format!("key column {} overflows", keys.column))?;
+    let mut stats = sirius::KeyStats::default();
+    for source in &keys.sources {
+        match source {
+            KeySource::Parked(slot) => {
+                let (sender, stream) = parked.claim(slot, "read the keys of")?;
+                sender
+                    .output_key_stats(stream, column, &mut stats)
+                    .map_err(|err| format!("failed to read runtime filter keys: {err}"))?;
+            }
+            KeySource::Received(tokens) => {
+                let exchange = context
+                    .direct_exchange()
+                    .ok_or("runtime filter keys arrived without a direct exchange")?;
+                for &token in tokens {
+                    exchange
+                        .key_stats(token, column, &mut stats)
+                        .map_err(|err| format!("failed to read runtime filter keys: {err}"))?;
+                }
+            }
+        }
+    }
+    Ok(KeyStats {
+        rows: stats.rows,
+        min: stats.min,
+        max: stats.max,
+    })
+}
+
+/// Copies every runtime filter's keys into its stream and closes it, before any input moves.
+fn copy_filter_keys(
+    fragment: &mut sirius::Fragment<'_>,
+    parked: &mut ParkedRegistry<sirius::Fragment<'_>>,
+    filters: &[FilterRun],
+) -> Result<(), String> {
+    for filter in filters {
+        let column = u32::try_from(filter.keys.column)
+            .map_err(|_| format!("key column {} overflows", filter.keys.column))?;
+        let mut batches = 0;
+        for source in &filter.keys.sources {
+            match source {
+                KeySource::Parked(slot) => {
+                    let (sender, stream) = parked.claim(slot, "copy the keys of")?;
+                    batches += fragment
+                        .copy_output_column(sender, stream, filter.stream_id, column)
+                        .map_err(|err| format!("failed to copy runtime filter keys: {err}"))?;
+                }
+                KeySource::Received(tokens) => {
+                    for &token in tokens {
+                        fragment
+                            .copy_received_column(filter.stream_id, token, column)
+                            .map_err(|err| format!("failed to copy runtime filter keys: {err}"))?;
+                        batches += 1;
+                    }
+                }
+            }
+        }
+        fragment
+            .close_input(filter.stream_id, 0)
+            .map_err(|err| format!("failed to close runtime filter stream: {err}"))?;
+        info!(
+            stream_id = filter.stream_id,
+            rows = filter.rows,
+            batches,
+            "copied runtime filter keys"
+        );
+    }
+    Ok(())
+}
+
 /// Runs one fragment on the engine thread: declare its streams, build, relay parked sender output
 /// in, run, then park the output for its receivers or return the rows.
 fn run_fragment<'ctx>(
     context: &'ctx SiriusContext,
     parked: &mut ParkedRegistry<sirius::Fragment<'ctx>>,
     request: &ExecuteRequest,
-) -> Result<Option<FragmentResult>, String> {
+    planned: PlanToRun<'_>,
+) -> Result<Option<FragmentResult>, RunError> {
     let start_us = unix_us();
     let started = Instant::now();
     let mut fragment = context
         .fragment()
         .map_err(|err| format!("failed to create fragment: {err}"))?;
 
-    let mut sender_rows = Vec::with_capacity(request.stream_inputs.len());
-    for schema in &request.stream_inputs {
+    let mut sender_rows = Vec::with_capacity(planned.stream_inputs.len());
+    for schema in planned.stream_inputs {
         let stream_id = stream_id_of(schema.node_id)?;
         for column in &schema.columns {
             fragment
@@ -286,6 +428,14 @@ fn run_fragment<'ctx>(
                 .declare_input_sender(stream_id, sender_id_of(sender_id)?)
                 .map_err(|err| format!("failed to declare sender on stream {stream_id}: {err}"))?;
         }
+        if let Some(filter) = planned
+            .filters
+            .iter()
+            .find(|filter| filter.stream_id == stream_id)
+        {
+            sender_rows.push(vec![Some(filter.rows)]);
+            continue;
+        }
         sender_rows.push(
             senders
                 .iter()
@@ -303,7 +453,7 @@ fn run_fragment<'ctx>(
     }
     match exact_cardinalities(sender_rows) {
         Some(rows) => {
-            for (schema, rows) in request.stream_inputs.iter().zip(rows) {
+            for (schema, rows) in planned.stream_inputs.iter().zip(rows) {
                 let stream_id = stream_id_of(schema.node_id)?;
                 fragment
                     .declare_input_cardinality(stream_id, rows)
@@ -334,11 +484,13 @@ fn run_fragment<'ctx>(
     }
 
     fragment
-        .build(&request.plan)
+        .build(planned.bytes)
         .map_err(|err| format!("failed to plan fragment: {err}"))?;
     let built = started.elapsed();
 
-    for schema in &request.stream_inputs {
+    copy_filter_keys(&mut fragment, parked, planned.filters).map_err(RunError::Filter)?;
+
+    for schema in planned.stream_inputs {
         let stream_id = stream_id_of(schema.node_id)?;
         for slot in senders_of(request, schema.node_id) {
             let sender_id = sender_id_of(slot.sender_id)?;
@@ -535,6 +687,8 @@ impl FragmentExecutor for SiriusEngine {
             broadcast: false,
             hash_keys: Vec::new(),
             drains: None,
+            filters: Vec::new(),
+            fallback: None,
         })?
         .ok_or_else(|| "result fragment returned no rows".to_string())
     }
@@ -550,6 +704,10 @@ impl FragmentExecutor for SiriusEngine {
                 broadcast: run.broadcast,
                 hash_keys: run.hash_keys,
                 drains: run.drains,
+                filters: run.filters,
+                fallback: run
+                    .fallback
+                    .map(|plan| (plan.to_substrait_bytes(), plan.stream_inputs.clone())),
                 respond,
             })
         })
@@ -561,6 +719,11 @@ impl FragmentExecutor for SiriusEngine {
 
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
         self.call(|respond| EngineRequest::DropParked { slot, respond })
+    }
+
+    fn key_stats(&self, keys: &FilterKeys) -> Result<KeyStats, String> {
+        let keys = keys.clone();
+        self.call(|respond| EngineRequest::KeyStats { keys, respond })
     }
 
     fn parked_fragments(&self) -> usize {
@@ -775,6 +938,8 @@ mod tests {
                     broadcast: false,
                     hash_keys: Vec::new(),
                     drains: None,
+                    filters: Vec::new(),
+                    fallback: None,
                     respond,
                 })
             })
@@ -908,6 +1073,8 @@ mod tests {
                 broadcast: false,
                 hash_keys: Vec::new(),
                 drains: None,
+                filters: Vec::new(),
+                fallback: None,
             })
             .expect("park the sender output");
         assert!(parked.is_none(), "a sender fragment returns no rows");
@@ -921,6 +1088,8 @@ mod tests {
                 broadcast: false,
                 hash_keys: Vec::new(),
                 drains: None,
+                filters: Vec::new(),
+                fallback: None,
             })
             .expect("relay into the receiver")
             .expect("the receiver returns rows");
@@ -937,6 +1106,8 @@ mod tests {
                 broadcast: false,
                 hash_keys: Vec::new(),
                 drains: None,
+                filters: Vec::new(),
+                fallback: None,
             })
         };
         park().expect("park the sender output");
@@ -949,6 +1120,8 @@ mod tests {
                 broadcast: false,
                 hash_keys: vec![usize::MAX],
                 drains: None,
+                filters: Vec::new(),
+                fallback: None,
             })
             .expect_err("an overflowing hash key fails the receiver");
         park().expect("the failed receiver released its input");

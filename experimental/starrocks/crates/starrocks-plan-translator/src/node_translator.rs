@@ -19,6 +19,7 @@ use crate::descriptor_table::{DescriptorTable, SlotKey};
 use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
 use crate::row_layout::RowLayout;
+use crate::runtime_filter::FilterInput;
 use crate::scan_paths::ScanFilePaths;
 use crate::type_mapper;
 use crate::{
@@ -64,6 +65,8 @@ struct PlanContext<'a> {
     scan_paths: &'a ScanFilePaths,
     /// Input streams bound to exchange nodes, keyed by receiver node id.
     exchange_inputs: &'a HashMap<i32, &'a ExchangeInput>,
+    /// Key streams bound to runtime filters, keyed by filter id.
+    filter_inputs: &'a HashMap<i32, &'a FilterInput>,
     /// Substrait extension registry shared across the whole plan.
     registry: &'a mut ExtensionRegistry,
     /// Stream schemas recorded as exchanges are lowered, in translation order.
@@ -80,12 +83,14 @@ impl<'a> PlanContext<'a> {
         desc: &'a DescriptorTable,
         scan_paths: &'a ScanFilePaths,
         exchange_inputs: &'a HashMap<i32, &'a ExchangeInput>,
+        filter_inputs: &'a HashMap<i32, &'a FilterInput>,
         registry: &'a mut ExtensionRegistry,
     ) -> Self {
         Self {
             desc,
             scan_paths,
             exchange_inputs,
+            filter_inputs,
             registry,
             stream_inputs: Vec::new(),
             consumed_above: HashMap::new(),
@@ -295,7 +300,80 @@ fn translate_scan(
         rel: scan_rel(ctx.desc, tuple_id, file_paths)?,
         layout: RowLayout::from_tuples(ctx.desc, &[tuple_id])?,
     };
-    apply_conjuncts(input, node, ctx)
+    let filtered = apply_conjuncts(input, node, ctx)?;
+    apply_runtime_filters(filtered, node, ctx)
+}
+
+/// Keeps only the scan rows whose probe key appears in a bound runtime filter's key stream: a
+/// left semi join per bound filter the scan probes. The join that built the filter is exact
+/// anyway, so dropping rows it would reject changes nothing but the work.
+fn apply_runtime_filters(
+    mut input: TranslatedRel,
+    node: &TPlanNode,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    for filter in crate::runtime_filter::probe_filters_of(node) {
+        let Some(bound) = filter
+            .filter_id
+            .and_then(|id| ctx.filter_inputs.get(&id).copied())
+        else {
+            continue;
+        };
+        let probe = filter
+            .plan_node_id_to_target_expr
+            .as_ref()
+            .and_then(|targets| targets.get(&node.node_id))
+            .ok_or_else(|| {
+                TranslateError::malformed(format!(
+                    "runtime filter {} lists scan {} as a target without its probe expression",
+                    bound.filter_id, node.node_id
+                ))
+            })?;
+        let key_type = type_mapper::map_type_desc(
+            &probe
+                .nodes
+                .first()
+                .ok_or_else(|| TranslateError::malformed("empty runtime filter probe expression"))?
+                .type_,
+            true,
+        )?;
+        let key_type_name = type_mapper::duckdb_type_name(&key_type)?;
+        if key_type_name != bound.column.ty {
+            return Err(TranslateError::malformed(format!(
+                "runtime filter {} probes a {key_type_name} key but its key stream carries {}",
+                bound.filter_id, bound.column.ty
+            )));
+        }
+        let mut expr_ctx = ctx.expr_context(&input.layout);
+        let probe = probe.translate(&mut expr_ctx)?;
+        let anchor = ctx.registry.register_function(URN_COMPARISON, "equal");
+        let condition = expr_translator::scalar_function(
+            anchor,
+            vec![probe, field_selection(input.layout.len() as i32)],
+            type_mapper::bool_type(),
+        );
+        let keys = TranslatedRel {
+            rel: stream_read_rel(
+                substrait::proto::NamedStruct {
+                    names: vec![bound.column.name.clone()],
+                    r#struct: Some(substrait::proto::r#type::Struct {
+                        types: vec![key_type],
+                        nullability: substrait::proto::r#type::Nullability::Required as i32,
+                        ..Default::default()
+                    }),
+                },
+                &bound.stream_view,
+            ),
+            layout: RowLayout::new([None]),
+        };
+        ctx.stream_inputs.push(StreamInputSchema {
+            node_id: bound.node_id,
+            stream_view: bound.stream_view.clone(),
+            columns: vec![bound.column.clone()],
+        });
+        input = join_rel(input, keys, condition, join_rel::JoinType::LeftSemi)?;
+    }
+    Ok(input)
 }
 
 /// Refuses a node whose `common_slot_map` this translator does not materialize.
@@ -358,9 +436,10 @@ pub(crate) fn translate_plan(
     desc: &DescriptorTable,
     scan_paths: &ScanFilePaths,
     exchange_inputs: &HashMap<i32, &ExchangeInput>,
+    filter_inputs: &HashMap<i32, &FilterInput>,
     registry: &mut ExtensionRegistry,
 ) -> Result<TranslatedFragment> {
-    let mut ctx = PlanContext::new(desc, scan_paths, exchange_inputs, registry);
+    let mut ctx = PlanContext::new(desc, scan_paths, exchange_inputs, filter_inputs, registry);
     let root = plan.translate(&mut ctx)?;
     Ok(TranslatedFragment {
         root,
@@ -1299,7 +1378,14 @@ pub(crate) fn project_exprs(
     // scan nodes to resolve file paths for.
     let scan_paths = ScanFilePaths::default();
     let exchange_inputs = HashMap::new();
-    let mut ctx = PlanContext::new(desc, &scan_paths, &exchange_inputs, registry);
+    let filter_inputs = HashMap::new();
+    let mut ctx = PlanContext::new(
+        desc,
+        &scan_paths,
+        &exchange_inputs,
+        &filter_inputs,
+        registry,
+    );
     project_exprs_with_context(input, exprs, &mut ctx)
 }
 

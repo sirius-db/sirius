@@ -69,6 +69,53 @@ pub struct DrainHandoff {
     pub respond: Sender<Vec<Box<dyn OutputDrain>>>,
 }
 
+/// Where one share of a runtime filter's keys sits on this CN.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeySource {
+    /// A same-CN sender's output parked under this slot.
+    Parked(SenderSlot),
+    /// Sealed batches a remote sender delivered, by token.
+    Received(Vec<u64>),
+}
+
+/// A runtime filter's keys on this CN: one column of every batch its build exchange received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterKeys {
+    /// Position of the key in the exchange's rows.
+    pub column: usize,
+    pub sources: Vec<KeySource>,
+}
+
+/// Non-null rows, minimum and maximum of a key column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyStats {
+    pub rows: u64,
+    pub min: i64,
+    pub max: i64,
+}
+
+impl Default for KeyStats {
+    /// No rows yet: `min` and `max` start at the ends of the range.
+    fn default() -> Self {
+        Self {
+            rows: 0,
+            min: i64::MAX,
+            max: i64::MIN,
+        }
+    }
+}
+
+/// A runtime filter to apply to a fragment: the key stream its plan reads, and where to copy
+/// the keys from. The sources are only read; their receiver still gets every batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterRun {
+    /// Engine stream id of the key stream.
+    pub stream_id: u64,
+    pub keys: FilterKeys,
+    /// Key rows, declared as the stream's cardinality.
+    pub rows: u64,
+}
+
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
 #[derive(Clone, Debug)]
 pub struct FragmentResult {
@@ -141,6 +188,11 @@ pub struct FragmentRun<'a> {
     pub hash_keys: Vec<usize>,
     /// Outputs to drain while the fragment runs; the rest stay parked until it finishes.
     pub drains: Option<DrainHandoff>,
+    /// Runtime filters whose key streams `plan` reads.
+    pub filters: Vec<FilterRun>,
+    /// The plan without its runtime filters, run instead when the keys cannot be copied (their
+    /// receiver took them first, say). Filters only drop rows the join would drop anyway.
+    pub fallback: Option<&'a TranslatedPlan>,
 }
 
 /// Runs a translated fragment, either parking its output for a downstream fragment or returning
@@ -171,6 +223,14 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     fn export_direct_next(&self, slot: SenderSlot) -> Result<Option<ExportedBatch>, String> {
         Err(format!(
             "this executor cannot export the output parked under {slot:?}"
+        ))
+    }
+
+    /// Rows, minimum and maximum of a runtime filter's integer keys, read in place.
+    fn key_stats(&self, keys: &FilterKeys) -> Result<KeyStats, String> {
+        Err(format!(
+            "this executor cannot read runtime filter keys from {:?}",
+            keys.sources
         ))
     }
 

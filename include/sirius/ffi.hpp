@@ -153,6 +153,16 @@ class SIRIUS_FFI_EXPORT DirectExchange {
   /// Tokens neither released nor consumed.
   [[nodiscard]] std::size_t outstanding() const;
 
+  /// Adds the non-null rows, minimum and maximum of signed integer column `column` of the sealed
+  /// batch under `token` to `rows`, `min` and `max`, leaving the batch for its receiver. A spilled
+  /// batch comes back to the GPU first.
+  /// @throws on a token that holds no sealed batch, or a column out of range or not an integer.
+  void key_stats(std::uint64_t token,
+                 std::uint32_t column,
+                 std::uint64_t& rows,
+                 std::int64_t& min,
+                 std::int64_t& max) const;
+
  private:
   std::shared_ptr<sirius::exec::direct_exchange> exchange_;
 };
@@ -282,6 +292,32 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws before build(), on an unknown stream or a result fragment, or without a
   /// DirectExchange.
   [[nodiscard]] std::unique_ptr<OutputDrain> output_drain(std::uint64_t stream_id) const;
+
+  /// Adds the non-null rows, minimum and maximum of signed integer column `column` of every batch
+  /// parked on output `stream_id` to `rows`, `min` and `max`, without draining it.
+  /// @throws before build(), on an unknown stream, without a DirectExchange, or on a column out of
+  /// range or not an integer.
+  void output_key_stats(std::uint64_t stream_id,
+                        std::uint32_t column,
+                        std::uint64_t& rows,
+                        std::int64_t& min,
+                        std::int64_t& max) const;
+
+  /// Push a copy of column `column` of every batch parked on `source`'s output `source_stream_id`
+  /// into input stream `input_stream_id`, leaving the source as it was. Does not close a sender.
+  /// @return the number of batches copied.
+  /// @throws as push_received() does, and on a column out of range.
+  std::size_t copy_output_column(Fragment& source,
+                                 std::uint64_t source_stream_id,
+                                 std::uint64_t input_stream_id,
+                                 std::uint32_t column);
+
+  /// Push a copy of column `column` of the sealed batch under `token` into input stream
+  /// `input_stream_id`. The token is not consumed.
+  /// @throws as push_received() does, and on a column out of range.
+  void copy_received_column(std::uint64_t input_stream_id,
+                            std::uint64_t token,
+                            std::uint32_t column);
 
   /// Push the batch received under `token` into input stream `stream_id`. Consumes the token
   /// unless it throws before reading it: before build() or on an undeclared input.
