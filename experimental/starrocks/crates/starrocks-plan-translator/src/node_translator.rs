@@ -211,6 +211,10 @@ fn translate_plan_node(
         TPlanNodeType::SORT_NODE => translate_sort(node, children, ctx),
         TPlanNodeType::HASH_JOIN_NODE => translate_hash_join(node, children, ctx),
         TPlanNodeType::NESTLOOP_JOIN_NODE => translate_nestloop_join(node, children, ctx),
+        // ANALYTIC_EVAL_NODE (window functions) is not translated. When it is, follow the BE
+        // (`Analytor::_output_result_chunk`): the node emits its child's row and then its result
+        // tuple (`TAnalyticNode.output_tuple_id`), and window function i fills that tuple's
+        // slot i, counted in descriptor order, as aggregates do in `translate_aggregation`.
         _ => Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
             node_type: node.node_type,
@@ -711,7 +715,8 @@ fn stream_read_rel(schema: substrait::proto::NamedStruct, stream_view: &str) -> 
 /// each measure becomes. One-phase keeps the existing aggregate surface. Partial and merge
 /// accept SUM, COUNT, MIN and MAX: a partial measure emits its partial state and a merge
 /// measure combines partial states, both as [`agg_phase::partial_state`] says. The output row
-/// layout is the aggregation output tuple.
+/// layout is the tuple the node emits: its output tuple, or its intermediate tuple when it
+/// doesn't finalize.
 fn translate_aggregation(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
@@ -724,14 +729,15 @@ fn translate_aggregation(
         field: "agg_node",
     })?;
     let phase = agg_phase::classify(node.node_id, node.node_type, agg)?;
-    if agg.intermediate_tuple_id != agg.output_tuple_id {
-        return Err(TranslateError::UnsupportedPlanNode {
-            node_id: node.node_id,
-            node_type: node.node_type,
-            reason: "aggregation node has distinct intermediate and output tuples",
-        });
-    }
-    let output_tuple = agg.output_tuple_id;
+    // Like the BE (`Aggregator::_build_output_chunk`), a finalizing node emits its output tuple
+    // and a non-finalizing one its intermediate tuple. Grouping key i is that tuple's
+    // materialized slot i and aggregate i its slot `keys + i`, counted in descriptor order, not
+    // by slot id. The FE's planner gives both ids the same tuple today.
+    let output_tuple = if agg.need_finalize {
+        agg.output_tuple_id
+    } else {
+        agg.intermediate_tuple_id
+    };
 
     let grouping_exprs = agg.grouping_exprs.as_deref().unwrap_or_default();
     let mut grouping_expressions = Vec::with_capacity(grouping_exprs.len());

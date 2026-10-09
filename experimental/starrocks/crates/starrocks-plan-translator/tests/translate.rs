@@ -5340,6 +5340,115 @@ fn each_aggregate_takes_its_own_output_slot() {
     assert!(names.contains(&"count".to_string()), "{names:?}");
 }
 
+/// Descriptor for an aggregation with separate tuples: scan tuple 0 (`id`, `name`, `price`),
+/// output tuple 1 (`name`, `n`, `top`) and intermediate tuple 2, whose wire order (`name` slot
+/// 7, `n_state` slot 5, `top_state` slot 6) is not its slot-id order.
+fn split_tuple_agg_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None), (2, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 0, "price", decimal64_15_2()),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "n", scalar_type(TPrimitiveType::BIGINT)),
+            slot(3, 1, "top", decimal64_15_2()),
+            slot(7, 2, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(5, 2, "n_state", scalar_type(TPrimitiveType::BIGINT)),
+            slot(6, 2, "top_state", decimal64_15_2()),
+        ],
+    )
+}
+
+/// Translates `count(*), max(price) GROUP BY name` over [`split_tuple_agg_desc`], hash-sending
+/// its output on `partition`. A node that doesn't finalize emits tuple 2, like the FE's
+/// `setIntermediateTuple`.
+fn translate_split_tuple_aggregation(
+    need_finalize: bool,
+    partition: Vec<TExpr>,
+) -> Result<TranslatedPlan, TranslateError> {
+    let mut agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![
+            aggregate_expr("count", scalar_type(TPrimitiveType::BIGINT), None),
+            aggregate_expr(
+                "max",
+                decimal64_15_2(),
+                Some(slot_ref(3, 0, decimal64_15_2())),
+            ),
+        ],
+    );
+    let agg_node = agg.agg_node.as_mut().unwrap();
+    agg_node.intermediate_tuple_id = 2;
+    agg_node.need_finalize = need_finalize;
+    if !need_finalize {
+        agg.row_tuples = vec![2];
+    }
+    translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![agg, scan_node(0, 0)]),
+        split_tuple_agg_desc(),
+        TDataPartition::new(
+            TPartitionType::HASH_PARTITIONED,
+            Some(partition),
+            None,
+            None,
+        ),
+    ))
+}
+
+/// The FE's column-order contract for a non-finalizing aggregation: grouping key i is slot i of
+/// its intermediate tuple and aggregate i slot `keys + i`, counted in descriptor order. The
+/// partition keys name the intermediate tuple's slots in reverse, so they resolve to the
+/// columns the contract assigns them; by slot id they would resolve to `[1, 0, 2]`.
+#[test]
+fn non_finalizing_aggregation_emits_its_intermediate_tuple_in_descriptor_order() {
+    let plan = translate_split_tuple_aggregation(
+        false,
+        vec![
+            slot_ref(6, 2, decimal64_15_2()),
+            slot_ref(5, 2, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(7, 2, scalar_type(TPrimitiveType::VARCHAR)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(root(&plan.plan).names, ["name", "n_state", "top_state"]);
+    assert_eq!(plan.output_partition_columns, Some(vec![2, 1, 0]));
+    // Aggregate i is column `keys + i`: the count, then the maximum.
+    let aggregate = root_aggregate(&plan.plan);
+    let kinds: Vec<_> = aggregate
+        .measures
+        .iter()
+        .map(|measure| type_kind(measure.measure.as_ref().unwrap().output_type.as_ref()))
+        .collect();
+    assert!(
+        matches!(
+            kinds.as_slice(),
+            [
+                substrait::proto::r#type::Kind::I64(_),
+                substrait::proto::r#type::Kind::Decimal(_)
+            ]
+        ),
+        "{kinds:?}"
+    );
+}
+
+/// A finalizing aggregation with a separate intermediate tuple still emits its output tuple.
+#[test]
+fn finalizing_aggregation_emits_its_output_tuple() {
+    let plan = translate_split_tuple_aggregation(
+        true,
+        vec![
+            slot_ref(3, 1, decimal64_15_2()),
+            slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(root(&plan.plan).names, ["name", "n", "top"]);
+    assert_eq!(plan.output_partition_columns, Some(vec![2, 1]));
+}
+
 /// Builds a SORT_NODE over sort tuple 1 carrying `limit` and `offset`, sorting on the single
 /// BIGINT column the `sort_fetch_desc` fixture materializes.
 fn sort_node_with(limit: i64, offset: Option<i64>) -> TPlanNode {
