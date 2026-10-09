@@ -97,8 +97,8 @@ struct EncodeKernelSpec {
   std::string source;
 
   // The `extern "C"` kernel symbol declared in `source`.  Stable per
-  // (tree shape, element dtype) pair; used as the cache key by
-  // higher layers.
+  // (tree shape, element dtype) pair.  Not a cache key on its own: the
+  // kernel cache hashes `source` together with it.
   std::string entry_symbol;
 
   // Output buffer specs in the order the renderer expects them in the

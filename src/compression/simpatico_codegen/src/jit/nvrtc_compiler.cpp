@@ -37,6 +37,23 @@ int arch_cc_for_current_device()
   return prop.major * 10 + prop.minor;
 }
 
+std::vector<std::string> nvrtc_options(const CompileOptions& opts)
+{
+  return {
+    "-std=c++20",
+    "-arch=sm_" + std::to_string(opts.arch_cc),
+    "--no-source-include",
+    "-default-device",
+  };
+}
+
+int nvrtc_version()
+{
+  int major = 0, minor = 0;
+  if (nvrtcVersion(&major, &minor) != NVRTC_SUCCESS) return 0;
+  return major * 1000 + minor * 10;
+}
+
 namespace {
 
 [[noreturn]] void throw_nvrtc(const char* api, nvrtcResult r)
@@ -168,19 +185,16 @@ CompiledKernel compile_plain_kernel(const std::string& source,
   nvrtcProgram prog = nullptr;
   NVRTC_OR_THROW(nvrtcCreateProgram(&prog,
                                     source.c_str(),
-                                    "codegen_jit.cu",
+                                    std::string(kNvrtcProgramName).c_str(),
                                     static_cast<int>(hdr_names.size()),
                                     hdr_sources.data(),
                                     hdr_names.data()));
 
-  const std::string arch_opt = "-arch=sm_" + std::to_string(opts.arch_cc);
-
-  std::vector<const char*> nvrtc_opts = {
-    "-std=c++20",
-    arch_opt.c_str(),
-    "--no-source-include",
-    "-default-device",
-  };
+  const std::vector<std::string> options = nvrtc_options(opts);
+  std::vector<const char*> nvrtc_opts;
+  nvrtc_opts.reserve(options.size());
+  for (const auto& option : options)
+    nvrtc_opts.push_back(option.c_str());
 
   nvrtcResult compile_result =
     nvrtcCompileProgram(prog, static_cast<int>(nvrtc_opts.size()), nvrtc_opts.data());

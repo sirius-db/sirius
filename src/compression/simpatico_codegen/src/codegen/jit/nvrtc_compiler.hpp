@@ -4,6 +4,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -30,6 +31,16 @@ struct CompileOptions {
 // Returns major*10+minor for the current CUDA device (e.g. 90 for H100).
 // Throws std::runtime_error if the device cannot be queried.
 int arch_cc_for_current_device();
+
+// Program name handed to nvrtcCreateProgram.
+inline constexpr std::string_view kNvrtcProgramName = "codegen_jit.cu";
+
+// The exact option list compile_plain_kernel passes to NVRTC for `opts`. The
+// kernel cache keys on it, so the key cannot drift from what is compiled.
+std::vector<std::string> nvrtc_options(const CompileOptions& opts);
+
+// NVRTC version as major * 1000 + minor * 10 (the CUDA_VERSION convention).
+int nvrtc_version();
 
 struct CompiledKernel {
   CUlibrary library = nullptr;

@@ -22,13 +22,6 @@
     "liburing",
     "openssl",
     "xxhash",
-    {
-      "features": [
-        "xxhsum"
-      ],
-      "host": true,
-      "name": "xxhash"
-    },
     "roaring",
     {
       "features": [
