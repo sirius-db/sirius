@@ -225,6 +225,9 @@ void scan_operator_input::prepare_for_processing(
         dynamic_cast<const ::cucascade::gpu_table_representation*>(data) != nullptr;
       needs_upload = data != nullptr &&
                      (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !is_gpu_table);
+      // Another converter (the memory prefetcher, say) may already have decoded this batch; its
+      // outcome binds this split all the same.
+      if (!needs_upload) { record_decode_outcome(data); }
     }
     if (needs_upload) {
       auto& registry = ::sirius::converter_registry::get();
@@ -322,11 +325,6 @@ void scan_operator_input::prepare_for_processing(
           }
         }
       }
-    } else {
-      // Another converter (the memory prefetcher, say) may already have decoded this batch; its
-      // outcome binds this split all the same.
-      auto ro = batch->to_read_only();
-      record_decode_outcome(ro.get_data());
     }
   }
 
