@@ -390,6 +390,12 @@ struct sirius_config {
   /// the override takes effect. Called from @ref finalize_derived_config.
   void enforce_native_backend_for_multi_gpu();
 
+  /// Re-default @c _scan_manager_config.uring.n_max_concurrent_scans to the
+  /// configured pipeline pool size (one outstanding scan per pipeline thread).
+  /// Called from @ref finalize_derived_config; an explicit config value, 0
+  /// included, is left alone.
+  void derive_uring_scan_budget();
+
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
   /// latency-bound, so the readahead needs several splits in flight per pipeline

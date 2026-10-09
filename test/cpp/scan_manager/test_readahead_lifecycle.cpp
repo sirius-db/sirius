@@ -73,10 +73,8 @@ constexpr auto PIPELINE_THREADS =
 
 TEST_CASE("each backend publishes its own default scan budget", "[scan_manager][readahead]")
 {
-  // The local (uring) backend defaults to 0 (readahead off): on local NVMe a
-  // prefetch only reorders the executor's own reads against the same device.
-  // That is Sirius's default (scan_manager_config), not cuCascade's struct
-  // default, which is the pipeline width.
+  // The local (uring) struct default is 0; like REST, sirius_config re-defaults
+  // it at load time (to the pipeline width) unless the config sets it.
   CHECK(scan_manager_config{}.uring.n_max_concurrent_scans == 0);
   CHECK_FALSE(scan_manager_config{}.uring.n_max_concurrent_scans_explicit);
   // cuCascade's rest::config struct default; sirius_config rescales it to the configured
@@ -703,8 +701,9 @@ TEST_CASE("the kvikIO backend builds no readahead however the cache is configure
   cfg.backend                 = sirius::scan_manager::io_backend::kvikio;
   cfg.cache.mode              = cache_mode::cucs;
   cfg.pipeline_width          = PIPELINE_THREADS;
-  // Local readahead is off by default now; opt it back in so this test still
-  // proves kvikIO is dropped despite a sibling backend carrying positive depth.
+  // A bare scan_manager_config skips sirius_config's derivation (uring stays 0);
+  // set the budget so this test still proves kvikIO is dropped despite a
+  // sibling backend carrying positive depth.
   cfg.uring.n_max_concurrent_scans = PIPELINE_THREADS;
   cfg.apply_cache_mode();
   REQUIRE(cfg.uring.n_max_concurrent_scans > 0);

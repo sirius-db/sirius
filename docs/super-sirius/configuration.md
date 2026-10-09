@@ -1,4 +1,4 @@
-# Configuration
+#Configuration
 
 This document covers Super Sirius configuration: the `sirius_config` class, operator parameters, thread pool settings, and DuckDB SET variables.
 
@@ -217,8 +217,10 @@ members retain their surface defaults before the pair is validated.
 
 > **Mutually exclusive with configured `sirius.memory` sub-blocks.** `sirius.space` is a low-level
 > alternative that declares individual memory spaces directly, bypassing the high-level
-> `sirius.memory` configurator. If any `sirius.space.{gpu,host,disk}` list is non-empty, the
-> configuration loader rejects a simultaneous non-null `sirius.memory.{gpu,host,disk}` sub-block
+> `sirius.memory` configurator. If any `sirius.space.{
+  gpu, host, disk}` list is non-empty, the
+> configuration loader rejects a simultaneous non-null `sirius.memory.{
+  gpu, host, disk}` sub-block
 > instead of silently ignoring it. A null memory sub-block is absent; a non-null mapping selects
 > the high-level path even when the mapping is empty or its individual values are null. Empty
 > `sirius.space` lists do not select the low-level path. This path is generally reserved for
@@ -264,7 +266,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 
 ```yaml
 sirius:
-  # NOTE: do NOT also configure sirius.memory — the loader rejects both paths together.
+#NOTE : do NOT also configure sirius.memory — the loader rejects both paths together.
   space:
     gpu:
       - { device_id: 0, memory_capacity: 40Gi, reservation_limit_fraction: 0.9 }
@@ -373,7 +375,7 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `n_max_concurrent_scans` | int | 0 | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). `0` (Sirius's default, and cuCascade's) keeps the readahead off for local reads, since a local NVMe read competes with the executor's own reads rather than hiding a round trip. An explicit `max_readahead_scans` overrides it. |
+| `n_max_concurrent_scans` | int | `pipeline.num_threads` | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). When omitted, Sirius sets it to the pipeline pool size: one outstanding scan per pipeline thread, half the REST default's depth, since local disk has no round trip to hide. `0` keeps the readahead off for local reads (cuCascade's own default). An explicit `max_readahead_scans` overrides it. |
 | `slices_per_pass` | int (**0..64**) | 8 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. A reactor works through one request at a time, in queue order; the default `8` keeps a single many-slice request (a whole-split prefetch, a wide demand read) deep — up to 8 slices per pass, bounded by the reactor's free staging slots — without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds such a request to a depth of 1-2 per reactor. |
 | `range_batch_slices` | int (**>= 0**) | 8 | Most slices one queue entry holds when a host-only multi-range read (a whole-split prefetch, the DuckDB-native decoder's column-chunk set) is dispatched to the uring reactors: a local read does not prefer bulk I/O, so the read is queued as several entries of at most this many slices instead of one per reactor. Reads with a device destination are never split. `0` = no split. |
 

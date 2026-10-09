@@ -418,14 +418,15 @@ TEST_CASE("apply_defaults derives the readahead budgets like the file path does"
   auto const& scan_manager = cfg.get_scan_manager_config();
 
   // Having no sirius.yaml must size the readahead exactly like an empty one.
-  // The local (uring) backend defaults to 0 (readahead off); the rest backend
+  // The local (uring) backend defaults to the pipeline width; the rest backend
   // defaults to max(8, 2x the pipeline width).
   CHECK(scan_manager.pipeline_width == pipeline_threads);
-  CHECK(scan_manager.uring.n_max_concurrent_scans == 0);
+  CHECK(scan_manager.uring.n_max_concurrent_scans == pipeline_threads);
+  CHECK_FALSE(scan_manager.uring.n_max_concurrent_scans_explicit);
   CHECK(scan_manager.rest.n_max_concurrent_scans == std::max<std::size_t>(8, 2 * pipeline_threads));
 }
 
-TEST_CASE("uring scan budget defaults off and honors an explicit value",
+TEST_CASE("uring scan budget defaults to the pipeline width and honors an explicit value",
           "[scan_manager][config][readahead]")
 {
   constexpr std::size_t pipeline_width = 7;
@@ -450,18 +451,17 @@ TEST_CASE("uring scan budget defaults off and honors an explicit value",
     return text;
   };
 
-  // Omitted: the local backend is off by default and is NOT scaled to the
-  // pipeline width any more.
+  // Omitted: one outstanding scan per pipeline thread.
   auto const omitted = load_scan_manager("sirius_uring_budget_omitted.yaml", yaml(std::nullopt));
   CHECK_FALSE(omitted.uring.n_max_concurrent_scans_explicit);
-  CHECK(omitted.uring.n_max_concurrent_scans == 0);
+  CHECK(omitted.uring.n_max_concurrent_scans == pipeline_width);
 
-  // An explicit 0 is still recorded as explicit (== the struct default).
+  // An explicit 0 is recorded as explicit and keeps the local readahead off.
   auto const explicit_zero = load_scan_manager("sirius_uring_budget_explicit_zero.yaml", yaml(0));
   CHECK(explicit_zero.uring.n_max_concurrent_scans_explicit);
   CHECK(explicit_zero.uring.n_max_concurrent_scans == 0);
 
-  // An explicit positive value opts the local path back in and wins.
+  // An explicit positive value wins over the pipeline width.
   auto const explicit_other =
     load_scan_manager("sirius_uring_budget_explicit_other.yaml", yaml(other_explicit));
   CHECK(explicit_other.uring.n_max_concurrent_scans_explicit);
@@ -569,7 +569,7 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
   CHECK(io.kvikio.task_size == std::optional<std::size_t>{std::size_t{8} << 20});
   CHECK(io.rest.max_connections == 17);
   CHECK(io.cache.eviction == eviction_policy::idle);
-  // Sirius's uring default (readahead off) reaches cuCascade unchanged.
+  // The struct's uring budget (0, before sirius_config derives one) reaches cuCascade unchanged.
   CHECK(io.uring.n_max_concurrent_scans == 0);
   CHECK_FALSE(io.uring.n_max_concurrent_scans_explicit);
   CHECK(io.rest.n_max_concurrent_scans == cfg.rest.n_max_concurrent_scans);
@@ -673,20 +673,23 @@ TEST_CASE("sirius_config forces the native backend for multi-GPU",
 
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
 {
-  auto const check_defaults = [&](scan_manager_config const& cfg) {
+  auto const check_defaults = [&](scan_manager_config const& cfg, std::size_t uring_budget) {
     CHECK(cfg.uring_n_reactors == 4);
     CHECK(cfg.rest_n_reactors == 2);
-    CHECK(cfg.uring.n_max_concurrent_scans == 0);
+    CHECK(cfg.uring.n_max_concurrent_scans == uring_budget);
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
     CHECK(cfg.uring.slices_per_pass == 8);
     CHECK(cfg.uring.range_batch_slices == 8);
   };
 
-  SECTION("default-constructed") { check_defaults(scan_manager_config{}); }
+  // The struct default is 0; sirius_config derives the pipeline width on load.
+  SECTION("default-constructed") { check_defaults(scan_manager_config{}, 0); }
 
   SECTION("empty uring block")
   {
-    check_defaults(load_scan_manager("sirius_uring_empty_block.yaml", uring_yaml("        {}\n")));
+    auto const cfg = load_scan_manager("sirius_uring_empty_block.yaml", uring_yaml("        {}\n"));
+    check_defaults(cfg, cfg.pipeline_width);
+    CHECK(cfg.pipeline_width > 0);
   }
 }
 

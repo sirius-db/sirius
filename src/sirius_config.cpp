@@ -981,16 +981,37 @@ try {
 
 void sirius_config::finalize_derived_config()
 {
-  // The uring (local-disk) readahead budget is NOT derived from the pipeline
-  // width: the local backend defaults to 0 (readahead off), because on local
-  // NVMe the prefetch competes with the executor's own reads for the same
-  // device.  An explicit uring.n_max_concurrent_scans in the config still wins.
   // The opportunistic strategy schedules against what the executor can run,
   // not what the device can queue, so it needs the pipeline pool's width.
   _scan_manager_config.pipeline_width =
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
+  derive_uring_scan_budget();
   derive_rest_scan_budget();
   enforce_native_backend_for_multi_gpu();
+}
+
+void sirius_config::derive_uring_scan_budget()
+{
+  // Local disk has no round trip to hide, so one outstanding scan per pipeline
+  // thread is enough lead: the readahead keeps the next split of every thread
+  // in flight.  Each reactor's priority tiers keep the executor's own reads
+  // ahead of that readahead on the shared device.
+  //
+  // Only the untouched default is replaced, so an explicit
+  // uring.n_max_concurrent_scans in the config (0, readahead off, included)
+  // still wins.
+  if (_scan_manager_config.uring.n_max_concurrent_scans_explicit) { return; }
+
+  auto const derived =
+    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
+  if (derived == _scan_manager_config.uring.n_max_concurrent_scans) { return; }
+
+  SIRIUS_LOG_INFO(
+    "sirius_config: uring.n_max_concurrent_scans defaulted to the configured pipeline pool size "
+    "= {}, replacing the built-in default of {}",
+    derived,
+    _scan_manager_config.uring.n_max_concurrent_scans);
+  _scan_manager_config.uring.n_max_concurrent_scans = derived;
 }
 
 void sirius_config::derive_rest_scan_budget()
@@ -1000,7 +1021,8 @@ void sirius_config::derive_rest_scan_budget()
   // per pipeline thread the readahead has no lead — every split a thread picks
   // up is the split whose prefetch only just started, so the read blocks on it.
   // Several splits per thread give the prefetch time to land.  Local disk has no
-  // such round trip to hide, so uring stays at one per thread.
+  // such round trip to hide, so uring stays at one per thread
+  // (derive_uring_scan_budget).
   //
   // Only the untouched default is replaced, so an explicit
   // rest.n_max_concurrent_scans in the config still wins.  The derived budget is
