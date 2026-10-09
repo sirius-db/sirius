@@ -61,6 +61,8 @@ class query_lifecycle_registry {
     query_lifecycle_state state{query_lifecycle_state::open};
     std::size_t submissions{0};
     std::size_t work{0};
+    // Opaque ownership only: never cast or dereference this pointer. Converting from
+    // shared_ptr<T> preserves the original control block and deleter for correct destruction.
     std::shared_ptr<void> resources;
   };
 
@@ -90,7 +92,7 @@ class query_lifecycle_registry {
     void reset() noexcept
     {
       if (auto control = std::exchange(control_, nullptr)) {
-        bool notify;
+        bool notify = false;
         {
           std::lock_guard lock(control->mutex);
           --control->work;
@@ -154,7 +156,7 @@ class query_lifecycle_registry {
     void finish() noexcept
     {
       if (auto control = std::exchange(control_, nullptr)) {
-        bool notify;
+        bool notify = false;
         {
           std::lock_guard lock(control->mutex);
           // Both counts belong to this control block. Release them together, so a publisher
@@ -270,8 +272,10 @@ class query_lifecycle_registry {
 
   /// Keep the execution's plan alive independently of its front-end engine. Registration
   /// precedes publication; an unknown ID is a missing registration, not a standalone mode.
+  /// Requires a non-null owner; queries without resources should omit this call.
   void retain_resources(query_id_t query_id, std::shared_ptr<void> resources)
   {
+    if (!resources) { throw std::invalid_argument("query resources require a non-null owner"); }
     auto control = find(query_id);
     if (!control) { throw std::logic_error("query resources require lifecycle registration"); }
     std::lock_guard lock(control->mutex);
@@ -352,6 +356,8 @@ class query_lifecycle_registry {
 
   /// Runtime teardown only, after producers and workers have stopped. Close every gate before
   /// checking counts, including controls already obtained by callers racing a registry lookup.
+  /// If any query is not idle, throw with every gate quiescing and all entries/resources retained.
+  /// This is an incomplete teardown: settle outstanding users before retrying, never reopen gates.
   void clear()
   {
     decltype(queries_) retired;

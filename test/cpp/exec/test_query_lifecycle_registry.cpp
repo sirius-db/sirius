@@ -393,17 +393,36 @@ TEST_CASE("lifecycle waits require a closed gate and clear preserves live accoun
           "[query_lifecycle_gate][concurrency]")
 {
   query_lifecycle_registry registry;
-  const auto q = make_query_id(1);
+  const auto idle = make_query_id(0);
+  const auto q    = make_query_id(1);
+  // The first entry passes the idle check; a later busy entry must prevent retirement of both.
+  registry.open_query(idle);
   registry.open_query(q);
+  auto idle_owner                  = std::make_shared<int>(1);
+  auto busy_owner                  = std::make_shared<int>(2);
+  std::weak_ptr<int> idle_resource = idle_owner;
+  std::weak_ptr<int> busy_resource = busy_owner;
+  registry.retain_resources(idle, idle_owner);
+  registry.retain_resources(q, busy_owner);
+  idle_owner.reset();
+  busy_owner.reset();
   REQUIRE_THROWS_AS(registry.wait_for_submissions(q), std::logic_error);
   REQUIRE_THROWS_AS(registry.wait_for_work(q), std::logic_error);
   auto lease = registry.try_acquire_work(q);
   REQUIRE_THROWS_AS(registry.clear(), std::logic_error);
-  REQUIRE(registry.size() == 1);
+  REQUIRE(registry.size() == 2);
+  REQUIRE_FALSE(registry.accepts_work(idle));
   REQUIRE_FALSE(registry.accepts_work(q));
+  CHECK_FALSE(idle_resource.expired());
+  CHECK_FALSE(busy_resource.expired());
+  CHECK(registry.activity(q).work == 1);
+  CHECK_FALSE(registry.try_begin_submission(idle));
+  CHECK_FALSE(registry.try_begin_submission(q));
   lease.reset();
   REQUIRE_NOTHROW(registry.clear());
   REQUIRE(registry.size() == 0);
+  CHECK(idle_resource.expired());
+  CHECK(busy_resource.expired());
   REQUIRE_NOTHROW(registry.wait_for_submissions(q));
   REQUIRE_NOTHROW(registry.wait_for_work(q));
 }
@@ -515,4 +534,22 @@ TEST_CASE("retaining query resources requires registration", "[query_lifecycle_g
   REQUIRE_THROWS_AS(registry.retain_resources(sirius::make_query_id(42), owner), std::logic_error);
   REQUIRE(registry.size() == 0);
   REQUIRE(owner.use_count() == 1);
+}
+
+TEST_CASE("retaining null resources fails without consuming registration", "[query_lifecycle_gate]")
+{
+  query_lifecycle_registry registry;
+  const auto q = make_query_id(42);
+  registry.open_query(q);
+  REQUIRE_THROWS_AS(registry.retain_resources(q, {}), std::invalid_argument);
+  REQUIRE(registry.size() == 1);
+  REQUIRE(registry.accepts_work(q));
+
+  auto owner = std::make_shared<int>(42);
+  REQUIRE_NOTHROW(registry.retain_resources(q, owner));
+  REQUIRE(owner.use_count() == 2);
+  registry.quiesce(q);
+  registry.release_resources(q);
+  REQUIRE(owner.use_count() == 1);
+  registry.close(q);
 }
