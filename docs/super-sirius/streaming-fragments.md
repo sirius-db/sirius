@@ -230,14 +230,24 @@ run():    ┌─ in_transaction ─ streaming_fragment::run() ──────
 - **One transaction at a time per `Context`.** Fragments share the connection, and a second
   `BEGIN` would fail and invalidate the open transaction. `in_transaction` holds the `Context`'s
   `conn_mutex`, so concurrent `build()`, `run()`, and `execute_substrait` calls wait for each other.
+- **Interrupt from any thread.** `Context::interrupt()`, or an `Interrupter` from
+  `Context::interrupter()` (which may outlive the `Context`), calls `Connection::Interrupt()`
+  without taking `conn_mutex`. The GPU executor sees the flag through the query's completion
+  handler, so the run stops within one task and throws DuckDB's `InterruptException`. A gate
+  shared with the handles is open only around the body of `run()` and `execute_substrait`, and
+  closing it clears the flag: an interrupt with no run in progress does nothing, and none can reach
+  the `COMMIT`/`ROLLBACK` that follows (a failed `ROLLBACK` would leave the connection's
+  transaction open, so every later `BEGIN` would fail). An interrupt that arrives just before the
+  gate opens is dropped. An embedder that must not lose one repeats it for as long as its own
+  bookkeeping, updated under the same lock, says the targeted run has not returned.
 
 ## Tests
 
 | File | Catch2 tags | Covers |
 |---|---|---|
 | `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` | Catalog verbs |
-| `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` | Spec errors; relay preconditions (FRAG-7); failed runs and single-use calls (FRAG-8); hash partitioning (FRAG-9), with INTEGER and BIGINT senders (FRAG-9b); out-of-order builds and runs (FRAG-10); a window between `build()` and `run()` (FRAG-11); `run()` guards (FRAG-12); runs from two threads (FRAG-13) |
-| `test/cpp/exec/test_sirius_ffi_embedder.cpp` | `[isolated_context][sirius_ffi]` | Public FFI with Substrait built in the test: leaf result, `relay_from` chain, builds before runs (one and two threads), `build()` and `run()` on different threads, drop after `build()`, a failed `build()`, a hash key on one output, concurrent `run()` and `execute_substrait` |
+| `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` | Spec errors; relay preconditions (FRAG-7); failed runs and single-use calls (FRAG-8); hash partitioning (FRAG-9), with INTEGER and BIGINT senders (FRAG-9b); out-of-order builds and runs (FRAG-10); a window between `build()` and `run()` (FRAG-11); `run()` guards (FRAG-12); runs from two threads (FRAG-13); an interrupt stopping a run that retries out-of-memory (FRAG-14) |
+| `test/cpp/exec/test_sirius_ffi_embedder.cpp` | `[isolated_context][sirius_ffi]` | Public FFI with Substrait built in the test: leaf result, `relay_from` chain, builds before runs (one and two threads), `build()` and `run()` on different threads, drop after `build()`, a failed `build()`, a hash key on one output, concurrent `run()` and `execute_substrait`, `interrupt()` while idle and during a run |
 | `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]` | Rollback of a `build()` that fails while resolving input types |
 
 `[isolated_context]` tests bring up their own `SiriusContext` and GPU pools; the listener in

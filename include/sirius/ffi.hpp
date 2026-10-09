@@ -48,6 +48,7 @@ namespace sirius::ffi {
 class DirectExchange;
 class Fragment;
 class OutputDrain;
+class Interrupter;
 
 /// RAII handle to a Sirius engine context.
 ///
@@ -110,6 +111,18 @@ class SIRIUS_FFI_EXPORT Context {
   /// Remove the pinned entry `name` and release its memory. Same threading
   /// contract as pin_table(). Returns a one-line summary; throws on failure.
   std::unique_ptr<std::string> unpin_table(const std::string& name);
+
+  /// Cancels the Fragment::run() or execute_substrait() in progress on this Context. Safe to
+  /// call from any thread while the run executes on another; it never waits for the run. The
+  /// run stops within one GPU task, including one retrying out-of-memory, and throws DuckDB's
+  /// interrupt error ("Interrupted!"); the query releases what it holds as on any failure, and
+  /// the Context stays usable. With no run in progress it does nothing: an interrupt never
+  /// carries over to a later run.
+  void interrupt() noexcept;
+
+  /// A handle that calls interrupt() from threads that cannot share the Context itself. It may
+  /// outlive the Context, after which it does nothing.
+  [[nodiscard]] std::unique_ptr<Interrupter> interrupter() const;
 
  private:
   struct Impl;
@@ -195,6 +208,28 @@ class SIRIUS_FFI_EXPORT OutputDrain {
   std::shared_ptr<sirius::exec::direct_exchange> exchange_;
 };
 
+/// Interrupts the [`Context`] it came from (see Context::interrupt()). Every method is safe to
+/// call from any thread, concurrently with the Context's own calls.
+class SIRIUS_FFI_EXPORT Interrupter {
+ public:
+  ~Interrupter();
+
+  Interrupter(const Interrupter&)            = delete;
+  Interrupter& operator=(const Interrupter&) = delete;
+
+  /// Same as Context::interrupt(); does nothing once the Context is destroyed.
+  void interrupt() const noexcept;
+
+  /// Shared with the Context; defined in the implementation.
+  struct Gate;
+
+ private:
+  explicit Interrupter(std::shared_ptr<Gate> gate);
+  std::shared_ptr<Gate> gate_;
+
+  friend class Context;
+};
+
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
 ///
 /// A fragment is either **intermediate** (declares output streams, rooted in a streaming sink)
@@ -207,7 +242,8 @@ class SIRIUS_FFI_EXPORT OutputDrain {
 /// Any number of fragments may be built before any runs; run them in any order where each
 /// source runs before its receiver's relay_from. build(), run() and Context::execute_substrait
 /// execute one at a time per Context: a concurrent call waits for the one in progress. run() and
-/// destruction may happen on a thread other than build()'s.
+/// destruction may happen on a thread other than build()'s. Context::interrupt() cancels a run
+/// from another thread.
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
@@ -334,7 +370,7 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// (relay_from and close_input close their sender). Runs once; after a failure, build a new
   /// fragment.
   /// @throws before build(), while an input is open (the fragment stays runnable), on a second
-  /// call, or on execution failure.
+  /// call, or on execution failure, including Context::interrupt().
   void run();
 
   /// Write this result fragment's rows into the caller-owned ArrowArrayStream at

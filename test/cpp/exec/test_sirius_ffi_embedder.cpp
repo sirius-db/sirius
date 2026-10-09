@@ -34,7 +34,9 @@
 #include <substrait/plan.pb.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -588,4 +590,72 @@ TEST_CASE("FFI copies a key column out of parked and received batches without ta
                     Catch::Matchers::ContainsSubstring("no sealed batch"));
   exchange->release(remote);
   CHECK(exchange->outstanding() == 0);
+}
+
+TEST_CASE("FFI interrupt() between runs does nothing, and an Interrupter may outlive its Context",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_interrupt_idle");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+  auto const plan = local_files_plan(path);
+
+  auto ctx         = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto interrupter = ctx->interrupter();
+  std::thread([&] {
+    interrupter->interrupt();
+    ctx->interrupt();
+  }).join();
+
+  auto fragment = sirius::ffi::make_fragment(*ctx);
+  fragment->build(plan);
+  fragment->run();
+  REQUIRE(result_i64s(*fragment) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+
+  ctx.reset();
+  interrupter->interrupt();
+}
+
+TEST_CASE("FFI interrupt() from another thread cancels a run, and the next run works",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_interrupt_run");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+  auto const plan = local_files_plan(path);
+
+  auto ctx         = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto interrupter = ctx->interrupter();
+  auto cancelled   = sirius::ffi::make_fragment(*ctx);
+  cancelled->build(plan);
+
+  // Interrupt continuously, so the run is cancelled wherever it is. Interrupts keep arriving
+  // during the rollback after it, which must still complete for the next run to begin.
+  std::atomic<bool> stop{false};
+  std::thread interrupting([&] {
+    while (!stop.load()) {
+      interrupter->interrupt();
+      std::this_thread::yield();
+    }
+  });
+  std::exception_ptr run_error;
+  try {
+    cancelled->run();
+  } catch (...) {
+    run_error = std::current_exception();
+  }
+  stop = true;
+  interrupting.join();
+  REQUIRE(run_error);
+  REQUIRE_THROWS_WITH(std::rethrow_exception(run_error),
+                      Catch::Matchers::ContainsSubstring("Interrupted"));
+
+  auto next = sirius::ffi::make_fragment(*ctx);
+  next->build(plan);
+  next->run();
+  REQUIRE(result_i64s(*next) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+
+  ArrowArrayStream stream{};
+  ctx->execute_substrait(plan, reinterpret_cast<std::uintptr_t>(&stream));
+  REQUIRE(collect_i64_column(stream) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }
