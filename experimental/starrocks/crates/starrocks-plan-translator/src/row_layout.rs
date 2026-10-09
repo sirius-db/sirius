@@ -31,11 +31,27 @@ impl RowLayout {
     }
 
     pub(crate) fn resolve(&self, key: SlotKey) -> Result<usize> {
-        let mut matches = self
-            .0
-            .iter()
-            .enumerate()
-            .filter_map(|(index, binding)| (*binding == Some(key)).then_some(index));
+        // The BE finds a slot ref's column by slot id alone (`ColumnRef::evaluate_checked` ->
+        // `Chunk::get_column_by_slot_id`); the ref's tuple id is not consulted, and the FE does
+        // not keep it in step with the child's row tuples. Prefer an exact match, then fall back
+        // to the slot id.
+        let by = |exact: bool| {
+            self.0
+                .iter()
+                .enumerate()
+                .filter_map(move |(index, binding)| {
+                    binding
+                        .filter(|bound| {
+                            bound.slot_id == key.slot_id
+                                && (!exact || bound.tuple_id == key.tuple_id)
+                        })
+                        .map(|_| index)
+                })
+                .collect::<Vec<_>>()
+        };
+        let exact = by(true);
+        let found = if exact.is_empty() { by(false) } else { exact };
+        let mut matches = found.into_iter();
         match (matches.next(), matches.next()) {
             (Some(index), None) => Ok(index),
             (None, _) => Err(TranslateError::descriptor(format!(
@@ -106,6 +122,24 @@ mod tests {
         assert_eq!(selected.resolve(left_key).unwrap(), 1);
         assert!(joined.select(&[-1]).is_err());
         assert!(joined.select(&[4]).is_err());
+    }
+
+    #[test]
+    fn a_slot_ref_naming_another_tuple_resolves_by_slot_id() {
+        // The FE can name a tuple the row doesn't carry; the BE looks the slot id up alone.
+        let layout = RowLayout::new([Some(SlotKey::new(9, 2)), Some(SlotKey::new(9, 9))]);
+        assert_eq!(layout.resolve(SlotKey::new(8, 2)).unwrap(), 0);
+        assert_eq!(layout.resolve(SlotKey::new(8, 9)).unwrap(), 1);
+        // An exact match wins over another tuple's slot with the same id.
+        let both = RowLayout::new([Some(SlotKey::new(0, 1)), Some(SlotKey::new(1, 1))]);
+        assert_eq!(both.resolve(SlotKey::new(1, 1)).unwrap(), 1);
+        assert!(
+            both.resolve(SlotKey::new(2, 1))
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert!(layout.resolve(SlotKey::new(8, 3)).is_err());
     }
 
     #[test]
