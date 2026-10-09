@@ -1,0 +1,8 @@
+@INCLUDE              = docs/api/Doxyfile
+PROJECT_BRIEF         = "GPU-native analytics · C API reference"
+OUTPUT_DIRECTORY      = build/docs/c
+INPUT                 = include/sirius/c docs/c/index.md
+EXCLUDE               =
+USE_MDFILE_AS_MAINPAGE = docs/c/index.md
+OPTIMIZE_OUTPUT_FOR_C = YES
+PREDEFINED            = SIRIUS_EXPORT= SIRIUS_C_NOEXCEPT= "__attribute__(x)="

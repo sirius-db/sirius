@@ -240,6 +240,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_INSTALLED_DIR="$PWD/build/vcpkg-release/vcpkg_installed" -DVCPKG_MANIFEST_INSTALL=OFF
           pixi run --locked -e vcpkg cmake --build build/static-consumer
+          pixi run --locked -e vcpkg python test/cmake/installed_consumer/run_tests.py build/static-consumer
           readelf -d build/static-consumer/consumer > build/static-consumer/dynamic.txt
           while read -r library; do
             case "$library" in
