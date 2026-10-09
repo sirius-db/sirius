@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/execution/physical_operator.hpp"
+#include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -27,7 +28,10 @@
 #include "sirius_config.hpp"
 
 #include <atomic>
+#include <cstdint>
+#include <mutex>
 #include <optional>
+#include <string_view>
 
 namespace duckdb {
 class SiriusContext;
@@ -143,14 +147,75 @@ class sirius_physical_partition : public sirius_physical_operator {
     const op::input_stats& stats) const override;
 
  protected:
+  /**
+   * @brief Closes accumulated input and releases retired storage after build tasks drain, then
+   * reports the size estimate.
+   */
   void on_finalize_operator() override;
 
+  /**
+   * @brief Records each batch pushed into the build side's FULL `default` port in the arrival
+   * ledger, when the downstream join accumulates dynamic filters.
+   *
+   * @throw std::logic_error if a batch arrives after the ledger was certified
+   */
+  void on_input_batch_pushed(std::string_view port_id, cucascade::data_batch& batch) override;
+
  private:
+  /**
+   * @brief The downstream join if this is the build side of a non-broadcast HASH partition with
+   * more than one partition and the join accumulates dynamic filters; otherwise null.
+   */
+  [[nodiscard]] sirius_physical_hash_join* accumulated_filter_join() const noexcept;
+
+  /**
+   * @brief Decides once, before the first batch leaves the input repository, whether the join
+   * accumulates a filter from this input.
+   *
+   * Certifies the arrival ledger only for a closed input: exactly one data-bearing port, named
+   * `default`, with one repository partition, a FULL barrier, and a finished source pipeline. Every
+   * other input declines.
+   *
+   * @return false iff the source pipeline has not finished yet, so no batch may be popped
+   */
+  [[nodiscard]] bool decide_accumulation();
+
+  /**
+   * @brief Contributes a HASH build task's input batch to @p join's accumulated Bloom filter, from
+   * `execute` before the batch is scattered.
+   *
+   * An input that is not exactly one batch with one original ID, or that carries a
+   * late-materialization directive, ends the accumulation instead.
+   *
+   * @param join The join whose accumulation started
+   * @param input The task's input
+   * @param batch The read accessor of the input's one batch
+   * @param stream The task's stream
+   * @return The original ID that `execute` publishes with after scatter, or no value if the input
+   * declined
+   */
+  [[nodiscard]] std::optional<std::uint64_t> contribute_to_accumulated_filter(
+    sirius_physical_hash_join& join,
+    pipelineable_operator_data const& input,
+    cucascade::read_only_data_batch const& batch,
+    ::cuda::stream_ref stream);
+
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 
-  /// Sum the bytes of all batches waiting on this partition's input port. Fed to the downstream
-  /// consumer's get_partition_strategy, which turns it into a partition count.
-  uint64_t compute_total_bytes();
+  /// Bytes and rows of the batches waiting on this partition's input port.
+  struct input_totals {
+    uint64_t bytes = 0;
+    uint64_t rows  = 0;
+  };
+
+  /// Sum the bytes and rows of all batches waiting on this partition's input port. Fed to the
+  /// downstream consumer's get_partition_strategy, which turns them into a partition count. Rows
+  /// come from batch metadata; a batch whose representation records none is counted at the
+  /// bytes-per-row of the batches that do.
+  input_totals compute_input_totals();
+
+  /// `compute_input_totals().bytes`.
+  uint64_t compute_total_bytes() { return compute_input_totals().bytes; }
 
   /// Return a latched projected total, scaled and floored at bytes already received.
   /// Returns nullopt when estimation is disabled or unavailable.
@@ -193,6 +258,18 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// Non-owning context providing narrow-passthrough events. The registered-state shared_ptr owns
   /// the context for at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer = nullptr;
+  /// Ledger of build-side arrivals, for the join to certify its dynamic filter accumulation. Only
+  /// used when the join accumulates a filter from this input, which is only true for
+  /// non-broadcast HASH joins with more than one partition. See decide_accumulation().
+  build_arrival_ledger _arrival_ledger;
+  /// Serializes decide_accumulation().
+  std::mutex _accumulation_mutex;
+  /// Whether decide_accumulation() has already been called. Guarded by `_accumulation_mutex`.
+  bool _accumulation_decided = false;
+  /// The join whose accumulation `decide_accumulation` started, or null: tasks skip the publication
+  /// session entirely without one.
+  std::atomic<sirius_physical_hash_join*> _accumulating_join{nullptr};
+
   /// Enabled only for grouped-aggregation partitions.
   bool _enable_size_estimation{false};
   /// Raw projection, latched so the task hint and sizing decision agree. Guarded by `lock`.

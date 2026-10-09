@@ -21,7 +21,9 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DUCKDB="$PROJECT_DIR/build/release/duckdb"
+DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
+SIRIUS_EXTENSION="${SIRIUS_EXTENSION_PATH:-$PROJECT_DIR/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension}"
+DUCKDB_ARGS=(-unsigned -bail -cmd "LOAD '${SIRIUS_EXTENSION//\'/\'\'}';")
 QUERY_DIR="$SCRIPT_DIR/queries"
 
 # --- Parse arguments ---
@@ -177,7 +179,7 @@ for q in "${QUERIES[@]}"; do
     Q_LOG="$OUTPUT_DIR/log_q${q}.txt"
 
     # Run in a fresh DuckDB process (no database file needed — views read parquet)
-    OUTPUT=$("$DUCKDB" < "$TEMP_SQL" 2>&1) || true
+    OUTPUT=$("$DUCKDB" "${DUCKDB_ARGS[@]}" < "$TEMP_SQL" 2>&1) || true
 
     echo "$OUTPUT" > "$Q_LOG"
     rm -f "$TEMP_SQL"

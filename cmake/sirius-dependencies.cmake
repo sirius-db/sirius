@@ -53,11 +53,11 @@ endif()
 # --- cuCollections (cuco) --- #
 
 # libcudf no longer ships its bundled copy. In the vcpkg build cuco comes from
-# the overlay port (vcpkg_ports/cuco); configure-time downloads are disabled
-# there. Otherwise (pixi build) fetch the same commit cudf is built against
-# (populate sources without add_subdirectory; CCCL comes from cudf). Either way
-# cuco is header-only and exposed as the cuco::cuco target, so both paths
-# consume it identically below.
+# the overlay port (sirius-duckdb/vcpkg_ports/cuco); configure-time downloads
+# are disabled there. Otherwise (pixi build) fetch the same commit cudf is built
+# against (populate sources without add_subdirectory; CCCL comes from cudf).
+# Either way cuco is header-only and exposed as the cuco::cuco target, so both
+# paths consume it identically below.
 if(VCPKG_BUILD)
   find_package(cuco CONFIG REQUIRED)
 else()
@@ -99,6 +99,12 @@ if(BUILD_WITH_CTRACK)
 
 endif()
 
+if(VCPKG_BUILD)
+  set(_sirius_pkg_config_path "$ENV{PKG_CONFIG_PATH}")
+  set(ENV{PKG_CONFIG_PATH}
+      "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/pkgconfig:${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/pkgconfig:$ENV{PKG_CONFIG_PATH}"
+  )
+endif()
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 if(VCPKG_BUILD)
@@ -108,6 +114,10 @@ if(VCPKG_BUILD)
 else()
   pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
   set(SIRIUS_CURL_TARGET PkgConfig::CURL)
+endif()
+
+if(VCPKG_BUILD)
+  set(ENV{PKG_CONFIG_PATH} "${_sirius_pkg_config_path}")
 endif()
 
 # Scope dependency options without changing the caller's cache.
@@ -121,6 +131,10 @@ set(CUCASCADE_WARNINGS_AS_ERRORS OFF)
 set(CUCASCADE_BUILD_IO OFF)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 endblock()
+# cuCascade has no C++ modules; scanning breaks older compiler caches.
+set_target_properties(
+  cucascade_objects cucascade_cudf_objects cucascade_topology_discovery_objects
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF)
 foreach(target cucascade_objects cucascade_cudf_objects)
   target_compile_definitions(${target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN)
 endforeach()
@@ -155,17 +169,3 @@ endif()
 add_subdirectory(rust/crates/telemetry/bridge)
 
 find_package(kvikio REQUIRED CONFIG)
-
-# The legacy DuckDB parent enables only C/CXX.
-if(NOT PROJECT_IS_TOP_LEVEL)
-  if(TARGET BS::thread_pool)
-    get_target_property(_bs_thread_pool_features BS::thread_pool
-                        INTERFACE_COMPILE_FEATURES)
-    if(_bs_thread_pool_features)
-      list(REMOVE_ITEM _bs_thread_pool_features cuda_std_17)
-      set_target_properties(
-        BS::thread_pool PROPERTIES INTERFACE_COMPILE_FEATURES
-                                   "${_bs_thread_pool_features}")
-    endif()
-  endif()
-endif()

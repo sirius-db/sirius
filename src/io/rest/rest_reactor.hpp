@@ -122,19 +122,45 @@ struct head_object_result {
 /**
  * @brief Concrete @c io_object backed by a RESTful object-store key.
  *
- * Passive bag of identity: the original URL/path (also the cache id), the
- * bucket + key the reactor authorizes against, and the object size discovered
- * by a one-time HEAD at construction.  Does no I/O of its own.
+ * Passive bag of identity: the original URL/path, the bucket + key the reactor
+ * authorizes against, the object size discovered by a one-time HEAD or suffix
+ * probe at construction, and the ETag that response carried.  Does no I/O of
+ * its own.
  */
 class rest_io_object : public io_object {
  public:
+  /// The cache id of an open with a strong validator.  Public so a caller that
+  /// knows a path and tag can derive the key without opening the object.
+  [[nodiscard]] static std::string generation_key(std::string_view path,
+                                                  std::string_view strong_tag)
+  {
+    std::string key;
+    key.reserve(path.size() + 1 + strong_tag.size());
+    key.append(path).push_back('\x1f');
+    key.append(strong_tag);
+    return key;
+  }
+
+  /// True iff @p etag is one strong entity-tag as RFC 7232 §2.3 defines it:
+  /// `"` etagc* `"`, with etagc = %x21 / %x23-7E / obs-text.  Rejects the weak
+  /// form, `*`, lists, unquoted tokens and anything with control characters.
+  [[nodiscard]] static bool is_strong_tag(std::string_view etag) noexcept
+  {
+    if (etag.size() < 2 || etag.front() != '"' || etag.back() != '"') { return false; }
+    for (unsigned char const c : etag.substr(1, etag.size() - 2)) {
+      if (c == '"' || c < 0x21 || c == 0x7F) { return false; }
+    }
+    return true;
+  }
+
   rest_io_object(
     std::string path, std::string bucket, std::string key, size_t size, std::string etag = {})
     : _path(std::move(path)),
       _bucket(std::move(bucket)),
       _key(std::move(key)),
       _file_size(size),
-      _etag(std::move(etag))
+      _etag(std::move(etag)),
+      _cache_id(make_cache_id(_path, _etag))
   {
   }
 
@@ -154,11 +180,12 @@ class rest_io_object : public io_object {
       _file_size(object_size),
       _window_lo(window_lo),
       _stash(std::move(stash)),
-      _etag(std::move(etag))
+      _etag(std::move(etag)),
+      _cache_id(make_cache_id(_path, _etag))
   {
   }
 
-  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
+  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _cache_id; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
   [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
@@ -174,6 +201,13 @@ class rest_io_object : public io_object {
   [[nodiscard]] size_t stash_window_lo() const noexcept { return _window_lo; }
 
  private:
+  [[nodiscard]] static std::string make_cache_id(std::string const& path, std::string const& etag)
+  {
+    if (is_strong_tag(etag)) { return generation_key(path, etag); }
+    static std::atomic<std::uint64_t> next_open{0};
+    return generation_key(path, "open#" + std::to_string(next_open.fetch_add(1)));
+  }
+
   std::string _path;
   std::string _bucket;
   std::string _key;
@@ -181,6 +215,7 @@ class rest_io_object : public io_object {
   size_t _window_lo{0};
   shared_byte_span _stash;
   std::string _etag;
+  std::string _cache_id;
 };
 
 // ---------------------------------------------------------------------------

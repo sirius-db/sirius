@@ -25,7 +25,9 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/regex/regex_playground.hpp>
+#include <expression_evaluator/round_floating_point.hpp>
 #include <helper/logical_type.hpp>
+#include <helper/timestamp_semantics.hpp>
 #include <sirius/exception.hpp>
 
 // duckdb
@@ -40,6 +42,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
+#include <cudf/strings/case.hpp>
 #include <cudf/strings/combine.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/find.hpp>
@@ -295,11 +298,41 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   if (resolved_id == function_id::second) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::SECOND);
   }
-  if (resolved_id == function_id::millisecond) {
-    return execute_datetime_extract_func(cudf::datetime::datetime_component::MILLISECOND);
-  }
-  if (resolved_id == function_id::microsecond) {
-    return execute_datetime_extract_func(cudf::datetime::datetime_component::MICROSECOND);
+  if (resolved_id == function_id::millisecond || resolved_id == function_id::microsecond) {
+    D_ASSERT(args.size() == 1);
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    auto const extract = [&](cudf::datetime::datetime_component component) {
+      return cudf::datetime::extract_datetime_component(
+        input.get_column_view(), component, _stream, _mr);
+    };
+
+    // cuDF returns separate base-1000 components; DuckDB includes the seconds
+    // within the minute. In particular, MICROSECOND excludes whole milliseconds.
+    // cuDF's time-of-day decomposition also handles pre-epoch timestamps without
+    // a signed epoch remainder. Widen before arithmetic: 59999 does not fit INT16.
+    auto const output_type = cudf::data_type{cudf::type_id::INT64};
+    cudf::numeric_scalar<int64_t> thousand(1000, true, _stream, _mr);
+    auto seconds = extract(cudf::datetime::datetime_component::SECOND);
+    auto millis  = extract(cudf::datetime::datetime_component::MILLISECOND);
+    auto scaled  = cudf::binary_operation(
+      seconds->view(), thousand, cudf::binary_operator::MUL, output_type, _stream, _mr);
+    auto result = cudf::binary_operation(
+      scaled->view(), millis->view(), cudf::binary_operator::ADD, output_type, _stream, _mr);
+    if (resolved_id == function_id::microsecond) {
+      auto micros = extract(cudf::datetime::datetime_component::MICROSECOND);
+      scaled      = cudf::binary_operation(
+        result->view(), thousand, cudf::binary_operator::MUL, output_type, _stream, _mr);
+      result = cudf::binary_operation(
+        scaled->view(), micros->view(), cudf::binary_operator::ADD, output_type, _stream, _mr);
+    }
+    auto finite = temporal::finite_mask(input.get_column_view(), _stream, _mr);
+    cudf::numeric_scalar<int64_t> null_result(0, false, _stream, _mr);
+    result = cudf::copy_if_else(result->view(), null_result, finite->view(), _stream, _mr);
+    return evaluate_result(std::move(result));
   }
 
   //----------Date Truncation Function----------//
@@ -377,6 +410,34 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
 
   //----------Unary Functions----------//
+  // TODO: Handle scalar inputs to these column-only string functions when DuckDB
+  // cannot constant-fold them (e.g. when expression rewriting is disabled).
+  if (resolved_id == function_id::upper || resolved_id == function_id::lower) {
+    D_ASSERT(args.size() == 1);
+    auto input         = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto const strings = cudf::strings_column_view(input.get_column_view());
+    // Use cuDF's Unicode mappings, including multi-character expansions. These can
+    // differ from DuckDB's single-code-point mappings (e.g. upper('ß'), lower('İ')).
+    auto result_column = resolved_id == function_id::upper
+                           ? cudf::strings::to_upper(strings, _stream, _mr)
+                           : cudf::strings::to_lower(strings, _stream, _mr);
+    return evaluate_result(std::move(result_column));
+  }
+  if (resolved_id == function_id::round) {
+    // Planning admits FLOAT and DOUBLE inputs with an optional constant INTEGER precision.
+    D_ASSERT(args.size() == 1 || args.size() == 2);
+    int32_t precision = 0;
+    if (args.size() == 2) {
+      D_ASSERT(args[1]->holds<sirius::ast::constant>());
+      precision = std::get<int32_t>(args[1]->get<sirius::ast::constant>().payload);
+    }
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    return evaluate_result(round_floating_point(input.get_column_view(), precision, _stream, _mr));
+  }
   if (resolved_id == function_id::strlen) {
     D_ASSERT(args.size() == 1);
     auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);

@@ -47,7 +47,7 @@
 #include "cuda/scan/strings/fsst.cuh"
 #include "cuda/scan/unpack_value.cuh"
 
-#include <cub/cub.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cuda/cmath>
 #include <cuda/std/algorithm>
 

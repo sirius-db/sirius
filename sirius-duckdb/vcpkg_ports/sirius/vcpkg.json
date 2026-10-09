@@ -1,0 +1,44 @@
+{
+  "dependencies": [
+    "cudf",
+    "cuvs",
+    "raft",
+    "cuco",
+    "nvrtc",
+    "nixl",
+    "yaml-cpp",
+    "abseil",
+    "numactl",
+    "liburing",
+    "openssl",
+    "xxhash",
+    {
+      "features": [
+        "xxhsum"
+      ],
+      "host": true,
+      "name": "xxhash"
+    },
+    "roaring",
+    {
+      "features": [
+        "http2"
+      ],
+      "name": "curl"
+    },
+    {
+      "host": true,
+      "name": "vcpkg-cmake"
+    },
+    {
+      "host": true,
+      "name": "vcpkg-cmake-config"
+    }
+  ],
+  "description": "GPU-native SQL engine",
+  "homepage": "https://github.com/sirius-db/sirius",
+  "license": "Apache-2.0",
+  "name": "sirius",
+  "supports": "linux & (x64 | arm64)",
+  "version-string": "0.0.0"
+}

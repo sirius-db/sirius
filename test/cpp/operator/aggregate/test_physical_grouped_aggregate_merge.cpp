@@ -41,6 +41,49 @@ using namespace sirius::test::operator_utils;
 using sirius::test::vector_to_cudf_column;
 }  // namespace
 
+TEST_CASE("grouped merge sizing applies the row floor to its strategy and repository",
+          "[physical_grouped_aggregate_merge][partition_build][unit]")
+{
+  constexpr uint64_t kTiB = uint64_t{1} << 40;
+  uint64_t total_bytes    = 122ull << 30;
+  uint64_t total_rows     = 3'387'732'936ull;
+  int expected_count      = 4;
+
+  SECTION("large row count raises a one-partition byte estimate") {}
+  SECTION("one partition suffices at the row target")
+  {
+    total_rows     = uint64_t{1} << 30;
+    expected_count = 1;
+  }
+  SECTION("one row above the target requires a second partition")
+  {
+    total_rows     = (uint64_t{1} << 30) + 1;
+    expected_count = 2;
+  }
+  SECTION("a larger byte-based count is preserved")
+  {
+    total_bytes    = 6 * kTiB;
+    expected_count = 6;
+  }
+
+  // Sizing only: synthetic totals and an empty repository need no GPU data allocations.
+  sirius_physical_grouped_aggregate local({}, {}, {}, 0);
+  shared_data_repository repo;
+  sirius_physical_grouped_aggregate_merge merge(&local, kTiB);
+  merge.set_active_gpu_ids({0});
+  auto port  = std::make_unique<sirius_physical_operator::port>();
+  port->repo = &repo;
+  merge.add_port("default", std::move(port));
+
+  auto const strategy =
+    merge.get_partition_strategy({total_bytes, false, false, total_bytes, total_rows});
+  CHECK(strategy.num_partitions == expected_count);
+  CHECK(repo.num_partitions() == static_cast<std::size_t>(expected_count));
+  CHECK(strategy.placement.num_partitions() == static_cast<std::size_t>(expected_count));
+  CHECK_FALSE(strategy.broadcast);
+  CHECK_FALSE(strategy.build_probe);
+}
+
 // single batch expects to return the exact same data as the input batch, since it assumes it was
 // already aggregated
 TEST_CASE("sirius_physical_grouped_aggregate_merge grouped aggregates single data_batch",

@@ -4596,3 +4596,186 @@ fn bare_cross_join_translates_to_constant_key_join() {
         .collect();
     assert_eq!(operands, vec![2, 4]);
 }
+
+#[test]
+fn common_slot_cannot_replace_an_input_binding() {
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![0]);
+    project.project_node = Some(TProjectNode::new(
+        Some(BTreeMap::from([
+            (1, int_literal(7)),
+            (2, string_literal("x")),
+        ])),
+        Some(BTreeMap::from([(1, int_literal(99))])),
+    ));
+    let error = translate_fragment(&params(
+        Some(TPlan::new(vec![project, scan_node(0, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(error, TranslateError::Descriptor(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("common slot 1 (tuple 0) already exists")
+    );
+}
+
+#[test]
+fn slot_references_require_one_matching_input_column() {
+    let bigint = scalar_type(TPrimitiveType::BIGINT);
+    let missing = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![slot_ref(99, 0, bigint.clone())]),
+    ))
+    .unwrap_err();
+    assert!(missing.to_string().contains("not part of the row layout"));
+
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    let payload = join.hash_join_node.as_mut().unwrap();
+    payload.eq_join_conjuncts[0].left = slot_ref(1, 0, bigint.clone());
+    payload.eq_join_conjuncts[0].right = slot_ref(1, 0, bigint);
+    let ambiguous = translate_fragment(&params(
+        Some(TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        ambiguous
+            .to_string()
+            .contains("slot 1 (tuple 0) is ambiguous")
+    );
+}
+
+/// All slots are BIGINT; descriptor ids intentionally differ from expression order.
+fn reordered_aggregate_outputs() -> starrocks_plan_translator::TranslatedPlan {
+    let bigint = scalar_type(TPrimitiveType::BIGINT);
+    let reference = |id, tuple| slot_ref(id, tuple, bigint.clone());
+    let aggregate = aggregation_node(
+        1,
+        1,
+        vec![],
+        vec![
+            aggregate_expr("sum", bigint.clone(), Some(reference(1, 0))),
+            aggregate_expr("count", bigint.clone(), Some(reference(1, 0))),
+        ],
+    );
+    let mut sort = sort_node_with(-1, None);
+    sort.row_tuples = vec![2];
+    let payload = sort.sort_node.as_mut().unwrap();
+    payload.sort_info = TSortInfo::new(
+        vec![reference(9, 2)],
+        vec![true],
+        vec![false],
+        Some(vec![reference(4, 1), reference(8, 1)]),
+    );
+    payload.sort_tuple_slot_exprs = None;
+    let mut project = base_plan_node(3, TPlanNodeType::PROJECT_NODE, 1, vec![3]);
+    project.project_node = Some(TProjectNode::new(
+        Some(BTreeMap::from([
+            (15, reference(3, 2)),
+            (12, reference(9, 2)),
+        ])),
+        None,
+    ));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None), (2, None), (3, None)],
+        vec![
+            slot(1, 0, "value", bigint.clone()),
+            slot(2, 0, "other", bigint.clone()),
+            slot(8, 1, "total", bigint.clone()),
+            slot(4, 1, "count", bigint.clone()),
+            slot(9, 2, "count", bigint.clone()),
+            slot(3, 2, "total", bigint.clone()),
+            slot(15, 3, "total", bigint.clone()),
+            slot(12, 3, "count", bigint.clone()),
+        ],
+    );
+    translate_fragment(&params(
+        Some(TPlan::new(vec![project, sort, aggregate, scan_node(0, 0)])),
+        Some(desc),
+        Some(vec![
+            reference(12, 3),
+            reference(15, 3),
+            reference(12, 3),
+            arithmetic(TExprOpcode::ADD, reference(15, 3), reference(12, 3)),
+        ]),
+    ))
+    .unwrap()
+}
+
+#[test]
+fn same_type_aggregate_sort_and_project_outputs_keep_their_bindings() {
+    let translated = reordered_aggregate_outputs();
+    assert_eq!(
+        translated.output_names,
+        ["count", "total", "count_1", "expr_3"]
+    );
+    let output = as_project(root(&translated.plan).input.as_ref().unwrap());
+    assert_eq!(emit_mapping(output.common.as_ref()), [2, 3, 4, 5]);
+    assert_eq!(
+        output.expressions[..3]
+            .iter()
+            .map(struct_field)
+            .collect::<Vec<_>>(),
+        [1, 0, 1]
+    );
+    assert_eq!(
+        argument_field_indices(scalar_fn(&output.expressions[3])),
+        [0, 1]
+    );
+    let project = as_project(output.input.as_ref().unwrap());
+    assert_eq!(
+        project
+            .expressions
+            .iter()
+            .map(struct_field)
+            .collect::<Vec<_>>(),
+        [1, 0]
+    );
+    let rel::RelType::Sort(sort) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected sort");
+    };
+    assert_eq!(struct_field(sort.sorts[0].expr.as_ref().unwrap()), 0);
+    let materialized = as_project(sort.input.as_ref().unwrap());
+    assert_eq!(
+        materialized
+            .expressions
+            .iter()
+            .map(struct_field)
+            .collect::<Vec<_>>(),
+        [1, 0]
+    );
+}
+
+/// Requires Python with DuckDB and an installed Substrait extension; see tests/README.md.
+#[test]
+#[ignore = "requires DuckDB Python and its Substrait extension"]
+fn execute_same_type_aggregate_sort_and_project_outputs() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let translated = reordered_aggregate_outputs();
+    let mut child = Command::new(std::env::var_os("PYTHON").unwrap_or_else(|| "python3".into()))
+        .args(["-c", include_str!("execute_layout.py")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start Python execution test");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&translated.to_substrait_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

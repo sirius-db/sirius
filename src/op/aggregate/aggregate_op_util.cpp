@@ -225,7 +225,7 @@ class pinned_host_buffer {
 
 /// |v| as an unsigned 128-bit value. The caller holds v in 128 bits already widened from a 32 or
 /// 64-bit decimal, so negating the most negative 32/64-bit value (-2^31, -2^63) cannot overflow.
-unsigned __int128 magnitude(__int128 v) { return static_cast<unsigned __int128>(v < 0 ? -v : v); }
+__uint128_t magnitude(__int128_t v) { return static_cast<__uint128_t>(v < 0 ? -v : v); }
 
 }  // namespace
 
@@ -250,7 +250,7 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
     }
   }
   std::unordered_set<int> widen;
-  auto const num_rows = static_cast<unsigned __int128>(table.num_rows());
+  auto const num_rows = static_cast<__uint128_t>(table.num_rows());
   if (num_rows == 0 || candidates.empty()) { return widen; }
 
   // Per candidate, one 3 x int64 slot {min, max, is_valid}. The minmax scalars are copied into
@@ -292,7 +292,7 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
     std::memcpy(&is_valid, slot + 2, sizeof(bool));
     if (!is_valid) { continue; }  // no valid value: nothing to overflow
     // Widen to 128 bits before taking magnitudes (see magnitude()).
-    auto const read = [&](int64_t const* word) -> __int128 {
+    auto const read = [&](int64_t const* word) -> __int128_t {
       if (type_id == cudf::type_id::DECIMAL32) {
         int32_t v;
         std::memcpy(&v, word, sizeof(v));
@@ -304,8 +304,8 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
     };
     auto const max_abs = std::max(magnitude(read(slot)), magnitude(read(slot + 1)));
     auto const limit   = type_id == cudf::type_id::DECIMAL32
-                           ? static_cast<unsigned __int128>(std::numeric_limits<int32_t>::max())
-                           : static_cast<unsigned __int128>(std::numeric_limits<int64_t>::max());
+                           ? static_cast<__uint128_t>(std::numeric_limits<int32_t>::max())
+                           : static_cast<__uint128_t>(std::numeric_limits<int64_t>::max());
     if (num_rows * max_abs > limit) { widen.insert(candidates[i]); }
   }
   return widen;

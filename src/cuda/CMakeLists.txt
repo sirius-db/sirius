@@ -7,6 +7,7 @@ target_sources(
           sirius_dynamic_in_list_filter.cu
           sirius_dynamic_small_in_list_filter.cu
           sirius_like_multiliteral.cu
+          sirius_round_floating_point.cu
           scan/gpu_decode_alp.cu
           scan/gpu_decode_bitpacking.cu
           scan/gpu_decode_rle.cu

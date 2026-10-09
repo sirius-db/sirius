@@ -319,6 +319,15 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void seal_dynamic_filter_plan() noexcept { _dynamic_filter_session.seal_plan(); }
   void cancel_dynamic_filter_publication() noexcept { _dynamic_filter_session.cancel(); }
 
+  /**
+   * @brief The session that publishes this join's dynamic filters, through which the build-side
+   * `sirius_physical_partition` accumulates a multi-partition filter.
+   */
+  [[nodiscard]] dynamic_filter_publication_session& dynamic_filter_session() noexcept
+  {
+    return _dynamic_filter_session;
+  }
+
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op);
@@ -502,7 +511,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::size_t num_equality_conditions = 0;
   std::vector<cudf::size_type> left_key_col_indices;
   std::vector<cudf::size_type> right_key_col_indices;
-  bool cast_necessary = false;
 
   /// Null-matching flag for the equi-keys passed to cuDF joins, cached at
   /// construction (conditions and join_type are fixed thereafter). cuDF applies one
@@ -521,16 +529,26 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   bool mark_is_null_safe_ = false;
 
  public:
-  //! Per-key cast info: whether each join key needs a cast before comparison
-  struct key_cast_info {
-    bool cast_left  = false;
-    bool cast_right = false;
-    cudf::data_type left_target_type{cudf::type_id::EMPTY};
-    cudf::data_type right_target_type{cudf::type_id::EMPTY};
+  /// Materialize operands through the native evaluator before admission/partition setup.
+  /// Idempotent: prepared operands are direct references. Maps hide appended key columns.
+  static void materialize_expression_join_keys(duckdb::vector<sirius::join_condition>& conditions,
+                                               duckdb::unique_ptr<sirius_physical_operator>& left,
+                                               duckdb::unique_ptr<sirius_physical_operator>& right,
+                                               duckdb::vector<std::size_t>& left_projection_map,
+                                               duckdb::vector<std::size_t>& right_projection_map);
+
+  struct prepared_key {
+    cudf::size_type left_index;
+    cudf::size_type right_index;
+    cudf::data_type type;
+    bool hash_key;
   };
+  /// Includes routed NULL-safe equalities for the existing partition-routing contract.
+  [[nodiscard]] std::vector<prepared_key> const& prepared_keys() const { return _prepared_keys; }
 
  protected:
-  std::vector<key_cast_info> key_casts;
+  std::vector<prepared_key> _prepared_keys;
+  std::vector<cudf::data_type> _hash_key_types;
 
   dynamic_filter_publication_session _dynamic_filter_session;
   // Non-owning; SiriusContext outlives the plan.

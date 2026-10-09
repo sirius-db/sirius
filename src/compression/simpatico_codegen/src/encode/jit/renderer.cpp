@@ -223,8 +223,8 @@ class SharedMemAllocator {
 // ---------------------------------------------------------------------
 class Walker {
  public:
-  Walker(std::string dtype, const DtypeInfo& dt, std::int32_t num_chunks)
-    : dtype_(std::move(dtype)), dt_(dt), num_chunks_(num_chunks)
+  Walker(std::string dtype, std::int32_t num_chunks)
+    : dtype_(std::move(dtype)), num_chunks_(num_chunks)
   {
   }
 
@@ -245,7 +245,6 @@ class Walker {
  private:
   // ----------------- Accumulators -----------------
   std::string dtype_;
-  const DtypeInfo& dt_;
   std::int32_t num_chunks_;
   std::int32_t next_node_id_ = 0;
   std::ostringstream params_;  // post-(flat,n) params, joined with ",\n"
@@ -1005,8 +1004,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   }
   // Per-op dtype lookup — the LaneInput is the source of truth.  A
   // Bitpack under Rle's `runs` subtree sees in.elem_type=int32_t
-  // even when the column dtype is int64_t.  Walker::dt_ is the root
-  // column type and intentionally unused here.
+  // even when the column dtype is int64_t.  The root column type is
+  // intentionally unused here.
   const DtypeInfo* op_dt = lookup_dtype(in.elem_type);
   if (op_dt == nullptr) {
     throw RenderError("render: Bitpack op-local dtype '" + in.elem_type + "' not in dtype table");
@@ -1235,7 +1234,7 @@ EncodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                       "'.  Supported: int32_t, int64_t");
   }
 
-  Walker w(element_dtype, *dt, num_chunks);
+  Walker w(element_dtype, num_chunks);
   return w.build(tree);
 }
 

@@ -82,7 +82,8 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// \throws The exception passed to close() (if any) once the queue is drained.
   std::optional<std::unique_ptr<op::operator_data>> get_next_split();
 
-  /// \brief True iff close() has been called and the queue is drained.
+  /// \brief True iff successfully closed and drained; a failed source remains
+  ///        schedulable so get_next_split() delivers its terminal exception.
   [[nodiscard]] bool is_closed() const;
 
   [[nodiscard]] bool has_more_splits() const;

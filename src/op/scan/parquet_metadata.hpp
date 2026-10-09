@@ -17,12 +17,16 @@
 #pragma once
 
 #include "io/types.hpp"
+#include "op/scan/table_scan/parquet_physical_profile.hpp"
 
+#include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
 
 #include <cstddef>
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius::op::scan {
 
@@ -40,8 +44,17 @@ namespace sirius::op::scan {
 class parquet_metadata final : public sirius::io::io_object_metadata {
  public:
   parquet_metadata(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
-                   std::size_t footer_byte_len)
-    : _file_metadata(std::move(file_metadata)), _footer_byte_len(footer_byte_len)
+                   std::size_t footer_byte_len,
+                   parquet_encryption_evidence encryption            = {},
+                   std::vector<uint8_t> original_schema              = {},
+                   std::string arrow_schema                          = {},
+                   std::vector<uint8_t> original_logical_annotations = {})
+    : encryption_evidence(encryption),
+      original_schema(std::move(original_schema)),
+      arrow_schema(std::move(arrow_schema)),
+      original_logical_annotations(std::move(original_logical_annotations)),
+      _file_metadata(std::move(file_metadata)),
+      _footer_byte_len(footer_byte_len)
   {
   }
 
@@ -53,9 +66,26 @@ class parquet_metadata final : public sirius::io::io_object_metadata {
 
   [[nodiscard]] std::size_t footer_byte_len() const noexcept { return _footer_byte_len; }
 
+  parquet_encryption_evidence const encryption_evidence;
+  // Retained before hybrid_scan_reader normalizes REQUIRED fields to OPTIONAL.
+  std::vector<uint8_t> const original_schema;
+  std::string const arrow_schema;
+  // One byte per raw SchemaElement; distinguishes a real logicalType from a
+  // converted_type annotation synthesized by cuDF during sanitize_schema.
+  std::vector<uint8_t> const original_logical_annotations;
+
  private:
   std::shared_ptr<cudf::io::parquet::FileMetaData const> _file_metadata;
   std::size_t _footer_byte_len{0};
 };
+
+// The three footer producers must publish the same complete evidence. Cache hits
+// return the very same record, including the original serialized schema.
+std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
+  io::sirius_datasource& source,
+  scan_contract_id contract,
+  std::string const& identity,
+  cudf::io::parquet_reader_options const& options,
+  bool* cache_hit = nullptr);
 
 }  // namespace sirius::op::scan

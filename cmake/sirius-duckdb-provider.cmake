@@ -1,12 +1,7 @@
 # DuckDB remains a source dependency until its package exposes the required
 # internal headers and extension libraries. Keep that contract in one place.
-if(PROJECT_IS_TOP_LEVEL)
-  set(_sirius_duckdb_default "${CMAKE_CURRENT_SOURCE_DIR}/duckdb")
-else()
-  set(_sirius_duckdb_default "${CMAKE_SOURCE_DIR}")
-endif()
 set(SIRIUS_DUCKDB_SOURCE_DIR
-    "${_sirius_duckdb_default}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/duckdb"
     CACHE PATH "DuckDB source tree used to build Sirius")
 
 if(NOT EXISTS "${SIRIUS_DUCKDB_SOURCE_DIR}/src/include/duckdb.hpp")
@@ -31,9 +26,7 @@ function(sirius_add_duckdb_source)
   add_subdirectory("${SIRIUS_DUCKDB_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/duckdb"
                    EXCLUDE_FROM_ALL)
 endfunction()
-if(PROJECT_IS_TOP_LEVEL)
-  sirius_add_duckdb_source()
-endif()
+sirius_add_duckdb_source()
 
 add_library(sirius_duckdb_dependency INTERFACE IMPORTED)
 add_library(sirius::duckdb_dependency ALIAS sirius_duckdb_dependency)

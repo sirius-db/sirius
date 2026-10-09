@@ -9,7 +9,7 @@ find_program(SIRIUS_NINJA_EXECUTABLE ninja REQUIRED)
 pkg_check_modules(SIRIUS_UCX REQUIRED IMPORTED_TARGET "ucx>=1.20.1")
 pkg_get_variable(_nixl_ucx_pkgconfig_dir ucx pcfiledir)
 
-set(_nixl_port "${CMAKE_CURRENT_LIST_DIR}/../vcpkg_ports/nixl")
+set(_nixl_port "${CMAKE_CURRENT_LIST_DIR}/../sirius-duckdb/vcpkg_ports/nixl")
 include("${_nixl_port}/nixl-source.cmake")
 set(_nixl_patches
     "${_nixl_port}/native-cpp-only.patch"

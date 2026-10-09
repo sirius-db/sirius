@@ -293,7 +293,7 @@ Ask in ~3 grouped rounds (`AskUserQuestion` allows up to 4 questions per call). 
 After confirming, echo the final `performance_test.py` command back to the user before running it.
 
 **Environment prerequisites** (verify these yourself; they are not user questions):
-- Sirius extension built: `pixi run -e clang make release` (the runner loads `build/release/extension/sirius/sirius.duckdb_extension` for any GPU engine).
+- Sirius extension built: `pixi run -e clang make release` (the runner loads `sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension` for any GPU engine).
 - For Super Sirius: `SIRIUS_CONFIG_FILE` set, or `--config <yaml>` passed (confirmed in Round 1).
 
 ---
@@ -355,6 +355,6 @@ After confirming, echo the final command(s), including any `generate_tpch_refres
 if generation was confirmed), before running.
 
 **Environment prerequisites** (verify yourself; not user questions):
-- Sirius extension built (`build/release/extension/sirius/sirius.duckdb_extension`).
+- Sirius extension built (`sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension`).
 - `tpch-dbgen` available for refresh and query generation (`test_datasets/tpch-dbgen/`; both
   scripts auto-unzip and build `dbgen`/`qgen` from `test_datasets/tpch-dbgen.zip` if missing).

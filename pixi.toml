@@ -10,7 +10,7 @@ platforms = [
   { name = "linux-64-cuda12", platform = "linux-64", cuda = "12" },
   { name = "linux-aarch64-cuda12", platform = "linux-aarch64", cuda = "12" },
 ]
-requires-pixi = ">=0.71"
+requires-pixi = ">=0.78"
 
 [activation]
 scripts = ["scripts/pixi_activate.sh"]
@@ -65,6 +65,7 @@ rust-src = "*"
 liburing = "*"
 meson = "=1.12.1"
 openssl = "*"
+xxhash = "0.8.*"
 libcurl = "*"
 tomlplusplus = "*"
 ucx = "=1.20.1"
@@ -72,8 +73,13 @@ pnpm = "*"
 python = "3.14.*"
 pyarrow = ">=14"
 seaweedfs = ">=4.48"
+fastavro = "1.12.2.*"
 
 [tasks]
+
+[tasks.duckdb]
+description = "Start the local DuckDB shell with Sirius loaded."
+cmd = '''sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"'''
 
 [tasks.clion-env]
 description = "Generate the Pixi environment file used by CLion."
@@ -132,7 +138,7 @@ scripts = ["scripts/vcpkg.sh"]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.nightly-runner.dependencies]
-pixi = "0.71.*"
+pixi = "0.78.*"
 
 [feature.nightly-runner.tasks]
 nightly-shell = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME pixi shell --manifest-path envs/nightly/pixi.toml"

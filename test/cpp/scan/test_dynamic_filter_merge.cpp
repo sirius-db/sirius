@@ -635,8 +635,8 @@ TEST_CASE("sirius_dynamic_bloom_filter never drops a true match (no false negati
   stream.sync();
   REQUIRE(out != nullptr);
   auto const survivors = to_host_int64(out->view().column(0), stream);
-  REQUIRE(survivors.size() >= num_keys);
-  REQUIRE(survivors.size() <= 2 * num_keys);
+  REQUIRE(survivors.size() >= static_cast<std::size_t>(num_keys));
+  REQUIRE(survivors.size() <= static_cast<std::size_t>(2 * num_keys));
   // Build keys precede every possible false positive in the probe sequence.
   for (int64_t key = 0; key < num_keys; ++key) {
     REQUIRE(survivors[key] == key);
@@ -686,8 +686,8 @@ TEST_CASE("sirius_dynamic_bloom_filter supports INT32 keys with no false negativ
   stream.sync();
   REQUIRE(out != nullptr);
   auto const survivors = to_host_int32(out->view().column(0), stream);
-  REQUIRE(survivors.size() >= num_keys);
-  REQUIRE(survivors.size() <= 2 * num_keys);
+  REQUIRE(survivors.size() >= static_cast<std::size_t>(num_keys));
+  REQUIRE(survivors.size() <= static_cast<std::size_t>(2 * num_keys));
   for (int32_t key = 0; key < num_keys; ++key) {
     REQUIRE(survivors[key] == key);
   }
@@ -1750,7 +1750,7 @@ TEST_CASE("deferred keys support arbitrary repeated membership filters",
   ::cuda::stream_ref stream = cudf::get_default_stream();
   auto table                = make_int64_sequence_table(10, stream);
   sirius_dynamic_filter_set filters;
-  auto producer = filters.register_producer({0});
+  auto producer = filters.register_producer({0}, 8);
   for (int64_t count = 10; count >= 3; --count) {
     REQUIRE(producer.push_filter(0, make_in_list_prefix(count, stream)));
   }
@@ -1924,7 +1924,7 @@ TEST_CASE("production policy uses gather once after weak marginals become curren
   auto first  = std::make_shared<counting_in_list_filter>(make_in_list_prefix(9, stream));
   auto second = std::make_shared<counting_in_list_filter>(make_in_list_prefix(4, stream));
   sirius_dynamic_filter_set filters;
-  auto producer = filters.register_producer({0});
+  auto producer = filters.register_producer({0}, 3);
   REQUIRE(producer.push_filter(0, first));
   REQUIRE(producer.push_filter(0, second));
   sirius::op::scan::dynamic_filter_gate gate;
