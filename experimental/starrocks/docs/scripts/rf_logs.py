@@ -45,3 +45,22 @@ for q in sorted(res):
             print(f'  {k} x{len(v)}:', dict(collections.Counter(f'{x[0]}:[{x[1]}]' for x in v)))
         else:
             print(f'  {k} x{len(v)}:', v[:3])
+
+# CNs with the per-filter accounting log one `runtime filter` line per filter and place it could
+# apply: outcome="applied", or outcome="skipped" with a reason. Count filters (not lines) per query.
+OUTCOME = re.compile(r'query=(\S+) .*?filter_id=(\d+).*? outcome="(\w+)"(?:.*? reason="(\w+)")?')
+outcomes = collections.defaultdict(lambda: collections.defaultdict(set))
+for cn in sorted(f for f in os.listdir(RUN) if re.match(r'cn\d+\.log', f)):
+    for line in open(os.path.join(RUN, cn), errors='replace'):
+        if 'runtime filter' not in line or 'outcome=' not in line: continue
+        m = OUTCOME.search(line)
+        if not m: continue
+        q = hi2q.get(m.group(1)[:18], m.group(1))
+        outcomes[q][m.group(3) if m.group(3) == 'applied' else 'skipped:' + (m.group(4) or '?')].add(int(m.group(2)))
+if outcomes:
+    print('\n# per-query filter outcomes (filter ids; a filter applied anywhere counts as applied)')
+    for q in sorted(outcomes):
+        applied = outcomes[q].get('applied', set())
+        parts = [f'applied={sorted(applied)}'] + [
+            f'{k}={sorted(v - applied)}' for k, v in sorted(outcomes[q].items()) if k != 'applied' and v - applied]
+        print(q, ' '.join(parts))
