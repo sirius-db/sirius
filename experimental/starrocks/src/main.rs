@@ -11,7 +11,7 @@ use sirius_starrocks_cn::SiriusEngine;
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
     BackendServer, BrpcServer, ComputeNodeConfig, FeConfig, FragmentExecutor, HeartbeatServer,
-    NixlEndpoint, SharedHeartbeatState, register_node, report_to_frontend_once,
+    Host, NixlEndpoint, SharedHeartbeatState, register_node, report_to_frontend_once,
     start_backend_server, start_heartbeat_server,
 };
 use tokio::task::{JoinError, JoinSet};
@@ -112,7 +112,12 @@ impl Args {
         // BackendService exposes the shallow CN RPC skeleton on the normal thrift port.
         let backend_server = start_backend_server(&self.compute_node)?;
         // BRPC PInternalService dispatches plan fragments on the brpc port.
-        let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone(), nixl.clone())?;
+        let brpc_runtime = BrpcRuntime::start(
+            &self.compute_node,
+            executor.clone(),
+            nixl.clone(),
+            Some(self.fe.host.clone()),
+        )?;
         self.registration
             .register_node_with_retries(&self.fe, &self.compute_node)
             .await?;
@@ -291,9 +296,10 @@ impl BrpcRuntime {
         compute_node: &ComputeNodeConfig,
         executor: Arc<dyn FragmentExecutor>,
         nixl: Option<Arc<dyn NixlEndpoint>>,
+        frontend_host: Option<Host>,
     ) -> Result<Self> {
         let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
-        let server = BrpcServer::with_executor(executor, compute_node, nixl);
+        let server = BrpcServer::with_executor(executor, compute_node, nixl, frontend_host);
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
         let join = tokio::task::spawn_blocking(move || {
