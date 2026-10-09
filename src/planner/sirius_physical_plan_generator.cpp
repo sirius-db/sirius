@@ -73,6 +73,8 @@
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/substrait_scan_ranges.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -85,7 +87,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
+#include <set>
 #include <thread>
 #include <utility>
 
@@ -181,8 +185,30 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
-//! Build a `parquet_ingestible_table_info` from a TABLE_SCAN. Destructive: `table_filters`
-//! is moved out of the scan.
+//! Attach the plan-carried byte ranges to the scan's files, claiming each file's ranges from the
+//! per-plan registry. A file keeps ONE entry holding all its ranges: the bound read view requires
+//! one entry per bound file. If the bind kept repeated occurrences of a ranged path, the first
+//! carries the ranges and the repeats own nothing, so no row group is read twice.
+void attach_byte_ranges(sirius::op::scan::parquet_ingestible_table_info& info,
+                        sirius::planner::scan_byte_ranges_state& ranges)
+{
+  // A range of length 0 owns no row group (parquet_byte_range.hpp), and unlike (0,0) it is not a
+  // whole-file read.
+  static constexpr std::pair<std::uint64_t, std::uint64_t> kOwnsNothing{
+    std::numeric_limits<std::uint64_t>::max(), 0};
+  info.resolved_file_ranges.assign(info.resolved_file_paths.size(), {});
+  std::set<std::string> claimed;
+  for (std::size_t i = 0; i < info.resolved_file_paths.size(); ++i) {
+    auto const& path = info.resolved_file_paths[i];
+    if (!ranges.has(path)) { continue; }
+    if (claimed.insert(path).second) {
+      info.resolved_file_ranges[i] = ranges.claim(path);
+    } else {
+      info.resolved_file_ranges[i] = {kOwnsNothing};
+    }
+  }
+}
+
 //! Fill the parquet bind data from a TABLE_SCAN. Split out from
 //! `build_parquet_table_info` so the iceberg path can populate the same fields into its own
 //! subclass — an iceberg table's data files are parquet, so every field here applies unchanged.
@@ -1479,6 +1505,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
   // resolved file later, so install the matching secret snapshot for each path before the bind
   // data moves into the GPU ingestible.
   install_parquet_s3_configs(*table_info, context, sirius_ctx.get());
+  // Remote paths never carry ranges here: extract_scan_byte_ranges refuses them.
+  if (auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
+        sirius::planner::scan_byte_ranges_state::kStateKey)) {
+    attach_byte_ranges(*table_info, *byte_ranges);
+  }
   return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
 }
 
@@ -1926,6 +1957,13 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw;
   }
   set_parent_ops(*plan, /*parent=*/nullptr);
+
+  // A plan-carried byte range that no scan consumed would degrade to a whole-file read and
+  // duplicate rows across splits — fail here, before anything executes.
+  if (auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
+        sirius::planner::scan_byte_ranges_state::kStateKey)) {
+    byte_ranges->assert_all_consumed();
+  }
 
   return plan;
 }
