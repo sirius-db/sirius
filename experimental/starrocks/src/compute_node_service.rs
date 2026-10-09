@@ -21,7 +21,7 @@ use crate::fragment_executor::{
 use crate::local_exchange::{
     ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, RemoteBatch, SenderSource,
 };
-use crate::nixl_chunk::{self, NixlEndpoint, NixlEnvelope, StreamHop};
+use crate::nixl_chunk::{self, AllocError, NixlEndpoint, NixlEnvelope, StreamHop};
 use crate::proto::starrocks::{
     ExecuteCommandRequestPb, ExecuteCommandResultPb, PCancelPlanFragmentRequest,
     PCancelPlanFragmentResult, PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult,
@@ -50,6 +50,18 @@ use thrift::{
     transport::TBufferChannel,
 };
 use tracing::{info, instrument, warn};
+
+/// How long a purge's frees are watched for, to log when they finished.
+const PURGE_WATCH: Duration = Duration::from_secs(600);
+
+/// How long a receive allocation that finds the pool full waits for a purge's frees
+/// (`SIRIUS_CN_ALLOC_WAIT_MS`, default 30 s), before it fails.
+fn alloc_wait_from_env() -> Duration {
+    std::env::var("SIRIUS_CN_ALLOC_WAIT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(Duration::from_secs(30), Duration::from_millis)
+}
 
 /// Bounds a `fetch_data` wait on a result fragment whose exchange senders never finish.
 const RESULT_WAIT: Duration = Duration::from_secs(600);
@@ -89,6 +101,8 @@ pub(crate) struct SiriusComputeNodeService {
     translate_only: bool,
     /// How each recent query ended on this CN, shared with the exchange and the reports.
     ends: Arc<QueryEnds>,
+    /// How long a receive allocation that finds the pool full waits for a purge's frees.
+    alloc_wait: Duration,
 }
 
 /// At most this many queries' descriptor tables are cached; past it the oldest is dropped.
@@ -209,6 +223,7 @@ impl SiriusComputeNodeService {
             reports: Arc::new(ExecReports::new(None, Arc::clone(&ends))),
             translate_only: std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some(),
             ends,
+            alloc_wait: alloc_wait_from_env(),
         }
     }
 
@@ -427,7 +442,14 @@ impl PInternalService for SiriusComputeNodeService {
         request: PTransmitChunkParams,
         attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PTransmitChunkResult>, crate::prpc::Error> {
-        let (status, reply) = match self.handle_nixl_chunk(&request, &attachment) {
+        let handled = match NixlEnvelope::decode(&attachment) {
+            Ok(NixlEnvelope::Alloc(layout)) => self
+                .allocate_waiting(&request, layout)
+                .await
+                .map(|reply| (reply, None)),
+            _ => self.handle_nixl_chunk(&request, &attachment),
+        };
+        let (status, reply) = match handled {
             Ok((reply, ready)) => {
                 if let Some(ready) = ready {
                     self.drain_ready_async(ready);
@@ -868,18 +890,7 @@ impl SiriusComputeNodeService {
         let nixl = self.nixl.as_ref().ok_or("this CN has no NIXL transport")?;
         match envelope {
             NixlEnvelope::Md(_) => Ok((nixl.local_md(), None)),
-            NixlEnvelope::Alloc(layout) => {
-                // No buffers for a query that already failed here: its sender stops at once,
-                // with the cause.
-                if let Some(cause) = request
-                    .finst_id
-                    .as_ref()
-                    .and_then(|id| self.exchanges.failure(FragmentInstanceId::from(id)))
-                {
-                    return Err(cause);
-                }
-                Ok((nixl.allocate(&layout)?.encode(), None))
-            }
+            NixlEnvelope::Alloc(layout) => Ok((self.allocate(request, &layout)?, None)),
             NixlEnvelope::Release(token) => {
                 nixl.release(token);
                 // Only a failed hop releases buffers this way, after its query's purge last
@@ -908,6 +919,64 @@ impl SiriusComputeNodeService {
                 Ok((Vec::new(), None))
             }
         }
+    }
+
+    /// Receive buffers for a batch with `layout`, on behalf of `request`'s sender. None for a
+    /// query that already failed here: its sender stops at once, with the cause.
+    fn allocate(
+        &self,
+        request: &PTransmitChunkParams,
+        layout: &[u8],
+    ) -> std::result::Result<Vec<u8>, AllocError> {
+        nixl_chunk::reject_native_chunk(request).map_err(AllocError::Failed)?;
+        let nixl = self
+            .nixl
+            .as_ref()
+            .ok_or_else(|| AllocError::Failed("this CN has no NIXL transport".to_string()))?;
+        if let Some(cause) = request
+            .finst_id
+            .as_ref()
+            .and_then(|id| self.exchanges.failure(FragmentInstanceId::from(id)))
+        {
+            return Err(AllocError::Failed(cause));
+        }
+        nixl.allocate(layout).map(|reply| reply.encode())
+    }
+
+    /// [`allocate`](Self::allocate), and when the pool is full while a purge's frees are pending
+    /// (or one finished meanwhile), waits for them off the brpc runtime, bounded by
+    /// `alloc_wait`, and tries once more. A late free then delays the next query instead of
+    /// failing it. Any other failure, a refused query's included, answers at once.
+    async fn allocate_waiting(
+        &self,
+        request: &PTransmitChunkParams,
+        layout: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let frees = self.executor.pending_frees();
+        let done_before = frees.as_ref().map(|frees| frees.done());
+        let err = match self.allocate(request, &layout) {
+            Err(AllocError::PoolFull(err)) => err,
+            allocated => return allocated.map_err(String::from),
+        };
+        let Some(frees) =
+            frees.filter(|frees| frees.pending() > 0 || Some(frees.done()) != done_before)
+        else {
+            return Err(err);
+        };
+        let (service, request) = (self.clone(), request.clone());
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let freed = frees.wait_for_none(service.alloc_wait);
+            info!(
+                freed,
+                waited_ms = started.elapsed().as_millis() as u64,
+                error = err,
+                "a receive allocation waited for a purge's frees"
+            );
+            service.allocate(&request, &layout).map_err(String::from)
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(format!("the allocation task panicked: {join_err}")))
     }
 
     /// A remote sender failed in place of its EOS: fails its receiver's query on this CN with the
@@ -1124,6 +1193,7 @@ impl SiriusComputeNodeService {
                     drains: None,
                     filters: filters.filters,
                     fallback: filters.fallback,
+                    query: Self::query_id(params),
                 })?
                 .ok_or_else(|| "result fragment returned no rows".to_string())?;
             let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
@@ -1194,6 +1264,7 @@ impl SiriusComputeNodeService {
             drains: None,
             filters: filters.filters,
             fallback: filters.fallback,
+            query: Self::query_id(params),
         };
         let shipped = if remote.is_empty() || !stream_output_enabled() {
             self.executor.run_fragment(run)?;
@@ -1432,10 +1503,17 @@ impl SiriusComputeNodeService {
     }
 
     fn purge(&self, query: FragmentInstanceId, error: &str, failed: bool) {
+        let started = std::time::Instant::now();
         self.results.fail_query(query, error);
         self.forget_descriptor_table(query);
         let deferred = self.filters.purge_query(query);
         let purged = self.exchanges.purge_query(query, error);
+        // A failed query's run in progress holds GPU memory and works for nothing: stop it, now
+        // that its cause is recorded, so the interrupted fragment reports that cause first. A
+        // finished query has nothing left running.
+        if failed {
+            self.executor.interrupt(query);
+        }
         for params in deferred
             .iter()
             .map(|scan| &scan.params)
@@ -1451,11 +1529,12 @@ impl SiriusComputeNodeService {
                 nixl.release(token);
             }
         }
+        // Not waited for: a drop runs on the engine thread, which may be busy with another
+        // fragment. Until it ran, a receive allocation that finds the pool full waits for it.
         for &slot in &purged.slots {
-            if let Err(err) = self.executor.drop_parked(slot) {
-                warn!(?slot, error = %err, "failed to drop a purged query's parked output");
-            }
+            self.executor.drop_parked_later(slot);
         }
+        self.watch_frees(query, started);
         let (released_buffers, dropped_parked) = (purged.tokens.len(), purged.slots.len());
         let (dropped_receivers, deferred_scans) = (purged.receivers.len(), deferred.len());
         if failed {
@@ -1481,13 +1560,46 @@ impl SiriusComputeNodeService {
         }
     }
 
+    /// Logs, on another thread, when what a purge of `query` asked the engine to free is free, and
+    /// what the CN holds then: the drops and the interrupted run finish after the purge returns.
+    fn watch_frees(&self, query: FragmentInstanceId, started: std::time::Instant) {
+        let Some(frees) = self
+            .executor
+            .pending_frees()
+            .filter(|frees| frees.pending() > 0)
+        else {
+            return;
+        };
+        let service = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("purge-watch".to_string())
+            .spawn(move || {
+                let freed = frees.wait_for_none(PURGE_WATCH);
+                info!(
+                    %query,
+                    freed,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "a purge's frees finished"
+                );
+                service.log_leak_counters("purge drained");
+            });
+    }
+
     /// Ends `params`' remote hops with a failure frame unless the transport already ended them,
-    /// and returns the error.
+    /// and returns the error. A fragment of a query that failed here while it ran (interrupted,
+    /// say, or refused its turn on the engine) fails because of that: its error leads with the
+    /// query's cause, so whichever reply or report reaches the FE first names the cause.
     fn end_hops(&self, params: &TExecPlanFragmentParams, failure: FragmentFailure) -> String {
+        let error = match Self::query_id(params).and_then(|query| self.exchanges.failure(query)) {
+            Some(cause) if !failure.error.starts_with(cause.as_str()) => {
+                format!("{cause} ({})", failure.error)
+            }
+            _ => failure.error,
+        };
         if !failure.hops_ended {
-            self.fail_remote_hops(params, &failure.error);
+            self.fail_remote_hops(params, &error);
         }
-        failure.error
+        error
     }
 
     /// Sends a failure frame to every remote destination of `params`' DATA_STREAM_SINK, in place
@@ -1980,9 +2092,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        fragment_executor::PendingFrees,
         fragment_executor::{DrainNext, ExportedBatch, FragmentResult, OutputDrain},
         local_exchange::ExchangeCounts,
-        nixl_chunk::AllocReply,
+        nixl_chunk::{AllocError, AllocReply},
         proto::starrocks::{
             PFetchDataRequest, PUniqueId,
             p_internal_service_brpc::{PInternalServiceRouter, SERVICE_NAME, methods},
@@ -2019,6 +2132,12 @@ mod tests {
         failed: Mutex<Vec<(SocketAddr, SenderSlot, String)>>,
         /// The CN every failure frame is delivered to, as `transmit_chunk` would.
         peer: Mutex<Option<SiriusComputeNodeService>>,
+        /// The receive pool has no room: every allocation fails.
+        full: std::sync::atomic::AtomicBool,
+        /// A free that finishes, making room, just as the pool is found full.
+        free_when_full: Mutex<Option<crate::running_query::PendingFree>>,
+        /// Allocation fails for a reason waiting would not change.
+        broken: std::sync::atomic::AtomicBool,
     }
 
     impl FakeNixl {
@@ -2033,7 +2152,20 @@ mod tests {
             b"local-md".to_vec()
         }
 
-        fn allocate(&self, layout: &[u8]) -> Result<AllocReply, String> {
+        fn allocate(&self, layout: &[u8]) -> Result<AllocReply, AllocError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.broken.load(SeqCst) {
+                return Err(AllocError::Failed("bad layout".to_string()));
+            }
+            if self.full.load(SeqCst) {
+                if let Some(free) = self.free_when_full.lock().unwrap().take() {
+                    self.full.store(false, SeqCst);
+                    drop(free);
+                }
+                return Err(AllocError::PoolFull(
+                    "failed to allocate receive buffers: 0 available".to_string(),
+                ));
+            }
             Ok(AllocReply {
                 token: 7,
                 device: 1,
@@ -4149,6 +4281,256 @@ mod tests {
         assert!(cached(74));
         cancel_with(&service, 74, Some(Reason::UserCancel), None);
         eventually("the purge", || !cached(74));
+    }
+
+    /// Stands in for the engine thread: parks like the stub, records what it is asked to
+    /// interrupt, and runs queued drops only once `busy` is cleared, as a busy engine thread would.
+    #[derive(Debug, Default)]
+    struct BusyEngine {
+        interrupted: Mutex<Vec<FragmentInstanceId>>,
+        /// The service, to read what it recorded about a query when asked to interrupt it.
+        service: Mutex<Option<SiriusComputeNodeService>>,
+        /// The query's recorded cause at each interrupt.
+        cause_when_interrupted: Mutex<Vec<Option<String>>>,
+        busy: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
+        frees: Arc<PendingFrees>,
+        dropped: Arc<Mutex<Vec<SenderSlot>>>,
+    }
+
+    impl BusyEngine {
+        fn set_busy(&self, busy: bool) {
+            *self.busy.0.lock().unwrap() = busy;
+            self.busy.1.notify_all();
+        }
+    }
+
+    impl FragmentExecutor for BusyEngine {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn drop_parked(&self, _slot: SenderSlot) -> Result<(), String> {
+            panic!("a purge must not wait for the engine thread");
+        }
+
+        fn drop_parked_later(&self, slot: SenderSlot) {
+            let (pending, busy, dropped) = (
+                self.frees.begin(),
+                Arc::clone(&self.busy),
+                Arc::clone(&self.dropped),
+            );
+            std::thread::spawn(move || {
+                let mut engine_busy = busy.0.lock().unwrap();
+                while *engine_busy {
+                    engine_busy = busy.1.wait(engine_busy).unwrap();
+                }
+                dropped.lock().unwrap().push(slot);
+                drop(pending);
+            });
+        }
+
+        fn interrupt(&self, query: FragmentInstanceId) {
+            self.interrupted.lock().unwrap().push(query);
+            let service = self.service.lock().unwrap().clone();
+            if let Some(service) = service {
+                self.cause_when_interrupted
+                    .lock()
+                    .unwrap()
+                    .push(service.exchanges.failure(query));
+            }
+        }
+
+        fn pending_frees(&self) -> Option<Arc<PendingFrees>> {
+            Some(Arc::clone(&self.frees))
+        }
+    }
+
+    /// Query `query` with a sender's output parked for a receiver that waits for a second sender.
+    fn parked_for_a_waiting_receiver(service: &SiriusComputeNodeService, query: i64) {
+        let mut result = query_fragment(query, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 2);
+        exec_ok(service, &result);
+        let mut sender = query_fragment(query, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 8060);
+        exec_ok(service, &sender);
+        assert_eq!(service.exchanges.counts().parked_senders, 1);
+    }
+
+    #[test]
+    fn a_failure_purge_interrupts_its_query_and_a_normal_end_does_not() {
+        let engine = Arc::new(BusyEngine::default());
+        let service = SiriusComputeNodeService::with_executor(
+            engine.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        *engine.service.lock().unwrap() = Some(service.clone());
+        service.fail_and_purge(FragmentInstanceId::from_halves(80, 3), "scan exploded");
+        service.release_query(
+            FragmentInstanceId::from_halves(81, 0),
+            "the query ended normally (QUERY_FINISHED)",
+        );
+        assert_eq!(
+            *engine.interrupted.lock().unwrap(),
+            [FragmentInstanceId::from_halves(80, 3)]
+        );
+        // Recorded first, so the interrupted fragment reports the cause rather than its
+        // interruption.
+        assert_eq!(
+            *engine.cause_when_interrupted.lock().unwrap(),
+            [Some("scan exploded".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_purge_returns_while_the_engine_thread_is_busy() {
+        let engine = Arc::new(BusyEngine::default());
+        let service = SiriusComputeNodeService::with_executor(
+            engine.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        parked_for_a_waiting_receiver(&service, 82);
+        engine.set_busy(true);
+        let started = std::time::Instant::now();
+        service.fail_and_purge(FragmentInstanceId::from_halves(82, 0), "scan exploded");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            engine.frees.pending(),
+            1,
+            "the drop waits for the engine thread"
+        );
+        assert!(engine.dropped.lock().unwrap().is_empty());
+        engine.set_busy(false);
+        assert!(engine.frees.wait_for_none(Duration::from_secs(10)));
+        assert_eq!(engine.dropped.lock().unwrap().len(), 1);
+        assert!(idle(&service));
+    }
+
+    #[test]
+    fn an_allocation_waits_for_a_purges_frees_up_to_a_bound() {
+        let engine = Arc::new(BusyEngine::default());
+        let nixl = Arc::new(FakeNixl::default());
+        let mut service = SiriusComputeNodeService::with_executor(
+            engine.clone(),
+            &ComputeNodeConfig::default(),
+            Some(nixl.clone()),
+        );
+        service.alloc_wait = Duration::from_millis(300);
+        let alloc = |service: &SiriusComputeNodeService| {
+            transmit(
+                service,
+                nixl_chunk::alloc_params(exchange_slot(83, 10, 2)),
+                NixlEnvelope::Alloc(vec![0; 24]),
+            )
+            .0
+        };
+        nixl.full.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // A purge's free is pending: the allocation waits for it, then succeeds.
+        let pending = engine.frees.begin();
+        let freeing = {
+            let nixl = Arc::clone(&nixl);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                nixl.full.store(false, std::sync::atomic::Ordering::SeqCst);
+                drop(pending);
+            })
+        };
+        assert_eq!(alloc(&service).status_code, TStatusCode::OK.0);
+        freeing.join().unwrap();
+
+        // A free that never comes: it gives up after its bound.
+        nixl.full.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _stuck = engine.frees.begin();
+        let started = std::time::Instant::now();
+        let status = alloc(&service);
+        assert_eq!(status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(status.error_msgs[0].contains("0 available"), "{status:?}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+
+        // Waiting would change nothing for a query that already failed here, or for an error
+        // other than a full pool: both answer at once, even with a free pending.
+        assert!(
+            service
+                .exchanges
+                .mark_failed(FragmentInstanceId::from_halves(83, 0), "scan exploded")
+        );
+        let started = std::time::Instant::now();
+        let status = alloc(&service);
+        assert_eq!(
+            (status.status_code, status.error_msgs),
+            (TStatusCode::CANCELLED.0, vec!["scan exploded".to_string()])
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        nixl.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        let other = |service: &SiriusComputeNodeService| {
+            transmit(
+                service,
+                nixl_chunk::alloc_params(exchange_slot(85, 10, 2)),
+                NixlEnvelope::Alloc(vec![0; 24]),
+            )
+            .0
+        };
+        let started = std::time::Instant::now();
+        let status = other(&service);
+        assert_eq!(status.error_msgs, ["bad layout"]);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        nixl.broken
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // No purge pending: a full pool fails at once.
+        drop(_stuck);
+        let started = std::time::Instant::now();
+        assert_eq!(other(&service).status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        // A free that finishes just after the pool was found full still earns a retry.
+        *nixl.free_when_full.lock().unwrap() = Some(engine.frees.begin());
+        assert_eq!(other(&service).status_code, TStatusCode::OK.0);
+    }
+
+    /// Fails every run after its query failed on this CN meanwhile, as an interrupted run does.
+    #[derive(Debug, Default)]
+    struct InterruptedRuns {
+        service: Mutex<Option<SiriusComputeNodeService>>,
+    }
+
+    impl FragmentExecutor for InterruptedRuns {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            let service = self.service.lock().unwrap().clone().unwrap();
+            service
+                .exchanges
+                .mark_failed(run.query.unwrap(), "scan exploded on cn2");
+            Err("Interrupted!".to_string())
+        }
+    }
+
+    #[test]
+    fn a_run_stopped_by_its_querys_failure_reports_the_cause_first() {
+        let executor = Arc::new(InterruptedRuns::default());
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        *executor.service.lock().unwrap() = Some(service.clone());
+        let mut leaf = query_fragment(84, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut leaf, 10, 8060);
+        let status = exec(&service, &leaf);
+        assert_eq!(
+            status.error_msgs,
+            ["scan exploded on cn2 (Interrupted!)"],
+            "{status:?}"
+        );
     }
 
     #[test]

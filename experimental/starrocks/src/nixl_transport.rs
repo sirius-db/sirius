@@ -31,8 +31,8 @@ use crate::fragment_executor::{
     DrainNext, ExportedBatch, FragmentExecutor, OutputDrain, SenderSlot,
 };
 use crate::nixl_chunk::{
-    AllocReply, NixlEndpoint, NixlEnvelope, StreamHop, alloc_params, control_params, failed_params,
-    packed_params,
+    AllocError, AllocReply, NixlEndpoint, NixlEnvelope, StreamHop, alloc_params, control_params,
+    failed_params, packed_params,
 };
 use crate::proto::starrocks::{
     PTransmitChunkParams, PTransmitChunkResult,
@@ -150,11 +150,17 @@ impl NixlEndpoint for NixlTransport {
         self.local_md.clone()
     }
 
-    fn allocate(&self, layout: &[u8]) -> Result<AllocReply, String> {
-        let (token, buffers) = self
-            .exchange
-            .allocate(layout)
-            .map_err(|err| format!("failed to allocate receive buffers: {err}"))?;
+    fn allocate(&self, layout: &[u8]) -> Result<AllocReply, AllocError> {
+        let (token, buffers) = self.exchange.allocate(layout).map_err(|err| {
+            let message = format!("failed to allocate receive buffers: {err}");
+            // The engine reports an exhausted pool as `std::bad_alloc: out_of_memory: ...`; the
+            // exception carries no other type across the FFI.
+            if err.what().contains("out_of_memory") {
+                AllocError::PoolFull(message)
+            } else {
+                AllocError::Failed(message)
+            }
+        })?;
         Ok(AllocReply {
             token,
             device: self.exchange.region().0,
