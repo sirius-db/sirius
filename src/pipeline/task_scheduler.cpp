@@ -72,7 +72,7 @@ task_scheduler::task_scheduler(
       auto it = std::find_if(sys_topology->gpus.begin(),
                              sys_topology->gpus.end(),
                              [device_id](const cucascade::memory::gpu_topology_info& dev) {
-                               return dev.id == device_id;
+                               return std::cmp_equal(dev.id, device_id);
                              });
 
       if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
@@ -357,9 +357,7 @@ void task_scheduler::management_eventloop()
         ++it;
         continue;
       }
-      uint64_t task_id = 0;
       if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
-        task_id = gpu_task->get_task_id();
         {
           // Priority packs query_id in its high 32 bits (see task_creator); the
           // queue's key extractor unpacks it the same way.

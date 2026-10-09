@@ -18,6 +18,7 @@
 #include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -305,10 +306,14 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
   }
 
-  SECTION("a multi-partition build publishes nothing")
+  SECTION("a multi-partition build publishes nothing without accumulation")
   {
     // Correctness stake: a filter built from one partition's slice of the build keys would drop
     // probe rows that do join, so this must be pinned on a build that really spans partitions.
+    // Accumulation (on by default) legitimately publishes for such a build, so it is turned off
+    // here to pin the whole-build path alone.
+    sirius::test::scoped_sirius_setting accumulation_off(
+      con, "enable_dynamic_filter_multi_partition", false);
     // The summed columns exist only to keep the projection from pruning them, widening the build
     // past broadcast candidacy. Reaching a genuinely partition-sliced build needs all three pins:
     // broadcast off, a small hash-partition target so the natural count exceeds one, and a build

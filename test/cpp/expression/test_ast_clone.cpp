@@ -18,6 +18,7 @@
 // copy path. node is move-only, so clone must reconstruct each alternative and
 // recursively duplicate every child unique_ptr into an independent allocation.
 
+#include "ast_test_builders.hpp"
 #include "catch.hpp"
 #include "expression/ast/utils.hpp"
 
@@ -125,5 +126,85 @@ TEST_CASE("ast_clone - cloning a struct_pack function_call deep-clones every chi
     REQUIRE(fc.arguments()[i]->holds<reference>());
     REQUIRE(fc.arguments()[i]->get<reference>().column_index ==
             src_args[i]->get<reference>().column_index);
+  }
+}
+
+TEST_CASE("native reference traversal covers every child shape without changing indices",
+          "[ast_references]")
+{
+  using namespace sirius::ast;
+  using namespace sirius::ast::test;
+  auto const type = sirius::logical_type::make(sirius::type_id::INTEGER);
+  std::vector<node> roots;
+  roots.emplace_back(reference{9, type});
+  roots.emplace_back(constant{sirius::value{int32_t{1}}, type});
+  roots.emplace_back(comparison{sirius::comparison_type::equal, make_ref(1), make_ref(2)});
+  conjunction conjunction_node;
+  conjunction_node.children.push_back(make_ref(3));
+  conjunction_node.children.push_back(make_ref(3));
+  roots.emplace_back(std::move(conjunction_node));
+  roots.emplace_back(between{make_ref(4), make_ref(5), make_ref(6), true, true});
+  std::vector<case_expr::when_then> cases;
+  cases.push_back({make_ref(7), make_ref(8)});
+  roots.emplace_back(case_expr{std::move(cases), make_ref(9), type});
+  roots.emplace_back(cast{make_ref(10), type, true, cast_kind::semantic});
+  roots.emplace_back(unary_op{unary_op::kind::op_is_null, make_ref(11)});
+  std::vector<std::unique_ptr<node>> children;
+  children.push_back(make_ref(12));
+  children.push_back(make_int_const(0));
+  roots.emplace_back(coalesce{std::move(children), type});
+  in_list list;
+  list.probe = make_ref(13);
+  list.values.push_back(make_ref(14));
+  list.values.push_back(make_int_const(0));
+  roots.emplace_back(std::move(list));
+  std::vector<std::unique_ptr<node>> args;
+  args.push_back(make_ref(15));
+  args.push_back(make_ref(16));
+  roots.emplace_back(function_call{sirius::function_id::add, std::move(args), type});
+  args.clear();
+  args.push_back(make_ref(17));
+  roots.emplace_back(aggregate{sirius::aggregate_id::sum, std::move(args), type, false});
+
+  std::vector<uint32_t> indices;
+  for (auto const& root : roots) {
+    visit_references(root, [&](reference const& ref) { indices.push_back(ref.column_index); });
+  }
+  CHECK(indices ==
+        std::vector<uint32_t>{9, 1, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17});
+}
+
+TEST_CASE("native transforms preserve DECIMAL CASE and COALESCE types",
+          "[ast_clone][ast_substitute]")
+{
+  using namespace sirius::ast;
+  using sirius::ast::test::make_ref;
+  auto const decimal = sirius::logical_type::make_decimal(38, 12);
+  auto const boolean = sirius::logical_type::make(sirius::type_id::BOOLEAN);
+  std::vector<case_expr::when_then> cases;
+  cases.push_back({make_ref(0, boolean), make_ref(1, decimal)});
+  std::vector<node> roots;
+  roots.emplace_back(case_expr{std::move(cases), make_ref(2, decimal), decimal});
+  std::vector<std::unique_ptr<node>> children;
+  children.push_back(make_ref(1, decimal));
+  children.push_back(make_ref(2, decimal));
+  roots.emplace_back(coalesce{std::move(children), decimal});
+  std::vector<std::unique_ptr<node>> replacements;
+  replacements.push_back(make_ref(3, boolean));
+  replacements.push_back(make_ref(4, decimal));
+  replacements.push_back(make_ref(5, decimal));
+  for (auto const& root : roots) {
+    auto cloned      = clone(root);
+    auto substituted = substitute_references(root, replacements);
+    REQUIRE(cloned->return_type() == decimal);
+    REQUIRE(substituted->return_type() == decimal);
+    visit_references(*cloned, [&](reference const& ref) {
+      CHECK(ref.column_index < 3);
+      CHECK(ref.return_type() == (ref.column_index == 0 ? boolean : decimal));
+    });
+    visit_references(*substituted, [&](reference const& ref) {
+      CHECK(ref.column_index >= 3);
+      CHECK(ref.return_type() == (ref.column_index == 3 ? boolean : decimal));
+    });
   }
 }

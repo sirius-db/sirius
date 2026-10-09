@@ -27,6 +27,7 @@
 #include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/rest/rest_ioctx.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/uri_parser.hpp"
 #include "late_mat/pin_uniqueness.hpp"
@@ -48,6 +49,7 @@
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
+#include "sirius_context.hpp"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/io/datasource.hpp>
@@ -89,6 +91,7 @@
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -642,11 +645,15 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
   return {};
 }
 
-/// Strip a leading "file://" scheme (case-insensitive) so the path can be
-/// resolved by a local-file backend. Thin alias for the shared helper — kept so
-/// the cache-key and routing call sites below read as they did, while there is
-/// exactly ONE implementation of the rule (sirius::io::strip_file_scheme).
-std::string normalize_path(std::string const& p) { return sirius::io::strip_file_scheme(p); }
+/// Strip a leading "file://" scheme and canonicalize the case-insensitive S3
+/// scheme. Bucket and key bytes remain byte-identical because they are part of
+/// the object-store identity and may be case-sensitive.
+std::string normalize_path(std::string const& p)
+{
+  auto normalized = sirius::io::strip_file_scheme(p);
+  if (sirius::io::s3::is_s3_path(normalized)) { normalized.replace(0, 5, "s3://"); }
+  return normalized;
+}
 
 /// One operator's output schema as cuDF carriers, or empty when some column has
 /// no native carrier — which is a reason not to defer, not an error.
@@ -1300,10 +1307,12 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
 sirius_scan_manager::sirius_scan_manager(
   const scan_manager_config& config,
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  std::shared_ptr<const sirius::memory::topology_index> topology_index)
+  std::shared_ptr<const sirius::memory::topology_index> topology_index,
+  std::shared_ptr<op::scan::physical_check_counters> physical_counters)
   : _config(config),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
+    _physical_counters(std::move(physical_counters)),
     // num_threads + k_max_concurrent_queries, not num_threads + 1: each query's coalescer
     // sequencer task BLOCKS (worker_loop -> process_provider_inputs -> queue.wait_dequeue)
     // and is unblocked only by that query's own split_provider tasks, which run on this same
@@ -1386,12 +1395,13 @@ sirius_scan_manager::~sirius_scan_manager()
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  // Footer-probe only when we will actually read + parse the footer.  On a warm
-  // re-bind the metadata_store already holds the parsed footer, so a suffix GET
-  // would download footer bytes we won't reuse — a plain HEAD resolves the size.
+  // Footer-probe only when we will probably read + parse the footer.  When the
+  // metadata_store holds a parsed footer for this path, a suffix GET would most
+  // likely download bytes we won't reuse — a plain HEAD resolves the size, and
+  // the exact-generation lookup below decides whether the footer is reused.
   auto const cache_key     = normalize_path(uri);
   auto const io_ctx        = ioctx_for_path(uri);
-  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
   auto const hint =
     footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
 
@@ -1401,29 +1411,12 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
                              uri);
   }
 
-  // Reuse a previously parsed footer when present — a prior bind or scan of the
-  // same file parks it in the ioctx metadata store, which lives for the ioctx's
-  // lifetime. On a miss, fetch + Thrift-parse the footer once and park it so the
-  // subsequent scan reuses it. Mirrors parquet_gpu_ingestible::build_file_scan_info,
-  // so the footer is parsed exactly once per file per process.
-  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
-  if (auto cached = datasource->metadata()) {
-    if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached))) {
-      file_metadata = pm->file_metadata();
-    }
-  }
-  if (!file_metadata) {
-    auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
-    auto const footer_byte_len = footer_buffer->size();
-    auto reader_options        = cudf::io::parquet_reader_options::builder().build();
-    cudf::io::parquet::experimental::hybrid_scan_reader reader{
-      cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-      reader_options};
-    file_metadata =
-      std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
-    [[maybe_unused]] auto const stored = datasource->store_metadata(
-      std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len));
-  }
+  // Resolve through the shared path so describe_parquet publishes the same
+  // complete footer evidence as scans and pinned parquet tables, including the
+  // raw schema and logical annotations normalized away by cuDF.
+  auto const reader_options = cudf::io::parquet_reader_options::builder().build();
+  auto const metadata = op::scan::resolve_parquet_metadata(*datasource, 0, uri, reader_options);
+  auto const file_metadata = metadata->file_metadata();
 
   auto schema = sirius::io::parquet_helpers::extract_schema(*file_metadata);
 
@@ -1435,11 +1428,14 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   return result;
 }
 
-void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
-                                            bool enable_pinned_zone_map_pruning,
-                                            const std::vector<int>& allocated_gpu_ids)
+void sirius_scan_manager::prepare_for_query(
+  const sirius::planner::query& query,
+  bool enable_pinned_zone_map_pruning,
+  const std::vector<int>& allocated_gpu_ids,
+  std::shared_ptr<pipeline::completion_handler> completion)
 {
   auto const query_id = query.query_id();
+  _execution_completion.store(completion);
 
   // No global reset here. It used to be how the previous query's state was dropped; with
   // concurrent queries that would tear down whatever is still running. Each query's state is
@@ -1483,8 +1479,11 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
 
   auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
 
-  auto state             = std::make_shared<query_scan_manager_state>();
-  state->pruning_enabled = enable_pinned_zone_map_pruning;
+  auto state               = std::make_shared<query_scan_manager_state>();
+  state->query_token       = sirius::value_of(query_id);
+  state->physical_counters = _physical_counters;
+  state->pruning_enabled   = enable_pinned_zone_map_pruning;
+  state->completion        = completion;
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
   // whole pool. Oversubscription across concurrent queries is absorbed by the dispatcher's
   // pending queue and the pool, not by a per-query cap.
@@ -1548,8 +1547,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
 
     if (plan.budget > 0) {
       // Registers its mailbox for the query's lifetime; unregistered in reset().
-      state->readahead =
-        std::make_shared<readahead_scan_manager>(*_query_event_publisher, plan.budget);
+      state->readahead = std::make_shared<readahead_scan_manager>(
+        *_query_event_publisher, plan.budget, _physical_counters);
       state->readahead->prepare_for_query(query);
       state->readahead->start(plan.strategy);
     }
@@ -1584,7 +1583,39 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     }
     // This scan reads disk, so it needs any walk the ingestible deferred. Must run here on the
     // query thread: GetPartitionStats touches ClientContext/LocalStorage.
-    op->get_ingestible().ensure_metadata_prepared();
+    auto* native = dynamic_cast<op::scan::duckdb_native_gpu_ingestible*>(&op->get_ingestible());
+    if (native) { acquire_checkpoint_key(query_id, native->attached_database()); }
+    auto pause_native_with_key_for_testing = [&] {
+      if (!native) { return; }
+      auto const& native_info =
+        static_cast<op::scan::duckdb_native_ingestible_table_info const&>(native->table_info());
+      auto state =
+        native_info.context->registered_state
+          ? native_info.context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+          : nullptr;
+      if (state && state->native_checkpoint_hook_for_testing) {
+        bool const pending = native->metadata_walk_pending();
+        state->observe_native_checkpoint_for_testing(
+          *native_info.context,
+          pending ? "native_walk_failed" : "native_prepared",
+          pending ? 0 : native->checkpoint_iteration());
+      }
+      duckdb::Value pause_ms;
+      if (native_info.context->TryGetCurrentSetting("sirius_test_pause_native_decode_ms",
+                                                    pause_ms) &&
+          !pause_ms.IsNull() && pause_ms.GetValue<uint64_t>() > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms.GetValue<uint64_t>()));
+      }
+    };
+    try {
+      op->get_ingestible().ensure_metadata_prepared();
+    } catch (...) {
+      // Pause with the checkpoint key held after metadata preparation fails, so tests can
+      // observe FORCE CHECKPOINT waiting before cleanup and replay.
+      pause_native_with_key_for_testing();
+      throw;
+    }
+    if (native) { pause_native_with_key_for_testing(); }
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(), [this](std::string_view file_path) -> std::shared_ptr<io::ioctx> {
         auto io_ctx = ioctx_for_path(file_path);
@@ -1612,10 +1643,26 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     return;
   }
 
-  state->checkpoint_locks.reserve(state->pending_mvcc_mask_jobs.size());
   for (auto const& request : state->pending_mvcc_mask_jobs) {
-    state->checkpoint_locks.push_back(
-      duckdb::DuckTransactionManager::Get(request.storage->GetAttached()).SharedCheckpointLock());
+    acquire_checkpoint_key(query_id, request.storage->GetAttached());
+  }
+
+  for (auto& request : state->pending_insert_delta_jobs) {
+    auto const* database = &request.storage->GetAttached();
+    std::optional<uint64_t> held_token;
+    {
+      std::lock_guard lk{_checkpoint_locks_mutex};
+      auto const it = _checkpoint_locks.find(query_id);
+      if (it != _checkpoint_locks.end()) {
+        auto const match = std::ranges::find_if(
+          it->second, [&](auto const& entry) { return entry.database == database && entry.key; });
+        if (match != it->second.end()) { held_token = match->query_token; }
+      }
+    }
+    if (!held_token)
+      throw std::logic_error("insert-delta capture requires the query checkpoint key");
+    request.checkpoint_witness = op::scan::key_held_witness{
+      database, request.storage->GetAttached().GetStorageManager().GetDBPath(), *held_token};
   }
 
   // A manual CHECKPOINT can replace DuckDB's on-disk base while the pinned
@@ -1627,11 +1674,12 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       &request.storage->GetAttached().GetStorageManager().GetBlockManager());
     if (block_manager == nullptr ||
         block_manager->GetCheckpointIteration() != request.metadata.checkpoint_iteration) {
-      throw std::runtime_error(
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::checkpoint_revalidation,
         "Sirius cannot safely scan pinned DuckDB table '" + request.entry_name +
-        "': its database was checkpointed after pin_table, so the pinned cache may be stale. "
-        "Run CALL unpin_table('" +
-        request.entry_name + "'), then pin_table again");
+          "': its database was checkpointed after pin_table, so the pinned cache may be stale. "
+          "Run CALL unpin_table('" +
+          request.entry_name + "'), then pin_table again");
     }
   }
 
@@ -1772,7 +1820,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
         delta_splits = cut_delta_splits_for_op(*delta_request,
                                                duckdb_info->projected_cols,
                                                io_ctx->open_datasource(duckdb_info->db_path),
-                                               sf_bm);
+                                               sf_bm,
+                                               assignment.op->contract_id());
         SIRIUS_LOG_INFO(
           "[sirius_scan_manager] operator '{}' serves {} insert-delta split(s) of pinned entry "
           "'{}' ({} delta row(s))",
@@ -1849,7 +1898,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     } else if (late_mat.port != nullptr) {
       installed_rides.push_back(installed_ride{late_mat.port, assignment.op});
     }
-    auto provider = make_provider_for_pinned_entry(assignment.entry,
+    auto provider                 = make_provider_for_pinned_entry(assignment.entry,
                                                    assignment.columns,
                                                    std::move(assignment.plan),
                                                    assignment.op->batch_telemetry(),
@@ -1859,11 +1908,47 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                    assignment.op->has_physical_overrides(),
                                                    std::move(pushdown_req),
                                                    std::move(dynamic_filters));
+    provider->contract_id         = assignment.op->contract_id();
+    provider->validation.identity = assignment.entry->identity_evidence;
+    provider->validation.layout   = assignment.entry->layout_evidence;
+    bool const native_pin = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(
+                              &assignment.op->get_ingestible().table_info()) != nullptr;
+    bool const native_validated      = native_pin && assignment.entry->mvcc != nullptr;
+    provider->validation.iteration   = {native_pin, native_validated};
+    provider->validation.visibility  = {native_pin, native_validated};
+    provider->validation.structure   = {true, true};
+    provider->validation.query_token = sirius::value_of(query_id);
     state->metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
   install_rider_deferrals(rider_candidates, installed_rides);
   state->pending_mvcc_mask_jobs.clear();
   state->pending_insert_delta_jobs.clear();
+
+  auto const query_token = sirius::value_of(query_id);
+  for (auto const& scan_entry : state->scans) {
+    auto* scan = scan_entry.op;
+    std::optional<op::scan::key_held_witness> expected_key;
+    if (auto* native =
+          dynamic_cast<op::scan::duckdb_native_gpu_ingestible*>(&scan->get_ingestible())) {
+      auto* database = &native->attached_database();
+      bool key_held  = false;
+      {
+        std::lock_guard lk{_checkpoint_locks_mutex};
+        auto const it = _checkpoint_locks.find(query_id);
+        if (it != _checkpoint_locks.end()) {
+          key_held = std::ranges::any_of(it->second, [&](auto const& entry) {
+            return entry.database == database && entry.key && entry.query_token == query_token;
+          });
+        }
+      }
+      if (key_held) {
+        expected_key = op::scan::key_held_witness{
+          database, database->GetStorageManager().GetDBPath(), query_token};
+      }
+    }
+    scan->set_query_validation(query_token, std::move(expected_key));
+    scan->get_ingestible().set_execution_completion(completion);
+  }
 
   // Publish only once the state is fully built: a prepare that threw above destroys `state`
   // locally and never leaves a half-built entry visible to reset() or a concurrent prepare.
@@ -1968,7 +2053,7 @@ void sirius_scan_manager::list_objects_paged(
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
                              s3_prefix_uri + "'");
   }
-  auto* rest = rest_ioctx_for_list();
+  auto rest = rest_ioctx_for_list(s3_prefix_uri);
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -1983,7 +2068,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: malformed URI '" + s3_uri +
                              "'");
   }
-  auto* rest = rest_ioctx_for_list();
+  auto rest = rest_ioctx_for_list(s3_uri);
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -1993,57 +2078,114 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
 
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
 {
-  // Normalize here so every caller (incl. the scan resolver, which forwards raw
-  // ingestible paths) routes `file://` the same way create_datasource does.
+  // Normalize raw ingestible paths before routing, including file:// URIs.
   auto file_path = normalize_path(std::string(path));
   auto type      = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
-  return ioctx_for_type(*type);
+  return ioctx_for_type(*type, file_path);
 }
 
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
-  sirius::io::io_context_type type)
+  sirius::io::io_context_type type, std::string_view path)
 {
-  // The local default `_io_ctx` already serves uring/kvikio; only an off-default
-  // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
-  if (_io_ctx && _io_ctx->type() == type) { return _io_ctx; }
+  auto const file_path    = path.empty() ? std::string{} : normalize_path(std::string(path));
+  std::uint64_t config_id = 0;
+  std::shared_ptr<const sirius::io::object_store_config> resolved_config;
+  auto const uses_object_store_config =
+    type == sirius::io::io_context_type::restful || type == sirius::io::io_context_type::kvikio;
+  if (uses_object_store_config && !file_path.empty()) {
+    if (auto snapshot = _s3_configs.resolve(file_path)) {
+      config_id       = snapshot->id;
+      resolved_config = std::move(snapshot->config);
+    }
+  }
+  // ID 0 denotes the manager's default config; installed snapshots have
+  // unique non-zero IDs, so a credential rotation cannot reuse an old ioctx.
+  auto const cache_key = routed_ioctx_key{type, config_id};
+  if (_io_ctx && _io_ctx->type() == type && !resolved_config) { return _io_ctx; }
 
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
+      return it->second;
+    }
   }
-  // Build outside the map mutex: make_ioctx/start spawn reactor threads and
-  // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
-  // park every concurrent lookup behind one long critical section. The build
-  // mutex serializes builders instead, so two first-touches of the same type
-  // never construct twice (a losing ioctx would need drain/stop teardown).
-  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+  // Serialize construction, not ordinary lookups. A waiting builder rechecks
+  // the scope so it cannot publish an ioctx with superseded credentials.
+  std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
+  if (uses_object_store_config && !file_path.empty()) {
+    auto latest          = _s3_configs.resolve(file_path);
+    auto const latest_id = latest ? latest->id : 0;
+    if (latest_id != config_id) {
+      build_lk.unlock();
+      return ioctx_for_type(type, file_path);
+    }
+  }
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
+      return it->second;
+    }
   }
-  auto io_ctx = _ioctx_registry.make_ioctx(type);
+  auto backend_config = _config;
+  if (resolved_config) { backend_config.object_store = *resolved_config; }
+  auto io_ctx = _ioctx_registry.make_ioctx(type, backend_config);
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
   if (_config.cache.use_prefetching_cache() && io_ctx->can_use_prefetching_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
   }
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] = _routed_io_ctxs.emplace(type, std::move(io_ctx));
+  auto [it, inserted] = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx));
   return it->second;
 }
 
-sirius::io::rest::rest_ioctx* sirius_scan_manager::rest_ioctx_for_list()
+std::shared_ptr<sirius::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(
+  std::string_view path)
 {
-  auto io_ctx = ioctx_for_type(sirius::io::io_context_type::restful);
-  return dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  return std::dynamic_pointer_cast<sirius::io::rest::rest_ioctx>(
+    ioctx_for_type(sirius::io::io_context_type::restful, path));
+}
+
+void sirius_scan_manager::install_s3_config(std::string_view path,
+                                            sirius::io::object_store_config config)
+{
+  auto scope = normalize_path(std::string(path));
+  std::vector<std::shared_ptr<sirius::io::ioctx>> retired;
+  {
+    // Existing in-flight users retain shared ownership of the old context.
+    std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+    auto superseded_id = _s3_configs.install(scope, std::move(config));
+    if (superseded_id) {
+      std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
+      for (auto const type :
+           {sirius::io::io_context_type::restful, sirius::io::io_context_type::kvikio}) {
+        auto it = _routed_io_ctxs.find(routed_ioctx_key{type, *superseded_id});
+        if (it != _routed_io_ctxs.end()) {
+          retired.push_back(std::move(it->second));
+          _routed_io_ctxs.erase(it);
+        }
+      }
+    }
+  }
 }
 
 void sirius_scan_manager::query_scan_manager_state::drain() noexcept
 {
+  if (completion && completion->injections)
+    completion->release_footer_for_testing(completion->injections->hold_footer_index);
   // Stop the prefetcher first: it holds shared_ptrs to the operators'
   // connectors and must not convert batches while per-query state is torn down.
-  prefetcher.reset();
+  if (prefetcher) {
+    prefetcher->stop();
+    if (physical_counters && physical_counters->track_units) {
+      try {
+        physical_counters->prefetcher_conversions(query_token, prefetcher->batches_prefetched());
+      } catch (...) {  // Test observation must not interrupt cleanup.
+      }
+    }
+    prefetcher.reset();
+  }
   if (!dispatcher) { return; }
   dispatcher->request_stop();
   dispatcher->wait_for_all();
@@ -2063,13 +2205,20 @@ std::shared_ptr<sirius_scan_manager::query_scan_manager_state> sirius_scan_manag
 
 void sirius_scan_manager::reset(sirius::query_id_t query_id)
 {
+  drain_query(query_id);
+  release_checkpoint_keys(query_id);
+}
+
+void sirius_scan_manager::drain_query(sirius::query_id_t query_id)
+{
   std::shared_ptr<query_scan_manager_state> state;
   {
     std::lock_guard lk{_query_states_mutex};
     auto it = _query_states.find(query_id);
-    if (it == _query_states.end()) { return; }  // already reset, or never registered
-    state = std::move(it->second);
-    _query_states.erase(it);
+    if (it != _query_states.end()) {
+      state = std::move(it->second);
+      _query_states.erase(it);
+    }
   }
   // Outside the lock on purpose: draining waits out this query's in-flight reads, which can
   // take as long as the slowest outstanding IO. Holding _query_states_mutex across it would
@@ -2080,7 +2229,8 @@ void sirius_scan_manager::reset(sirius::query_id_t query_id)
   // a task still running is a use-after-free (scoped_dispatcher's dtor asserts on it).
   // ~query_scan_manager_state then runs: dispatcher (already idle) first, then the coalescer,
   // then the providers.
-  state->drain();
+  if (state) { state->drain(); }
+  state.reset();
 }
 
 void sirius_scan_manager::reset_all()
@@ -2090,6 +2240,12 @@ void sirius_scan_manager::reset_all()
     std::lock_guard lk{_query_states_mutex};
     query_ids.reserve(_query_states.size());
     for (auto const& [query_id, state] : _query_states) {
+      query_ids.push_back(query_id);
+    }
+  }
+  {
+    std::lock_guard lk{_checkpoint_locks_mutex};
+    for (auto const& [query_id, keys] : _checkpoint_locks) {
       query_ids.push_back(query_id);
     }
   }
@@ -2176,6 +2332,63 @@ void sirius_scan_manager::reset_caches()
   for (auto& [type, io_ctx] : _routed_io_ctxs) {
     if (io_ctx) { refresh(*io_ctx); }
   }
+}
+
+void sirius_scan_manager::acquire_checkpoint_key(sirius::query_id_t query_id,
+                                                 duckdb::AttachedDatabase& database)
+{
+  auto key = duckdb::DuckTransactionManager::Get(database).SharedCheckpointLock();
+  std::lock_guard lk{_checkpoint_locks_mutex};
+  _checkpoint_locks[query_id].push_back(
+    checkpoint_lock_entry{&database, std::move(key), sirius::value_of(query_id)});
+}
+
+void sirius_scan_manager::release_checkpoint_keys(sirius::query_id_t query_id)
+{
+  std::vector<checkpoint_lock_entry> keys;
+  {
+    std::lock_guard lk{_checkpoint_locks_mutex};
+    auto it = _checkpoint_locks.find(query_id);
+    if (it == _checkpoint_locks.end()) { return; }
+    keys = std::move(it->second);
+    _checkpoint_locks.erase(it);
+  }
+}
+
+bool sirius_scan_manager::holds_checkpoint_key(
+  duckdb::AttachedDatabase const& database) const noexcept
+{
+  std::lock_guard lk{_checkpoint_locks_mutex};
+  for (auto const& [query_id, keys] : _checkpoint_locks) {
+    if (std::any_of(keys.begin(), keys.end(), [&](auto const& entry) {
+          return entry.database == &database;
+        })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::size_t sirius_scan_manager::checkpoint_key_count(sirius::query_id_t query_id) const noexcept
+{
+  std::lock_guard lk{_checkpoint_locks_mutex};
+  auto it = _checkpoint_locks.find(query_id);
+  return it == _checkpoint_locks.end() ? 0 : it->second.size();
+}
+
+std::size_t sirius_scan_manager::checkpoint_key_count() const noexcept
+{
+  std::lock_guard lk{_checkpoint_locks_mutex};
+  std::size_t count = 0;
+  for (auto const& [query_id, keys] : _checkpoint_locks) {
+    count += keys.size();
+  }
+  return count;
+}
+
+bool sirius_scan_manager::holds_any_checkpoint_key() const noexcept
+{
+  return checkpoint_key_count() != 0;
 }
 
 void sirius_scan_manager::start() {}
@@ -2611,6 +2824,14 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
           stored.push_back(column_names[i]);
         }
       }
+      std::vector<std::size_t> evidence_columns(entry.cache_info.column_ids.size());
+      std::iota(evidence_columns.begin(), evidence_columns.end(), 0);
+      try {
+        validate_pinned_entry_for_serving(entry, evidence_columns);
+        entry.layout_evidence = {true, true};
+      } catch (std::exception const&) {
+        entry.layout_evidence = {true, false};
+      }
       return stored;
     }
     // Source, row count, or completeness contract differs → remove registry visibility and rebuild
@@ -2641,6 +2862,15 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
 
   // A new object gets a new handle. Any query still serving the old object keeps
   // that exact object alive; its origins never resolve through this name.
+  entry.identity_evidence = {true, true};
+  std::vector<std::size_t> evidence_columns(entry.cache_info.column_ids.size());
+  std::iota(evidence_columns.begin(), evidence_columns.end(), 0);
+  try {
+    validate_pinned_entry_for_serving(entry, evidence_columns);
+    entry.layout_evidence = {true, true};
+  } catch (std::exception const&) {
+    entry.layout_evidence = {true, false};
+  }
   _pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry));
   publish_late_mat_handle(name);
   // The replace path stored every column.
@@ -2745,6 +2975,15 @@ void sirius_scan_manager::insert_pinned_entry_host(
   // Replace, never mutate: a query already serving the old entry holds its own shared_ptr and
   // keeps both its data and exact-object late-mat handle valid to completion. Only the map slot
   // is swapped here, all under one lock so a concurrent lookup sees either whole entry.
+  entry.identity_evidence = {true, true};
+  std::vector<std::size_t> evidence_columns(entry.cache_info.column_ids.size());
+  std::iota(evidence_columns.begin(), evidence_columns.end(), 0);
+  try {
+    validate_pinned_entry_for_serving(entry, evidence_columns);
+    entry.layout_evidence = {true, true};
+  } catch (std::exception const&) {
+    entry.layout_evidence = {true, false};
+  }
   std::lock_guard pin_lk{_pinned_entries_mutex};
   _pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry));
   publish_late_mat_handle(name);
@@ -2801,6 +3040,15 @@ void sirius_scan_manager::insert_pinned_entry_device(
 
   // Replace, never mutate — see insert_pinned_entry_host. Existing query leases keep the old
   // entry and its handle alive without redirecting either through this registry name.
+  entry.identity_evidence = {true, true};
+  std::vector<std::size_t> evidence_columns(entry.cache_info.column_ids.size());
+  std::iota(evidence_columns.begin(), evidence_columns.end(), 0);
+  try {
+    validate_pinned_entry_for_serving(entry, evidence_columns);
+    entry.layout_evidence = {true, true};
+  } catch (std::exception const&) {
+    entry.layout_evidence = {true, false};
+  }
   std::lock_guard pin_lk{_pinned_entries_mutex};
   _pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry));
   publish_late_mat_handle(name);
@@ -2917,37 +3165,21 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
 
   std::size_t total_bytes = 0;
   for (auto const& path : file_paths) {
-    auto const cache_key = normalize_path(path);
-    auto const io_ctx    = ioctx_for_path(path);
-    bool const footer_cached =
-      io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
-    auto datasource = create_datasource(
+    auto const cache_key     = normalize_path(path);
+    auto const io_ctx        = ioctx_for_path(path);
+    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+    auto datasource          = create_datasource(
       path,
       footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe);
     if (!datasource) {
       throw std::runtime_error("[pin_table] no backend supports parquet path: " + path);
     }
 
-    // Same footer resolution as describe_parquet / build_file_scan_info, so a
-    // file is parsed at most once per process however it is first touched.
-    std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
-    if (auto cached_md = datasource->metadata()) {
-      if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached_md))) {
-        file_metadata = pm->file_metadata();
-      }
-    }
-    if (!file_metadata) {
-      auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
-      auto const footer_byte_len = footer_buffer->size();
-      auto probe_options         = cudf::io::parquet_reader_options::builder().build();
-      cudf::io::parquet::experimental::hybrid_scan_reader reader{
-        cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-        probe_options};
-      file_metadata =
-        std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
-      std::ignore = datasource->store_metadata(
-        std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len));
-    }
+    // Use the shared resolver so a pin publishes complete footer evidence and
+    // later scans reuse the exact same metadata record.
+    auto const probe_options = cudf::io::parquet_reader_options::builder().build();
+    auto const metadata = op::scan::resolve_parquet_metadata(*datasource, 0, path, probe_options);
+    auto const file_metadata = metadata->file_metadata();
 
     if (file_metadata->row_groups.empty()) { continue; }
     std::vector<cudf::size_type> row_groups(file_metadata->row_groups.size());
@@ -3544,11 +3776,15 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
           [&](insert_delta_job_request const& r) { return r.entry_name == pinned_name; });
         if (delta_request == state.pending_insert_delta_jobs.end()) {
           insert_delta_job_request request;
-          request.storage                = duckdb_info->storage;
-          request.context                = duckdb_info->context;
-          request.n_cache                = entry.mvcc->n_cache();
-          request.approximate_batch_size = duckdb_info->approximate_batch_size;
-          request.entry_name             = pinned_name;
+          request.storage                  = duckdb_info->storage;
+          request.context                  = duckdb_info->context;
+          request.n_cache                  = entry.mvcc->n_cache();
+          request.approximate_batch_size   = duckdb_info->approximate_batch_size;
+          request.entry_name               = pinned_name;
+          request.first_consuming_contract = op->contract_id();
+          request.profiles                 = duckdb_info->profiles;
+          request.storage_version =
+            duckdb_info->storage->GetAttached().GetStorageManager().GetStorageVersion();
           state.pending_insert_delta_jobs.push_back(std::move(request));
           delta_request = std::prev(state.pending_insert_delta_jobs.end());
         }

@@ -22,6 +22,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_FILTER` | `FILTER` | `src/planner/sirius_plan_filter.cpp` |
 | `LOGICAL_AGGREGATE_AND_GROUP_BY` | `HASH_GROUP_BY` / `UNGROUPED_AGGREGATE` | `src/planner/sirius_plan_aggregate.cpp` |
 | `LOGICAL_COMPARISON_JOIN` | `HASH_JOIN` / `NESTED_LOOP_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
+| `LOGICAL_CROSS_PRODUCT` | `NESTED_LOOP_JOIN` (no conditions) | `src/planner/sirius_plan_cross_product.cpp` |
 | `LOGICAL_DELIM_JOIN` | `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
 | `LOGICAL_ORDER_BY` | `ORDER_BY` | `src/planner/sirius_plan_order.cpp` |
 | `LOGICAL_TOP_N` | `TOP_N` | `src/planner/sirius_plan_top_n.cpp` |
@@ -36,7 +37,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (`ALL` forms only) | `REPLICATE` over `PROJECTION`, `HASH_GROUP_BY` and `UNION` | `src/planner/sirius_plan_set_operation.cpp` |
 
 **Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
-`LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_CROSS_PRODUCT`, `LOGICAL_RECURSIVE_CTE`
+`LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_RECURSIVE_CTE`
 
 **Unsupported expressions** are rejected the same way, during plan construction rather than at execution time. Wherever a plan builder translates a DuckDB expression via `sirius::ast::from_duckdb()`, a `nullptr` result (untranslatable expression) throws `NotImplementedException` so the query falls back to CPU instead of reaching the GPU evaluator with a hole in its expression list. Rejection sites: projections (`sirius_plan_projection.cpp`), filter predicates (`sirius_plan_filter.cpp`), pushed-down scan filters (`sirius_plan_get.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`, `sirius_physical_table_scan.cpp` — where a *skipped* pushdown translation is distinguished from a *failed* one so a predicate is never silently dropped), and join conditions (`src/expression/join_condition.cpp`). Nested-typed (STRUCT/LIST/MAP) columns are accepted for scan and projection passthrough but rejected as *operands* — in WHERE, GROUP BY, JOIN ON, and sort keys (`sirius_plan_order.cpp`, `sirius_plan_top_n.cpp`) — via `reject_nested_column_operation()` in `sirius_physical_plan_generator.cpp`. Two further non-operator reject conditions: any plan node whose output types contain `SQLNULL` (e.g. an uncast `NULL` in `VALUES`), and any aggregate expression the translator declines (e.g. ORDER BY aggregates lowered to `arg_min_null`/`create_sort_key`) — both throw in `sirius_physical_plan_generator.cpp` / `sirius_plan_aggregate.cpp`. Because rejection is a plan-capability decision, an unsupported expression falls back even when the input is empty.
 
@@ -52,6 +53,8 @@ The `plan_comparison_join()` method selects the join implementation:
 Left side = probe (streamed), right side = build (materialized).
 
 Before either is chosen, `materialize_expression_join_keys()` pushes a projection below the join that turns complex equality-key expressions into real columns, rewriting the condition side to a plain reference so `PARTITION` (which hashes by column index) can consume it. It also materializes the *cast* on a null-safe key that will be routed to the mixed join's cuDF AST predicate: a routed key skips the hash-key path's `cudf::cast`, and a cuDF AST can only cast to INT64 / UINT64 / FLOAT64, so e.g. the INTEGER cast DuckDB inserts for a SMALLINT/INTEGER `IS NOT DISTINCT FROM` has to become a column. `are_conditions_supported()` rejects any routed null-safe key still carrying an untranslatable expression, so the join lands on the nested loop join (or CPU) instead of throwing mid-query.
+
+A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, `JOIN ... ON true`) becomes a `NESTED_LOOP_JOIN` without conditions (`src/planner/sirius_plan_cross_product.cpp`). It is refused when its estimated output exceeds the row limit of a cuDF column.
 
 ### Aggregate Planning
 

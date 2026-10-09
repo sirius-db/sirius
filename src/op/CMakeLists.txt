@@ -28,6 +28,8 @@ target_sources(
           scan/parquet_gpu_ingestible.cpp
           scan/parquet_materialize.cpp
           scan/duckdb_native_gpu_ingestible.cpp
+          scan/table_scan/bound_read_view.cpp
+          scan/table_scan/parquet_physical_profile.cpp
           scan/iceberg_metadata_reader.cpp
           scan/puffin_reader.cpp
           scan/positional_delete_filter.cpp
@@ -36,6 +38,8 @@ target_sources(
           scan/iceberg_gpu_ingestible.cpp
           dynamic_filter/dynamic_filter_key_domain.cpp
           dynamic_filter/dynamic_filter_publish_plan.cpp
+          dynamic_filter/complete_build_inventory.cpp
+          dynamic_filter/dynamic_filter_replica_space.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
           dynamic_filter/sirius_dynamic_filter.cpp
           sirius_physical_column_data_scan.cpp

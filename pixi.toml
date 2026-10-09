@@ -10,13 +10,16 @@ platforms = [
   { name = "linux-64-cuda12", platform = "linux-64", cuda = "12" },
   { name = "linux-aarch64-cuda12", platform = "linux-aarch64", cuda = "12" },
 ]
-requires-pixi = ">=0.71"
+requires-pixi = ">=0.78"
 
 [activation]
 scripts = ["scripts/pixi_activate.sh"]
 
 [activation.env]
 SCCACHE_BASEDIRS = "$PIXI_PROJECT_ROOT:$CONDA_PREFIX"
+# BASEDIRS + preprocessor cache mode can serve another checkout's object and depfile
+# (mozilla/sccache#2863, fix in #2868); remove once a release with the fix is pinned.
+SCCACHE_DIRECT = "false"
 
 [dependencies]
 bc = "*"
@@ -42,7 +45,6 @@ mold = "*"
 libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
-boto3 = ">=1.43.68,<2"
 croaring = "*"
 
 [pypi-dependencies]
@@ -60,14 +62,13 @@ sqlite = "3.*"
 rust-src = "*"
 liburing = "*"
 openssl = "*"
+xxhash = "0.8.*"
 libcurl = "*"
 pnpm = "*"
-python = ">=3.10"
+python = "3.14.*"
 pyarrow = ">=14"
-# Go toolchain (with cgo) to build the patched testcontainers-native bridge used
-# by the C++ S3 integration tests (fetched at configure time; see
-# cmake/testcontainers_native.cmake). Upstream go.mod requires >=1.25.
-go-cgo = ">=1.25"
+seaweedfs = ">=4.48"
+fastavro = "1.12.2.*"
 
 [tasks]
 

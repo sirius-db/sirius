@@ -115,6 +115,13 @@ walk_result walk_all(duckdb::DataTable& storage,
 
 }  // namespace
 
+TEST_CASE("native range uses unknown reason until a refusal is classified",
+          "[scan][duckdb_native_walker]")
+{
+  duckdb_native_row_group_range range;
+  REQUIRE(range.failure_reason == verdict_reason::native_unknown);
+}
+
 //===--------------------------------------------------------------------===//
 // Overflow (big-string) refusal — strings at/over GetStringBlockLimit (4,096 B
 // at the default block size) live in overflow blocks the GPU string decoder

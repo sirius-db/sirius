@@ -57,21 +57,21 @@ namespace sirius::op::detail {
 class scoped_replica_reservation final {
  public:
   /**
-   * @brief Attempts to reserve and attach destination capacity
+   * @brief Attempts to reserve @p bytes in @p space and attach them to @p stream's tracker
    *
    * @throw std::invalid_argument if @p bytes is zero
-   * @throw std::logic_error if @p target has no GPU reservation-aware allocator
+   * @throw std::logic_error if @p space has no GPU reservation-aware allocator
    * @return An attached scope, or `std::nullopt` when capacity or tracker state rejects it
    */
   [[nodiscard]] static std::optional<scoped_replica_reservation> try_acquire(
-    dynamic_filter_replica_space const& target, std::size_t bytes, ::cuda::stream_ref stream)
+    cucascade::memory::memory_space& space, std::size_t bytes, ::cuda::stream_ref stream)
   {
     if (bytes == 0) {
       throw std::invalid_argument(
         "[scoped_replica_reservation] a replica reservation must be non-empty");
     }
 
-    auto reservation = target.get_gpu_space().make_reservation_or_null(bytes);
+    auto reservation = space.make_reservation_or_null(bytes);
     if (!reservation) { return std::nullopt; }
 
     auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
@@ -88,6 +88,17 @@ class scoped_replica_reservation final {
 
     scoped_replica_reservation scope{allocator, stream};
     return std::optional<scoped_replica_reservation>{std::move(scope)};
+  }
+
+  /**
+   * @brief Attempts to reserve and attach destination capacity in @p target's GPU space
+   *
+   * @copydetails try_acquire(cucascade::memory::memory_space&, std::size_t, ::cuda::stream_ref)
+   */
+  [[nodiscard]] static std::optional<scoped_replica_reservation> try_acquire(
+    dynamic_filter_replica_space const& target, std::size_t bytes, ::cuda::stream_ref stream)
+  {
+    return try_acquire(target.get_gpu_space(), bytes, stream);
   }
 
   scoped_replica_reservation(scoped_replica_reservation const&)            = delete;

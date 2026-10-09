@@ -63,7 +63,7 @@
         "CMAKE_C_COMPILER_LAUNCHER": "sccache",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_LINKER_TYPE": "MOLD",
-        "DUCKDB_EXTENSION_CONFIGS": "${sourceDir}/../extension_config.cmake",
+        "DUCKDB_EXTENSION_CONFIGS": "${fileDir}/../extension_config.cmake",
         "EXPORT_DYNAMIC_SYMBOLS": "ON",
         "EXTENSION_STATIC_BUILD": "ON",
         "OVERRIDE_GIT_DESCRIBE": "v1.5.6"
@@ -85,7 +85,7 @@
       "name": "base-clang"
     },
     {
-      "binaryDir": "${sourceDir}/../build/debug",
+      "binaryDir": "${fileDir}/../build/debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_CUDA_FLAGS_DEBUG": "-g -lineinfo -O0",
@@ -99,7 +99,7 @@
       "name": "debug"
     },
     {
-      "binaryDir": "${sourceDir}/../build/release",
+      "binaryDir": "${fileDir}/../build/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
@@ -108,7 +108,7 @@
       "name": "release"
     },
     {
-      "binaryDir": "${sourceDir}/../build/relwithdebinfo",
+      "binaryDir": "${fileDir}/../build/relwithdebinfo",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       },
@@ -117,7 +117,7 @@
       "name": "relwithdebinfo"
     },
     {
-      "binaryDir": "${sourceDir}/../build/clang-debug",
+      "binaryDir": "${fileDir}/../build/clang-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_CUDA_FLAGS_DEBUG": "-g -lineinfo -O0",
@@ -131,7 +131,7 @@
       "name": "clang-debug"
     },
     {
-      "binaryDir": "${sourceDir}/../build/clang-release",
+      "binaryDir": "${fileDir}/../build/clang-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
@@ -140,7 +140,7 @@
       "name": "clang-release"
     },
     {
-      "binaryDir": "${sourceDir}/../build/clang-relwithdebinfo",
+      "binaryDir": "${fileDir}/../build/clang-relwithdebinfo",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       },
@@ -163,7 +163,7 @@
       "name": "clang-sanitizer-base"
     },
     {
-      "binaryDir": "${sourceDir}/../build/clang-asan",
+      "binaryDir": "${fileDir}/../build/clang-asan",
       "displayName": "Clang ASan (RelWithDebInfo)",
       "environment": {
         "SIRIUS_SANITIZER_TYPE": "address"
@@ -172,7 +172,7 @@
       "name": "clang-asan"
     },
     {
-      "binaryDir": "${sourceDir}/../build/clang-tsan",
+      "binaryDir": "${fileDir}/../build/clang-tsan",
       "displayName": "Clang TSan (RelWithDebInfo)",
       "environment": {
         "SIRIUS_SANITIZER_TYPE": "thread"
@@ -183,12 +183,11 @@
     {
       "cacheVariables": {
         "CMAKE_LINKER_TYPE": "BFD",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_TOOLCHAIN_FILE": "${fileDir}/../vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CPM_LOCAL_PACKAGES_ONLY": "ON",
-        "SIRIUS_BUILD_S3_TESTS": "OFF",
         "VCPKG_BUILD": "ON",
         "VCPKG_INSTALL_OPTIONS": "--clean-buildtrees-after-build",
-        "VCPKG_MANIFEST_DIR": "${sourceDir}/.."
+        "VCPKG_MANIFEST_DIR": "${fileDir}/.."
       },
       "environment": {
         "VCPKG_BUILD_TYPE": "release",
@@ -200,7 +199,7 @@
       "name": "vcpkg-base"
     },
     {
-      "binaryDir": "${sourceDir}/../build/vcpkg-debug",
+      "binaryDir": "${fileDir}/../build/vcpkg-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_CUDA_FLAGS_DEBUG": "-g -lineinfo -O0",
@@ -212,7 +211,7 @@
       "name": "vcpkg-debug"
     },
     {
-      "binaryDir": "${sourceDir}/../build/vcpkg-release",
+      "binaryDir": "${fileDir}/../build/vcpkg-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
@@ -221,7 +220,7 @@
       "name": "vcpkg-release"
     },
     {
-      "binaryDir": "${sourceDir}/../build/vcpkg-relwithdebinfo",
+      "binaryDir": "${fileDir}/../build/vcpkg-relwithdebinfo",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       },
@@ -230,7 +229,7 @@
       "name": "vcpkg-relwithdebinfo"
     },
     {
-      "binaryDir": "${sourceDir}/../build/ci-release",
+      "binaryDir": "${fileDir}/../build/ci-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_CUDA_COMPILER_LAUNCHER": "ccache",
@@ -239,7 +238,7 @@
         "CMAKE_LINKER_TYPE": "",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_TOOLCHAIN_PATH}"
       },
-      "displayName": "CI Release (Docker vcpkg + ccache)",
+      "displayName": "CI Release (vcpkg + ccache)",
       "inherits": "vcpkg-base",
       "name": "ci-release"
     }

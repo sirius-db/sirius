@@ -56,12 +56,21 @@ jobs:
       - name: Init build submodules
         run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
 
-      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
         with:
           cache: false
-          pixi-version: v0.71.1
+          locked: true
+          pixi-version: v0.81.0
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
+
+      - name: Test Simpatico cache identity without a GPU
+        run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} cmake \
+            -S src/compression/simpatico_codegen/tests/cache -B build/cache-host -G Ninja
+          pixi run -e ${{ matrix.cuda.pixi-environment }} cmake --build build/cache-host
+          pixi run -e ${{ matrix.cuda.pixi-environment }} ctest \
+            --test-dir build/cache-host -L cache_host --output-on-failure --no-tests=error
 
       - name: Configure sccache backend
         run: |
@@ -85,6 +94,13 @@ jobs:
         run: |
           set -o pipefail
           make -j$(nproc) 2>&1 | tee /tmp/build.log
+
+      - name: Build shared DuckDB scan host tests
+        run: |
+          cmake --build build/release --target libduckdb.so
+          cmake -S test/cmake/scan_host -B build/release/scan-host -G Ninja \
+            -DDUCKDB_LIBRARY="$PWD/build/release/src/libduckdb.so"
+          cmake --build build/release/scan-host
 
       - name: Check installed Sirius package
         run: |
@@ -143,10 +159,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
         with:
           cache: false
-          pixi-version: v0.71.1
+          locked: true
+          pixi-version: v0.81.0
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
@@ -156,6 +173,14 @@ jobs:
 
       - name: Extract build artifacts
         run: tar -xf build.tar
+
+      - name: Check shared DuckDB scan host detection
+        # The legacy DuckDB library includes Sirius and needs the driver libraries.
+        run: |
+          export LD_LIBRARY_PATH="$PWD/build/release/src${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          ./build/release/scan-host/scan_host_pie
+          ./build/release/scan-host/scan_host_pic
+          ./build/release/scan-host/scan_host_nonpie
 
       - name: Provision DuckDB extensions the tests load
         # The iceberg cases LOAD without INSTALL on purpose: a test must not reach the network,
@@ -226,6 +251,13 @@ jobs:
           chmod -R a+r test_datasets/
           mkdir -p test_datasets/tpch_parquet_sf1
           ./build/release/duckdb -f scripts/tpch_to_parquet.sql
+
+      - name: S3 integration tests
+        run: make s3-test
+
+      - name: S3 large integration tests
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: make s3-test-large
 
       - name: TPC-H performance snapshot
         id: tpch

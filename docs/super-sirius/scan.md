@@ -17,6 +17,12 @@ Before a query runs, `sirius_scan_manager::prepare_for_query` walks the plan's `
 
 Data reaches the GPU through the Sirius IO subsystem (`io::ioctx` / `io::sirius_datasource`, with a pinned-memory prefetching cache) — see the IO sections later in this document. The scan path consumes that layer: each split carries prefetch hints, and the read for a split goes through the `ioctx` its backend resolves to. The target device travels with the request.
 
+## Scan contracts
+
+Before transparent GPU execution, Sirius checks that its scans read the same bound inputs as DuckDB's original plan. Each fresh split is checked against the scan consuming it. Native scans hold checkpoint protection until cleanup, and CPU fallback requires permitted sources and successful cleanup.
+
+See [Scan Contracts](scan-contracts-design.md) for the checks, fallback rules, and limitations.
+
 ## Scan Operator
 
 ### `sirius_gpu_scan_operator` — `GPU_SCAN`
@@ -83,6 +89,19 @@ Two polymorphic carriers separate per-table from per-split state (`gpu_ingestibl
 
 The operator skips `post_filter_and_project` only when the state is already `ROW_FILTERED_AND_PROJECTED`.
 
+Required scan predicates, including `IS NOT NULL` introduced by DuckDB's string-predicate
+rewrites, belong to the scan's row-level evaluator. Native reads and pinned batches retain
+them through materialization and evaluate them before dropping filter-only columns. An empty
+`projection_ids` means all `column_ids` are read; an explicit projection is extended with
+filter-only columns while preserving the original output arity.
+
+Parquet (and its Iceberg subclass) also retains NULL predicates in the residual. Null-count
+statistics can prune whole row groups, but mixed groups still need row filtering. NULL tests
+never enter cuDF's min/max statistics expression; a partial reader pushdown cannot claim the
+whole predicate was applied. Numeric decode-range analysis likewise retains the residual when
+it cannot represent required NULL rejection. Advisory `OPTIONAL_FILTER`s and hive partition
+predicates already enforced by DuckDB's file selection remain omitted.
+
 ### Factories
 
 There is no factory class. Each implementation provides a free `make_ingestible(std::unique_ptr<...table_info>)` overload (defined in its `.cpp`); the pipeline converter calls the right overload by the concrete `table_info` type it built.
@@ -93,7 +112,7 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 ### DuckDB-native ingestible
 
-`duckdb_native_gpu_ingestible` (`duckdb_native_gpu_ingestible.{hpp,cpp}`) prepares a serial walk plan in its constructor (`prepare_duckdb_native_walk`: partition statistics, projected-type viability gate, and filter-stat row-group pruning — a non-viable query throws to trigger CPU fallback before any per-segment IO). It slices the table's row groups into fixed internal ranges of eight groups. `next_split_provider` hands out one range per claim; each metadata task walks that range and emits a `duckdb_native_scan_info`. `materialize_metadata_to_table` decodes the range's storage segments into a `cudf::table` (always `UNFILTERED`); filter evaluation and projection to output arity happen in `post_filter_and_project`.
+`duckdb_native_gpu_ingestible` (`duckdb_native_gpu_ingestible.{hpp,cpp}`) prepares its serial walk plan during execution preparation under a shared checkpoint lease (`prepare_duckdb_native_walk`: partition statistics, projected-type viability gate, and filter-stat row-group pruning — a non-viable query throws through the runtime fallback policy before any per-segment IO). See [Native checkpoint lease](scan-contracts-design.md#native-checkpoint-lease) for its lifetime and effect on checkpoints. It slices the table's row groups into fixed internal ranges of eight groups. `next_split_provider` hands out one range per claim; each metadata task walks that range and emits a `duckdb_native_scan_info`. `materialize_metadata_to_table` decodes the range's storage segments into a `cudf::table` (always `UNFILTERED`); filter evaluation and projection to output arity happen in `post_filter_and_project`.
 
 ### Iceberg ingestible
 
@@ -394,7 +413,7 @@ Before decode, the scan walks DuckDB's storage metadata to learn, per row group,
 
 ### Phase 1 — `prepare_duckdb_native_walk()` (serial)
 
-Runs once, single-threaded, because it touches `ClientContext`/`LocalStorage`, which are not thread-safe:
+Runs once during execution preparation under a shared checkpoint lease. This work stays on the query thread because `ClientContext`/`LocalStorage` are not thread-safe:
 
 - Reads `PartitionStatistics` for every row group (the source of each row group's absolute first-row index and row count, used both for rowid synthesis and decoded-byte budgeting).
 - Gates the projected types: an exhaustive type switch refuses 128-bit and nested types up front — except fixed-size `ARRAY` with a supported fixed-width element, which is admitted and decodes as cuDF `LIST` — so an unsupported projection becomes a clean CPU fallback before any per-segment IO.
@@ -423,11 +442,13 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
 1. **Row group statistics pruning:** during the per-file metadata task, `filter_row_groups_with_stats()` runs against each fetched footer; row groups whose Parquet column min/max statistics cannot match the filter are dropped before any read is scheduled. Pure hive-partition filters are dropped during plan construction since hive columns aren't in the parquet file.
 
-   Only the stats-safe part of the predicate is handed to the stats filter. `is_unsafe_for_stats_filter()` rejects any expression containing a null test, and a bare column reference used directly as the predicate (`WHERE flag`) — both fault inside cuDF's statistics rewrite rather than merely mis-pruning. `stats_safe_conjuncts()` keeps only the safe top-level AND conjuncts (so `v IS NULL AND id > 3000` still prunes on `id`); a compound conjunct containing anything unsafe is dropped whole. Dropping conjuncts is sound: it can only retain extra row groups, and the full predicate is still applied at read/post-decode time.
+   Only the stats-safe part of the predicate is handed to the stats filter. `is_unsafe_for_stats_filter()` rejects any expression containing a null test, and a bare column reference used directly as the predicate (`WHERE flag`) — both fault inside cuDF's statistics rewrite rather than merely mis-pruning. `conjuncts_without()` keeps only the safe top-level AND conjuncts (so `v IS NULL AND id > 3000` still prunes on `id`); a compound conjunct containing anything unsafe is dropped whole. Dropping conjuncts is sound: it can only retain extra row groups, and the full predicate is still applied at read/post-decode time.
 
 2. **Null-count pruning:** a second statistics pass prunes on `null_count`: an `IS NULL` predicate drops row groups with `null_count == 0`, and `IS NOT NULL` drops row groups where every row is null (`null_count == rg.num_rows`); an absent `null_count` stat keeps the row group. The predicates come straight from the `TableFilterSet` (not the converted AST — see the translation-path note below), only from conjunctive positions, and only for scalar leaf columns (nested/legacy-repeated schemas are skipped).
 
 3. **Reader-level filter pushdown:** the cuDF AST is set on `parquet_reader_options` via `set_filter()`, so cuDF applies the filter inside `read_parquet`. When the reader applies the row filter, `materialize_table` reports `ROW_FILTERED` (or `ROW_FILTERED_AND_PROJECTED` once hive partitions are assembled), so the scan operator skips a redundant post-decode filter.
+
+   Before cuDF 26.12, the reader's bloom filter probe is wrong for some column types (rapidsai/cudf#24319). The reader filter (`_reader_pushdown_expression`) therefore leaves out equalities on the types listed by `has_unreliable_bloom_filter_probe()`, and they are applied post-decode. From cuDF 26.12 the list is empty.
 
 Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
@@ -491,7 +512,7 @@ Three backends ship:
 | REST / object store | `rest::rest_ioctx = templated_ioctx<rest_reactor>` | `rest/rest_reactor.hpp` | `s3://` | libcurl-multi over an epoll loop; the worker chooses 4–16 MiB GETs and benefits from parallel operations. See [S3 / Object-Store Backend](#s3--object-store-backend). |
 | kvikio fallback | `kvikio_context` | (none) | any | Wraps kvikIO local/remote handles (GDS-capable for local files). It has no reactors or cache and consumes the shared prepared-slice hook eagerly and serially. |
 
-The scan manager builds one ioctx for the run: `uring_ioctx` when `backend` is `sirius`, otherwise the `kvikio_context` fallback (the registry can also resolve an `s3://` URL to the REST backend via `lookup`). A new backend is a reactor + io_object that satisfy the concepts, a `templated_ioctx` specialization, and a registry entry.
+The scan manager builds a local ioctx (`uring_ioctx` for `backend: sirius`, otherwise `kvikio_context`). It also builds REST ioctxs on demand for S3 LIST and for S3 reads routed through Sirius. REST ioctxs are cached by the path-scoped credential snapshot, so a replaced secret affects subsequent operations. A new backend is a reactor + io_object that satisfy the concepts, a `templated_ioctx` specialization, and a registry entry.
 
 ### S3 / Object-Store Backend
 
@@ -505,6 +526,10 @@ DuckDB still decodes Hive partition values, so `col=a%20b/` yields `a b`. Glob s
 
 **Opening objects.** A generic open issues a blocking HEAD to obtain the object size. A `parquet_footer_probe` open uses a suffix-range GET to obtain both the size and the footer bytes; those bytes stay on the resulting `rest_io_object` and serve the binder's footer reads. If the suffix response cannot be used, the open falls back to HEAD. Parsed footer metadata is stored separately in the ioctx's `metadata_store`.
 
+**Object identity.** The open's strong ETag (RFC 7232 §2.3) is its cache-version validator: the `rest_io_object`'s cache id is `path + 0x1F + ETag`, so an overwrite that changes the validator gets a different cache *generation* and shares neither cached bytes nor parsed metadata with its predecessor, while an identical strong tag maps to the same generation. An open whose ETag is missing, weak (`W/`), `*`, or otherwise malformed gets an id unique to that open: it caches within itself only, and the ioctx warns with bounded per-ioctx path deduplication. `rest_io_object::is_strong_tag()` and `generation_key()` expose the rule.
+
+Every range GET for a strong-validator open carries `If-Match: <ETag>`. On an accepted data response (`206`, or a full-object `200`) the response ETag must equal the open's; a `412`, or a missing, weak, or different tag, fails the read with `sirius::io::object_changed_error` (`object_path()`, `expected_tag()`, `observed_tag()`). Nothing from such a response is published, the failure is terminal rather than retried, and a transient retry (`503`) resends the same condition. Opens without a strong validator read unconditionally and offer no snapshot consistency across their GETs. A prefetch that fails this way keeps its exception on the request; `sirius_datasource::prefetch_failure()` returns it, already set when the completion callback runs. Cache hits and footer-stash hits do not revalidate against the store.
+
 **Reads.** Each `rest_reactor` runs a libcurl multi handle on one epoll worker thread and reuses a pool of easy handles. The worker claims free easy handles before expanding a logical slice. It chooses a 4–16 MiB physical target from queued bytes and free connections; contiguous slices are balanced under the 16 MiB ceiling, while fragmented cache fills are grouped only at whole cache-chunk boundaries. The response's `Content-Range` and exact byte count are checked before an operation completes. HEAD, LIST, and footer-probe requests use blocking easy handles on the caller thread; they share DNS and TLS-session caches with the workers.
 
 S3 has no direct-to-device transport in this backend. Device reads allocate enough page-aligned, pinned CuCascade blocks for each physical operation, scatter the GET into them, then issue `cudaMemcpyAsync`. The staging owner remains alive through retries and until a CUDA event reports completion; only then are cache chunks published and the coordinator credit settled. Reads into caller-provided contiguous host memory do not allocate staging.
@@ -515,6 +540,24 @@ Pages are processed as they arrive, so listing memory is bounded by one page plu
 
 **Authorization.** `request_authorizer` signs each request attempt and returns the request URL and headers. LIST uses the separate `authorize_list` entry point, which custom authorizers must implement if they support glob expansion.
 
+Sirius registers its own `CREATE SECRET (TYPE SIRIUS_S3, ...)` type, so this workflow does not require DuckDB's httpfs extension. It also accepts httpfs `TYPE S3` secrets when that extension is available. For each S3 bind, open, and glob, Sirius selects the best path-scoped `SIRIUS_S3` secret first, then an `S3` secret if no `SIRIUS_S3` secret matches, then the programmatically set `object_store_config` if neither matches. An invalid matching secret or failed S3 request is an error, not a reason to try another credential source. A selected secret must use `PROVIDER CONFIG` and contain non-empty `KEY_ID` and `SECRET`; partial, refresh-enabled, and non-static secrets fail without falling back to the programmatic config. `SESSION_TOKEN`, `REGION`, and `ENDPOINT` also come only from that selected secret: missing session token means no token, missing region defaults to `us-east-1`, and missing endpoint derives the regional AWS endpoint. `USE_SSL` and `VERIFY_SSL` map to endpoint transport and TLS certificate verification. Secret replacement therefore affects subsequent S3 operations on the same connection. Resolved config snapshots retain the credential fields needed by REST signing; Sirius does not retain the DuckDB secret object or its catalog name in bind data. Sirius currently supports only `URL_STYLE 'path'`; request-changing options such as requester-pays, proxies, extra headers, SSE/KMS, and URL compatibility mode are rejected when enabled. Other explicit URL styles fail clearly. Secret values are not included in Sirius diagnostics.
+
+For example, a scoped Sirius secret supplies credentials directly to a normal Parquet scan:
+
+```sql
+CREATE SECRET project_s3 (
+  TYPE SIRIUS_S3,
+  PROVIDER CONFIG,
+  SCOPE 's3://analytics-bucket/curated/',
+  KEY_ID 'ACCESS_KEY',
+  SECRET 'SECRET_KEY',
+  REGION 'us-west-2'
+);
+
+SELECT count(*)
+FROM read_parquet('s3://analytics-bucket/curated/events.parquet');
+```
+
 | Authorizer | Mechanism |
 |------------|-----------|
 | `sigv4_presigned_authorizer` | SigV4 credentials in the query string. This is the default. |
@@ -522,7 +565,7 @@ Pages are processed as they arrive, so listing memory is bounded by one page plu
 
 Both authorizers use path-style URLs and support temporary credentials. The session token is signed as a header in header mode and as a query parameter in presigned mode. Custom authorizers can use another credential source or return broker-issued URLs.
 
-**Configuration.** `object_store_config` supplies the endpoint, region, static credentials, optional session token, signing mode, and TLS settings. The built-in factory does not search environment variables, AWS profiles, or IMDS. A custom authorizer can implement those sources. If the endpoint, region, or static keys are missing, the factory returns no REST ioctx and the S3 read fails.
+**Configuration.** C++ callers can set `object_store_config` through `sirius_config::set_object_store_config()` before scan-manager initialization. It supplies an in-memory endpoint, region, static credentials, optional session token, signing mode, and TLS settings when no scoped secret matches. This configuration cannot be loaded from YAML. `TYPE SIRIUS_S3, PROVIDER CONFIG` secrets supply a static key pair and optional session token without httpfs; httpfs `TYPE S3, PROVIDER CONFIG` secrets work too when installed. Credential-chain providers, SSO, automatic refresh, environment variables, AWS profiles, and IMDS are not consumed by Sirius. A custom authorizer can implement those sources. If the selected secret is incomplete, Sirius reports an error; without a secret, missing fallback endpoint, region, or static keys leaves no REST ioctx and the S3 read fails.
 
 Connection limits, the logical merge-gap hint, footer-probe size, retry budgets, keepalive, and LIST caps live in `rest::config`; the defaults are defined in `io/rest/config.hpp`. Physical request sizing is worker-owned rather than configured. `request_timeout_s` is also used as the lifetime of a presigned URL. Async data requests retry transient curl and HTTP failures, with a separate bounded retry for HTTP 403. Control requests treat HTTP 403 as terminal.
 
@@ -537,7 +580,7 @@ The cache does two things beyond classic prefetch:
 - **Partial reads.** A `device_read` over a range whose chunks are only partially cached copies the cached chunks straight to device and completes the rest from the backend in the same call, instead of treating a partial overlap as a miss.
 - **Populate-on-read.** On a backend that supports bounce-staged host-to-device reads, an uncached chunk being read for the device is loaded into a cache buffer (file → cache chunk → device) and published to the cache, so the next read of the same chunk is a hit — caching as a side effect of reading, like an OS page cache. A heavily-partial boundary chunk whose over-read would exceed ~25% of the chunk is instead read through an internal bounce slot and left uncached (zero over-read).
 
-Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same path regardless of whether prefetching is wired up.
+Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The store keeps one generation per path — a registration replaces whatever the path held — and `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); the exact-key lookup decides whether the footer is reused.
 
 **fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` registers a scan range set and stashes its `cache_handle`. The readahead manager later drives that handle through allocation and asynchronous prefetch; the consumer stage records when reading begins so stale work can be refused or awaited instead of issuing duplicate I/O.
 
@@ -550,6 +593,7 @@ Separately from the prefetching cache, the ioctx always exposes a `metadata_stor
 - **No admission control in the cache.** Issuing a prefetch never blocks the calling thread: how much read-ahead is in flight is decided by `readahead_scan_manager`'s scan budget (`scan_manager.max_readahead_scans`, defaulting to the backend's `ioctx::n_max_concurrent_scans`), not throttled a second time here. The cache takes an `exec::completion_controller` slot per issued IO purely so teardown can wait those completions out — they write through raw `cached_chunk*` into file entries the cache owns.
 - **Evictor as backpressure.** When the buffer pool can't satisfy a load, the worker posts an eviction request and blocks until the evictor returns enough chunks; pool exhaustion is never a silent failure. Eviction walks LRU candidates using a per-chunk `chunk_lifecycle` score (query-tick aging plus insert/consume counts), so never-consumed entries are not evicted first.
 - **Multi-GPU safe.** Device reads carry the caller's device id; the reactor sets the device before the H2D copy, and pinned chunks are portable across CUDA contexts.
+- **Generations.** Cache entries are keyed by the io_object's cache id (path plus strong ETag for object stores, path for local files) and shared-owned: the map holds one owner while a generation is current, and a `cache_handle`, an in-flight fill, a queued completion, or a cached-copy retirement holds another for as long as it may touch the generation's chunks. Admitting a newer generation of a path retires the older ones — they leave the map, keep serving their holders, and are reclaimed synchronously when the last owner releases. The evictor only borrows. `generation_count(path)` and `retired_generation_count()` expose the state.
 
 ### Constants
 

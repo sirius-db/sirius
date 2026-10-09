@@ -23,6 +23,7 @@
 #include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/config.hpp"
+#include "io/cache/metadata_store.hpp"
 #include "io/cache/types.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
@@ -33,12 +34,15 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <latch>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
 #include <stop_token>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <variant>
@@ -75,14 +79,62 @@ namespace sirius::io::cache {
   });
 }
 
+struct cache_generation {
+  /// Materialise a chunk for every offset in @p incoming, fold the matching
+  /// entry of @p desired into its populated extent, and count the calling
+  /// request as a subscriber of each.  Returns the chunks in @p incoming
+  /// order.  @p desired runs index-parallel to @p incoming.
+  std::vector<cached_chunk*> update_and_get_chunks(std::span<const size_t> incoming,
+                                                   std::span<const chunk_fill> desired);
+
+  std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
+                                          std::size_t size,
+                                          coverage_policy policy) const;
+
+  /// Slot index covering byte @p off.  Callers must bounds-check against
+  /// @c slots.size() — a read past EOF has no slot.
+  [[nodiscard]] std::size_t slot_of(std::size_t off) const noexcept { return off / chunk_size; }
+
+  mutable std::shared_mutex mtx;
+  std::shared_ptr<const io_object> io_obj;
+  std::string key;          ///< @c io_object::raw_file_cache_id()
+  std::string object_path;  ///< @c io_object::object_path(), for grouping generations
+  /// Direct-mapped: slot i covers [i * chunk_size, (i + 1) * chunk_size);
+  /// nullptr means that chunk has never been materialised.  Sized once at
+  /// creation — exactly the capacity the old sorted vector reserved — so a
+  /// lookup is an index instead of a search.
+  std::vector<cached_chunk*> slots;
+  chunk_arena arena;  ///< owns the chunks `slots` points at; append-only
+  std::vector<cached_chunk*> reclaim_claimed;
+  std::vector<std::byte*> reclaim_batch;
+  size_t file_size{0};
+  size_t chunk_size{1};
+  std::atomic<bool> retired{false};
+};
+
+/// The last failure of an issued prefetch attempt, kept by the request so its
+/// consumer can ask after the terminal notification.  Stored before the
+/// producer leaves @c loading; a later successful attempt does not clear it.
+struct prefetch_failure_slot {
+  std::mutex mtx;
+  std::exception_ptr failure;
+};
+
 /// One prefetch request: the two stage machines plus the chunk set they cover.
 /// Held by value — the cache's queues and the owning @ref cache_handle
 /// each carry a copy, so the stages outlive whichever side finishes first.
+/// The copies do not own the generation whose chunks they name: @c generation
+/// is a weak reference, and the handle carries the owner separately.  The copy
+/// handed to the evictor also drops @c obj.  A request parked in the evictor's
+/// queue therefore keeps neither a retired generation nor its object alive;
+/// what it does retain is its own chunk-pointer vector and stage machines.
 struct prefetch_request {
   std::shared_ptr<const io_object> obj;
   std::shared_ptr<producer_stage> producer;
   std::shared_ptr<consumer_stage> consumer;
   std::shared_ptr<const std::vector<cached_chunk*>> chunks;
+  std::weak_ptr<cache_generation> generation;
+  std::shared_ptr<prefetch_failure_slot> failure;
   std::uint32_t timestamp{0};
   /// Preferred NUMA node for the staging buffers, derived from the requesting
   /// GPU's topology.  -1 means "no preference" (allocate from any arena).
@@ -213,6 +265,11 @@ class cache_handle {
   /// handle.
   [[nodiscard]] bool wait_until_prepared() noexcept;
 
+  /// The exception a failed prefetch ended with; null when none has failed.
+  /// Available once @ref wait_until_ready returns or the prefetch's completion
+  /// callback runs.
+  [[nodiscard]] std::exception_ptr failure() const noexcept;
+
   /// The chunks of the underlying request.  Null when the handle is empty.
   [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept;
 
@@ -221,8 +278,9 @@ class cache_handle {
  private:
   friend class prefetching_cache;
 
-  explicit cache_handle(prefetch_request req) noexcept;
+  cache_handle(prefetch_request req, std::shared_ptr<cache_generation> generation) noexcept;
 
+  std::shared_ptr<cache_generation> _generation;
   prefetch_request _req;
 };
 
@@ -347,6 +405,14 @@ class prefetching_cache {
     return _eviction_batch_size.load(std::memory_order_relaxed);
   }
 
+  /// Generations of exactly @p object_path that are still alive: the current
+  /// one in the map plus any retired one some operation still owns.
+  [[nodiscard]] std::size_t generation_count(std::string_view object_path) const noexcept;
+
+  /// Alive generations that are no longer in the map, over all paths.  Zero
+  /// means every retired generation has been reclaimed.
+  [[nodiscard]] std::size_t retired_generation_count() const noexcept;
+
  private:
   struct cached_copy_retirement;
 
@@ -376,10 +442,13 @@ class prefetching_cache {
   [[nodiscard]] prepare_result prepare_request(prefetch_request& req,
                                                bool wait_for_eviction = false);
 
-  /// Resolve cache positions handle-first, then against the file-wide entry.
+  [[nodiscard]] std::shared_ptr<cache_generation> generation_for(const io_object& obj,
+                                                                 cache_handle* handle) const;
+
+  /// Resolve cache positions handle-first, then against @p generation.
   /// A partial lookup preserves every materialised position so the read planner
   /// can mix resident, loadable, and backend-staged pieces in one dispatch.
-  [[nodiscard]] std::vector<cached_chunk*> ranges_in_cache(const io_object& obj,
+  [[nodiscard]] std::vector<cached_chunk*> ranges_in_cache(cache_generation const* generation,
                                                            size_t offset,
                                                            size_t size,
                                                            coverage_policy policy,
@@ -401,34 +470,6 @@ class prefetching_cache {
   void await_inflight_prefetch(const io_object& obj,
                                std::span<const slice> requests,
                                cache_handle* handle) const;
-
-  struct file_entry {
-    /// Materialise a chunk for every offset in @p incoming, fold the matching
-    /// entry of @p desired into its populated extent, and count the calling
-    /// request as a subscriber of each.  Returns the chunks in @p incoming
-    /// order.  @p desired runs index-parallel to @p incoming.
-    std::vector<cached_chunk*> update_and_get_chunks(std::span<const size_t> incoming,
-                                                     std::span<const chunk_fill> desired);
-
-    std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
-                                            std::size_t size,
-                                            coverage_policy policy) const;
-
-    /// Slot index covering byte @p off.  Callers must bounds-check against
-    /// @c slots.size() — a read past EOF has no slot.
-    [[nodiscard]] std::size_t slot_of(std::size_t off) const noexcept { return off / chunk_size; }
-
-    mutable std::shared_mutex mtx;
-    std::shared_ptr<const io_object> io_obj;
-    /// Direct-mapped: slot i covers [i * chunk_size, (i + 1) * chunk_size);
-    /// nullptr means that chunk has never been materialised.  Sized once at
-    /// creation — exactly the capacity the old sorted vector reserved — so a
-    /// lookup is an index instead of a search.
-    std::vector<cached_chunk*> slots;
-    chunk_arena arena;  ///< owns the chunks `slots` points at; append-only
-    size_t file_size{0};
-    size_t chunk_size{1};
-  };
 
   /// Enqueue @p copies and keep their cache-hit pins alive until @p stream has
   /// passed them. The preallocated retirement also settles the cache-copy
@@ -460,10 +501,12 @@ class prefetching_cache {
   /// live reader; any such chunk is left alone and logged instead.
   void reclaim_all_chunks() noexcept;
 
-  file_entry& get_or_create_file_entry(const io_object& obj);
+  std::shared_ptr<cache_generation> get_or_create_generation(const io_object& obj);
+
+  void reclaim_idle_chunks(cache_generation& generation) noexcept;
 
   const config _cfg;
-  std::unique_ptr<buffer_pool> _pool;
+  std::shared_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;
 
   ioctx* const _io_ctx;
@@ -524,7 +567,13 @@ class prefetching_cache {
   bool _dispose_on_idle{false};
 
   mutable std::shared_mutex _map_mtx;
-  std::unordered_map<std::string, std::unique_ptr<file_entry>> _file_cache;
+  std::unordered_map<std::string, std::shared_ptr<cache_generation>> _file_cache;
+  std::unordered_map<std::string,
+                     std::vector<std::weak_ptr<cache_generation>>,
+                     detail::string_hash,
+                     std::equal_to<>>
+    _generations_by_path;
+  std::shared_ptr<std::shared_mutex> _retire_mtx;
 
   /// One stream-ordered ticket frontier replaces a CUDA event per cached-copy
   /// batch. The bounded waiter pool drives that frontier so an all-hit read

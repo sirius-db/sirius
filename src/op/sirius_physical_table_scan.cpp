@@ -32,6 +32,7 @@
 #include <cucascade/data/data_batch.hpp>
 
 #include <format>
+#include <utility>
 
 namespace sirius {
 namespace op {
@@ -53,10 +54,12 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   std::size_t estimated_cardinality,
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
-  duckdb::virtual_column_map_t virtual_columns_p)
+  duckdb::virtual_column_map_t virtual_columns_p,
+  duckdb::vector<duckdb::LogicalType> duckdb_types_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
     function(std::move(function_p)),
+    duckdb_types(std::move(duckdb_types_p)),
     bind_data(std::move(bind_data_p)),
     returned_types(std::move(returned_types_p)),
     column_ids(std::move(column_ids_p)),
@@ -241,7 +244,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     referenced_indices.reserve(expected_output_columns);
     for (std::size_t i = 0; i < expected_output_columns; i++) {
       auto const& batch_idx_opt = batch_column_map[projection_ids[i]];
-      if (!batch_idx_opt.has_value() || *batch_idx_opt >= input_view.num_columns()) {
+      if (!batch_idx_opt.has_value() ||
+          std::cmp_greater_equal(*batch_idx_opt, input_view.num_columns())) {
         throw std::runtime_error(
           std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
                       "input_view.num_columns()={}",

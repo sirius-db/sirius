@@ -21,7 +21,7 @@
  *        plain column reference so PARTITION/CONCAT/hash-join see an ordinary column index.
  */
 
-#include "expression/ast/to_duckdb.hpp"
+#include "expression/ast/node.hpp"
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -141,11 +141,7 @@ sirius::op::sirius_physical_hash_join* find_hash_join(sirius::op::sirius_physica
   return nullptr;
 }
 
-bool is_bound_ref(const sirius::ast::node& side)
-{
-  auto expr = sirius::ast::to_duckdb(side);
-  return expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
-}
+bool is_bound_ref(const sirius::ast::node& side) { return side.holds<sirius::ast::reference>(); }
 
 /// Assert that every equality condition side of @p hj is a plain column reference (BOUND_REF),
 /// i.e. any complex expression was materialized out into a projection below the join.
@@ -262,4 +258,98 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   // Fast path: plain-reference keys need no projection below the join.
   CHECK_FALSE(has_projection_child(*hj));
   require_all_equality_sides_are_references(*hj);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - mixed SEMI and ANTI materialize casts in hash keys",
+                 "[join_expression_key][isolated_context]")
+{
+  const bool anti             = GENERATE(false, true);
+  const bool right_family     = GENERATE(false, true);
+  const std::string residual  = GENERATE("<>", "IS NOT DISTINCT FROM");
+  const std::string lhs       = right_family ? "small_right" : "big_left";
+  const std::string rhs       = right_family ? "big_left" : "small_right";
+  const std::string lhs_key   = right_family ? "rid" : "id";
+  const std::string rhs_key   = right_family ? "id" : "rid";
+  const std::string lhs_value = right_family ? "other" : "val";
+  const std::string rhs_value = right_family ? "val" : "other";
+  const auto query = "SELECT l.* FROM " + lhs + " l " + (anti ? "ANTI" : "SEMI") + " JOIN " + rhs +
+                     " r ON CAST(l." + lhs_key + " AS SMALLINT) = CAST(r." + rhs_key +
+                     " AS SMALLINT) AND l." + lhs_value + " " + residual + " r." + rhs_value;
+  INFO(query);
+  auto plan = generate_sirius_plan(*con, query);
+  REQUIRE(plan);
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  const auto expected_type = right_family ? (anti ? JoinType::RIGHT_ANTI : JoinType::RIGHT_SEMI)
+                                          : (anti ? JoinType::ANTI : JoinType::SEMI);
+  REQUIRE(hj->join_type == expected_type);
+  CHECK(has_projection_child(*hj));
+  REQUIRE(hj->conditions.size() == 2);
+  for (auto const& condition : hj->conditions) {
+    if (condition.comparison == sirius::comparison_type::equal) {
+      CHECK(is_bound_ref(*condition.left));
+      CHECK(is_bound_ref(*condition.right));
+    }
+  }
+  CHECK(hj->types.size() == 2);
+  const auto& output = right_family ? hj->rhs_output_columns : hj->lhs_output_columns;
+  CHECK(output.col_idxs.size() == 2);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - hash-only casts are evaluated before partitioning",
+                 "[join_expression_key][isolated_context]")
+{
+  const std::string join_type = GENERATE("JOIN", "SEMI JOIN", "ANTI JOIN");
+  const auto query            = "SELECT l.* FROM big_left l " + join_type +
+                     " small_right r ON CAST(l.id AS SMALLINT) = CAST(r.rid AS SMALLINT)";
+  INFO(query);
+  auto plan = generate_sirius_plan(*con, query);
+  REQUIRE(plan);
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  CHECK(has_projection_child(*hj));
+  REQUIRE(hj->conditions.size() == 1);
+  CHECK(is_bound_ref(*hj->conditions[0].left));
+  CHECK(is_bound_ref(*hj->conditions[0].right));
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - string case inequality operand is materialized",
+                 "[join_expression_key][string_case][isolated_context]")
+{
+  REQUIRE(!con->Query("CREATE TABLE countries (id INTEGER, country VARCHAR)")->HasError());
+  REQUIRE(!con->Query("INSERT INTO countries VALUES (0, 'Germany'), (1, 'France')")->HasError());
+  REQUIRE(!con->Query("CREATE TABLE birth_countries (id INTEGER, country VARCHAR)")->HasError());
+  REQUIRE(
+    !con->Query("INSERT INTO birth_countries VALUES (0, 'GERMANY'), (1, 'FRANCE'), (2, 'USA')")
+       ->HasError());
+  auto const name = GENERATE("upper", "lower");
+  auto plan       = generate_sirius_plan(
+    *con,
+    "SELECT l.id FROM birth_countries l JOIN countries r ON l.id = r.id AND l.country <> " +
+      std::string(name) + "(r.country)");
+  REQUIRE(plan);
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  bool saw_inequality = false;
+  for (auto const& condition : hj->conditions) {
+    if (condition.comparison != sirius::comparison_type::not_equal) { continue; }
+    saw_inequality = true;
+    CHECK(is_bound_ref(*condition.left));
+    CHECK(is_bound_ref(*condition.right));
+  }
+  REQUIRE(saw_inequality);
+  CHECK(has_projection_child(*hj));
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "projection - string case functions plan successfully",
+                 "[string_case][isolated_context]")
+{
+  REQUIRE(!con->Query("CREATE TABLE names (name VARCHAR)")->HasError());
+  REQUIRE(!con->Query("INSERT INTO names VALUES ('Call Center'), (NULL)")->HasError());
+  auto plan = generate_sirius_plan(*con, "SELECT lower(name), upper(name) FROM names");
+  REQUIRE(plan);
 }

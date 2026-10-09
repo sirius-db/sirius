@@ -125,6 +125,20 @@ class sized_input : public sirius::op::operator_data {
   std::size_t bytes_;
 };
 
+class prepare_oom_input : public sirius::op::operator_data {
+ public:
+  [[nodiscard]] sirius::op::operator_data_type get_type() const override
+  {
+    return sirius::op::operator_data_type::BASE;
+  }
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override { return 64; }
+
+  void prepare_for_processing(const ::cucascade::memory::memory_space*, ::cuda::stream_ref) override
+  {
+    throw rmm::out_of_memory("injected prepare OOM");
+  }
+};
+
 // Minimal idata_representation stub that reports different compressed vs uncompressed
 // sizes without requiring the full compressed_host_representation infrastructure.
 // Used to test the peak_materialization_bytes logic in get_estimated_bytes_to_materialize_input.
@@ -286,6 +300,35 @@ struct pipeline_context {
   std::unique_ptr<stub_operator> stub_op;
 };
 
+struct two_operator_pipeline_context {
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::unique_ptr<stub_operator> stub_source;
+  std::unique_ptr<stub_operator> first_op;
+  std::unique_ptr<stub_operator> second_op;
+};
+
+two_operator_pipeline_context create_two_operator_pipeline_context()
+{
+  two_operator_pipeline_context ctx;
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
+  ctx.pipeline->set_pipeline_id(44);
+  ctx.stub_source = std::make_unique<stub_operator>();
+  ctx.first_op    = std::make_unique<stub_operator>();
+  ctx.second_op   = std::make_unique<stub_operator>();
+
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*ctx.pipeline, *ctx.stub_source);
+  build_state.add_pipeline_operator(*ctx.pipeline, *ctx.first_op);
+  build_state.add_pipeline_operator(*ctx.pipeline, *ctx.second_op);
+  build_state.set_pipeline_sink(*ctx.pipeline, *ctx.second_op, 1);
+
+  // Number the stubs as the converter does in production; task execution reads operator ids.
+  std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
+  sirius::pipeline::assign_operator_ids(pipelines);
+  return ctx;
+}
+
 pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
@@ -318,7 +361,7 @@ cached_scan_pipeline_context create_cached_scan_pipeline_context()
   ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(43);
   ctx.scan_op = std::make_unique<sirius::op::scan::sirius_gpu_scan_operator>(
-    duckdb::vector<sirius::logical_type>{}, 0, nullptr);
+    duckdb::vector<sirius::logical_type>{}, 0, nullptr, /*contract_id=*/1);
 
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*ctx.pipeline, *ctx.scan_op);
@@ -908,6 +951,77 @@ TEST_CASE(
   pressure_allocator->deallocate(
     stream, pressure_alloc, kPreAllocationSize, alignof(std::max_align_t));
   pressure_allocator->reset_stream_reservation(stream);
+}
+
+// ---------------------------------------------------------------------------
+// Test: a prepare OOM resumes at the attempt's current start index.
+//
+// prepare_for_processing runs before any operator in this attempt, so the input
+// is still the input for local_state._start_operator_index. A resumed task must
+// keep that index; a first attempt (index 0) still resumes at 0.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("gpu_pipeline_task prepare OOM resumes at the current start index",
+          "[gpu_pipeline_task][prepare_oom_resume]")
+{
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  constexpr std::size_t kReservationSize = 1ULL * 1024 * 1024;
+
+  auto expect_resume_at = [&](std::size_t start_index) {
+    auto ctx = create_two_operator_pipeline_context();
+    REQUIRE(ctx.pipeline->get_operators().size() == 2);
+
+    int execute_count  = 0;
+    auto count_execute = [&execute_count](const sirius::op::operator_data&, ::cuda::stream_ref) {
+      ++execute_count;
+      return std::unique_ptr<sirius::op::operator_data>{};
+    };
+    ctx.stub_source->on_execute = count_execute;
+    ctx.first_op->on_execute    = count_execute;
+    ctx.second_op->on_execute   = count_execute;
+
+    auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+      ctx.pipeline, sirius::test::make_test_telemetry_context());
+
+    auto input            = std::make_unique<prepare_oom_input>();
+    auto* const installed = input.get();
+    auto task             = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+      /*task_id=*/1,
+      std::vector<cucascade::shared_data_repository*>{},
+      std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(input),
+                                                                        start_index),
+      std::move(global_state));
+
+    auto info        = task->get_estimated_reservation_size_info(f.gpu_space);
+    auto reservation = f.manager->request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, kReservationSize);
+    REQUIRE(reservation != nullptr);
+    auto* ls =
+      dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(task->local_state());
+    REQUIRE(ls != nullptr);
+    ls->set_reservation(std::move(reservation), info);
+
+    rmm::cuda_stream stream;
+    bool threw = false;
+    try {
+      task->execute(stream);
+    } catch (sirius::pipeline::oom_reschedule_exception& ex) {
+      threw = true;
+      REQUIRE(ex.get_resume_operator_index() == start_index);
+      auto released = ex.release_intermediate_data();
+      REQUIRE(released.get() == installed);
+    }
+    REQUIRE(threw);
+    REQUIRE(execute_count == 0);
+  };
+
+  SECTION("resumed task keeps start index 1") { expect_resume_at(1); }
+  SECTION("first attempt resumes at start index 0") { expect_resume_at(0); }
 }
 
 // ---------------------------------------------------------------------------

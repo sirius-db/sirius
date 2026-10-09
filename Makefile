@@ -115,20 +115,16 @@ list-presets: $(PRESETS_LINK)
 # -----------------------------------------------------------------------------
 # S3 integration test gates
 # -----------------------------------------------------------------------------
-# MinIO is started by the test binary itself (test/cpp/utils/s3_container.*) when
-# SIRIUS_TEST_S3_AUTO=1 is set. The testcontainers-native bridge it uses is
-# fetched and patched at configure time (cmake/testcontainers_native.cmake,
-# third_party/testcontainers-native.patch) when SIRIUS_BUILD_S3_TESTS=ON. There
-# is no separate `s3-up`/`s3-down` step, no docker-compose, and no env.sh to
-# source: the binary spins up HTTP + TLS MinIO on dynamic ports, uploads
-# fixtures, runs the tests, and tears the containers down on exit.
+# The test binary starts SeaweedFS on local HTTP and TLS ports when
+# SIRIUS_TEST_S3_AUTO=1. The Pixi environment provides weed; override its path
+# with SIRIUS_TEST_WEED. Fixtures and server cleanup are managed in-process.
 #
 # `make test`         runs the default Catch2 suite. Without
-#                     SIRIUS_TEST_S3_AUTO it does not start MinIO, and the
-#                     MinIO-backed cases skip.
+#                     SIRIUS_TEST_S3_AUTO it does not start SeaweedFS, and the
+#                     SeaweedFS-backed cases skip.
 # `make s3-test`      standard S3 gate: runs [s3][integration] except
 #                     [large]/[aws] (incl. the SQL-over-S3 surface and the tiny
-#                     TPC-H Q1-Q22 suite) with MinIO auto-managed, in strict mode.
+#                     TPC-H Q1-Q22 suite) with SeaweedFS auto-managed, in strict mode.
 # `make s3-test-large`
 #                     large-fixture gate, run as two processes. Both run the
 #                     SF10 lineitem cases, with cache.mode sirius in the first
@@ -193,7 +189,7 @@ s3-test-large:
 	  echo "s3-test-large: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
-	@# Two processes, so MinIO is brought up once per group: first the SF10
+	@# Two processes, so SeaweedFS is brought up once per group: first the SF10
 	@# lineitem cases with cache.mode sirius ([large-cache]) plus the SF1 TPC-H
 	@# suite and the 1001-object glob case, which use cache.mode none; then the
 	@# SF10 lineitem cases with cache.mode none ([large-nocache]). Catch2
@@ -220,7 +216,7 @@ s3-tpch:
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 SIRIUS_TEST_S3_TPCH=1; \
 	$(S3_TEST_BIN) --order decl "[s3][integration][sql][tpch]"
 
-# Manual real-AWS gates. These never start MinIO/Docker and are excluded from
+# Manual real-AWS gates. These never start the local backend and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
 # real bucket, and assume-role TEMPORARY credentials including the session
 # token); keep usage bounded. SIRIUS_TEST_S3_STRICT=1 turns a missing-env skip

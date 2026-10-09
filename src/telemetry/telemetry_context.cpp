@@ -25,6 +25,7 @@
 #include "telemetry-bridge/gen/plan.rs.h"
 #include "telemetry-bridge/gen/port.rs.h"
 #include "telemetry/batch_telemetry.hpp"
+#include "telemetry/nvtx_injection.hpp"
 
 #include <unistd.h>
 
@@ -38,6 +39,8 @@ namespace sirius::telemetry {
 
 rust::Box<quent::Context> make_quent_context(const sirius::telemetry_config& config)
 {
+  detail::configure_nvtx_injection(config.enable_quent && config.enable_nvtx,
+                                   config.nvtx_injection_lib);
   return quent::create_context([&config] {
     if (!config.enable_quent) { return quent::ExporterOptions::none(); }
     if (config.exporter == "ndjson") {

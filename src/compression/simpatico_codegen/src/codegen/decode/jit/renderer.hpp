@@ -126,6 +126,13 @@ inline constexpr DecodeShape kShapeSparseDictGather{Enumerator::chunk_csr, Consu
 inline constexpr DecodeShape kShapeSparseStrSplitMeta{Enumerator::chunk_csr,
                                                       Consumer::offsets_meta};
 
+/// Chunks one block of the rendered kernel serves: kTBSize / 32 (one chunk per warp) for the index
+/// walk, 1 for every other enumerator.
+[[nodiscard]] constexpr int chunks_per_block(DecodeShape shape) noexcept
+{
+  return shape.enumerator == Enumerator::index_list ? ::codegen::kTBSize / 32 : 1;
+}
+
 /// False for product points with no meaning or no renderer support — e.g.
 /// re-ballotting only the survivors of an existing mask.  Render rejects these
 /// rather than emitting something plausible; the combinations that ARE
@@ -185,7 +192,7 @@ struct DecodeKernelSpec {
   // emitted alongside the declaration text, so the two cannot disagree.
   std::vector<TrailingParam> trailing;
 
-  // Launch geometry.  grid_x = num_chunks_for(n) (launcher computes).
+  // Launch geometry.  The launcher computes grid_x = ceil(num_chunks_for(n) / chunks_per_block).
   int block_x      = 128;  // plain-CUDA block; RLE/Delta primitives assume 128
   int shared_bytes = 0;    // dynamic shared workspace peak (RLE boundaries)
 
