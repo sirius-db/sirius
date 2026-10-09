@@ -19,8 +19,8 @@ Context::~Context() noexcept = default;
 std::expected<std::unique_ptr<Context>, Error> Context::create(const ContextConfig& config) noexcept
 try {
   try {
-    auto impl = std::make_unique<Impl>(config.impl_->config);
-    return std::unique_ptr<Context>(new Context(std::move(impl)));
+    // A new-expression allocates the handle before evaluating its initializer.
+    return std::unique_ptr<Context>(new Context(std::make_unique<Impl>(config.impl_->config)));
   } catch (const std::bad_alloc&) {
     throw;
   } catch (const std::exception& e) {
