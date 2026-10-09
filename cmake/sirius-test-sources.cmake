@@ -32,6 +32,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_exchange_direct.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
@@ -172,6 +173,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_union_mgpu.cpp
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
+    test/cpp/memory/test_slab_pool.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_partition_placement.cpp
