@@ -36,6 +36,6 @@ The system CUDA toolkit remains a build prerequisite, as for the other Sirius
 GPU ports; CUDA driver libraries are runtime dependencies.
 
 Installed Sirius consumers should use the standalone shared package or the vcpkg
-static package described in [Building Sirius](../../docs/building.md). The legacy
+static package described in [Building Sirius](../../../docs/building.md). The legacy
 installed DuckDB export set does not discover Sirius's dependencies and is not
 supported for installed consumers.
