@@ -302,8 +302,8 @@ void gpu_pipeline_executor::process_task(
             })
             .get();
       } catch (const std::exception& e) {
-        if (_query_lifecycle.report_failure(
-              std::current_exception(), pipe ? pipe->get_query_id() : make_query_id(0))) {
+        if (_query_lifecycle.report_failure(std::current_exception(),
+                                            pipe ? pipe->get_query_id() : make_query_id(0))) {
           throw;
         }
         // The downgrade executor cancelled this request (its queue was drained). This task cannot
@@ -526,9 +526,10 @@ void gpu_pipeline_executor::process_task(
             // (cross-GPU processing contention, follow-up #17). 50 ms gives
             // typical SF100 probe tasks time to finish their current work
             // without putting the rescheduled task into a tight busy-spin.
-            std::this_thread::sleep_for(std::chrono::milliseconds(
-              completion && completion->injections ? completion->injections->gpu_task_retry_backoff_ms
-                                                   : 50));
+            std::this_thread::sleep_for(
+              std::chrono::milliseconds(completion && completion->injections
+                                          ? completion->injections->gpu_task_retry_backoff_ms
+                                          : 50));
 
             // Schedule the rescheduled task. It goes back through manager_loop()
             // to acquire a fresh reservation before execution.
