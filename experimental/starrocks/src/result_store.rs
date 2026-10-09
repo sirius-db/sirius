@@ -121,10 +121,13 @@ impl ResultStore {
     }
 
     /// Fails every result slot of `query` still waiting, so `fetch_data` reports `error` at once
-    /// instead of waiting out its timeout.
+    /// instead of waiting out its timeout. `query` may be any instance id of the query: like the
+    /// exchange purge, this matches on the hi half they share.
     pub(crate) fn fail_query(&self, query: FragmentInstanceId, error: &str) {
         for state in self.lock().values_mut() {
-            if matches!(state, FragmentState::Waiting { query: waiting } if *waiting == query) {
+            if matches!(state, FragmentState::Waiting { query: waiting }
+                if waiting.query_hi() == query.query_hi())
+            {
                 *state = FragmentState::Failed(error.to_string());
             }
         }
@@ -281,7 +284,8 @@ mod tests {
         );
         store.reserve(id, query);
         store.reserve(other_id, other);
-        store.fail_query(query, "merge exploded");
+        // By another instance of the query, as a remote sender's failure frame names it.
+        store.fail_query(FragmentInstanceId::from_halves(5, 3), "merge exploded");
         let err = store.take_next(id, Duration::from_secs(5)).unwrap_err();
         assert!(err.contains("merge exploded"), "{err}");
         let err = store.take_next(other_id, Duration::ZERO).unwrap_err();

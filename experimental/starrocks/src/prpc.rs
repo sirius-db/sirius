@@ -154,7 +154,7 @@ impl Error {
 }
 
 /// One blocking PRPC call: connect, send one request, and return its response body and
-/// attachment.
+/// attachment. `timeout` bounds each step on its own.
 #[cfg(feature = "nixl-transport")]
 pub(crate) fn call_blocking(
     peer: std::net::SocketAddr,
@@ -164,17 +164,51 @@ pub(crate) fn call_blocking(
     attachment: Vec<u8>,
     timeout: std::time::Duration,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    use std::io::Write;
-
     let mut stream = std::net::TcpStream::connect_timeout(&peer, timeout)
         .with_context(|| format!("failed to connect to {peer}"))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
+    round_trip(&mut stream, service_name, method_name, body, attachment)
+}
+
+/// [`call_blocking`] that gives up once `deadline` passes, however the time splits between
+/// connecting, sending and waiting for the reply.
+#[cfg(feature = "nixl-transport")]
+pub(crate) fn call_blocking_by(
+    peer: std::net::SocketAddr,
+    service_name: &str,
+    method_name: &str,
+    body: Vec<u8>,
+    attachment: Vec<u8>,
+    deadline: std::time::Instant,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut stream = DeadlineStream {
+        stream: None,
+        deadline,
+    };
+    let connect = stream.remaining()?;
+    stream.stream = Some(
+        std::net::TcpStream::connect_timeout(&peer, connect)
+            .with_context(|| format!("failed to connect to {peer}"))?,
+    );
+    round_trip(&mut stream, service_name, method_name, body, attachment)
+}
+
+/// Sends one request on `stream` and reads its response.
+#[cfg(feature = "nixl-transport")]
+fn round_trip(
+    stream: &mut (impl Read + std::io::Write),
+    service_name: &str,
+    method_name: &str,
+    body: Vec<u8>,
+    attachment: Vec<u8>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let request = Frame::for_request(service_name, method_name, body, attachment, Some(1));
     stream
         .write_all(&request.encode())
         .context("failed to send PRPC request")?;
-    let frame = Frame::read(&mut stream)?.context("peer closed before responding")?;
+    stream.flush().context("failed to send PRPC request")?;
+    let frame = Frame::read(stream)?.context("peer closed before responding")?;
     let response = frame
         .meta
         .response
@@ -185,6 +219,59 @@ pub(crate) fn call_blocking(
             "PRPC error {code}: {}",
             response.error_text.unwrap_or_default()
         )),
+    }
+}
+
+/// A connection whose every read and write waits only for what is left until `deadline`.
+#[cfg(feature = "nixl-transport")]
+struct DeadlineStream {
+    stream: Option<std::net::TcpStream>,
+    deadline: std::time::Instant,
+}
+
+#[cfg(feature = "nixl-transport")]
+impl DeadlineStream {
+    fn remaining(&self) -> io::Result<std::time::Duration> {
+        let left = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the PRPC call ran out of time",
+            ));
+        }
+        Ok(left)
+    }
+
+    /// The connection, its timeouts set to what is left.
+    fn timed(&mut self) -> io::Result<&mut std::net::TcpStream> {
+        let left = self.remaining()?;
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "not connected"))?;
+        stream.set_read_timeout(Some(left))?;
+        stream.set_write_timeout(Some(left))?;
+        Ok(stream)
+    }
+}
+
+#[cfg(feature = "nixl-transport")]
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.timed()?.read(buf)
+    }
+}
+
+#[cfg(feature = "nixl-transport")]
+impl std::io::Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.timed()?.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.timed()?.flush()
     }
 }
 
@@ -493,6 +580,36 @@ mod tests {
     };
 
     use super::*;
+
+    /// A peer that trickles a reply one byte at a time never outlasts the call's deadline, even
+    /// though no single read waits long.
+    #[cfg(feature = "nixl-transport")]
+    #[test]
+    fn a_call_by_a_deadline_gives_up_on_a_trickling_peer() {
+        use std::time::{Duration, Instant};
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            for _ in 0..100 {
+                if stream.write_all(&[0]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        let result = call_blocking_by(addr, "S", "m", Vec::new(), Vec::new(), deadline);
+        assert!(result.is_err());
+        // The 12-byte header alone takes 1.2 s to arrive.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn frame_round_trip_preserves_attachment_and_correlation() {

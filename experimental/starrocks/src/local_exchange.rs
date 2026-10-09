@@ -98,12 +98,14 @@ struct PendingReceiver {
 const PURGED_QUERIES: usize = 1024;
 
 /// What a purged query still held: the caller frees it outside the exchange lock.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub(crate) struct Purged {
     /// Parked same-CN sender outputs, each released with `drop_parked`.
     pub(crate) slots: Vec<SenderSlot>,
     /// Direct-exchange receive buffers remote senders filled, each released by token.
     pub(crate) tokens: Vec<u64>,
+    /// Receivers that were still waiting, and so never run.
+    pub(crate) receivers: Vec<TExecPlanFragmentParams>,
 }
 
 /// What the rendezvous holds right now. All zero on an idle CN.
@@ -134,9 +136,10 @@ struct ExchangeState {
 impl ExchangeState {
     fn refuse_purged(&self, fragment_instance_id: FragmentInstanceId) -> Result<(), String> {
         if let Some(error) = self.purged.get(&fragment_instance_id.query_hi()) {
-            // The original error, so whichever refusal reaches the FE first still names the cause.
+            // The original error first, so whichever refusal reaches the FE first leads with the
+            // cause.
             return Err(format!(
-                "the query of fragment instance {fragment_instance_id} already failed: {error}"
+                "{error} (fragment instance {fragment_instance_id} came after its query failed)"
             ));
         }
         Ok(())
@@ -387,15 +390,21 @@ impl LocalExchange {
         let query_hi = query.query_hi();
         let ours = |id: &FragmentInstanceId| id.query_hi() == query_hi;
         let mut state = self.lock();
-        if let Entry::Vacant(first) = state.purged.entry(query_hi) {
-            first.insert(error.to_string());
-            state.purged_order.push_back(query_hi);
-            if state.purged_order.len() > PURGED_QUERIES {
-                let oldest = state.purged_order.pop_front().expect("over capacity");
-                state.purged.remove(&oldest);
-            }
-        }
-        state.receivers.retain(|id, _| !ours(id));
+        Self::mark(&mut state, query_hi, error);
+        let receivers: Vec<FragmentInstanceId> = state
+            .receivers
+            .keys()
+            .filter(|id| ours(id))
+            .copied()
+            .collect();
+        let mut purged = Purged {
+            receivers: receivers
+                .iter()
+                .filter_map(|id| state.receivers.remove(id))
+                .map(|receiver| receiver.params)
+                .collect(),
+            ..Purged::default()
+        };
         state
             .remote_seq
             .retain(|(key, _), _| !ours(&key.fragment_instance_id));
@@ -405,7 +414,6 @@ impl LocalExchange {
             .filter(|key| ours(&key.fragment_instance_id))
             .copied()
             .collect();
-        let mut purged = Purged::default();
         for key in keys {
             for source in state
                 .sources
@@ -422,6 +430,32 @@ impl LocalExchange {
             }
         }
         purged
+    }
+
+    /// Refuses everything of `query` (any instance id of it) from now on, as a purge does, without
+    /// collecting what it holds yet. Returns false if the query had already failed here, keeping
+    /// that first error.
+    pub(crate) fn mark_failed(&self, query: FragmentInstanceId, error: &str) -> bool {
+        Self::mark(&mut self.lock(), query.query_hi(), error)
+    }
+
+    /// The error that failed `query` (any instance id of it) on this CN, if it did.
+    pub(crate) fn failure(&self, query: FragmentInstanceId) -> Option<String> {
+        self.lock().purged.get(&query.query_hi()).cloned()
+    }
+
+    /// Records the first error of query `query_hi`; returns whether this was it.
+    fn mark(state: &mut ExchangeState, query_hi: u64, error: &str) -> bool {
+        let Entry::Vacant(first) = state.purged.entry(query_hi) else {
+            return false;
+        };
+        first.insert(error.to_string());
+        state.purged_order.push_back(query_hi);
+        if state.purged_order.len() > PURGED_QUERIES {
+            let oldest = state.purged_order.pop_front().expect("over capacity");
+            state.purged.remove(&oldest);
+        }
+        true
     }
 
     /// What the rendezvous holds right now.
@@ -824,8 +858,17 @@ mod tests {
             .push_remote_frame(doomed_late, 0, 0, false, names(), Some(remote(99)))
             .unwrap();
 
+        assert_eq!(exchange.failure(doomed.fragment_instance_id), None);
         let purged = exchange.purge_query(FragmentInstanceId::from_halves(41, 0), "boom");
+        assert_eq!(
+            exchange
+                .failure(doomed_late.fragment_instance_id)
+                .as_deref(),
+            Some("boom")
+        );
+        assert_eq!(exchange.failure(other.fragment_instance_id), None);
         assert_eq!(purged.slots, vec![local_slot(doomed, 0)]);
+        assert_eq!(purged.receivers.len(), 1, "the waiting receiver never runs");
         let mut tokens = purged.tokens;
         tokens.sort_unstable();
         assert_eq!(tokens, vec![41, 99]);
@@ -837,9 +880,9 @@ mod tests {
                 remote_batches: 1,
             }
         );
-        assert_eq!(
-            exchange.purge_query(FragmentInstanceId::from_halves(41, 0), "again"),
-            Purged::default(),
+        let again = exchange.purge_query(FragmentInstanceId::from_halves(41, 0), "again");
+        assert!(
+            again.slots.is_empty() && again.tokens.is_empty() && again.receivers.is_empty(),
             "a second purge finds nothing"
         );
     }
@@ -849,14 +892,15 @@ mod tests {
     fn a_purged_query_refuses_late_receivers_senders_and_frames() {
         let exchange = LocalExchange::default();
         let key = query_key(43, 2, 7);
-        exchange.purge_query(FragmentInstanceId::from_halves(43, 0), "GPU out of memory");
+        assert!(exchange.mark_failed(FragmentInstanceId::from_halves(43, 5), "GPU out of memory"));
+        assert!(!exchange.mark_failed(FragmentInstanceId::from_halves(43, 0), "a later error"));
         exchange.purge_query(
             FragmentInstanceId::from_halves(43, 0),
             "cancelled by the FE",
         );
         let refused = |result: Result<Option<ReadyFragment>, String>| {
             let err = result.unwrap_err();
-            assert!(err.contains("already failed: GPU out of memory"), "{err}");
+            assert!(err.starts_with("GPU out of memory ("), "{err}");
         };
         refused(exchange.register_receiver(key.fragment_instance_id, vec![(7, 1)], params()));
         refused(exchange.push_sender(key, 0, local(key, 0)));
