@@ -1069,10 +1069,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   // finish() at the end of this body quiesces any transient per-query state
   // the materialization created; the pinned entries themselves persist across
   // windows.
-  duckdb::SiriusContext::StandaloneQueryScope window(*sirius_ctx, context, "pin_table");
+  duckdb::SiriusContext::StandaloneQueryScope window(
+    *sirius_ctx, context, "pin_table", sirius::exec::query_admission::access::maintenance);
   try {
-    auto pin_registry_guard = sirius_ctx->lock_pinned_table_registry();
-
     // The read is driven by sirius::materialize_all_batches (pin_table.cpp), which
     // round-robins the materialized batches across all GPU memory spaces so a pin
     // distributes its chunks evenly. For tier='host' each materialized GPU table is
@@ -1433,10 +1432,9 @@ void SiriusRegistration::UnpinTableFunction(ClientContext& context,
   }
   {
     // Registry removal must be serialized against execution windows (plan
-    // generation reads pinned entries); a lock-only guard suffices — unpin
+    // generation reads pinned entries); a maintenance permit also excludes writers. Unpin
     // creates no per-query runtime state to clean.
     duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
-    auto pin_registry_guard = sirius_ctx->lock_pinned_table_registry();
     sirius_ctx->get_scan_manager().remove_pinned_entry(data.name);
   }
 

@@ -161,12 +161,11 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
     throw InternalException("Sirius connection state is unavailable while guarding UPDATE");
   }
 
-  std::shared_lock<std::shared_mutex> update_guard;
+  sirius::exec::query_admission::permit update_guard;
   if (!connection_state->has_pinned_update_guard()) {
-    update_guard = sirius_context.lock_pinned_table_updates();
+    update_guard = sirius_context.acquire_pinned_update_guard(context);
   }
   {
-    SiriusContext::SlotGuard pin_registry_guard(sirius_context, context);
     auto pinned_name = pinned_name_for_table(sirius_context.get_scan_manager(), *target);
     if (pinned_name) {
       throw InvalidInputException(
@@ -177,9 +176,7 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
     }
   }
 
-  if (update_guard.owns_lock()) {
-    connection_state->set_pinned_update_guard(std::move(update_guard));
-  }
+  if (update_guard) { connection_state->set_pinned_update_guard(std::move(update_guard)); }
 }
 
 /// Resolve the config file path. Search order:
@@ -661,12 +658,22 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   }
 }
 
-SiriusContext::SlotGuard::SlotGuard(SiriusContext& ctx, ClientContext& context) : ctx_(ctx)
+SiriusContext::SlotGuard::SlotGuard(SiriusContext& ctx,
+                                    ClientContext& context,
+                                    sirius::exec::query_admission::access kind)
+  : permit_(ctx.acquire_query_lifecycle_slot(&context, kind))
 {
-  ctx_.acquire_query_lifecycle_slot(&context);
 }
+SiriusContext::SlotGuard::~SlotGuard() noexcept = default;
 
-SiriusContext::SlotGuard::~SlotGuard() noexcept { ctx_.release_query_lifecycle_slot(); }
+void SiriusContext::StandaloneQueryScope::release() noexcept
+{
+  if (connection_state_) {
+    connection_state_->execution_window_active = false;
+    connection_state_->execution_options.reset();
+  }
+  permit_.reset();
+}
 
 void SiriusContext::StandaloneQueryScope::log_window_event(char const* event,
                                                            char const* outcome) const noexcept
@@ -683,9 +690,11 @@ void SiriusContext::StandaloneQueryScope::log_window_event(char const* event,
   }
 }
 
-SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
-                                                          ClientContext& context,
-                                                          std::string_view window_label)
+SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
+  SiriusContext& ctx,
+  ClientContext& context,
+  std::string_view window_label,
+  sirius::exec::query_admission::access kind)
   : ctx_(ctx), window_id_(sirius::make_query_id(0)), connection_id_(0), query_ordinal_(0)
 {
   Value inject;
@@ -696,11 +705,10 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     connection_id_ = conn_state->connection_id();
     query_ordinal_ = conn_state->current_query_ordinal();
   }
-  // Window id + keyed tags are prepared BEFORE the slot is acquired: after
-  // acquire, no statement on any path allocates, so release cannot be skipped
-  // (and the noexcept destructor cannot terminate) for an allocation reason.
-  window_id_ =
-    sirius::make_query_id(ctx_.next_window_id_.fetch_add(1, std::memory_order_relaxed) + 1);
+  // The arrival ticket establishes FIFO priority. The member permit releases on
+  // constructor failure, including failures before the explicit begin rollback.
+  permit_     = ctx_.acquire_query_lifecycle_slot(&context, kind);
+  window_id_  = sirius::make_query_id(static_cast<std::uint32_t>(permit_.ticket()));
   completion_ = std::make_shared<sirius::pipeline::completion_handler>(
     ctx.window_task_counter(),
     [registry = &ctx_.query_lifecycle_, id = window_id_](std::exception_ptr error) {
@@ -710,6 +718,8 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   if (completion_->injections) ctx.record_certification_budget(false, false, 10);
   completion_->non_rollbackable_state =
     completion_->injections && completion_->injections->non_rollbackable_state;
+  connection_state_ = get_sirius_connection_state(context);
+  if (connection_state_) connection_state_->execution_window_active = true;
   std::snprintf(begin_tag_,
                 sizeof(begin_tag_),
                 "QueryBegin instance=%p connection=%llu window=%llu query=%llu",
@@ -725,7 +735,6 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
                 static_cast<unsigned long long>(sirius::value_of(window_id_)),
                 static_cast<unsigned long long>(query_ordinal_));
 
-  ctx_.acquire_query_lifecycle_slot(&context);
   log_window_event("begin", "-");
   try {
     {
@@ -744,7 +753,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     }
     lease_release_.state = lease_release_state::begin_failed;
     log_window_event("end", "unavailable");
-    ctx_.release_query_lifecycle_slot();
+    release();
     throw;
   } catch (std::exception& e) {
     // Roll back this execution's registrations. Report fatal CUDA evidence before wrapping
@@ -758,7 +767,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     ctx_.query_lifecycle_.report_failure(std::current_exception(), window_id_);
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
-    ctx_.release_query_lifecycle_slot();
+    release();
     throw SiriusBeginWindowFailureException(
       string("Sirius execution-window initialization failed: ") + e.what());
   } catch (...) {
@@ -771,7 +780,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     ctx_.query_lifecycle_.report_failure(std::current_exception(), window_id_);
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
-    ctx_.release_query_lifecycle_slot();
+    release();
     throw SiriusBeginWindowFailureException(
       "Sirius execution-window initialization failed: "
       "unknown exception");
@@ -785,9 +794,9 @@ void SiriusContext::StandaloneQueryScope::finish()
   // logging throw — by this non-throwing releaser; nothing below can retain
   // the slot.
   struct slot_releaser {
-    SiriusContext& ctx;
-    ~slot_releaser() noexcept { ctx.release_query_lifecycle_slot(); }
-  } releaser{ctx_};
+    StandaloneQueryScope& scope;
+    ~slot_releaser() noexcept { scope.release(); }
+  } releaser{*this};
 
   try {
     lease_release_.keys_released =
@@ -818,7 +827,7 @@ SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
     // are attributed just as they are on an explicit finish().
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "unwind");
-    ctx_.release_query_lifecycle_slot();
+    release();
     state_ = scope_state::FAILED;
   }
   std::lock_guard lock(ctx_.window_completions_mutex_);
@@ -865,6 +874,17 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     throw std::runtime_error("SiriusContext::initialize: no GPUs discovered");
   }
   config_ = config.resolve(discovery.get_topology());
+  admission_.configure(config_.max_concurrent_queries());
+  if (config_.max_concurrent_queries() > 1) {
+    for (auto const& space : config_.get_memory_space_configs()) {
+      if (auto gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+          gpu && gpu->per_stream_reservation)
+        throw std::invalid_argument(
+          "Concurrent Sirius queries require per_stream_reservation: false (the default); "
+          "per-stream trackers cannot safely follow conversions across worker streams");
+    }
+  }
+
   sirius::converter_registry::initialize(config_.get_downgrade_executor_config().copy_chunk_bytes);
 
   // Discovery is shared by all subsystems; execution GPU ids come from the
@@ -1163,6 +1183,9 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 void SiriusContext::terminate()
 {
   throw_if_not_initialized();
+  admission_.close();
+  mark_runtime_unavailable();
+  admission_.wait_until_idle();
   query_lifecycle_.quiesce_all();
 
   // Restore LIBCUDF_HW_DECOMPRESSION to its prior state (unset it if we exported it). Paired with
@@ -1336,14 +1359,10 @@ const sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache() const
   return *cuvs_index_cache_;
 }
 
-std::shared_lock<std::shared_mutex> SiriusContext::lock_pinned_table_updates()
+sirius::exec::query_admission::permit SiriusContext::acquire_pinned_update_guard(
+  ClientContext& context)
 {
-  return std::shared_lock(pinned_table_update_mutex_);
-}
-
-std::unique_lock<std::shared_mutex> SiriusContext::lock_pinned_table_registry()
-{
-  return std::unique_lock(pinned_table_update_mutex_);
+  return acquire_query_lifecycle_slot(&context, sirius::exec::query_admission::access::writer);
 }
 
 std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_telemetry_context()
@@ -1380,7 +1399,8 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
 
 bool SiriusContext::is_query_lifecycle_active() const noexcept
 {
-  return query_lifecycle_held_.load(std::memory_order_acquire);
+  auto counts = admission_.snapshot();
+  return counts.active_queries || counts.planners || counts.maintenance_active;
 }
 
 SiriusConnectionState::SiriusConnectionState()
@@ -1818,12 +1838,20 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
 
   try {
-    // Plan-generation window: create_plan below reads the scan manager's pin
-    // registry, which requires single-flight discipline, so the validation is
-    // serialized against execution windows. Placed after the replan block so
-    // its nested bind never re-enters the slot, and inside this try so a
-    // runtime-unavailable error takes the existing fallback split below.
-    SlotGuard plan_window(*this, context);
+    // Copy can rebind table functions, whose bind callbacks may acquire maintenance access.
+    // Finish it before taking a planning permit so maintenance cannot wait on our own permit.
+    duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
+    bool plan_is_copyable = true;
+    try {
+      validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
+    } catch (NotImplementedException&) {
+      plan_is_copyable = false;
+    }
+
+    // Protect pin-registry reads and GPU plan validation against maintenance. Both SQL
+    // replanning and logical-plan copying must finish before entering this window.
+    // Keep acquisition inside this try so runtime-unavailable errors use the fallback below.
+    SlotGuard plan_window(*this, context, sirius::exec::query_admission::access::planning);
     auto physical_original_views =
       prepared.physical_plan
         ? sirius::op::scan::capture_bound_read_views(prepared.physical_plan->Root(), context)
@@ -1842,13 +1870,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                          sirius::planner::scan_contract_provenance{
                            std::nullopt, conn_state->planning_generation()})
                      : std::make_unique<sirius::planner::sirius_physical_plan_generator>(context);
-    duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
-    bool plan_is_copyable = true;
-    try {
-      validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
-    } catch (NotImplementedException&) {
-      plan_is_copyable = false;
-    }
     // Hand the validated plan over instead of discarding it, so the first execution can skip
     // an identical rebuild. Stamp the pinned-registry epoch the plan was built against: the
     // execution window re-checks it and rebuilds if a pin or unpin landed in between.
@@ -2001,51 +2022,30 @@ void SiriusContext::throw_if_not_initialized() const
   if (!is_initialized_) { throw std::runtime_error("Sirius context is not initialized."); }
 }
 
-void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
+sirius::exec::query_admission::permit SiriusContext::acquire_query_lifecycle_slot(
+  ClientContext* context, sirius::exec::query_admission::access kind)
 {
-  // `| 1` keeps the sentinel (0 = free) unreachable; a cross-thread hash
-  // collision could only cause a spurious diagnosable error, never a missed
-  // release (the check is advisory — correctness rests on the scope-bound
-  // release).
-  auto const my_hash = std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1;
-  // Same-thread reacquire would be a silent permanent wait (plain std::mutex).
-  // Only the CURRENT holder can observe its own hash here, so a match is a
-  // definite programming error — surface it as a diagnosable error instead.
-  if (holder_thread_hash_.load(std::memory_order_relaxed) == my_hash) {
-    throw std::runtime_error(
-      "Sirius internal error: query-lifecycle slot re-acquired on the holding thread "
-      "(nested execution window)");
+  const sirius::exec::query_admission::permit* writer = nullptr;
+  if (context) {
+    auto state = get_sirius_connection_state(*context);
+    if (state && state->execution_window_active)
+      throw InvalidInputException(
+        "Nested Sirius execution windows are unsupported; concurrent FFI fragments require "
+        "separate execution contexts");
+    if (state && state->has_pinned_update_guard()) {
+      if (kind == sirius::exec::query_admission::access::maintenance)
+        throw InvalidInputException(
+          "Sirius maintenance cannot run inside a guarded update-producing statement");
+      writer = &state->pinned_update_guard();
+    }
   }
-  // Fast-fail before waiting: no point queuing on an unavailable runtime or
-  // for an already-cancelled query.
-  if (get_runtime_health() == runtime_health::UNAVAILABLE) { throw_runtime_unavailable(); }
-  if (context && context->IsInterrupted()) { throw InterruptException(); }
-
-  query_lifecycle_mutex_.lock();
-  holder_thread_hash_.store(my_hash, std::memory_order_relaxed);
-  query_lifecycle_held_.store(true, std::memory_order_release);
-
-  // Re-check AFTER acquiring, BEFORE any shared mutation: the previous holder
-  // may have latched unavailability, and this waiter may have been cancelled,
-  // while it was blocked. A cancelled waiter must never late-enter the window.
-  if (get_runtime_health() == runtime_health::UNAVAILABLE) {
-    release_query_lifecycle_slot();
-    throw_runtime_unavailable();
-  }
-  if (context && context->IsInterrupted()) {
-    release_query_lifecycle_slot();
-    throw InterruptException();
-  }
-}
-
-void SiriusContext::release_query_lifecycle_slot() noexcept
-{
-  // Unlocking a std::mutex from a thread that does not hold it is undefined behaviour.
-  D_ASSERT(holder_thread_hash_.load(std::memory_order_relaxed) ==
-           (std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1));
-  holder_thread_hash_.store(0, std::memory_order_relaxed);
-  query_lifecycle_held_.store(false, std::memory_order_release);
-  query_lifecycle_mutex_.unlock();
+  return admission_.acquire(
+    kind,
+    [&] {
+      if (get_runtime_health() == runtime_health::UNAVAILABLE) throw_runtime_unavailable();
+      if (context && context->IsInterrupted()) throw InterruptException();
+    },
+    writer);
 }
 
 // ================= Free Functions ================= //

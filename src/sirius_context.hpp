@@ -20,6 +20,7 @@
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "event/query_event_publisher.hpp"
+#include "exec/query_admission.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -54,7 +55,6 @@
 #include <mutex>
 #include <optional>
 #include <set>
-#include <shared_mutex>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -111,12 +111,17 @@ class SiriusConnectionState : public ClientContextState {
   /// A new query on this connection invalidates any leftover capture.
   void QueryBegin(ClientContext& context) final
   {
+    if (is_internal_query_active()) return;
     captured_plan_.reset();
     captured_original_views_.reset();
+    // DuckDB has finished/abandoned the previous statement before starting another.
+    // Backstop a missing QueryEnd without releasing an outer writer during internal SQL.
+    pinned_update_guard_.reset();
   }
 
   void QueryEnd() final
   {
+    if (is_internal_query_active()) return;
     pinned_update_guard_.reset();
     execution_options.reset();
   }
@@ -125,14 +130,16 @@ class SiriusConnectionState : public ClientContextState {
   std::optional<sirius::operator_params> operator_overrides;
   std::optional<sirius::compression_config> compression_overrides;
   std::shared_ptr<const sirius::operator_params> execution_options;
+  bool execution_window_active{false};
 
-  [[nodiscard]] bool has_pinned_update_guard() const noexcept
+  [[nodiscard]] bool has_pinned_update_guard() const noexcept { return bool(pinned_update_guard_); }
+  const sirius::exec::query_admission::permit& pinned_update_guard() const
   {
-    return pinned_update_guard_.has_value();
+    return pinned_update_guard_;
   }
-  void set_pinned_update_guard(std::shared_lock<std::shared_mutex> guard)
+  void set_pinned_update_guard(sirius::exec::query_admission::permit guard)
   {
-    pinned_update_guard_.emplace(std::move(guard));
+    pinned_update_guard_ = std::move(guard);
   }
 
   /// \brief Per-connection monotonic query ordinal, advanced by the shared
@@ -303,7 +310,7 @@ class SiriusConnectionState : public ClientContextState {
   std::optional<std::string> session_label_;
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
-  std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;
+  sirius::exec::query_admission::permit pinned_update_guard_;
   uint64_t connection_id_;
   uint64_t query_ordinal_ = 0;
 };
@@ -549,24 +556,23 @@ class SiriusContext : public ClientContextState {
   [[noreturn]] void throw_runtime_unavailable() const;
 
   /**
-   * @brief Lock-only RAII over the query-lifecycle slot, for plan-generation
-   * windows (OnFinalizePrepare validation, explicit-path plan building,
-   * runtime-sensitive SET callbacks). Same-scope/same-thread by construction:
-   * the destructor releases what the constructor acquired, so no release path
-   * exists outside the acquiring scope.
+   * @brief Scoped planning or maintenance admission, without holding a mutex
+   * across the work. Planning is shared; maintenance excludes resource users.
    */
   class SlotGuard {
    public:
     /// @p context is the acquiring connection: a cancellation that arrived
-    /// while waiting is honored AFTER the lock is obtained and BEFORE any
-    /// shared mutation (the cancelled waiter never late-enters the window).
-    SlotGuard(SiriusContext& ctx, ClientContext& context);
+    /// while waiting is polled promptly and checked before admission.
+    SlotGuard(SiriusContext& ctx,
+              ClientContext& context,
+              sirius::exec::query_admission::access kind =
+                sirius::exec::query_admission::access::maintenance);
     ~SlotGuard() noexcept;
     SlotGuard(const SlotGuard&)            = delete;
     SlotGuard& operator=(const SlotGuard&) = delete;
 
    private:
-    SiriusContext& ctx_;
+    sirius::exec::query_admission::permit permit_;
   };
 
   /**
@@ -576,8 +582,8 @@ class SiriusContext : public ClientContextState {
    * finish() did not complete — it attempts the cleanup once, marks the
    * runtime UNAVAILABLE if that fails, and always releases the slot.
    *
-   * Every acquire/release pair lives in one C++ scope on one thread, so
-   * release is exactly-once by construction and DuckDB's QueryEnd delivery
+   * Permit ownership is transferable; release is exactly-once by construction.
+   * DuckDB's QueryEnd delivery
    * (unreliable for abandoned results) plays no part in slot ownership.
    */
   class StandaloneQueryScope {
@@ -593,7 +599,11 @@ class SiriusContext : public ClientContextState {
       std::size_t keys_released = 0;
     };
 
-    StandaloneQueryScope(SiriusContext& ctx, ClientContext& context, std::string_view window_label);
+    StandaloneQueryScope(
+      SiriusContext& ctx,
+      ClientContext& context,
+      std::string_view window_label,
+      sirius::exec::query_admission::access kind = sirius::exec::query_admission::access::query);
     ~StandaloneQueryScope() noexcept;
     StandaloneQueryScope(const StandaloneQueryScope&)            = delete;
     StandaloneQueryScope& operator=(const StandaloneQueryScope&) = delete;
@@ -631,6 +641,9 @@ class SiriusContext : public ClientContextState {
     /// Best-effort window begin/end log line — never throws.
     void log_window_event(char const* event, char const* outcome) const noexcept;
     SiriusContext& ctx_;
+    sirius::exec::query_admission::permit permit_;
+    shared_ptr<SiriusConnectionState> connection_state_;
+    void release() noexcept;
     /// This window's query id; see sirius::query_id_t.
     sirius::query_id_t window_id_;
     uint64_t connection_id_;
@@ -681,7 +694,6 @@ class SiriusContext : public ClientContextState {
   /// \brief The registry itself, for subsystems that hold a long-lived binding to it.
   [[nodiscard]] sirius::data::data_repository_manager_registry& get_data_repository_registry();
 
-  /// \brief The per-query enqueue gate, for tests and for subsystems that consult it directly.
   enum class query_retirement_mode { completed, cancelled };
 
   /// Close publication, stop scan producers, and settle this query's asynchronous work.
@@ -690,6 +702,7 @@ class SiriusContext : public ClientContextState {
   /// Keeps the plan and registries owned until the execution window releases them.
   void retire_query_work(sirius::query_id_t query_id, query_retirement_mode mode);
 
+  /// \brief The per-query registry used by runtime components and diagnostics.
   [[nodiscard]] sirius::exec::query_lifecycle_registry& get_query_lifecycle_registry() noexcept
   {
     return query_lifecycle_;
@@ -735,9 +748,8 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::vss::cuvs_index_cache& get_cuvs_index_cache();
   [[nodiscard]] const sirius::vss::cuvs_index_cache& get_cuvs_index_cache() const;
 
-  /// Coordinate update execution with pin-registry mutations.
-  std::shared_lock<std::shared_mutex> lock_pinned_table_updates();
-  std::unique_lock<std::shared_mutex> lock_pinned_table_registry();
+  /// Retain through the update-producing statement, excluding pin-registry maintenance.
+  sirius::exec::query_admission::permit acquire_pinned_update_guard(ClientContext& context);
 
   [[nodiscard]] std::shared_ptr<const sirius::telemetry::telemetry_context> get_telemetry_context()
     const;
@@ -768,6 +780,10 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
 
   /// \brief Whether the shared query lifecycle slot is currently held by any connection.
+  [[nodiscard]] sirius::exec::query_admission::counts admission_counts() const
+  {
+    return admission_.snapshot();
+  }
   [[nodiscard]] bool is_query_lifecycle_active() const noexcept;
 
   /// \brief Snapshot counters for transparent execution observability.
@@ -842,8 +858,8 @@ class SiriusContext : public ClientContextState {
   /// (and before returning) re-checks BOTH runtime health and the acquiring
   /// connection's cancellation: a cancelled waiter never late-enters the
   /// window (it releases and throws instead of running any shared mutation).
-  void acquire_query_lifecycle_slot(ClientContext* context);
-  void release_query_lifecycle_slot() noexcept;
+  sirius::exec::query_admission::permit acquire_query_lifecycle_slot(
+    ClientContext* context, sirius::exec::query_admission::access kind);
   /// The begin-of-window shared mutations (repository-manager registration and
   /// the query's task_creator state) — runs INSIDE the held slot, right after
   /// acquire and the health check. Plans are normally generated before this
@@ -876,28 +892,9 @@ class SiriusContext : public ClientContextState {
   void drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept;
 
   mutable std::mutex mutex_;
-  // The Super Sirius runtime is shared across connections, so plan generation
-  // and engine execution must be serialized (single-flight). The slot is
-  // scope-bound: held only inside StandaloneQueryScope / SlotGuard windows
-  // (acquire and release in the same scope on the same thread), never across
-  // DuckDB's user-visible result lifetime, so an abandoned stream or pending
-  // result holds nothing.
-  std::mutex query_lifecycle_mutex_;
-  // Pin and unpin take this exclusively; updates hold it from validation
-  // through QueryEnd so neither operation can pass the other between checks.
-  std::shared_mutex pinned_table_update_mutex_;
-  std::atomic<bool> query_lifecycle_held_{false};
-  // Hash of the holder's thread id, written under the gate while held, 0 when
-  // free. Read (relaxed) before acquiring ONLY to detect a same-thread
-  // reacquire, which is turned into a diagnosable fatal error instead of a
-  // silent permanent wait.
-  std::atomic<size_t> holder_thread_hash_{0};
+  sirius::exec::query_admission admission_;
   // See runtime_health: latched when a mandatory cleanup step fails.
   std::atomic<bool> runtime_unavailable_{false};
-  // Monotonic execution-window id for window-keyed logging.
-  /// 32-bit to match sirius::query_id_t, which task_creator packs into the scheduling
-  /// priority. The first window gets id 1, so 0 is never a live query id.
-  std::atomic<std::uint32_t> next_window_id_{0};
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   // Holds LIBCUDF_HW_DECOMPRESSION=ON while the context is initialized, when

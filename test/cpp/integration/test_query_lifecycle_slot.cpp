@@ -31,6 +31,9 @@
 
 #include "log/logging.hpp"
 #include "sirius_extension.hpp"
+#include "utils/pinned_entry_census.hpp"
+
+#include <cuda_runtime_api.h>
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -60,6 +63,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <regex>
@@ -2047,6 +2051,275 @@ void run_ac13_concurrent_logging(duckdb::Connection& a,
 
 // The scenario for one variant. Runs inside the existing child process and
 // reports progress through the existing watchdog result file.
+
+// Hold real SQL calls after admission, before initialization, so overlap and queueing
+// are asserted from runtime state rather than inferred from thread creation or timing.
+class concurrent_window_sink final : public sirius::log::sink {
+ public:
+  explicit concurrent_window_sink(unsigned count) : remaining(count) {}
+  void set_level(sirius::log::level) override {}
+  bool should_log(sirius::log::level level) const override
+  {
+    return level == sirius::log::level::info;
+  }
+  void log(sirius::log::level, std::source_location const&, std::string_view message) override
+  {
+    if (!message.starts_with("[window] begin instance=")) return;
+    std::unique_lock lock(mutex);
+    if (remaining == 0) return;
+    --remaining;
+    cv.notify_all();
+    cv.wait_for(lock, std::chrono::seconds(20), [&] { return released; });
+  }
+  bool flush() override { return true; }
+  bool await_all()
+  {
+    std::unique_lock lock(mutex);
+    return cv.wait_for(lock, std::chrono::seconds(10), [&] { return remaining == 0; });
+  }
+  void release()
+  {
+    {
+      std::lock_guard lock(mutex);
+      released = true;
+    }
+    cv.notify_all();
+  }
+
+ private:
+  std::mutex mutex;
+  std::condition_variable cv;
+  unsigned remaining;
+  bool released{false};
+};
+
+void run_concurrent_admission(std::string const& variant,
+                              duckdb::DuckDB& db,
+                              duckdb::Connection& setup,
+                              fs::path const& output,
+                              slot_watchdog_result& out)
+{
+  unsigned const limit = variant == "concurrent_4" ? 4 : 2;
+  bool const fail      = variant == "concurrent_failure" || variant == "concurrent_two_failures";
+  bool const both_fail = variant == "concurrent_two_failures";
+  bool const active_cancel = variant == "concurrent_active_cancel";
+  bool const compressed_pin =
+    variant == "concurrent_compressed_host" || variant == "concurrent_compressed_gpu";
+  bool const pins = variant == "concurrent_host_pin" || variant == "concurrent_gpu_pin" ||
+                    variant == "concurrent_mvcc" || compressed_pin || variant == "concurrent_unpin";
+  bool const mvcc   = variant == "concurrent_mvcc";
+  bool const cancel = variant == "concurrent_cancel";
+  bool const maintenance_case =
+    variant == "concurrent_maintenance" || variant == "concurrent_unpin";
+  if (!set_gpu_execution(setup, false, out.error) ||
+      !create_range_table(setup, "concurrent_input", 200000, out.error) ||
+      !run_statement(setup, "CHECKPOINT", "concurrency checkpoint", out.error))
+    return;
+  auto runtime = sirius::test::get_registered_sirius_context(setup);
+  if (runtime->get_config().max_concurrent_queries() != static_cast<int>(limit)) {
+    out.error = "test concurrency configuration was not applied";
+    return;
+  }
+  std::vector<std::unique_ptr<duckdb::Connection>> connections;
+  for (unsigned i = 0; i < limit + 2; ++i) {
+    auto con = std::make_unique<duckdb::Connection>(db);
+    if (!run_statement(*con, "SET enable_duckdb_fallback=false", "disable fallback", out.error))
+      return;
+    connections.push_back(std::move(con));
+  }
+  if (compressed_pin) {
+    auto plan_dir = output.parent_path() / "compressed-plans";
+    fs::create_directories(plan_dir);
+    {
+      std::ofstream plan(plan_dir / "concurrent_input.txt");
+      plan << "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+    }
+    for (auto const& setting : std::vector<std::string>{
+           "SET pin_table_compression=true",
+           "SET pin_table_compression_min_batch_size_bytes=0",
+           "SET enable_compressed_materialization=true",
+           "SET pin_table_input_compression_plan_dir=" + sql_quote(plan_dir.string())})
+      if (!run_statement(setup, setting, "compressed pin setup", out.error)) return;
+  }
+  if (pins && !run_statement(setup,
+                             "CALL pin_table(format='duckdb', name='concurrent_input', tier='" +
+                               std::string((variant == "concurrent_gpu_pin" ||
+                                            variant == "concurrent_compressed_gpu")
+                                             ? "gpu"
+                                             : "host") +
+                               "')",
+                             "concurrent pin",
+                             out.error))
+    return;
+  if (compressed_pin) {
+    auto census = sirius::test::census_entry(setup, "concurrent_input");
+    if (!census.compressed_chunks || census.compressed_chunks != census.chunks) {
+      out.error = "concurrent pin fixture did not actually compress";
+      return;
+    }
+  }
+  if (mvcc) {
+    if (!run_statement(*connections[0], "BEGIN TRANSACTION", "old snapshot", out.error) ||
+        !run_scalar_query(*connections[0],
+                          "SELECT sum(i) FROM concurrent_input",
+                          range_sum(200000),
+                          "establish old snapshot",
+                          out.error) ||
+        !run_statement(
+          setup, "DELETE FROM concurrent_input WHERE i % 7 = 0", "concurrent delete", out.error))
+      return;
+  }
+  if (both_fail && !run_statement(*connections[1],
+                                  "SET sirius_test_inject_transparent_gpu_error='isolated failure'",
+                                  "second failure",
+                                  out.error))
+    return;
+  if (fail && !run_statement(*connections[0],
+                             "SET sirius_test_inject_transparent_gpu_error='isolated failure'",
+                             "inject failure",
+                             out.error))
+    return;
+  std::string aggregate_sql = "SELECT sum(i) FROM concurrent_input";
+  std::string expected_sum  = range_sum(200000);
+  if (variant == "concurrent_many_scans") {
+    aggregate_sql = "SELECT sum(i) FROM (";
+    for (int scan = 0; scan < 12; ++scan) {
+      if (scan) aggregate_sql += " UNION ALL ";
+      aggregate_sql += "SELECT i FROM concurrent_input";
+    }
+    aggregate_sql += ") scans";
+    expected_sum = std::to_string(12ULL * 200000 * 199999 / 2);
+  }
+  if (variant == "concurrent_mixed") {
+    aggregate_sql =
+      "SELECT sum(s) FROM (SELECT a.i % 97 AS g, sum(b.i) AS s "
+      "FROM concurrent_input a JOIN concurrent_input b ON a.i=b.i "
+      "WHERE a.i % 3 = 0 GROUP BY 1 ORDER BY s DESC LIMIT 17) grouped";
+    auto cpu = setup.Query(aggregate_sql);
+    if (!cpu || cpu->HasError()) {
+      out.error = "CPU mixed-workload reference failed";
+      return;
+    }
+    expected_sum = cpu->GetValue(0, 0).ToString();
+  }
+  if (variant == "concurrent_cache") {
+    auto path = output.parent_path() / "concurrent.parquet";
+    if (!run_statement(setup,
+                       "COPY concurrent_input TO " + sql_quote(path.string()) + " (FORMAT PARQUET)",
+                       "write shared cache fixture",
+                       out.error))
+      return;
+    aggregate_sql = "SELECT sum(i) FROM read_parquet(" + sql_quote(path.string()) + ")";
+  }
+  std::string current_sum = expected_sum;
+  if (mvcc) {
+    auto cpu = setup.Query(aggregate_sql);
+    if (!cpu || cpu->HasError()) {
+      out.error = "CPU MVCC reference failed";
+      return;
+    }
+    current_sum = cpu->GetValue(0, 0).ToString();
+  }
+  auto before        = runtime->get_transparent_execution_stats();
+  auto previous_sink = sirius::log::get_sink();
+  auto gate          = std::make_shared<concurrent_window_sink>(limit);
+  sirius::log::set_sink(gate);
+  struct restore {
+    std::shared_ptr<sirius::log::sink> previous;
+    std::shared_ptr<concurrent_window_sink> gate;
+    ~restore()
+    {
+      gate->release();
+      sirius::log::set_sink(previous);
+    }
+  } restore_sink{previous_sink, gate};
+  auto execute = [&](unsigned i) {
+    if (variant == "concurrent_prepared" || variant == "concurrent_cycles") {
+      auto prepared = connections[i]->Prepare(aggregate_sql);
+      if (prepared->HasError()) return prepared->GetError();
+      for (int repeat = 0; repeat < (variant == "concurrent_cycles" ? 20 : 2); ++repeat) {
+        auto result = prepared->Execute();
+        std::string error;
+        if (!require_scalar_result(result.get(), "concurrent prepared", expected_sum, error))
+          return error;
+      }
+      return std::string{};
+    }
+    async_query_result result;
+    run_async_scalar_query(*connections[i],
+                           aggregate_sql,
+                           (mvcc && i != 0) ? current_sum : expected_sum,
+                           "concurrent aggregate",
+                           result);
+    return result.error;
+  };
+  std::vector<std::future<std::string>> queries;
+  for (unsigned i = 0; i < limit; ++i)
+    queries.push_back(std::async(std::launch::async, execute, i));
+  mark_workload_started(output, out);
+  bool const overlapping = gate->await_all() && runtime->admission_counts().active_queries == limit;
+  auto extra             = std::async(std::launch::async, execute, limit);
+  auto await             = [&](auto predicate) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!predicate() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    return predicate();
+  };
+  bool const queued       = await([&] { return runtime->admission_counts().queued_queries == 1; });
+  bool cancelled_promptly = true;
+  if (cancel) {
+    connections[limit]->Interrupt();
+    cancelled_promptly = extra.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  }
+  std::future<std::string> maintenance;
+  bool maintenance_waiting = true;
+  if (maintenance_case) {
+    maintenance = std::async(std::launch::async, [&] {
+      auto result = connections[limit + 1]->Query(variant == "concurrent_unpin"
+                                                    ? "CALL unpin_table('concurrent_input')"
+                                                    : "CALL reset_sirius_cache()");
+      return result->HasError() ? result->GetError() : std::string{};
+    });
+    maintenance_waiting =
+      await([&] { return runtime->admission_counts().maintenance_waiters == 1; });
+  }
+  if (active_cancel) connections[0]->Interrupt();
+  gate->release();
+  for (unsigned i = 0; i < limit; ++i) {
+    auto error = queries[i].get();
+    if (active_cancel && i == 0) {
+      if (error.empty()) out.error = "active cancellation unexpectedly succeeded";
+    } else if (fail && (i == 0 || both_fail)) {
+      if (error.find("isolated failure") == std::string::npos)
+        out.error = "expected query-local injected failure: " + error;
+    } else if (!error.empty())
+      out.error = error;
+  }
+  if (mvcc) { run_statement(*connections[0], "COMMIT", "close old snapshot", out.error); }
+  auto extra_error = extra.get();
+  if (cancel ? extra_error.empty() : !extra_error.empty())
+    out.error = "unexpected queued-query result: " + extra_error;
+  if (maintenance.valid()) {
+    auto error = maintenance.get();
+    if (!error.empty()) out.error = error;
+  }
+  if (!overlapping || !queued || !cancelled_promptly || !maintenance_waiting)
+    out.error = "admission overlap/queue/cancellation/maintenance invariant failed";
+  auto counts = runtime->admission_counts();
+  if (counts.active_queries || counts.queued_queries || counts.maintenance_active ||
+      runtime->get_query_lifecycle_registry().size())
+    out.error = "query state retained after concurrent retirement";
+  auto followup = execute(limit + 1);
+  if (!followup.empty()) out.error = followup;
+  auto after    = runtime->get_transparent_execution_stats();
+  auto expected = limit + 2;  // counts execution attempts, including the failed/cancelled calls
+  if (variant == "concurrent_prepared") expected *= 2;
+  if (variant == "concurrent_cycles") expected *= 20;
+  if (after.executions - before.executions != expected)
+    out.error = "concurrent workload did not execute the expected GPU queries";
+  out.b_completed = out.error.empty();
+}
+
 slot_watchdog_result run_scenario(std::string const& variant,
                                   fs::path const& database_path,
                                   fs::path const& output_path)
@@ -2062,8 +2335,10 @@ slot_watchdog_result run_scenario(std::string const& variant,
     duckdb::Connection a(db);
     duckdb::Connection b(db);
 
-    if (variant == "stream" || variant == "pending" || variant == "cached_no_rebind" ||
-        variant == "ac1_pending_gpu") {
+    if (variant.starts_with("concurrent_")) {
+      run_concurrent_admission(variant, db, a, output_path, out);
+    } else if (variant == "stream" || variant == "pending" || variant == "cached_no_rebind" ||
+               variant == "ac1_pending_gpu") {
       run_abandoned_result_scenario(variant, a, b, output_path, out);
     } else if (variant == "ac2_gpu_single_flight") {
       run_ac2_gpu_single_flight(a, b, output_path, out);
@@ -2151,6 +2426,34 @@ class QueryLifecycleSlotFixture {
     auto const log_dir = variant_log_dir(output_path);
     if (variant_requires_file_log(variant)) { fs::create_directories(log_dir); }
 
+    auto child_config = config_path;
+    if (variant.starts_with("concurrent_")) {
+      std::ifstream input(config_path);
+      std::string yaml((std::istreambuf_iterator<char>(input)), {});
+      auto pos = yaml.find("sirius:");
+      if (pos == std::string::npos) throw std::runtime_error("missing Sirius configuration root");
+      yaml.insert(
+        pos + 7,
+        "\n  max_concurrent_queries: " + std::string(variant == "concurrent_4" ? "4" : "2"));
+      if (variant == "concurrent_cache") {
+        auto executor = yaml.find("  executor:");
+        yaml.insert(executor + 11,
+                    "\n    scan_manager:\n      max_readahead_scans: 1\n      readahead_strategy: "
+                    "eager\n      cache:\n        mode: sirius");
+      } else if (variant == "concurrent_host_pin" || variant == "concurrent_compressed_host") {
+        auto executor = yaml.find("  executor:");
+        yaml.insert(executor + 11,
+                    "\n    scan_manager:\n      memory_prefetcher:\n        enable: true\n        "
+                    "num_threads: 4\n        min_free_fraction: 0.0");
+      }
+      if (variant == "concurrent_many_scans") {
+        auto executor = yaml.find("  executor:");
+        yaml.insert(executor + 11, "\n    scan_manager:\n      num_threads: 2");
+      }
+      child_config = work_dir / (variant + ".yaml");
+      std::ofstream config_out(child_config);
+      config_out << yaml;
+    }
     std::vector<std::string> child_arguments{"sirius_unittest", kChildRunnerCase};
     std::vector<char*> child_argv;
     child_argv.reserve(child_arguments.size() + 1);
@@ -2162,7 +2465,7 @@ class QueryLifecycleSlotFixture {
     std::vector<sirius::test::child_process_environment::override> environment_overrides{
       {kEnvVariant, variant},
       {kEnvOutput, output_path.string()},
-      {kEnvConfig, config_path.string()}};
+      {kEnvConfig, child_config.string()}};
     if (variant_requires_file_log(variant)) {
       environment_overrides.emplace_back("SIRIUS_LOG_BACKEND", "spdlog");
       environment_overrides.emplace_back("SIRIUS_LOG_DIR", log_dir.string());
@@ -2333,4 +2636,63 @@ TEST_CASE_METHOD(QueryLifecycleSlotFixture,
                  "[query_lifecycle][slot_leak]")
 {
   require_variant_succeeds("ac12_operator_ids");
+}
+
+TEST_CASE_METHOD(QueryLifecycleSlotFixture,
+                 "Sirius bounded admission overlaps real SQL queries",
+                 "[query_lifecycle][concurrent_queries]")
+{
+  for (auto const* variant : {"concurrent_2",
+                              "concurrent_4",
+                              "concurrent_failure",
+                              "concurrent_cancel",
+                              "concurrent_maintenance",
+                              "concurrent_many_scans",
+                              "concurrent_two_failures",
+                              "concurrent_active_cancel",
+                              "concurrent_mixed",
+                              "concurrent_host_pin",
+                              "concurrent_gpu_pin",
+                              "concurrent_mvcc",
+                              "concurrent_compressed_host",
+                              "concurrent_compressed_gpu",
+                              "concurrent_cache",
+                              "concurrent_unpin",
+                              "concurrent_prepared",
+                              "concurrent_cycles"}) {
+    INFO(variant);
+    require_variant_succeeds(variant);
+  }
+}
+
+TEST_CASE_METHOD(QueryLifecycleSlotFixture,
+                 "concurrent SQL qualification requires two real GPUs",
+                 "[.][concurrent_queries_mgpu]")
+{
+  int devices = 0;
+  REQUIRE(cudaGetDeviceCount(&devices) == cudaSuccess);
+  INFO("This explicit qualification target requires at least two visible GPUs; it must not skip.");
+  REQUIRE(devices >= 2);
+  config_path = config_path.parent_path() / "integration-2gpu.yaml";
+  REQUIRE(fs::exists(config_path));
+  for (auto const* variant : {"concurrent_2",
+                              "concurrent_4",
+                              "concurrent_mixed",
+                              "concurrent_two_failures",
+                              "concurrent_active_cancel",
+                              "concurrent_host_pin",
+                              "concurrent_gpu_pin",
+                              "concurrent_compressed_host",
+                              "concurrent_compressed_gpu",
+                              "concurrent_cache",
+                              "concurrent_cycles"}) {
+    require_variant_succeeds(variant);
+  }
+}
+
+TEST_CASE_METHOD(QueryLifecycleSlotFixture,
+                 "concurrent logging retains query attribution",
+                 "[query_lifecycle][concurrent_logging]")
+{
+  require_variant_succeeds("ac13_concurrent_logging");
 }

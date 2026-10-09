@@ -82,9 +82,11 @@ registration and retained resources. Scheduler tests hold a task after removing 
 production queue and prove retirement waits for its disposal. Queue tests exercise reentrant
 destructors. SQL lifecycle tests cover cleanup and subsequent queries.
 
-Query diagnostics retain bounded metadata after retirement without retaining query resources.
-Fatal shared-device failures close publication and refuse later registration; ordinary query
-errors remain query-local. SQL execution remains serialized until the next admission layer.
+Bounded admission, maintenance, settings and memory progress are described in
+[Concurrent queries](concurrent-queries.md). The implementation journal records tested scenarios
+and the remaining hardware qualification gates. Query diagnostics retain bounded metadata after
+retirement without retaining query resources. Fatal shared-device failures close publication
+and refuse later registration; ordinary query errors remain query-local.
 
 Report exceptions through `query_lifecycle_registry::report_failure()` before converting them
 to DuckDB error results. Classification uses CUDA status codes from Sirius/cuDF exceptions.

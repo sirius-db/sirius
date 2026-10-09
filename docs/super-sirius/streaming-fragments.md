@@ -231,6 +231,10 @@ run():    ┌─ in_transaction ─ streaming_fragment::run() ──────
   `BEGIN` would fail and invalidate the open transaction. `in_transaction` holds the `Context`'s
   `conn_mutex`, so concurrent `build()`, `run()`, and `execute_substrait` calls wait for each other.
 
+`run()` holds a query admission permit through execution and retirement. `build()` does not
+retain one. The FFI Context still serializes its connection; concurrent SQL admission does not
+establish a concurrent streaming producer/consumer contract.
+
 ## Tests
 
 | File | Catch2 tags | Covers |

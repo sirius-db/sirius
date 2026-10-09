@@ -70,18 +70,11 @@ TEST_CASE("query_id: an earlier query always sorts before a later one", "[query_
   CHECK(earlier_last < later_first);
 }
 
-TEST_CASE("query_id: priority bits stay non-negative with bit 31 set", "[query_id]")
+TEST_CASE("query_id: priority rejects IDs outside the scheduling range", "[query_id]")
 {
-  // Regression: queue_priority is SIGNED. Before masking, an id >= 2^31 shifted into the sign
-  // bit, making the packed priority negative and inverting the "earlier query first" ordering.
-  const auto high_id = make_query_id(0x8000'0000U);
-  CHECK(query_priority_bits(high_id) >= 0);
-
-  const auto higher_id = make_query_id(0xFFFF'FFFFU);
-  CHECK(query_priority_bits(higher_id) >= 0);
-
-  // The mask is what makes this hold: bit 31 is dropped rather than shifted into the sign bit.
-  CHECK(query_priority_bits(high_id) == query_priority_bits(make_query_id(0)));
+  CHECK(query_priority_bits(make_query_id(sirius::max_query_id)) ==
+        (static_cast<std::int64_t>(sirius::max_query_id) << 32));
+  CHECK_THROWS_AS(query_priority_bits(make_query_id(0x8000'0000U)), std::overflow_error);
 }
 
 TEST_CASE("planner::query reports the id it was constructed with", "[query_id]")
