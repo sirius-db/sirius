@@ -45,6 +45,20 @@ qualification of the reordered intermediate branches. Original branch tips are p
 `backup/pr2001-reorder-20261008/`. The complete reordered implementation is checked against the
 previous combined tip; only documentation should differ after moving the dependency-specific tests.
 
+## Reorder verification (2026-10-08)
+
+- Full release builds passed for the admission baseline without #2001 and the final tip with it.
+- Baseline admission, query-ID, lifecycle, runtime-health, session-option and concurrent SQL
+  regression run: **51 test cases / 478 assertions**, including the 18 SQL variants that do not
+  require the relocated memory retry behavior.
+- Final memory wait, HOST collection, GPU executor, downgrade and concurrent SQL run:
+  **30 test cases / 14,791 assertions**, including all 20 SQL variants and the relocated
+  memory-pressure cancellation/timeout scenarios.
+- Benchmark runner Python regressions: **31 tests passed**. The runner is identical on both sides
+  of the comparison.
+- Final source, tests and benchmark skill content match the pre-reorder combined tip exactly.
+  Documentation records the new order; no performance benchmark results are claimed.
+
 ## Original extraction layers
 
 | Layer | PR | Branch | Commit |
