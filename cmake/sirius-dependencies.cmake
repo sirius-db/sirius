@@ -126,6 +126,10 @@ set(CUCASCADE_WARNINGS_AS_ERRORS OFF)
 set(CUCASCADE_BUILD_IO OFF)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 endblock()
+# cuCascade has no C++ modules; scanning breaks older compiler caches.
+set_target_properties(
+  cucascade_objects cucascade_cudf_objects cucascade_topology_discovery_objects
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF)
 foreach(target cucascade_objects cucascade_cudf_objects)
   target_compile_definitions(${target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN)
 endforeach()

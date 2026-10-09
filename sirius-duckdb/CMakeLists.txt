@@ -53,8 +53,11 @@ endif()
 
 foreach(target IN ITEMS sirius_extension sirius_loadable_extension)
   target_link_libraries(${target} ${sirius_target})
-  set_target_properties(${target} PROPERTIES CXX_STANDARD 20
-                                             CXX_STANDARD_REQUIRED ON)
+  set_target_properties(
+    ${target}
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CXX_SCAN_FOR_MODULES OFF)
   target_include_directories(${target}
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/include)
 endforeach()
