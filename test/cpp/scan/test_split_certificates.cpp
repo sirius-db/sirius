@@ -705,7 +705,7 @@ TEST_CASE("Parquet certificates include physical-original file evidence after co
   for (std::size_t i = 0; i < splits.size(); ++i) {
     REQUIRE(splits[i]);
     REQUIRE(splits[i]->certificates().size() == 1);
-    auto const& input_identity = splits[i]->certificates().front().input_identity;
+    auto const input_identity = splits[i]->certificates().front().input_identity;
     CHECK(input_identity.find(paths[i] + "|footer=") == 0);
     if (with_evidence) {
       auto const is_first = paths[i] == first;
@@ -780,9 +780,10 @@ TEST_CASE("Local glob evidence reaches Parquet certificates through physical com
     auto file = provider();
     REQUIRE(file);
     REQUIRE(file->certificates().size() == 1);
-    auto const& identity = file->certificates().front().input_identity;
+    auto const identity = file->certificates().front().input_identity;
     REQUIRE(evidence->size_present[index]);
-    CHECK(evidence->size[index] == std::filesystem::file_size(source));
+    REQUIRE(evidence->size[index] >= 0);
+    CHECK(static_cast<uintmax_t>(evidence->size[index]) == std::filesystem::file_size(source));
     CHECK(identity.find("|size=" + std::to_string(evidence->size[index])) != std::string::npos);
     REQUIRE(evidence->last_modified_present[index]);
     CHECK(identity.find("|last_modified=" + std::to_string(evidence->last_modified[index])) !=
@@ -1015,7 +1016,7 @@ TEST_CASE("Split consumption rejects a foreign projection contract", "[scan][cer
   scan_operator_input foreign_input(std::make_unique<certificate_test_split>(72));
   auto const before = observer.get_transparent_execution_stats();
 
-  REQUIRE_THROWS_WITH(scan.execute(foreign_input, ::cuda::stream_ref{}),
+  REQUIRE_THROWS_WITH(scan.execute(foreign_input, ::cuda::stream_ref{cudaStream_t{nullptr}}),
                       Catch::Matchers::ContainsSubstring("contract"));
   auto const after = observer.get_transparent_execution_stats();
   CHECK(after.certificate_mismatches == before.certificate_mismatches + 1);

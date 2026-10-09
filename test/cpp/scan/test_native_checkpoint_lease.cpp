@@ -139,16 +139,6 @@ bool wait_for_key_count(duckdb::SiriusContext& context,
   return false;
 }
 
-bool wait_for_no_key(duckdb::SiriusContext& context, std::chrono::milliseconds timeout)
-{
-  auto const deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (!context.get_scan_manager().holds_any_checkpoint_key()) { return true; }
-    std::this_thread::sleep_for(5ms);
-  }
-  return false;
-}
-
 struct phase_gate {
   std::mutex mutex;
   std::condition_variable cv;
@@ -414,8 +404,7 @@ TEST_CASE("native checkpoint lease starts at execution preparation and releases 
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
@@ -467,8 +456,7 @@ TEST_CASE("planning and retained prepared native plans hold no checkpoint lease"
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
@@ -504,8 +492,7 @@ TEST_CASE("native walk refusal is an execution failure and releases before repla
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto context      = sirius::test::get_registered_sirius_context(*con);
   auto const before = context->get_transparent_execution_stats();
@@ -599,8 +586,7 @@ TEST_CASE("native checkpoint lease releases on cancellation with a forced checkp
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
@@ -630,8 +616,7 @@ TEST_CASE("native checkpoint lease releases on a decode error-result",
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
@@ -696,8 +681,7 @@ TEST_CASE("a multi-native plan releases every checkpoint key",
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
@@ -724,8 +708,7 @@ TEST_CASE("a waiting forced checkpoint stalls writes but not read-only transacti
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto checkpoint_connection = sibling_connection(fixture);
   auto writer                = sibling_connection(fixture);
@@ -773,8 +756,7 @@ TEST_CASE("native-first planning cannot deadlock a cold Iceberg metadata connect
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto checkpoint_connection = sibling_connection(fixture);
   auto context               = sirius::test::get_registered_sirius_context(*con);
@@ -819,8 +801,7 @@ TEST_CASE("prepared native re-execution reacquires a fresh checkpoint lease",
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling  = sibling_connection(fixture);
   auto context  = sirius::test::get_registered_sirius_context(*con);
@@ -910,8 +891,7 @@ TEST_CASE("epoch-invalidated execution rebuild takes the native checkpoint lease
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling      = sibling_connection(fixture);
   auto context      = sirius::test::get_registered_sirius_context(*con);
