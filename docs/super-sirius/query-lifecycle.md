@@ -73,12 +73,20 @@ separate publication barrier for coordinators that already closed it. Waiting on
 an open gate is rejected. No caller may wait for its own submission guard or lease,
 or hold a lock needed by a user it is waiting for.
 
-`retain_resources()` requires registration and can keep a physical plan alive
-independently of its engine. `release_resources()` requires a quiescing, idle
+`retain_resources()` requires registration and a non-null owner, and can keep a physical plan
+alive independently of its engine. Queries without resources omit this call. The stored
+`shared_ptr<void>` retains ownership only: the registry never casts or dereferences it, and
+conversion from `shared_ptr<T>` preserves the original control block and deleter.
+`release_resources()` requires a quiescing, idle
 query. `close()` refuses live accounting and closes an idle query's gate before
 removal. `clear()` closes all gates and checks all entries before removing any;
 it is intended for shutdown after producers and workers stop. Repeated cleanup
 of unknown IDs is harmless.
+
+If `clear()` finds outstanding submissions or work, it throws without removing any entries or
+releasing their resources. Every existing query remains quiescing, so no new work can enter.
+Teardown is incomplete: the caller must settle outstanding users before retrying `clear()`;
+the failed attempt does not reopen gates or partially retire idle queries.
 
 Resource destructors run outside registry locks and may reenter the registry.
 Shared control blocks keep accounting storage alive if handles outlive the
