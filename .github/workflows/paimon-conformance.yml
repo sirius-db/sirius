@@ -1,0 +1,131 @@
+name: Paimon conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Completed Test run for this source head (PR runs use the recorded merge build)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: paimon-conformance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  conformance:
+    runs-on: [self-hosted, ubuntu-24.04, gpu-2xt4]
+    timeout-minutes: 90
+    env:
+      SIRIUS_LOG_LEVEL: warn
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialize diagnostics
+        run: |
+          mkdir -p build/paimon-conformance
+          printf 'Revision: %s\nBuild run: %s\n' "$GITHUB_SHA" "$BUILD_RUN_ID" > build/paimon-conformance/setup.log
+
+      - name: Verify build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]] || { echo "Invalid build run ID"; exit 1; }
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          url = os.environ["GITHUB_API_URL"] + "/repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["BUILD_RUN_ID"]
+          request = Request(url, headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json"})
+          with urlopen(request, timeout=30) as response:
+              run = json.load(response)
+          Path("build/paimon-conformance/build-run.json").write_text(json.dumps(run, indent=2) + "\n")
+          PY
+            python3 test/cpp/integration/data/paimon_conformance/build_provenance.py \
+              --run build/paimon-conformance/build-run.json --expected-sha "$GITHUB_SHA"
+          } 2>&1 | tee -a build/paimon-conformance/setup.log
+
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          cache: false
+          pixi-version: v0.71.1
+          environments: default
+          activate-environment: default
+
+      - name: Download matching CUDA 13 build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-cuda-13
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: build/paimon-conformance/artifact
+
+      - name: Extract matching Sirius build
+        run: |
+          set -euo pipefail
+          {
+            tar -xf build/paimon-conformance/artifact/build.tar
+            pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_provenance.py \
+              --run build/paimon-conformance/build-run.json --expected-sha "$GITHUB_SHA" \
+              --checkout-sha-file build/release/sirius-build-sha.txt \
+              | tee build/paimon-conformance/build-provenance.json
+          } 2>&1 | tee -a build/paimon-conformance/setup.log
+
+      - name: Build pinned Paimon test dependency
+        run: |
+          set -euo pipefail
+          pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_extension.py \
+            --duckdb build/release/duckdb --output build/paimon-conformance/source-build --jobs 4 \
+            2>&1 | tee -a build/paimon-conformance/setup.log
+
+      - name: Run Paimon cases
+        run: |
+          set -euo pipefail
+          pixi run --locked python3 test/cpp/integration/data/paimon_conformance/run_conformance.py \
+            --duckdb build/release/duckdb \
+            --paimon-extension build/paimon-conformance/source-build/paimon.duckdb_extension \
+            2>&1 | tee build/paimon-conformance/conformance.log
+
+      - name: Summarize Paimon result including setup failures
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo '## Paimon conformance'
+            printf 'Job status: **%s**\n' "$JOB_STATUS"
+            echo 'If no case report exists, source building/build retrieval did not complete; cases are NOT RUN.'
+            echo 'Build artifacts expire after one day. An expired/missing artifact requires a new matching build, never substitution with another revision.'
+            echo '```'
+            cat build/paimon-conformance/build-provenance.json 2>/dev/null || true
+            tail -60 build/paimon-conformance/setup.log 2>/dev/null || true
+            tail -60 build/paimon-conformance/source-build/build.log 2>/dev/null || true
+            tail -60 build/paimon-conformance/conformance.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paimon-conformance-${{ github.run_id }}
+          path: |
+            build/paimon-conformance/*.log
+            build/paimon-conformance/*.json
+            build/paimon-conformance/run-*/
+            build/paimon-conformance/source-build/build.log
+            build/paimon-conformance/source-build/build-receipt.json
+            build/paimon-conformance/source-build/*.stdout
+            build/paimon-conformance/source-build/*.stderr
+            build/paimon-conformance/source-build/build/**/*.log
+            build/paimon-conformance/source-build/build/**/CMakeCache.txt
+          if-no-files-found: warn
+          retention-days: 14

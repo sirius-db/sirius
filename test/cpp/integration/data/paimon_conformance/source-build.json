@@ -1,0 +1,40 @@
+{
+  "cmake_options": {
+    "BUILD_EXTENSIONS_ONLY": "ON",
+    "BUILD_SHELL": "OFF",
+    "BUILD_UNITTESTS": "OFF",
+    "CMAKE_BUILD_TYPE": "Release",
+    "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
+    "DISABLE_BUILTIN_EXTENSIONS": "ON",
+    "DUCKDB_EXPLICIT_PLATFORM": "linux_amd64",
+    "EXTENSION_STATIC_BUILD": "OFF",
+    "OVERRIDE_GIT_DESCRIBE": "v1.5.6-0-g069cc9f9b5",
+    "PAIMON_ENABLE_OSS": "OFF",
+    "PAIMON_ENABLE_REST": "OFF",
+    "PAIMON_ENABLE_S3": "OFF"
+  },
+  "duckdb_version": "v1.5.6",
+  "extension_version": "e49d491",
+  "format_version": 1,
+  "platform": "linux_amd64",
+  "sources": {
+    "duckdb": {
+      "commit": "069cc9f9b5be802405797faecc284961b07c70ef",
+      "sha256": "77cfc249ad652104b770fa7a8bb1d0119c3232e5dd03aadaaa1c9c7554fe7c05",
+      "size_bytes": 100995483,
+      "url": "https://codeload.github.com/duckdb/duckdb/tar.gz/069cc9f9b5be802405797faecc284961b07c70ef"
+    },
+    "extension": {
+      "commit": "e49d491a103e30399d2d0cdc9c2f7efaf138d200",
+      "sha256": "b68ea0391b851b500aaeb116223c0a575dd420a3f0c25be12a9fd0bff9b9889c",
+      "size_bytes": 256347,
+      "url": "https://codeload.github.com/polardb/duckdb-paimon/tar.gz/e49d491a103e30399d2d0cdc9c2f7efaf138d200"
+    },
+    "native": {
+      "commit": "53f9c86d45aabb0a6f1a379271da07d7a9f27a3d",
+      "sha256": "1b7903c0fa487f0f8744ee4a512d8ffd898b2312af0a73b5800d9a279b088f6e",
+      "size_bytes": 31616075,
+      "url": "https://codeload.github.com/apache/paimon-cpp/tar.gz/53f9c86d45aabb0a6f1a379271da07d7a9f27a3d"
+    }
+  }
+}
