@@ -39,8 +39,8 @@
 
 namespace sirius::scan_manager {
 
-/// Default uring reactor count (cuCascade's @c io_config::uring_n_reactors; one
-/// worker thread each);
+/// Default uring reactor count (matches cuCascade's @c io_config::uring_n_reactors;
+/// one worker thread each);
 /// counted in the scan-manager sizing budget below.
 inline constexpr std::size_t default_uring_n_reactors = 4;
 

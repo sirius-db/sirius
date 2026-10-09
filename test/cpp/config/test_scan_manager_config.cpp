@@ -678,7 +678,7 @@ TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager
     CHECK(cfg.rest_n_reactors == 2);
     CHECK(cfg.uring.n_max_concurrent_scans == uring_budget);
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
-    CHECK(cfg.uring.slices_per_pass == 8);
+    CHECK(cfg.uring.slices_per_pass == 4);
     CHECK(cfg.uring.range_batch_slices == 8);
   };
 
