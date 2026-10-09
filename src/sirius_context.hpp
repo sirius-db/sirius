@@ -76,6 +76,10 @@ namespace sirius {
 class sirius_engine;
 }  // namespace sirius
 
+namespace sirius::exec {
+class exchange_staging;
+}  // namespace sirius::exec
+
 namespace duckdb {
 
 class Connection;
@@ -671,6 +675,10 @@ class SiriusContext : public ClientContextState {
   /// \brief The registry itself, for subsystems that hold a long-lived binding to it.
   [[nodiscard]] sirius::data::data_repository_manager_registry& get_data_repository_registry();
 
+  /// \brief Makes exchange data (parked fragment output, stream inputs, received batches)
+  /// visible to the downgrade executor. Created on first use; only exchanging callers need it.
+  [[nodiscard]] sirius::exec::exchange_staging& get_exchange_staging();
+
   [[nodiscard]] sirius::pipeline::task_scheduler& get_task_scheduler();
   [[nodiscard]] const sirius::pipeline::task_scheduler& get_task_scheduler() const;
 
@@ -923,6 +931,8 @@ class SiriusContext : public ClientContextState {
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
+  std::once_flag exchange_staging_once_;
+  std::unique_ptr<sirius::exec::exchange_staging> exchange_staging_;
   /// Observes where a query is in its execution.  Declared before the creator
   /// and scheduler that report into it so it outlives them on teardown.
   std::shared_ptr<sirius::event::query_event_publisher> query_event_publisher_;

@@ -21,6 +21,7 @@
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
 #include "cudf/cudf_utils.hpp"                             // sirius::get_cudf_type
 #include "data/data_batch_utils.hpp"                       // sirius::make_data_batch
+#include "downgrade/downgrade_executor.hpp"                // sirius::parallel::downgrade_executor
 #include "duckdb/catalog/catalog.hpp"                      // duckdb::Catalog
 #include "duckdb/catalog/catalog_transaction.hpp"          // duckdb::CatalogTransaction
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
@@ -36,6 +37,7 @@
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
+#include "exec/batch_stream.hpp"                           // sirius::exec::batch_stream
 #include "exec/exchange_direct.hpp"                        // sirius::exec::direct_exchange
 #include "exec/stream_bind_catalog.hpp"                    // sirius::exec::stream_bind_catalog
 #include "exec/stream_plan_bindings.hpp"      // sirius::exec::register_stream_source_function
@@ -230,9 +232,16 @@ struct Context::Impl {
     auto const gpus = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     if (gpus.size() == 1) {
       if (auto slab = sirius::memory::find_slab(*gpus.front())) {
-        exchange = std::make_shared<sirius::exec::direct_exchange>(
-          *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id()),
-          std::move(*slab));
+        auto& gpu =
+          *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id());
+        exchange = std::make_shared<sirius::exec::direct_exchange>(gpu, std::move(*slab));
+        // Exchange data can wait a long time for its receivers. Let it spill to host under
+        // pressure rather than fail the query when a shuffle outgrows the pool.
+        exchange->enable_spill(
+          context->get_exchange_staging(),
+          [ctx = context.get(), space = gpu.get_id()](std::size_t bytes) {
+            ctx->get_downgrade_executor(space).request_free_memory_and_wait(bytes);
+          });
       }
     }
 
@@ -421,7 +430,50 @@ std::unique_ptr<std::vector<std::uint64_t>> DirectExchange::allocate(std::uintpt
 
 void DirectExchange::release(std::uint64_t token) const { exchange_->release(token); }
 
+void DirectExchange::seal(std::uint64_t token) const { exchange_->seal(token); }
+
 std::size_t DirectExchange::outstanding() const { return exchange_->outstanding(); }
+
+OutputDrain::OutputDrain(std::shared_ptr<sirius::exec::batch_stream> stream,
+                         std::shared_ptr<sirius::exec::direct_exchange> exchange)
+  : stream_(std::move(stream)), exchange_(std::move(exchange))
+{
+}
+
+std::unique_ptr<std::vector<std::uint8_t>> OutputDrain::export_next(
+  std::uint32_t timeout_ms,
+  bool& ended,
+  std::uint64_t& token,
+  std::uint64_t& rows,
+  std::vector<std::uint64_t>& src) const
+{
+  using availability  = sirius::exec::batch_stream::availability;
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  ended               = false;
+  for (;;) {
+    switch (stream_->classify()) {
+      case availability::END_OF_STREAM: ended = true; return nullptr;
+      case availability::HAS_DATA:
+        // Rethrows the fragment's error; nullptr only if another consumer took the batch.
+        if (auto batch = stream_->try_pull()) {
+          if (auto exported = exchange_->export_batch(std::move(batch))) {
+            token = exported->token;
+            rows  = exported->rows;
+            src   = std::move(exported->src);
+            return std::make_unique<std::vector<std::uint8_t>>(std::move(exported->layout));
+          }
+        }
+        break;  // a batch without rows is not sent
+      case availability::WAITING: {
+        auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now());
+        if (left.count() <= 0) { return nullptr; }
+        static_cast<void>(stream_->wait_for(left));
+        break;
+      }
+    }
+  }
+}
 
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 
@@ -633,16 +685,31 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_direct(std::uint64_t
   return nullptr;
 }
 
+std::unique_ptr<OutputDrain> Fragment::output_drain(std::uint64_t stream_id) const
+{
+  impl_->require_built("output_drain()");
+  if (!impl_->ctx.exchange) {
+    throw sirius::invalid_input_exception(
+      "Fragment: output_drain() needs a direct exchange (a single GPU slab memory space)");
+  }
+  return std::make_unique<OutputDrain>(impl_->fragment->output_stream(stream_id),
+                                       impl_->ctx.exchange);
+}
+
 void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)
 {
   impl_->require_built("push_received()");
   auto& exchange       = impl_->ctx.require_exchange();
   const auto& declared = impl_->fragment->input_spec(stream_id);
-  auto table           = exchange.take(token);
-  check_declared_schema(declared, table->view(), stream_id, "received batch");
-  auto& gpu  = exchange.space();
-  auto batch = sirius::make_data_batch(
-    std::move(table), gpu, gpu.acquire_stream(), telemetry::batch_telemetry_info{});
+  // A sealed batch may have spilled to host; it is checked when it is next on the GPU.
+  auto batch = exchange.take_batch(token);
+  {
+    auto const read_only = batch->to_read_only();
+    if (read_only.get_current_tier() == cucascade::memory::Tier::GPU) {
+      check_declared_schema(
+        declared, sirius::get_cudf_table_view(read_only), stream_id, "received batch");
+    }
+  }
   if (!impl_->fragment->push(stream_id, std::move(batch))) {
     throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
                                           " refused a received batch; it had already ended");

@@ -257,6 +257,13 @@ exec::batch_stream::availability sirius_physical_streaming_sink::availability(
   return _outputs[index]->classify();
 }
 
+std::shared_ptr<exec::batch_stream> sirius_physical_streaming_sink::output_stream(
+  std::size_t index) const
+{
+  validate_index(index);
+  return _outputs[index];
+}
+
 void sirius_physical_streaming_sink::fail_output(std::exception_ptr error)
 {
   for (auto& s : _outputs) {

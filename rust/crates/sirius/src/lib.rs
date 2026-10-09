@@ -305,6 +305,15 @@ impl Fragment<'_> {
         }))
     }
 
+    /// A handle that exports output stream `stream_id` from any thread, including while
+    /// [`run`](Fragment::run) executes, so the output ships as it is produced. Take it after
+    /// [`build`](Fragment::build) and before `run`. A fragment dropped without running fails it.
+    pub fn output_drain(&self, stream_id: u64) -> Result<OutputDrain, Exception> {
+        Ok(OutputDrain {
+            inner: self.inner.output_drain(stream_id)?,
+        })
+    }
+
     /// Push the batch received under `token` into input stream `stream_id`, consuming the token.
     pub fn push_received(&mut self, stream_id: u64, token: u64) -> Result<(), Exception> {
         self.inner.pin_mut().push_received(stream_id, token)
@@ -371,6 +380,58 @@ pub struct ExportedBatch {
     pub src: Vec<(u64, u64)>,
 }
 
+/// What [`OutputDrain::next`] found within its timeout.
+#[derive(Debug)]
+pub enum DrainNext {
+    Batch(ExportedBatch),
+    /// Nothing yet; the fragment may still produce more.
+    Waiting,
+    /// The stream ended and every batch was exported.
+    End,
+}
+
+/// Exports one output stream of a [`Fragment`] while it runs, from [`Fragment::output_drain`].
+/// The full contract is documented on the C++ `sirius::ffi::OutputDrain`.
+pub struct OutputDrain {
+    inner: UniquePtr<sirius_sys::OutputDrain>,
+}
+
+// SAFETY: the C++ handle shares only the output's batch stream, which locks its own state, and
+// the direct exchange, which serializes every call on one mutex and sets the CUDA device itself.
+unsafe impl Send for OutputDrain {}
+
+impl OutputDrain {
+    /// The next batch with rows, waiting up to `timeout` for the fragment to produce one. Errors
+    /// once the fragment's run failed.
+    pub fn next(&mut self, timeout: std::time::Duration) -> Result<DrainNext, Exception> {
+        let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        let (mut ended, mut token, mut rows) = (false, 0, 0);
+        let mut src = CxxVector::new();
+        let layout =
+            self.inner
+                .export_next(timeout_ms, &mut ended, &mut token, &mut rows, src.pin_mut())?;
+        if !layout.is_null() {
+            return Ok(DrainNext::Batch(ExportedBatch {
+                token,
+                rows,
+                layout: layout.as_slice().to_vec(),
+                src: address_pairs(&src),
+            }));
+        }
+        Ok(if ended {
+            DrainNext::End
+        } else {
+            DrainNext::Waiting
+        })
+    }
+}
+
+impl std::fmt::Debug for OutputDrain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OutputDrain")
+    }
+}
+
 /// Receives batches straight into a context's GPU slab, from [`SiriusContext::direct_exchange`].
 /// The full contract is documented on the C++ `sirius::ffi::DirectExchange`.
 pub struct DirectExchange {
@@ -407,6 +468,12 @@ impl DirectExchange {
     /// Free what `token` holds. Unknown and consumed tokens are ignored.
     pub fn release(&self, token: u64) -> Result<(), Exception> {
         self.inner.release(token)
+    }
+
+    /// Holds a fully received batch so it may spill to host while it waits for its receiver. A
+    /// sealed token is still pushed with [`Fragment::push_received`] and freed with `release`.
+    pub fn seal(&self, token: u64) -> Result<(), Exception> {
+        self.inner.seal(token)
     }
 
     /// Tokens neither released nor consumed.
@@ -466,7 +533,7 @@ mod tests {
     use prost::Message;
     use substrait::proto::{Plan, PlanRel, ReadRel, Rel, RelRoot, plan_rel, rel};
 
-    use super::{SiriusContext, SubstraitResult, stream_view_name};
+    use super::{DrainNext, SiriusContext, SubstraitResult, stream_view_name};
 
     /// The engine keeps process-global GPU state, so at most one context may be
     /// live at a time; context-constructing tests hold this for their duration.
@@ -788,6 +855,44 @@ mod tests {
         assert_eq!(rows, 3);
         assert_eq!(exchange.outstanding().unwrap(), 0);
         assert!(exchange.allocate(b"not a layout").is_err());
+
+        // A drain taken before the run waits, then delivers every batch and the end of the
+        // stream from another thread.
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender
+            .build(&local_files_plan(
+                path.to_str().unwrap(),
+                vec!["id".to_string(), "name".to_string()],
+            ))
+            .unwrap();
+        let mut drain = sender.output_drain(0).unwrap();
+        assert!(sender.output_drain(1).is_err());
+        assert!(matches!(
+            drain.next(std::time::Duration::ZERO).unwrap(),
+            DrainNext::Waiting
+        ));
+        sender.run().unwrap();
+        let streamed = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut rows = 0;
+                    loop {
+                        match drain.next(std::time::Duration::from_millis(10)).unwrap() {
+                            DrainNext::Batch(batch) => {
+                                rows += batch.rows;
+                                exchange.release(batch.token).unwrap();
+                            }
+                            DrainNext::Waiting => {}
+                            DrainNext::End => return rows,
+                        }
+                    }
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(streamed, 3);
+        assert_eq!(exchange.outstanding().unwrap(), 0);
     }
 
     /// Byte-range splits of one parquet file must read every row exactly once: each split

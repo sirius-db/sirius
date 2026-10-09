@@ -16,7 +16,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::fragment_executor::{FragmentExecutor, SenderSlot};
+use crate::fragment_executor::{FragmentExecutor, OutputDrain, SenderSlot};
 use crate::proto::starrocks::PTransmitChunkParams;
 
 const MAGIC: [u8; 4] = *b"SRNX";
@@ -203,6 +203,10 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
     /// Receive and export buffers this CN's direct exchange still holds.
     fn outstanding(&self) -> usize;
 
+    /// Lets a fully received batch spill to host while it waits for its receiver. The token is
+    /// still pushed and released as before.
+    fn seal(&self, token: u64) -> Result<(), String>;
+
     /// Writes every batch parked under `slot` into `peer`'s pool, announcing each, then EOS.
     fn send(
         &self,
@@ -211,6 +215,20 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
         names: Vec<String>,
         executor: Arc<dyn FragmentExecutor>,
     ) -> Result<(), String>;
+
+    /// Writes every batch of each hop's drain into its peer's pool as the fragment produces it,
+    /// serving all hops at once, then sends each EOS. Returns once every drain ended, or on the
+    /// first error, after which no hop sends its EOS.
+    fn stream(&self, hops: Vec<StreamHop>) -> Result<(), String>;
+}
+
+/// One remote output streamed while its fragment runs.
+#[derive(Debug)]
+pub struct StreamHop {
+    pub peer: SocketAddr,
+    pub slot: SenderSlot,
+    pub names: Vec<String>,
+    pub drain: Box<dyn OutputDrain>,
 }
 
 /// Rejects StarRocks native shuffle so a stock BE `ChunkPB` cannot be treated as Sirius.

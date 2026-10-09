@@ -444,4 +444,56 @@ TEST_CASE("FFI direct exchange delivers what relay_from does", "[isolated_contex
   });
   CHECK(direct == relayed);
   CHECK(exchange->outstanding() == 0);
+
+  // The same hop with the sender's output drained on this thread while it runs on another.
+  auto const streamed = [&] {
+    auto receiver = sirius::ffi::make_fragment(*ctx);
+    receiver->declare_input_column(0, "a", "BIGINT");
+    receiver->build(stream_read_plan(0));
+    auto sender = sirius::ffi::make_fragment(*ctx);
+    sender->declare_output(0);
+    sender->build(local_files_plan(path));
+    auto drain = sender->output_drain(0);
+    CHECK_THROWS_WITH(sender->output_drain(1),
+                      Catch::Matchers::ContainsSubstring("no output stream"));
+
+    std::exception_ptr run_error;
+    std::thread runner([&] {
+      try {
+        sender->run();
+      } catch (...) {
+        run_error = std::current_exception();
+      }
+    });
+    bool ended          = false;
+    std::uint64_t token = 0;
+    std::uint64_t rows  = 0;
+    std::vector<std::uint64_t> src;
+    while (!ended) {
+      auto const layout = drain->export_next(10, ended, token, rows, src);
+      if (!layout) { continue; }
+      std::uint64_t remote = 0;
+      auto const dst       = exchange->allocate(
+        reinterpret_cast<std::uintptr_t>(layout->data()), layout->size(), remote);
+      for (std::size_t i = 0; i < src.size(); i += 2) {
+        REQUIRE(cudaMemcpy(reinterpret_cast<void*>((*dst)[i]),
+                           reinterpret_cast<void const*>(src[i]),
+                           src[i + 1],
+                           cudaMemcpyDeviceToDevice) == cudaSuccess);
+      }
+      REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+      exchange->release(token);
+      receiver->push_received(0, remote);
+    }
+    runner.join();
+    REQUIRE_FALSE(run_error);
+    // Ended stays ended.
+    CHECK(drain->export_next(0, ended, token, rows, src) == nullptr);
+    CHECK(ended);
+    receiver->close_input(0, 0);
+    receiver->run();
+    return result_i64s(*receiver);
+  }();
+  CHECK(streamed == relayed);
+  CHECK(exchange->outstanding() == 0);
 }
