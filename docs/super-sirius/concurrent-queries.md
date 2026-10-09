@@ -75,12 +75,16 @@ retries retire only the affected query. Queued requests poll interruption every 
 queries poll completion/interruption/health every 25 ms. Already-submitted kernels must finish
 before their buffers can be released; cancellation does not preempt them.
 
-Reservations use nonblocking attempts. Waiting tasks remain visible to scheduling/spilling and
-retry with backoff from 5 to 50 ms. The configurable memory reservation retry budget defaults
-to 30 seconds of requested backoff without observed progress, excluding extra scheduler delay.
-See [Memory reservation retries](configuration.md#memory-reservation-retries).
-Operator OOM/batch-contention retries are separately bounded. HOST result transfer must obtain
-a real reservation.
+GPU reservations retain the existing blocking wait and synchronous downgrade path at this
+point in the stack. Memory pressure can delay dispatch and query retirement; prompt cancellation
+or a timeout while blocked on a reservation is not guaranteed. Operator OOM/batch-contention
+retries remain separately bounded. HOST result collection retains its existing unreserved
+fallback when a reservation is unavailable.
+
+The final memory-progress PR (#2001) adds nonblocking GPU reservation retries, a configurable
+retry budget and reservation-backed HOST result collection. Compare the benchmark-runner PR
+(#2015) with that final PR to measure these changes, using an external process timeout for the
+baseline and recording failures/timeouts as well as throughput.
 
 Illegal device access, device assertion, launch failure/timeout, uncorrectable ECC and destroyed
 CUDA contexts latch shared GPU-runtime unavailability. Existing owners stop/retire and later GPU
