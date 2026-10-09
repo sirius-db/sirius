@@ -67,7 +67,47 @@
 
 namespace sirius::ffi {
 
+// What a Context and its Interrupters share. `open` brackets the run that interrupt() may cancel,
+// so an interrupt never lands between runs or in the COMMIT/ROLLBACK after one: a failed ROLLBACK
+// would leave the connection's transaction open, and every later BEGIN on it would fail. `conn`
+// is cleared before the Context tears the connection down.
+struct Interrupter::Gate {
+  std::mutex mutex;
+  duckdb::Connection* conn{nullptr};
+  bool open{false};
+
+  void interrupt() noexcept
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    // Sets the ClientContext's interrupt flag, which the GPU executor checks per task.
+    if (conn && open) { conn->Interrupt(); }
+  }
+};
+
 namespace {
+
+// Opens `gate` for one run. Closing it clears an interrupt that arrived during the run, so the
+// next run starts uninterrupted (BEGIN TRANSACTION clears the flag too, but nothing relies on it).
+class interruptible_run {
+ public:
+  explicit interruptible_run(Interrupter::Gate& gate) : gate_(gate)
+  {
+    std::lock_guard<std::mutex> lock(gate_.mutex);
+    gate_.open = true;
+  }
+  ~interruptible_run()
+  {
+    std::lock_guard<std::mutex> lock(gate_.mutex);
+    gate_.open = false;
+    gate_.conn->context->ClearInterrupt();
+  }
+
+  interruptible_run(const interruptible_run&)            = delete;
+  interruptible_run& operator=(const interruptible_run&) = delete;
+
+ private:
+  Interrupter::Gate& gate_;
+};
 
 constexpr const char* kSiriusStateKey   = "sirius_state";
 constexpr duckdb::idx_t kArrowBatchSize = 1u << 20;
@@ -216,9 +256,19 @@ struct Context::Impl {
   // The ring exchange, when the context was made with one; shared with RingExchange handles.
   std::shared_ptr<sirius::exec::ring_exchange> ring;
 
-  // Frees the exchange's buffers while the memory space they come from still exists.
+  std::shared_ptr<Interrupter::Gate> gate = std::make_shared<Interrupter::Gate>();
+
+  Impl()                       = default;
+  Impl(const Impl&)            = delete;
+  Impl& operator=(const Impl&) = delete;
+  // Detaches every Interrupter, then frees the ring's and the exchange's buffers while the memory
+  // space they come from still exists.
   ~Impl()
   {
+    {
+      std::lock_guard<std::mutex> lock(gate->mutex);
+      gate->conn = nullptr;
+    }
     if (ring) { ring->close(); }
     if (exchange) { exchange->close(); }
   }
@@ -332,6 +382,10 @@ struct Context::Impl {
     duckdb::DBConfig::GetConfig(*db->instance)
       .SetOptionByName("parquet_metadata_cache", duckdb::Value::BOOLEAN(true));
     conn = duckdb::make_uniq<duckdb::Connection>(*db);
+    {
+      std::lock_guard<std::mutex> lock(gate->mutex);
+      gate->conn = conn.get();
+    }
     // Register the engine on the connection and disable DuckDB optimizer rewrites this
     // no-fallback FFI path cannot safely execute.
     auto& client = *conn->context;
@@ -398,6 +452,7 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // only sees the total, and the query window in the telemetry covers execution alone.
   double lower_ms = 0, plan_ms = 0, execute_ms = 0;
   in_transaction(impl_->conn_mutex, *impl_->conn, [&] {
+    interruptible_run interruptible(*impl_->gate);
     // The same result path as a zero-output Fragment.
     sirius::exec::fragment_spec spec;
     spec.plan_source = [&](duckdb::ClientContext&) {
@@ -579,6 +634,19 @@ std::unique_ptr<std::vector<std::uint8_t>> OutputDrain::export_ring_next(
     // A batch without rows is not sent.
   }
 }
+
+void Context::interrupt() noexcept { impl_->gate->interrupt(); }
+
+std::unique_ptr<Interrupter> Context::interrupter() const
+{
+  return std::unique_ptr<Interrupter>(new Interrupter(impl_->gate));
+}
+
+Interrupter::Interrupter(std::shared_ptr<Gate> gate) : gate_(std::move(gate)) {}
+
+Interrupter::~Interrupter() = default;
+
+void Interrupter::interrupt() const noexcept { gate_->interrupt(); }
 
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 
@@ -908,7 +976,10 @@ void Fragment::run()
 {
   impl_->require_built("run()");
   // Scans read DuckDB MVCC state through the active transaction.
-  in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] { impl_->fragment->run(); });
+  in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] {
+    interruptible_run interruptible(*impl_->ctx.gate);
+    impl_->fragment->run();
+  });
 }
 
 void Fragment::result_to_arrow(std::uintptr_t out_stream_addr)
