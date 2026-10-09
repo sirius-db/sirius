@@ -473,6 +473,8 @@ Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way
 
 Merges grouped aggregate results from multiple partitions. Drains one partition per task, similar to MERGE_SORT.
 
+**Row floor on the partition count.** The merge concatenates its partition's input, and a cuDF column holds fewer than 2^31 rows. Its `get_partition_strategy` raises the byte-based count to at least `ceil(rows / 2^30)` partitions (saturating at `INT_MAX`), using the row count that PARTITION reports next to the byte total (`partition_sizing_input::total_rows`, measured from batch metadata or projected at the received row width). This targets at most 2^30 rows per partition on average; hash skew and row-count estimation can still leave an individual partition over cuDF's limit. The floor is a sizing safeguard for configurations with large `hash_partition_bytes` targets. Before it existed, a 122 GB, 3.4 billion-row merge input at a 1 TiB target failed with "Total number of concatenated rows exceeds the column size limit".
+
 ### `sirius_physical_ungrouped_aggregate_merge` — `MERGE_AGGREGATE`
 **File:** `src/op/sirius_physical_ungrouped_aggregate_merge.hpp`
 

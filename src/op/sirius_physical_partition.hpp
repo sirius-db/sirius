@@ -202,9 +202,20 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 
-  /// Sum the bytes of all batches waiting on this partition's input port. Fed to the downstream
-  /// consumer's get_partition_strategy, which turns it into a partition count.
-  uint64_t compute_total_bytes();
+  /// Bytes and rows of the batches waiting on this partition's input port.
+  struct input_totals {
+    uint64_t bytes = 0;
+    uint64_t rows  = 0;
+  };
+
+  /// Sum the bytes and rows of all batches waiting on this partition's input port. Fed to the
+  /// downstream consumer's get_partition_strategy, which turns them into a partition count. Rows
+  /// come from batch metadata; a batch whose representation records none is counted at the
+  /// bytes-per-row of the batches that do.
+  input_totals compute_input_totals();
+
+  /// `compute_input_totals().bytes`.
+  uint64_t compute_total_bytes() { return compute_input_totals().bytes; }
 
   /// Return a latched projected total, scaled and floored at bytes already received.
   /// Returns nullopt when estimation is disabled or unavailable.
