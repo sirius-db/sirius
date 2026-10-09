@@ -453,6 +453,18 @@ void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)
   impl_->fragment->close_input(stream_id, sender_id);
 }
 
+void Fragment::push_arrow(std::uint64_t stream_id,
+                          std::uint32_t sender_id,
+                          std::uintptr_t array_addr,
+                          std::uintptr_t schema_addr)
+{
+  impl_->require_built("push_arrow()");
+  impl_->fragment->push_arrow(stream_id,
+                              sender_id,
+                              reinterpret_cast<const ArrowArray*>(array_addr),
+                              reinterpret_cast<const ArrowSchema*>(schema_addr));
+}
+
 void Fragment::run()
 {
   impl_->require_built("run()");

@@ -18,11 +18,12 @@
 // Builds Substrait in the test because the FFI has no SQL helper.
 // Covers a result fragment, a relay_from chain, several fragments built before any runs (on one
 // and on two threads), build() and run()/drop on different threads, drop after build(), a build()
-// that fails after setup, and execute_substrait. Spec errors and failed-build rollback live in
-// test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
+// that fails after setup, execute_substrait, and push_arrow. Spec errors and failed-build rollback
+// live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
 
 #include "sirius/exception.hpp"
 #include "sirius/ffi.hpp"
+#include "utils/arrow_batch_utils.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 
 #include <catch.hpp>
@@ -30,7 +31,9 @@
 #include <duckdb/common/arrow/arrow.hpp>
 #include <substrait/plan.pb.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <future>
 #include <memory>
@@ -362,4 +365,70 @@ TEST_CASE("FFI concurrent run() and execute_substrait on one Context wait for ea
   REQUIRE(result_i64s(*first) == expected);
   REQUIRE(result_i64s(*second) == expected);
   REQUIRE(collect_i64_column(direct) == expected);
+}
+
+TEST_CASE("FFI push_arrow feeds a fragment from two senders on two threads",
+          "[isolated_context][sirius_ffi]")
+{
+  auto ctx      = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto fragment = sirius::ffi::make_fragment(*ctx);
+  fragment->declare_input_column(0, "a", "BIGINT");
+  fragment->declare_input_sender(0, 0);
+  fragment->declare_input_sender(0, 1);
+  fragment->build(stream_read_plan(0));
+
+  auto first  = sirius::test::arrow_batch_from_sql("SELECT i::BIGINT AS a FROM range(1, 4) t(i)");
+  auto second = sirius::test::arrow_batch_from_sql("SELECT i::BIGINT AS a FROM range(4, 6) t(i)");
+  auto push   = [&](std::uint32_t sender, sirius::test::arrow_batch& batch) {
+    return std::async(std::launch::async, [&fragment, &batch, sender] {
+      fragment->push_arrow(0, sender, batch.array_addr(), batch.schema_addr());
+      // The copy is complete on return: scribble over the host values before the producer
+      // releases them, so a copy still in flight would show up in the result.
+      auto& column = *batch.array.children[0];
+      std::memset(const_cast<void*>(column.buffers[1]), 0, sizeof(std::int64_t) * column.length);
+      fragment->close_input(0, sender);
+    });
+  };
+  std::future<void> pushes[] = {push(0, *first), push(1, *second)};
+  for (auto& pushed : pushes) {
+    pushed.get();
+  }
+  first.reset();
+  second.reset();
+  fragment->run();
+
+  auto rows = result_i64s(*fragment);
+  std::sort(rows.begin(), rows.end());
+  REQUIRE(rows == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+}
+
+TEST_CASE("FFI push_arrow refuses bad calls and leaves the fragment runnable",
+          "[isolated_context][sirius_ffi]")
+{
+  using Catch::Matchers::ContainsSubstring;
+  auto ctx      = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto fragment = sirius::ffi::make_fragment(*ctx);
+  fragment->declare_input_column(0, "a", "BIGINT");
+  fragment->declare_input_sender(0, 0);
+  fragment->declare_input_sender(0, 1);
+  auto ids   = sirius::test::arrow_batch_from_sql("SELECT i::BIGINT AS a FROM range(1, 4) t(i)");
+  auto names = sirius::test::arrow_batch_from_sql("SELECT 'x' AS a");
+  auto push  = [&](std::uint64_t stream, std::uint32_t sender, sirius::test::arrow_batch& batch) {
+    fragment->push_arrow(stream, sender, batch.array_addr(), batch.schema_addr());
+  };
+
+  REQUIRE_THROWS_WITH(push(0, 0, *ids), ContainsSubstring("build() must run before"));
+  fragment->build(stream_read_plan(0));
+  REQUIRE_THROWS_WITH(push(0, 7, *ids), ContainsSubstring("not in the expected set"));
+  REQUIRE_THROWS_WITH(push(9, 0, *ids), ContainsSubstring("no input stream with id 9"));
+  REQUIRE_THROWS_WITH(push(0, 0, *names), ContainsSubstring("is declared BIGINT"));
+
+  push(0, 0, *ids);
+  fragment->close_input(0, 0);
+  REQUIRE_THROWS_WITH(push(0, 0, *ids), ContainsSubstring("already closed"));
+  fragment->close_input(0, 1);
+  REQUIRE_THROWS_WITH(push(0, 1, *ids), ContainsSubstring("already ended"));
+  fragment->run();
+  REQUIRE(result_i64s(*fragment) == std::vector<std::int64_t>{1, 2, 3});
+  REQUIRE_THROWS_WITH(push(0, 0, *ids), ContainsSubstring("before run()"));
 }
