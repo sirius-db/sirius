@@ -284,6 +284,15 @@ impl ExecReports {
         }
     }
 
+    /// Whether an instance of `query` (any instance id of it) still owes a report: one still
+    /// waiting or running here.
+    pub(crate) fn owes(&self, query: FragmentInstanceId) -> bool {
+        self.lock()
+            .owed
+            .keys()
+            .any(|instance| instance.query_hi() == query.query_hi())
+    }
+
     /// How many instances still owe a report. Zero on an idle CN.
     pub(crate) fn owed(&self) -> usize {
         self.lock().owed.len()

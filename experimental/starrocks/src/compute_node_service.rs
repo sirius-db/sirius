@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::ComputeNodeConfig;
+use crate::deadlines::{self, Deadline, Deadlines};
 use crate::fe_report::ExecReports;
 use crate::recent_queries::{self, ENDED_NORMALLY, QueryEnds, RecentQueries, is_normal_end};
 /// Remote outputs ship while their fragment runs unless `SIRIUS_CN_STREAM_OUTPUT` is `0`, which
@@ -63,7 +64,15 @@ fn alloc_wait_from_env() -> Duration {
         .map_or(Duration::from_secs(30), Duration::from_millis)
 }
 
-/// Bounds a `fetch_data` wait on a result fragment whose exchange senders never finish.
+/// How often the deadline watcher checks for queries whose time is up.
+const DEADLINE_TICK: Duration = Duration::from_millis(100);
+
+/// How much longer than its query's deadline a `fetch_data` waits, so the deadline's purge, not
+/// the wait, is what fails it, with the timeout as its cause.
+const DEADLINE_GRACE: Duration = Duration::from_secs(5);
+
+/// Bounds a `fetch_data` wait on a result fragment whose exchange senders never finish, when the
+/// query has no timeout.
 const RESULT_WAIT: Duration = Duration::from_secs(600);
 
 /// Sirius compute-node implementation of StarRocks PInternalService.
@@ -101,8 +110,11 @@ pub(crate) struct SiriusComputeNodeService {
     translate_only: bool,
     /// How each recent query ended on this CN, shared with the exchange and the reports.
     ends: Arc<QueryEnds>,
-    /// How long a receive allocation that finds the pool full waits for a purge's frees.
+    /// How long a receive allocation that finds the pool full waits for a purge's frees, at
+    /// most: the query's own deadline may cut it shorter.
     alloc_wait: Duration,
+    /// Each query's deadline on this CN, from its query timeout.
+    deadlines: Arc<Deadlines>,
 }
 
 /// At most this many queries' descriptor tables are cached; past it the oldest is dropped.
@@ -224,6 +236,7 @@ impl SiriusComputeNodeService {
             translate_only: std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some(),
             ends,
             alloc_wait: alloc_wait_from_env(),
+            deadlines: Arc::default(),
         }
     }
 
@@ -307,7 +320,11 @@ impl PInternalService for SiriusComputeNodeService {
         // and StarRocks treats a missing result buffer as a failure rather than an empty result.
         // A result fragment still waiting on its exchange inputs blocks, so wait off the runtime.
         let results = self.results.clone();
-        let outcome = tokio::task::spawn_blocking(move || results.take_next(id, RESULT_WAIT))
+        let wait = self
+            .deadlines
+            .remaining(id)
+            .map_or(RESULT_WAIT, |left| left + DEADLINE_GRACE);
+        let outcome = tokio::task::spawn_blocking(move || results.take_next(id, wait))
             .await
             .unwrap_or_else(|join_err| Err(format!("fetch_data wait task panicked: {join_err}")));
         let outcome = match outcome {
@@ -318,6 +335,7 @@ impl PInternalService for SiriusComputeNodeService {
         };
         if outcome.eos {
             self.ends.delivered(id);
+            self.deadlines.end(id);
             self.forget_descriptor_table(id);
         }
         match outcome.batch {
@@ -420,6 +438,8 @@ impl PInternalService for SiriusComputeNodeService {
             warn!(%query, reason = cancel.reason, error = cancel.error, "the FE cancelled a failed query");
         }
         self.reports.cancel_query(query, &cancel.error);
+        // It polls no more: its delivered result slots can go now.
+        self.results.forget_delivered(query);
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
             if cancel.finished {
@@ -583,6 +603,7 @@ impl SiriusComputeNodeService {
                 "{cause} (fragment instance {instance} came after its query ended)"
             ));
         }
+        self.start_deadline(params);
         self.reports.expect(params);
         let run = || {
             self.run_or_register(params)
@@ -966,7 +987,15 @@ impl SiriusComputeNodeService {
         let (service, request) = (self.clone(), request.clone());
         tokio::task::spawn_blocking(move || {
             let started = std::time::Instant::now();
-            let freed = frees.wait_for_none(service.alloc_wait);
+            let wait = request
+                .finst_id
+                .as_ref()
+                .and_then(|id| service.deadlines.remaining(FragmentInstanceId::from(id)))
+                // Just past the deadline, so its purge has refused the query by the retry.
+                .map_or(service.alloc_wait, |left| {
+                    (left + 2 * DEADLINE_TICK).min(service.alloc_wait)
+                });
+            let freed = frees.wait_for_none(wait);
             info!(
                 freed,
                 waited_ms = started.elapsed().as_millis() as u64,
@@ -1176,7 +1205,11 @@ impl SiriusComputeNodeService {
         remote_inputs: Vec<(i32, i32, Vec<RemoteBatch>)>,
         filters: FilterPlan<'_>,
     ) -> std::result::Result<Vec<ReadyFragment>, FragmentFailure> {
-        Self::injected_failure(false)?;
+        if Self::claim_injection("") {
+            return Err("injected fragment failure (SIRIUS_CN_FAIL_ONCE_FILE)"
+                .to_string()
+                .into());
+        }
         if Self::is_mysql_result_sink(params)? {
             let id = Self::fragment_instance_id(params).ok_or_else(|| {
                 "RESULT_SINK fragment is missing a fragment_instance_id".to_string()
@@ -1251,8 +1284,19 @@ impl SiriusComputeNodeService {
             }
         }
         let on_exchange_input = !inputs.is_empty() || !remote_inputs.is_empty();
-        if on_exchange_input && !remote.is_empty() {
-            Self::injected_failure(true)?;
+        if on_exchange_input && !remote.is_empty() && Self::claim_injection("remote-sender") {
+            return Err(
+                "injected fragment failure (SIRIUS_CN_FAIL_ONCE_FILE, remote-sender)"
+                    .to_string()
+                    .into(),
+            );
+        }
+        if !remote.is_empty() && Self::claim_injection("hang-sender") {
+            warn!(
+                instance = %FragmentInstanceId::from(&exec.fragment_instance_id),
+                "injected hang (SIRIUS_CN_FAIL_ONCE_FILE, hang-sender): sending nothing"
+            );
+            return Ok(Vec::new());
         }
         let run = FragmentRun {
             plan: translated,
@@ -1504,6 +1548,7 @@ impl SiriusComputeNodeService {
 
     fn purge(&self, query: FragmentInstanceId, error: &str, failed: bool) {
         let started = std::time::Instant::now();
+        self.deadlines.end(query);
         self.results.fail_query(query, error);
         self.forget_descriptor_table(query);
         let deferred = self.filters.purge_query(query);
@@ -1558,6 +1603,103 @@ impl SiriusComputeNodeService {
                 "released a finished query's exchange state"
             );
         }
+    }
+
+    /// Starts the deadline of `params`' query from its first fragment here, when the FE sent a
+    /// query timeout, and widens how long ended queries are remembered to match it.
+    fn start_deadline(&self, params: &TExecPlanFragmentParams) {
+        let (Some(query), Some(timeout)) = (
+            Self::query_id(params),
+            deadlines::query_timeout(
+                params
+                    .query_options
+                    .as_ref()
+                    .and_then(|options| options.query_timeout),
+            ),
+        ) else {
+            return;
+        };
+        if let Some(window) = self.ends.observe_timeout(timeout) {
+            self.results.set_window(window);
+            self.descriptor_tables
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .set_window(window);
+        }
+        if self.deadlines.start(query, timeout) {
+            let service = self.clone();
+            let spawned = std::thread::Builder::new()
+                .name("query-deadlines".to_string())
+                .spawn(move || service.watch_deadlines());
+            if let Err(err) = spawned {
+                warn!(error = %err, "cannot watch query deadlines");
+                self.deadlines.watcher_stopped();
+            }
+        }
+    }
+
+    /// Fails each query whose deadline passed, until no deadline is left to watch. A panic
+    /// failing one query is contained, so the others' deadlines still fire; should the watcher
+    /// die anyway, the next query's first fragment starts another.
+    fn watch_deadlines(&self) {
+        struct Stopped<'a>(&'a Deadlines);
+        impl Drop for Stopped<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.watcher_stopped();
+                }
+            }
+        }
+        let _stopped = Stopped(&self.deadlines);
+        loop {
+            std::thread::sleep(DEADLINE_TICK);
+            let (passed, left) = self.deadlines.take_passed(std::time::Instant::now());
+            for deadline in passed {
+                let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.deadline_passed(deadline)
+                }));
+                if let Err(panic) = failed {
+                    warn!(
+                        query = %deadline.query,
+                        panic = panic_message(panic.as_ref()),
+                        "failing a query at its deadline panicked"
+                    );
+                }
+            }
+            if !left {
+                return;
+            }
+        }
+    }
+
+    /// `deadline`'s query ran out of time here. One that already ended (the FE's own timeout
+    /// came first, say) or holds nothing here any more is left alone; any other is failed and
+    /// purged with the timeout as its cause, so its receivers stop waiting, its result slots and
+    /// its runs fail, and its reports and failure frames go out.
+    fn deadline_passed(&self, deadline: Deadline) {
+        let query = deadline.query;
+        if self.ends.cause(query).is_some() || self.ends.ended_by_fe(query) {
+            return;
+        }
+        let holds = self.exchanges.holds(query)
+            || self.filters.holds(query)
+            || self.reports.owes(query)
+            || self.results.waits_for(query);
+        if !holds {
+            return;
+        }
+        let cause = format!(
+            "query timed out after {} s on this CN",
+            deadline.timeout.as_secs()
+        );
+        // Claimed atomically: an FE cancel or a normal end since the checks above wins, and the
+        // query is then not failed after the fact.
+        if !self.exchanges.mark_failed_unless_ended(query, &cause) {
+            return;
+        }
+        warn!(%query, cause, "a query's deadline passed; failing it");
+        self.fail_and_purge(query, &cause);
+        self.log_leak_counters("deadline");
     }
 
     /// Logs, on another thread, when what a purge of `query` asked the engine to free is free, and
@@ -1901,26 +2043,23 @@ impl SiriusComputeNodeService {
     /// failure, so exactly one fragment fails per `touch`: an e2e script can fail one query
     /// partway through and check that nothing it held outlives it.
     ///
-    /// A file holding `remote-sender` is claimed only by a fragment that runs on exchange input
-    /// and sends to another CN (`remote_sender`). When a remote frame started that fragment, no
-    /// `exec_plan_fragment` reply carries its error, and only its failure frames tell the query.
-    fn injected_failure(remote_sender: bool) -> std::result::Result<(), String> {
+    /// What the file holds picks the fragment and what happens to it:
+    /// - empty: the next fragment fails;
+    /// - `remote-sender`: the next fragment that runs on exchange input and sends to another CN
+    ///   fails. When a remote frame started it, no `exec_plan_fragment` reply carries its error,
+    ///   and only its failure frames tell the query;
+    /// - `hang-sender`: the next fragment that sends to another CN stops without running, sending
+    ///   neither EOS nor a failure frame, as a dead peer would. Only a deadline ends its query.
+    ///
+    /// Returns whether this fragment claimed the file holding `kind`.
+    fn claim_injection(kind: &str) -> bool {
         let Some(path) = std::env::var_os("SIRIUS_CN_FAIL_ONCE_FILE") else {
-            return Ok(());
+            return false;
         };
         let Ok(wanted) = std::fs::read_to_string(&path) else {
-            return Ok(());
+            return false;
         };
-        if (wanted.trim() == "remote-sender") != remote_sender {
-            return Ok(());
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => Err(format!(
-                "injected fragment failure (SIRIUS_CN_FAIL_ONCE_FILE{})",
-                if remote_sender { ", remote-sender" } else { "" }
-            )),
-            Err(_) => Ok(()),
-        }
+        wanted.trim() == kind && std::fs::remove_file(&path).is_ok()
     }
 
     /// The query a fragment belongs to.
@@ -4530,6 +4669,221 @@ mod tests {
             status.error_msgs,
             ["scan exploded on cn2 (Interrupted!)"],
             "{status:?}"
+        );
+    }
+
+    /// Gives `params`' query a timeout of `seconds`, as the FE's query options carry it.
+    fn with_timeout(mut params: TExecPlanFragmentParams, seconds: i32) -> TExecPlanFragmentParams {
+        params.query_options = Some(starrocks_thrift::internal_service::TQueryOptions {
+            query_timeout: Some(seconds),
+            ..Default::default()
+        });
+        params
+    }
+
+    /// A result receiver of `query`, reporting as backend 1, waiting for a sender that never
+    /// comes, with a 1 s query timeout.
+    fn waiting_for_a_lost_sender(
+        service: &SiriusComputeNodeService,
+        frontend: &crate::fe_report::fake_frontend::FakeFrontend,
+        query: i64,
+    ) {
+        let mut result = query_fragment(query, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        reports_to(&mut result, frontend, 1);
+        exec_ok(service, &with_timeout(result, 1));
+    }
+
+    #[test]
+    fn a_receiver_whose_sender_never_comes_fails_at_its_query_timeout() {
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let service = SiriusComputeNodeService::new();
+        waiting_for_a_lost_sender(&service, &frontend, 90);
+        // fetch_data waits for the query's deadline, not RESULT_WAIT, and reads its cause.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            fetch_error(&service, 90, 10),
+            "query timed out after 1 s on this CN"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(900) && waited < Duration::from_secs(4),
+            "{waited:?}"
+        );
+        assert_eq!(
+            report_ends(&frontend.wait_for(1)),
+            [(
+                1,
+                TStatusCode::INTERNAL_ERROR,
+                "query timed out after 1 s on this CN".to_string()
+            )]
+        );
+        assert!(idle(&service));
+    }
+
+    #[test]
+    fn a_receive_allocation_waits_no_longer_than_its_querys_deadline() {
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let engine = Arc::new(BusyEngine::default());
+        let nixl = Arc::new(FakeNixl::default());
+        let mut service = SiriusComputeNodeService::with_executor(
+            engine.clone(),
+            &ComputeNodeConfig::default(),
+            Some(nixl.clone()),
+        );
+        service.alloc_wait = Duration::from_secs(30);
+        waiting_for_a_lost_sender(&service, &frontend, 91);
+        nixl.full.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _stuck = engine.frees.begin();
+        let started = std::time::Instant::now();
+        let status = transmit(
+            &service,
+            nixl_chunk::alloc_params(exchange_slot(91, 10, 2)),
+            NixlEnvelope::Alloc(vec![0; 24]),
+        )
+        .0;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // By then the deadline failed the query, which refuses the allocation with its cause.
+        assert_eq!(
+            (status.status_code, status.error_msgs),
+            (
+                TStatusCode::CANCELLED.0,
+                vec!["query timed out after 1 s on this CN".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn the_fes_timeout_and_the_local_deadline_end_a_query_once() {
+        use crate::proto::starrocks::PPlanFragmentCancelReason as Reason;
+        // The FE first: the deadline then finds the query ended and does nothing.
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let service = SiriusComputeNodeService::new();
+        waiting_for_a_lost_sender(&service, &frontend, 92);
+        cancel_with(&service, 92, Some(Reason::Timeout), None);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            report_ends(&frontend.wait_for(1)),
+            [(
+                1,
+                TStatusCode::CANCELLED,
+                "query cancelled: the query timed out".to_string()
+            )]
+        );
+        assert_eq!(
+            service
+                .exchanges
+                .failure(FragmentInstanceId::from_halves(92, 0)),
+            Some("query cancelled: the query timed out".to_string())
+        );
+
+        // The deadline first: the FE's cancel then adds nothing.
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        waiting_for_a_lost_sender(&service, &frontend, 93);
+        eventually("the deadline", || {
+            service
+                .exchanges
+                .failure(FragmentInstanceId::from_halves(93, 0))
+                .is_some()
+        });
+        cancel_with(&service, 93, Some(Reason::Timeout), None);
+        assert_eq!(
+            report_ends(&frontend.wait_for(1)),
+            [(
+                1,
+                TStatusCode::INTERNAL_ERROR,
+                "query timed out after 1 s on this CN".to_string()
+            )]
+        );
+        assert!(idle(&service));
+    }
+
+    #[test]
+    fn a_deadline_leaves_a_query_that_finished_alone() {
+        let service = SiriusComputeNodeService::new();
+        let mut result = query_fragment(94, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        exec_ok(&service, &with_timeout(result, 1));
+        let mut sender = query_fragment(94, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 8060);
+        exec_ok(&service, &with_timeout(sender, 1));
+        for _ in 0..2 {
+            route(
+                &service,
+                methods::FETCH_DATA,
+                fetch_request(94, 10),
+                Vec::new(),
+            );
+        }
+        assert_eq!(
+            service
+                .deadlines
+                .remaining(FragmentInstanceId::from_halves(94, 0)),
+            None,
+            "its last row delivered, the query's deadline is gone"
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            service
+                .exchanges
+                .failure(FragmentInstanceId::from_halves(94, 0)),
+            None,
+            "not failed after the fact"
+        );
+
+        // A purged query's deadline goes with it.
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        waiting_for_a_lost_sender(&service, &frontend, 95);
+        assert!(
+            service
+                .deadlines
+                .remaining(FragmentInstanceId::from_halves(95, 0))
+                .is_some()
+        );
+        service.fail_and_purge(FragmentInstanceId::from_halves(95, 0), "scan exploded");
+        assert_eq!(
+            service
+                .deadlines
+                .remaining(FragmentInstanceId::from_halves(95, 0)),
+            None
+        );
+    }
+
+    /// Panics when asked to interrupt query 96, as a bug failing one query at its deadline would.
+    #[derive(Debug)]
+    struct PanicsInterrupting96;
+
+    impl FragmentExecutor for PanicsInterrupting96 {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn interrupt(&self, query: FragmentInstanceId) {
+            if query.query_hi() == FragmentInstanceId::from_halves(96, 0).query_hi() {
+                panic!("interrupting query 96 failed");
+            }
+        }
+    }
+
+    #[test]
+    fn a_panic_failing_one_query_at_its_deadline_spares_the_others() {
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(PanicsInterrupting96),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        waiting_for_a_lost_sender(&service, &frontend, 96);
+        let mut later = query_fragment(97, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut later, 2, 1);
+        exec_ok(&service, &with_timeout(later, 2));
+        assert_eq!(
+            fetch_error(&service, 97, 10),
+            "query timed out after 2 s on this CN"
         );
     }
 
