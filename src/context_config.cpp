@@ -52,9 +52,13 @@ std::expected<ContextConfigBuilder, Error> ContextConfigBuilder::from_yaml(
   try {
     impl->config = load_configuration(path);
   } catch (const configuration_load_error& e) {
-    auto code = ErrorCode::invalid_configuration;
-    if (e.status == SIRIUS_CONFIGURATION_IO) { code = ErrorCode::configuration_io; }
-    if (e.status == SIRIUS_MALFORMED_YAML) { code = ErrorCode::malformed_yaml; }
+    ErrorCode code;
+    switch (e.code) {
+      case configuration_load_error_code::io: code = ErrorCode::configuration_io; break;
+      case configuration_load_error_code::malformed_yaml: code = ErrorCode::malformed_yaml; break;
+      case configuration_load_error_code::invalid_configuration:
+      default: code = ErrorCode::invalid_configuration; break;
+    }
     return std::unexpected(Error{code, e.what()});
   }
   return ContextConfigBuilder(std::move(impl));

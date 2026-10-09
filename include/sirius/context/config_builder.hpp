@@ -38,6 +38,12 @@ namespace sirius {
 /**
  * @brief Assemble a configuration using defaults or YAML.
  *
+ * @par Thread safety
+ * Objects may be transferred between threads, including for destruction.
+ * Const operations and copying may run concurrently while the source stays alive.
+ * Assignment and destruction require exclusive access to that object; separate
+ * copies may be used independently on different threads.
+ *
  * YAML settings take precedence over built-in defaults. Copies share immutable
  * settings and remain valid independently of the original builder.
  *

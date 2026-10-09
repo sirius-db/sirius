@@ -14,7 +14,7 @@ parsed_sirius_config load_configuration(const std::filesystem::path& path)
     file.open(path, std::ios::binary);
     if (!file) {
       throw configuration_load_error(
-        SIRIUS_CONFIGURATION_IO, "Cannot open configuration file", path);
+        configuration_load_error_code::io, "Cannot open configuration file", path);
     }
     std::string contents;
     char buffer[8192];
@@ -23,15 +23,16 @@ parsed_sirius_config load_configuration(const std::filesystem::path& path)
     }
     if (!file.eof()) {
       throw configuration_load_error(
-        SIRIUS_CONFIGURATION_IO, "Cannot read configuration file", path);
+        configuration_load_error_code::io, "Cannot read configuration file", path);
     }
     return parsed_sirius_config::from_node(YAML::Load(contents), path);
-  } catch (const std::ios_base::failure& e) {
-    throw configuration_load_error(SIRIUS_CONFIGURATION_IO, e.what(), path);
+  } catch (const std::ios_base::failure&) {
+    throw configuration_load_error(
+      configuration_load_error_code::io, "Cannot read configuration file", path);
   } catch (const YAML::Exception& e) {
-    throw configuration_load_error(SIRIUS_MALFORMED_YAML, e.what(), path);
+    throw configuration_load_error(configuration_load_error_code::malformed_yaml, e.what(), path);
   } catch (const configuration_input_error& e) {
-    throw configuration_load_error(SIRIUS_INVALID_CONFIGURATION, e.what());
+    throw configuration_load_error(configuration_load_error_code::invalid_configuration, e.what());
   }
 }
 }  // namespace sirius
