@@ -13,8 +13,9 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -30,13 +31,15 @@ use crate::fragment_executor::{
     DrainNext, ExportedBatch, FragmentExecutor, OutputDrain, SenderSlot,
 };
 use crate::nixl_chunk::{
-    AllocReply, NixlEndpoint, NixlEnvelope, StreamHop, control_params, packed_params,
+    AllocReply, NixlEndpoint, NixlEnvelope, StreamHop, alloc_params, control_params, failed_params,
+    packed_params,
 };
 use crate::proto::starrocks::{
     PTransmitChunkParams, PTransmitChunkResult,
     p_internal_service_brpc::{SERVICE_NAME, methods},
 };
 use crate::prpc;
+use starrocks_thrift::status_code::TStatusCode;
 
 /// Appended to bring-up errors, whose usual cause is the environment.
 const ENV_HINT: &str = "source experimental/starrocks/scripts/cn-env.sh (NIXL_PREFIX, \
@@ -44,6 +47,13 @@ const ENV_HINT: &str = "source experimental/starrocks/scripts/cn-env.sh (NIXL_PR
                         UCX_TLS=cuda_copy,cuda_ipc,tcp,self";
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bounds a failure frame, from connecting to its reply, which a sender sends while its query is
+/// already failing: a peer that does not answer by then is likely the cause.
+const FAILED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// At most this many failure frames are in flight at once, each on its own thread.
+const FAILED_IN_FLIGHT: usize = 64;
 
 /// How long the transport waits on one streamed output when every output is waiting on its
 /// fragment and no WRITE is in flight.
@@ -196,19 +206,39 @@ impl NixlEndpoint for NixlTransport {
                 .collect(),
         )
     }
+
+    fn fail(&self, peer: SocketAddr, slot: SenderSlot, error: &str) {
+        send_failed(vec![(peer, slot)], error);
+    }
 }
 
 impl NixlTransport {
+    /// Ships `hops` on the transport thread. If that thread cannot take them, each hop still ends
+    /// with a failure frame.
     fn ship(&self, hops: Vec<Hop>) -> Result<(), String> {
+        let ends: Vec<_> = hops.iter().map(|hop| (hop.peer, hop.slot)).collect();
         let (respond, response) = channel();
-        self.requests
+        let shipped = self
+            .requests
             .as_ref()
-            .ok_or_else(|| "the nixl transport is shutting down".to_string())?
-            .send(ShipRequest { hops, respond })
-            .map_err(|_| "the nixl-transport thread is not running".to_string())?;
-        response
-            .recv()
-            .map_err(|_| "the nixl-transport thread dropped the hop".to_string())?
+            .ok_or_else(|| "the nixl transport is shutting down".to_string())
+            .and_then(|requests| {
+                requests
+                    .send(ShipRequest { hops, respond })
+                    .map_err(|_| "the nixl-transport thread is not running".to_string())
+            })
+            .and_then(|()| {
+                response
+                    .recv()
+                    .map_err(|_| "the nixl-transport thread dropped the hop".to_string())
+            });
+        match shipped {
+            Ok(result) => result,
+            Err(err) => {
+                send_failed(ends, &err);
+                Err(err)
+            }
+        }
     }
 }
 
@@ -292,7 +322,9 @@ struct Lane {
     source: Source,
     streamed: bool,
     inflight: VecDeque<Write>,
-    announce: Sender<(u64, u64)>,
+    announce: Sender<Announce>,
+    /// The error the hop's announcer hit first: the receiver refused a frame, or its CN is gone.
+    refused: Arc<OnceLock<String>>,
     /// The source has no more batches.
     drained: bool,
     totals: HopTotals,
@@ -302,6 +334,14 @@ impl Lane {
     fn done(&self) -> bool {
         self.drained && self.inflight.is_empty()
     }
+}
+
+/// What a hop's announcer sends next.
+enum Announce {
+    /// A finished WRITE: the receiver's token and the batch's rows.
+    Batch { token: u64, rows: u64 },
+    /// The hop's last frame: EOS, or a failure frame carrying the error that ended the hop.
+    End(Result<(), String>),
 }
 
 #[derive(Default)]
@@ -373,22 +413,36 @@ impl Transport {
 
     /// Ships every hop at once, keeping a window of WRITEs in flight per hop. Announces leave in
     /// order from one thread per hop, so a WRITE never waits on the previous batch's announce
-    /// round trip. After the first error no hop sends its EOS.
+    /// round trip. After the first error every hop ends with a failure frame instead of its EOS.
     fn ship(&mut self, hops: Vec<Hop>) -> Result<(), String> {
         self.reap_quarantine();
         let started = Instant::now();
         let remotes = hops
             .iter()
             .map(|hop| self.remote_agent(hop.peer))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .inspect_err(|err| {
+                send_failed(hops.iter().map(|hop| (hop.peer, hop.slot)).collect(), err);
+            })?;
         let window = env_u64("SIRIUS_CN_NIXL_WINDOW").map_or(4, |n| n as usize);
         std::thread::scope(|scope| {
             let mut lanes = Vec::with_capacity(hops.len());
             let mut announcers = Vec::with_capacity(hops.len());
             for (hop, remote) in hops.into_iter().zip(remotes) {
-                let (announce, frames) = channel::<(u64, u64)>();
+                let (announce, frames) = channel::<Announce>();
                 let (peer, slot, names) = (hop.peer, hop.slot, hop.names);
-                announcers.push(scope.spawn(move || announce_all(peer, slot, &names, frames)));
+                let refused = Arc::new(OnceLock::new());
+                let announcer_refused = Arc::clone(&refused);
+                announcers.push(scope.spawn(move || {
+                    announce_all(
+                        slot,
+                        &names,
+                        frames,
+                        &announcer_refused,
+                        |params, envelope| call(peer, params, envelope).map(drop),
+                        |err| send_failed(vec![(peer, slot)], err),
+                    )
+                }));
                 lanes.push(Lane {
                     peer,
                     slot,
@@ -397,6 +451,7 @@ impl Transport {
                     source: hop.source,
                     inflight: VecDeque::new(),
                     announce,
+                    refused,
                     drained: false,
                     totals: HopTotals::default(),
                 });
@@ -416,11 +471,10 @@ impl Transport {
                         self.quarantine(lane.peer, write);
                     }
                 }
-                if pumped.is_ok() {
-                    let _ = lane.announce.send((0, 0));
-                }
+                let _ = lane.announce.send(Announce::End(pumped.clone()));
             }
             // Dropping the lanes closes every announce queue, so the announcers can finish.
+            let refusals: Vec<_> = lanes.iter().map(|lane| Arc::clone(&lane.refused)).collect();
             let shipped: Vec<_> = lanes
                 .into_iter()
                 .map(|lane| (lane.peer, lane.slot, lane.streamed, lane.totals))
@@ -448,7 +502,8 @@ impl Transport {
                     "shipping packed exchange hop"
                 );
             }
-            pumped.and(announced)
+            let refused = refusals.iter().find_map(|refused| refused.get().cloned());
+            hops_outcome(pumped, announced, refused)
         })
     }
 
@@ -458,6 +513,7 @@ impl Transport {
         loop {
             let mut progressed = false;
             for lane in lanes.iter_mut() {
+                refusal(lane)?;
                 progressed |= self.fill(lane, window, Duration::ZERO)?;
                 progressed |= self.retire(lane)?;
             }
@@ -486,7 +542,7 @@ impl Transport {
         while !lane.drained && lane.inflight.len() < window {
             match lane.source.next(lane.slot, timeout)? {
                 DrainNext::Batch(batch) => {
-                    let write = self.post(lane.peer, &lane.remote, batch)?;
+                    let write = self.post(lane.peer, lane.slot, &lane.remote, batch)?;
                     lane.inflight.push_back(write);
                 }
                 DrainNext::Waiting => break,
@@ -510,7 +566,10 @@ impl Transport {
                     lane.totals.rows += write.rows;
                     lane.totals.bytes += write.bytes;
                     lane.totals.write_us += write.posted.elapsed().as_micros() as u64;
-                    let _ = lane.announce.send((write.remote, write.rows));
+                    let _ = lane.announce.send(Announce::Batch {
+                        token: write.remote,
+                        rows: write.rows,
+                    });
                     progressed = true;
                 }
                 Err(err) => {
@@ -524,8 +583,14 @@ impl Transport {
     }
 
     /// Allocates the receiver's buffers for `batch` and posts one WRITE of all of them.
-    fn post(&self, peer: SocketAddr, remote: &str, batch: ExportedBatch) -> Result<Write, String> {
-        let reply = call(peer, control_params(), &NixlEnvelope::Alloc(batch.layout))
+    fn post(
+        &self,
+        peer: SocketAddr,
+        slot: SenderSlot,
+        remote: &str,
+        batch: ExportedBatch,
+    ) -> Result<Write, String> {
+        let reply = call(peer, alloc_params(slot), &NixlEnvelope::Alloc(batch.layout))
             .and_then(|reply| AllocReply::decode(&reply))
             .inspect_err(|_| self.release(batch.token))?;
         let request = self
@@ -698,35 +763,121 @@ impl Transport {
     }
 }
 
-/// Sends `(token, rows)` frames in order, then EOS (token 0). After the first failure the rest
-/// are not announced, so their receive buffers are released instead.
+/// Announces batches in order with `send`, then EOS (token 0). The first error, a refused or
+/// failed announce or EOS, is recorded in `refused` so the transport stops pulling the hop's
+/// output; the batches still to come are released instead of announced. A hop that fails, here
+/// or on the transport thread, or that the transport drops without ending, ends with `fail` in
+/// place of its EOS: a hop never just stops.
 fn announce_all(
-    peer: SocketAddr,
     slot: SenderSlot,
     names: &[String],
-    frames: Receiver<(u64, u64)>,
+    frames: Receiver<Announce>,
+    refused: &OnceLock<String>,
+    send: impl Fn(PTransmitChunkParams, &NixlEnvelope) -> Result<(), String>,
+    fail: impl FnOnce(&str),
 ) -> Result<(), String> {
+    let packed = |token, rows| NixlEnvelope::Packed {
+        token,
+        rows,
+        names: names.to_vec(),
+    };
+    let announce = |params, envelope: &NixlEnvelope| {
+        send(params, envelope).inspect_err(|err| {
+            let _ = refused.set(err.clone());
+        })
+    };
     let mut result = Ok(());
-    for (seq, (token, rows)) in frames.into_iter().enumerate() {
-        if result.is_err() {
-            if token != 0 {
-                let _ = call(peer, control_params(), &NixlEnvelope::Release(token));
+    let mut seq = 0;
+    let mut frames = frames.into_iter();
+    let ended = loop {
+        match frames.next() {
+            None => break Err("the nixl transport dropped the hop before it ended".to_string()),
+            Some(Announce::End(ended)) => break result.clone().and(ended),
+            Some(Announce::Batch { token, .. }) if result.is_err() => {
+                let _ = send(control_params(), &NixlEnvelope::Release(token));
             }
-            continue;
+            Some(Announce::Batch { token, rows }) => {
+                result = announce(packed_params(Some(slot), seq, false), &packed(token, rows));
+                seq += 1;
+            }
         }
-        let envelope = NixlEnvelope::Packed {
-            token,
-            rows,
-            names: names.to_vec(),
-        };
-        result = call(
-            peer,
-            packed_params(Some(slot), seq as i64, token == 0),
-            &envelope,
-        )
-        .map(drop);
+    };
+    let ended = ended.and_then(|()| announce(packed_params(Some(slot), seq, true), &packed(0, 0)));
+    ended.inspect_err(|err| fail(err))
+}
+
+/// The hop's announcer failed: the transport stops pulling its output with that error.
+fn refusal(lane: &Lane) -> Result<(), String> {
+    lane.refused.get().map_or(Ok(()), |err| Err(err.clone()))
+}
+
+/// How shipping a set of hops went. A hop's refused announce comes first: the transport stopped
+/// because of it, and it carries the receiver's cause, where a later error would be secondary.
+fn hops_outcome(
+    pumped: Result<(), String>,
+    announced: Result<(), String>,
+    refused: Option<String>,
+) -> Result<(), String> {
+    match refused {
+        Some(err) => Err(err),
+        None => pumped.and(announced),
     }
-    result
+}
+
+/// Sends each hop's receiver in `ends` a failure frame in place of its EOS, each from its own
+/// thread, so a peer that does not answer holds up neither the caller nor the other hops. Best
+/// effort: a peer that refuses the frame or does not answer within [`FAILED_TIMEOUT`] is logged,
+/// and past [`FAILED_IN_FLIGHT`] frames in flight the rest are dropped.
+fn send_failed(ends: Vec<(SocketAddr, SenderSlot)>, error: &str) {
+    for (peer, slot) in ends {
+        let Some(permit) = FailedPermit::take() else {
+            warn!(peer = %peer, ?slot, "too many exchange failure frames in flight; dropping one");
+            continue;
+        };
+        let failed = NixlEnvelope::Failed {
+            error: error.to_string(),
+        };
+        let spawned = std::thread::Builder::new()
+            .name("exchange-failed".to_string())
+            .spawn(move || {
+                let _permit = permit;
+                let deadline = Instant::now() + FAILED_TIMEOUT;
+                match call_by(peer, failed_params(slot), &failed, deadline) {
+                    Ok(_) => info!(peer = %peer, ?slot, "sent an exchange failure frame"),
+                    Err(err) => warn!(
+                        peer = %peer,
+                        ?slot,
+                        error = %err,
+                        "failed to send an exchange failure frame"
+                    ),
+                }
+            });
+        if let Err(err) = spawned {
+            warn!(peer = %peer, ?slot, error = %err, "cannot spawn an exchange failure frame");
+        }
+    }
+}
+
+/// One of the [`FAILED_IN_FLIGHT`] failure frames that may be in flight; returned when dropped.
+struct FailedPermit;
+
+static FAILED_IN_FLIGHT_NOW: AtomicUsize = AtomicUsize::new(0);
+
+impl FailedPermit {
+    fn take() -> Option<Self> {
+        FAILED_IN_FLIGHT_NOW
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |now| {
+                (now < FAILED_IN_FLIGHT).then_some(now + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for FailedPermit {
+    fn drop(&mut self) {
+        FAILED_IN_FLIGHT_NOW.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// One `transmit_chunk` round trip to `peer`, returning the reply attachment.
@@ -735,19 +886,50 @@ fn call(
     params: PTransmitChunkParams,
     envelope: &NixlEnvelope,
 ) -> Result<Vec<u8>, String> {
-    let (body, attachment) = prpc::call_blocking(
+    let reply = prpc::call_blocking(
         peer,
         SERVICE_NAME,
         methods::TRANSMIT_CHUNK,
         params.encode_to_vec(),
         envelope.encode(),
         RPC_TIMEOUT,
-    )
-    .map_err(|err| format!("transmit_chunk to {peer}: {err:#}"))?;
+    );
+    transmit_reply(peer, reply)
+}
+
+/// [`call`] that gives up once `deadline` passes.
+fn call_by(
+    peer: SocketAddr,
+    params: PTransmitChunkParams,
+    envelope: &NixlEnvelope,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let reply = prpc::call_blocking_by(
+        peer,
+        SERVICE_NAME,
+        methods::TRANSMIT_CHUNK,
+        params.encode_to_vec(),
+        envelope.encode(),
+        deadline,
+    );
+    transmit_reply(peer, reply)
+}
+
+/// The attachment of `peer`'s `transmit_chunk` reply, or why it failed.
+fn transmit_reply(
+    peer: SocketAddr,
+    reply: anyhow::Result<(Vec<u8>, Vec<u8>)>,
+) -> Result<Vec<u8>, String> {
+    let (body, attachment) = reply.map_err(|err| format!("transmit_chunk to {peer}: {err:#}"))?;
     let status = PTransmitChunkResult::decode(body.as_slice())
         .map_err(|err| format!("transmit_chunk reply from {peer}: {err}"))?
         .status
         .ok_or_else(|| format!("transmit_chunk reply from {peer} carries no status"))?;
+    // The peer already failed the query: its message is that failure's cause, which is what the
+    // FE should report rather than this refusal.
+    if status.status_code == TStatusCode::CANCELLED.0 {
+        return Err(status.error_msgs.join("; "));
+    }
     if status.status_code != 0 {
         return Err(format!(
             "{peer} refused transmit_chunk: {}",
@@ -784,7 +966,172 @@ fn check_single_visible_device(visible: Option<&str>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_single_visible_device;
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::result_store::FragmentInstanceId;
+
+    /// What one hop sent: `(eos, envelope)` per frame, the failure it ended with, and the error
+    /// it recorded for the transport.
+    type Sent = (Vec<(bool, NixlEnvelope)>, Option<String>, Option<String>);
+
+    /// Runs `announce_all` over `frames`, refusing the announce of `refuse` (a token; 0 is EOS)
+    /// with "busy".
+    fn announce(frames: Vec<Announce>, refuse: Option<u64>) -> (Result<(), String>, Sent) {
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(1, 2),
+            node_id: 3,
+            sender_id: 0,
+        };
+        let (announce, received) = channel();
+        for frame in frames {
+            announce.send(frame).unwrap();
+        }
+        drop(announce);
+        let sent = Mutex::new(Vec::new());
+        let mut failed = None;
+        let refused = OnceLock::new();
+        let result = announce_all(
+            slot,
+            &["id".to_string()],
+            received,
+            &refused,
+            |params, envelope| {
+                sent.lock()
+                    .unwrap()
+                    .push((params.eos == Some(true), envelope.clone()));
+                match envelope {
+                    NixlEnvelope::Packed { token, .. } if Some(*token) == refuse => {
+                        Err("busy".to_string())
+                    }
+                    _ => Ok(()),
+                }
+            },
+            |err| failed = Some(err.to_string()),
+        );
+        (
+            result,
+            (sent.into_inner().unwrap(), failed, refused.into_inner()),
+        )
+    }
+
+    fn batch(token: u64) -> Announce {
+        Announce::Batch { token, rows: 1 }
+    }
+
+    fn packed(token: u64) -> NixlEnvelope {
+        NixlEnvelope::Packed {
+            token,
+            rows: u64::from(token != 0),
+            names: vec!["id".to_string()],
+        }
+    }
+
+    #[test]
+    fn a_hop_ends_with_eos_once_every_batch_is_announced() {
+        let (result, (sent, failed, refused)) =
+            announce(vec![batch(5), batch(6), Announce::End(Ok(()))], None);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            sent,
+            vec![(false, packed(5)), (false, packed(6)), (true, packed(0))]
+        );
+        assert_eq!((failed, refused), (None, None));
+    }
+
+    #[test]
+    fn a_hop_that_fails_ends_with_a_failure_frame_and_no_eos() {
+        // The transport fails the hop: its own error, nothing for the transport to stop on.
+        let (result, (sent, failed, refused)) = announce(
+            vec![batch(5), Announce::End(Err("WRITE failed".to_string()))],
+            None,
+        );
+        assert_eq!(result, Err("WRITE failed".to_string()));
+        assert_eq!(sent, vec![(false, packed(5))]);
+        assert_eq!(failed.as_deref(), Some("WRITE failed"));
+        assert_eq!(refused, None);
+
+        // The peer refuses an announce: the transport is told to stop, and the batches after it
+        // are released, not announced.
+        let (result, (sent, failed, refused)) =
+            announce(vec![batch(5), batch(6), Announce::End(Ok(()))], Some(5));
+        assert_eq!(result, Err("busy".to_string()));
+        assert_eq!(
+            sent,
+            vec![(false, packed(5)), (false, NixlEnvelope::Release(6))]
+        );
+        assert_eq!(failed.as_deref(), Some("busy"));
+        assert_eq!(refused.as_deref(), Some("busy"));
+
+        // The peer refuses the EOS: the hop still ends with a failure frame.
+        let (result, (sent, failed, refused)) =
+            announce(vec![batch(5), Announce::End(Ok(()))], Some(0));
+        assert_eq!(result, Err("busy".to_string()));
+        assert_eq!(sent, vec![(false, packed(5)), (true, packed(0))]);
+        assert_eq!(failed.as_deref(), Some("busy"));
+        assert_eq!(refused.as_deref(), Some("busy"));
+
+        // The transport drops the hop without ending it.
+        let (result, (sent, failed, _)) = announce(vec![batch(5)], None);
+        assert!(result.is_err());
+        assert_eq!(sent, vec![(false, packed(5))]);
+        assert!(failed.unwrap().contains("dropped the hop"));
+    }
+
+    #[test]
+    fn a_refused_hop_stops_the_transport_with_the_receivers_cause() {
+        let lane = Lane {
+            peer: "127.0.0.1:9".parse().unwrap(),
+            slot: SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from_halves(1, 2),
+                node_id: 3,
+                sender_id: 0,
+            },
+            remote: String::new(),
+            source: Source::Streamed(Box::new(NoBatches)),
+            streamed: true,
+            inflight: VecDeque::new(),
+            announce: channel().0,
+            refused: Arc::new(OnceLock::new()),
+            drained: false,
+            totals: HopTotals::default(),
+        };
+        assert_eq!(refusal(&lane), Ok(()));
+        lane.refused.set("scan exploded".to_string()).unwrap();
+        assert_eq!(refusal(&lane), Err("scan exploded".to_string()));
+
+        // A later, secondary error of the pump doesn't replace the receiver's cause.
+        let secondary = || Err("failed to allocate receive buffers".to_string());
+        assert_eq!(
+            hops_outcome(
+                secondary(),
+                Err("scan exploded".to_string()),
+                Some("scan exploded".into())
+            ),
+            Err("scan exploded".to_string())
+        );
+        assert_eq!(hops_outcome(secondary(), Ok(()), None), secondary());
+    }
+
+    #[derive(Debug)]
+    struct NoBatches;
+
+    impl OutputDrain for NoBatches {
+        fn next(&mut self, _timeout: Duration) -> Result<DrainNext, String> {
+            Ok(DrainNext::End)
+        }
+    }
+
+    #[test]
+    fn failure_frames_in_flight_are_capped() {
+        let permits: Vec<_> = std::iter::from_fn(FailedPermit::take)
+            .take(FAILED_IN_FLIGHT + 1)
+            .collect();
+        assert_eq!(permits.len(), FAILED_IN_FLIGHT);
+        assert!(FailedPermit::take().is_none());
+        drop(permits);
+        assert!(FailedPermit::take().is_some());
+    }
 
     #[test]
     fn one_cn_sees_one_gpu() {
