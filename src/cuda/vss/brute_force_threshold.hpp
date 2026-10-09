@@ -96,6 +96,8 @@ threshold_join_result brute_force_threshold(
  * per-row bound equivalent to distance <= eps (L2: |x|^2 - 2 q.x <= eps^2 - |q|^2; cosine over unit
  * vectors: -q^.x^ <= eps - 1) and matches are appended as they are read, with distances computed
  * for survivors only. Edge order is unspecified. Metrics: those gemm_search_supports accepts.
+ * With @p count_only the pairs are counted and not written: the three columns come back null
+ * and only n_edges is set.
  */
 threshold_join_result gemm_threshold(
   raft::device_resources const& res,
@@ -103,6 +105,7 @@ threshold_join_result gemm_threshold(
   dataset_matrix_view queries,
   float eps,
   cuvs::distance::DistanceType metric,
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref(),
+  bool count_only                   = false);
 
 }  // namespace sirius::vss

@@ -1367,6 +1367,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   std::size_t n_right    = 0;
   bool score_read        = false;
   for (auto const& column_id : column_ids) {
+    if (req.count_only) { break; }  // one BIGINT column, the count: handled below
     if (!column_id.HasPrimaryIndex()) {
       throw duckdb::NotImplementedException("sirius_knn_join: virtual/rowid columns unsupported");
     }
@@ -1389,7 +1390,22 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   duckdb::vector<duckdb::LogicalType> kept_types(n_left + n_right + 1);
   // Physical position, in the emitted layout, of each entry of column_ids.
   std::vector<std::size_t> emitted_pos(column_ids.size());
-  for (std::size_t ci = 0; ci < column_ids.size(); ++ci) {
+  if (req.count_only) {
+    // The count pushdown left one BIGINT column, the pairs counted per probe batch, and nothing
+    // reads the sides or the score.
+    if (column_ids.size() != 1 || op.returned_types.size() != 1 ||
+        op.returned_types[0] != duckdb::LogicalType::BIGINT) {
+      throw duckdb::InternalException(
+        "sirius_knn_join: a count-only join emits exactly one BIGINT column");
+    }
+    if (!use_streaming) {
+      throw duckdb::NotImplementedException(
+        "sirius_knn_join: a count-only join needs the streaming operator");
+    }
+    kept_types[0]  = duckdb::LogicalType::BIGINT;
+    emitted_pos[0] = 0;
+  }
+  for (std::size_t ci = 0; !req.count_only && ci < column_ids.size(); ++ci) {
     auto const idx  = column_ids[ci].GetPrimaryIndex();
     std::size_t pos = 0;
     if (idx < declared_left) {
@@ -1404,7 +1420,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     kept_types[pos] = op.returned_types[idx];
     emitted_pos[ci] = pos;
   }
-  kept_types[n_left + n_right] = op.returned_types[score_idx_orig];
+  if (!req.count_only) { kept_types[n_left + n_right] = op.returned_types[score_idx_orig]; }
   SIRIUS_LOG_DEBUG(
     "[vector_join] output columns: declared left={} right={}, read {} -> keeping left={} "
     "right={} score={}",

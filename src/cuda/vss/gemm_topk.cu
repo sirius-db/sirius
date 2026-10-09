@@ -472,7 +472,8 @@ threshold_join_result gemm_threshold(raft::device_resources const& res,
                                      dataset_matrix_view queries,
                                      float eps,
                                      cuvs::distance::DistanceType metric,
-                                     rmm::device_async_resource_ref mr)
+                                     rmm::device_async_resource_ref mr,
+                                     bool count_only)
 {
   auto kind = score_kind_of(metric);
   CUDF_EXPECTS(kind.has_value(), "gemm_threshold: unsupported metric");
@@ -487,8 +488,9 @@ threshold_join_result gemm_threshold(raft::device_resources const& res,
     search.qn.data(), m, eps, static_cast<int>(*kind), bounds.data());
 
   // Edges accumulate in one buffer that doubles when a tile overflows it. The overflowing tile's
-  // scores are still in place, so only its emission is re-run, never its GEMM.
-  std::size_t capacity = std::size_t{1} << 20;
+  // scores are still in place, so only its emission is re-run, never its GEMM. Counting only,
+  // the buffer has no room and the kernel writes nothing: the counter is the answer.
+  std::size_t capacity = count_only ? 0 : std::size_t{1} << 20;
   std::size_t size     = 0;
   rmm::device_uvector<int64_t> rows(capacity, stream, mr);
   rmm::device_uvector<int64_t> cols(capacity, stream, mr);
@@ -501,25 +503,26 @@ threshold_join_result gemm_threshold(raft::device_resources const& res,
       CUDF_CUDA_TRY(cudaMemsetAsync(counter.data(), 0, sizeof(unsigned long long), stream.value()));
       dim3 const grid(static_cast<unsigned>((n + per_block - 1) / per_block),
                       static_cast<unsigned>(t));
-      threshold_emit_kernel<<<grid, kBlock, 0, stream.value()>>>(search.scores.data(),
-                                                                 n,
-                                                                 bounds.data() + q0,
-                                                                 search.qn.data() + q0,
-                                                                 static_cast<int>(*kind),
-                                                                 search.x_root_norms.data(),
-                                                                 eps,
-                                                                 q0,
-                                                                 rows.data() + size,
-                                                                 cols.data() + size,
-                                                                 dist.data() + size,
-                                                                 counter.data(),
-                                                                 capacity - size);
+      threshold_emit_kernel<<<grid, kBlock, 0, stream.value()>>>(
+        search.scores.data(),
+        n,
+        bounds.data() + q0,
+        search.qn.data() + q0,
+        static_cast<int>(*kind),
+        search.x_root_norms.data(),
+        eps,
+        q0,
+        count_only ? nullptr : rows.data() + size,
+        count_only ? nullptr : cols.data() + size,
+        count_only ? nullptr : dist.data() + size,
+        counter.data(),
+        count_only ? 0 : capacity - size);
       CUDF_CHECK_CUDA(stream.value());
       unsigned long long emitted = 0;
       CUDF_CUDA_TRY(cudaMemcpyAsync(
         &emitted, counter.data(), sizeof(emitted), cudaMemcpyDeviceToHost, stream.value()));
       stream.synchronize();
-      if (size + emitted <= capacity) {
+      if (count_only || size + emitted <= capacity) {
         size += emitted;
         return;
       }
@@ -531,6 +534,9 @@ threshold_join_result gemm_threshold(raft::device_resources const& res,
       capacity = grown;
     }
   });
+  if (count_only) {
+    return threshold_join_result{nullptr, nullptr, nullptr, static_cast<int64_t>(size)};
+  }
   rows.resize(size, stream);
   cols.resize(size, stream);
   dist.resize(size, stream);

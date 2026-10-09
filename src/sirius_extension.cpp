@@ -3351,11 +3351,12 @@ static void SiriusPostOptimizeVectorJoin(OptimizerExtensionInput& input,
   if (!plan) { return; }
   // Plain-SQL vector joins become the operator only for a plan Sirius is about to run: never on a
   // CPU replan (fallback or an internal query), which has to stay a plan DuckDB can execute.
-  auto sirius_ctx = input.context.registered_state->Get<SiriusContext>("sirius_state");
-  auto conn_state = get_sirius_connection_state(input.context);
-  if (sirius_ctx && sirius_ctx->is_initialized() && conn_state &&
-      !conn_state->is_internal_query_active() && !conn_state->is_cpu_fallback_active() &&
-      sirius::vss::plan_has_vector_distance(*plan)) {
+  auto sirius_ctx     = input.context.registered_state->Get<SiriusContext>("sirius_state");
+  auto conn_state     = get_sirius_connection_state(input.context);
+  bool const gpu_plan = sirius_ctx && sirius_ctx->is_initialized() && conn_state &&
+                        !conn_state->is_internal_query_active() &&
+                        !conn_state->is_cpu_fallback_active();
+  if (gpu_plan && sirius::vss::plan_has_vector_distance(*plan)) {
     // A rewritten plan has no CPU form, so it stands only if Sirius will plan the rest of the
     // query as well; otherwise DuckDB's own plan is put back and runs as it always did.
     unique_ptr<LogicalOperator> original;
@@ -3387,6 +3388,8 @@ static void SiriusPostOptimizeVectorJoin(OptimizerExtensionInput& input,
       }
     }
   }
+  // After the rewrite, so that a plain-SQL count(*) over a threshold predicate is matched too.
+  if (gpu_plan) { sirius::vss::push_count_into_vector_joins(*plan); }
   stamp_vector_join_cardinality(input.context, *plan);
 }
 

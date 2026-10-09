@@ -2625,4 +2625,147 @@ std::size_t rewrite_plain_sql_vector_joins(duckdb::ClientContext& context,
   }
 }
 
+namespace {
+
+/// A bare count(*): no groups, no FILTER, not DISTINCT, nothing else computed beside it.
+bool is_bare_count_star(duckdb::LogicalAggregate const& agg)
+{
+  if (!agg.groups.empty() || !agg.grouping_functions.empty() || agg.expressions.size() != 1) {
+    return false;
+  }
+  for (auto const& set : agg.grouping_sets) {
+    if (!set.empty()) { return false; }
+  }
+  auto const& e = *agg.expressions[0];
+  if (e.GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) { return false; }
+  auto const& bound = e.Cast<duckdb::BoundAggregateExpression>();
+  return bound.function.name == "count_star" && bound.children.empty() && !bound.filter &&
+         !bound.order_bys && bound.aggr_type == duckdb::AggregateType::NON_DISTINCT;
+}
+
+// The aggregate that sums the per-batch counts. Sirius plans aggregates by name, and
+// sum_no_overflow is the one whose BIGINT input it sums without widening; DuckDB's own carries a
+// HUGEINT result and a bind callback that refuses callers, so the function is built here with the
+// count's BIGINT type. It never runs on the CPU: a plan Sirius cannot execute is re-planned from
+// the SQL without this pass, and these callbacks make that explicit rather than silent.
+[[noreturn]] void count_sum_cpu()
+{
+  throw duckdb::InternalException(
+    "sirius_knn_join: the pushed-down count of a vector join runs on the GPU only");
+}
+duckdb::idx_t count_sum_state_size(duckdb::AggregateFunction const&)
+{
+  return sizeof(std::int64_t);
+}
+void count_sum_initialize(duckdb::AggregateFunction const&, duckdb::data_ptr_t state)
+{
+  *reinterpret_cast<std::int64_t*>(state) = 0;
+}
+void count_sum_update(
+  duckdb::Vector[], duckdb::AggregateInputData&, duckdb::idx_t, duckdb::Vector&, duckdb::idx_t)
+{
+  count_sum_cpu();
+}
+void count_sum_combine(duckdb::Vector&, duckdb::Vector&, duckdb::AggregateInputData&, duckdb::idx_t)
+{
+  count_sum_cpu();
+}
+void count_sum_finalize(
+  duckdb::Vector&, duckdb::AggregateInputData&, duckdb::Vector&, duckdb::idx_t, duckdb::idx_t)
+{
+  count_sum_cpu();
+}
+// The transparent path copies a plan by serialization. A function without serialization
+// callbacks is re-bound on the way back, and sum_no_overflow's bind refuses that; with them, the
+// copy carries the BIGINT result type and binds nothing, as DuckDB's own deserializer of the
+// function does.
+void count_sum_serialize(duckdb::Serializer&,
+                         duckdb::optional_ptr<duckdb::FunctionData>,
+                         duckdb::AggregateFunction const&)
+{
+}
+duckdb::unique_ptr<duckdb::FunctionData> count_sum_deserialize(duckdb::Deserializer& deserializer,
+                                                               duckdb::AggregateFunction& function)
+{
+  function.SetReturnType(deserializer.Get<duckdb::LogicalType const&>());
+  return nullptr;
+}
+duckdb::AggregateFunction count_sum_function()
+{
+  duckdb::AggregateFunction f("sum_no_overflow",
+                              {duckdb::LogicalType::BIGINT},
+                              duckdb::LogicalType::BIGINT,
+                              count_sum_state_size,
+                              count_sum_initialize,
+                              count_sum_update,
+                              count_sum_combine,
+                              count_sum_finalize,
+                              duckdb::FunctionNullHandling::DEFAULT_NULL_HANDLING);
+  f.SetSerializeCallback(count_sum_serialize);
+  f.SetDeserializeCallback(count_sum_deserialize);
+  return f;
+}
+
+}  // namespace
+
+std::size_t push_count_into_vector_joins(LogicalOperator& plan)
+{
+  std::size_t n = 0;
+  for (auto& child : plan.children) {
+    if (child) { n += push_count_into_vector_joins(*child); }
+  }
+  if (plan.type != duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY ||
+      plan.children.size() != 1) {
+    return n;
+  }
+  auto& agg = plan.Cast<duckdb::LogicalAggregate>();
+  if (!is_bare_count_star(agg)) { return n; }
+  // A count(*) reads no column, so projections between it and the join carry nothing it
+  // needs: the plain-SQL rewrite leaves one that holds the replaced join's columns in place.
+  // They are stepped over here and dropped below.
+  auto* slot = &plan.children[0];
+  while ((*slot)->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION &&
+         (*slot)->children.size() == 1) {
+    slot = &(*slot)->children[0];
+  }
+  if ((*slot)->type != duckdb::LogicalOperatorType::LOGICAL_GET) { return n; }
+  auto& get = (*slot)->Cast<duckdb::LogicalGet>();
+  if (get.function.name != "sirius_knn_join" && get.function.name != "sirius_knn_join_rel") {
+    return n;
+  }
+  auto* bind = dynamic_cast<SiriusVectorJoinBindData*>(get.bind_data.get());
+  // A filter the planner pushed into the join would be applied to pairs that no longer exist,
+  // so any table filter keeps the pairs.
+  if (bind == nullptr || bind->req.mode != vector_join_mode::threshold || bind->req.count_only ||
+      !get.table_filters.filters.empty()) {
+    return n;
+  }
+  if (slot != &plan.children[0]) { plan.children[0] = std::move(*slot); }
+
+  // The join now returns one BIGINT per probe batch: the pairs that batch found.
+  get.returned_types = {duckdb::LogicalType::BIGINT};
+  get.names          = {"pairs"};
+  get.ClearColumnIds();
+  get.AddColumnId(0);
+  get.projection_ids.clear();
+  bind->req.count_only = true;
+
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  children.push_back(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+    duckdb::LogicalType::BIGINT, duckdb::ColumnBinding(get.table_index, 0)));
+  auto summed =
+    duckdb::make_uniq<duckdb::BoundAggregateExpression>(count_sum_function(),
+                                                        std::move(children),
+                                                        nullptr,
+                                                        nullptr,
+                                                        duckdb::AggregateType::NON_DISTINCT);
+  summed->alias      = agg.expressions[0]->alias;
+  agg.expressions[0] = std::move(summed);
+  // The operators above cache their types; the join's and the aggregate's just changed.
+  plan.ResolveOperatorTypes();
+  SIRIUS_LOG_INFO(
+    "[vector_join] count(*) pushed into the threshold join: it counts pairs and emits none");
+  return n + 1;
+}
+
 }  // namespace sirius::vss

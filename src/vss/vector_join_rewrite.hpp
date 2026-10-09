@@ -53,4 +53,9 @@ std::size_t rewrite_plain_sql_vector_joins(duckdb::ClientContext& context,
 /// Whether @p plan computes a vector distance anywhere: the only plans the rewrite can change.
 bool plan_has_vector_distance(duckdb::LogicalOperator& plan);
 
+/// `SELECT count(*)` directly over a threshold vector join: the join counts its pairs instead of
+/// producing them, and the aggregate sums the one count each probe batch returns. Returns how
+/// many joins were changed. For a plan Sirius is about to run, after the plain-SQL rewrite.
+std::size_t push_count_into_vector_joins(duckdb::LogicalOperator& plan);
+
 }  // namespace sirius::vss

@@ -92,6 +92,11 @@ struct vector_join_request {
   /// Whether anything reads the score. Set by the planner from the columns the query reads; a
   /// threshold join that no one reads the distance of only has to decide membership.
   bool score_read{true};
+  /// The statement only counts the pairs: `SELECT count(*)` directly over a threshold join. The
+  /// operator then counts inside the search and emits one BIGINT row per probe batch instead of
+  /// the pairs, which past a few hundred million would be written to host memory only to be
+  /// counted. Set by push_count_into_vector_joins; the planner then reads no column and no score.
+  bool count_only{false};
   /// Take the corpus from a child scan materialized by the build phase instead of from a
   /// pinned catalog table. Temporary A/B switch (`build_source => 'scan'`) while the build
   /// phase is verified against the pin path; the SQL surface that replaces it is the

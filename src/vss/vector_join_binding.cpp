@@ -350,6 +350,7 @@ void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
   serializer.WriteProperty(134, "predicate_ops", pred_ops);
   serializer.WriteProperty(135, "predicate_values", pred_values);
   serializer.WriteProperty(136, "probe_scalar", req.probe_scalar);
+  serializer.WriteProperty(137, "count_only", req.count_only);
   serializer.WriteProperty(140, "left_rows", data.left_rows);
   serializer.WriteProperty(141, "right_rows", data.right_rows);
   serializer.WriteProperty(142, "probe_is_relation", data.probe_is_relation);
@@ -388,6 +389,7 @@ duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
       {pred_columns[i], static_cast<corpus_predicate::op>(pred_ops[i]), pred_values[i]});
   }
   req.probe_scalar          = deserializer.ReadProperty<bool>(136, "probe_scalar");
+  req.count_only            = deserializer.ReadProperty<bool>(137, "count_only");
   result->left_rows         = deserializer.ReadProperty<std::uint64_t>(140, "left_rows");
   result->right_rows        = deserializer.ReadProperty<std::uint64_t>(141, "right_rows");
   result->probe_is_relation = deserializer.ReadProperty<bool>(142, "probe_is_relation");

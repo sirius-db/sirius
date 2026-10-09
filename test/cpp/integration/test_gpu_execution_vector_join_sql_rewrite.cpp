@@ -157,6 +157,65 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "count(*) over a threshold join is counted inside the join",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  SqlRewriteTables tables(*this);
+  // The aggregate directly over the join: the join counts, the aggregate sums the batches.
+  std::string const counted =
+    "SELECT count(*) FROM sr_probe p, sr_corpus c WHERE array_distance(p.vec, c.vec) <= 0.9;";
+  require_gpu_matches_duckdb(*con, counted);
+  REQUIRE(con->ExtractPlan(counted)->ToString().find("sum_no_overflow") != std::string::npos);
+  // The explicit call, a cosine threshold, against the same count on DuckDB.
+  std::string const called =
+    "SELECT count(*) FROM sirius_knn_join('sr_probe','vec','sr_corpus','vec', metric => "
+    "'cosine', join_mode => 'threshold', eps => 0.8);";
+  REQUIRE(con->ExtractPlan(called)->ToString().find("sum_no_overflow") != std::string::npos);
+  run_ok("SET gpu_execution = false;");
+  auto const expected = sorted_rows(*con,
+                                    "SELECT count(*) FROM sr_probe p, sr_corpus c "
+                                    "WHERE array_cosine_similarity(p.vec, c.vec) >= 0.8;");
+  run_ok("SET gpu_execution = true;");
+  auto const got = sorted_rows(*con, called);
+  REQUIRE(got == expected);
+  // Shapes the pushdown must leave alone still answer: a second aggregate, groups, a filter
+  // above the join.
+  require_gpu_matches_duckdb(*con,
+                             "SELECT count(*), min(array_distance(p.vec, c.vec)) FROM sr_probe "
+                             "p, sr_corpus c WHERE array_distance(p.vec, c.vec) <= 0.9;");
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.cat, count(*) FROM sr_probe p, sr_corpus c WHERE "
+                             "array_distance(p.vec, c.vec) <= 0.9 GROUP BY p.cat;");
+  std::string const filtered =
+    "SELECT count(*) FROM sr_probe p, sr_corpus c WHERE array_distance(p.vec, c.vec) <= 0.9 "
+    "AND p.id <> c.id;";
+  require_gpu_matches_duckdb(*con, filtered);
+  REQUIRE(con->ExtractPlan(filtered)->ToString().find("sum_no_overflow") == std::string::npos);
+  // Over the lists: the count equals the number of pairs the same approximate join returns.
+  run_ok("SET vector_join_probes = 2;");
+  auto const approx_rows = sorted_rows(
+    *con,
+    "SELECT p.id, c.id FROM sr_probe p, sr_corpus c WHERE array_distance(p.vec, c.vec) <= 0.9;");
+  auto const approx_count = sorted_rows(*con, counted);
+  run_ok("RESET vector_join_probes;");
+  REQUIRE(approx_count.size() == 1);
+  REQUIRE(approx_count[0][0] == std::to_string(approx_rows.size()));
+  // Enough probe rows for the kernel to score them in several tiles, so the count crosses tile
+  // boundaries (a 512 MB score tile holds 6 400 rows against this corpus).
+  run_ok(
+    "CREATE TABLE sr_probe_big AS SELECT i::INTEGER AS id, list_transform(range(8), lambda "
+    "d: ((hash(i * 100 + d + 31337) % 2000)::FLOAT / 1000.0 - 1.0))::FLOAT[8] AS vec FROM "
+    "range(15000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_probe_big', tier => 'gpu', format => 'duckdb');");
+  require_gpu_matches_duckdb(*con,
+                             "SELECT count(*) FROM sr_probe_big p, sr_corpus c WHERE "
+                             "array_distance(p.vec, c.vec) <= 1.2;");
+  con->Query("SELECT * FROM unpin_table('sr_probe_big');");
+  run_ok("DROP TABLE sr_probe_big;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "a range on the similarity or the distance runs as the vector join",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {

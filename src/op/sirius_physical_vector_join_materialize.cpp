@@ -582,6 +582,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
 
   auto const& input        = dynamic_cast<const partitioned_operator_data&>(input_data);
   auto const partition_idx = input.get_partition_idx().value_or(0);  // = left batch index
+  if (_request.count_only) {
+    // Each piece is one BIGINT row, the count, already what the aggregate above sums.
+    auto counts = input.get_data_batches();
+    const_cast<partitioned_operator_data&>(input).remove_read_only_lock();
+    return std::make_unique<pipelineable_operator_data>(std::move(counts));
+  }
   // The executor read-locked the pieces where they are. A piece the downgrade executor took to
   // disk has to be moved (exclusive lock) before it can be read, so this stage drops those locks
   // and takes its own per piece, restoring a disk-resident one to the host tier through the engine.

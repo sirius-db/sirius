@@ -602,11 +602,12 @@ vss::threshold_join_result threshold_search(raft::device_resources const& res,
                                             float eps,
                                             cuvs::distance::DistanceType metric,
                                             rmm::device_async_resource_ref mr,
-                                            std::int64_t min_gemm_rows = 0)
+                                            std::int64_t min_gemm_rows = 0,
+                                            bool count_only            = false)
 {
   return gemm_search_enabled() && vss::gemm_search_supports(metric) &&
              queries.extent(0) >= min_gemm_rows
-           ? vss::gemm_threshold(res, dataset, queries, eps, metric, mr)
+           ? vss::gemm_threshold(res, dataset, queries, eps, metric, mr, count_only)
            : vss::brute_force_threshold(res, dataset, queries, eps, metric, mr);
 }
 
@@ -1410,6 +1411,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // That is why this path accumulates ragged edge lists instead of a fixed-width block, and why
   // it has no k -- and therefore none of the k <= 1024 ceiling that knn_merge_parts imposes.
   bool const radius_join = _request.mode == vss::vector_join_mode::threshold;
+  // A count-only statement never sees the pairs: each part is counted and dropped, and the task
+  // ends with one BIGINT row, the count, in place of the edge lists and host pieces below.
+  bool const count_only = radius_join && _request.count_only;
   std::vector<std::unique_ptr<cudf::column>> radius_left, radius_neighbors, radius_distances;
   // A threshold's answer can outgrow the device. Once the pairs held on it (16 B each) pass a
   // budget they are closed into an output batch and moved to host memory, the way the downgrade
@@ -1486,14 +1490,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   auto note_radius_part = [&](std::int64_t pairs) {
     held_pairs += pairs;
     total_pairs += pairs;
-    if (total_pairs > max_pairs) {
+    if (!count_only && total_pairs > max_pairs) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] the pairs within the threshold reach " +
         std::to_string(total_pairs) + " for one probe batch, more than host and device memory " +
         "can hold as output (~" + std::to_string(max_pairs) + "); tighten the threshold or join " +
         "fewer probe rows at a time");
     }
-    if (host_space != nullptr && must_flush()) { flush_radius(); }
+    if (host_space != nullptr && !count_only && must_flush()) { flush_radius(); }
   };
   // The kernel works in distance space. For cosine with a similarity threshold the user's
   // "score >= eps" is the same set as "distance <= 1 - eps"; for a distance threshold it is eps
@@ -1945,12 +1949,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           mr);
         if (kept.rows.size() > 0) {
           auto const pairs = static_cast<std::int64_t>(kept.rows.size());
-          radius_left.push_back(
-            std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
-          radius_neighbors.push_back(
-            std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
-          radius_distances.push_back(
-            std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
+          if (!count_only) {
+            radius_left.push_back(
+              std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
+            radius_neighbors.push_back(
+              std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
+            radius_distances.push_back(
+              std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
+          }
           note_radius_part(pairs);
         }
         CUDF_CUDA_TRY(
@@ -2440,9 +2446,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             // Same construction as the exhaustive radius path: a slice's in-range pairs are
             // final when produced, so they are appended, never folded, and there is no k. The
             // kernel numbers query rows within the gathered matrix; rows_c maps them back.
-            auto edges =
-              threshold_search(res, slice_view, queries_view, search_radius, search_metric, mr);
-            if (edges.n_edges > 0) {
+            auto edges = threshold_search(
+              res, slice_view, queries_view, search_radius, search_metric, mr, 0, count_only);
+            if (count_only) {
+              note_radius_part(edges.n_edges);
+            } else if (edges.n_edges > 0) {
               auto left =
                 cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                           vss::column_size(edges.n_edges, "vector join threshold"),
@@ -2705,14 +2713,17 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         auto edges =
           searched.extent(0) == 0
             ? vss::threshold_join_result{nullptr, nullptr, nullptr, 0}
-            : threshold_search(res, searched, queries, radius_eps, metric, mr, kGemmMinProbeRows);
+            : threshold_search(
+                res, searched, queries, radius_eps, metric, mr, kGemmMinProbeRows, count_only);
         last_edge_bytes =
           static_cast<std::size_t>(edges.n_edges) * (2 * sizeof(std::int64_t) + sizeof(float));
         advance(j + 1);
         release_staged(staged);
         auto const chunk_base = offset;
         offset += batch_rows;
-        if (edges.n_edges > 0) {
+        if (count_only) {
+          note_radius_part(edges.n_edges);
+        } else if (edges.n_edges > 0) {
           if (kept) {
             auto mapped     = cudf::gather(cudf::table_view{{kept->row_ids->view()}},
                                        edges.neighbors->view(),
@@ -2791,6 +2802,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   if (nothing_searched && _right_total_rows > 0) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_stream] right table produced no rows to join against");
+  }
+
+  if (count_only) {
+    // One row, the pairs this probe batch found; the aggregate above sums the batches.
+    cudf::numeric_scalar<std::int64_t> const count(total_pairs, true, stream);
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(cudf::make_column_from_scalar(count, 1, stream, mr));
+    auto batch = sirius::make_data_batch(
+      std::make_unique<cudf::table>(std::move(cols)), *mem_space, stream, batch_telemetry());
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+    batches.push_back(std::move(batch));
+    return std::make_unique<partitioned_operator_data>(std::move(batches), left_idx);
   }
 
   vss::shaped_join_result shaped;
