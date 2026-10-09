@@ -679,6 +679,7 @@ TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager
     CHECK(cfg.uring.n_max_concurrent_scans == 0);
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
     CHECK(cfg.uring.slices_per_pass == 8);
+    CHECK(cfg.uring.range_batch_slices == 8);
     CHECK(cfg.uring.prefetch_reactors == 0);
     CHECK_FALSE(cfg.uring.prefetch_reactors_explicit);
   };
@@ -716,7 +717,22 @@ TEST_CASE("sirius_config rejects an out-of-range uring.slices_per_pass",
                      "free staging slot), got -1");
 }
 
-TEST_CASE("uring prefetch_reactors derives from the readahead and validates against the pool",
+TEST_CASE("sirius_config reads uring.range_batch_slices", "[scan_manager][config][uring]")
+{
+  for (std::size_t const value : {std::size_t{0}, std::size_t{1}, std::size_t{32}}) {
+    CAPTURE(value);
+    auto const cfg =
+      load_scan_manager("sirius_uring_range_batch_slices_" + std::to_string(value) + ".yaml",
+                        uring_yaml("        range_batch_slices: " + std::to_string(value) + "\n"));
+    CHECK(cfg.uring.range_batch_slices == value);
+    CHECK(cfg.to_io_config().uring.range_batch_slices == value);
+  }
+  require_load_error("sirius_uring_range_batch_slices_negative.yaml",
+                     uring_yaml("        range_batch_slices: -1\n"),
+                     "'uring.range_batch_slices': must be 0 or more (0 = no split), got -1");
+}
+
+TEST_CASE("uring prefetch_reactors is opt-in and validates against the pool",
           "[scan_manager][config][uring][prefetch_reactors]")
 {
   // `body` goes under scan_manager; `readahead` adds a cache and a uring budget.
@@ -734,35 +750,22 @@ TEST_CASE("uring prefetch_reactors derives from the readahead and validates agai
 
   CHECK(cucascade::io::uring::config{}.prefetch_reactors == 0);
 
-  SECTION("derived: 1 only when the uring readahead runs")
+  SECTION("stays 0 when omitted, even when the uring readahead runs")
   {
     auto const off =
       load_scan_manager("sirius_pr_off.yaml", yaml("      uring_n_reactors: 4\n", false));
     CHECK_FALSE(off.uring.prefetch_reactors_explicit);
     CHECK(off.uring.prefetch_reactors == 0);
 
-    // A cache but no uring budget: the local readahead stays off.
-    auto const cache_only =
-      load_scan_manager("sirius_pr_cache_only.yaml", yaml("      uring_n_reactors: 4\n", true));
-    CHECK(cache_only.uring.prefetch_reactors == 0);
-
+    // The reactors' priority queues keep demand ahead of prefetch, so the
+    // readahead no longer reserves a reactor.
     auto const on = load_scan_manager("sirius_pr_on.yaml", yaml(uring(budget), true));
     CHECK_FALSE(on.uring.prefetch_reactors_explicit);
-    CHECK(on.uring.prefetch_reactors == 1);
-    CHECK(on.to_io_config().uring.prefetch_reactors == 1);
-
-    // max_readahead_scans: 0 turns the readahead, and so the isolation, off.
-    auto const vetoed = load_scan_manager(
-      "sirius_pr_vetoed.yaml", yaml("      max_readahead_scans: 0\n" + uring(budget), true));
-    CHECK(vetoed.uring.prefetch_reactors == 0);
-
-    // A single reactor has none to spare.
-    auto const single = load_scan_manager(
-      "sirius_pr_single.yaml", yaml("      uring_n_reactors: 1\n" + uring(budget), true));
-    CHECK(single.uring.prefetch_reactors == 0);
+    CHECK(on.uring.prefetch_reactors == 0);
+    CHECK(on.to_io_config().uring.prefetch_reactors == 0);
   }
 
-  SECTION("explicit values win over the derivation")
+  SECTION("explicit values are kept")
   {
     auto const zero = load_scan_manager(
       "sirius_pr_zero.yaml", yaml(uring(budget + "        prefetch_reactors: 0\n"), true));

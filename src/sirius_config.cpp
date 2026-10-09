@@ -257,6 +257,19 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
     }
   }
   {
+    // Signed for the same reason.
+    std::optional<long long> batch;
+    r.optional("range_batch_slices", batch);
+    if (batch.has_value()) {
+      if (*batch < 0) {
+        throw std::runtime_error(
+          "'uring.range_batch_slices': must be 0 or more (0 = no split), got " +
+          std::to_string(*batch));
+      }
+      opt.range_batch_slices = static_cast<std::size_t>(*batch);
+    }
+  }
+  {
     // Signed for the same reason; the upper bound (below the reactor count) is
     // checked in finalize_derived_config, where uring_n_reactors is known.
     std::optional<long long> prefetch_reactors;
@@ -992,24 +1005,16 @@ void sirius_config::finalize_derived_config()
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
   enforce_native_backend_for_multi_gpu();
-  derive_uring_prefetch_reactors();
+  validate_uring_prefetch_reactors();
 }
 
-void sirius_config::derive_uring_prefetch_reactors()
+void sirius_config::validate_uring_prefetch_reactors()
 {
   auto& sm    = _scan_manager_config;
   auto& uring = sm.uring;
-  // Prefetch isolation only pays when there is prefetch traffic: without the
-  // readahead the reserved reactors would sit idle and demand would lose their
-  // bandwidth.  With it on, one reactor (~5 GB/s) is enough to keep the
-  // readahead ahead of the executor while demand reads never queue behind it;
-  // measured on TPC-H SF1000 local parquet with 4 reactors, 1 beats both 0 and 2.
-  if (!uring.prefetch_reactors_explicit) {
-    auto const readahead_runs = sm.resolve_readahead(uring.n_max_concurrent_scans,
-                                                     scan_manager::prefetch_strategy::opportunistic)
-                                  .budget > 0;
-    uring.prefetch_reactors = readahead_runs && sm.uring_n_reactors > 1 ? 1 : 0;
-  }
+  // No derived default: each uring reactor's two-tier queue keeps demand reads
+  // ahead of readahead prefetch (see cucascade::io::io_priority), so reserving a
+  // reactor for prefetch is an explicit opt-in only.
   if (uring.prefetch_reactors == 0) { return; }
   if (sm.uring_n_reactors == 1) {
     SIRIUS_LOG_WARN(

@@ -41,7 +41,7 @@ using queue_delay_stats = cucascade::io::uring::uring_reactor::queue_delay_stats
   }
 }
 
-// Queue delay of one io_class (d = demand, p = prefetch): count, sum/max in ms and the
+// Queue delay of one queue tier (h = high, l = low priority): count, sum/max in ms and the
 // non-empty log2-us histogram buckets as bucket:count (see queue_delay_stats).
 [[nodiscard]] std::string format_queue_delay(queue_delay_stats const& s, char const* tag)
 {
@@ -77,18 +77,21 @@ std::optional<std::string> format_gauges_line(std::size_t index,
   if (idle) { return std::nullopt; }
   return std::format(
     "[uring_gauges] reactor={} inflight={} max_inflight={} pending_ops={} "
-    "active_slices={} queued_requests={} queued_MiB={} started={} MiB_s={:.0f}{}{}",
+    "active_slices={} queued_requests={} queued_low={} queued_MiB={} started={} preemptions={} "
+    "MiB_s={:.0f}{}{}",
     index,
     g.inflight_ops,
     g.max_inflight_ops,
     g.pending_ops,
     g.active_remaining_slices,
     g.queued_requests,
+    g.queued_low_requests,
     g.queued_bytes >> 20,
     started,
+    previous != nullptr ? g.preemptions - previous->preemptions : std::uint64_t{0},
     seconds > 0 ? static_cast<double>(bytes) / static_cast<double>(1 << 20) / seconds : 0.0,
-    format_queue_delay(g.queue_delay[0], "d"),
-    format_queue_delay(g.queue_delay[1], "p"));
+    format_queue_delay(g.queue_delay[0], "h"),
+    format_queue_delay(g.queue_delay[1], "l"));
 }
 
 uring_gauges_sampler::uring_gauges_sampler(

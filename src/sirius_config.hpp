@@ -397,12 +397,11 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
-  /// Default @c _scan_manager_config.uring.prefetch_reactors to 1 when the
-  /// uring readahead will run (0 otherwise), then validate it against
-  /// @c uring_n_reactors: ignored with a warning for a single reactor, rejected
-  /// when it would leave no demand reactor. Called from
-  /// @ref finalize_derived_config; an explicit config value is never re-derived.
-  void derive_uring_prefetch_reactors();
+  /// Validate an explicit @c _scan_manager_config.uring.prefetch_reactors
+  /// against @c uring_n_reactors: ignored with a warning for a single reactor,
+  /// rejected when it would leave no demand reactor. It is never derived (it
+  /// stays 0 unless named). Called from @ref finalize_derived_config.
+  void validate_uring_prefetch_reactors();
 
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;

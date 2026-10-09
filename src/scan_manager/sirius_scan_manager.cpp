@@ -1381,9 +1381,10 @@ sirius_scan_manager::sirius_scan_manager(
     _io_ctx = make_default_ioctx(cucascade::io::io_context_type::uring);
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] default io context: uring n_reactors={} slices_per_pass={} "
-      "prefetch_reactors={}",
+      "range_batch_slices={} prefetch_reactors={}",
       _config.uring_n_reactors,
       _config.uring.slices_per_pass,
+      _config.uring.range_batch_slices,
       _config.uring.prefetch_reactors);
   } else {
     if (_topology_index->gpu_ids().size() > 1) {
