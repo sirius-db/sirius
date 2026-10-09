@@ -13,6 +13,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_certification_cost.cpp
     test/cpp/integration/test_transparent_verdicts.cpp
     test/cpp/compression/test_compression.cpp
+    test/cpp/config/test_c_api_config.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp

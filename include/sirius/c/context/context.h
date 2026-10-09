@@ -37,7 +37,7 @@ typedef struct sirius_context sirius_context;
  * sirius_error_destroy(error);
  * @endcode
  */
-SIRIUS_EXPORT sirius_status sirius_context_create(const sirius_config* config,
+SIRIUS_EXPORT sirius_status sirius_context_create(const sirius_context_config* config,
                                                   sirius_context** out_context,
                                                   sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Destroy an engine and release its resources. A null handle is allowed.

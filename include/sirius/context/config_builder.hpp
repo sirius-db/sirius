@@ -39,6 +39,12 @@ namespace sirius {
 /**
  * @brief Assemble a configuration using defaults or YAML.
  *
+ * @par Thread safety
+ * Objects may be transferred between threads, including for destruction.
+ * Const operations and copying may run concurrently while the source stays alive.
+ * Assignment and destruction require exclusive access to that object; separate
+ * copies may be used independently on different threads.
+ *
  * YAML settings take precedence over built-in defaults. Copies share immutable
  * settings and remain valid independently of the original builder.
  *
@@ -91,7 +97,7 @@ class ContextConfigBuilder {
   ContextConfigBuilder()
   {
     sirius_error* diagnostic = nullptr;
-    auto status              = sirius_config_builder_create(&handle_, &diagnostic);
+    auto status              = sirius_context_config_builder_create(&handle_, &diagnostic);
     if (status != SIRIUS_SUCCESS) {
       auto error = Error::from_c(status, diagnostic);
       if (error.code == ErrorCode::allocation_failure) { throw std::bad_alloc{}; }
@@ -109,7 +115,7 @@ class ContextConfigBuilder {
   /// @endcode
   ContextConfigBuilder(const ContextConfigBuilder& other) noexcept : handle_(other.handle_)
   {
-    sirius_config_builder_retain(handle_);
+    sirius_context_config_builder_retain(handle_);
   }
   /// Share another builder's immutable settings through this handle.
   ///
@@ -122,8 +128,8 @@ class ContextConfigBuilder {
   /// @endcode
   ContextConfigBuilder& operator=(const ContextConfigBuilder& other) noexcept
   {
-    sirius_config_builder_retain(other.handle_);
-    sirius_config_builder_release(handle_);
+    sirius_context_config_builder_retain(other.handle_);
+    sirius_context_config_builder_release(handle_);
     handle_ = other.handle_;
     return *this;
   }
@@ -137,7 +143,7 @@ class ContextConfigBuilder {
   ///   return builder.build();
   /// }(); // The configuration result outlives the builder.
   /// @endcode
-  ~ContextConfigBuilder() noexcept { sirius_config_builder_release(handle_); }
+  ~ContextConfigBuilder() noexcept { sirius_context_config_builder_release(handle_); }
 
   /**
    * @brief Read and validate a YAML file, retaining its contents for later builds.
@@ -187,11 +193,11 @@ class ContextConfigBuilder {
     const std::filesystem::path& path) noexcept
   {
     try {
-      auto bytes                      = path.string();
-      ::sirius_config_builder* handle = nullptr;
-      sirius_error* diagnostic        = nullptr;
+      auto bytes                              = path.string();
+      ::sirius_context_config_builder* handle = nullptr;
+      sirius_error* diagnostic                = nullptr;
       auto status =
-        sirius_config_builder_from_yaml(bytes.data(), bytes.size(), &handle, &diagnostic);
+        sirius_context_config_builder_from_yaml(bytes.data(), bytes.size(), &handle, &diagnostic);
       if (status != SIRIUS_SUCCESS) { return std::unexpected(Error::from_c(status, diagnostic)); }
       return ContextConfigBuilder(handle);
     } catch (const std::bad_alloc&) {
@@ -229,16 +235,18 @@ class ContextConfigBuilder {
    */
   [[nodiscard]] std::expected<ContextConfig, Error> build() const noexcept
   {
-    ::sirius_config* handle  = nullptr;
-    sirius_error* diagnostic = nullptr;
-    auto status              = sirius_config_builder_build(handle_, &handle, &diagnostic);
+    ::sirius_context_config* handle = nullptr;
+    sirius_error* diagnostic        = nullptr;
+    auto status = sirius_context_config_builder_build(handle_, &handle, &diagnostic);
     if (status != SIRIUS_SUCCESS) { return std::unexpected(Error::from_c(status, diagnostic)); }
     return ContextConfig(handle);
   }
 
  private:
-  explicit ContextConfigBuilder(::sirius_config_builder* handle) noexcept : handle_(handle) {}
-  ::sirius_config_builder* handle_ = nullptr;
+  explicit ContextConfigBuilder(::sirius_context_config_builder* handle) noexcept : handle_(handle)
+  {
+  }
+  ::sirius_context_config_builder* handle_ = nullptr;
 };
 
 }  // namespace sirius

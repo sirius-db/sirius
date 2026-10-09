@@ -9,7 +9,7 @@ struct sirius_context {
   duckdb::SiriusContext engine;
 };
 
-sirius_status sirius_context_create(const sirius_config* config,
+sirius_status sirius_context_create(const sirius_context_config* config,
                                     sirius_context** out,
                                     sirius_error** error) noexcept
 {

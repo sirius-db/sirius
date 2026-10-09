@@ -13,25 +13,25 @@ Create immutable configuration snapshots without accessing GPUs:
 
 int main(void)
 {
-    sirius_config_builder *builder = NULL;
-    sirius_config *config = NULL;
+    sirius_context_config_builder *builder = NULL;
+    sirius_context_config *config = NULL;
     sirius_error *error = NULL;
-    sirius_status status = sirius_config_builder_create(&builder, &error);
+    sirius_status status = sirius_context_config_builder_create(&builder, &error);
     if (status == SIRIUS_SUCCESS) {
-        status = sirius_config_builder_build(builder, &config, &error);
+        status = sirius_context_config_builder_build(builder, &config, &error);
     }
     if (status != SIRIUS_SUCCESS) {
         fprintf(stderr, "Sirius error %u: %s\n", (unsigned)status,
                 sirius_error_message(error));
     }
     sirius_error_destroy(error);
-    sirius_config_release(config);
-    sirius_config_builder_release(builder);
+    sirius_context_config_release(config);
+    sirius_context_config_builder_release(builder);
     return status == SIRIUS_SUCCESS ? 0 : 1;
 }
 ```
 
-Use sirius_config_builder_from_yaml() to load the
+Use sirius_context_config_builder_from_yaml() to load the
 [YAML configuration schema](https://github.com/sirius-db/sirius/blob/main/docs/super-sirius/configuration.md).
 The file is read once; builders and built configurations retain its settings independently.
 Hardware availability and capacity are checked when initializing an engine.
@@ -53,6 +53,8 @@ lifetime constraints.
   an owned diagnostic. Pass empty output slots; release previous results before reusing them.
 - Diagnostics are best effort. A nonzero status is a failure even if no message is available.
 - No C++ exception crosses the C interface. Treat unknown nonzero status codes as failures.
+- Immutable configuration handles support concurrent reads, builds, and ownership transfer
+  between threads. Keep a live reference throughout each call and give output slots exclusive access.
 - Keep borrowed handles alive for each call. Do not release a reference concurrently with its use.
 
 ## Compatibility
