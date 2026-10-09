@@ -65,8 +65,10 @@ target_link_libraries(
   ${CMAKE_DL_LIBS})
 
 target_include_directories(
-  sirius_unittest BEFORE PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/third_party
-                                 ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
+  sirius_unittest BEFORE
+  PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/src/include
+          ${SIRIUS_SUBSTRAIT_DIR}/third_party
+          ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
 # A fresh-process helper for NVTX startup tests. A shared test context can cache
 # domain handles and mask first-domain capture bugs.
