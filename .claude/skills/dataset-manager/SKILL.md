@@ -38,7 +38,7 @@ Each entry follows the same structure: script location, command template, suppor
 | Default output (parquet) | `test_datasets/tpch_parquet_sf<SF>` |
 | Default output (duckdb) | `test_datasets/tpch_sf<SF>.duckdb` |
 | Default output (duckdb + `--cluster`) | `test_datasets/tpch_sf<SF>_sorted.duckdb` |
-| Prerequisites | Parquet: pixi env (rust, python, pyarrow). DuckDB: `build/release/duckdb` + pixi env rust for tpchgen-rs (falls back to building the bundled classic dbgen) |
+| Prerequisites | Parquet: pixi env (rust, python, pyarrow). DuckDB: `sirius-duckdb/build/release/duckdb` + pixi env rust for tpchgen-rs (falls back to building the bundled classic dbgen) |
 
 ```bash
 cd test/tpch_performance && pixi run bash generate_tpch_data.sh <SF> --format <FORMAT> [--cluster] [--cluster-keys <spec>] [--output <path>]
@@ -61,7 +61,7 @@ Notes:
 | Formats | `duckdb`, `parquet` |
 | Default output (duckdb) | `test_datasets/tpcds_sf<SF>.duckdb` |
 | Default output (parquet) | `test_datasets/tpcds_parquet_sf<SF>` |
-| Prerequisites | `build/release/duckdb` |
+| Prerequisites | `sirius-duckdb/build/release/duckdb` |
 
 ```bash
 cd test/tpcds_performance && bash generate_tpcds_data.sh <SF> --format <FORMAT> [--output <path>]
@@ -74,7 +74,7 @@ Notes:
 
 For any benchmark that requires the DuckDB binary, check before running:
 ```bash
-test -x build/release/duckdb
+test -x sirius-duckdb/build/release/duckdb
 ```
 If missing, tell the user to build first: `pixi run make`
 

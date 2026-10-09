@@ -1,0 +1,13 @@
+{
+  global:
+    sirius_duckdb_cpp_init;
+    /* Keep the bundled exception runtime preemptible so DuckDB and Sirius
+       share the host's runtime when available. Hiding these symbols would
+       isolate exception state when exceptions cross the library boundary. */
+    __cxa_*;
+    __gxx_personality_v0;
+    InitializeInjectionNvtx2;
+    dlopen;
+  local:
+    *;
+};

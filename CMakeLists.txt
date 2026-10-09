@@ -66,7 +66,7 @@ else()
   )
 endif()
 
-if(SIRIUS_BUILD_TESTS OR NOT PROJECT_IS_TOP_LEVEL)
+if(SIRIUS_BUILD_TESTS)
   include(cmake/sirius-test-sources.cmake)
   include(cmake/sirius-tests.cmake)
 endif()

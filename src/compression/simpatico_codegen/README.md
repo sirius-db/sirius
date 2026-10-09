@@ -19,7 +19,7 @@ Simpatico is built and tested as part of Sirius. From the Sirius repository root
 ```bash
 git submodule update --init --recursive
 pixi run make
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[compression]"
+pixi run build/release/test/cpp/sirius_unittest "[compression]"
 ```
 
 On CUDA 12 systems, add `-e cuda12` to each `pixi run` command and use `pixi shell -e cuda12` instead of `pixi shell`.
