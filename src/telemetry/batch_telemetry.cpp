@@ -177,15 +177,23 @@ batch_telemetry_registry& batch_telemetry_registry::instance()
   return registry;
 }
 
-void batch_telemetry_registry::install(
+bool batch_telemetry_registry::install(
   std::shared_ptr<const telemetry_context> context,
   sirius::memory::sirius_memory_reservation_manager& memory_manager)
 {
-  if (!context) { return; }
+  if (!context) { return false; }
   if (impl_->enabled.load(std::memory_order_acquire)) {
     SIRIUS_LOG_WARN("batch_telemetry_registry::install: already installed; ignoring.");
-    return;
+    return false;
   }
+  struct install_guard {
+    batch_telemetry_registry* registry;
+    bool committed = false;
+    ~install_guard()
+    {
+      if (!committed) { registry->uninstall(); }
+    }
+  } rollback{this};
   impl_->context = std::move(context);
 
   auto declare_tier =
@@ -219,17 +227,32 @@ void batch_telemetry_registry::install(
 
   impl_->enabled.store(true, std::memory_order_release);
   SIRIUS_LOG_INFO("Batch telemetry installed ({} tier resources).", impl_->tier_handles.size());
+  rollback.committed = true;
+  return true;
 }
 
-void batch_telemetry_registry::uninstall()
+void batch_telemetry_registry::uninstall() noexcept
 {
-  if (!impl_->enabled.exchange(false, std::memory_order_acq_rel)) { return; }
+  // Also clean up a partial install, which has not enabled event recording yet.
+  impl_->enabled.store(false, std::memory_order_release);
+  // Export failures must not retain a context or prevent allocator teardown.
+  auto emit = [](auto&& action) noexcept {
+    try {
+      action();
+    } catch (...) {
+    }
+  };
 
   for (auto& shard : impl_->shards) {
     std::lock_guard lock(shard.mutex);
     for (auto& [batch_id, placements] : shard.placements) {
       for (auto& p : placements) {
-        impl_->consume(p, batch_consumed_reason::query_end);
+        emit([&] {
+          p.handle->batch_consumed(
+            {.instance_name = "",
+             .reason        = std::string(to_string_view(batch_consumed_reason::query_end))});
+        });
+        emit([&] { p.handle->exit(); });
       }
     }
     shard.placements.clear();
@@ -239,8 +262,8 @@ void batch_telemetry_registry::uninstall()
     impl_->ports.clear();
   }
   for (auto& handle : impl_->tier_handles) {
-    handle->finalizing();
-    handle->exit();
+    emit([&] { handle->finalizing(); });
+    emit([&] { handle->exit(); });
   }
   impl_->tier_handles.clear();
   impl_->tier_resources.clear();

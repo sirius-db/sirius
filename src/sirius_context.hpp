@@ -872,7 +872,10 @@ class SiriusContext : public ClientContextState {
   /// 32-bit to match sirius::query_id_t, which task_creator packs into the scheduling
   /// priority. The first window gets id 1, so 0 is never a live query id.
   std::atomic<std::uint32_t> next_window_id_{0};
-  bool is_initialized_ = false;
+  void release_resources() noexcept;
+
+  bool is_initialized_            = false;
+  bool batch_telemetry_installed_ = false;
   sirius::sirius_config config_;
   // Holds LIBCUDF_HW_DECOMPRESSION=ON while the context is initialized, when
   // operator_params.use_hw_decompression is set and every GPU's CUDA driver

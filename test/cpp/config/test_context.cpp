@@ -42,6 +42,7 @@
 #include <duckdb/main/client_config.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <array>
@@ -2389,4 +2390,23 @@ TEST_CASE("Sirius configuration enables dense count join by default and accepts 
     Catch::Matchers::ContainsSubstring("sirius.operator_params.dense_count_join_max_bytes") &&
       Catch::Matchers::ContainsSubstring("internal engine policy") &&
       Catch::Matchers::ContainsSubstring("remove this key"));
+}
+
+TEST_CASE("failed initialization releases a newly installed converter registry",
+          "[sirius][context][public_context][isolated_context]")
+{
+  sirius::converter_registry::reset_for_testing();
+  finally restore_registry{[] { sirius::converter_registry::initialize(); }};
+  auto root = YAML::LoadFile(
+    (fs::path(__FILE__).parent_path() / "data" / "init_failure_pinned_rollback.yaml").string());
+  root["sirius"]["executor"]["downgrade"]["copy_chunk_bytes"] = "2Mi";
+  auto config = sirius::parsed_sirius_config::from_node(root);
+  duckdb::SiriusContext engine;
+  REQUIRE_THROWS(engine.initialize(config));
+  CHECK_FALSE(sirius::converter_registry::is_initialized());
+
+  // Reuse the same engine object with a different converter configuration.
+  root["sirius"]["executor"]["scan_manager"]["uring_n_reactors"] = 1;
+  root["sirius"]["executor"]["downgrade"]["copy_chunk_bytes"]    = "1Gi";
+  REQUIRE_NOTHROW(engine.initialize(sirius::parsed_sirius_config::from_node(root)));
 }

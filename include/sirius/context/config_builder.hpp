@@ -25,18 +25,25 @@
 
 #pragma once
 
+#include <sirius/c/context/config_builder.h>
 #include <sirius/context/config.hpp>
 #include <sirius/error.hpp>
-#include <sirius/export.hpp>
 
 #include <expected>
 #include <filesystem>
-#include <memory>
+#include <new>
+#include <stdexcept>
 
 namespace sirius {
 
 /**
  * @brief Assemble a configuration using defaults or YAML.
+ *
+ * @par Thread safety
+ * Objects may be transferred between threads, including for destruction.
+ * Const operations and copying may run concurrently while the source stays alive.
+ * Assignment and destruction require exclusive access to that object; separate
+ * copies may be used independently on different threads.
  *
  * YAML settings take precedence over built-in defaults. Copies share immutable
  * settings and remain valid independently of the original builder.
@@ -44,7 +51,8 @@ namespace sirius {
  * from_yaml() and build() validate settings without hardware access. They can be
  * used on machines without GPUs. GPU availability and capacity are checked during
  * context creation. Ordinary configuration failures are returned as Error values;
- * allocation failures may throw std::bad_alloc.
+ * allocation failures in from_yaml() and build() return ErrorCode::allocation_failure.
+ * Constructing a default builder may throw std::bad_alloc.
  *
  * Create a configuration from defaults:
  * @code{.cpp}
@@ -74,10 +82,11 @@ namespace sirius {
  * }
  * @endcode
  */
-class SIRIUS_EXPORT ContextConfigBuilder {
+class ContextConfigBuilder {
  public:
   /// Start with built-in defaults. Hardware resolution is deferred to context creation.
   /// @throws std::bad_alloc if builder storage cannot be allocated.
+  /// @throws std::runtime_error for an unexpected implementation failure.
   ///
   /// @code{.cpp}
   /// #include <sirius/context/config_builder.hpp>
@@ -85,7 +94,16 @@ class SIRIUS_EXPORT ContextConfigBuilder {
   /// sirius::ContextConfigBuilder builder;
   /// auto config = builder.build();
   /// @endcode
-  ContextConfigBuilder();
+  ContextConfigBuilder()
+  {
+    sirius_error* diagnostic = nullptr;
+    auto status              = sirius_context_config_builder_create(&handle_, &diagnostic);
+    if (status != SIRIUS_SUCCESS) {
+      auto error = Error::from_c(status, diagnostic);
+      if (error.code == ErrorCode::allocation_failure) { throw std::bad_alloc{}; }
+      throw std::runtime_error(error.message);
+    }
+  }
   /// Share the current immutable settings with another builder.
   ///
   /// @code{.cpp}
@@ -95,8 +113,11 @@ class SIRIUS_EXPORT ContextConfigBuilder {
   /// sirius::ContextConfigBuilder copy = original;
   /// auto config = copy.build();
   /// @endcode
-  ContextConfigBuilder(const ContextConfigBuilder&) noexcept;
-  /// Replace this builder's settings with an independent copy of another's.
+  ContextConfigBuilder(const ContextConfigBuilder& other) noexcept : handle_(other.handle_)
+  {
+    sirius_context_config_builder_retain(handle_);
+  }
+  /// Share another builder's immutable settings through this handle.
   ///
   /// @code{.cpp}
   /// #include <sirius/context/config_builder.hpp>
@@ -105,7 +126,13 @@ class SIRIUS_EXPORT ContextConfigBuilder {
   /// sirius::ContextConfigBuilder builder;
   /// builder = defaults; // Replace the settings with the defaults.
   /// @endcode
-  ContextConfigBuilder& operator=(const ContextConfigBuilder&) noexcept;
+  ContextConfigBuilder& operator=(const ContextConfigBuilder& other) noexcept
+  {
+    sirius_context_config_builder_retain(other.handle_);
+    sirius_context_config_builder_release(handle_);
+    handle_ = other.handle_;
+    return *this;
+  }
   /// Release the builder without affecting configurations already built from it.
   ///
   /// @code{.cpp}
@@ -116,7 +143,7 @@ class SIRIUS_EXPORT ContextConfigBuilder {
   ///   return builder.build();
   /// }(); // The configuration result outlives the builder.
   /// @endcode
-  ~ContextConfigBuilder() noexcept;
+  ~ContextConfigBuilder() noexcept { sirius_context_config_builder_release(handle_); }
 
   /**
    * @brief Read and validate a YAML file, retaining its contents for later builds.
@@ -149,8 +176,9 @@ class SIRIUS_EXPORT ContextConfigBuilder {
    * @param path Configuration file to read; relative paths use the working directory.
    * @return A builder on success, otherwise an Error with code
    *         ErrorCode::configuration_io, ErrorCode::malformed_yaml,
-   *         or ErrorCode::invalid_configuration.
-   * @throws std::bad_alloc if allocation fails.
+   *         ErrorCode::invalid_configuration, ErrorCode::invalid_argument,
+   *         ErrorCode::allocation_failure, or ErrorCode::internal_error.
+   * Allocation failures are returned as ErrorCode::allocation_failure.
    *
    * @code{.cpp}
    * #include <sirius/context/config_builder.hpp>
@@ -162,7 +190,24 @@ class SIRIUS_EXPORT ContextConfigBuilder {
    * @endcode
    */
   [[nodiscard]] static std::expected<ContextConfigBuilder, Error> from_yaml(
-    const std::filesystem::path& path);
+    const std::filesystem::path& path) noexcept
+  {
+    try {
+      auto bytes                              = path.string();
+      ::sirius_context_config_builder* handle = nullptr;
+      sirius_error* diagnostic                = nullptr;
+      auto status =
+        sirius_context_config_builder_from_yaml(bytes.data(), bytes.size(), &handle, &diagnostic);
+      if (status != SIRIUS_SUCCESS) { return std::unexpected(Error::from_c(status, diagnostic)); }
+      return ContextConfigBuilder(handle);
+    } catch (const std::bad_alloc&) {
+      return std::unexpected(Error{ErrorCode::allocation_failure, {}});
+    } catch (const std::filesystem::filesystem_error&) {
+      return std::unexpected(Error{ErrorCode::invalid_argument, {}});
+    } catch (...) {
+      return std::unexpected(Error{ErrorCode::internal_error, {}});
+    }
+  }
 
   /**
    * @brief Produce an immutable snapshot of the validated settings.
@@ -176,7 +221,7 @@ class SIRIUS_EXPORT ContextConfigBuilder {
    * leaves the builder unchanged.
    *
    * @return A valid ContextConfig. Settings are validated when loaded.
-   * @throws std::bad_alloc if allocation fails.
+   * Allocation failures are returned as ErrorCode::allocation_failure.
    *
    * @code{.cpp}
    * #include <sirius/context/config_builder.hpp>
@@ -188,12 +233,20 @@ class SIRIUS_EXPORT ContextConfigBuilder {
    * }
    * @endcode
    */
-  [[nodiscard]] std::expected<ContextConfig, Error> build() const;
+  [[nodiscard]] std::expected<ContextConfig, Error> build() const noexcept
+  {
+    ::sirius_context_config* handle = nullptr;
+    sirius_error* diagnostic        = nullptr;
+    auto status = sirius_context_config_builder_build(handle_, &handle, &diagnostic);
+    if (status != SIRIUS_SUCCESS) { return std::unexpected(Error::from_c(status, diagnostic)); }
+    return ContextConfig(handle);
+  }
 
  private:
-  struct Impl;
-  explicit ContextConfigBuilder(std::shared_ptr<const Impl> impl);
-  std::shared_ptr<const Impl> impl_;
+  explicit ContextConfigBuilder(::sirius_context_config_builder* handle) noexcept : handle_(handle)
+  {
+  }
+  ::sirius_context_config_builder* handle_ = nullptr;
 };
 
 }  // namespace sirius

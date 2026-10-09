@@ -20,6 +20,8 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -344,4 +346,42 @@ TEST_CASE("bounded_thread_pool concurrent producers all tasks execute", "[bounde
 
   pool.wait_all();
   REQUIRE(counter.load() == num_threads * tasks_each);
+}
+
+TEST_CASE("bounded_thread_pool propagates initialization failures after joining workers",
+          "[bounded_thread_pool]")
+{
+  std::atomic<int> initialized{0};
+  std::atomic<int> exited{0};
+  struct exit_counter {
+    std::atomic<int>& count;
+    ~exit_counter() { ++count; }
+  };
+  auto initialize = [&](bool allocation_failure) {
+    thread_local exit_counter on_exit{exited};
+    if (initialized.fetch_add(1) == 0) {
+      if (allocation_failure) { throw std::bad_alloc{}; }
+      throw std::runtime_error("worker initialization failed");
+    }
+  };
+
+  SECTION("allocation failure")
+  {
+    REQUIRE_THROWS_AS(bounded_thread_pool(4, "test", {}, [&] { initialize(true); }),
+                      std::bad_alloc);
+  }
+  SECTION("other initialization failure")
+  {
+    REQUIRE_THROWS_AS(bounded_thread_pool(4, "test", {}, [&] { initialize(false); }),
+                      std::runtime_error);
+  }
+  CHECK(initialized.load() == 4);
+  CHECK(exited.load() == 4);
+
+  // A failed pool leaves no workers behind and does not prevent a fresh pool.
+  {
+    bounded_thread_pool retry(4, "test", {}, [&] { initialize(false); });
+  }
+  CHECK(initialized.load() == 8);
+  CHECK(exited.load() == 8);
 }

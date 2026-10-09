@@ -149,7 +149,7 @@ class itask_executor {
    * returns nullptr (no per-thread init). Override to set the CUDA device or
    * perform other per-thread setup.
    */
-  virtual sirius::exec::invocable<void() noexcept> get_per_thread_init() { return nullptr; }
+  virtual sirius::exec::invocable<void()> get_per_thread_init() { return nullptr; }
 
   /**
    * @brief Called from start() after the manager thread is launched.

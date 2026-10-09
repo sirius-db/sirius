@@ -5,11 +5,13 @@
 # See the LICENSE file at the repo root for the full text.
 """Run the Sirius C++ unit tests.
 
-The run has three steps:
+The run has four steps:
 
   shards     Two Catch2 shards per visible GPU, run in parallel. Each shard sees
-             one GPU and uses integration-shard.yaml. [multi_gpu] and hidden
-             tests are excluded.
+             one GPU and uses integration-shard.yaml. [multi_gpu],
+             [public_context], and hidden tests are excluded.
+  context    The [public_context] lifecycle tests run alone because default
+             contexts reserve most of each GPU's memory.
   multi_gpu  The [multi_gpu] tests with all GPUs visible. Skipped when fewer
              than two GPUs are visible.
   late_mat   The late-materialization tests with SIRIUS_EXP_LATE_MAT=1. The
@@ -39,13 +41,14 @@ from typing import NamedTuple
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UNITTEST_DIR = Path("extension/sirius/test/cpp")
 SHARD_CONFIG = REPO_ROOT / "test/cpp/integration/integration-shard.yaml"
-STEPS = ("shards", "multi_gpu", "late_mat")
+STEPS = ("shards", "context", "multi_gpu", "late_mat")
 STEP_SPECS = {
-    "shards": "~[.]~[multi_gpu]",
+    "shards": "~[.]~[multi_gpu]~[public_context]",
+    "context": "[public_context]~[.]",
     "multi_gpu": "[multi_gpu]~[.]",
     "late_mat": "[late_mat],[deferred_query],[native_filter]",
 }
-TIMEOUT_MIN = {"shards": 45, "multi_gpu": 20, "late_mat": 20}
+TIMEOUT_MIN = {"shards": 45, "context": 20, "multi_gpu": 20, "late_mat": 20}
 SUMMARY_PREFIXES = ("All tests passed", "test cases:", "No tests ran")
 
 _print_lock = threading.Lock()
@@ -224,7 +227,7 @@ def main() -> int:
                     )
                     for i in range(count)
                 ]
-            case "multi_gpu":
+            case "context" | "multi_gpu":
                 jobs = [Job(label=step, cmd=cmd, env={}, log_dir=log_root / step)]
             case "late_mat":
                 jobs = [

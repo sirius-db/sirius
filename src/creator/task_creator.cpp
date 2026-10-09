@@ -396,11 +396,13 @@ void task_creator::do_stop_thread_pool()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _bounded_pool->interrupt();
+  if (_bounded_pool) { _bounded_pool->interrupt(); }
   _task_creation_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _bounded_pool->wait_all();
-  _bounded_pool->stop();
+  if (_bounded_pool) {
+    _bounded_pool->wait_all();
+    _bounded_pool->stop();
+  }
   _bounded_pool.reset();
 }
 

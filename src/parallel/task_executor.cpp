@@ -80,12 +80,14 @@ void itask_executor::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _bounded_pool->interrupt();
+  if (_bounded_pool) { _bounded_pool->interrupt(); }
   _task_queue.interrupt();
   on_stop();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _bounded_pool->wait_all();
-  _bounded_pool->stop();
+  if (_bounded_pool) {
+    _bounded_pool->wait_all();
+    _bounded_pool->stop();
+  }
   _bounded_pool.reset();
   on_stopped();
 }
