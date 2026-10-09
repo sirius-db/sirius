@@ -3215,7 +3215,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   add_sirius_option(config,
                     option_visibility::internal,
                     "sirius_test_sync_cpu_replay",
-                    "wait at the CPU replay test rendezvous after this window releases its slot",
+                    "wait at the CPU replay test rendezvous before a CPU plan runs",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(false));
   add_sirius_option(config,

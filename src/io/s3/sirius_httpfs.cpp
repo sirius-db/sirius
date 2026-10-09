@@ -47,10 +47,11 @@ namespace {
 constexpr std::string_view kScheme = "s3://";
 
 /// FileHandle backed by a sirius_datasource resolved through the
-/// scan_manager's create_datasource(path) seam — the datasource carries its
-/// io backend, io_object and any cached metadata, and its host_read goes
-/// through the prefetch-cache-integrated path. Holds shared ownership so the
-/// backend outlives the handle. @c cursor_ only serves the sequential
+/// scan_manager's open_datasource_on seam — the datasource carries its io
+/// backend, io_object and any cached metadata; its host_read goes through the
+/// prefetching cache for GPU-path opens and straight to the backend for
+/// CPU-path opens (see datasource_cache_mode_for). Holds shared ownership so
+/// the backend outlives the handle. @c cursor_ only serves the sequential
 /// @c Read/Seek bookkeeping; the parquet reader uses positional reads.
 class sirius_httpfs_file_handle : public duckdb::FileHandle {
  public:
@@ -154,6 +155,16 @@ std::shared_ptr<sirius::io::ioctx> route_for_open(gated_access const& access,
                               "(scan_manager.backend = sirius)");
   }
   return io_ctx;
+}
+
+/// A CPU consumer's datasource bypasses the prefetching cache: it runs outside
+/// the GPU execution window, so a reset_sirius_cache() concurrent with its
+/// reads could replace the cache instance under it.  GPU-path opens (the
+/// binder's footer read for a GPU scan, the scan itself) keep today's cache use.
+sirius::io::datasource_cache_mode datasource_cache_mode_for(gated_access const& access)
+{
+  return access.cpu_path ? sirius::io::datasource_cache_mode::bypass_cache
+                         : sirius::io::datasource_cache_mode::use_cache;
 }
 
 /// The LIST-provided size Glob attaches ("file_size", duckdb-httpfs convention).
@@ -278,8 +289,11 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   auto s3_config = resolve_duckdb_s3_secret(
     *client, path, sirius_ctx->get_config().get_scan_manager_config().object_store);
   sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
-  auto datasource = sirius_ctx->get_scan_manager().open_datasource_on(
-    route_for_open(access, path, "reading"), path);
+  auto datasource =
+    sirius_ctx->get_scan_manager().open_datasource_on(route_for_open(access, path, "reading"),
+                                                      path,
+                                                      sirius::io::open_hint::generic,
+                                                      datasource_cache_mode_for(access));
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + path + "'");
   }
@@ -313,7 +327,8 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
   auto datasource =
     sirius_ctx->get_scan_manager().open_datasource_on(route_for_open(access, file.path, "reading"),
                                                       file.path,
-                                                      sirius::io::open_hint::parquet_footer_probe);
+                                                      sirius::io::open_hint::parquet_footer_probe,
+                                                      datasource_cache_mode_for(access));
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + file.path + "'");
   }

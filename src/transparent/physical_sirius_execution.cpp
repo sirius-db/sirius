@@ -194,7 +194,10 @@ void PhysicalSiriusExecution::execute_cpu_only(duckdb::ExecutionContext& context
     "Transparent execution: GPU planning declined; running the CPU plan under "
     "the S3 CPU fallback admission. Reason: {}",
     reason);
-  if (state.sirius_context) { state.sirius_context->record_cpu_only_execution(); }
+  if (state.sirius_context) {
+    state.sirius_context->record_cpu_only_execution();
+    state.sirius_context->before_cpu_replay_for_testing(client);
+  }
   duckdb::SiriusContext::CpuFallbackGuard fallback_guard(client, decision);
   state.result = run_cpu_fallback_plan(client, *cpu_fallback_prepared_, state.cpu_executor);
 }

@@ -1,8 +1,10 @@
+#include "io/cache/prefetching_cache.hpp"
 #include "io/object_store_config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "util/env_guard.hpp"
+#include "utils/cache_bypass_test_utils.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
 #include "utils/parquet_fixture_utils.hpp"
@@ -18,6 +20,10 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
+#include <optional>
+#include <regex>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -726,4 +732,265 @@ TEST_CASE("C1 publication failure restores the local CPU plan",
 {
   if (!enter_case()) { return; }
   check_publication_failure(false, false);
+}
+
+namespace {
+bool enter_c3_case(bool cached = true)
+{
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
+    return false;
+  }
+  auto const name   = Catch::getResultCapture().getCurrentTestName();
+  auto const* child = std::getenv("SIRIUS_NATIVE_LEASE_CHILD_CASE");
+  if (child && name == child) { return true; }
+  sirius::test::scratch_dir dir("c3_config");
+  std::ifstream input(sirius::test::integration_config_path());
+  REQUIRE(input.good());
+  std::string config{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+  auto const position = config.find("  executor:\n");
+  REQUIRE(position != std::string::npos);
+  config.insert(
+    position + std::string("  executor:\n").size(),
+    std::string("    scan_manager:\n      backend: sirius\n      cache:\n        mode: ") +
+      (cached ? "sirius" : "none") +
+      "\n        eviction: lru\n      rest:\n        request_timeout_s: 30\n");
+  auto const path = dir.file("config.yaml");
+  {
+    std::ofstream output(path);
+    output << config;
+    REQUIRE(output.good());
+  }
+  sirius::util::env_guard child_config("SIRIUS_TEST_SHARED_CONFIG_OVERRIDE", path);
+  auto result = sirius::test::run_test_child(name);
+  std::cout << result.output;
+  INFO(result.output);
+  REQUIRE_FALSE(result.timed_out);
+  REQUIRE(result.signal == -1);
+  REQUIRE(result.exit_code == 0);
+  return false;
+}
+
+struct c3_cache_sample {
+  std::uint64_t hits   = 0;
+  std::uint64_t loads  = 0;
+  std::uint64_t misses = 0;
+  std::string text;
+};
+
+c3_cache_sample sample_c3_cache(sirius::io::ioctx& context, bool cached)
+{
+  auto* cache = context.cache();
+  if (!cached) {
+    if (cache) { throw std::runtime_error("C3 no-cache control unexpectedly has a cache"); }
+    return {0, 0, 0, "cache=none"};
+  }
+  if (!cache) { throw std::runtime_error("C3 fixture did not initialize its routed cache"); }
+  if (cache->chunk_size() != (1U << 20)) {
+    throw std::runtime_error("C3 fixture requires a 1 MiB cache chunk");
+  }
+  auto summary = cache->summary();
+  static std::regex const fields{
+    R"(global\[reads=\d+ hits=(\d+) h2d=(\d+) miss=(\d+) evictions=\d+\])"};
+  std::smatch match;
+  if (!std::regex_search(summary, match, fields)) {
+    throw std::runtime_error("C3 cache summary did not contain the required global counters");
+  }
+  return {std::stoull(match[1].str()),
+          std::stoull(match[2].str()),
+          std::stoull(match[3].str()),
+          std::move(summary)};
+}
+
+struct c3_hook_cleanup {
+  fixture& f;
+  bool armed;
+  ~c3_hook_cleanup()
+  {
+    if (!armed) { return; }
+    try {
+      f.con.Query("SET sirius_test_sync_cpu_replay=false");
+    } catch (...) {
+    }
+    f.context->cpu_replay_hook_for_testing = {};
+  }
+};
+
+enum class c3_entry { literal, glob, a1, a2, a3 };
+
+void check_c3_cpu_read(c3_entry entry, bool cached = true)
+{
+  fixture f;
+  f.enable();
+  query_ok(f.con, "SET threads=1");
+  auto const uri    = "s3://" + f.bucket + "/parquet/nation.parquet";
+  bool const replay = entry == c3_entry::a1 || entry == c3_entry::a2 || entry == c3_entry::a3;
+  bool const window = entry == c3_entry::a2 || entry == c3_entry::a3;
+  auto sql          = window ? f.window(true) : f.rows(true);
+  if (entry == c3_entry::glob) {
+    sql = "SELECT n_nationkey, n_name FROM read_parquet(" +
+          sql_quote("s3://" + f.bucket + "/parquet/nation*.parquet") + ") ORDER BY n_nationkey";
+  }
+  if (entry == c3_entry::a3) { sql = "SELECT * FROM gpu_execution(" + sql_quote(sql) + ")"; }
+  if (!replay) { query_ok(f.con, "SET gpu_execution=false"); }
+  if (entry == c3_entry::a1) {
+    query_ok(f.con, "SET sirius_test_inject_transparent_gpu_error='c3 runtime replay probe'");
+  }
+  auto expected = query_ok(f.reference, window ? f.window(false) : f.rows(false));
+  auto& manager = f.context->get_scan_manager();
+  std::mutex observation_mutex;
+  std::optional<c3_cache_sample> before;
+  std::shared_ptr<sirius::io::ioctx> observed_context;
+  unsigned hook_calls = 0;
+  auto capture        = [&](bool from_hook) {
+    auto context = manager.ioctx_for_path(uri);
+    if (!context || context->type() != sirius::io::io_context_type::restful) {
+      throw std::runtime_error("C3 fixture did not select the REST ioctx");
+    }
+    auto counters = sample_c3_cache(*context, cached);
+    std::lock_guard lock(observation_mutex);
+    if (from_hook) { ++hook_calls; }
+    before           = std::move(counters);
+    observed_context = std::move(context);
+  };
+  c3_hook_cleanup cleanup{f, replay};
+  if (replay) {
+    f.context->cpu_replay_hook_for_testing = [&] { capture(true); };
+    query_ok(f.con, "SET sirius_test_sync_cpu_replay=true");
+  } else {
+    capture(false);
+  }
+  auto const stats_before = f.context->get_transparent_execution_stats();
+  auto const cpu_before   = f.context->cpu_only_executions();
+  auto result             = query_ok(f.con, sql);
+  REQUIRE(sirius::test::collect_rows(*result, false) ==
+          sirius::test::collect_rows(*expected, false));
+  auto const stats_after = f.context->get_transparent_execution_stats();
+  if (entry == c3_entry::a2) {
+    REQUIRE(f.context->cpu_only_executions() == cpu_before + 1);
+    REQUIRE(stats_after.executions == stats_before.executions);
+  } else if (replay) {
+    REQUIRE(stats_after.runtime_fallbacks == stats_before.runtime_fallbacks + 1);
+  } else {
+    REQUIRE(stats_after.runtime_fallbacks == stats_before.runtime_fallbacks);
+    REQUIRE(stats_after.executions == stats_before.executions);
+  }
+  auto current_context = manager.ioctx_for_path(uri);
+  REQUIRE(current_context);
+  auto const after = sample_c3_cache(*current_context, cached);
+  std::lock_guard lock(observation_mutex);
+  std::cout << "C3_OBSERVATION entry=" << static_cast<int>(entry) << " hook_calls=" << hook_calls
+            << " before=" << (before ? before->text : "missing CPU-phase rendezvous")
+            << " after=" << after.text << std::endl;
+  if (replay) {
+    INFO("A2 requires the planned CPU-only rendezvous; other replay entries already have it");
+    REQUIRE(hook_calls == 1);
+  } else {
+    REQUIRE(hook_calls == 0);
+  }
+  REQUIRE(before.has_value());
+  REQUIRE(current_context.get() == observed_context.get());
+  INFO("before=" << before->text << "; after=" << after.text);
+  CHECK(after.hits == before->hits);
+  CHECK(after.loads == before->loads);
+  CHECK(after.misses == before->misses);
+}
+}  // namespace
+
+TEST_CASE("C3 plain literal CPU reads bypass the prefetch cache",
+          "[s3][integration][cpu_fallback][c3_bypass]")
+{
+  if (!enter_c3_case()) { return; }
+  check_c3_cpu_read(c3_entry::literal);
+}
+
+TEST_CASE("C3 plain glob CPU reads bypass the prefetch cache",
+          "[s3][integration][cpu_fallback][c3_bypass]")
+{
+  if (!enter_c3_case()) { return; }
+  check_c3_cpu_read(c3_entry::glob);
+}
+
+TEST_CASE("C3 A1 CPU replay bypasses the prefetch cache",
+          "[s3][integration][cpu_fallback][c3_bypass]")
+{
+  if (!enter_c3_case()) { return; }
+  check_c3_cpu_read(c3_entry::a1);
+}
+
+TEST_CASE("C3 A2 CPU execution has an observable bypass boundary",
+          "[s3][integration][cpu_fallback][c3_bypass]")
+{
+  if (!enter_c3_case()) { return; }
+  check_c3_cpu_read(c3_entry::a2);
+}
+
+TEST_CASE("C3 A3 CPU replay bypasses the prefetch cache",
+          "[s3][integration][cpu_fallback][c3_bypass]")
+{
+  if (!enter_c3_case()) { return; }
+  check_c3_cpu_read(c3_entry::a3);
+}
+
+TEST_CASE("C3 supported GPU query retains prefetch cache use",
+          "[s3][integration][cpu_fallback][c3_bypass]")
+{
+  if (!enter_c3_case()) { return; }
+  fixture f;
+  f.enable();
+  query_ok(f.con, "SET enable_duckdb_fallback=false");
+  query_ok(f.con, "SET sirius_test_inject_transparent_gpu_error=''");
+  query_ok(f.con, "SET sirius_test_sync_cpu_replay=false");
+  auto const uri = "s3://" + f.bucket + "/parquet/nation.parquet";
+  auto context   = f.context->get_scan_manager().ioctx_for_path(uri);
+  REQUIRE(context);
+  auto const before       = sample_c3_cache(*context, true);
+  auto const stats_before = f.context->get_transparent_execution_stats();
+  auto const cpu_before   = f.context->cpu_only_executions();
+  f.equal(f.rows(true), f.rows(false));
+  auto const after       = sample_c3_cache(*context, true);
+  auto const stats_after = f.context->get_transparent_execution_stats();
+  REQUIRE(f.context->get_scan_manager().ioctx_for_path(uri).get() == context.get());
+  REQUIRE(stats_after.successful_rebinds == stats_before.successful_rebinds + 1);
+  REQUIRE(stats_after.executions == stats_before.executions + 1);
+  REQUIRE(stats_after.fallbacks == stats_before.fallbacks);
+  REQUIRE(stats_after.runtime_fallbacks == stats_before.runtime_fallbacks);
+  REQUIRE(f.context->cpu_only_executions() == cpu_before);
+  std::cout << "C3_GPU_CONTROL before=" << before.text << " after=" << after.text << std::endl;
+  CHECK(after.hits + after.loads + after.misses > before.hits + before.loads + before.misses);
+}
+
+TEST_CASE("C3 plain CPU no-cache control matches local rows",
+          "[s3][integration][cpu_fallback][c3_bypass]")
+{
+  if (!enter_c3_case(false)) { return; }
+  check_c3_cpu_read(c3_entry::literal, false);
+}
+
+TEST_CASE("C3 fixture records and holds manager-owned reads", "[rest][c3_preflight]")
+{
+  if (sirius::test::run_isolated()) { return; }
+  using namespace sirius::test::cache_bypass;
+  rest_fixture f;
+  auto source        = populate(f);
+  auto const records = f.server.requests();
+  REQUIRE(records.size() == 1);
+  CHECK(records.front().ranges == std::vector<std::string>{first_chunk_range});
+  CHECK(records.front().if_match == std::vector<std::string>{object_tag});
+  auto object = source->get_io_object().shared_from_this();
+  source.reset();
+  REQUIRE(snapshot(*f.context).hits > 0);
+  auto bytes = reset_during_read(f, [&] {
+    std::vector<std::uint8_t> result(chunk_bytes);
+    auto future = f.context->host_read_async_io(*object, 0, result.size(), result.data());
+    if (std::move(future).get() != result.size()) {
+      throw std::runtime_error("C3 direct-backend fixture read was short");
+    }
+    return result;
+  });
+  REQUIRE(bytes == f.server.expected());
+  CHECK(snapshot(*f.context).hits == 0);
+  CHECK(f.manager.ioctx_for_path(object_uri).get() == f.context.get());
+  CHECK(f.server.requests().size() == records.size() + 1);
+  f.server.check();
 }
