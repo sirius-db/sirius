@@ -676,11 +676,6 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::data::data_repository_manager_registry::manager_ptr
   get_data_repository_manager(sirius::query_id_t query_id) const;
 
-  /// \brief Snapshot of every in-flight query's manager, ascending by query id.
-  /// Memory pressure is a global condition, so the downgrade executors sweep across all of them.
-  [[nodiscard]] std::vector<sirius::data::data_repository_manager_registry::manager_ptr>
-  get_data_repository_managers() const;
-
   /// \brief The registry itself, for subsystems that hold a long-lived binding to it.
   [[nodiscard]] sirius::data::data_repository_manager_registry& get_data_repository_registry();
 

@@ -3023,7 +3023,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto discovery = sirius::op::scan::discover_from_manifests(
     *con->context, v2_path, std::move(*inventory.inventory));
   sirius::io::kvikio_context ioctx;
-  sirius::op::scan::clear_iceberg_delete_data_cache();
+  // This fixture owns a fresh connection-local payload cache.
   auto data = sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
   REQUIRE(data);
   REQUIRE(data->positional_deletes.size() == 1);
@@ -3073,7 +3073,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   }
   CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
         before.iceberg_manifest_walks + 2);
-  sirius::op::scan::clear_iceberg_delete_data_cache();
+  // This fixture owns a fresh connection-local payload cache.
   generator.insert_gpu_pipeline_operators(root);
   std::map<std::string, std::unordered_map<std::string, std::vector<int64_t>>> payloads;
   std::function<void(sirius::op::sirius_physical_operator&)> visit = [&](auto& node) {

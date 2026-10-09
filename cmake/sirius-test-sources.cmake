@@ -291,6 +291,7 @@ set(TEST_SOURCES
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
+    test/cpp/telemetry/test_batch_query_ownership.cpp
     test/cpp/vss/test_brute_force_search.cpp
     test/cpp/vss/test_cudf_raft_interop.cpp
     test/cpp/vss/test_cuvs_index_cache.cpp
