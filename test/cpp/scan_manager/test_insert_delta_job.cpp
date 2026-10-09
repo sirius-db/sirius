@@ -569,8 +569,9 @@ TEST_CASE("insert-delta physical evidence is the union inside a mixed row group"
     mixed |= persistent && transient;
   }
   REQUIRE(mixed);
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
-  std::shared_ptr<sirius::io::sirius_datasource> datasource = ioctx->open_datasource(tdb.path);
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::datasource> datasource =
+    cucascade::io::open_datasource(ioctx, tdb.path);
   std::vector<projected_column> columns{real_col(0), real_col(1)};
   auto splits = cut_delta_splits_for_op(requests[0], columns, datasource, nullptr, 81);
   REQUIRE(splits.size() == 1);

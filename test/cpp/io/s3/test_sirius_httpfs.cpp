@@ -297,7 +297,7 @@ class sirius_httpfs_fixture {
     load_sirius_extension(db);
     auto context = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(context);
-    sirius::io::object_store_config object_store;
+    cucascade::io::object_store_config object_store;
     object_store.endpoint   = env.endpoint;
     object_store.region     = env.region;
     object_store.access_key = env.access_key;

@@ -296,6 +296,7 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/s3/test_duckdb_secret_config.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
+    test/cpp/scan_manager/test_describe_parquet_overwrite_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)
 # cmake-format: on

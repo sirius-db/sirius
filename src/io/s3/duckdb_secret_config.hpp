@@ -8,7 +8,6 @@
 #pragma once
 
 #include <cucascade/io/object_store_config.hpp>
-
 #include <duckdb/main/client_context.hpp>
 
 #include <string_view>

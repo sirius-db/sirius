@@ -109,6 +109,8 @@ failure_cause classify_failure(std::exception_ptr error, late_failure_cause fall
     return {late_failure_cause::reader_io, e.what()};
   } catch (cucascade::io::credential_error const& e) {
     return {late_failure_cause::reader_io, e.what()};
+  } catch (cucascade::io::object_changed_error const& e) {
+    return {late_failure_cause::reader_io, e.what()};
   } catch (std::exception const& e) {
     return {fallback, e.what()};
   } catch (...) {

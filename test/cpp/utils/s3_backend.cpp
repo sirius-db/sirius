@@ -16,9 +16,8 @@
 
 #include "utils/s3_backend.hpp"
 
-#include <cucascade/io/rest/s3/sigv4.hpp>
-
 #include <arpa/inet.h>
+#include <cucascade/io/rest/s3/sigv4.hpp>
 #include <curl/curl.h>
 #include <duckdb.hpp>
 #include <fcntl.h>
@@ -429,13 +428,13 @@ long s3_put(s3_endpoint const& ep,
   // UNSIGNED-PAYLOAD lets us stream arbitrarily large bodies (e.g. the SF10
   // lineitem fixture) without hashing them; SeaweedFS accepts it.
   auto signed_req = cucascade::io::rest::s3::sign_request("PUT",
-                                                       ep.authority,
-                                                       canonical_uri,
-                                                       /*query=*/"",
-                                                       "UNSIGNED-PAYLOAD",
-                                                       /*extra_headers=*/{},
-                                                       creds,
-                                                       std::time(nullptr));
+                                                          ep.authority,
+                                                          canonical_uri,
+                                                          /*query=*/"",
+                                                          "UNSIGNED-PAYLOAD",
+                                                          /*extra_headers=*/{},
+                                                          creds,
+                                                          std::time(nullptr));
 
   CURL* curl = curl_easy_init();
   if (curl == nullptr) return -1;

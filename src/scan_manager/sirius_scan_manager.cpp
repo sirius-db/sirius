@@ -1442,9 +1442,9 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   // the exact-generation lookup below decides whether the footer is reused.
   auto const cache_key     = normalize_path(uri);
   auto const io_ctx        = ioctx_for_path(uri);
-  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
-  auto const hint =
-    footer_cached ? cucascade::io::open_hint::generic : cucascade::io::open_hint::parquet_footer_probe;
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+  auto const hint          = footer_cached ? cucascade::io::open_hint::generic
+                                           : cucascade::io::open_hint::parquet_footer_probe;
 
   auto datasource = create_datasource(uri, hint);
   if (!datasource) {
@@ -2141,8 +2141,8 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   auto const file_path    = path.empty() ? std::string{} : normalize_path(std::string(path));
   std::uint64_t config_id = 0;
   std::shared_ptr<const cucascade::io::object_store_config> resolved_config;
-  auto const uses_object_store_config =
-    type == cucascade::io::io_context_type::restful || type == cucascade::io::io_context_type::kvikio;
+  auto const uses_object_store_config = type == cucascade::io::io_context_type::restful ||
+                                        type == cucascade::io::io_context_type::kvikio;
   if (uses_object_store_config && !file_path.empty()) {
     if (auto snapshot = _s3_configs.resolve(file_path)) {
       config_id       = snapshot->id;
@@ -3292,10 +3292,9 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
 
   std::size_t total_bytes = 0;
   for (auto const& path : file_paths) {
-    auto const cache_key = normalize_path(path);
-    auto const io_ctx    = ioctx_for_path(path);
-    bool const footer_cached =
-      io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
+    auto const cache_key     = normalize_path(path);
+    auto const io_ctx        = ioctx_for_path(path);
+    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
     auto datasource =
       create_datasource(path,
                         footer_cached ? cucascade::io::open_hint::generic

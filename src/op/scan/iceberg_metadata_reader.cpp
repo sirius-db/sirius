@@ -24,10 +24,10 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <duckdb/common/types/vector.hpp>
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
+#include <duckdb/common/types/vector.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>

@@ -905,6 +905,9 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
     } catch (cucascade::io::credential_error const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
+    } catch (cucascade::io::object_changed_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
     } catch (std::system_error const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
@@ -946,7 +949,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // generation lookup below decides reuse. Mirrors describe_parquet.
   // The store is keyed by the normalized path, so look up what the open uses.
   auto const normalized    = sirius::io::strip_file_scheme(file_path);
-  bool const footer_cached = io_ctx->metadata_store().get_metadata(normalized) != nullptr;
+  bool const footer_cached = io_ctx->metadata_store().has_path(normalized);
   std::shared_ptr<cucascade::io::datasource> sirius_ds;
   {
     sirius_ds =
@@ -990,6 +993,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   } catch (duckdb::IOException const&) {
     throw;
   } catch (cucascade::io::credential_error const&) {
+    throw;
+  } catch (cucascade::io::object_changed_error const&) {
     throw;
   } catch (std::system_error const&) {
     throw;

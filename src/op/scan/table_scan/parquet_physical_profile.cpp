@@ -17,12 +17,13 @@
 #include "op/scan/table_scan/parquet_physical_profile.hpp"
 
 #include "io/parquet_helpers.hpp"
-#include <cucascade/cudf/datasource.hpp>
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
+
+#include <cucascade/cudf/datasource.hpp>
 
 #include <algorithm>
 #include <limits>

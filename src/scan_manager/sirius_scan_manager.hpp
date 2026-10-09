@@ -21,12 +21,12 @@
 #include "event/query_event_publisher.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
+#include "io/scoped_object_store_configs.hpp"
 #include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_snapshot_identity.hpp"
 #include "pin_table.hpp"
 #include "pipeline/completion_handler.hpp"
-#include "io/scoped_object_store_configs.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/insert_delta_job.hpp"
@@ -1075,7 +1075,7 @@ class sirius_scan_manager {
   /// by-path routing above resolves to a type and then lands here).  Returns
   /// nullptr when the registry cannot build that backend.
   std::shared_ptr<cucascade::io::ioctx> ioctx_for_type(cucascade::io::io_context_type type,
-                                                    std::string_view path = {});
+                                                       std::string_view path = {});
 
   /// Why the registry could not build a backend, as far as Sirius can tell.
   struct ioctx_failure {

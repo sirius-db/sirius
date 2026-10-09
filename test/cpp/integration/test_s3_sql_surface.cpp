@@ -7,7 +7,6 @@
 
 #include "catch.hpp"
 #include "io/s3/sirius_httpfs.hpp"
-#include "io/sirius_datasource.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "scan_manager/config.hpp"
 #include "sirius_context.hpp"
@@ -329,7 +328,7 @@ class sirius_config_env_guard {
     object_store_.ca_bundle_path = ca_bundle.value_or("");
     object_store_.tls_verify     = tls_verify.value_or(false);
     if (signing_mode.has_value()) {
-      REQUIRE(sirius::io::string_to_enum(*signing_mode, object_store_.s3_signing_mode));
+      REQUIRE(cucascade::io::string_to_enum(*signing_mode, object_store_.s3_signing_mode));
     }
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
@@ -419,7 +418,7 @@ class sirius_config_env_guard {
   }
 
   [[nodiscard]] fs::path const& config_path() const noexcept { return config_path_; }
-  [[nodiscard]] sirius::io::object_store_config const& object_store() const noexcept
+  [[nodiscard]] cucascade::io::object_store_config const& object_store() const noexcept
   {
     return object_store_;
   }
@@ -427,7 +426,7 @@ class sirius_config_env_guard {
  private:
   fs::path dir_;
   fs::path config_path_;
-  sirius::io::object_store_config object_store_;
+  cucascade::io::object_store_config object_store_;
   std::string original_config_env_;
   std::string original_disable_env_;
   bool had_original_config_env_{false};
@@ -1074,7 +1073,7 @@ TEST_CASE("S3 SQL config guard keeps object-store credentials out of YAML", "[s3
     CHECK(yaml.find("signing_mode:") == std::string::npos);
     CHECK(guard.object_store().session_token == "temporary-session-token");
     CHECK(guard.object_store().s3_signing_mode ==
-          sirius::io::object_store_config::signing_mode::header);
+          cucascade::io::object_store_config::signing_mode::header);
   }
 }
 
@@ -1377,7 +1376,7 @@ TEST_CASE("S3 LIST keeps its REST context alive while credentials rotate",
   std::size_t pages = 0;
   manager.list_objects_paged(prefix,
                              /*page_size=*/1,
-                             [&](sirius::io::rest::s3::list_objects_v2_page const&) {
+                             [&](cucascade::io::rest::s3::list_objects_v2_page const&) {
                                ++pages;
                                if (pages == 1) {
                                  // Replacing the final scope retires the registry's owner of the
