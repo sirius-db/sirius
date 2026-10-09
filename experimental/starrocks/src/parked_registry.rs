@@ -68,6 +68,12 @@ impl<F> ParkedRegistry<F> {
         Ok((&mut entry.fragment, stream))
     }
 
+    /// Fragments still parked.
+    #[cfg(feature = "sirius-engine")]
+    pub(crate) fn len(&self) -> usize {
+        self.parked.len()
+    }
+
     /// One destination's release; the fragment drops with the last destination.
     pub(crate) fn release(&mut self, slot: &SenderSlot) -> Result<(), String> {
         let (id, _) = self

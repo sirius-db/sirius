@@ -6,7 +6,8 @@
 //! when every expected sender is complete. There is no fusion: every leaf runs, then hops, then
 //! the root.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
@@ -92,6 +93,30 @@ struct PendingReceiver {
     expected_senders: HashMap<i32, usize>,
 }
 
+/// How many purged queries are remembered. A frame for a query purged longer ago than this is
+/// no longer refused, and the state it rebuilds waits for senders that never come.
+const PURGED_QUERIES: usize = 1024;
+
+/// What a purged query still held: the caller frees it outside the exchange lock.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Purged {
+    /// Parked same-CN sender outputs, each released with `drop_parked`.
+    pub(crate) slots: Vec<SenderSlot>,
+    /// Direct-exchange receive buffers remote senders filled, each released by token.
+    pub(crate) tokens: Vec<u64>,
+}
+
+/// What the rendezvous holds right now. All zero on an idle CN.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExchangeCounts {
+    /// Receivers waiting on at least one sender.
+    pub(crate) receivers: usize,
+    /// Parked same-CN sender outputs.
+    pub(crate) parked_senders: usize,
+    /// Remote batches holding receive buffers.
+    pub(crate) remote_batches: usize,
+}
+
 #[derive(Debug, Default)]
 struct ExchangeState {
     receivers: HashMap<FragmentInstanceId, PendingReceiver>,
@@ -99,6 +124,23 @@ struct ExchangeState {
     /// Next expected remote-frame sequence number per sender. A duplicate (below) is dropped
     /// idempotently; a gap (above) is a lost frame and fails the sender.
     remote_seq: HashMap<(ExchangeKey, i32), i64>,
+    /// Queries purged after a failure or cancel, by [`FragmentInstanceId::query_hi`], with the
+    /// error that purged them; `purged_order` is oldest first. A late receiver, sender or frame of
+    /// one is refused, with that error, instead of rebuilding state that would never complete.
+    purged: HashMap<u64, String>,
+    purged_order: VecDeque<u64>,
+}
+
+impl ExchangeState {
+    fn refuse_purged(&self, fragment_instance_id: FragmentInstanceId) -> Result<(), String> {
+        if let Some(error) = self.purged.get(&fragment_instance_id.query_hi()) {
+            // The original error, so whichever refusal reaches the FE first still names the cause.
+            return Err(format!(
+                "the query of fragment instance {fragment_instance_id} already failed: {error}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Matches receiver-first StarRocks dispatch with later sender results.
@@ -130,6 +172,7 @@ impl LocalExchange {
             }
         }
         let mut state = self.lock();
+        state.refuse_purged(fragment_instance_id)?;
         if state.receivers.contains_key(&fragment_instance_id) {
             return Err(format!(
                 "duplicate receiver registration for fragment {fragment_instance_id}"
@@ -146,6 +189,7 @@ impl LocalExchange {
     }
 
     /// Records one sender as produced, returning the receiver when this completes its sender set.
+    /// On error the source is not kept, and the caller still owns what it holds.
     pub(crate) fn push_sender(
         &self,
         key: ExchangeKey,
@@ -153,6 +197,7 @@ impl LocalExchange {
         source: SenderSource,
     ) -> Result<Option<ReadyFragment>, String> {
         let mut state = self.lock();
+        state.refuse_purged(key.fragment_instance_id)?;
         let senders = state.sources.entry(key).or_default();
         if senders.contains_key(&sender_id) {
             return Err(format!("duplicate sender {sender_id} for exchange {key:?}"));
@@ -184,6 +229,7 @@ impl LocalExchange {
             ));
         }
         let mut state = self.lock();
+        state.refuse_purged(key.fragment_instance_id)?;
         let expected_seq = state.remote_seq.entry((key, sender_id)).or_insert(0);
         if seq < *expected_seq {
             info!(
@@ -302,6 +348,67 @@ impl LocalExchange {
             params: receiver.params,
             inputs,
         }))
+    }
+
+    /// Drops everything held for `query`'s receivers and returns what it still owned, then
+    /// refuses any later receiver, sender or frame of the query with `error`. Idempotent; the
+    /// first error is kept, being the cause. A receiver already handed over by `take_ready` is not
+    /// here: it frees its own inputs.
+    pub(crate) fn purge_query(&self, query: FragmentInstanceId, error: &str) -> Purged {
+        let query_hi = query.query_hi();
+        let ours = |id: &FragmentInstanceId| id.query_hi() == query_hi;
+        let mut state = self.lock();
+        if let Entry::Vacant(first) = state.purged.entry(query_hi) {
+            first.insert(error.to_string());
+            state.purged_order.push_back(query_hi);
+            if state.purged_order.len() > PURGED_QUERIES {
+                let oldest = state.purged_order.pop_front().expect("over capacity");
+                state.purged.remove(&oldest);
+            }
+        }
+        state.receivers.retain(|id, _| !ours(id));
+        state
+            .remote_seq
+            .retain(|(key, _), _| !ours(&key.fragment_instance_id));
+        let keys: Vec<ExchangeKey> = state
+            .sources
+            .keys()
+            .filter(|key| ours(&key.fragment_instance_id))
+            .copied()
+            .collect();
+        let mut purged = Purged::default();
+        for key in keys {
+            for source in state
+                .sources
+                .remove(&key)
+                .into_iter()
+                .flat_map(HashMap::into_values)
+            {
+                match source {
+                    SenderSource::LocalParked { slot, .. } => purged.slots.push(slot),
+                    SenderSource::Remote { batches, .. } => purged
+                        .tokens
+                        .extend(batches.iter().map(|batch| batch.token)),
+                }
+            }
+        }
+        purged
+    }
+
+    /// What the rendezvous holds right now.
+    pub(crate) fn counts(&self) -> ExchangeCounts {
+        let state = self.lock();
+        let mut counts = ExchangeCounts {
+            receivers: state.receivers.len(),
+            ..ExchangeCounts::default()
+        };
+        for source in state.sources.values().flat_map(HashMap::values) {
+            match source {
+                SenderSource::LocalParked { .. } => counts.parked_senders += 1,
+                SenderSource::Remote { batches, .. } => counts.remote_batches += batches.len(),
+            }
+        }
+        counts
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ExchangeState> {
@@ -604,5 +711,103 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn query_key(hi: i64, instance: i64, node_id: i32) -> ExchangeKey {
+        ExchangeKey {
+            fragment_instance_id: FragmentInstanceId::from_halves(hi, instance),
+            node_id,
+        }
+    }
+
+    /// A failed query's waiting receiver, parked local sender and received remote batches are
+    /// all returned for release; another query's state is untouched.
+    #[test]
+    fn purge_returns_what_a_query_holds_and_leaves_other_queries() {
+        let exchange = LocalExchange::default();
+        let (doomed, other) = (query_key(41, 2, 7), query_key(42, 2, 7));
+        let doomed_late = query_key(41, 3, 9);
+        for key in [doomed, other] {
+            exchange
+                .register_receiver(key.fragment_instance_id, vec![(7, 3)], params())
+                .unwrap();
+            exchange.push_sender(key, 0, local(key, 0)).unwrap();
+            exchange
+                .push_remote_frame(
+                    key,
+                    1,
+                    0,
+                    false,
+                    names(),
+                    Some(remote(key.fragment_instance_id.query_hi())),
+                )
+                .unwrap();
+        }
+        // A sender whose receiver was never registered here is purged too.
+        exchange
+            .push_remote_frame(doomed_late, 0, 0, false, names(), Some(remote(99)))
+            .unwrap();
+
+        let purged = exchange.purge_query(FragmentInstanceId::from_halves(41, 0), "boom");
+        assert_eq!(purged.slots, vec![local_slot(doomed, 0)]);
+        let mut tokens = purged.tokens;
+        tokens.sort_unstable();
+        assert_eq!(tokens, vec![41, 99]);
+        assert_eq!(
+            exchange.counts(),
+            ExchangeCounts {
+                receivers: 1,
+                parked_senders: 1,
+                remote_batches: 1,
+            }
+        );
+        assert_eq!(
+            exchange.purge_query(FragmentInstanceId::from_halves(41, 0), "again"),
+            Purged::default(),
+            "a second purge finds nothing"
+        );
+    }
+
+    /// After a purge, nothing of the query can rebuild exchange state that would never complete.
+    #[test]
+    fn a_purged_query_refuses_late_receivers_senders_and_frames() {
+        let exchange = LocalExchange::default();
+        let key = query_key(43, 2, 7);
+        exchange.purge_query(FragmentInstanceId::from_halves(43, 0), "GPU out of memory");
+        exchange.purge_query(
+            FragmentInstanceId::from_halves(43, 0),
+            "cancelled by the FE",
+        );
+        let refused = |result: Result<Option<ReadyFragment>, String>| {
+            let err = result.unwrap_err();
+            assert!(err.contains("already failed: GPU out of memory"), "{err}");
+        };
+        refused(exchange.register_receiver(key.fragment_instance_id, vec![(7, 1)], params()));
+        refused(exchange.push_sender(key, 0, local(key, 0)));
+        refused(exchange.push_remote_frame(key, 0, 0, true, names(), Some(remote(5))));
+        assert_eq!(exchange.counts(), ExchangeCounts::default());
+        // Another query is unaffected.
+        let live = query_key(44, 2, 7);
+        assert!(
+            exchange
+                .register_receiver(live.fragment_instance_id, vec![(7, 1)], params())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn purged_queries_are_remembered_up_to_a_bound() {
+        let exchange = LocalExchange::default();
+        for hi in 0..=PURGED_QUERIES as i64 {
+            exchange.purge_query(FragmentInstanceId::from_halves(hi, 0), "boom");
+        }
+        let state = exchange.lock();
+        assert_eq!(state.purged.len(), PURGED_QUERIES);
+        assert!(
+            !state.purged.contains_key(&0),
+            "the oldest purge is forgotten first"
+        );
+        assert!(state.purged.contains_key(&(PURGED_QUERIES as u64)));
     }
 }

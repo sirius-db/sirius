@@ -200,6 +200,9 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
     /// Frees a receive token that will not be pushed. Unknown and consumed tokens are ignored.
     fn release(&self, token: u64);
 
+    /// Receive and export buffers this CN's direct exchange still holds.
+    fn outstanding(&self) -> usize;
+
     /// Writes every batch parked under `slot` into `peer`'s pool, announcing each, then EOS.
     fn send(
         &self,

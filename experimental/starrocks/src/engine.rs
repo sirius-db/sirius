@@ -15,6 +15,7 @@
 //! process-global context serializes queries — both lifted by the streaming evolution.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -79,6 +80,9 @@ pub struct SiriusEngine {
     thread: Mutex<Option<JoinHandle<()>>>,
     /// The context's direct exchange, present when its GPU pool is a slab.
     direct_exchange: Option<Arc<sirius::DirectExchange>>,
+    /// Parked sender fragments, published by the engine thread after every request so a reader
+    /// never waits behind a running fragment.
+    parked: Arc<AtomicUsize>,
 }
 
 impl SiriusEngine {
@@ -90,15 +94,18 @@ impl SiriusEngine {
     pub fn start(config: Option<PathBuf>) -> Result<Self, String> {
         let (request_tx, request_rx) = channel::<EngineRequest>();
         let (ready_tx, ready_rx) = channel();
+        let parked = Arc::new(AtomicUsize::new(0));
+        let published = Arc::clone(&parked);
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
-            .spawn(move || engine_thread(config, request_rx, ready_tx))
+            .spawn(move || engine_thread(config, request_rx, ready_tx, published))
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
             Ok(Ok(direct_exchange)) => Ok(Self {
                 requests: Mutex::new(Some(request_tx)),
                 thread: Mutex::new(Some(thread)),
                 direct_exchange: direct_exchange.map(Arc::new),
+                parked,
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
@@ -135,6 +142,7 @@ fn engine_thread(
     config: Option<PathBuf>,
     requests: Receiver<EngineRequest>,
     ready: Sender<Result<Option<sirius::DirectExchange>, String>>,
+    published: Arc<AtomicUsize>,
 ) {
     let context = match build_context(config) {
         Ok(context) => {
@@ -175,6 +183,7 @@ fn engine_thread(
                 let _ = respond.send(parked.release(&slot));
             }
         }
+        published.store(parked.len(), Ordering::Relaxed);
     }
     info!("sirius-engine thread shutting down");
 }
@@ -458,6 +467,10 @@ impl FragmentExecutor for SiriusEngine {
 
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
         self.call(|respond| EngineRequest::DropParked { slot, respond })
+    }
+
+    fn parked_fragments(&self) -> usize {
+        self.parked.load(Ordering::Relaxed)
     }
 }
 
