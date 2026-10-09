@@ -16,6 +16,7 @@
 
 #include "transparent/physical_sirius_execution.hpp"
 
+#include "cuda/device_health.hpp"
 #include "log/logging.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
@@ -354,7 +355,11 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         context.client, "transparent_execution", gpu_prepared, parameters, window->query_id());
 
       if (state.result->HasError()) {
-        gpu_error = state.result->GetErrorObject();
+        gpu_error  = state.result->GetErrorObject();
+        auto error = std::make_exception_ptr(std::runtime_error(gpu_error.RawMessage()));
+        state.sirius_context->get_query_lifecycle_registry().record_error(window->query_id(),
+                                                                          error);
+        // The interface reports typed CUDA failures before converting them to ErrorData.
         state.result.reset();
         gpu_failed = true;
       }
@@ -371,6 +376,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       runtime_unavailable_error = true;
     } catch (std::exception& e) {
       if (window) window->report_failure(std::current_exception());
+      state.sirius_context->get_query_lifecycle_registry().report_failure(std::current_exception());
       gpu_error  = duckdb::ErrorData(e);
       gpu_failed = true;
     }

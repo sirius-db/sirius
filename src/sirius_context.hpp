@@ -527,17 +527,19 @@ class SiriusContext : public ClientContextState {
   };
 
   /// \brief Health of the shared Sirius runtime. Set to UNAVAILABLE when a
-  /// mandatory per-query cleanup step fails: the shared scan/task/repository
-  /// state can no longer be trusted, so every later attempt to enter a Sirius
-  /// execution or plan-generation window gets a stable, session-preserving
-  /// error (never INTERNAL/FATAL — those would invalidate the whole
+  /// fatal CUDA failure is reported or a mandatory per-query cleanup step fails:
+  /// the shared device or scan/task/repository state can no longer be trusted, so every later
+  /// attempt to enter a Sirius execution or plan-generation window gets a stable,
+  /// session-preserving error (never INTERNAL/FATAL — those would invalidate the whole
   /// DatabaseInstance and defeat "CPU queries continue"). CPU / non-Sirius
   /// paths never consult this.
   enum class runtime_health : uint8_t { OK, UNAVAILABLE };
   [[nodiscard]] runtime_health get_runtime_health() const noexcept
   {
-    return runtime_unavailable_.load(std::memory_order_acquire) ? runtime_health::UNAVAILABLE
-                                                                : runtime_health::OK;
+    return (runtime_unavailable_.load(std::memory_order_acquire) ||
+            query_lifecycle_.runtime_failed())
+             ? runtime_health::UNAVAILABLE
+             : runtime_health::OK;
   }
   void mark_runtime_unavailable() noexcept
   {
