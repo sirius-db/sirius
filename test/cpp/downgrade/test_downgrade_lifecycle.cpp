@@ -136,7 +136,7 @@ TEST_CASE("start_stop_cycle", "[downgrade_lifecycle]")
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  repo_registry.create_for_query(kTestQueryId);
 
   // nullptr memory_space -- monitor loop won't trigger
   auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
@@ -400,7 +400,7 @@ TEST_CASE("stop_cancels_pending_requests", "[downgrade_lifecycle]")
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  repo_registry.create_for_query(kTestQueryId);
 
   auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
@@ -433,7 +433,7 @@ TEST_CASE("drain_cancels_pending_requests_with_exception", "[downgrade_lifecycle
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  repo_registry.create_for_query(kTestQueryId);
 
   auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();

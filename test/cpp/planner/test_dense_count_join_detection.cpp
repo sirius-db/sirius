@@ -693,9 +693,11 @@ TEST_CASE_METHOD(dense_count_join_fixture,
                  "non-plain keys",
                  "[dense_count_join][plan]")
 {
-  CHECK_FALSE(has_dense_count_join(
-    "SELECT c_id, count(o_id) FILTER (WHERE o_id > 0) FROM cust LEFT JOIN ord ON c_id = o_cust "
-    "GROUP BY c_id"));
+  CHECK_THROWS_WITH(
+    has_dense_count_join(
+      "SELECT c_id, count(o_id) FILTER (WHERE o_id > 0) FROM cust LEFT JOIN ord ON c_id = o_cust "
+      "GROUP BY c_id"),
+    Catch::Matchers::ContainsSubstring("Aggregates with a FILTER clause not supported"));
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust AND c_grp = o_cust "
     "GROUP BY c_id"));

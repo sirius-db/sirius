@@ -21,7 +21,7 @@
  *        plain column reference so PARTITION/CONCAT/hash-join see an ordinary column index.
  */
 
-#include "expression/ast/to_duckdb.hpp"
+#include "expression/ast/node.hpp"
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -141,11 +141,7 @@ sirius::op::sirius_physical_hash_join* find_hash_join(sirius::op::sirius_physica
   return nullptr;
 }
 
-bool is_bound_ref(const sirius::ast::node& side)
-{
-  auto expr = sirius::ast::to_duckdb(side);
-  return expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
-}
+bool is_bound_ref(const sirius::ast::node& side) { return side.holds<sirius::ast::reference>(); }
 
 /// Assert that every equality condition side of @p hj is a plain column reference (BOUND_REF),
 /// i.e. any complex expression was materialized out into a projection below the join.
@@ -265,7 +261,7 @@ TEST_CASE_METHOD(join_expression_key_fixture,
 }
 
 TEST_CASE_METHOD(join_expression_key_fixture,
-                 "join expression key - mixed SEMI and ANTI keep casts in hash keys",
+                 "join expression key - mixed SEMI and ANTI materialize casts in hash keys",
                  "[join_expression_key][isolated_context]")
 {
   const bool anti             = GENERATE(false, true);
@@ -288,12 +284,12 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   const auto expected_type = right_family ? (anti ? JoinType::RIGHT_ANTI : JoinType::RIGHT_SEMI)
                                           : (anti ? JoinType::ANTI : JoinType::SEMI);
   REQUIRE(hj->join_type == expected_type);
-  CHECK_FALSE(has_projection_child(*hj));
+  CHECK(has_projection_child(*hj));
   REQUIRE(hj->conditions.size() == 2);
   for (auto const& condition : hj->conditions) {
     if (condition.comparison == sirius::comparison_type::equal) {
-      CHECK_FALSE(is_bound_ref(*condition.left));
-      CHECK_FALSE(is_bound_ref(*condition.right));
+      CHECK(is_bound_ref(*condition.left));
+      CHECK(is_bound_ref(*condition.right));
     }
   }
   CHECK(hj->types.size() == 2);
@@ -302,7 +298,7 @@ TEST_CASE_METHOD(join_expression_key_fixture,
 }
 
 TEST_CASE_METHOD(join_expression_key_fixture,
-                 "join expression key - hash-only casts stay unmaterialized",
+                 "join expression key - hash-only casts are evaluated before partitioning",
                  "[join_expression_key][isolated_context]")
 {
   const std::string join_type = GENERATE("JOIN", "SEMI JOIN", "ANTI JOIN");
@@ -313,10 +309,10 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   REQUIRE(plan);
   auto* hj = find_hash_join(plan.get());
   REQUIRE(hj);
-  CHECK_FALSE(has_projection_child(*hj));
+  CHECK(has_projection_child(*hj));
   REQUIRE(hj->conditions.size() == 1);
-  CHECK_FALSE(is_bound_ref(*hj->conditions[0].left));
-  CHECK_FALSE(is_bound_ref(*hj->conditions[0].right));
+  CHECK(is_bound_ref(*hj->conditions[0].left));
+  CHECK(is_bound_ref(*hj->conditions[0].right));
 }
 
 TEST_CASE_METHOD(join_expression_key_fixture,
