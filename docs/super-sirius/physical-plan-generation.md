@@ -77,7 +77,7 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 2. A `UNION` merges the two tagged inputs.
 3. A `HASH_GROUP_BY` on every column sums each tag into a `BIGINT`: `m - n` for `EXCEPT ALL`, `m` and `n` for `INTERSECT ALL`.
 4. A `PROJECTION` keeps the columns and appends the copy count as a `CASE` expression: `CASE WHEN s > 0 THEN s ELSE 0 END` or `CASE WHEN m < n THEN m ELSE n END`.
-5. `REPLICATE` repeats each row by that count and drops the count column. Its byte cap is `concat_batch_bytes` (0 is read as 1) and its row cap is `INT32_MAX`.
+5. `REPLICATE` repeats each row by that count and drops the count column. Its byte cap is `concat_batch_bytes` (0 means no byte cap) and its row cap is `INT32_MAX`.
 
 The builder throws `NotImplementedException`, so the query falls back to CPU, for:
 

@@ -221,7 +221,7 @@ Repeats each input row by a count column, then drops that column. The count is a
 
 - **GPU execution:** two passes per input batch in `gpu_replicate_impl` (`src/op/replicate/gpu_replicate_impl.cu`). `plan_slices` takes an `INT64` prefix sum of the counts and a byte prefix weighted by `cudf::row_bit_count`, then cuts the output into slices of at most `max_rows` rows and at most `max_bytes` bytes plus one row. `materialize` copies one slice with one `cudf::repeat` call. `cudf::repeat` sums its counts in 32 bits without checking, so planning in 64 bits and capping a slice at `INT32_MAX` rows keeps every call exact.
 - **Output batches:** one per slice, on the input batch's memory space. An input with no copies gives one empty batch, so downstream operators still see the schema.
-- **Key members:** `_output_limits` (`gpu_replicate_impl::limits`). The planner sets `max_rows` to `INT32_MAX` and `max_bytes` to `concat_batch_bytes`, reading 0 as 1.
+- **Key members:** `_output_limits` (`gpu_replicate_impl::limits`). The planner sets `max_rows` to `INT32_MAX` and `max_bytes` to `concat_batch_bytes`, reading 0 as no cap (`SIZE_MAX`).
 - **Errors:** a null or negative count, a non-integer count column, or a batch of the wrong width throws `sirius::internal_exception`. These are planner bugs, not reasons to fall back.
 - **Memory:** one `execute` holds the whole expansion of its input batches, so the limits shape output batches but do not bound peak memory. A key with very many copies is still one task.
 

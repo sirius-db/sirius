@@ -337,13 +337,14 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - concat_batch_bytes = 0 caps REPLICATE batches at one byte",
+                 "set_operation - concat_batch_bytes = 0 leaves REPLICATE without a byte cap",
                  "[planner][set_operation][isolated_context]")
 {
   sirius::test::scoped_sirius_setting const bytes{*con, "concat_batch_bytes", std::uint64_t{0}};
   auto const plan = lower("SELECT k FROM ia EXCEPT ALL SELECT k FROM ib");
   REQUIRE(plan->type == SiriusPhysicalOperatorType::REPLICATE);
-  CHECK(plan->Cast<sirius::op::sirius_physical_replicate>().output_limits().max_bytes == 1);
+  CHECK(plan->Cast<sirius::op::sirius_physical_replicate>().output_limits().max_bytes ==
+        std::numeric_limits<std::size_t>::max());
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,

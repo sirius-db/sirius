@@ -29,7 +29,6 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -379,14 +378,15 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
   std::array arms{create_plan(*op.children[0]), create_plan(*op.children[1])};
   // The ALL plan is typed from these, so each arm must actually produce them.
   auto const key_types = reconcile_input_types(arms, op.types, name);
-  // concat_batch_bytes = 0 asks for the smallest batches; REPLICATE needs a positive cap.
+  // concat_batch_bytes = 0 leaves batches whole, as in CONCAT: no byte cap, only the row cap.
+  auto const max_bytes = op_params.concat_batch_bytes == 0 ? std::numeric_limits<std::size_t>::max()
+                                                           : op_params.concat_batch_bytes;
   return plan_set_operation_all(
     op.type,
     std::move(arms),
     key_types,
     op.estimated_cardinality,
-    {.max_rows  = std::numeric_limits<cudf::size_type>::max(),
-     .max_bytes = std::max<std::size_t>(op_params.concat_batch_bytes, 1)});
+    {.max_rows = std::numeric_limits<cudf::size_type>::max(), .max_bytes = max_bytes});
 }
 
 }  // namespace sirius::planner
