@@ -421,6 +421,9 @@ impl SiriusComputeNodeService {
             }
             return Ok(());
         }
+        if runtime_filters::enabled() {
+            Self::log_planned_skips(&params);
+        }
         let expected_senders = Self::receiver_exchanges(&params)?;
         if !expected_senders.is_empty() {
             let exec = params
@@ -463,16 +466,37 @@ impl SiriusComputeNodeService {
         self.drain_ready(ready)
     }
 
+    /// Logs the runtime filters `params`' fragment builds or probes that the plan already rules
+    /// out: a join filter this CN can't build, and a probe target no CN filters.
+    fn log_planned_skips(params: &TExecPlanFragmentParams) {
+        let (query, instance) = (Self::query_id(params), Self::fragment_instance_id(params));
+        let builds = runtime_filter::skipped_builds(params).unwrap_or_else(|err| {
+            warn!(error = %err, "cannot read a fragment's runtime filters");
+            Vec::new()
+        });
+        for skip in builds
+            .into_iter()
+            .chain(runtime_filter::skipped_probes(params))
+        {
+            runtime_filters::log_skipped(
+                query,
+                instance,
+                skip.filter_id,
+                Some(skip.node_id),
+                skip.reason.as_str(),
+                "",
+            );
+        }
+    }
+
     /// Defers a leaf fragment whose scans probe runtime filters that a receiver on this CN builds
     /// from a broadcast join. A timer runs it unfiltered if its filters take too long.
     fn defer_for_filters(&self, params: &TExecPlanFragmentParams) -> bool {
         if !runtime_filters::enabled() {
             return false;
         }
-        let probed: Vec<i32> = runtime_filter::probed_filters(params)
-            .into_iter()
-            .map(|probe| probe.filter_id)
-            .collect();
+        let probes = runtime_filter::probed_filters(params);
+        let probed: Vec<i32> = probes.iter().map(|probe| probe.filter_id).collect();
         let (Some(query), Some(instance)) =
             (Self::query_id(params), Self::fragment_instance_id(params))
         else {
@@ -482,8 +506,27 @@ impl SiriusComputeNodeService {
             return false;
         }
         let sites = self.filters.sites(query, &probed);
+        for probe in &probes {
+            if sites.iter().any(|(id, _)| *id == probe.filter_id) {
+                continue;
+            }
+            // Only a broadcast join's filter can be built here; another holds part of the keys
+            // on each CN.
+            let reason = if probe.broadcast {
+                "not_built_on_this_cn"
+            } else {
+                "not_broadcast"
+            };
+            runtime_filters::log_skipped(
+                Some(query),
+                Some(instance),
+                probe.filter_id,
+                Some(probe.scan_node_id),
+                reason,
+                "",
+            );
+        }
         if sites.is_empty() {
-            info!(%instance, probed = ?probed, "no runtime filter of this scan is built on this CN");
             return false;
         }
         info!(
@@ -551,14 +594,22 @@ impl SiriusComputeNodeService {
         let params = &scan.params;
         let dump_seq = Self::dump_fragment(params);
         let unfiltered = self.translate_fragment_logged(params, &[], dump_seq)?;
+        let (query, instance) = (Self::query_id(params), Self::fragment_instance_id(params));
+        let skip = |filter_id: i32, reason: &str, detail: &str| {
+            runtime_filters::log_skipped(query, instance, filter_id, None, reason, detail);
+        };
+        if !filtered {
+            for (filter_id, _) in &scan.filters {
+                skip(*filter_id, "timeout", "");
+            }
+        }
+        let waited_ms = scan.deferred_at.elapsed().as_millis() as u64;
         let mut inputs = Vec::new();
         let mut runs = Vec::new();
+        let mut applying = Vec::new();
         for (filter_id, site) in scan.filters.iter().filter(|_| filtered) {
             let Some(sources) = self.exchanges.complete_sources(site.key) else {
-                info!(
-                    filter_id,
-                    "runtime filter keys were taken before the scan ran"
-                );
+                skip(*filter_id, "keys_taken", "");
                 continue;
             };
             let keys = FilterKeys {
@@ -568,17 +619,16 @@ impl SiriusComputeNodeService {
             let stats = match self.executor.key_stats(&keys) {
                 Ok(stats) => stats,
                 Err(err) => {
-                    warn!(filter_id, error = %err, "cannot read runtime filter keys; skipping it");
+                    skip(*filter_id, "keys_unreadable", &err);
                     continue;
                 }
             };
             let density = runtime_filters::max_density();
             if !runtime_filters::selective(&stats, density) {
-                info!(
-                    filter_id,
-                    ?stats,
-                    density,
-                    "runtime filter keys fill their range; skipping it"
+                skip(
+                    *filter_id,
+                    "dense",
+                    &format!("{stats:?} max_density={density}"),
                 );
                 continue;
             }
@@ -597,12 +647,7 @@ impl SiriusComputeNodeService {
                 keys,
                 rows: stats.rows,
             });
-            info!(
-                filter_id,
-                ?stats,
-                waited_ms = scan.deferred_at.elapsed().as_millis() as u64,
-                "applying runtime filter"
-            );
+            applying.push((*filter_id, node_id as u64, stats));
         }
         let filtered_plan = if inputs.is_empty() {
             None
@@ -613,7 +658,9 @@ impl SiriusComputeNodeService {
             {
                 Ok(plan) => Some(plan),
                 Err(err) => {
-                    warn!(error = %err, "cannot translate the scan with its runtime filters");
+                    for (filter_id, _, _) in &applying {
+                        skip(*filter_id, "untranslatable", &err.to_string());
+                    }
                     None
                 }
             }
@@ -621,11 +668,19 @@ impl SiriusComputeNodeService {
         match &filtered_plan {
             Some(plan) => {
                 // Only the filters the plan reads; a filter of another scan type stays unbound.
-                runs.retain(|run| {
+                let bound = |stream_id: u64| {
                     plan.stream_inputs
                         .iter()
-                        .any(|input| input.node_id as u64 == run.stream_id)
-                });
+                        .any(|input| input.node_id as u64 == stream_id)
+                };
+                runs.retain(|run| bound(run.stream_id));
+                for (filter_id, stream_id, stats) in &applying {
+                    if bound(*stream_id) {
+                        runtime_filters::log_applied(query, instance, *filter_id, stats, waited_ms);
+                    } else {
+                        skip(*filter_id, "unbound", "no scan of the plan reads its keys");
+                    }
+                }
                 self.execute_fragment(
                     params,
                     plan,
@@ -760,7 +815,7 @@ impl SiriusComputeNodeService {
         Ok(resolved)
     }
 
-    /// Writes the received fragment params to `$SIRIUS_CN_DUMP_FRAGMENTS/fragment-<seq>.txt`
+    /// Writes the received fragment params to `$SIRIUS_CN_DUMP_FRAGMENTS/fragment-<pid>-<seq>.txt`
     /// (debug format) for offline plan analysis. No-op when the variable is unset.
     fn dump_fragment(params: &TExecPlanFragmentParams) -> Option<u64> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -769,7 +824,7 @@ impl SiriusComputeNodeService {
         };
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::path::Path::new(&dir).join(format!("fragment-{seq:04}.txt"));
+        let path = Self::dump_path(&dir, "fragment", seq, "txt");
         if let Err(err) = std::fs::write(&path, format!("{params:#?}")) {
             tracing::warn!(error = %err, path = %path.display(), "failed to dump fragment params");
         }
@@ -1312,7 +1367,16 @@ impl SiriusComputeNodeService {
         Ok(translated)
     }
 
-    /// Writes the translated Substrait plan bytes to `$SIRIUS_CN_DUMP_FRAGMENTS/plan-<seq>.substrait`
+    /// `<dir>/<prefix>-<pid>-<seq>.<extension>`. The CNs of a cluster may share one dump directory
+    /// and each numbers its own fragments from 0, so the process id keeps their files apart.
+    fn dump_path(dir: &str, prefix: &str, seq: u64, extension: &str) -> std::path::PathBuf {
+        std::path::Path::new(dir).join(format!(
+            "{prefix}-{}-{seq:04}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    /// Writes the translated Substrait plan bytes to `$SIRIUS_CN_DUMP_FRAGMENTS/plan-<pid>-<seq>.substrait`
     /// so a failing plan can be replayed against the engine in isolation. No-op when unset.
     fn dump_substrait(translated: &TranslatedPlan, dump_seq: Option<u64>) {
         let Ok(dir) = std::env::var("SIRIUS_CN_DUMP_FRAGMENTS") else {
@@ -1321,7 +1385,7 @@ impl SiriusComputeNodeService {
         let Some(seq) = dump_seq else {
             return;
         };
-        let path = std::path::Path::new(&dir).join(format!("plan-{seq:04}.substrait"));
+        let path = Self::dump_path(&dir, "plan", seq, "substrait");
         if let Err(err) = std::fs::write(&path, translated.to_substrait_bytes()) {
             tracing::warn!(error = %err, path = %path.display(), "failed to dump substrait plan");
         }
@@ -2139,6 +2203,7 @@ mod tests {
     fn sparse_keys() -> crate::fragment_executor::KeyStats {
         crate::fragment_executor::KeyStats {
             rows: 2_000_000,
+            distinct: 2_000_000,
             min: 1,
             max: 100_000_000,
         }
@@ -2186,6 +2251,7 @@ mod tests {
     fn keys_that_fill_their_range_are_not_applied() {
         let executor = Arc::new(FilterRecorder::new(crate::fragment_executor::KeyStats {
             rows: 2_000_000,
+            distinct: 2_000_000,
             min: 1,
             max: 2_000_000,
         }));
@@ -2216,6 +2282,74 @@ mod tests {
             vec![(Vec::new(), Vec::new(), false)]
         );
         assert_eq!(service.filters.deferred(), 0);
+    }
+
+    /// Runs `run` with the log lines of this thread captured, and returns them.
+    fn captured_logs(run: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer(Arc::default());
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn a_scan_logs_why_its_filters_are_not_applied() {
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FilterRecorder::new(sparse_keys())),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        // A broadcast filter with no receiver building it here.
+        // `run_or_register` directly: a routed request runs on another thread.
+        let logs = captured_logs(|| service.run_or_register(&probing_scan(35)).unwrap());
+        assert!(
+            logs.contains(r#"filter_id=0 node=0 outcome="skipped" reason="not_built_on_this_cn""#),
+            "{logs}"
+        );
+        // A partitioned join's filter: each CN holds part of the keys.
+        let mut partitioned = probing_scan(36);
+        let plan = partitioned.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0].probe_runtime_filters.as_mut().unwrap()[0].build_join_mode =
+            Some(starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED);
+        let logs = captured_logs(|| service.run_or_register(&partitioned).unwrap());
+        assert!(
+            logs.contains(r#"outcome="skipped" reason="not_broadcast""#),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn a_receiver_logs_the_filters_it_cannot_build() {
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FilterRecorder::new(sparse_keys())),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        let mut builder = filter_builder(37);
+        let plan = builder.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        let join = plan.nodes[0].hash_join_node.as_mut().unwrap();
+        join.build_runtime_filters.as_mut().unwrap()[0].build_join_mode =
+            Some(starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED);
+        let logs = captured_logs(|| service.run_or_register(&builder).unwrap());
+        assert!(
+            logs.contains(r#"filter_id=0 node=5 outcome="skipped" reason="not_broadcast""#),
+            "{logs}"
+        );
     }
 
     #[test]

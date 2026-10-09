@@ -153,13 +153,15 @@ class SIRIUS_FFI_EXPORT DirectExchange {
   /// Tokens neither released nor consumed.
   [[nodiscard]] std::size_t outstanding() const;
 
-  /// Adds the non-null rows, minimum and maximum of signed integer column `column` of the sealed
-  /// batch under `token` to `rows`, `min` and `max`, leaving the batch for its receiver. A spilled
-  /// batch comes back to the GPU first.
+  /// Adds the non-null rows, distinct keys, minimum and maximum of signed integer column `column`
+  /// of the sealed batch under `token` to `rows`, `distinct`, `min` and `max`, leaving the batch
+  /// for its receiver. A spilled batch comes back to the GPU first. Distinct keys are counted per
+  /// batch, so summed over batches they are at least the true count.
   /// @throws on a token that holds no sealed batch, or a column out of range or not an integer.
   void key_stats(std::uint64_t token,
                  std::uint32_t column,
                  std::uint64_t& rows,
+                 std::uint64_t& distinct,
                  std::int64_t& min,
                  std::int64_t& max) const;
 
@@ -293,13 +295,15 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// DirectExchange.
   [[nodiscard]] std::unique_ptr<OutputDrain> output_drain(std::uint64_t stream_id) const;
 
-  /// Adds the non-null rows, minimum and maximum of signed integer column `column` of every batch
-  /// parked on output `stream_id` to `rows`, `min` and `max`, without draining it.
+  /// Adds the non-null rows, distinct keys (counted per batch and summed), minimum and maximum of
+  /// signed integer column `column` of every batch parked on output `stream_id` to `rows`,
+  /// `distinct`, `min` and `max`, without draining it.
   /// @throws before build(), on an unknown stream, without a DirectExchange, or on a column out of
   /// range or not an integer.
   void output_key_stats(std::uint64_t stream_id,
                         std::uint32_t column,
                         std::uint64_t& rows,
+                        std::uint64_t& distinct,
                         std::int64_t& min,
                         std::int64_t& max) const;
 
