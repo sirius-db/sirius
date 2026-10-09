@@ -251,13 +251,23 @@ class CacheProcesses(unittest.TestCase):
         self.assertEqual(self.worker(), (1, 1, 0))
         self.assertTrue(legacy.exists())
         self.assertEqual(self.worker("project", expected=2), (1, 1, 0))
+        if "version" in WORKERS:
+            for component in ("major", "minor"):
+                settings = {"SIMPATICO_TEST_NVRTC_VERSION": component}
+                self.assertEqual(self.worker("version", **settings), (1, 1, 0))
+            # Ordinary use must not prune any other header/compiler environment.
+            self.assertEqual(self.worker(), (0, 1, 1))
+            self.assertEqual(self.worker("project", expected=2), (0, 1, 1))
         paths = list(self.cache.glob("v2/*/*.cubin"))
-        self.assertEqual(len(paths), 2)
+        self.assertEqual(len(paths), 4 if "version" in WORKERS else 2)
+        unknown = paths[0].parent / "keep.txt"
+        unknown.write_text("not a cache record")
         abandoned = Path(str(paths[0]) + ".tmp.Abc123")
         abandoned.write_text("interrupted publication")
         result = subprocess.run(
-            [WORKERS["normal"], "clear"],
-            env=self.environment,
+            [WORKERS.get("version", WORKERS["normal"]), "clear"],
+            # Maintenance must work without querying NVRTC at all.
+            env=self.environment | {"SIMPATICO_TEST_NVRTC_VERSION": "error"},
             cwd=self.root,
             text=True,
             capture_output=True,
@@ -268,6 +278,7 @@ class CacheProcesses(unittest.TestCase):
         self.assertFalse(abandoned.exists())
         self.assertEqual(list(self.cache.glob("v2/*/*.cubin")), [])
         self.assertEqual(unrelated.read_text(), "preserve me")
+        self.assertEqual(unknown.read_text(), "not a cache record")
         self.assertEqual(self.worker(), (1, 1, 0))
 
 
