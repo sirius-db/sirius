@@ -2323,7 +2323,13 @@ mod tests {
         );
         // A partitioned join's filter: each CN holds part of the keys.
         let mut partitioned = probing_scan(36);
-        let plan = partitioned.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        let plan = partitioned
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap();
         plan.nodes[0].probe_runtime_filters.as_mut().unwrap()[0].build_join_mode =
             Some(starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED);
         let logs = captured_logs(|| service.run_or_register(&partitioned).unwrap());
