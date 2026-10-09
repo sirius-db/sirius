@@ -1087,6 +1087,26 @@ TEST_CASE("repeated loads clear explicit and cap-derived operator values",
   require_shared_operator_defaults(config.get_operator_params(), physical_default);
 }
 
+TEST_CASE("admission default follows the GPU-memory derivation and ignores effective capacity",
+          "[sirius][config][operator_defaults]")
+{
+  auto const derived = sirius::config::derived_default_admission_bytes_per_gpu();
+  sirius::sirius_config config;
+  REQUIRE(config.get_operator_params().admission_bytes_per_gpu == derived);
+
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0) {
+    REQUIRE(derived >= (1ULL << 30));
+    REQUIRE(derived <= (8ULL << 30));
+  } else {
+    REQUIRE(derived == 0);
+  }
+
+  // A capped effective GPU capacity narrows the batch defaults but not the admission target.
+  config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
+  REQUIRE(config.get_operator_params().admission_bytes_per_gpu == derived);
+}
+
 TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
           "[sirius][context][config][operator_defaults][isolated_context]")
 {

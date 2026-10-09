@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "planner/gpu_admission.hpp"
+#include "sirius_config.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -315,4 +316,22 @@ TEST_CASE("estimate_bytes_per_row saturates instead of wrapping", "[admission_es
   auto const total = total_scan_bytes({{1000, k_max}});
   REQUIRE(total.has_value());
   CHECK(gpu_count_for_bytes(*total, 1024, 4) == 4);
+}
+
+TEST_CASE("admission default scales with GPU memory between 1 and 8 GiB", "[admission_estimator]")
+{
+  using sirius::config::admission_bytes_per_gpu_for_memory;
+  constexpr uint64_t GiB = 1ULL << 30;
+  constexpr uint64_t MiB = 1ULL << 20;
+  // GB200: 189,471 MiB -> 7.9 GiB, under the cap.
+  CHECK(admission_bytes_per_gpu_for_memory(189'471 * MiB) == (189'471 * MiB) / 24);
+  // GB300 (256 GB) and anything larger hit the 8 GiB cap.
+  CHECK(admission_bytes_per_gpu_for_memory(256 * GiB) == 8 * GiB);
+  CHECK(admission_bytes_per_gpu_for_memory(192 * GiB) == 8 * GiB);
+  // 80 GB H100 class lands in between.
+  CHECK(admission_bytes_per_gpu_for_memory(80 * GiB) == (80 * GiB) / 24);
+  // L4 class (24 GB) and smaller sit on the 1 GiB floor.
+  CHECK(admission_bytes_per_gpu_for_memory(24 * GiB) == 1 * GiB);
+  CHECK(admission_bytes_per_gpu_for_memory(16 * GiB) == 1 * GiB);
+  CHECK(admission_bytes_per_gpu_for_memory(0) == 1 * GiB);
 }

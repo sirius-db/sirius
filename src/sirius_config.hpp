@@ -52,6 +52,27 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 /// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
 
+/// Per-GPU admission target for a GPU with `gpu_total_bytes` of memory: memory / 24, clamped to
+/// [1 GiB, 8 GiB]. Pure arithmetic so it can be unit-tested without a GPU. Memory stands in for
+/// GPU class here: the real quantity is how many scan bytes one GPU processes in the time it takes
+/// to involve another, which is not knowable at startup. Smaller GPUs get a lower target, which
+/// sends medium queries to more GPUs, the safe direction.
+constexpr uint64_t admission_bytes_per_gpu_for_memory(uint64_t gpu_total_bytes)
+{
+  constexpr uint64_t floor_bytes = 1ULL << 30;  // 1 GiB
+  constexpr uint64_t cap_bytes   = 8ULL << 30;  // 8 GiB
+  uint64_t const derived         = gpu_total_bytes / 24;
+  return derived < floor_bytes ? floor_bytes : (derived > cap_bytes ? cap_bytes : derived);
+}
+
+/// Default `admission_bytes_per_gpu`: admission_bytes_per_gpu_for_memory() of the smallest
+/// visible GPU's total memory; 0 (admission off) when no GPU is visible. Memoized like
+/// derived_default_batch_size(). Anchored on a 4x GB200 (189 GiB per GPU -> 7.9 GiB), where
+/// 8 GiB was the largest value that left no TPC-H query at SF100 or SF1000 more than 5% slower
+/// than all four GPUs (2026-10-08, with the table-row-count scan estimate). Not narrowed by an
+/// explicit GPU capacity: this is a parallelism dial, not a memory budget.
+uint64_t derived_default_admission_bytes_per_gpu();
+
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = DEFAULT_BATCH_SIZE;
@@ -246,11 +267,13 @@ struct operator_params {
   double dense_count_join_memory_fraction = config::DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
-  /// At query start, the engine estimates total scan output bytes from the plan's
-  /// estimated_cardinality × per-column width, then assigns
-  /// ceil(total_bytes / admission_bytes_per_gpu) GPUs, clamped to [1, active_gpu_count].
-  /// 0 disables dynamic estimation and falls back to topology.gpus_per_query.
-  uint64_t admission_bytes_per_gpu = 0;
+  /// At query start, the engine estimates total scan output bytes from each scan's row count
+  /// (the larger of the planner's estimate and the table's unfiltered count) × per-column width,
+  /// then assigns ceil(total_bytes / admission_bytes_per_gpu) GPUs, clamped to
+  /// [1, active_gpu_count]. Defaults to config::derived_default_admission_bytes_per_gpu()
+  /// (smallest GPU's memory / 24, clamped to [1 GiB, 8 GiB]); 0 disables the estimate and
+  /// falls back to topology.gpus_per_query.
+  uint64_t admission_bytes_per_gpu = config::derived_default_admission_bytes_per_gpu();
 
   /// Bytes assumed per variable-width column (VARCHAR, LIST, etc.) when computing
   /// per-row byte estimates for admission. Only used when admission_bytes_per_gpu > 0.
