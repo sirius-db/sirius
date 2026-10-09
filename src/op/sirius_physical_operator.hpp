@@ -264,11 +264,31 @@ class pipelineable_operator_data : public operator_data {
   /**
    * @brief IDs of the non-null input batches in input order, as constructed.
    *
-   * The IDs survive preparation, which may replace a batch with a cross-GPU clone that has a new
-   * ID, and task retries, which reuse this object. `dynamic_filter_publication_session` uses them
-   * to deduplicate contributions.
+   * The IDs survive every row-preserving replacement: preparation, which may replace a batch with a
+   * cross-GPU clone that has a new ID; `with_batches_preserving_rows`; and task retries, which
+   * reuse this object. `dynamic_filter_publication_session` uses them to deduplicate contributions.
    */
   [[nodiscard]] std::vector<std::uint64_t> original_batch_ids() const;
+
+  /**
+   * @brief Builds a payload of the same dynamic type that carries @p batches in place of this
+   * payload's batches.
+   *
+   * Use this when each replacement holds the same rows in the same order, as when
+   * `materialize_deferred_input` restores late-materialized columns. Rows are unchanged, so the
+   * result keeps everything this payload knows about them: its per-position original batch IDs (the
+   * first original ID wins, so a relocated and then restored batch keeps the producer's ID), its
+   * preferred device, and the metadata of a subtype, such as a partition index or a scan receipt.
+   * An operator that changes rows or columns must build a new plain payload instead.
+   *
+   * @throws std::invalid_argument if @p batches does not pair one batch with each of this payload's
+   * batches, null exactly where this payload's batch is null
+   *
+   * @param batches The replacement for each batch of this payload, in the same positions
+   * @return The new payload; this payload is unchanged
+   */
+  [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const;
 
   [[nodiscard]] operator_data_type get_type() const override
   {
@@ -350,9 +370,27 @@ class pipelineable_operator_data : public operator_data {
     return result.empty() ? "UNKNOWN" : result;
   }
 
+ protected:
+  /**
+   * @brief Takes the row identity of @p source, whose batches this payload's batches replace
+   * position by position.
+   *
+   * Copies the preferred device and records, for each position whose batch ID differs, the original
+   * ID @p source reports for that position. Used by every `with_batches_preserving_rows`
+   * implementation.
+   *
+   * @throws std::invalid_argument if the two payloads do not hold non-null batches at the same
+   * positions
+   */
+  void adopt_row_identity(pipelineable_operator_data const& source);
+
  private:
+  /// The original ID of the batch at @p position, which must hold a non-null batch.
+  [[nodiscard]] std::uint64_t original_batch_id_at(std::size_t position) const;
+
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
-  /// (position, original ID) of each batch that preparation replaced with a clone; usually empty.
+  /// (position, original ID) of each batch that a row-preserving replacement swapped for a batch
+  /// with another ID; usually empty.
   std::vector<std::pair<std::size_t, std::uint64_t>> _replaced_batch_ids;
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
@@ -406,6 +444,14 @@ class partitioned_operator_data : public pipelineable_operator_data {
    *         "place by data affinity", not "partition 0".
    */
   [[nodiscard]] std::optional<std::size_t> get_partition_idx() const { return _partition_idx; }
+
+  /// Keeps the partition index; see `pipelineable_operator_data::with_batches_preserving_rows`.
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const override;
+
+ protected:
+  /// Takes the row identity and the partition index of @p source.
+  void adopt_partition_identity(partitioned_operator_data const& source);
 
  private:
   std::optional<std::size_t> _partition_idx;

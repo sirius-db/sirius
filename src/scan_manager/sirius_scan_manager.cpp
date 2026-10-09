@@ -203,7 +203,7 @@ struct cached_databatch_provider : public databatch_provider {
                             std::vector<cudf::data_type> normalization_targets,
                             bool has_physical_overrides,
                             sirius::pushdown_request pushdown_req,
-                            std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters)
+                            std::shared_ptr<op::scan::dynamic_filter_consumer> consumer)
     : _plan(std::move(plan)),
       _entry_owner(std::move(entry)),
       _entry(deref_or_throw(_entry_owner)),
@@ -213,7 +213,7 @@ struct cached_databatch_provider : public databatch_provider {
       _normalization_targets(std::move(normalization_targets)),
       _has_physical_overrides(has_physical_overrides),
       _pushdown_req(std::move(pushdown_req)),
-      _dynamic_filters(std::move(dynamic_filters))
+      _consumer(std::move(consumer))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -308,17 +308,19 @@ struct cached_databatch_provider : public databatch_provider {
     }
     auto const index = _plan.survivor_chunk_indices[cursor];
     std::shared_ptr<cucascade::data_batch> data;
+    std::vector<op::scan::applied_entry> decode_attached;
     if (_entry.tier == cucascade::memory::Tier::GPU) {
-      data = get_device_databatch(index);
+      data = get_device_databatch(index, decode_attached);
     } else if (_entry.tier == cucascade::memory::Tier::HOST) {
-      data = get_host_databatch(index);
+      data = get_host_databatch(index, decode_attached);
     }
     if (!data) { return {}; }
     auto mask             = index < _mvcc_masks.size() ? _mvcc_masks[index] : mvcc_chunk_mask{};
     auto const converts   = chunk_needs_carrier_conversion(index);
     auto const dest_bytes = converts ? conversion_destination_bytes_for_chunk(index) : 0;
     databatch_provider::batch out{std::move(data), std::move(mask), converts, dest_bytes};
-    out.origin = origin_for(index);
+    out.origin          = origin_for(index);
+    out.decode_attached = std::move(decode_attached);
     return out;
   }
 
@@ -330,7 +332,18 @@ struct cached_databatch_provider : public databatch_provider {
   /// Exclusive scan of per-chunk rows over ALL the entry's chunks.
   std::vector<std::int64_t> _chunk_row_start;
 
-  std::shared_ptr<cucascade::data_batch> get_host_databatch(std::size_t index)
+  template <typename Representation>
+  void attach_memberships(Representation& projected,
+                          std::vector<op::scan::applied_entry>& history) const
+  {
+    // The MVCC mask is already attached. Keep the provider defaults for prefetch;
+    // scan_operator_input::prepare_for_processing applies the split policy if conversion is still
+    // pending.
+    op::scan::attach_membership_probes(projected, _consumer.get(), {}, history);
+  }
+
+  std::shared_ptr<cucascade::data_batch> get_host_databatch(
+    std::size_t index, std::vector<op::scan::applied_entry>& history)
   {
     if (index >= _entry.host_chunks.size()) { return nullptr; }
     const auto& chunk = _entry.host_chunks.at(index);
@@ -343,6 +356,7 @@ struct cached_databatch_provider : public databatch_provider {
         auto const& mask = _mvcc_masks[index];
         projected->set_visibility_mask(sirius::decode_visibility_mask{mask.words, mask.row_count});
       }
+      attach_memberships(*projected, history);
       return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
     }
     auto& host          = chunk->cast<cucascade::host_data_representation>();
@@ -354,7 +368,8 @@ struct cached_databatch_provider : public databatch_provider {
       telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
-  std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
+  std::shared_ptr<cucascade::data_batch> get_device_databatch(
+    std::size_t index, std::vector<op::scan::applied_entry>& history)
   {
     // GPU-tier compression-enabled pin: one device_pin_chunk per batch, in
     // emission order. Dispatch per chunk on the populated form — a single pin may
@@ -385,40 +400,8 @@ struct cached_databatch_provider : public databatch_provider {
           projected->set_visibility_mask(
             sirius::decode_visibility_mask{mask.words, mask.row_count});
         }
-        // The drain usually precedes join publication. Decode-time refresh replaces this early
-        // snapshot; snapshot_membership_probes owns the shared output-to-slot mapping contract.
-        // Masked chunks compose these probes with the visibility mask attached above.
-        if (sirius::decompression_pushdown_enabled() && _dynamic_filters &&
-            _dynamic_filters->has_filters()) {
-          auto const snapshot = _dynamic_filters->snapshot();
-          if (!snapshot.empty()) {
-            auto snap =
-              sirius::op::scan::snapshot_membership_probes(snapshot, _column_indices.size());
-            SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-              "[decompression-pushdown] join filter attach (drain) channel={}: slots={} "
-              "attached={} "
-              "generation={} skipped_non_maskable={}",
-              static_cast<void const*>(_dynamic_filters.get()),
-              _column_indices.size(),
-              snap.attached_probes,
-              snap.generation,
-              snap.skipped_non_mask);
-            if (snap.attached_probes > 0) {
-              auto const base = pushdown_scan
-                                  ? pushdown_scan
-                                  : std::make_shared<const sirius::decompression_pushdown_scan>(
-                                      sirius::pushdown_request{});
-              pushdown_scan = base->with_membership_probes(std::move(snap.probes), snap.generation);
-            }
-          } else {
-            SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-              "[decompression-pushdown] join filter attach (drain) channel={}: none published yet "
-              "(expected — the drain precedes join publication; the decode-time snapshot "
-              "retries)",
-              static_cast<void const*>(_dynamic_filters.get()));
-          }
-        }
         if (pushdown_scan) { projected->set_pushdown_scan(std::move(pushdown_scan)); }
+        attach_memberships(*projected, history);
         return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
       }
       // Uncompressed chunk: project the requested columns (positions into the
@@ -603,10 +586,7 @@ struct cached_databatch_provider : public databatch_provider {
   /// host path would have to parse the chunk header to know what its plans can
   /// exploit, and that tier is not where the decode costs anything.
   sirius::pushdown_request _pushdown_req;
-  /// The operator's dynamic-filter channel (may be null). NOT a snapshot: the
-  /// per-batch attach in get_device_databatch snapshots it at serve time so
-  /// batches pick up join filters as they are published mid-scan.
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _dynamic_filters;
+  std::shared_ptr<op::scan::dynamic_filter_consumer> _consumer;
   std::atomic<std::size_t> _index{0};
 };
 
@@ -841,11 +821,12 @@ std::optional<std::string> admit_group_key_extension(
 /// output, so admitting one means moving the substitution ahead of the filter's
 /// gather and carrying the rowid through it.
 ///
-/// A scan a join may publish a filter into is admitted. What the rowid needs is
-/// that a served batch still be the chunk's rows in order, and a published
-/// filter breaks that only by compacting the batch during the decode --
-/// substitute_deferred_columns checks the row count and fails rather than
-/// addressing rows the batch no longer holds.
+/// A scan a join may publish a filter into is admitted. What the rowid needs is that a served batch
+/// still be the chunk's rows in order, so a deferring scan's decode carries no dynamic membership
+/// probes: `sirius_gpu_scan_operator::decode_consumer` is null once a deferral is installed, and
+/// the endpoint applies the filters after substitution instead. prepare_for_query therefore
+/// installs every deferral before it builds any provider.
+///
 /// What the install did, for the rider pass that runs after every assignment.
 struct late_mat_outcome {
   /// The scan is ADDRESSABLE (its batches carry pin-order origins) but deferred
@@ -1779,6 +1760,16 @@ void sirius_scan_manager::prepare_for_query(
   // (maybe_start_memory_prefetcher, above) — until materialization is device-aware.
   bool const single_gpu_pin =
     _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size() == 1;
+  // Two passes: the first installs every deferral, riders included, and the second builds the
+  // providers. A provider attaches decode probes through its scan's decode_consumer(), which an
+  // installed deferral withholds, so no provider may exist before the last deferral does.
+  struct provider_inputs {
+    mvcc_chunk_mask_set masks;
+    std::vector<insert_delta_split> delta_splits;
+    sirius::pushdown_request pushdown_req;
+  };
+  std::vector<provider_inputs> provider_inputs_by_assignment;
+  provider_inputs_by_assignment.reserve(cached_assignments.size());
   for (auto& assignment : cached_assignments) {
     mvcc_chunk_mask_set masks;  // stays empty for parquet pins
     std::vector<insert_delta_split> delta_splits;
@@ -1840,47 +1831,13 @@ void sirius_scan_manager::prepare_for_query(
     auto const& ingestible = assignment.op->get_ingestible();
     auto pushdown_req      = sirius::op::build_pushdown_request(
       ingestible.filter_analysis(), slot_map, ingestible.output_prefix_width());
-    // The provider captures the operator's dynamic-filter CHANNEL (not a
-    // snapshot) so each compressed batch can pick up join-published filters at
-    // serve time.
-    std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
-    if (sirius::decompression_pushdown_enabled()) {
-      auto const& info = ingestible.table_info();
-      if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
-        dynamic_filters = pq->sirius_dynamic_filters;
-      } else if (auto const* native =
-                   dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
-        dynamic_filters = native->sirius_dynamic_filters;
-      }
-      // Channel identity: this pointer must match the one the hash join
-      // publishes into (both resolve through the generator's channel map, keyed
-      // by duckdb's DynamicTableFilterSet pointer) and the one the decode-time
-      // snapshot logs.
-      SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-        "[decompression-pushdown] entry '{}': join filter channel={} published_now={} decode "
-        "request: "
-        "{} slot(s), covers_whole_filter={}",
-        assignment.entry_name,
-        static_cast<void const*>(dynamic_filters.get()),
-        dynamic_filters ? dynamic_filters->has_filters() : false,
-        pushdown_req.columns.size(),
-        pushdown_req.ranges_cover_whole_filter);
-    } else {
+    if (!sirius::decompression_pushdown_enabled()) {
       // Answering an equality off a dictionary is independent of the gate; row
       // dropping is not, so give it up when the gate is off.
       auto const unfiltered =
         sirius::decompression_pushdown_scan{std::move(pushdown_req)}.without_row_selection();
       pushdown_req = unfiltered ? unfiltered->request() : sirius::pushdown_request{};
     }
-    // The provider charges a served column only for the cast scan normalization will make, so
-    // it needs the scan's carrier targets. They are passed in output order, which is also the
-    // order the cached chunks are served in: assignment.columns follows the ingestible's
-    // materialized order, and both ingestibles materialize the output columns first (in output
-    // order) and any pure-filter columns after them, so served slot k is output column k for
-    // every k below the output arity. Only a hive-partition output column would decouple the
-    // two -- it occupies an output position with no materialized column -- and such a scan
-    // cannot serve from a pin, since a pin never captures a partition column and a scan
-    // requesting one therefore misses the cache.
     // Both halves of the deferral, installed before a single task runs. Read
     // the eligibility conditions here against prepare_origin_annotation's: the
     // scan side must substitute only for batches the provider stamps.
@@ -1899,16 +1856,49 @@ void sirius_scan_manager::prepare_for_query(
     } else if (late_mat.port != nullptr) {
       installed_rides.push_back(installed_ride{late_mat.port, assignment.op});
     }
+    provider_inputs_by_assignment.push_back(
+      provider_inputs{std::move(masks), std::move(delta_splits), std::move(pushdown_req)});
+  }
+  install_rider_deferrals(rider_candidates, installed_rides);
+
+  for (std::size_t i = 0; i < cached_assignments.size(); ++i) {
+    auto& assignment = cached_assignments[i];
+    auto& inputs     = provider_inputs_by_assignment[i];
+    auto consumer    = assignment.op->decode_consumer();
+    if (sirius::decompression_pushdown_enabled()) {
+      if (assignment.op->consumer() && !consumer) {
+        SIRIUS_LOG_INFO(
+          "[late-mat] operator {}: dynamic decode attachments withheld — deferral addresses whole "
+          "chunks",
+          assignment.op->get_operator_id());
+      }
+      SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+        "[decompression-pushdown] entry '{}': consumer={} request: {} slot(s), "
+        "covers_whole_filter={}",
+        assignment.entry_name,
+        static_cast<void const*>(consumer.get()),
+        inputs.pushdown_req.columns.size(),
+        inputs.pushdown_req.ranges_cover_whole_filter);
+    }
+    // The provider charges a served column only for the cast scan normalization will make, so
+    // it needs the scan's carrier targets. They are passed in output order, which is also the
+    // order the cached chunks are served in: assignment.columns follows the ingestible's
+    // materialized order, and both ingestibles materialize the output columns first (in output
+    // order) and any pure-filter columns after them, so served slot k is output column k for
+    // every k below the output arity. Only a hive-partition output column would decouple the
+    // two -- it occupies an output position with no materialized column -- and such a scan
+    // cannot serve from a pin, since a pin never captures a partition column and a scan
+    // requesting one therefore misses the cache.
     auto provider                 = make_provider_for_pinned_entry(assignment.entry,
                                                    assignment.columns,
                                                    std::move(assignment.plan),
                                                    assignment.op->batch_telemetry(),
-                                                   std::move(masks),
-                                                   std::move(delta_splits),
+                                                   std::move(inputs.masks),
+                                                   std::move(inputs.delta_splits),
                                                    assignment.op->normalization_targets(),
                                                    assignment.op->has_physical_overrides(),
-                                                   std::move(pushdown_req),
-                                                   std::move(dynamic_filters));
+                                                   std::move(inputs.pushdown_req),
+                                                   std::move(consumer));
     provider->contract_id         = assignment.op->contract_id();
     provider->validation.identity = assignment.entry->identity_evidence;
     provider->validation.layout   = assignment.entry->layout_evidence;
@@ -1921,7 +1911,6 @@ void sirius_scan_manager::prepare_for_query(
     provider->validation.query_token = sirius::value_of(query_id);
     state->metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
-  install_rider_deferrals(rider_candidates, installed_rides);
   state->pending_mvcc_mask_jobs.clear();
   state->pending_insert_delta_jobs.clear();
 
@@ -3476,7 +3465,7 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::vector<cudf::data_type> normalization_targets,
   bool has_physical_overrides,
   sirius::pushdown_request pushdown_req,
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters)
+  std::shared_ptr<op::scan::dynamic_filter_consumer> consumer)
 {
   return std::make_unique<cached_databatch_provider>(std::move(entry),
                                                      selected_columns,
@@ -3487,7 +3476,7 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
                                                      std::move(normalization_targets),
                                                      has_physical_overrides,
                                                      std::move(pushdown_req),
-                                                     std::move(dynamic_filters));
+                                                     std::move(consumer));
 }
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,

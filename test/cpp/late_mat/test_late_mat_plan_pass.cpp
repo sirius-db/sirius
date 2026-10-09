@@ -31,6 +31,7 @@
 #include <expression/ast/comparison.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/ast/reference.hpp>
+#include <op/scan/sirius_physical_dynamic_filter.hpp>
 #include <op/sirius_physical_concat.hpp>
 #include <op/sirius_physical_filter.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
@@ -113,6 +114,11 @@ struct test_filter : sirius::op::sirius_physical_filter {
 
 struct test_projection : sirius::op::sirius_physical_projection {
   using sirius_physical_projection::sirius_physical_projection;
+  void link(sirius_physical_operator* parent) { _parent_op = parent; }
+};
+
+struct test_dynamic_filter : sirius::op::scan::sirius_physical_dynamic_filter {
+  using sirius_physical_dynamic_filter::sirius_physical_dynamic_filter;
   void link(sirius_physical_operator* parent) { _parent_op = parent; }
 };
 
@@ -540,6 +546,368 @@ TEST_CASE("a join key may not be deferred, however far it rides", "[late_mat][li
 
   auto const planned = sirius::planner::plan_deferral(*scan);
   REQUIRE(planned.join_keys_skipped == 1);
+}
+
+TEST_CASE("registered dynamic-filter targets preserve unrelated payload deferral",
+          "[late_mat][lifetime][dynamic_filter]")
+{
+  wide_scan scan(5);
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto first   = channel->register_producer({2, 0});
+  auto second  = channel->register_producer({1, 2});
+  channel->freeze_registration();
+  REQUIRE(channel->snapshot().empty());
+  REQUIRE_FALSE(channel->snapshot().terminal());
+  test_dynamic_filter endpoint(
+    make_string_types(5),
+    0,
+    std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      channel,
+      sirius::op::scan::consumer_config{
+        .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
+      std::vector<sirius::op::scan::binding>{}));
+  keyless_key_source keys;
+  auto chain = partition_chain(5, 3, keys);
+  opaque_op reader(5);
+  scan.link(&endpoint);
+  link_chain(endpoint, chain, reader);
+  for (auto const& partition : chain) {
+    REQUIRE(partition->partition_keys().empty());
+  }
+
+  for (int completed = 0; completed <= 2; ++completed) {
+    CAPTURE(completed);
+    if (completed == 1) { first.finish(); }
+    if (completed == 2) { second.finish(); }
+    auto const lives = analyze_column_lifetimes(scan);
+    for (std::size_t position : {0, 1, 2}) {
+      REQUIRE(lives[position].first_reader == &endpoint);
+      REQUIRE(lives[position].position_at_reader == position);
+      REQUIRE(lives[position].reader_input == &scan);
+      REQUIRE_FALSE(lives[position].read_as_join_key);
+      REQUIRE(lives[position].group_key_at.empty());
+    }
+    for (std::size_t position : {3, 4}) {
+      REQUIRE(lives[position].first_reader == &reader);
+    }
+    auto const planned = sirius::planner::plan_deferral(scan);
+    REQUIRE(planned.installable());
+    REQUIRE(planned.port == &reader);
+    REQUIRE(planned.positions == std::vector<std::size_t>{3, 4});
+    REQUIRE(planned.port_positions == planned.positions);
+    REQUIRE(planned.boundaries == 4);
+    REQUIRE(planned.join_keys_skipped == 0);
+  }
+  REQUIRE(channel->snapshot().terminal());
+
+  auto const planned = sirius::planner::plan_deferral(scan);
+  std::vector<cudf::data_type> const schema(5, cudf::data_type{cudf::type_id::STRING});
+  auto handle = std::make_shared<sirius::late_mat::pin_entry_handle>("payload", 1);
+  std::vector<sirius::late_mat::column_origin> origins;
+  for (auto position : planned.positions) {
+    sirius::late_mat::column_origin origin;
+    origin.handle     = handle;
+    origin.generation = handle->generation();
+    origin.column_pos = static_cast<std::uint32_t>(position);
+    origins.push_back(std::move(origin));
+  }
+  REQUIRE(sirius::planner::install_deferral(
+    scan,
+    *planned.port,
+    sirius::late_mat::make_defer_pair(
+      schema, planned.positions, schema, planned.port_positions, origins)));
+  REQUIRE(scan.deferred_output().output_positions == std::vector<std::size_t>{3, 4});
+  REQUIRE(reader.port_directive().valid());
+  REQUIRE(endpoint.port_directive().empty());
+}
+
+TEST_CASE("an unscoped dynamic-filter producer permits restoration only before its endpoint",
+          "[late_mat][lifetime][dynamic_filter]")
+{
+  auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto unscoped = channel->register_producer({});
+  std::vector<sirius::op::sirius_dynamic_filter_set::producer> scoped;
+  SECTION("unscoped alone") {}
+  SECTION("unscoped alongside a scoped producer")
+  {
+    scoped.push_back(channel->register_producer({1}));
+  }
+  channel->freeze_registration();
+  wide_scan scan(3);
+  test_dynamic_filter endpoint(
+    make_string_types(3),
+    0,
+    std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      channel,
+      sirius::op::scan::consumer_config{
+        .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
+      std::vector<sirius::op::scan::binding>{}));
+  opaque_op reader(3);
+  keyless_key_source keys;
+  auto chain = partition_chain(3, 3, keys);
+  link_chain(scan, chain, endpoint);
+  endpoint.link(&reader);
+
+  auto const lives = analyze_column_lifetimes(scan);
+  for (std::size_t position = 0; position < lives.size(); ++position) {
+    REQUIRE(lives[position].first_reader == &endpoint);
+    REQUIRE(lives[position].position_at_reader == position);
+    REQUIRE_FALSE(lives[position].read_as_join_key);
+  }
+  auto const before_endpoint = sirius::planner::plan_deferral(scan);
+  REQUIRE(before_endpoint.installable());
+  REQUIRE(before_endpoint.port == &endpoint);
+  REQUIRE(before_endpoint.port_input == chain.back().get());
+  REQUIRE(before_endpoint.positions == std::vector<std::size_t>{0, 1, 2});
+  REQUIRE(before_endpoint.join_keys_skipped == 0);
+
+  wide_scan immediate_scan(3);
+  immediate_scan.link(&endpoint);
+  REQUIRE_FALSE(sirius::planner::plan_deferral(immediate_scan).installable());
+}
+
+TEST_CASE("known empty dynamic-filter endpoints preserve profitable deferral",
+          "[late_mat][lifetime][dynamic_filter]")
+{
+  std::shared_ptr<sirius::op::scan::dynamic_filter_consumer> consumer;
+  SECTION("null consumer") {}
+  SECTION("producer-free channel")
+  {
+    auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    channel->freeze_registration();
+    consumer = std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      channel, sirius::op::scan::consumer_config{}, std::vector<sirius::op::scan::binding>{});
+  }
+  wide_scan scan(3);
+  test_dynamic_filter endpoint(make_string_types(3), 0, consumer);
+  keyless_key_source keys;
+  auto chain = partition_chain(3, 3, keys);
+  opaque_op reader(3);
+  scan.link(&endpoint);
+  link_chain(endpoint, chain, reader);
+  auto const planned = sirius::planner::plan_deferral(scan);
+  REQUIRE(planned.installable());
+  REQUIRE(planned.port == &reader);
+  REQUIRE(planned.positions == std::vector<std::size_t>{0, 1, 2});
+}
+
+TEST_CASE("an unknown dynamic-filter shape ends every column's ride",
+          "[late_mat][lifetime][dynamic_filter]")
+{
+  fake_scan scan(2);
+  sirius::op::sirius_physical_operator endpoint(
+    sirius::op::SiriusPhysicalOperatorType::DYNAMIC_FILTER, make_types(2), 0);
+  scan.link(&endpoint);
+  auto const lives = analyze_column_lifetimes(scan);
+  for (auto const& life : lives) {
+    REQUIRE(life.first_reader == &endpoint);
+    REQUIRE(life.reader_input == &scan);
+  }
+}
+
+TEST_CASE("dynamic-filter endpoints follow projection filter and shortened join output ordinals",
+          "[late_mat][lifetime][dynamic_filter]")
+{
+  auto scan          = duckdb::make_uniq<fake_scan>(4);
+  auto* scan_ptr     = scan.get();
+  auto scan_channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto scan_producer = scan_channel->register_producer({3});
+  scan_channel->freeze_registration();
+  auto first = duckdb::make_uniq<test_dynamic_filter>(
+    make_types(4),
+    0,
+    std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      scan_channel,
+      sirius::op::scan::consumer_config{
+        .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
+      std::vector<sirius::op::scan::binding>{}));
+  auto* first_ptr = first.get();
+  scan->link(first.get());
+  first->children.push_back(std::move(scan));
+
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
+  for (auto position : {2, 0, 3, 1}) {
+    expressions.push_back(ref(position));
+  }
+  auto projection = duckdb::make_uniq<test_projection>(make_types(4), std::move(expressions), 0);
+  first->link(projection.get());
+  projection->children.push_back(std::move(first));
+  auto predicate = std::make_unique<sirius::ast::node>(
+    sirius::ast::comparison{sirius::comparison_type::equal, ref(1), ref(1)});
+  auto filter = duckdb::make_uniq<test_filter>(
+    make_types(4), std::move(predicate), 0, std::vector<cudf::size_type>{3, 0, 1, 2});
+  auto* filter_ptr = filter.get();
+  projection->link(filter.get());
+  filter->children.push_back(std::move(projection));
+
+  duckdb::LogicalDummyScan stub(0);
+  stub.types = duckdb::vector<duckdb::LogicalType>(4, duckdb::LogicalType::INTEGER);
+  duckdb::vector<sirius::join_condition> conditions;
+  sirius::join_condition condition;
+  condition.left       = ref(0);
+  condition.right      = ref(2);
+  condition.comparison = sirius::comparison_type::equal;
+  conditions.push_back(std::move(condition));
+  test_join join(stub,
+                 duckdb::make_uniq<fake_scan>(4),
+                 std::move(filter),
+                 std::move(conditions),
+                 duckdb::JoinType::INNER,
+                 /*left_projection_map=*/{3},
+                 /*right_projection_map=*/{1, 0, 3},
+                 /*delim_types=*/{},
+                 /*estimated_cardinality=*/1);
+  filter_ptr->link(&join);
+  auto join_channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto join_producer = join_channel->register_producer({1});
+  join_channel->freeze_registration();
+  test_dynamic_filter second(
+    make_types(4),
+    0,
+    std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      join_channel,
+      sirius::op::scan::consumer_config{
+        .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
+      std::vector<sirius::op::scan::binding>{}));
+  opaque_op reader(4);
+  join.link(&second);
+  second.link(&reader);
+
+  REQUIRE(first_ptr->consumer()->channel() == scan_channel);
+  REQUIRE(second.consumer()->channel() == join_channel);
+  REQUIRE(scan_channel != join_channel);
+  auto const lives = analyze_column_lifetimes(*scan_ptr);
+  REQUIRE(lives[2].first_reader == &second);
+  REQUIRE(lives[2].position_at_reader == 1);
+  REQUIRE(lives[2].scan_output_position == 2);
+  REQUIRE(lives[2].reader_input == &join);
+  REQUIRE(lives[2].join_key_at.empty());
+  REQUIRE_FALSE(lives[2].read_as_join_key);
+  REQUIRE(lives[3].first_reader == first_ptr);
+  REQUIRE(lives[3].position_at_reader == 3);
+  REQUIRE(lives[3].reader_input == scan_ptr);
+  REQUIRE(lives[1].first_reader == &reader);
+  REQUIRE(lives[1].position_at_reader == 2);
+  REQUIRE(lives[1].reader_input == &second);
+}
+
+TEST_CASE("dynamic-filter reads retain later join and group roles and prevent count-only deferral",
+          "[late_mat][lifetime][dynamic_filter]")
+{
+  auto scan      = duckdb::make_uniq<wide_scan>(3);
+  auto* scan_ptr = scan.get();
+  auto channel   = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto producer  = channel->register_producer({0, 1});
+  channel->freeze_registration();
+  auto endpoint = duckdb::make_uniq<test_dynamic_filter>(
+    make_string_types(3),
+    0,
+    std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      channel,
+      sirius::op::scan::consumer_config{
+        .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
+      std::vector<sirius::op::scan::binding>{}));
+  auto* endpoint_ptr = endpoint.get();
+  scan->link(endpoint.get());
+  endpoint->children.push_back(std::move(scan));
+
+  duckdb::LogicalDummyScan stub(0);
+  stub.types = duckdb::vector<duckdb::LogicalType>(4, duckdb::LogicalType::VARCHAR);
+  duckdb::vector<sirius::join_condition> conditions;
+  sirius::join_condition condition;
+  condition.left  = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  condition.right = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  condition.comparison = sirius::comparison_type::equal;
+  conditions.push_back(std::move(condition));
+  test_join join(stub,
+                 std::move(endpoint),
+                 duckdb::make_uniq<wide_scan>(1),
+                 std::move(conditions),
+                 duckdb::JoinType::INNER,
+                 /*left_projection_map=*/{},
+                 /*right_projection_map=*/{},
+                 /*delim_types=*/{},
+                 /*estimated_cardinality=*/1);
+  endpoint_ptr->link(&join);
+  auto aggregate = make_aggregate(4, {0, 2}, {1}, cudf::aggregation::Kind::COUNT_VALID);
+  join.link(aggregate.get());
+
+  auto const lives = analyze_column_lifetimes(*scan_ptr);
+  REQUIRE(lives[0].first_reader == endpoint_ptr);
+  REQUIRE_FALSE(lives[0].read_as_join_key);
+  REQUIRE(lives[0].join_key_at.size() == 1);
+  REQUIRE(lives[0].join_key_at.front().join == &join);
+  REQUIRE(lives[0].join_key_at.front().from_lhs);
+  REQUIRE(lives[0].join_key_at.front().bare_column_equality);
+  REQUIRE(lives[0].group_key_at ==
+          std::vector<sirius::op::sirius_physical_operator const*>{aggregate.get()});
+  REQUIRE(lives[1].first_reader == endpoint_ptr);
+  REQUIRE_FALSE(lives[1].consumed_as_count_only);
+}
+
+TEST_CASE("a dynamic-filter target ends a group-key extension at its mapped input",
+          "[late_mat][lifetime][dynamic_filter]")
+{
+  wide_scan scan(3);
+  auto aggregate = make_aggregate(3, {1, 2}, {0});
+  auto channel   = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto producer  = channel->register_producer({0});
+  channel->freeze_registration();
+  test_dynamic_filter endpoint(
+    make_string_types(3),
+    0,
+    std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      channel,
+      sirius::op::scan::consumer_config{
+        .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
+      std::vector<sirius::op::scan::binding>{}));
+  opaque_op reader(3);
+  scan.link(aggregate.get());
+  aggregate->link(&endpoint);
+  endpoint.link(&reader);
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE(lives[1].first_reader == aggregate.get());
+  REQUIRE(lives[1].group_ride.has_value());
+  REQUIRE(lives[1].group_ride->reader == &endpoint);
+  REQUIRE(lives[1].group_ride->position_at_reader == 0);
+  REQUIRE(lives[1].group_ride->reader_input == aggregate.get());
+  REQUIRE_FALSE(lives[1].group_ride->read_as_join_key);
+  REQUIRE(lives[2].group_ride.has_value());
+  REQUIRE(lives[2].group_ride->reader == &reader);
+  REQUIRE(lives[2].group_ride->position_at_reader == 1);
+}
+
+TEST_CASE("duplicate projection references stop before a dynamic-filter endpoint",
+          "[late_mat][lifetime][dynamic_filter]")
+{
+  fake_scan scan(2);
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
+  for (auto position : {0, 0, 1}) {
+    expressions.push_back(ref(position));
+  }
+  test_projection projection(make_types(3), std::move(expressions), 0);
+  auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto producer = channel->register_producer({0, 1});
+  channel->freeze_registration();
+  test_dynamic_filter endpoint(
+    make_types(3),
+    0,
+    std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      channel,
+      sirius::op::scan::consumer_config{
+        .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
+      std::vector<sirius::op::scan::binding>{}));
+  opaque_op reader(3);
+  scan.link(&projection);
+  projection.link(&endpoint);
+  endpoint.link(&reader);
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE(lives[0].first_reader == &projection);
+  REQUIRE(lives[0].reader_input == &scan);
+  REQUIRE(lives[1].first_reader == &reader);
+  REQUIRE(lives[1].position_at_reader == 2);
 }
 
 TEST_CASE("a wide bundle over a long ride plans a deferral at its reader", "[late_mat][lifetime]")

@@ -29,6 +29,7 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
 #include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
@@ -52,6 +53,7 @@
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <filesystem>
@@ -321,10 +323,13 @@ struct sirius_scan_binding {
   [[nodiscard]] bool operator==(sirius_scan_binding const&) const = default;
 };
 
-// Resolve the unique GPU scan that owns filter_set and return its base table name.
+// Resolve the unique GPU scan that owns filter_set and return its base table name. The scan's
+// consumer must carry the decode bindings of every endpoint column in push_ordinals; a native
+// scan's assembly is a leading identity, so each binds the decoder slot of the same index.
 std::string owning_scan_table_of(
   sirius_physical_operator* root,
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> const& filter_set)
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> const& filter_set,
+  std::vector<std::size_t> const& push_ordinals)
 {
   std::vector<sirius::op::scan::duckdb_native_ingestible_table_info const*> owners;
   for_each_operator(root, [&](sirius_physical_operator* op) {
@@ -333,7 +338,27 @@ std::string owning_scan_table_of(
     auto const* info = dynamic_cast<sirius::op::scan::duckdb_native_ingestible_table_info const*>(
       &scan.get_ingestible().table_info());
     REQUIRE(info != nullptr);
-    if (info->sirius_dynamic_filters.get() == filter_set.get()) { owners.push_back(info); }
+    if (scan.consumer() && scan.consumer()->channel() == filter_set) {
+      std::size_t wrappers = 0;
+      for_each_operator(root, [&](sirius_physical_operator* candidate) {
+        if (candidate->type != SiriusPhysicalOperatorType::DYNAMIC_FILTER ||
+            candidate->children.size() != 1 || candidate->children[0].get() != &scan) {
+          return;
+        }
+        auto const& endpoint = candidate->Cast<sirius::op::scan::sirius_physical_dynamic_filter>();
+        REQUIRE(endpoint.consumer() == scan.consumer());
+        ++wrappers;
+      });
+      REQUIRE(wrappers == 1);
+      auto const decode_bindings = scan.consumer()->decode_bindings();
+      REQUIRE_FALSE(decode_bindings.empty());
+      for (auto const ordinal : push_ordinals) {
+        REQUIRE(std::ranges::any_of(decode_bindings, [&](sirius::op::scan::binding const& entry) {
+          return entry.output_ordinal == ordinal && std::cmp_equal(entry.column_index, ordinal);
+        }));
+      }
+      owners.push_back(info);
+    }
   });
   REQUIRE(owners.size() == 1);
   return owners[0]->table_name;
@@ -346,7 +371,11 @@ std::vector<sirius_scan_binding> scan_bindings_of(sirius::op::sirius_physical_ha
   auto const& plan = hj.dynamic_filter_plan();
   for (auto const& target : plan.probe_targets()) {
     if (target.route_class != sirius::op::dynamic_filter_route_class::scan) { continue; }
-    auto table_name = owning_scan_table_of(root, target.filter_set);
+    std::vector<std::size_t> push_ordinals;
+    for (auto const& binding : target.key_bindings) {
+      push_ordinals.push_back(binding.channel_push_ordinal);
+    }
+    auto table_name = owning_scan_table_of(root, target.filter_set, push_ordinals);
     for (auto const& binding : target.key_bindings) {
       bindings.push_back(sirius_scan_binding{
         .condition_index =

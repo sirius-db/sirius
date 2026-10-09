@@ -270,6 +270,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_native_metadata_cache.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
+    test/cpp/scan/test_dynamic_filter_integration.cpp
     test/cpp/scan/test_fused_membership_mask.cpp
     test/cpp/scan/test_fused_scan_filter_delivery.cpp
     test/cpp/scan/test_iceberg_batch_layout.cpp

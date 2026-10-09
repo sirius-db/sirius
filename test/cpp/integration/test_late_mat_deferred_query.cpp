@@ -35,10 +35,12 @@
 // run over the joined rows rather than the ones the scan produced.
 
 #include <catch.hpp>
+#include <compression/decompression_pushdown_policy.hpp>
 #include <duckdb.hpp>
 #include <late_mat/column_origin.hpp>
 #include <late_mat/defer_directive.hpp>
 #include <utils/parquet_fixture_utils.hpp>
+#include <utils/pinned_entry_census.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <cstdint>
@@ -240,4 +242,139 @@ TEST_CASE("a deferred payload rides a real plan and comes back right", "[late_ma
   auto unpin = con.Query("CALL unpin_table('late_mat_customer');");
   REQUIRE(unpin);
   REQUIRE_FALSE(unpin->HasError());
+}
+
+namespace {
+
+/// The q10 shape over an integer customer table, so that a bitpack plan can compress every pinned
+/// column, and a selective orders filter, so that the join publishes a filter into the customer
+/// scan.
+constexpr char const* kCompressedQuery =
+  "SELECT c.c_custkey, c.c_a, c.c_b, c.c_c, count(*) AS n "
+  "FROM read_parquet('{C}') c "
+  "JOIN read_parquet('{O}') o ON c.c_custkey = o.o_custkey "
+  "JOIN read_parquet('{L}') l ON o.o_orderkey = l.l_orderkey "
+  "WHERE o.o_orderkey < 2000 "
+  "GROUP BY c.c_custkey, c.c_a, c.c_b, c.c_c "
+  "ORDER BY c.c_custkey";
+
+std::string compressed_query_for(fs::path const& customer,
+                                 fs::path const& orders,
+                                 fs::path const& lines)
+{
+  std::string sql = kCompressedQuery;
+  sql.replace(sql.find("{C}"), 3, customer.string());
+  sql.replace(sql.find("{O}"), 3, orders.string());
+  sql.replace(sql.find("{L}"), 3, lines.string());
+  return sql;
+}
+
+std::vector<std::string> rows_of(duckdb::MaterializedQueryResult& result)
+{
+  std::vector<std::string> rows;
+  for (duckdb::idx_t i = 0; i < result.RowCount(); ++i) {
+    std::string row;
+    for (duckdb::idx_t c = 0; c < result.ColumnCount(); ++c) {
+      row += result.GetValue(c, i).ToString() + "|";
+    }
+    rows.push_back(std::move(row));
+  }
+  return rows;
+}
+
+}  // namespace
+
+TEST_CASE("a compressed pin under filtered decode and late materialization answers correctly",
+          "[late_mat][dynamic_filter][deferred_query][.late_mat_fused]")
+{
+  if (!sirius::late_mat::late_mat_enabled() || !sirius::decompression_pushdown_enabled()) {
+    SKIP("needs SIRIUS_EXP_LATE_MAT=1 and SIRIUS_EXP_FUSED_SCAN_FILTER=1 in the environment");
+  }
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  sirius::test::scratch_dir scratch{"late_mat_compressed_query"};
+  auto const& tmp   = scratch.path();
+  auto const orders = tmp / "orders.parquet";
+  auto const lines  = tmp / "lineitem.parquet";
+  generate_parquet(tmp / "customer.parquet", orders, lines);
+  auto const customer = tmp / "integer_customer.parquet";
+  {
+    sirius::test::scoped_sirius_disable disable_sirius;
+    duckdb::DuckDB gen_db(nullptr);
+    duckdb::Connection gen(gen_db);
+    auto r = gen.Query(
+      "COPY (SELECT range AS c_custkey, range * 7 AS c_a, range * 11 AS c_b, "
+      "range * 13 AS c_c FROM range(" +
+      std::to_string(kCustomers) + ")) TO " + sirius::test::sql_literal(customer.string()) +
+      " (FORMAT PARQUET);");
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+  }
+  std::vector<std::string> expected;
+  {
+    sirius::test::scoped_sirius_disable disable_sirius;
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    auto r = con.Query(compressed_query_for(customer, orders, lines));
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+    expected = rows_of(*r);
+  }
+  REQUIRE_FALSE(expected.empty());
+
+  auto yaml_path = tmp / "late_mat_compressed_query.yaml";
+  write_config(yaml_path);
+  {
+    // One bitpack block per customer column, in schema order.
+    std::ofstream plan(tmp / "late_mat_compressed_customer.txt");
+    for (int column = 0; column < 4; ++column) {
+      plan << (column == 0 ? "" : "---\n")
+           << "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+    }
+  }
+
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con    = local_env.make_connection();
+  auto run_ok = [&con](std::string const& sql) {
+    auto r = con.Query(sql);
+    REQUIRE(r);
+    if (r->HasError()) { UNSCOPED_INFO(sql << ": " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+  };
+  run_ok("SET enable_duckdb_fallback = false;");
+  run_ok("SET pin_table_compression = true;");
+  run_ok("SET pin_table_compression_min_batch_size_bytes = 0;");
+  run_ok("SET pin_table_compression_max_compressed_fraction = 1000;");
+  run_ok("SET pin_table_input_compression_plan_dir = " + sirius::test::sql_literal(tmp.string()) +
+         ";");
+  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey", 1);
+  run_ok("CALL pin_table(" + sirius::test::sql_literal(customer.string()) +
+         ", tier='gpu', name='late_mat_compressed_customer');");
+  auto const census = sirius::test::census_entry(con, "late_mat_compressed_customer");
+  REQUIRE(census.chunks > 0);
+  REQUIRE(census.compressed_chunks == census.chunks);
+
+  auto const before = sirius::late_mat::deferrals_installed();
+  auto res          = con.Query(compressed_query_for(customer, orders, lines));
+  REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO("query error: " << res->GetError()); }
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(rows_of(*res) == expected);
+  // A compressed origin cannot prove its deferred columns null-free, so no deferral installs over
+  // it, and the decode keeps its dynamic membership probes. When compressed origins become
+  // deferrable, this case must instead require an installed deferral, which then exercises
+  // sirius_gpu_scan_operator::decode_consumer() withholding those probes.
+  REQUIRE(sirius::late_mat::deferrals_installed() == before);
+
+  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
+  run_ok("CALL unpin_table('late_mat_compressed_customer');");
+  run_ok("SET pin_table_compression = false;");
 }

@@ -30,7 +30,11 @@
 #include <cucascade/memory/error.hpp>
 
 #include <algorithm>
+#include <memory>
 #include <optional>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -39,18 +43,70 @@ namespace op {
 // operator_data
 //===--------------------------------------------------------------------===//
 
+std::uint64_t pipelineable_operator_data::original_batch_id_at(std::size_t position) const
+{
+  auto const replaced =
+    std::ranges::find(_replaced_batch_ids, position, &std::pair<std::size_t, std::uint64_t>::first);
+  return replaced != _replaced_batch_ids.end() ? replaced->second
+                                               : _data_batches[position]->get_batch_id();
+}
+
 std::vector<std::uint64_t> pipelineable_operator_data::original_batch_ids() const
 {
   std::vector<std::uint64_t> ids;
   ids.reserve(_data_batches.size());
   for (std::size_t position = 0; position < _data_batches.size(); ++position) {
-    if (!_data_batches[position]) { continue; }
-    auto const replaced = std::ranges::find(
-      _replaced_batch_ids, position, &std::pair<std::size_t, std::uint64_t>::first);
-    ids.push_back(replaced != _replaced_batch_ids.end() ? replaced->second
-                                                        : _data_batches[position]->get_batch_id());
+    if (_data_batches[position]) { ids.push_back(original_batch_id_at(position)); }
   }
   return ids;
+}
+
+void pipelineable_operator_data::adopt_row_identity(pipelineable_operator_data const& source)
+{
+  auto const same_positions = std::ranges::equal(
+    _data_batches, source._data_batches, [](auto const& replacement, auto const& original) {
+      return (replacement == nullptr) == (original == nullptr);
+    });
+  if (!same_positions) {
+    throw std::invalid_argument(
+      "pipelineable_operator_data: a row-preserving replacement must replace each batch in place");
+  }
+  if (auto const device = source.get_preferred_device_id()) { set_preferred_device_id(*device); }
+  _replaced_batch_ids.clear();
+  for (std::size_t position = 0; position < _data_batches.size(); ++position) {
+    if (!_data_batches[position]) { continue; }
+    auto const original = source.original_batch_id_at(position);
+    if (_data_batches[position]->get_batch_id() != original) {
+      _replaced_batch_ids.emplace_back(position, original);
+    }
+  }
+}
+
+std::unique_ptr<pipelineable_operator_data>
+pipelineable_operator_data::with_batches_preserving_rows(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
+{
+  auto replacement = std::make_unique<pipelineable_operator_data>(std::move(batches));
+  replacement->adopt_row_identity(*this);
+  return replacement;
+}
+
+//===--------------------------------------------------------------------===//
+// partitioned_operator_data
+//===--------------------------------------------------------------------===//
+
+void partitioned_operator_data::adopt_partition_identity(partitioned_operator_data const& source)
+{
+  adopt_row_identity(source);
+  _partition_idx = source._partition_idx;
+}
+
+std::unique_ptr<pipelineable_operator_data> partitioned_operator_data::with_batches_preserving_rows(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
+{
+  auto replacement = std::make_unique<partitioned_operator_data>(std::move(batches));
+  replacement->adopt_partition_identity(*this);
+  return replacement;
 }
 
 const std::vector<std::shared_ptr<::cucascade::data_batch>>&
