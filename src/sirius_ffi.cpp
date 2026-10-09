@@ -48,6 +48,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 namespace sirius::ffi {
@@ -286,6 +287,7 @@ struct Fragment::Impl {
     std::vector<std::string> names;
     std::vector<std::string> type_names;
     std::set<sirius::exec::sender_id_t> expected_senders;
+    std::optional<std::uint64_t> estimated_rows;
   };
 
   std::map<sirius::exec::stream_id_t, declared_input> inputs;
@@ -325,6 +327,7 @@ struct Fragment::Impl {
       }
       spec.expected_senders = declared.expected_senders;
       if (spec.expected_senders.empty()) { spec.expected_senders.insert(0); }
+      spec.estimated_rows = declared.estimated_rows;
       resolved.emplace(id, std::move(spec));
     }
     return resolved;
@@ -365,6 +368,12 @@ void Fragment::declare_input_sender(std::uint64_t stream_id, std::uint32_t sende
 {
   impl_->require_not_built("declare_input_sender");
   impl_->inputs[stream_id].expected_senders.insert(sender_id);
+}
+
+void Fragment::declare_input_cardinality(std::uint64_t stream_id, std::uint64_t rows)
+{
+  impl_->require_not_built("declare_input_cardinality");
+  impl_->inputs[stream_id].estimated_rows = rows;
 }
 
 void Fragment::declare_output(std::uint64_t stream_id)
@@ -472,6 +481,12 @@ std::size_t Fragment::output_batch_count(std::uint64_t stream_id) const
 {
   if (!impl_->fragment) { return 0; }
   return impl_->fragment->output_batch_count(stream_id);
+}
+
+std::uint64_t Fragment::output_row_count(std::uint64_t stream_id) const
+{
+  if (!impl_->fragment) { return 0; }
+  return impl_->fragment->output_row_count(stream_id);
 }
 
 std::unique_ptr<std::vector<std::string>> Fragment::output_types() const
