@@ -24,9 +24,7 @@
 
 #pragma once
 
-#include <sirius/export.hpp>
-
-#include <memory>
+#include <sirius/c/context/config.h>
 
 namespace sirius {
 
@@ -43,7 +41,7 @@ namespace sirius {
  * values are resolved during context creation, after telemetry starts. A valid
  * configuration does not guarantee that the machine can satisfy its requirements.
  */
-class SIRIUS_EXPORT ContextConfig {
+class ContextConfig {
  public:
   /// Share the immutable snapshot with another configuration.
   ///
@@ -55,7 +53,10 @@ class SIRIUS_EXPORT ContextConfig {
   ///   sirius::ContextConfig copy = *config;
   /// }
   /// @endcode
-  ContextConfig(const ContextConfig&) noexcept;
+  ContextConfig(const ContextConfig& other) noexcept : handle_(other.handle_)
+  {
+    sirius_config_retain(handle_);
+  }
   /// Replace this snapshot with another configuration's snapshot.
   ///
   /// @code{.cpp}
@@ -68,7 +69,13 @@ class SIRIUS_EXPORT ContextConfig {
   ///   if (replacement) { *config = *replacement; }
   /// }
   /// @endcode
-  ContextConfig& operator=(const ContextConfig&) noexcept;
+  ContextConfig& operator=(const ContextConfig& other) noexcept
+  {
+    sirius_config_retain(other.handle_);
+    sirius_config_release(handle_);
+    handle_ = other.handle_;
+    return *this;
+  }
   /// Release this configuration's reference to the snapshot.
   ///
   /// @code{.cpp}
@@ -78,12 +85,11 @@ class SIRIUS_EXPORT ContextConfig {
   ///   auto config = sirius::ContextConfigBuilder{}.build();
   /// } // A successfully built configuration is released at the end of the scope.
   /// @endcode
-  ~ContextConfig() noexcept;
+  ~ContextConfig() noexcept { sirius_config_release(handle_); }
 
  private:
-  struct Impl;
-  explicit ContextConfig(std::shared_ptr<const Impl> impl);
-  std::shared_ptr<const Impl> impl_;
+  explicit ContextConfig(::sirius_config* handle) noexcept : handle_(handle) {}
+  ::sirius_config* handle_;
 
   friend class ContextConfigBuilder;
 };

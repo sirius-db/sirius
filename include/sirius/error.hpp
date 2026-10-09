@@ -16,6 +16,10 @@
 
 #pragma once
 
+#include <sirius/c/error.h>
+
+#include <memory>
+#include <new>
 #include <string>
 
 namespace sirius {
@@ -29,6 +33,12 @@ enum class ErrorCode {
   malformed_yaml,
   /// A setting is unknown, invalid, or conflicts with another.
   invalid_configuration,
+  /// An allocation failed. The diagnostic may be empty.
+  allocation_failure,
+  /// A supplied argument cannot be represented by the C interface.
+  invalid_argument,
+  /// An unexpected implementation failure or unknown status was reported.
+  internal_error,
 };
 
 /// @brief A failure returned through std::expected by the public API.
@@ -50,8 +60,34 @@ struct Error {
   /// Category for programmatic error handling.
   ErrorCode code;
   /// Human-readable diagnostic, including file or setting context when available.
+  /// May be empty when diagnostic storage is unavailable.
   /// Its wording is not a stable interface and should not be parsed.
   std::string message;
+
+ private:
+  static Error from_c(sirius_status status, sirius_error* diagnostic) noexcept
+  {
+    std::unique_ptr<sirius_error, decltype(&sirius_error_destroy)> owner(diagnostic,
+                                                                         sirius_error_destroy);
+    auto code = ErrorCode::internal_error;
+    switch (status) {
+      case SIRIUS_CONFIGURATION_IO: code = ErrorCode::configuration_io; break;
+      case SIRIUS_MALFORMED_YAML: code = ErrorCode::malformed_yaml; break;
+      case SIRIUS_INVALID_CONFIGURATION: code = ErrorCode::invalid_configuration; break;
+      case SIRIUS_ALLOCATION_FAILURE: code = ErrorCode::allocation_failure; break;
+      case SIRIUS_INVALID_ARGUMENT: code = ErrorCode::invalid_argument; break;
+      default: break;
+    }
+    try {
+      return {code,
+              std::string(sirius_error_message(diagnostic), sirius_error_message_size(diagnostic))};
+    } catch (const std::bad_alloc&) {
+      return {ErrorCode::allocation_failure, {}};
+    } catch (...) {
+      return {ErrorCode::internal_error, {}};
+    }
+  }
+  friend class ContextConfigBuilder;
 };
 
 }  // namespace sirius

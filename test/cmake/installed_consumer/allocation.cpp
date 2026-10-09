@@ -1,5 +1,6 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include <sirius/c/context/config_builder.h>
+#include <sirius/context/config_builder.hpp>
 
 #include <atomic>
 #include <cstdlib>
@@ -46,5 +47,23 @@ int main()
   status                = sirius_config_builder_build(builder, &config, &error);
   sirius_config_builder_release(builder);
   if (status != SIRIUS_ALLOCATION_FAILURE || config || error) { return 4; }
+  fail_allocation = false;
+  sirius::ContextConfigBuilder cpp_builder;
+  auto cpp_config = cpp_builder.build();
+  if (!cpp_config) { return 7; }
+  const std::filesystem::path empty_path;
+  fail_allocation    = true;
+  auto copy          = cpp_builder;
+  auto snapshot_copy = *cpp_config;
+  copy               = cpp_builder;
+  snapshot_copy      = *cpp_config;
+  auto failed_build  = cpp_builder.build();
+  if (failed_build || failed_build.error().code != sirius::ErrorCode::allocation_failure) {
+    return 8;
+  }
+  auto failed_load = sirius::ContextConfigBuilder::from_yaml(empty_path);
+  if (failed_load || failed_load.error().code != sirius::ErrorCode::allocation_failure) {
+    return 9;
+  }
   return 0;
 }
