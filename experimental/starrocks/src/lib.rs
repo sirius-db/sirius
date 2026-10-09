@@ -65,12 +65,15 @@ mod prpc;
 mod recent_queries;
 mod result_encoder;
 mod result_store;
+// The run record is used only by the engine; pending frees by every executor.
+#[cfg_attr(not(feature = "sirius-engine"), allow(dead_code))]
+mod running_query;
 mod runtime_filters;
 
 pub use brpc::BrpcServer;
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
-pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
+pub use fragment_executor::{FragmentExecutor, FragmentResult, PendingFrees, StubExecutor};
 pub use nixl_chunk::NixlEndpoint;
 #[cfg(feature = "nixl-transport")]
 pub use nixl_transport::NixlTransport;
