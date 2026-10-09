@@ -6,7 +6,7 @@
 
 use std::fmt;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Condvar, Mutex, PoisonError},
     time::{Duration, Instant},
 };
@@ -75,10 +75,20 @@ enum FragmentState {
     Waiting { query: FragmentInstanceId },
     /// Rows produced, not yet delivered.
     Pending(TResultBatch),
-    /// Rows delivered; the next poll reports end-of-stream.
-    Drained,
-    /// The query failed; every poll reports the cause.
-    Failed(String),
+    /// Rows delivered, at the given time; the next poll reports end-of-stream.
+    Drained(Instant),
+    /// The query failed, at the given time; every poll reports the cause.
+    Failed(String, Instant),
+}
+
+impl FragmentState {
+    /// When the slot ended, rows delivered or failed; `None` while it still has work.
+    fn ended_at(&self) -> Option<Instant> {
+        match self {
+            Self::Drained(at) | Self::Failed(_, at) => Some(*at),
+            Self::Waiting { .. } | Self::Pending(_) => None,
+        }
+    }
 }
 
 /// What a single `fetch_data` poll should return to the FE.
@@ -92,16 +102,72 @@ pub(crate) struct FetchOutcome {
     pub(crate) eos: bool,
 }
 
+/// At most this many ended slots are kept; past it the oldest is dropped early.
+const MAX_ENDED_SLOTS: usize = 65_536;
+
 /// Process-wide store of fragment results keyed by fragment instance id.
 ///
 /// Shared across all BRPC connections via an `Arc` inside the compute-node service, so a
 /// `fetch_data` poll on one connection sees results buffered by an `exec_plan_fragment` on another.
-#[derive(Debug, Default)]
+///
+/// A slot that ended (rows delivered, or failed) is kept for `window` after it ended, so a repeat
+/// poll still reads EOS and the poll after a failure still reads its cause, then dropped; at most
+/// [`MAX_ENDED_SLOTS`] ended slots are kept.
+#[derive(Debug)]
 pub(crate) struct ResultStore {
-    /// Buffered results keyed by fragment instance id.
-    inner: Mutex<HashMap<FragmentInstanceId, FragmentState>>,
+    /// Buffered results, and when each ended slot ended.
+    inner: Mutex<Slots>,
     /// Wakes a `take_next` blocked on a waiting fragment.
     ready: Condvar,
+    /// How long an ended slot is kept.
+    window: Mutex<Duration>,
+}
+
+#[derive(Debug, Default)]
+struct Slots {
+    by_id: HashMap<FragmentInstanceId, FragmentState>,
+    /// Ended slots in the order they ended. An entry whose slot no longer ended at that time was
+    /// dropped or replaced since, and is skipped.
+    ended: VecDeque<(Instant, FragmentInstanceId)>,
+}
+
+impl Slots {
+    /// Puts `state` in `id`'s slot, noting when it ended if it did.
+    fn set(&mut self, id: FragmentInstanceId, state: FragmentState) {
+        if let Some(ended) = state.ended_at() {
+            self.ended.push_back((ended, id));
+        }
+        self.by_id.insert(id, state);
+    }
+
+    /// Drops the slots that ended longer ago than `window`, and the oldest past the cap.
+    fn prune(&mut self, window: Duration) {
+        let now = Instant::now();
+        while let Some(&(ended, id)) = self.ended.front() {
+            if now.duration_since(ended) < window && self.ended.len() <= MAX_ENDED_SLOTS {
+                break;
+            }
+            self.ended.pop_front();
+            if self
+                .by_id
+                .get(&id)
+                .and_then(FragmentState::ended_at)
+                .is_some_and(|at| at == ended)
+            {
+                self.by_id.remove(&id);
+            }
+        }
+    }
+}
+
+impl Default for ResultStore {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::default(),
+            ready: Condvar::new(),
+            window: Mutex::new(crate::recent_queries::REMEMBER_FOR),
+        }
+    }
 }
 
 impl ResultStore {
@@ -110,27 +176,67 @@ impl ResultStore {
     /// kept, so a repeated dispatch cannot hide rows or a failure behind a fresh wait.
     pub(crate) fn reserve(&self, id: FragmentInstanceId, query: FragmentInstanceId) {
         self.lock()
+            .by_id
             .entry(id)
             .or_insert(FragmentState::Waiting { query });
     }
 
     /// Buffers an executed fragment's result for later `fetch_data` collection.
     pub(crate) fn insert(&self, id: FragmentInstanceId, batch: TResultBatch) {
-        self.lock().insert(id, FragmentState::Pending(batch));
+        self.lock().set(id, FragmentState::Pending(batch));
         self.ready.notify_all();
     }
 
-    /// Fails every result slot of `query` still waiting, so `fetch_data` reports `error` at once
-    /// instead of waiting out its timeout. `query` may be any instance id of the query: like the
-    /// exchange purge, this matches on the hi half they share.
-    pub(crate) fn fail_query(&self, query: FragmentInstanceId, error: &str) {
-        for state in self.lock().values_mut() {
-            if matches!(state, FragmentState::Waiting { query: waiting }
+    /// Keeps an ended slot for `window` after it ended.
+    pub(crate) fn set_window(&self, window: Duration) {
+        *self
+            .window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = window;
+    }
+
+    /// Drops `query`'s (any instance id of it) slots whose rows were all delivered: the FE
+    /// cancelled the query, so it polls no more.
+    pub(crate) fn forget_delivered(&self, query: FragmentInstanceId) {
+        self.lock().by_id.retain(|id, state| {
+            id.query_hi() != query.query_hi() || !matches!(state, FragmentState::Drained(_))
+        });
+    }
+
+    /// Whether a result slot of `query` (any instance id of it) still waits for its rows.
+    pub(crate) fn waits_for(&self, query: FragmentInstanceId) -> bool {
+        self.lock().by_id.values().any(|state| {
+            matches!(state, FragmentState::Waiting { query: waiting }
                 if waiting.query_hi() == query.query_hi())
-            {
-                *state = FragmentState::Failed(error.to_string());
-            }
+        })
+    }
+
+    /// How many slots the store holds, ended or not.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().by_id.len()
+    }
+
+    /// Fails every result slot of `query` not yet delivered, so `fetch_data` reports `error` at
+    /// once instead of waiting out its timeout, and rows nobody will fetch are freed. `query` may
+    /// be any instance id of the query: like the exchange purge, this matches on the hi half they
+    /// share.
+    pub(crate) fn fail_query(&self, query: FragmentInstanceId, error: &str) {
+        let mut slots = self.lock();
+        let failing: Vec<FragmentInstanceId> = slots
+            .by_id
+            .iter()
+            .filter(|(id, state)| match state {
+                FragmentState::Waiting { query: waiting } => waiting.query_hi() == query.query_hi(),
+                FragmentState::Pending(_) => id.query_hi() == query.query_hi(),
+                FragmentState::Drained(_) | FragmentState::Failed(..) => false,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in failing {
+            slots.set(id, FragmentState::Failed(error.to_string(), Instant::now()));
         }
+        drop(slots);
         self.ready.notify_all();
     }
 
@@ -138,14 +244,13 @@ impl ResultStore {
     /// A fragment still waiting on its exchange inputs blocks the caller for up to `timeout`;
     /// replying not-ready instead would desync the FE packet counter. An id this CN never buffered
     /// is an error (StarRocks treats a missing result buffer as a failure, not an empty result),
-    /// as are a failed query and a timed-out wait. A drained fragment stays in the map so a repeat
-    /// poll still reports EOS rather than reading as unknown.
+    /// as are a failed query and a timed-out wait. A drained fragment stays in the map, for the
+    /// window, so a repeat poll still reports EOS rather than reading as unknown.
     ///
     /// TODO(starrocks-execute): this is a single-batch, single-poller model. The real executor
-    /// needs (a) chunked/streamed delivery of many batches, (b) safety against duplicate or
+    /// needs (a) chunked/streamed delivery of many batches and (b) safety against duplicate or
     /// concurrent polls (advance state only after the response is written; keep a per-fragment
-    /// in-flight guard), and (c) eviction of drained entries on `cancel_plan_fragment`/timeout so
-    /// the map does not grow for the process lifetime.
+    /// in-flight guard).
     pub(crate) fn take_next(
         &self,
         id: FragmentInstanceId,
@@ -154,7 +259,7 @@ impl ResultStore {
         let deadline = Instant::now() + timeout;
         let mut guard = self.lock();
         loop {
-            match guard.get_mut(&id) {
+            match guard.by_id.get_mut(&id) {
                 None => return Err(format!("no buffered result for fragment instance {id}")),
                 Some(FragmentState::Waiting { .. }) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -170,35 +275,43 @@ impl ResultStore {
                         .unwrap_or_else(PoisonError::into_inner)
                         .0;
                 }
-                Some(state @ FragmentState::Pending(_)) => {
-                    let FragmentState::Pending(batch) =
-                        std::mem::replace(state, FragmentState::Drained)
-                    else {
+                Some(FragmentState::Pending(_)) => {
+                    let drained = FragmentState::Drained(Instant::now());
+                    let Some(FragmentState::Pending(batch)) = guard.by_id.remove(&id) else {
                         unreachable!("state matched Pending")
                     };
+                    guard.set(id, drained);
                     return Ok(FetchOutcome {
                         batch: Some(batch),
                         packet_seq: 0,
                         eos: false,
                     });
                 }
-                Some(FragmentState::Drained) => {
+                Some(FragmentState::Drained(_)) => {
                     return Ok(FetchOutcome {
                         batch: None,
                         packet_seq: 1,
                         eos: true,
                     });
                 }
-                Some(FragmentState::Failed(error)) => return Err(error.clone()),
+                Some(FragmentState::Failed(error, _)) => return Err(error.clone()),
             }
         }
     }
 
-    /// Locks the inner map, recovering from a poisoned mutex (state is disposable result data).
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<FragmentInstanceId, FragmentState>> {
-        self.inner
+    /// Locks the slots, recovering from a poisoned mutex (state is disposable result data), and
+    /// drops the ended ones past the window or the cap: only those, oldest first.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Slots> {
+        let window = *self
+            .window
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slots = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slots.prune(window);
+        slots
     }
 }
 
@@ -236,6 +349,60 @@ mod tests {
             .take_next(id, Duration::ZERO)
             .expect("drained fragment still known");
         assert!(third.eos);
+    }
+
+    #[test]
+    fn ended_slots_age_out_after_the_window_and_delivered_ones_go_on_a_cancel() {
+        let store = ResultStore::default();
+        store.set_window(Duration::from_millis(200));
+        let (drained, failed) = (
+            FragmentInstanceId::from_halves(8, 1),
+            FragmentInstanceId::from_halves(8, 2),
+        );
+        store.insert(drained, batch(&["a"]));
+        store.take_next(drained, Duration::ZERO).unwrap();
+        store.reserve(failed, FragmentInstanceId::from_halves(8, 0));
+        store.fail_query(failed, "scan exploded");
+        // Inside the window a repeat poll still reads EOS, and the failure its cause.
+        assert!(store.take_next(drained, Duration::ZERO).unwrap().eos);
+        assert_eq!(
+            store.take_next(failed, Duration::ZERO).unwrap_err(),
+            "scan exploded"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(store.len(), 0, "both aged out");
+
+        // The FE's cancel drops a delivered slot at once, never a failed one.
+        store.set_window(crate::recent_queries::REMEMBER_FOR);
+        store.insert(drained, batch(&["a"]));
+        store.take_next(drained, Duration::ZERO).unwrap();
+        store.reserve(failed, FragmentInstanceId::from_halves(8, 0));
+        store.fail_query(failed, "scan exploded");
+        store.forget_delivered(FragmentInstanceId::from_halves(8, 0));
+        assert!(store.take_next(drained, Duration::ZERO).is_err());
+        assert!(store.take_next(failed, Duration::ZERO).is_err());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn a_failure_frees_rows_nobody_fetched_and_ended_slots_are_capped() {
+        let store = ResultStore::default();
+        let pending = FragmentInstanceId::from_halves(11, 1);
+        store.insert(pending, batch(&["a"]));
+        store.fail_query(FragmentInstanceId::from_halves(11, 0), "scan exploded");
+        assert_eq!(
+            store.take_next(pending, Duration::ZERO).unwrap_err(),
+            "scan exploded",
+            "the rows are gone; the poll reads the cause"
+        );
+
+        // Past the cap the oldest ended slot goes first.
+        for lo in 0..=MAX_ENDED_SLOTS as i64 {
+            let id = FragmentInstanceId::from_halves(12, lo);
+            store.reserve(id, FragmentInstanceId::from_halves(12, 0));
+        }
+        store.fail_query(FragmentInstanceId::from_halves(12, 0), "boom");
+        assert!(store.len() <= MAX_ENDED_SLOTS + 1);
     }
 
     #[test]

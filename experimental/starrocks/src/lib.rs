@@ -47,6 +47,7 @@ use tracing::{debug, info, instrument, warn};
 mod admin_command;
 mod brpc;
 mod compute_node_service;
+mod deadlines;
 #[cfg(feature = "sirius-engine")]
 mod engine;
 mod fe_report;

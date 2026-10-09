@@ -441,9 +441,28 @@ impl LocalExchange {
         self.ends.fail(query, error)
     }
 
+    /// [`mark_failed`](Self::mark_failed), unless the query already ended in any way, the FE
+    /// having ended it included. Returns whether this claimed the failure.
+    pub(crate) fn mark_failed_unless_ended(&self, query: FragmentInstanceId, error: &str) -> bool {
+        let _state = self.lock();
+        self.ends.fail_unless_ended(query, error)
+    }
+
     /// Why `query` (any instance id of it) ended on this CN, if it did.
     pub(crate) fn failure(&self, query: FragmentInstanceId) -> Option<String> {
         self.ends.cause(query).map(|cause| cause.to_string())
+    }
+
+    /// Whether the rendezvous holds anything of `query` (any instance id of it): a receiver
+    /// waiting for its senders, or a sender's output waiting for its receiver.
+    pub(crate) fn holds(&self, query: FragmentInstanceId) -> bool {
+        let ours = |id: &FragmentInstanceId| id.query_hi() == query.query_hi();
+        let state = self.lock();
+        state.receivers.keys().any(ours)
+            || state
+                .sources
+                .keys()
+                .any(|key| ours(&key.fragment_instance_id))
     }
 
     /// What the rendezvous holds right now.
