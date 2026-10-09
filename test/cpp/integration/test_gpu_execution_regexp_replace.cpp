@@ -109,7 +109,7 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
          R"(regexp_replace(s, '(a)(b)(a)( )(a)(b)(a)( )(aba)', '<\9>'))",
          R"(regexp_replace(s, 'aba', '<\0>'))",
          R"(regexp_replace(s, '[A-Z]', '\0\0'))",
-         R"(regexp_replace(s, '\s', '\0\0'))",
+         R"(regexp_replace(s, '[ \t\r\n\f]', '\0\0'))",
          R"(regexp_replace(s, '^(a)', '<\1>'))",
          R"(regexp_replace(s, '(a)$', '<\1>'))",
          R"(regexp_replace(s, '([0-9]+)', '<\1>'))",
@@ -121,6 +121,56 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
        }) {
     INFO(expression);
     compare_gpu_vs_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "regexp_replace incompatible character classes fall back during planning",
+                 "[integration][gpu_execution][regexp_replace][regexp_replace_classes]")
+{
+  run_ok("CREATE TABLE regex_t(s VARCHAR);");
+  run_ok(
+    "INSERT INTO regex_t VALUES ('éa'), ('x٣y'), ('a' || chr(160) || 'b'),"
+    " ('Ωmega'), ('abc'), ('a b'), (''), (NULL);");
+  run_ok("CHECKPOINT;");
+  for (auto const* pattern : {R"(\w)",
+                              R"(\W)",
+                              R"(\d)",
+                              R"(\D)",
+                              R"(\s)",
+                              R"(\S)",
+                              R"(\b)",
+                              R"(\B)",
+                              R"([\w])",
+                              R"(\\\w)",
+                              "[[:alpha:]]",
+                              "[[:digit:]]",
+                              "[[:space:]]",
+                              "[^[:alpha:]]",
+                              "[a[:digit:]]"}) {
+    INFO(pattern);
+    // RE2 can match \B inside a UTF-8 sequence. A leading space keeps its first match at
+    // a character boundary, so the CPU result can be materialized by the comparison helper.
+    auto const subject = std::string{pattern} == R"(\B)" ? "' ' || s" : "s";
+    expect_plan_fallback_matches_cpu(std::string{"SELECT regexp_replace("} + subject + ", '" +
+                                     pattern + "', 'X') FROM regex_t");
+    expect_plan_fallback_matches_cpu(std::string{"SELECT regexp_replace("} + subject + ", '(" +
+                                     pattern + R"()', '<\1>') FROM regex_t)");
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "regexp_replace escaped class names remain literal on GPU",
+                 "[integration][gpu_execution][regexp_replace][regexp_replace_classes]")
+{
+  run_ok("CREATE TABLE regex_t(s VARCHAR);");
+  run_ok(R"(INSERT INTO regex_t VALUES ('\w\W\d\D\s\S\b\B'), ('éa'), (NULL);)");
+  run_ok("CHECKPOINT;");
+  for (auto const* pattern :
+       {R"(\\w)", R"(\\W)", R"(\\d)", R"(\\D)", R"(\\s)", R"(\\S)", R"(\\b)", R"(\\B)"}) {
+    INFO(pattern);
+    compare_gpu_vs_cpu(std::string{"SELECT regexp_replace(s, '"} + pattern +
+                       "', 'X') FROM regex_t");
   }
 }
 

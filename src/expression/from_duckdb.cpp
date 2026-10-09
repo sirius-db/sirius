@@ -287,6 +287,28 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
       auto const& value = expr.children[i]->Cast<duckdb::BoundConstantExpression>().value;
       if (value.IsNull() || value.type() != duckdb::LogicalType::VARCHAR) { return nullptr; }
     }
+    auto const& pattern =
+      duckdb::StringValue::Get(expr.children[1]->Cast<duckdb::BoundConstantExpression>().value);
+    // RE2's shorthand classes and word boundaries are ASCII-only; cuDF's are Unicode-aware.
+    // cuDF also does not implement POSIX classes. Skip escaped characters so a literal \\w
+    // remains supported, but reject these constructs wherever they occur in the pattern.
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+      if (pattern[i] == '\\' && i + 1 < pattern.size()) {
+        switch (pattern[++i]) {
+          case 'w':
+          case 'W':
+          case 'd':
+          case 'D':
+          case 's':
+          case 'S':
+          case 'b':
+          case 'B': return nullptr;
+          default: break;
+        }
+      } else if (pattern.compare(i, 2, "[:") == 0) {
+        return nullptr;
+      }
+    }
     auto const& replacement =
       duckdb::StringValue::Get(expr.children[2]->Cast<duckdb::BoundConstantExpression>().value);
     // cuDF's template syntax differs from RE2's. Only translate single-digit backreferences;
@@ -302,8 +324,6 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
     }
     if (has_backrefs && replacement.find("${") != std::string::npos) { return nullptr; }
     if (has_backrefs) {
-      auto const& pattern =
-        duckdb::StringValue::Get(expr.children[1]->Cast<duckdb::BoundConstantExpression>().value);
       duckdb_re2::RE2::Options options;
       options.set_log_errors(false);
       duckdb_re2::RE2 const regex(pattern, options);
