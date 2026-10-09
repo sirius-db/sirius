@@ -10,16 +10,17 @@ crate-type = ["staticlib"]
 [dependencies]
 cxx = "1"
 instrumentation-model = { path = "../model" }
-quent-dynamic-attributes = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
-quent-instrumentation = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591", features = ["io-ndjson", "io-msgpack", "io-postcard"] }
-quent-io = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591", default-features = false, features = ["ndjson", "msgpack", "postcard"] }
-nvtx-injection = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591", features = ["static-injection"] }
-nvtx-bridge = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
+quent-dynamic-attributes = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
+quent-instrumentation = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc", features = ["io-ndjson", "io-msgpack", "io-postcard"] }
+quent-io = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc", default-features = false, features = ["ndjson", "msgpack", "postcard"] }
+nvtx-injection = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc", features = ["static-injection"] }
+quent-nvtx-bridge = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
+quent-nvtx-events = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
 
 [build-dependencies]
 cxx-build = "1"
 # Experimental and unstable: quent's `experimental/vibe/codegen/cpp` (LLM-written, unreviewed
 # upstream, `publish = false`). Its generated C++ API can change on any rev bump; there is no
 # stable C++ generator yet.
-quent-schema-codegen-cpp = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
-quent-yaml = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
+quent-schema-codegen-cpp = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
+quent-yaml = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }

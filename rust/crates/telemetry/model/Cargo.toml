@@ -7,7 +7,7 @@ edition.workspace = true
 collector = ["quent-instrumentation/io-collector"]
 
 [dependencies]
-quent-instrumentation = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591", features = [
+quent-instrumentation = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc", features = [
     "io-msgpack",
     "io-ndjson",
     "io-postcard",
@@ -15,8 +15,8 @@ quent-instrumentation = { git = "https://github.com/dhruv9vats/quent.git", rev =
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-quent-instrumentation-build = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
-quent-yaml = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
+quent-instrumentation-build = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
+quent-yaml = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }
 # Captures this crate's git provenance into QUENT_SOURCE_* so the generated ModelSource
 # records Sirius (not quent) as the model's source in the model.qmi sidecar.
-quent-build-info = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
+quent-build-info = { git = "https://github.com/dhruv9vats/quent.git", rev = "6e7770f166839d9aaae7faa06e4169c552c54acc" }

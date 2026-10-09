@@ -193,7 +193,6 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> plan)
 {
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
-  query_handle_.planning();
   reset();
   sirius_owned_plan = std::move(plan);
   initialize_internal(*sirius_owned_plan);
@@ -284,6 +283,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       "Sirius context is not initialized. Check that SIRIUS_DISABLE is not set "
       "and review extension loading logs for errors.");
   }
+
+  query_handle_.planning();
 
   sirius_physical_plan = &plan;
 

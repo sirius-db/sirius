@@ -1737,44 +1737,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "nvtx-analyzer"
-version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
-dependencies = [
- "nvtx-bridge",
- "nvtx-events",
- "quent-events",
- "quent-time",
- "rustc-hash",
- "tracing",
-]
-
-[[package]]
-name = "nvtx-bridge"
-version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
-dependencies = [
- "nvtx-events",
- "quent-events",
- "serde",
-]
-
-[[package]]
-name = "nvtx-events"
-version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "nvtx-injection"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "cc",
- "libc",
- "nvtx-events",
  "nvtx-sys",
  "thiserror",
 ]
@@ -1782,15 +1749,15 @@ dependencies = [
 [[package]]
 name = "nvtx-server"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "axum",
  "moka",
- "nvtx-analyzer",
- "nvtx-bridge",
- "nvtx-ui",
  "quent-events",
  "quent-io",
+ "quent-nvtx-analyzer",
+ "quent-nvtx-events",
+ "quent-nvtx-ui",
  "serde",
  "tokio",
  "tracing",
@@ -1806,17 +1773,6 @@ dependencies = [
  "bindgen",
  "cc",
  "widestring",
-]
-
-[[package]]
-name = "nvtx-ui"
-version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
-dependencies = [
- "nvtx-analyzer",
- "quent-time",
- "serde",
- "ts-rs",
 ]
 
 [[package]]
@@ -2112,7 +2068,7 @@ dependencies = [
 [[package]]
 name = "quent-analyzer"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "quent-dynamic-attributes",
  "quent-events",
@@ -2126,7 +2082,7 @@ dependencies = [
 [[package]]
 name = "quent-build-info"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "serde",
  "serde_json",
@@ -2135,7 +2091,7 @@ dependencies = [
 [[package]]
 name = "quent-collector"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "quent-collector-client",
  "quent-collector-proto",
@@ -2149,7 +2105,7 @@ dependencies = [
 [[package]]
 name = "quent-collector-client"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "bitcode",
  "http",
@@ -2168,7 +2124,7 @@ dependencies = [
 [[package]]
 name = "quent-collector-proto"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "prost",
  "protox",
@@ -2180,7 +2136,7 @@ dependencies = [
 [[package]]
 name = "quent-constraints"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "petgraph",
  "quent-schema",
@@ -2191,7 +2147,7 @@ dependencies = [
 [[package]]
 name = "quent-dynamic-attributes"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "serde",
  "ts-rs",
@@ -2200,7 +2156,7 @@ dependencies = [
 [[package]]
 name = "quent-events"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "quent-build-info",
  "quent-dynamic-attributes",
@@ -2212,7 +2168,7 @@ dependencies = [
 [[package]]
 name = "quent-fsm"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "petgraph",
  "quent-constraints",
@@ -2225,7 +2181,7 @@ dependencies = [
 [[package]]
 name = "quent-instrumentation"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "async-trait",
  "quent-build-info",
@@ -2245,7 +2201,7 @@ dependencies = [
 [[package]]
 name = "quent-instrumentation-build"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "convert_case 0.12.0",
  "prettyplease 0.3.0",
@@ -2262,7 +2218,7 @@ dependencies = [
 [[package]]
 name = "quent-io"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "async-trait",
  "http",
@@ -2279,7 +2235,7 @@ dependencies = [
 [[package]]
 name = "quent-io-collector"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "async-trait",
  "http",
@@ -2294,7 +2250,7 @@ dependencies = [
 [[package]]
 name = "quent-io-msgpack"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -2309,7 +2265,7 @@ dependencies = [
 [[package]]
 name = "quent-io-ndjson"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -2324,7 +2280,7 @@ dependencies = [
 [[package]]
 name = "quent-io-postcard"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "async-trait",
  "postcard",
@@ -2339,7 +2295,7 @@ dependencies = [
 [[package]]
 name = "quent-io-types"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -2351,7 +2307,7 @@ dependencies = [
 [[package]]
 name = "quent-log"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "quent-constraints",
  "quent-schema",
@@ -2361,9 +2317,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "quent-nvtx-analyzer"
+version = "0.1.0"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
+dependencies = [
+ "quent-events",
+ "quent-nvtx-events",
+ "quent-time",
+ "rustc-hash",
+ "tracing",
+]
+
+[[package]]
+name = "quent-nvtx-bridge"
+version = "0.1.0"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
+dependencies = [
+ "libc",
+ "nvtx-injection",
+ "nvtx-sys",
+ "quent-events",
+ "quent-instrumentation",
+ "quent-nvtx-events",
+ "quent-time",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "quent-nvtx-events"
+version = "0.1.0"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
+dependencies = [
+ "quent-events",
+ "serde",
+]
+
+[[package]]
+name = "quent-nvtx-ui"
+version = "0.1.0"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
+dependencies = [
+ "quent-nvtx-analyzer",
+ "quent-time",
+ "serde",
+ "ts-rs",
+]
+
+[[package]]
 name = "quent-os"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "quent-constraints",
  "quent-ref-target",
@@ -2376,7 +2381,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-analyzer"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "quent-analyzer",
  "quent-events",
@@ -2391,7 +2396,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-server"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "async-trait",
  "axum",
@@ -2423,7 +2428,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-ui"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "async-trait",
  "quent-analyzer",
@@ -2438,9 +2443,9 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-ui-bindings"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
- "nvtx-ui",
+ "quent-nvtx-ui",
  "quent-query-engine-ui",
  "quent-ui",
  "ts-rs",
@@ -2449,7 +2454,7 @@ dependencies = [
 [[package]]
 name = "quent-ref-target"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "quent-constraints",
  "quent-schema",
@@ -2459,7 +2464,7 @@ dependencies = [
 [[package]]
 name = "quent-ref-tree"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "petgraph",
  "quent-constraints",
@@ -2472,7 +2477,7 @@ dependencies = [
 [[package]]
 name = "quent-resource"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "indexmap",
  "quent-constraints",
@@ -2487,7 +2492,7 @@ dependencies = [
 [[package]]
 name = "quent-schema"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "indexmap",
  "rustc-hash",
@@ -2499,7 +2504,7 @@ dependencies = [
 [[package]]
 name = "quent-schema-codegen-cpp"
 version = "0.0.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "convert_case 0.11.0",
  "prettyplease 0.3.0",
@@ -2516,7 +2521,7 @@ dependencies = [
 [[package]]
 name = "quent-store"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "quent-build-info",
  "quent-events",
@@ -2533,7 +2538,7 @@ dependencies = [
 [[package]]
 name = "quent-store-build"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "prettyplease 0.3.0",
  "quent-instrumentation-build",
@@ -2546,7 +2551,7 @@ dependencies = [
 [[package]]
 name = "quent-time"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "serde",
  "thiserror",
@@ -2556,7 +2561,7 @@ dependencies = [
 [[package]]
 name = "quent-ui"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "quent-analyzer",
  "quent-dynamic-attributes",
@@ -2569,7 +2574,7 @@ dependencies = [
 [[package]]
 name = "quent-yaml"
 version = "0.1.0"
-source = "git+https://github.com/dhruv9vats/quent.git?rev=7d0aabd70478c0d1ccc17bf95bfae6f777ef5591#7d0aabd70478c0d1ccc17bf95bfae6f777ef5591"
+source = "git+https://github.com/dhruv9vats/quent.git?rev=6e7770f166839d9aaae7faa06e4169c552c54acc#6e7770f166839d9aaae7faa06e4169c552c54acc"
 dependencies = [
  "indexmap",
  "quent-constraints",
@@ -3205,11 +3210,12 @@ dependencies = [
  "cxx",
  "cxx-build",
  "instrumentation-model",
- "nvtx-bridge",
  "nvtx-injection",
  "quent-dynamic-attributes",
  "quent-instrumentation",
  "quent-io",
+ "quent-nvtx-bridge",
+ "quent-nvtx-events",
  "quent-schema-codegen-cpp",
  "quent-yaml",
 ]

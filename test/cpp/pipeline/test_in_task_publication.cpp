@@ -23,6 +23,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <rmm/error.hpp>
@@ -294,6 +295,22 @@ struct harness {
   void run_inline(std::unique_ptr<observed_task> task, int device)
   {
     rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    task->telemetry_fsm().queued({.queue = {
+                                    .target = quent::task_queue::TaskQueueId{quent::nil_uuid()},
+                                    .data   = {.entries = 1},
+                                  }});
+    task->telemetry_fsm().reserving({
+      .requested_bytes      = 0,
+      .input_basis          = 0,
+      .peak_estimate        = 0,
+      .bytes_to_materialize = 0,
+      .manager_thread =
+        {
+          .target = quent::task_manager_loop_thread::TaskManagerLoopThreadId{quent::nil_uuid()},
+          .data   = {},
+        },
+    });
+
     auto info        = task->get_estimated_reservation_size_info(&memory.gpu(device));
     auto reservation = memory.gpu(device).make_reservation_or_null(small_reservation +
                                                                    info.bytes_to_materialize_input);

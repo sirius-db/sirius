@@ -132,38 +132,6 @@ entities:
           group_id: { scope-ref: ThreadGroup }
       exit: {}
 
-#  GpuMemory:
-#    doc: Device memory owned by a GPU.
-#    resource:
-#      bytes:
-#        kind: occupancy
-#        known-bounds: true
-#    events:
-#      declaration:
-#        attributes:
-#          gpu_id: { scope-ref: GpuDevice }
-#
-#  HostMemory:
-#    doc: Host memory owned by a worker.
-#    resource:
-#      bytes:
-#        kind: occupancy
-#        known-bounds: true
-#    events:
-#      declaration:
-#        attributes:
-#          worker_id: { scope-ref: Worker }
-#
-#  Storage:
-#    doc: Persistent storage used by a worker.
-#    resource:
-#      bytes:
-#        kind: occupancy
-#        known-bounds: true
-#    events:
-#      declaration:
-#        attributes:
-#          worker_id: { scope-ref: Worker }
   MemorySpace:
     doc: A logical memory space data can reside in, like device memory, host memory or storage.
     resource:
@@ -192,34 +160,6 @@ entities:
           gpu_id: { option: { ref: GpuDevice } }
           label: string
       exit: {}
-
-#  StorageChannel:
-#    doc: A worker-local channel transferring bytes between storage and host memory.
-#    resource:
-#      bytes: { kind: rate }
-#    events:
-#      declaration:
-#        attributes:
-#          worker_id: { scope-ref: Worker }
-#
-#  PcieChannel:
-#    doc: A GPU-local channel transferring bytes between host and device memory.
-#    resource:
-#      bytes: { kind: rate }
-#    events:
-#      declaration:
-#        attributes:
-#          worker_id: { scope-ref: GpuDevice }
-#
-#  GpuDirectChannel:
-#    doc: A GPU-local channel transferring bytes between host and storage.
-#    resource:
-#      bytes: { kind: rate }
-#    events:
-#      declaration:
-#        attributes:
-#          worker_id: { scope-ref: GpuDevice }
-
 
 fsms:
   Query:
