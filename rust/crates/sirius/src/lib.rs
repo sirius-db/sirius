@@ -172,6 +172,41 @@ impl SiriusContext {
         let summary = self.inner.borrow_mut().pin_mut().unpin_table(&name)?;
         Ok(summary.to_string_lossy().into_owned())
     }
+
+    /// A handle that cancels this context's run in progress from another thread.
+    ///
+    /// `SiriusContext` stays on the thread that runs queries; hand the returned
+    /// [`Interrupter`] to the threads that need to cancel them.
+    pub fn interrupter(&self) -> Interrupter {
+        Interrupter {
+            inner: self.inner.borrow().interrupter(),
+        }
+    }
+}
+
+/// Cancels the query running on the [`SiriusContext`] it came from, from any thread.
+///
+/// The cancelled call stops within one GPU task, including one retrying out of
+/// memory, and returns DuckDB's interrupt error ("Interrupted!"); the context stays
+/// usable. With no call in progress [`Interrupter::interrupt`] does nothing, so an
+/// interrupt never carries over to a later query. The handle may outlive its
+/// context, after which it does nothing.
+pub struct Interrupter {
+    inner: UniquePtr<sirius_sys::Interrupter>,
+}
+
+// SAFETY: the C++ `Interrupter` holds only a shared pointer to a mutex-guarded
+// gate; `interrupt()` locks it and sets DuckDB's atomic interrupt flag, and is
+// documented as callable from any thread. Destroying the handle on any thread
+// only releases that shared pointer.
+unsafe impl Send for Interrupter {}
+unsafe impl Sync for Interrupter {}
+
+impl Interrupter {
+    /// Cancel the query in progress on this handle's context, if any.
+    pub fn interrupt(&self) {
+        self.inner.interrupt();
+    }
 }
 
 fn collect_arrow_stream(stream: FFI_ArrowArrayStream) -> Result<SubstraitResult, SiriusError> {
@@ -1040,6 +1075,48 @@ mod tests {
             .execute_substrait_result(&local_files_plan_ranged(&[(p, 10, 5)], names()))
             .expect("empty split plan");
         assert_eq!(rows(&empty).len(), 0);
+    }
+
+    /// An `Interrupter` can be handed to another thread; the context cannot.
+    #[test]
+    fn interrupter_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::Interrupter>();
+    }
+
+    /// An interrupt from another thread with no query running does not cancel
+    /// the next query, and the handle may outlive its context. Requires a GPU.
+    #[test]
+    fn idle_interrupt_does_not_cancel_the_next_query() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ids.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids]).unwrap();
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let plan = local_files_plan(path.to_str().unwrap(), vec!["id".to_string()]);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let interrupter = ctx.interrupter();
+        std::thread::scope(|scope| {
+            scope.spawn(|| interrupter.interrupt());
+        });
+        let batches = ctx
+            .execute_substrait(&plan)
+            .expect("execute after an idle interrupt");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+
+        drop(ctx);
+        interrupter.interrupt();
     }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`

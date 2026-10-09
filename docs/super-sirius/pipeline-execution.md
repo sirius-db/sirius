@@ -350,6 +350,7 @@ while running:
     1. thread_pool.reserve()              -- block until a worker slot is available (RAII)
     2. task_request_publisher.send()      -- tell pipeline executor we can accept work
     3. task_queue.pop()                   -- block until a task is available
+       (dropped if its query was interrupted; see Interrupts)
     4. clamp request to get_max_memory()  -- bound the history-based estimate by the space limit
     5. memory_space.make_reservation()    -- reserve GPU memory for the task
     6. task.set_reservation(reservation)  -- attach reservation to task
@@ -428,7 +429,8 @@ Retryable execution failures are modeled as a small exception hierarchy: `task_r
 
 The GPU executor catches the **base** `task_reschedule_exception` and:
 
-1. Checks if the completion handler already has an error (skip if so)
+1. Checks if the completion handler already has an error, or the query was interrupted (skip if so;
+   see [Interrupts](#interrupts))
 2. Increments `retry_count` (max 100 retries, `MAX_RETRIES`)
 3. Logs the retry attempt
 4. Marks the original task as rescheduled (skips pipeline completion tracking)
@@ -438,6 +440,23 @@ The GPU executor catches the **base** `task_reschedule_exception` and:
 8. Reschedules the new task back through the manager loop
 
 If max retries are exceeded, the error propagates and terminates the query.
+
+## Interrupts
+
+`Connection::Interrupt()` (DuckDB's cancel, callable from another thread; the embedder's
+`sirius::ffi::Context::interrupt()` calls it) sets `ClientContext::interrupted`.
+`StandaloneQueryScope` installs `completion_handler::interrupt_check`, which reads that flag
+through a weak pointer to the client, before any task is submitted. The GPU executor checks it in
+three places:
+
+- in the manager loop, after popping a task and before reserving memory for it;
+- in the worker, before `execute()` (the reservation may have blocked for a long time);
+- in the reschedule handler, before an out-of-memory or launch-failure retry.
+
+An interrupted query's task is dropped and the query fails with `duckdb::InterruptException`
+(`late_failure_cause::other`). The query thread then drains it through `drain_after_error()`, as
+for any other failure, and transparent execution rethrows the interrupt instead of falling back to
+the CPU. DuckDB clears the flag when the connection's next statement starts.
 
 ## Error Handling and Draining
 
