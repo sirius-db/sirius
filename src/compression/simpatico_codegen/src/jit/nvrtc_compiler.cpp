@@ -99,6 +99,21 @@ namespace {
 
 }  // namespace
 
+const detail::Digest& detail::cache_environment()
+{
+  static const Digest identity = [] {
+    int major = 0, minor = 0;
+    NVRTC_OR_THROW(nvrtcVersion(&major, &minor));
+    // Both linkage modes use the reported version. Same-version compiler
+    // patches intentionally retain reuse; header contents have their own digests.
+    return environment_identity({kEmbeddedJitHeadersIdentity,
+                                 kCcclEmbeddedHeadersIdentity,
+                                 static_cast<uint32_t>(major),
+                                 static_cast<uint32_t>(minor)});
+  }();
+  return identity;
+}
+
 CUfunction CompiledKernel::func_for_current_device() const
 {
   if (!kern) return nullptr;

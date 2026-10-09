@@ -210,11 +210,14 @@ jobs:
 
       - name: Test Simpatico cache across processes
         run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} \
+            build/release/simpatico_codegen/tests/cache/test_cache_environment
           pixi run -e ${{ matrix.cuda.pixi-environment }} python \
             src/compression/simpatico_codegen/tests/cache/test_cache_process.py \
             --worker build/release/simpatico_codegen/tests/cache/test_cache_worker \
             --project-worker build/release/simpatico_codegen/tests/cache/test_cache_worker_project \
-            --cccl-worker build/release/simpatico_codegen/tests/cache/test_cache_worker_cccl
+            --cccl-worker build/release/simpatico_codegen/tests/cache/test_cache_worker_cccl \
+            --version-worker build/release/simpatico_codegen/tests/cache/test_cache_worker_version
 
       - name: Run C++ unit tests
         run: |
