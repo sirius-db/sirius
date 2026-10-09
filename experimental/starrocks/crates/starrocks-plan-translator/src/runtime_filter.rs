@@ -9,7 +9,8 @@
 
 use starrocks_thrift::exprs::TExprNodeType;
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
-use starrocks_thrift::plan_nodes::{TPlanNode, TPlanNodeType};
+use starrocks_thrift::opcodes::TExprOpcode;
+use starrocks_thrift::plan_nodes::{THashJoinNode, TPlanNode, TPlanNodeType};
 use starrocks_thrift::runtime_filter::{
     TRuntimeFilterBuildJoinMode, TRuntimeFilterBuildType, TRuntimeFilterDescription,
 };
@@ -75,7 +76,9 @@ pub fn probed_filters(params: &TExecPlanFragmentParams) -> Vec<ProbedFilter> {
 }
 
 /// Join filters `params`' fragment builds at a broadcast hash join whose build child is an
-/// exchange and whose key is a bare column of it. Filters of any other shape are left out.
+/// exchange and whose key is a bare column of it. Filters of any other shape are left out, and
+/// so are filters the semi-join rewrite would apply wrongly: a key the join compares with `<=>`,
+/// and the broadcast branch of a skew join.
 pub fn built_filters(params: &TExecPlanFragmentParams) -> Result<Vec<BuiltFilter>> {
     let nodes = plan_nodes(params);
     if nodes.is_empty() {
@@ -92,11 +95,10 @@ pub fn built_filters(params: &TExecPlanFragmentParams) -> Result<Vec<BuiltFilter
     let children = child_indices(nodes)?;
     let mut built = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
-        let Some(filters) = node
-            .hash_join_node
-            .as_ref()
-            .and_then(|join| join.build_runtime_filters.as_ref())
-        else {
+        let Some(join) = node.hash_join_node.as_ref() else {
+            continue;
+        };
+        let Some(filters) = join.build_runtime_filters.as_ref() else {
             continue;
         };
         let Some(exchange) = children[index]
@@ -117,6 +119,9 @@ pub fn built_filters(params: &TExecPlanFragmentParams) -> Result<Vec<BuiltFilter
             let Some((filter_id, tuple_id, slot_id)) = broadcast_key(filter) else {
                 continue;
             };
+            if null_safe_key(join, filter) {
+                continue;
+            }
             let column = RowLayout::from_tuples(&desc, input_row_tuples)?
                 .resolve(SlotKey::new(tuple_id, slot_id))?;
             let schema = desc.named_struct_for_tuples(input_row_tuples)?;
@@ -166,9 +171,14 @@ fn is_join_filter(filter: &TRuntimeFilterDescription) -> bool {
 }
 
 /// `(filter id, tuple id, slot id)` of a broadcast join filter keyed on a bare slot.
+///
+/// A skew join's broadcast branch (`is_broad_cast_join_in_skew`) holds only the skewed keys, and
+/// its probe scan also feeds the shuffle branch, so applying it there would drop that branch's
+/// rows. StarRocks sends those keys to the merge node instead; it isn't a broadcast filter.
 fn broadcast_key(filter: &TRuntimeFilterDescription) -> Option<(i32, i32, i32)> {
     if !is_join_filter(filter)
         || filter.build_join_mode != Some(TRuntimeFilterBuildJoinMode::BROADCAST)
+        || filter.is_broad_cast_join_in_skew == Some(true)
     {
         return None;
     }
@@ -180,6 +190,21 @@ fn broadcast_key(filter: &TRuntimeFilterDescription) -> Option<(i32, i32, i32)> 
     }
     let slot = node.slot_ref.as_ref()?;
     Some((filter.filter_id?, slot.tuple_id, slot.slot_id))
+}
+
+/// Whether `join` compares `filter`'s key with `<=>`. The FE plans filters on null-safe joins
+/// too, but 4.1.3 doesn't mark them in the filter, so this reads the join condition the filter
+/// was built from (`expr_order`), or every condition when it's unset. The semi-join that applies
+/// a filter compares with `=`, which would drop the NULL keys `<=>` matches.
+fn null_safe_key(join: &THashJoinNode, filter: &TRuntimeFilterDescription) -> bool {
+    let null_safe = |condition: &starrocks_thrift::plan_nodes::TEqJoinCondition| {
+        condition.opcode == Some(TExprOpcode::EQ_FOR_NULL)
+    };
+    match filter.expr_order.map(usize::try_from) {
+        Some(Ok(order)) => join.eq_join_conjuncts.get(order).is_none_or(null_safe),
+        Some(Err(_)) => true,
+        None => join.eq_join_conjuncts.iter().any(null_safe),
+    }
 }
 
 fn plan_nodes(params: &TExecPlanFragmentParams) -> &[TPlanNode] {

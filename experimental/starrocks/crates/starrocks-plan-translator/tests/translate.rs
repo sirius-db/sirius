@@ -5589,3 +5589,67 @@ fn a_broadcast_join_reports_the_filters_it_builds_from_its_exchange() {
         }]
     );
 }
+
+/// A broadcast join with filter 7 on its first key, over probe exchange 10 and build exchange 11.
+fn join_building_filter_7(
+    configure: impl FnOnce(
+        &mut starrocks_thrift::plan_nodes::THashJoinNode,
+        &mut starrocks_thrift::runtime_filter::TRuntimeFilterDescription,
+    ),
+) -> Vec<starrocks_plan_translator::runtime_filter::BuiltFilter> {
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    let mut filter = runtime_filter(
+        7,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        0,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::BROADCAST,
+    );
+    filter.expr_order = Some(0);
+    let hash_join = join.hash_join_node.as_mut().unwrap();
+    configure(hash_join, &mut filter);
+    hash_join.build_runtime_filters = Some(vec![filter]);
+    let plan = TPlan::new(vec![
+        join,
+        exchange_node(10, vec![0]),
+        exchange_node(11, vec![1]),
+    ]);
+    starrocks_plan_translator::runtime_filter::built_filters(&params(
+        Some(plan),
+        Some(join_desc()),
+        None,
+    ))
+    .unwrap()
+}
+
+#[test]
+fn a_filter_on_a_null_safe_join_key_is_not_built() {
+    // `=` keeps the filter.
+    assert_eq!(join_building_filter_7(|_, _| {}).len(), 1);
+    // `<=>` matches NULL keys, which the semi-join rewrite would drop.
+    let null_safe = join_building_filter_7(|join, _| {
+        join.eq_join_conjuncts[0].opcode = Some(TExprOpcode::EQ_FOR_NULL);
+    });
+    assert!(null_safe.is_empty(), "{null_safe:?}");
+    // Without `expr_order`, any null-safe condition refuses it.
+    let unordered = join_building_filter_7(|join, filter| {
+        join.eq_join_conjuncts[0].opcode = Some(TExprOpcode::EQ_FOR_NULL);
+        filter.expr_order = None;
+    });
+    assert!(unordered.is_empty(), "{unordered:?}");
+    // An `expr_order` past the join's conditions can't be checked, so it's refused too.
+    let unknown = join_building_filter_7(|_, filter| filter.expr_order = Some(3));
+    assert!(unknown.is_empty(), "{unknown:?}");
+}
+
+#[test]
+fn a_skew_joins_broadcast_branch_filter_is_not_built() {
+    let skew = join_building_filter_7(|_, filter| {
+        filter.is_broad_cast_join_in_skew = Some(true);
+    });
+    assert!(skew.is_empty(), "{skew:?}");
+    let plain = join_building_filter_7(|_, filter| {
+        filter.is_broad_cast_join_in_skew = Some(false);
+    });
+    assert_eq!(plain.len(), 1);
+}
