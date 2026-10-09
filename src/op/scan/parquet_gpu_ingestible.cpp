@@ -343,13 +343,15 @@ class parquet_batch_coalescer : public batch_coalescer {
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                           std::shared_ptr<scan_plan const> plan,
                           scan_contract_id contract_id,
-                          std::shared_ptr<physical_check_counters> counters)
+                          std::shared_ptr<physical_check_counters> counters,
+                          bool file_boundaries = false)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
       _needs_assembly(needs_output_assembly(*_plan)),
       _contract_id(contract_id),
-      _counters(std::move(counters))
+      _counters(std::move(counters)),
+      _file_boundaries(file_boundaries)
   {
   }
 
@@ -468,6 +470,9 @@ class parquet_batch_coalescer : public batch_coalescer {
       cur_rows += rg.num_rows;
     }
     seal_file();
+    // File-boundary mode: emit at each file's end so no split ever bundles two
+    // files' row groups — every split's provenance is exactly one file.
+    if (_file_boundaries && !_slices.empty()) { emitted.push_back(emit_current()); }
     return emitted;
   }
 
@@ -537,6 +542,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::shared_ptr<physical_check_counters> _counters;
   std::vector<uint8_t> _run_original_schema;
   std::string _run_arrow_schema;
+  const bool _file_boundaries = false;
 
   std::vector<row_group_slice> _slices;
   std::vector<split_materializer_certificate> _certificates;
@@ -871,7 +877,8 @@ std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer(
                                                    _reader_options,
                                                    _plan,
                                                    _info->contract_id,
-                                                   _info->profiles->counters);
+                                                   _info->profiles->counters,
+                                                   _info->batch_within_file_boundaries);
 }
 
 //===----------------------------------------------------------------------===//

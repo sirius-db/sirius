@@ -814,6 +814,10 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
   }
   info->scan_output_arity      = keep.size();
   info->approximate_batch_size = batch_size;
+  // Pin-only: never bundle two files' row groups into one chunk, so every pinned
+  // chunk has single-file provenance and a scan over a SUBSET of the pinned files
+  // can be served by whole-chunk selection.
+  info->batch_within_file_boundaries = true;
   return info;
 }
 
@@ -1372,7 +1376,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                       *representative_host_space,
                                       std::move(pinned_column_types),
                                       std::move(host_result.chunk_stats),
-                                      std::move(host_result.column_storage));
+                                      std::move(host_result.column_storage),
+                                      std::move(host_result.chunk_file_paths));
     // The host path always REPLACES, so every pinned column holds this
     // materialization's values.
     attach_proven_unique(host_result.unique_verdicts, pinned_column_names);
@@ -1399,7 +1404,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                         std::move(cache_info),
                                         std::move(dev_result.chunks),
                                         *gpu_spaces_mut[0],
-                                        std::move(dev_result.column_storage));
+                                        std::move(dev_result.column_storage),
+                                        std::move(dev_result.chunk_file_paths));
     // The compressed device path always REPLACES, as above.
     attach_proven_unique(dev_result.unique_verdicts, pinned_column_names);
     attach_duckdb_mvcc_metadata(std::move(dev_result.base_row_count_per_chunk));
@@ -1423,7 +1429,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                                      std::move(mat.chunk_memory_spaces),
                                                      std::move(pinned_column_types),
                                                      std::move(mat.chunk_stats),
-                                                     std::move(mat.column_storage));
+                                                     std::move(mat.column_storage),
+                                                     std::move(mat.chunk_file_paths));
     attach_proven_unique(mat.unique_verdicts, stored);
     attach_duckdb_mvcc_metadata(std::move(base_row_count_per_chunk));
   }
@@ -2314,6 +2321,38 @@ static void SiriusSetSessionLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+void SiriusRegistration::RegisterPinTableFunctions(CatalogTransaction& transaction,
+                                                   Catalog& catalog)
+{
+  // pin_table takes either a positional path (parquet) or no positional (duckdb,
+  // where 'name' is the catalog table reference) — register both arities as a set.
+  TableFunctionSet pin_table_set("pin_table");
+  auto add_pin_table_overload = [&](vector<LogicalType> positional_args) {
+    TableFunction pin_table(
+      "pin_table", std::move(positional_args), PinTableFunction, PinTableBind);
+    pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
+    pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
+    pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
+    pin_table.named_parameters["compression"] = LogicalType::BOOLEAN;
+    pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
+    pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
+    pin_table_set.AddFunction(std::move(pin_table));
+  };
+  add_pin_table_overload({LogicalType::VARCHAR});
+  add_pin_table_overload({});
+  CreateTableFunctionInfo pin_table_info(pin_table_set);
+  // Idempotent: every FFI Context registers these on the same system catalog.
+  pin_table_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+  catalog.CreateTableFunction(transaction, pin_table_info);
+
+  TableFunction unpin_table(
+    "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
+  CreateTableFunctionInfo unpin_table_info(unpin_table);
+  // Idempotent: every FFI Context registers these on the same system catalog.
+  unpin_table_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+  catalog.CreateTableFunction(transaction, unpin_table_info);
+}
+
 void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   // A fragment plan reads each of its input streams through sirius_stream_source(id). Register
@@ -2368,29 +2407,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo profiler_stop_info(profiler_stop);
   catalog.CreateTableFunction(transaction, profiler_stop_info);
 
-  // pin_table takes either a positional path (parquet) or no positional (duckdb,
-  // where 'name' is the catalog table reference) — register both arities as a set.
-  TableFunctionSet pin_table_set("pin_table");
-  auto add_pin_table_overload = [&](vector<LogicalType> positional_args) {
-    TableFunction pin_table(
-      "pin_table", std::move(positional_args), PinTableFunction, PinTableBind);
-    pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
-    pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
-    pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
-    pin_table.named_parameters["compression"] = LogicalType::BOOLEAN;
-    pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
-    pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
-    pin_table_set.AddFunction(std::move(pin_table));
-  };
-  add_pin_table_overload({LogicalType::VARCHAR});
-  add_pin_table_overload({});
-  CreateTableFunctionInfo pin_table_info(pin_table_set);
-  catalog.CreateTableFunction(transaction, pin_table_info);
-
-  TableFunction unpin_table(
-    "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
-  CreateTableFunctionInfo unpin_table_info(unpin_table);
-  catalog.CreateTableFunction(transaction, unpin_table_info);
+  RegisterPinTableFunctions(transaction, catalog);
 
   // sirius_create_ann_index(table, column, metric=>, index_type=>, n_lists=>, schema_name=>)
   TableFunction create_ann_index("sirius_create_ann_index",

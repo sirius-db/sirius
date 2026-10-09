@@ -21,6 +21,8 @@
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
 #include "cudf/cudf_utils.hpp"                             // sirius::get_cudf_type
 #include "data/data_batch_utils.hpp"                       // sirius::make_data_batch
+#include "duckdb/catalog/catalog.hpp"                      // duckdb::Catalog
+#include "duckdb/catalog/catalog_transaction.hpp"          // duckdb::CatalogTransaction
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
 #include "duckdb/common/enums/optimizer_type.hpp"          // duckdb::OptimizerType
 #include "duckdb/execution/column_binding_resolver.hpp"    // duckdb::ColumnBindingResolver
@@ -44,8 +46,9 @@
 #include "memory/slab_memory_resource.hpp"  // sirius::memory::find_slab
 #include "parquet_extension.hpp"            // duckdb::ParquetExtension
 #include "sirius/ffi.hpp"
-#include "sirius_config.hpp"   // sirius::sirius_config
-#include "sirius_context.hpp"  // duckdb::SiriusContext
+#include "sirius_config.hpp"        // sirius::sirius_config
+#include "sirius_context.hpp"       // duckdb::SiriusContext
+#include "sirius_registration.hpp"  // duckdb::SiriusRegistration (pin_table registration)
 
 #include <cudf/utilities/type_dispatcher.hpp>
 
@@ -249,6 +252,14 @@ struct Context::Impl {
     client.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey,
                                     duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
     sirius::exec::register_stream_source_function(*db->instance);
+
+    // pin_table/unpin_table on the embedded catalog, so Context::pin_table can run
+    // the same table function the extension registers (same bind, same behavior).
+    {
+      auto transaction = duckdb::CatalogTransaction::GetSystemTransaction(*db->instance);
+      auto& catalog    = duckdb::Catalog::GetSystemCatalog(*db->instance);
+      duckdb::SiriusRegistration::RegisterPinTableFunctions(transaction, catalog);
+    }
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
@@ -318,6 +329,55 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // The stream's release callback deletes the ResultArrowArrayStreamWrapper.
   auto* wrapper = new duckdb::ResultArrowArrayStreamWrapper(std::move(result), kArrowBatchSize);
   *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
+}
+
+std::unique_ptr<std::string> Context::pin_table(const std::string& path,
+                                                const std::string& tier,
+                                                const std::string& name,
+                                                const std::string& cols_joined,
+                                                const std::string& format,
+                                                const std::string& schema_name)
+{
+  duckdb::vector<duckdb::Value> positional;
+  if (!path.empty()) { positional.emplace_back(path); }
+
+  duckdb::named_parameter_map_t named;
+  if (!tier.empty()) { named["tier"] = duckdb::Value(tier); }
+  if (!name.empty()) { named["name"] = duckdb::Value(name); }
+  if (!cols_joined.empty()) {
+    duckdb::vector<duckdb::Value> cols;
+    std::size_t start = 0;
+    while (start <= cols_joined.size()) {
+      auto end = cols_joined.find('\n', start);
+      if (end == std::string::npos) { end = cols_joined.size(); }
+      if (end > start) { cols.emplace_back(cols_joined.substr(start, end - start)); }
+      start = end + 1;
+    }
+    named["cols"] = duckdb::Value::LIST(duckdb::LogicalType::VARCHAR, std::move(cols));
+  }
+  if (!format.empty()) { named["format"] = duckdb::Value(format); }
+  if (!schema_name.empty()) { named["schema_name"] = duckdb::Value(schema_name); }
+
+  // The relation runs through the connection's ordinary (autocommit) query path —
+  // the same way the extension's `CALL pin_table(...)` executes — so bind
+  // validation, transactions, and the pin execution window all behave identically.
+  std::lock_guard<std::mutex> lock(impl_->conn_mutex);
+  auto result = impl_->conn->TableFunction("pin_table", positional, named)->Execute();
+  if (result->HasError()) { result->ThrowError(); }
+  while (result->Fetch()) {}
+
+  return std::make_unique<std::string>("pinned '" + name + "' tier=" + tier);
+}
+
+std::unique_ptr<std::string> Context::unpin_table(const std::string& name)
+{
+  duckdb::vector<duckdb::Value> positional;
+  positional.emplace_back(name);
+  std::lock_guard<std::mutex> lock(impl_->conn_mutex);
+  auto result = impl_->conn->TableFunction("unpin_table", positional)->Execute();
+  if (result->HasError()) { result->ThrowError(); }
+  while (result->Fetch()) {}
+  return std::make_unique<std::string>("unpinned '" + name + "'");
 }
 
 std::unique_ptr<DirectExchange> Context::direct_exchange() const
