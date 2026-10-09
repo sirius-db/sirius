@@ -62,6 +62,7 @@ mod nixl_transport;
 mod parked_registry;
 mod proto;
 mod prpc;
+mod recent_queries;
 mod result_encoder;
 mod result_store;
 mod runtime_filters;
