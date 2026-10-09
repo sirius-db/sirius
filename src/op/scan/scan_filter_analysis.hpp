@@ -120,9 +120,13 @@ scan_filter_analysis analyze_scan_filters(
  * scan's column primary index, so the request comes out parallel to that
  * column list. Analysis entries that map to no slot are dropped — a partition
  * filter, say, which is enforced elsewhere.
+ *
+ * @p output_prefix_width is the scan's @c gpu_ingestible::output_prefix_width, recorded as @c
+ * sirius::pushdown_request::output_prefix_width wherever that field admits it.
  */
 sirius::pushdown_request build_pushdown_request(scan_filter_analysis const& analysis,
-                                                std::span<const std::size_t> primary_index_by_slot);
+                                                std::span<const std::size_t> primary_index_by_slot,
+                                                std::optional<std::size_t> output_prefix_width);
 
 /**
  * @brief The part of a scan's filter that still has to be evaluated after the

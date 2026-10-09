@@ -35,9 +35,12 @@
 #include <duckdb/planner/filter/null_filter.hpp>
 #include <helper/type_conversions.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <utility>
+#include <vector>
 
 using namespace sirius::op;
 
@@ -302,7 +305,7 @@ TEST_CASE("required IS NOT NULL survives scan conversion and range analysis",
     REQUIRE(result.ranges.at(1).lo == 11);
     REQUIRE_FALSE(result.ranges_cover_whole_filter);
     std::vector<std::size_t> const slots{0, 1};
-    auto request = build_pushdown_request(result, slots);
+    auto request = build_pushdown_request(result, slots, std::nullopt);
     REQUIRE_FALSE(request.ranges_cover_whole_filter);
   }
 
@@ -325,5 +328,50 @@ TEST_CASE("required IS NOT NULL survives scan conversion and range analysis",
               .empty());
     REQUIRE(analyze_scan_filters(f.filters, f.column_ids, f.returned_types, {0})
               .ranges_cover_whole_filter);
+  }
+}
+
+TEST_CASE("build_pushdown_request records the output prefix only where it leaves a slot out",
+          "[scan]")
+{
+  // Two output columns (primary indices 0 and 1) then a pure-filter column (primary index 2) that
+  // carries the scan's only range.
+  scan_filter_analysis analysis;
+  analysis.ranges.emplace(2, sirius::decode_range{0, 99});
+  analysis.ranges_cover_whole_filter = true;
+  std::vector<std::size_t> const slots{0, 1, 2};
+
+  SECTION("a prefix that leaves the pure-filter slot out is recorded")
+  {
+    auto const width   = GENERATE(std::size_t{1}, std::size_t{2});
+    auto const request = build_pushdown_request(analysis, slots, width);
+    REQUIRE(request.output_prefix_width == width);
+    REQUIRE(request.ranges_cover_whole_filter);
+  }
+
+  SECTION("a prefix covering every slot is not recorded")
+  {
+    auto const width   = GENERATE(std::size_t{3}, std::size_t{4});
+    auto const request = build_pushdown_request(analysis, slots, width);
+    REQUIRE_FALSE(request.output_prefix_width.has_value());
+  }
+
+  SECTION("an empty prefix is not recorded")
+  {
+    REQUIRE_FALSE(build_pushdown_request(analysis, slots, 0).output_prefix_width.has_value());
+  }
+
+  SECTION("no prefix is not recorded")
+  {
+    REQUIRE_FALSE(
+      build_pushdown_request(analysis, slots, std::nullopt).output_prefix_width.has_value());
+  }
+
+  SECTION("an empty analysis still returns an empty request")
+  {
+    auto const request = build_pushdown_request(scan_filter_analysis{}, slots, 2);
+    REQUIRE(request.empty());
+    REQUIRE(request.columns.empty());
+    REQUIRE_FALSE(request.output_prefix_width.has_value());
   }
 }
