@@ -337,6 +337,12 @@ struct cached_databatch_provider : public databatch_provider {
     if (!chunk) { return nullptr; }
     if (auto* compressed = dynamic_cast<sirius::compressed_host_representation*>(chunk.get())) {
       auto projected = compressed->select_columns(_column_indices);
+      // The host payload's plans become available after reconstruction. Attach only to
+      // this query's projection; the converter narrows the request against those plans.
+      if (!_pushdown_req.empty()) {
+        projected->set_pushdown_scan(
+          std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req));
+      }
       // Host-tier mirror of the device path: carrying the mask lets the decode-time
       // membership snapshot compose with it rather than skip the split.
       if (chunk_has_mvcc_mask(index)) {

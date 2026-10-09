@@ -25,7 +25,9 @@
 
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/selection.hpp>
+#include <codegen/util/stream_pool.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <log/logging.hpp>
 
 #include <algorithm>
@@ -505,6 +507,10 @@ std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::
   // An in-place equality answer is only worth asking for where the plan can
   // resolve the predicate without materialising the column (a dictionary root);
   // pushing it into any other plan is correct but only moves the comparison.
+  // Critically, non-dictionary BOOL8 requests cause the fused decode path to
+  // reject row filtering, which was measured as an +83 % throughput regression
+  // on fusion-enabled plans. Stripping equals_any here therefore applies on both
+  // the device and host conversion paths.
   auto narrowed  = _request;
   bool any_asked = false;
   for (std::size_t i = 0; i < narrowed.columns.size(); ++i) {
@@ -606,39 +612,27 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
     predicates.size(),
     request.empty());
 
-  // The lanes are streams of `space`, and `mr` and the decode's launches follow the current device.
   if (space.get_tier() != cucascade::memory::Tier::GPU ||
       space.get_device_id() != rmm::get_current_cuda_device().value()) {
     throw std::logic_error(
       "decompress_chunk: the memory space is not a GPU space on the current device");
   }
-  // The lanes come from the stream pool of `space`, which cuCascade shares round-robin with every
-  // other `memory_space::acquire_stream()` caller, for example cuCascade's own host-to-GPU and
-  // GPU-to-GPU converters, the memory prefetcher, pin materialization, dynamic-filter and hash-join
-  // publication, and concurrent decodes. They are borrowed references, neither exclusive nor
-  // necessarily distinct, owned by the pool for the memory space's lifetime. Sharing couples
-  // latency in both directions: every wait the decode makes on a lane, including the session's
-  // final wait and the scan-filter joins, also waits for work others queued on it, and work others
-  // queue later runs behind the decode's. The coupling also chains through event waits: the
-  // scan-filter joins make shared lanes wait on each other, and hash-join publication makes a pool
-  // stream wait on its build writer's event, so a wait can cover work on streams outside the pool.
-  // It cannot deadlock, because every stream wait references an event that is already recorded and
-  // no pool user queues host-gated work, as Simpatico's borrowed-stream overloads require. Decoded
-  // columns can record a lane as their deallocation stream, so the converters rebind them to the
-  // task stream. With the non-default `per_stream_reservation: true`, allocations are charged by
-  // stream: a lane that is also a memory prefetcher worker's stream charges the decode's
-  // allocations to that worker's reservation, so compressed scans are not accounted correctly in
-  // that mode.
-  // One lane per selected column or filter mask source, whichever is more, up to kDecodeStreams:
-  // the filter's first wave decodes one request per source, so several sources on one column still
-  // run in parallel, while a lane that would receive no request would only add another shared
-  // stream to the decode's waits. Membership probes run in the first wave only when the chunk has
-  // no range, equality, or visibility mask; otherwise they run one at a time on the first lane
-  // after it. They are counted regardless, because whether a range survives planning is decided
-  // later, by build_chunk_pushdown_config inside decompress_with_pushdown: an extra lane receives
-  // no decode work, while a missing one would serialize concurrent probes. cuda::stream_ref has no
-  // default constructor, so the unused tail of the array repeats the first lane and is never passed
-  // on.
+  auto* allocator = space.get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  if (!allocator) { throw std::logic_error("decompress_chunk: missing GPU reservation allocator"); }
+  auto allocation_context = allocator->allocation_context_for(stream);
+  // Persistent lanes belong to this host thread and GPU. The context admits their allocations
+  // against the caller's reservation, while the allocator remembers each pointer's origin for free.
+  // Converters rebind returned buffers to their task stream before a worker's lanes can be
+  // destroyed. One lane per selected column or filter mask source, whichever is more, up to
+  // kDecodeStreams: the filter's first wave decodes one request per source, so several sources on
+  // one column still run in parallel, while a lane that would receive no request would only add
+  // another stream to the decode's waits. Membership probes run in the first wave only when the
+  // chunk has no range, equality, or visibility mask; otherwise they run one at a time on the first
+  // lane after it. They are counted regardless, because whether a range survives planning is
+  // decided later, by build_chunk_pushdown_config inside decompress_with_pushdown: an extra lane
+  // receives no decode work, while a missing one would serialize concurrent probes.
+  // cuda::stream_ref has no default constructor, so the unused tail of the array repeats the first
+  // lane and is never passed on.
   std::size_t mask_sources = 0;
   if (!request.empty() && !request.row_selection_disabled) {
     for (auto const& entry : request.columns) {
@@ -648,13 +642,30 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
   }
   auto const lane_count =
     std::clamp<std::size_t>(std::max(selected.size(), mask_sources), 1, kDecodeStreams);
-  auto const first_lane = space.acquire_stream();
+  auto& pool = simpatico::thread_device_stream_pool(kDecodeStreams);
+  if (pool.streams.size() < lane_count) {
+    throw std::logic_error("decompress_chunk: decode pool has too few streams");
+  }
+  auto const first_lane = ::cuda::stream_ref{pool.streams.at(0)};
   auto const all_lanes  = [&]<std::size_t... I>(std::index_sequence<I...>) {
     return std::array<::cuda::stream_ref, kDecodeStreams>{
-      first_lane, (I + 1 < lane_count ? space.acquire_stream() : first_lane)...};
+      first_lane,
+      (I + 1 < lane_count ? ::cuda::stream_ref{pool.streams.at(I + 1)} : first_lane)...};
   }(std::make_index_sequence<kDecodeStreams - 1>{});
   std::span<const ::cuda::stream_ref> const lanes{all_lanes.data(), lane_count};
-  if (!request.empty() && !request.row_selection_disabled) {
+  // Two conditions enable decode-time pushdown:
+  // (a) The ordinary path: non-empty request with row selection enabled.
+  // (b) A visibility mask is present alongside row_selection_disabled=true (e.g., a
+  //     without_row_selection() scan that still carries equals_any predicates and an MVCC mask).
+  //     Without this guard, the old gate short-circuited before decompress_with_pushdown and the
+  //     mask was applied post-decode by materialize_table instead of being fused into wave 1.
+  //     When scan==nullptr (all predicates dropped by for_chunk), decompress_with_pushdown is still
+  //     called but build_chunk_pushdown_config returns config.enabled=false (no sources), so it
+  //     returns nullptr and execution falls through to plain decompress; the mask is then applied
+  //     post-decode by materialize_table, preserving correctness.
+  bool const has_pushdown =
+    (!request.empty() && !request.row_selection_disabled) || keep_mask.has_mask();
+  if (has_pushdown) {
     out.table =
       decompress_with_pushdown(chunk, selected, request, keep_mask, lanes, stream, mr, out.outcome);
   }

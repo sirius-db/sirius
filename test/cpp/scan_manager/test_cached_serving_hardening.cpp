@@ -64,6 +64,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/load_balancing_scan_batch_coalescer.hpp>
@@ -72,6 +73,7 @@
 #include <scan_manager/split_connector.hpp>
 #include <telemetry/data_batch_probe.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -679,6 +681,111 @@ TEST_CASE("cached provider composes the decode-side pushdown with the mvcc mask 
   REQUIRE_FALSE(b_served.visibility.has_mask());
 
   REQUIRE_FALSE(provider->get_next_batch().data);  // end of stream
+}
+
+TEST_CASE("host cached provider keeps pushdown requests query local across projection and clone",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e = env();
+  constexpr std::size_t rows{64};
+  auto entry = std::make_shared<pinned_entry>();
+  set_cached_columns(*entry, {"k", "v"});
+  entry->tier         = cucascade::memory::Tier::HOST;
+  entry->memory_space = e.host_space;
+  entry->num_rows     = rows;
+  auto original       = std::make_shared<sirius::compressed_host_representation>(
+    *e.host_space,
+    std::make_shared<sirius::pinned_compressed_blob>(),
+    std::vector<std::string>{"k", "v"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/256,
+    /*num_rows=*/static_cast<std::int64_t>(rows));
+  entry->host_chunks.push_back(original);
+
+  // Requests are indexed by output slot, even when projection reverses pin columns.
+  std::vector<std::size_t> columns{1, 0};
+  sirius::pushdown_request request;
+  request.columns.resize(2);
+  request.columns[0].equals_any  = {"AIR", "AIR REG"};
+  request.row_selection_disabled = true;
+  auto mask                      = make_test_mask(rows);
+  auto make_provider             = [&](sirius::pushdown_request wanted) {
+    return sirius::scan_manager::make_provider_for_pinned_entry(
+      entry,
+      columns,
+      sirius::scan_manager::cached_scan_plan{.survivor_chunk_indices = {0}},
+      sirius::telemetry::batch_telemetry_info{},
+      sirius::scan_manager::mvcc_chunk_mask_set{mask},
+      /*delta_splits=*/{},
+      /*normalization_targets=*/{},
+      /*has_physical_overrides=*/false,
+      std::move(wanted));
+  };
+  auto first_provider = make_provider(request);
+  auto first          = first_provider->get_next_batch();
+  REQUIRE(first.data);
+  auto const first_scan = [&] {
+    auto first_ro = first.data->to_read_only();
+    auto const* first_rep =
+      dynamic_cast<sirius::compressed_host_representation const*>(first_ro.get_data());
+    REQUIRE(first_rep != nullptr);
+    REQUIRE(first_rep->selected_indices() == std::optional<std::vector<std::size_t>>{columns});
+    REQUIRE(first_rep->pushdown_scan() != nullptr);
+    REQUIRE(first_rep->pushdown_scan()->request().columns[0].equals_any ==
+            request.columns[0].equals_any);
+    REQUIRE(first_rep->pushdown_scan()->request().row_selection_disabled);
+    REQUIRE(first_rep->visibility_mask().words == mask.words);
+    return first_rep->pushdown_scan();
+  }();
+
+  // A clone used by conversion/prefetch must retain the query's immutable request.
+  auto cloned = [&] {
+    auto first_mut = first.data->to_mutable();
+    return first_mut.get_data()->clone(e.stream());
+  }();
+  auto const* cloned_rep =
+    dynamic_cast<sirius::compressed_host_representation const*>(cloned.get());
+  REQUIRE(cloned_rep != nullptr);
+  REQUIRE(cloned_rep->pushdown_scan() == first_scan);
+  REQUIRE(cloned_rep->visibility_mask().words == mask.words);
+  REQUIRE(cloned_rep->visibility_mask().row_count == rows);
+
+  // Both tier wrappers share their backing storage and must preserve the same row mask.
+  sirius::compressed_device_representation device(
+    *e.gpu_space,
+    std::make_shared<sirius::compressed_device_blob>(),
+    std::vector<std::string>{"k", "v"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/256,
+    /*num_rows=*/static_cast<std::int64_t>(rows));
+  auto device_projected = device.select_columns(columns);
+  device_projected->set_pushdown_scan(first_scan);
+  device_projected->set_visibility_mask(sirius::decode_visibility_mask{mask.words, mask.row_count});
+  auto device_clone = device_projected->clone(e.stream());
+  auto const* device_cloned_rep =
+    dynamic_cast<sirius::compressed_device_representation const*>(device_clone.get());
+  REQUIRE(device_cloned_rep != nullptr);
+  REQUIRE(device_cloned_rep->pushdown_scan() == first_scan);
+  REQUIRE(device_cloned_rep->visibility_mask().words == mask.words);
+  REQUIRE(device_cloned_rep->visibility_mask().row_count == rows);
+  REQUIRE(device_cloned_rep->selected_indices() ==
+          std::optional<std::vector<std::size_t>>{columns});
+
+  request.columns[0].equals_any = {"MAIL"};
+  auto second_provider          = make_provider(request);
+  auto second                   = second_provider->get_next_batch();
+  auto second_ro                = second.data->to_read_only();
+  auto const* second_rep =
+    dynamic_cast<sirius::compressed_host_representation const*>(second_ro.get_data());
+  REQUIRE(second_rep != nullptr);
+  REQUIRE(second_rep->pushdown_scan()->request().columns[0].equals_any ==
+          request.columns[0].equals_any);
+  REQUIRE(first_scan->request().columns[0].equals_any ==
+          std::vector<std::string>{"AIR", "AIR REG"});
+  REQUIRE(original->pushdown_scan() == nullptr);
+  REQUIRE_FALSE(original->visibility_mask().has_mask());
+  REQUIRE_FALSE(first_provider->get_next_batch().data);
+  REQUIRE_FALSE(second_provider->get_next_batch().data);
 }
 
 TEST_CASE("cached provider marks only selected converting columns",
@@ -1421,6 +1528,72 @@ TEST_CASE("prepare_for_processing never steals from a GPU-resident (pin-shaped) 
   auto ro = batch->to_read_only();
   REQUIRE(ro.get_data() != nullptr);
   REQUIRE(ro.get_data()->get_size_in_bytes() == size_before);
+}
+
+TEST_CASE("prepare_for_processing reads the outcome of a prefetched GPU decode",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e                 = env();
+  auto make_decoded_batch = [&](sirius::pushdown_outcome outcome) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::BOOL8}, 4, cudf::mask_state::UNALLOCATED, e.stream()));
+    auto rep = std::make_unique<sirius::decompression_pushdown_batch_representation>(
+      std::make_unique<cudf::table>(std::move(columns)),
+      *e.gpu_space,
+      e.stream(),
+      std::move(outcome));
+    return cucascade::data_batch::make(10001, std::move(rep));
+  };
+
+  SECTION("predicate-substituted prefetched columns retain their interpretation")
+  {
+    sirius::pushdown_outcome outcome;
+    outcome.predicate_columns      = {0};
+    outcome.predicates_enforced    = true;
+    outcome.selection_unprofitable = true;
+    auto batch                     = make_decoded_batch(outcome);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.row_filter_pending              = true;
+    split.pushdown_selection_unprofitable = std::make_shared<std::atomic<bool>>(false);
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.pushdown_predicate_columns == outcome.predicate_columns);
+    REQUIRE(split.pushdown_predicates_enforced);
+    REQUIRE_FALSE(split.pushdown_row_filtered);
+    REQUIRE(split.pushdown_selection_unprofitable->load());
+    // An already-resident GPU wrapper must not gain prepare's conversion-only steal.
+    REQUIRE(split.stolen_table == nullptr);
+    REQUIRE_FALSE(split.converted_table_steal_pending);
+    auto ro = batch->to_read_only();
+    REQUIRE(dynamic_cast<sirius::decompression_pushdown_batch_representation const*>(
+              ro.get_data()) != nullptr);
+  }
+
+  SECTION("prefetched compaction consumes its already-applied visibility mask")
+  {
+    sirius::pushdown_outcome outcome;
+    outcome.row_filtered            = true;
+    outcome.visibility_mask_applied = true;
+    auto batch                      = make_decoded_batch(outcome);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.mvcc_keep_mask     = make_test_mask(8);
+    split.row_filter_pending = true;
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.pushdown_row_filtered);
+    REQUIRE_FALSE(split.mvcc_keep_mask.has_mask());
+    REQUIRE(split.stolen_table == nullptr);
+  }
+
+  SECTION("prefetched row filtering still rejects an unconsumed positional mask")
+  {
+    sirius::pushdown_outcome outcome;
+    outcome.row_filtered = true;
+    auto batch           = make_decoded_batch(outcome);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.mvcc_keep_mask = make_test_mask(8);
+    REQUIRE_THROWS_WITH(split.prepare_for_processing(e.gpu_space, e.stream()),
+                        Catch::Matchers::ContainsSubstring("unconsumed mvcc keep-mask"));
+  }
 }
 
 TEST_CASE("prepare_for_processing gates immediate and transactional converted-table steals",

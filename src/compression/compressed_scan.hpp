@@ -308,10 +308,12 @@ class decompression_pushdown_scan {
  * Never returns a null table: every way the filtering can decline ends in the
  * plain decode of the same columns.
  *
- * The decode takes its parallel streams from the shared stream pool of @p space, the GPU memory
- * space the output lands in, and allocates from @p mr. @p space must be a GPU space on the current
- * device, which is also the device of @p mr. The returned columns may record one of those streams
- * for deallocation; callers rebind them to @p stream (see `compression_converters.cpp`).
+ * The decode uses persistent streams belonging to the calling host thread and current device, and
+ * allocates from @p mr. @p space must be a GPU space on the current device, which is also the
+ * device of @p mr. Allocations through the reservation-aware allocator of @p space use the
+ * reservation associated with @p stream according to its configured tracking scope. The returned
+ * columns may record a private lane for deallocation; callers rebind them and any selection buffers
+ * to @p stream before they can outlive the calling thread (see `compression_converters.cpp`).
  *
  * @throw std::logic_error if @p space is not a GPU memory space on the current device
  */

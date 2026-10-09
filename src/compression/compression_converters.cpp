@@ -35,6 +35,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <log/logging.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 
@@ -52,10 +53,9 @@ namespace sirius {
 
 namespace {
 
-// Rebind a column's buffers (recursively) to `s` for ordered teardown. The decode runs on streams
-// of the target memory space's shared pool, which other engine work also uses, while the caller's
-// pipeline stream `s` orders the rest of the work downstream; re-pointing frees here keeps them
-// ordered with that work instead of with whatever runs next on a shared stream.
+// Rebind all output buffers to the caller's pipeline stream for ordered teardown after decode.
+// Private decode lanes belong to the calling thread, while returned batches may outlive that
+// thread.
 std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
                                                    ::cuda::stream_ref s)
 {
@@ -77,7 +77,7 @@ std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column>
     type, size, std::move(*contents.data), std::move(null_mask), nc, std::move(children));
 }
 
-// The GPU memory space a decode lands in. Decode takes its streams from this space's pool, so a
+// The GPU memory space a decode lands in. Its allocator accounts private decode lanes, so a
 // missing or non-GPU space is rejected before any device work.
 const cucascade::memory::memory_space& gpu_decode_space(
   const cucascade::memory::memory_space* space, char const* conversion)
@@ -122,16 +122,39 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     throw std::runtime_error("[compression_converters] reconstruct failed: " + read_error);
   }
 
-  // Decode across up to 4 memory-space streams, submitted from the calling thread — no worker
-  // threads are spawned. The H2D fetch above ran on `stream`; sync it first so
-  // pool-stream reads are ordered after all fetched bytes are resident.
+  // Decode across up to 4 private persistent streams, submitted from the calling thread -- no
+  // worker threads are spawned. The H2D fetch above ran on `stream`; sync it first so pool-stream
+  // reads are ordered after all fetched bytes are resident.
   stream.sync();
-  auto const mr = rmm::mr::get_current_device_resource_ref();
+  auto* const gpu_mr = space.get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  if (!gpu_mr) {
+    throw std::logic_error("reconstruct_and_decompress_to_gpu: missing GPU allocator");
+  }
+  auto const mr = rmm::device_async_resource_ref{*gpu_mr};
   // `subset` already holds only the projected columns, so the scan's request —
   // which is indexed by projected position — lines up with 0..num_columns.
   std::vector<std::size_t> selection(subset.num_columns());
   std::iota(selection.begin(), selection.end(), std::size_t{0});
-  auto decoded      = decompress_chunk(subset, selection, scan, keep_mask, space, stream, mr);
+  // Host projections carry the query request before their compression plans are
+  // reconstructed. Apply the same dictionary-eligibility narrowing as the device path:
+  // for_chunk strips equals_any from any column whose plan cannot answer the predicate
+  // in-place (i.e., not a dictionary root).
+  //
+  // Note on generic BOOL8 retention: earlier behaviour passed the raw scan here, which
+  // incidentally triggered BOOL8 column substitution for non-dictionary equality columns,
+  // reducing peak memory for those decodes. The reviewer's retained-memory concern is
+  // valid — a four-output stress measurement showed logical peak drop from 192 MB to
+  // 87 MB. However, profiling (SF50 equality workloads, 888 SQL + 22 microbenchmark
+  // executions) showed the opposite effect on throughput: restoring generic BOOL8 caused
+  // a +1.8 % regression on simple equality, +5.4 % on mixed predicates, and an +83 %
+  // regression on fusion-enabled mixed-predicate plans (Nsight confirmed the fused decode
+  // path rejects useful row filtering when a non-dictionary BOOL8 request is present).
+  // The memory reduction is a stress-case artifact and does not justify the fusion cost.
+  // Any future work on generic BOOL8 retention must preserve dictionary-only mask
+  // admission so the fused path is not affected.
+  auto const narrowed_scan = scan ? scan->for_chunk(subset, selection) : nullptr;
+  auto decoded =
+    decompress_chunk(subset, selection, narrowed_scan.get(), keep_mask, space, stream, mr);
   auto decompressed = std::move(decoded.table);
 
   // Re-point decoded buffers onto `stream` so pipeline teardown is ordered.
@@ -204,7 +227,9 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     "device-to-GPU decompression");
   auto const& indices = rep.selected_indices();
   auto const& ct      = rep.table();
-  auto const mr       = rmm::mr::get_current_device_resource_ref();
+  auto* const gpu_mr  = space.get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  if (!gpu_mr) { throw std::logic_error("decompress_device_to_gpu: missing GPU allocator"); }
+  auto const mr = rmm::device_async_resource_ref{*gpu_mr};
 
   // Projected column count — what the scan's request is indexed by.
   auto const n_selected =

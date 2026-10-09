@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#include "compression/compressed_scan.hpp"
+
 #include <cudf/column/column_factories.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -17,6 +19,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -240,4 +243,114 @@ TEST_CASE("Simpatico decode charges one request's temporaries beyond earlier out
   CHECK(allocator->get_allocated_bytes(attachment_stream) == 0);
   CHECK(streams.sync_all() == cudaSuccess);
   input_stream.synchronize();
+}
+
+TEST_CASE("Compressed facade admits private lanes against the caller and frees allocation origins",
+          "[compression][decode][reservation][allocation_origin]")
+{
+  using namespace cucascade::memory;
+  auto per_stream                = GENERATE(false, true);
+  constexpr cudf::size_type rows = 1024;
+  constexpr std::size_t bytes    = rows * sizeof(std::int32_t);
+  rmm::mr::cuda_async_memory_resource input_resource{8U << 20};
+  rmm::cuda_stream task_stream;
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                              rows,
+                                              cudf::mask_state::UNALLOCATED,
+                                              task_stream.view(),
+                                              input_resource));
+  REQUIRE(cudaMemsetAsync(
+            columns.front()->mutable_view().head<std::int32_t>(), 7, bytes, task_stream.value()) ==
+          cudaSuccess);
+  cudf::table input{std::move(columns)};
+  task_stream.synchronize();
+  auto compressed = simpatico::compress_with_plan(
+    input.view(), "input -> identity\n", task_stream.view(), input_resource);
+  int device = -1;
+  REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+  gpu_memory_space_config config;
+  config.device_id              = device;
+  config.memory_capacity        = 1U << 20;
+  config.per_stream_reservation = per_stream;
+  memory_space space{config};
+  auto* allocator = space.get_memory_resource_as<reservation_aware_resource_adaptor>();
+  REQUIRE(allocator != nullptr);
+  auto& lanes = simpatico::thread_device_stream_pool(4);
+  REQUIRE(lanes.streams.size() >= 4);
+  auto lane = ::cuda::stream_ref{lanes.streams.front()};
+  if (per_stream) {
+    REQUIRE(allocator->attach_reservation_to_tracker(lane, space.make_reservation(4 * bytes)));
+  }
+  REQUIRE(
+    allocator->attach_reservation_to_tracker(task_stream.view(),
+                                             space.make_reservation(256),
+                                             std::make_unique<fail_reservation_limit_policy>()));
+  std::array<std::size_t, 1> const selected{0};
+  CHECK_THROWS_AS(
+    sirius::decompress_chunk(compressed,
+                             selected,
+                             nullptr,
+                             {},
+                             space,
+                             task_stream.view(),
+                             *space.get_memory_resource_of<cucascade::memory::Tier::GPU>()),
+    rmm::out_of_memory);
+  CHECK(allocator->get_allocated_bytes(task_stream.view()) == 0);
+  if (per_stream) { CHECK(allocator->get_allocated_bytes(lane) == 0); }
+  allocator->reset_stream_reservation(task_stream.view());
+  REQUIRE(
+    allocator->attach_reservation_to_tracker(task_stream.view(),
+                                             space.make_reservation(bytes),
+                                             std::make_unique<fail_reservation_limit_policy>()));
+  auto decoded =
+    sirius::decompress_chunk(compressed,
+                             selected,
+                             nullptr,
+                             {},
+                             space,
+                             task_stream.view(),
+                             *space.get_memory_resource_of<cucascade::memory::Tier::GPU>());
+  REQUIRE(decoded.table != nullptr);
+  CHECK(allocator->get_allocated_bytes(task_stream.view()) == bytes);
+  CHECK(allocator->get_peak_allocated_bytes(task_stream.view()) == bytes);
+  if (per_stream) { CHECK(allocator->get_allocated_bytes(lane) == 0); }
+  std::vector<std::int32_t> expected(rows);
+  REQUIRE(cudaMemcpyAsync(expected.data(),
+                          decoded.table->view().column(0).head<std::int32_t>(),
+                          bytes,
+                          cudaMemcpyDeviceToHost,
+                          task_stream.value()) == cudaSuccess);
+  task_stream.synchronize();
+  CHECK(
+    std::all_of(expected.begin(), expected.end(), [](auto value) { return value == 0x07070707; }));
+
+  // Match converter teardown ordering: the decoded buffers survive their original reservation.
+  auto output_columns = decoded.table->release();
+  auto contents       = output_columns.front()->release();
+  contents.data->set_stream(task_stream.view());
+  rmm::device_buffer null_mask =
+    contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
+  null_mask.set_stream(task_stream.view());
+  output_columns.front() = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                                          rows,
+                                                          std::move(*contents.data),
+                                                          std::move(null_mask),
+                                                          0);
+  decoded.table          = std::make_unique<cudf::table>(std::move(output_columns));
+  allocator->reset_stream_reservation(task_stream.view());
+  REQUIRE(allocator->attach_reservation_to_tracker(task_stream.view(),
+                                                   space.make_reservation(2 * bytes)));
+  std::jthread free_thread([&] {
+    cudaSetDevice(device);
+    decoded.table.reset();
+  });
+  free_thread.join();
+  task_stream.synchronize();
+  CHECK(allocator->get_allocated_bytes(task_stream.view()) == 0);
+  if (per_stream) { allocator->reset_stream_reservation(lane); }
+  allocator->reset_stream_reservation(task_stream.view());
+  CHECK(allocator->get_total_allocated_bytes() == 0);
+  CHECK(allocator->get_total_reserved_bytes() == 0);
+  CHECK(allocator->get_active_reservation_count() == 0);
 }
