@@ -97,7 +97,9 @@ enum class prepare_result : std::uint8_t {
 
 class sirius_datasource : public cudf::io::datasource {
  public:
-  explicit sirius_datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_obj);
+  explicit sirius_datasource(std::shared_ptr<ioctx> io_ctx,
+                             std::shared_ptr<io_object> io_obj,
+                             datasource_cache_mode mode = datasource_cache_mode::use_cache);
 
   ~sirius_datasource() override;
 
@@ -209,6 +211,9 @@ class sirius_datasource : public cudf::io::datasource {
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
+  /// The mode this datasource was created with; duplicates inherit it.
+  [[nodiscard]] datasource_cache_mode cache_mode() const noexcept { return _cache_mode; }
+
   /// Whether the backend serving this datasource would rather be handed one
   /// batched request than a stream of small reads.  See @c ioctx::prefers_bulk_io.
   [[nodiscard]] bool prefers_bulk_io() const noexcept;
@@ -216,8 +221,10 @@ class sirius_datasource : public cudf::io::datasource {
  private:
   std::shared_ptr<ioctx> _io_ctx;
   std::shared_ptr<io_object> _io_object;
+  datasource_cache_mode const _cache_mode;
   /// Handle of the most recent insert into the prefetching cache, or empty
   /// if none was made.  Disposing it lets the cache reclaim the request.
+  /// Never populated for a bypass_cache datasource.
   cache::cache_handle _cache_handle;
 };
 

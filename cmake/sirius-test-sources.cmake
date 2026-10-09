@@ -142,6 +142,7 @@ set(TEST_SOURCES
     test/cpp/io/kvikio/test_kvikio_remote.cpp
     test/cpp/io/test_io_request.cpp
     test/cpp/io/test_parquet_helpers.cpp
+    test/cpp/io/test_sirius_datasource.cpp
     test/cpp/io/test_templated_ioctx.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
@@ -307,6 +308,7 @@ set(TEST_SOURCES
     test/cpp/utils/s3_backend.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/s3/test_duckdb_secret_config.cpp
+    test/cpp/io/rest/test_rest_cache_bypass.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
     test/cpp/io/cache/test_cache_object_identity.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp

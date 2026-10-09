@@ -64,8 +64,9 @@ std::future<size_t> bridge_semi_to_std(Producer&& producer)
 }  // namespace
 
 sirius_datasource::sirius_datasource(std::shared_ptr<ioctx> io_ctx,
-                                     std::shared_ptr<io_object> io_obj)
-  : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_obj))
+                                     std::shared_ptr<io_object> io_obj,
+                                     datasource_cache_mode mode)
+  : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_obj)), _cache_mode(mode)
 {
 }
 
@@ -210,12 +211,13 @@ std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
   // deliberately reused across splits of the same file.  The new
   // datasource starts with a default-constructed cache_handle so
   // its fadvise() calls can't accidentally cancel the original's work.
-  return std::make_unique<sirius_datasource>(_io_ctx, _io_object);
+  return std::make_unique<sirius_datasource>(_io_ctx, _io_object, _cache_mode);
 }
 
 void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
                                 std::optional<int> dev_id)
 {
+  if (_cache_mode == datasource_cache_mode::bypass_cache) { return; }
   auto* cache = _io_ctx->cache();
   if (cache == nullptr || !_io_ctx->can_use_prefetching_cache()) { return; }
 
@@ -298,7 +300,9 @@ std::exception_ptr sirius_datasource::prefetch_failure() const noexcept
 
 bool sirius_datasource::uses_prefetching_cache() const noexcept
 {
-  return _io_ctx->uses_prefetching_cache();
+  // The mode test comes first: a bypass datasource must not even read the
+  // ioctx's replaceable cache slot.
+  return _cache_mode == datasource_cache_mode::use_cache && _io_ctx->uses_prefetching_cache();
 }
 
 bool sirius_datasource::prefers_bulk_io() const noexcept { return _io_ctx->prefers_bulk_io(); }

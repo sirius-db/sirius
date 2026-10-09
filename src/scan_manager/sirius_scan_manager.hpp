@@ -908,7 +908,8 @@ class sirius_scan_manager {
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> open_datasource_on(
     std::shared_ptr<sirius::io::ioctx> const& io_ctx,
     std::string_view path,
-    sirius::io::open_hint hint = sirius::io::open_hint::generic);
+    sirius::io::open_hint hint             = sirius::io::open_hint::generic,
+    sirius::io::datasource_cache_mode mode = sirius::io::datasource_cache_mode::use_cache);
 
   /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
   ///        to @p sink, one call per page; @p sink returns false to stop early.
