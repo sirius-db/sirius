@@ -352,8 +352,10 @@ against the pipeline pool's width rather than the backend's depth — one prefet
 deployment is only useful while a pipeline thread could still pick up another scan. An explicit
 `max_readahead_scans` wins over that substitution.
 
-Both are resolved against a single backend: the live one publishing the widest
-`n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
+A query's local policy is selected from the serving backend publishing the widest budget.
+A runtime budget additionally accounts for every backend touched by each split across all
+queries. Demand reads borrow immediately; their debt pauses speculative prefetch. Events are
+routed by query ID. A failed cache allocation gets one eviction retry before speculation yields.
 
 Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
 

@@ -19,7 +19,6 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb_table_identity.hpp"
 #include "event/query_event_publisher.hpp"
-#include "exec/query_lifecycle_registry.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
@@ -967,6 +966,7 @@ class sirius_scan_manager {
     //! request_stop() here stops only this query's work; the shared pool and every other
     //! query keep running.
     std::unique_ptr<exec::scoped_dispatcher> dispatcher;
+    std::unique_ptr<exec::scoped_dispatcher> coalescer_dispatcher;
   };
 
   /// \brief Enqueue @p state's metadata producers before starting its coalescer consumers.
@@ -1037,6 +1037,9 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
   exec::static_thread_pool _thread_pool;
+  exec::static_thread_pool _coalescer_pool;
+  std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
+    std::make_shared<shared_scan_budget>();
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
