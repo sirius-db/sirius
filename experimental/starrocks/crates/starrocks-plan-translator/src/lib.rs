@@ -31,7 +31,7 @@
 //! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
 //! | `SELECT_NODE`        | `FilterRel`        |
 //! | `PROJECT_NODE`       | `ProjectRel` (common slots materialized first as hidden `ProjectRel`s) |
-//! | `AGGREGATION_NODE`   | `AggregateRel` (one-phase, or two-phase `SUM` via `agg_phase`) |
+//! | `AGGREGATION_NODE`   | `AggregateRel` (one-phase, or two-phase `SUM`/`COUNT`/`MIN`/`MAX` via `agg_phase`) |
 //! | `EXCHANGE_NODE`      | `ReadRel` (named table = the engine's `sirius_stream_<node_id>` view) |
 //! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
 //! | `HASH_JOIN_NODE`      | `JoinRel` (inner/outer/left-semi; left/right anti as outer join + `is_null` filter, null-aware left anti as mark join + `not`) |
@@ -58,8 +58,10 @@
 //!
 //! Aggregate functions (`sum`, `count`, `min`, `max`, `avg`, and the
 //! `multi_distinct_*` distinct forms) are decomposed by `expr_translator::aggregate_call` for
-//! `AggregateRel` measures. Two-phase plans accept **SUM only** (partial and merge both stay
-//! `sum`); AVG and distinct in a partial/merge node are rejected.
+//! `AggregateRel` measures. Two-phase plans accept SUM, COUNT, MIN and MAX: the partial step
+//! emits one partial-state column per measure and the merge step combines it (`sum`, `sum` of
+//! the counts, `min`, `max`); `agg_phase::partial_state` types that column for both fragments.
+//! AVG and distinct in a partial/merge node are rejected.
 //!
 //! Type mapping lives in `type_mapper`. Intentional v1 omissions return
 //! [`TranslateError::UnsupportedType`]: `LARGEINT` (128-bit), `DECIMAL256` and
