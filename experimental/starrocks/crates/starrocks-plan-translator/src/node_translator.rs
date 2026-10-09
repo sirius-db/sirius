@@ -653,17 +653,26 @@ fn translate_exchange(
     if let Some(states) = ctx.state_columns.get(&node.node_id)
         && let Some(structure) = schema.r#struct.as_mut()
     {
-        for key in states.keys() {
-            layout.resolve(*key)?;
+        // The merge's slot refs resolve like any other (`RowLayout::resolve`), so they may name
+        // the exchange's slots through another tuple.
+        let mut by_column = HashMap::with_capacity(states.len());
+        for (key, columns) in states {
+            if by_column.insert(layout.resolve(*key)?, columns).is_some() {
+                return Err(TranslateError::UnsupportedPlanNode {
+                    node_id: node.node_id,
+                    node_type: node.node_type,
+                    reason: "two merge aggregates read the same partial-state column",
+                });
+            }
         }
         let mut types = Vec::with_capacity(structure.types.len());
         let mut bindings = Vec::with_capacity(layout.len());
-        for (ty, binding) in structure.types.drain(..).zip(layout.columns()) {
-            match binding.and_then(|key| states.get(&key)) {
+        for (index, (ty, binding)) in structure.types.drain(..).zip(layout.columns()).enumerate() {
+            match by_column.get(&index) {
                 Some(columns) => {
-                    for (index, column) in columns.iter().enumerate() {
+                    for (position, column) in columns.iter().enumerate() {
                         types.push(column.clone());
-                        bindings.push(binding.filter(|_| index == 0));
+                        bindings.push(binding.filter(|_| position == 0));
                     }
                 }
                 None => {

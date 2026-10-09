@@ -21,6 +21,10 @@ const AGG_COLUMN_ORDER: &str = "tpch-sf1000-agg-column-order";
 /// Two-phase AVG fragments, which used to fail with "two-phase aggregation supports SUM, COUNT,
 /// MIN and MAX only".
 const TWO_PHASE_AVG: &str = "tpch-sf1000-two-phase-avg";
+/// Fragments whose slot refs name a tuple the input row doesn't carry, which used to fail with
+/// "slot N (tuple T) is not part of the row layout". The BE finds a slot ref's column by slot id
+/// alone (`Chunk::get_column_by_slot_id`), so those plans are valid.
+const SLOT_LAYOUT: &str = "tpch-sf1000-slot-layout";
 
 /// Reads a recorded fragment from a fixture directory.
 fn load(dir: &str, name: &str) -> TExecPlanFragmentParams {
@@ -651,4 +655,96 @@ fn q22_two_phase_global_avg_partial_and_merge_agree_on_the_exchange_row() {
     assert_eq!(stream_types(&merge, 6), ["DOUBLE", "BIGINT"]);
     assert_eq!(measure_fields(top_aggregate(&merge)), [0, 1]);
     assert_eq!(merge.output_names.len(), 1);
+}
+
+/// The grouping-key fields and the measures' argument fields of every aggregation, outermost
+/// first.
+fn aggregations(plan: &TranslatedPlan) -> Vec<(Vec<usize>, Vec<Vec<usize>>)> {
+    use substrait::proto::{function_argument, rel};
+    rels(plan)
+        .into_iter()
+        .filter_map(|rel| match rel.rel_type.as_ref() {
+            Some(rel::RelType::Aggregate(aggregate)) => Some(aggregate),
+            _ => None,
+        })
+        .map(|aggregate| {
+            let keys = aggregate.grouping_expressions.iter().map(field).collect();
+            let arguments = aggregate
+                .measures
+                .iter()
+                .map(|measure| {
+                    measure
+                        .measure
+                        .as_ref()
+                        .unwrap()
+                        .arguments
+                        .iter()
+                        .map(|argument| match argument.arg_type.as_ref() {
+                            Some(function_argument::ArgType::Value(value)) => field(value),
+                            other => panic!("unexpected argument {other:?}"),
+                        })
+                        .collect()
+                })
+                .collect();
+            (keys, arguments)
+        })
+        .collect()
+}
+
+/// q16's dedupe-and-count fragment (SORT <- AGG count <- AGG merge dedupe <- EXCHANGE). The FE
+/// writes the merge dedupe's first key and the count's argument as `ps_suppkey` of the partial
+/// fragment's projection tuple (8), while the exchange carries the partial aggregation's tuple
+/// (9) with the same slot ids.
+#[test]
+fn q16_merge_dedupe_resolves_slots_of_another_tuple() {
+    let params = load(SLOT_LAYOUT, "q16-dedupe-count");
+    let exchange = params
+        .fragment
+        .as_ref()
+        .and_then(|fragment| fragment.plan.as_ref())
+        .unwrap()
+        .nodes
+        .iter()
+        .find(|node| node.node_type == TPlanNodeType::EXCHANGE_NODE)
+        .unwrap();
+    assert_eq!(exchange.row_tuples, [9]);
+    let first_key = aggregation(&params, 12).grouping_exprs.as_ref().unwrap()[0].nodes[0]
+        .slot_ref
+        .as_ref()
+        .unwrap();
+    assert_eq!((first_key.tuple_id, first_key.slot_id), (8, 2));
+
+    let plan = translate(SLOT_LAYOUT, "q16-dedupe-count").unwrap();
+    // Outermost first: count(ps_suppkey) grouped by brand, type, size over the dedupe's
+    // (suppkey, brand, type, size); the dedupe groups the exchange's four columns.
+    assert_eq!(
+        aggregations(&plan),
+        [(vec![1, 2, 3], vec![vec![0]]), (vec![0, 1, 2, 3], vec![])]
+    );
+}
+
+/// q18's partial fragment ends in a top-N over the partial SUM. Its sort tuple is materialized
+/// from slots the FE writes as tuple 15 (o_totalprice, o_orderdate) and tuple 14 (the rest),
+/// while the aggregation below emits only tuple 14: (c_name, c_custkey, o_orderkey,
+/// o_orderdate, o_totalprice, sum).
+#[test]
+fn q18_top_n_materializes_slots_of_another_tuple() {
+    use substrait::proto::rel;
+
+    let plan = translate(SLOT_LAYOUT, "q18-partial-topn").unwrap();
+    let rels = rels(&plan);
+    let sort = rels
+        .iter()
+        .position(|rel| matches!(rel.rel_type, Some(rel::RelType::Sort(_))))
+        .unwrap();
+    let Some(rel::RelType::Project(project)) = rels[sort + 1].rel_type.as_ref() else {
+        panic!("expected the sort tuple's projection under the sort");
+    };
+    // Sort tuple 16: o_totalprice, o_orderdate, c_custkey, c_name, o_orderkey, sum.
+    let fields: Vec<_> = project.expressions.iter().map(field).collect();
+    assert_eq!(fields, [4, 3, 1, 0, 2, 5]);
+    assert!(matches!(
+        rels[sort + 2].rel_type,
+        Some(rel::RelType::Aggregate(_))
+    ));
 }

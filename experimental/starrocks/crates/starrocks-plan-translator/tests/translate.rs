@@ -4247,8 +4247,9 @@ fn translate_partial_avg() -> TranslatedPlan {
 }
 
 /// Translates the merge step of [`translate_partial_avg`] over exchange 7, whose sender
-/// emitted `names`.
-fn translate_merge_avg(names: &[&str]) -> Result<TranslatedPlan, TranslateError> {
+/// emitted `names`. The merge names its partial states through `state_tuple`; the exchange
+/// carries tuple 1.
+fn translate_merge_avg(names: &[&str], state_tuple: i32) -> Result<TranslatedPlan, TranslateError> {
     let merge = aggregation_node(
         8,
         2,
@@ -4257,19 +4258,23 @@ fn translate_merge_avg(names: &[&str]) -> Result<TranslatedPlan, TranslateError>
             merge_aggregate_expr(
                 "avg",
                 scalar_type(TPrimitiveType::DOUBLE),
-                slot_ref(2, 1, scalar_type(TPrimitiveType::VARBINARY)),
+                slot_ref(2, state_tuple, scalar_type(TPrimitiveType::VARBINARY)),
             ),
             merge_aggregate_expr(
                 "avg",
                 decimal128(38, 8),
-                slot_ref(3, 1, scalar_type(TPrimitiveType::VARBINARY)),
+                slot_ref(3, state_tuple, scalar_type(TPrimitiveType::VARBINARY)),
             ),
             merge_aggregate_expr(
                 "count",
                 scalar_type(TPrimitiveType::BIGINT),
-                slot_ref(4, 1, scalar_type(TPrimitiveType::BIGINT)),
+                slot_ref(4, state_tuple, scalar_type(TPrimitiveType::BIGINT)),
             ),
-            merge_aggregate_expr("sum", decimal128(38, 2), slot_ref(5, 1, decimal128(38, 2))),
+            merge_aggregate_expr(
+                "sum",
+                decimal128(38, 2),
+                slot_ref(5, state_tuple, decimal128(38, 2)),
+            ),
         ],
     );
     translate_with_streams(
@@ -4401,7 +4406,7 @@ fn two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
     );
 
     let names: Vec<&str> = partial.output_names.iter().map(String::as_str).collect();
-    let merge = translate_merge_avg(&names).unwrap();
+    let merge = translate_merge_avg(&names, 1).unwrap();
     assert_eq!(stream_types(&merge), emitted);
 }
 
@@ -4410,7 +4415,7 @@ fn two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
 /// reads its column past the AVG counts, and the output is the merge's tuple again.
 #[test]
 fn two_phase_merge_avg_divides_the_summed_sums_by_the_summed_counts() {
-    let merge = translate_merge_avg(&["c0", "c1", "c2", "c3", "c4", "c5", "c6"]).unwrap();
+    let merge = translate_merge_avg(&["c0", "c1", "c2", "c3", "c4", "c5", "c6"], 1).unwrap();
     assert_eq!(
         measure_names(&merge.plan),
         ["sum", "sum", "sum", "sum", "sum", "sum"]
@@ -4460,8 +4465,23 @@ fn two_phase_merge_avg_divides_the_summed_sums_by_the_summed_counts() {
 /// merge expects, and the width check says so instead of reading the wrong columns.
 #[test]
 fn two_phase_merge_avg_refuses_a_row_without_the_counts() {
-    let err = translate_merge_avg(&["c0", "c1", "c2", "c3", "c4"]).unwrap_err();
+    let err = translate_merge_avg(&["c0", "c1", "c2", "c3", "c4"], 1).unwrap_err();
     assert!(err.to_string().contains("has 7 fields"), "{err}");
+}
+
+/// The FE can name a slot through a tuple the row doesn't carry (q16 does); slot refs then
+/// resolve by slot id, as in the BE. The partial states such refs name still widen and retype
+/// the exchange row: matching the refs' tuple against the row's would miss them.
+#[test]
+fn two_phase_merge_avg_reading_states_through_another_tuple_widens_the_exchange_row() {
+    let merge = translate_merge_avg(&["c0", "c1", "c2", "c3", "c4", "c5", "c6"], 3).unwrap();
+    assert_eq!(
+        stream_types(&merge),
+        [
+            "VARCHAR", "DOUBLE", "BIGINT", "DOUBLE", "BIGINT", "BIGINT", "DOUBLE"
+        ]
+    );
+    assert_eq!(measure_fields(&merge.plan), [1, 2, 3, 4, 5, 6].map(Some));
 }
 
 /// A merge aggregation has to read its partial states from an exchange, the only place the
