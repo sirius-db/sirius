@@ -61,26 +61,34 @@ void fan_out_and_join(exec::scoped_dispatcher& dispatcher,
   exec::completion_controller controller;
   auto completion_token = controller.on_completion([state] { state->done.set_value(); });
 
-  for (auto& task : tasks) {
-    // Slot acquired BEFORE the enqueue and moved into the lambda: a stopping
-    // dispatcher's silent enqueue drop (or a skipped-after-stop lambda)
-    // destroys the lambda, releasing the slot — the join fires either way and
-    // the count check below makes the drop loud.
-    dispatcher.enqueue([state, task = std::move(task), slot = controller.acquire()]() mutable {
-      try {
-        task();
-        state->completed.fetch_add(1, std::memory_order_release);
-      } catch (...) {
-        // An errored task deliberately does not count as completed; the first
-        // error is what the join rethrows.
-        std::call_once(state->first_error_once,
-                       [&] { state->first_error = std::current_exception(); });
-      }
-    });
+  std::exception_ptr submission_error;
+  try {
+    for (auto& task : tasks) {
+      // Slot acquired BEFORE the enqueue and moved into the lambda: a stopping
+      // dispatcher's silent enqueue drop (or a skipped-after-stop lambda)
+      // destroys the lambda, releasing the slot — the join fires either way and
+      // the count check below makes the drop loud.
+      dispatcher.enqueue([state, task = std::move(task), slot = controller.acquire()]() mutable {
+        try {
+          task();
+          state->completed.fetch_add(1, std::memory_order_release);
+        } catch (...) {
+          // An errored task deliberately does not count as completed; the first
+          // error is what the join rethrows.
+          std::call_once(state->first_error_once,
+                         [&] { state->first_error = std::current_exception(); });
+        }
+      });
+    }
+  } catch (...) {
+    // Earlier tasks may still borrow the caller's workset. Join them before unwinding it,
+    // and preserve the submission error even if one of those tasks also fails.
+    submission_error = std::current_exception();
   }
   controller.close();
   done_future.wait();
 
+  if (submission_error) { std::rethrow_exception(submission_error); }
   if (state->first_error) { std::rethrow_exception(state->first_error); }
   auto const completed = state->completed.load(std::memory_order_acquire);
   if (completed != n_tasks) {
