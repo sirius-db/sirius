@@ -269,20 +269,6 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
       opt.range_batch_slices = static_cast<std::size_t>(*batch);
     }
   }
-  {
-    // Signed for the same reason; the upper bound (below the reactor count) is
-    // checked in finalize_derived_config, where uring_n_reactors is known.
-    std::optional<long long> prefetch_reactors;
-    r.optional("prefetch_reactors", prefetch_reactors);
-    if (prefetch_reactors.has_value()) {
-      if (*prefetch_reactors < 0) {
-        throw std::runtime_error("'uring.prefetch_reactors': must be 0 or more, got " +
-                                 std::to_string(*prefetch_reactors));
-      }
-      opt.prefetch_reactors          = static_cast<std::size_t>(*prefetch_reactors);
-      opt.prefetch_reactors_explicit = true;
-    }
-  }
   r.reject_unknown();
 }
 
@@ -1005,31 +991,6 @@ void sirius_config::finalize_derived_config()
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
   enforce_native_backend_for_multi_gpu();
-  validate_uring_prefetch_reactors();
-}
-
-void sirius_config::validate_uring_prefetch_reactors()
-{
-  auto& sm    = _scan_manager_config;
-  auto& uring = sm.uring;
-  // No derived default: each uring reactor's two-tier queue keeps demand reads
-  // ahead of readahead prefetch (see cucascade::io::io_priority), so reserving a
-  // reactor for prefetch is an explicit opt-in only.
-  if (uring.prefetch_reactors == 0) { return; }
-  if (sm.uring_n_reactors == 1) {
-    SIRIUS_LOG_WARN(
-      "sirius_config: uring.prefetch_reactors={} ignored: with a single uring reactor there is "
-      "none left for demand reads",
-      uring.prefetch_reactors);
-    uring.prefetch_reactors = 0;
-    return;
-  }
-  if (uring.prefetch_reactors >= sm.uring_n_reactors) {
-    throw std::runtime_error("'uring.prefetch_reactors': must be below uring_n_reactors (" +
-                             std::to_string(sm.uring_n_reactors) +
-                             ") so at least one reactor serves demand reads, got " +
-                             std::to_string(uring.prefetch_reactors));
-  }
 }
 
 void sirius_config::derive_rest_scan_budget()

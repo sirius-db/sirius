@@ -1381,11 +1381,10 @@ sirius_scan_manager::sirius_scan_manager(
     _io_ctx = make_default_ioctx(cucascade::io::io_context_type::uring);
     SIRIUS_LOG_DEBUG(
       "[sirius_scan_manager] default io context: uring n_reactors={} slices_per_pass={} "
-      "range_batch_slices={} prefetch_reactors={}",
+      "range_batch_slices={}",
       _config.uring_n_reactors,
       _config.uring.slices_per_pass,
-      _config.uring.range_batch_slices,
-      _config.uring.prefetch_reactors);
+      _config.uring.range_batch_slices);
   } else {
     if (_topology_index->gpu_ids().size() > 1) {
       throw std::runtime_error(
@@ -2224,9 +2223,7 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
       if (_reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).empty()) {
         return {.cause = "no HOST-tier memory space for pinned staging", .by_configuration = false};
       }
-      return {.cause =
-                "invalid uring configuration (check uring.n_max_concurrent_scans, "
-                "uring.prefetch_reactors)",
+      return {.cause = "invalid uring configuration (check uring.n_max_concurrent_scans)",
               .by_configuration = false};
     case cucascade::io::io_context_type::kvikio:
       return {.cause = "kvikIO backend could not be constructed (check kvikio.* settings)",

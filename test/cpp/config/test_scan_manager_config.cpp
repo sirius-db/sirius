@@ -680,8 +680,6 @@ TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
     CHECK(cfg.uring.slices_per_pass == 8);
     CHECK(cfg.uring.range_batch_slices == 8);
-    CHECK(cfg.uring.prefetch_reactors == 0);
-    CHECK_FALSE(cfg.uring.prefetch_reactors_explicit);
   };
 
   SECTION("default-constructed") { check_defaults(scan_manager_config{}); }
@@ -732,80 +730,12 @@ TEST_CASE("sirius_config reads uring.range_batch_slices", "[scan_manager][config
                      "'uring.range_batch_slices': must be 0 or more (0 = no split), got -1");
 }
 
-TEST_CASE("uring prefetch_reactors is opt-in and validates against the pool",
-          "[scan_manager][config][uring][prefetch_reactors]")
+TEST_CASE("uring prefetch_reactors is no longer a config key", "[scan_manager][config][uring]")
 {
-  // `body` goes under scan_manager; `readahead` adds a cache and a uring budget.
-  auto yaml = [](std::string const& body, bool readahead) {
-    std::string text = body;
-    if (readahead) {
-      text +=
-        "      cache:\n"
-        "        mode: cucs\n";
-    }
-    return scan_manager_yaml(text);
-  };
-  auto uring        = [](std::string const& fields) { return "      uring:\n" + fields; };
-  auto const budget = std::string{"        n_max_concurrent_scans: 8\n"};
-
-  CHECK(cucascade::io::uring::config{}.prefetch_reactors == 0);
-
-  SECTION("stays 0 when omitted, even when the uring readahead runs")
-  {
-    auto const off =
-      load_scan_manager("sirius_pr_off.yaml", yaml("      uring_n_reactors: 4\n", false));
-    CHECK_FALSE(off.uring.prefetch_reactors_explicit);
-    CHECK(off.uring.prefetch_reactors == 0);
-
-    // The reactors' priority queues keep demand ahead of prefetch, so the
-    // readahead no longer reserves a reactor.
-    auto const on = load_scan_manager("sirius_pr_on.yaml", yaml(uring(budget), true));
-    CHECK_FALSE(on.uring.prefetch_reactors_explicit);
-    CHECK(on.uring.prefetch_reactors == 0);
-    CHECK(on.to_io_config().uring.prefetch_reactors == 0);
-  }
-
-  SECTION("explicit values are kept")
-  {
-    auto const zero = load_scan_manager(
-      "sirius_pr_zero.yaml", yaml(uring(budget + "        prefetch_reactors: 0\n"), true));
-    CHECK(zero.uring.prefetch_reactors_explicit);
-    CHECK(zero.uring.prefetch_reactors == 0);
-
-    auto const two =
-      load_scan_manager("sirius_pr_two.yaml", yaml(uring("        prefetch_reactors: 2\n"), false));
-    CHECK(two.uring.prefetch_reactors_explicit);
-    CHECK(two.uring.prefetch_reactors == 2);
-
-    auto const three = load_scan_manager(
-      "sirius_pr_three.yaml",
-      yaml("      uring_n_reactors: 4\n" + uring("        prefetch_reactors: 3\n"), false));
-    CHECK(three.uring.prefetch_reactors == 3);
-    CHECK(three.to_io_config().uring.prefetch_reactors == 3);
-
-    // With one reactor an explicit value is ignored (with a warning), not rejected.
-    auto const single = load_scan_manager(
-      "sirius_pr_single_explicit.yaml",
-      yaml("      uring_n_reactors: 1\n" + uring("        prefetch_reactors: 1\n"), false));
-    CHECK(single.uring.prefetch_reactors == 0);
-  }
-
-  SECTION("rejects a negative value and one that leaves no demand reactor")
-  {
-    require_load_error("sirius_pr_negative.yaml",
-                       yaml(uring("        prefetch_reactors: -1\n"), false),
-                       "'uring.prefetch_reactors': must be 0 or more, got -1");
-    auto rejects = [](std::string const& name, std::string const& text, std::string const& what) {
-      scoped_yaml file(name, text);
-      sirius::sirius_config cfg;
-      CHECK_THROWS_WITH(cfg.load_from_file(file.path()), Catch::Matchers::ContainsSubstring(what));
-    };
-    rejects("sirius_pr_all.yaml",
-            yaml("      uring_n_reactors: 4\n" + uring("        prefetch_reactors: 4\n"), false),
-            "'uring.prefetch_reactors': must be below uring_n_reactors (4) so at least one "
-            "reactor serves demand reads, got 4");
-    rejects("sirius_pr_word.yaml",
-            yaml(uring("        prefetch_reactors: one\n"), false),
-            "uring.prefetch_reactors");
-  }
+  // Reserving reactors for prefetch was replaced by each reactor's priority
+  // tiers, so a config that still names the key fails loudly instead of being
+  // silently ignored.
+  require_load_error("sirius_uring_prefetch_reactors.yaml",
+                     uring_yaml("        prefetch_reactors: 1\n"),
+                     "unknown config key: 'prefetch_reactors' in uring");
 }
