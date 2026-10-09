@@ -56,6 +56,7 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
     test/cpp/expression_evaluator/test_like_multiliteral.cpp
+    test/cpp/expression_evaluator/test_round_floating_point.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
@@ -88,6 +89,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
     test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
+    test/cpp/integration/test_gpu_execution_round.cpp
     test/cpp/integration/test_gpu_execution_substring.cpp
     test/cpp/integration/test_parquet_bloom_filter_pushdown.cpp
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
