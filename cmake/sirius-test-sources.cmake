@@ -49,7 +49,6 @@ set(TEST_SOURCES
     test/cpp/expression/test_ast_substitute.cpp
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
-    test/cpp/expression/test_ast_to_duckdb.cpp
     test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_value.cpp
@@ -78,7 +77,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_dynamic_filter_multi_partition.cpp
     test/cpp/integration/test_gpu_execution_expression_fallback.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
-    test/cpp/integration/test_gpu_execution_grouping_sets_fallback.cpp
+    test/cpp/integration/test_gpu_execution_grouping_sets.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_unsigned_narrowing.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp

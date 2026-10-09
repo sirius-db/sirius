@@ -21,12 +21,8 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression/ast/to_duckdb.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
-#include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
@@ -214,10 +210,9 @@ bool sirius_physical_nested_loop_join::is_supported(
   if (!is_join_type_supported(join_type)) { return false; }
   if (join_type == duckdb::JoinType::MARK) { return true; }
   for (auto& cond : conditions) {
-    auto left_expr = sirius::ast::to_duckdb(*cond.left);
-    if (left_expr->return_type.InternalType() == duckdb::PhysicalType::STRUCT ||
-        left_expr->return_type.InternalType() == duckdb::PhysicalType::LIST ||
-        left_expr->return_type.InternalType() == duckdb::PhysicalType::ARRAY) {
+    auto const id = cond.left->return_type().id();
+    if (id == sirius::type_id::STRUCT || id == sirius::type_id::LIST ||
+        id == sirius::type_id::ARRAY) {
       return false;
     }
   }
@@ -243,8 +238,7 @@ duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_
 {
   duckdb::vector<sirius::logical_type> result;
   for (auto& op : conditions) {
-    auto right_expr = sirius::ast::to_duckdb(*op.right);
-    result.push_back(sirius::from_duckdb(right_expr->return_type));
+    result.push_back(op.right->return_type());
   }
   return result;
 }
@@ -379,29 +373,6 @@ const cudf::ast::expression& fold_logical_and(
     chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND, lhs, terms[i].get());
   }
   return chain.empty() ? terms[0].get() : chain.back();
-}
-
-// Resolve table column index: BOUND_REF, BOUND_CAST(BOUND_REF), or BOUND_SUBQUERY (scalar
-// subquery result = single column, index 0).
-bool get_column_index(const duckdb::Expression& expr, cudf::size_type& out_idx)
-{
-  if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
-    out_idx = static_cast<cudf::size_type>(expr.Cast<duckdb::BoundReferenceExpression>().index);
-    return true;
-  }
-  if (expr.expression_class == duckdb::ExpressionClass::BOUND_CAST) {
-    const auto& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
-    if (cast_expr.child->expression_class == duckdb::ExpressionClass::BOUND_REF) {
-      out_idx = static_cast<cudf::size_type>(
-        cast_expr.child->Cast<duckdb::BoundReferenceExpression>().index);
-      return true;
-    }
-  }
-  if (expr.expression_class == duckdb::ExpressionClass::BOUND_SUBQUERY) {
-    out_idx = 0;
-    return true;
-  }
-  return false;
 }
 
 }  // namespace
@@ -667,14 +638,12 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     }
     result_table = std::make_unique<cudf::table>(std::move(out_cols));
   } else {
-    // Resolve column indices and target types so AST predicate operands match (cudf requires
-    // matching types). Columns used in conditions may be cast to the expression return type.
+    // Evaluate condition operands before building the cuDF predicate (cuDF requires matching
+    // operand types). Keep the evaluated tables alive until the join completes.
     // Reserve to the exact number of conditions to prevent reallocation.
     // cudf::ast::operation stores operands as reference_wrapper<expression const> — any
     // reallocation of these vectors invalidates the stored references and causes UB/segfault.
 
-    std::map<uint64_t, cudf::size_type> left_expressions_to_idx;
-    std::map<uint64_t, cudf::size_type> right_expressions_to_idx;
     std::vector<cudf::ast::column_reference> left_refs;
     std::vector<cudf::ast::column_reference> right_refs;
     std::vector<cudf::ast::operation> cond_ops;
@@ -686,84 +655,49 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     distinct_inner_ops.reserve(conditions.size());
     and_chain.reserve(conditions.size() > 1 ? conditions.size() - 1 : 0);
     std::vector<cudf::column_view> left_col_views, right_col_views;
-    std::vector<std::unique_ptr<cudf::column>> intermediates_scope_holder;
-    std::vector<std::unique_ptr<cudf::table>> expression_res_scope_hodler;
-    left_col_views.reserve(left.num_columns());
-    right_col_views.reserve(right.num_columns());
+    std::vector<std::unique_ptr<cudf::table>> evaluated_operands;
+    left_col_views.reserve(conditions.size());
+    right_col_views.reserve(conditions.size());
+    evaluated_operands.reserve(2 * conditions.size());
 
-    // Resolves one side of a join condition to a column index in col_views, evaluating or casting
-    // as needed. Returns the index to use as the cudf::ast::column_reference offset.
-    auto resolve_join_col = [&](const duckdb::Expression& expr,
-                                const sirius::ast::node& ast_expr,
-                                std::map<uint64_t, cudf::size_type>& expr_to_idx,
-                                const ::cucascade::read_only_data_batch& batch,
+    // Each condition owns its evaluated operands. Reuse a direct column only when it already
+    // satisfies the reference's physical contract; narrowed carriers and every operation go
+    // through native evaluation. Hash-only expression reuse cannot establish equivalence.
+    auto resolve_join_col = [&](const sirius::ast::node& expr,
                                 const cudf::table_view& table,
                                 std::vector<cudf::column_view>& col_views,
                                 const char* side) -> cudf::size_type {
-      auto cond_hash = expr.Hash();
-      auto it        = expr_to_idx.find(cond_hash);
-      if (it != expr_to_idx.end()) { return it->second; }
-      cudf::size_type join_input_index = static_cast<cudf::size_type>(col_views.size());
-      expr_to_idx[cond_hash]           = join_input_index;
-      cudf::size_type source_idx       = 0;
-      if (!get_column_index(expr, source_idx)) {
-        sirius::expression_evaluator evaluator(&ast_expr,
-                                               mr,
-                                               stream,
-                                               strategy_from_config(),
-                                               expression_evaluator::default_min_ast_size,
-                                               like_swar_fastpath_enabled(),
-                                               like_cache());
-        auto expr_result_table = evaluator.evaluate(table);
-        auto expr_view         = expr_result_table->view();
-        if (expr_view.num_columns() != 1) {
-          throw std::runtime_error(std::string("sirius_physical_nested_loop_join: expression on ") +
-                                   side + " should produce one column");
-        }
-        if (expr_view.num_rows() != table.num_rows()) {
-          throw std::runtime_error(
-            std::string(
-              "sirius_physical_nested_loop_join: expression result row count must match ") +
-            side + " table");
-        }
-        col_views.push_back(expr_view.column(0));
-        expression_res_scope_hodler.push_back(std::move(expr_result_table));
-      } else {
-        auto target_type = duckdb::GetCudfType(expr.return_type);
-
-        // now lets see if we have to cast
-        if (table.column(source_idx).type() != target_type) {
-          if (expr.expression_class != duckdb::ExpressionClass::BOUND_CAST) {
-            // We might want to just change this to an ASSERT
-            throw std::runtime_error(
-              "sirius_physical_nested_loop_join: unexpected, column type does not match, yet "
-              "there "
-              "is no BOUND_CAST");
-          }
-          intermediates_scope_holder.push_back(
-            sirius::cast_through_rep(table.column(source_idx), target_type, stream));
-          col_views.push_back(intermediates_scope_holder.back()->view());
-        } else {
-          col_views.push_back(table.column(source_idx));
+      auto const join_input_index = static_cast<cudf::size_type>(col_views.size());
+      if (expr.holds<sirius::ast::reference>()) {
+        auto const& ref   = expr.get<sirius::ast::reference>();
+        auto const column = table.column(ref.column_index);
+        if (column.type() == sirius::get_cudf_type(ref.return_type())) {
+          col_views.push_back(column);
+          return join_input_index;
         }
       }
+      sirius::expression_evaluator evaluator(&expr,
+                                             mr,
+                                             stream,
+                                             strategy_from_config(),
+                                             expression_evaluator::default_min_ast_size,
+                                             like_swar_fastpath_enabled(),
+                                             like_cache());
+      auto result     = evaluator.evaluate(table);
+      auto const view = result->view();
+      if (view.num_columns() != 1 || view.num_rows() != table.num_rows()) {
+        throw std::runtime_error(std::string("sirius_physical_nested_loop_join: operand on ") +
+                                 side + " must produce one column with the input row count");
+      }
+      col_views.push_back(view.column(0));
+      evaluated_operands.push_back(std::move(result));
       return join_input_index;
     };
 
     for (const auto& cond : conditions) {
-      auto const* left_node                 = cond.left.get();
-      auto const* right_node                = cond.right.get();
-      auto left_owned                       = sirius::ast::to_duckdb(*left_node);
-      auto right_owned                      = sirius::ast::to_duckdb(*right_node);
-      cudf::size_type left_join_input_index = resolve_join_col(
-        *left_owned, *left_node, left_expressions_to_idx, left_batch, left, left_col_views, "left");
-      cudf::size_type right_join_input_index = resolve_join_col(*right_owned,
-                                                                *right_node,
-                                                                right_expressions_to_idx,
-                                                                right_batch,
-                                                                right,
-                                                                right_col_views,
-                                                                "right");
+      auto const left_join_input_index = resolve_join_col(*cond.left, left, left_col_views, "left");
+      auto const right_join_input_index =
+        resolve_join_col(*cond.right, right, right_col_views, "right");
 
       // RIGHT is executed as a left join with the input tables swapped below. Keep
       // each operand attached to its original table; swapping the result maps alone

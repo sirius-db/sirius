@@ -524,8 +524,7 @@ static duckdb::vector<std::unique_ptr<sirius::ast::node>> copy_expressions(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> result;
   result.reserve(src.size());
   for (const auto& expr : src) {
-    // node is move-only and aggregate nodes cannot round-trip through to_duckdb,
-    // so deep-clone the AST node directly.
+    // Deep-clone the move-only expression tree, including aggregate children.
     if (expr == nullptr) {
       throw not_implemented_exception("copy_expressions: cannot clone a null aggregate expression");
     }
