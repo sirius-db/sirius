@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -972,6 +973,110 @@ TEST_CASE_METHOD(fragment_fixture,
     con->Rollback();
     throw;
   }
+}
+
+// ============================================================================
+// FRAG-9c: DATE and TIMESTAMP keys hash-partition, and senders agree on each key's destination
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-9c: DATE and TIMESTAMP keys route each key to the same destination",
+                 "[integration][streaming_fragment]")
+{
+  // TPC-H q18's partial fragment hash-partitions on o_orderdate. Each temporal key keeps its
+  // own cuDF type, so the senders (one listing the keys in reverse) must agree as they are.
+  struct temporal_case {
+    const char* name;
+    const char* literal;  // printf format for key k
+    sirius::type_id type;
+    cudf::type_id storage;  // the integer the cuDF timestamp stores
+  };
+  auto const kase = GENERATE(
+    temporal_case{"DATE", "DATE '1995-01-%02d'", sirius::type_id::DATE, cudf::type_id::INT32},
+    temporal_case{"TIMESTAMP",
+                  "TIMESTAMP '1995-01-01 00:00:%02d'",
+                  sirius::type_id::TIMESTAMP,
+                  cudf::type_id::INT64});
+  INFO(kase.name);
+
+  auto values = [&](bool reversed) {
+    std::string query = "SELECT k FROM (VALUES ";
+    for (int i = 1; i <= 20; ++i) {
+      int const k = reversed ? 21 - i : i;
+      char literal[64];
+      std::snprintf(literal, sizeof(literal), kase.literal, k);
+      query += std::string(i > 1 ? ", (" : "(") + literal + ")";
+    }
+    return query + ") t(k)";
+  };
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&](bool reversed) {
+      fragment_spec spec;
+      spec.plan_source  = sirius::test::sql_plan_source(values(reversed));
+      spec.outputs      = {0, 1};
+      spec.partitioning = sirius::op::partition_spec{{0}};
+      auto sender       = std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+      sender->build();
+      sender->run();
+      return sender;
+    };
+    auto forward  = make_sender(false);
+    auto backward = make_sender(true);
+    REQUIRE(forward->sink_types()[0].id() == kase.type);
+    REQUIRE(backward->sink_types()[0].id() == kase.type);
+
+    auto drain_keys = [&](streaming_fragment& sender, stream_id_t destination) {
+      std::vector<std::int64_t> keys;
+      while (auto batch = sender.pull(destination)) {
+        auto const column = sirius::get_cudf_table_view(**batch).column(0);
+        auto const stored = cudf::bit_cast(column, cudf::data_type{kase.storage});
+        if (kase.storage == cudf::type_id::INT32) {
+          auto host = sirius::test::operator_utils::copy_column_to_host<std::int32_t>(stored);
+          keys.insert(keys.end(), host.begin(), host.end());
+        } else {
+          auto host = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(stored);
+          keys.insert(keys.end(), host.begin(), host.end());
+        }
+      }
+      std::sort(keys.begin(), keys.end());
+      return keys;
+    };
+
+    std::size_t routed = 0;
+    for (stream_id_t destination : {0, 1}) {
+      auto const from_forward  = drain_keys(*forward, destination);
+      auto const from_backward = drain_keys(*backward, destination);
+      // Both destinations get keys, so matching sets are not just "everything went to one".
+      REQUIRE_FALSE(from_forward.empty());
+      REQUIRE(from_forward == from_backward);
+      routed += from_forward.size();
+    }
+    REQUIRE(routed == 20);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-9d: a TIMESTAMP key in another unit is still refused",
+                 "[integration][streaming_fragment]")
+{
+  // TIMESTAMP_NS stores the same instant as a different integer than TIMESTAMP does, so a
+  // sender holding it would route matching keys elsewhere.
+  con->BeginTransaction();
+  fragment_spec spec;
+  spec.plan_source = sirius::test::sql_plan_source(
+    "SELECT k::TIMESTAMP_NS AS k FROM (VALUES (TIMESTAMP '1995-01-01 00:00:01')) t(k)");
+  spec.outputs      = {0, 1};
+  spec.partitioning = sirius::op::partition_spec{{0}};
+  streaming_fragment fragment(*con->context, std::move(spec));
+  REQUIRE_THROWS_WITH(fragment.build(), ContainsSubstring("unsupported partition key type"));
+  con->Rollback();
 }
 
 // ============================================================================
