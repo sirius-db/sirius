@@ -502,8 +502,12 @@ std::vector<std::unique_ptr<cudf::column>> make_empty_input_row(
       // An empty set, so that COUNT(DISTINCT) of the empty input is 0.
       auto offsets = make_constant_column<cudf::size_type>(0, 2, stream, mr);
       auto child   = cudf::empty_like(cudf::lists_column_view(aggregate_cols.column(i)).child());
-      row.push_back(
-        cudf::make_lists_column(1, std::move(offsets), std::move(child), 0, rmm::device_buffer{}));
+      row.push_back(cudf::make_lists_column(
+        1,
+        std::move(offsets),
+        std::move(child),
+        0,
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr)));
     } else {
       row.push_back(make_null_column(aggregate_cols.column(i), 1, stream, mr));
     }
