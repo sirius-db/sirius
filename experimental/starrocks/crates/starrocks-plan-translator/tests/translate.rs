@@ -3766,40 +3766,356 @@ fn two_phase_sum_stays_sum() {
         "{:?}",
         extension_function_names(&merge_plan.plan)
     );
-    let rel::RelType::Aggregate(aggregate) = root(&merge_plan.plan)
-        .input
-        .as_ref()
-        .unwrap()
-        .rel_type
-        .as_ref()
-        .unwrap()
-    else {
-        panic!("expected merge aggregate");
-    };
-    assert_eq!(aggregate.measures.len(), 1);
+    assert_eq!(root_aggregate(&merge_plan.plan).measures.len(), 1);
 }
 
-/// Two-phase AVG is rejected: this GROUP BY shuffle path only lowers SUM.
+/// Two-phase AVG is rejected on both sides: its partial state is not one column.
 #[test]
 fn two_phase_avg_is_rejected() {
-    let mut avg = aggregate_expr(
-        "avg",
-        scalar_type(TPrimitiveType::DOUBLE),
-        Some(slot_ref(1, 1, scalar_type(TPrimitiveType::DOUBLE))),
-    );
-    avg.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
-    let merge = aggregation_node(8, 1, Vec::new(), vec![avg]);
+    let avg = || {
+        aggregate_expr(
+            "avg",
+            scalar_type(TPrimitiveType::DOUBLE),
+            Some(slot_ref(1, 1, scalar_type(TPrimitiveType::DOUBLE))),
+        )
+    };
+    let mut merge_avg = avg();
+    merge_avg.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let merge = aggregation_node(8, 1, Vec::new(), vec![merge_avg]);
     // Merge AVG reads the exchange's partial-state column (tuple 1), not the scan tuple.
-    let err = translate_with_streams(
+    let merge_err = translate_with_streams(
         TPlan::new(vec![merge, exchange_node(7, vec![1])]),
         scalar_agg_desc_for_avg(),
         &[stream_input(7, &["total"])],
     )
     .unwrap_err();
+
+    let mut partial = aggregation_node(
+        1,
+        1,
+        Vec::new(),
+        vec![aggregate_expr(
+            "avg",
+            scalar_type(TPrimitiveType::DOUBLE),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    partial.agg_node.as_mut().unwrap().need_finalize = false;
+    let partial_err = translate_fragment(&params(
+        Some(TPlan::new(vec![partial, scan_node(0, 0)])),
+        Some(scalar_agg_desc_for_avg()),
+        None,
+    ))
+    .unwrap_err();
+
+    for err in [merge_err, partial_err] {
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("expected unsupported plan node, got {err:?}");
+        };
+        assert_eq!(
+            reason,
+            "two-phase aggregation supports SUM, COUNT, MIN and MAX only"
+        );
+    }
+}
+
+/// Builds a merge (`is_merge_agg`) measure `name(child)`.
+fn merge_aggregate_expr(name: &str, ret_type: TTypeDesc, child: TExpr) -> TExpr {
+    let mut expr = aggregate_expr(name, ret_type, Some(child));
+    expr.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    expr
+}
+
+/// Descriptor for two-phase tests: scan tuple 0 (`id` BIGINT, `name` VARCHAR, `price`
+/// DECIMAL64(15,2)) and aggregation tuple 1 (`name` key, `state` declared as `state_type`).
+fn two_phase_desc(state_type: TTypeDesc) -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 0, "price", decimal64_15_2()),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "state", state_type),
+        ],
+    )
+}
+
+fn decimal64_15_2() -> TTypeDesc {
+    scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2))
+}
+
+/// Translates a partial aggregation over the scan of [`two_phase_desc`], grouped by `name`.
+fn translate_partial(
+    measure: TExpr,
+    state_type: TTypeDesc,
+) -> Result<TranslatedPlan, TranslateError> {
+    let mut partial = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![measure],
+    );
+    partial.agg_node.as_mut().unwrap().need_finalize = false;
+    translate_fragment(&params(
+        Some(TPlan::new(vec![partial, scan_node(0, 0)])),
+        Some(two_phase_desc(state_type)),
+        None,
+    ))
+}
+
+/// Translates a merge aggregation of `measure` over exchange 7, grouped by `name`.
+fn translate_merge(
+    measure: TExpr,
+    state_type: TTypeDesc,
+) -> Result<TranslatedPlan, TranslateError> {
+    let merge = aggregation_node(
+        8,
+        1,
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![measure],
+    );
+    translate_with_streams(
+        TPlan::new(vec![merge, exchange_node(7, vec![1])]),
+        two_phase_desc(state_type),
+        &[stream_input(7, &["name", "state"])],
+    )
+}
+
+/// Returns the aggregate relation under the plan root, looking through the projection that casts
+/// a two-phase integer `sum` back to its declared type.
+fn root_aggregate(plan: &substrait::proto::Plan) -> &substrait::proto::AggregateRel {
+    let mut rel = root(plan).input.as_ref().unwrap();
+    if let Some(rel::RelType::Project(project)) = rel.rel_type.as_ref() {
+        rel = project.input.as_ref().unwrap();
+    }
+    let Some(rel::RelType::Aggregate(aggregate)) = rel.rel_type.as_ref() else {
+        panic!("expected aggregate relation under the root");
+    };
+    aggregate
+}
+
+/// The types the projection above the root aggregate casts its columns to, by column; `None` for
+/// a column passed through.
+fn root_casts(plan: &substrait::proto::Plan) -> Vec<Option<substrait::proto::Type>> {
+    let Some(rel::RelType::Project(project)) = root(plan).input.as_ref().unwrap().rel_type.as_ref()
+    else {
+        return Vec::new();
+    };
+    project
+        .expressions
+        .iter()
+        .map(|expr| match expr.rex_type.as_ref() {
+            Some(expression::RexType::Cast(cast)) => cast.r#type.clone(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Returns the name and output type of the aggregate's only measure.
+fn sole_measure(plan: &substrait::proto::Plan) -> (String, &substrait::proto::AggregateFunction) {
+    use substrait::proto::extensions::simple_extension_declaration::MappingType;
+    let aggregate = root_aggregate(plan);
+    assert_eq!(aggregate.measures.len(), 1);
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    let name = plan
+        .extensions
+        .iter()
+        .find_map(|declaration| match declaration.mapping_type.as_ref() {
+            Some(MappingType::ExtensionFunction(function))
+                if function.function_anchor == measure.function_reference =>
+            {
+                Some(function.name.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    (name, measure)
+}
+
+/// Returns the DuckDB types the plan declares for its only input stream.
+fn stream_types(plan: &TranslatedPlan) -> Vec<String> {
+    assert_eq!(plan.stream_inputs.len(), 1);
+    plan.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| column.ty.clone())
+        .collect()
+}
+
+fn type_kind(ty: Option<&substrait::proto::Type>) -> &substrait::proto::r#type::Kind {
+    ty.unwrap().kind.as_ref().unwrap()
+}
+
+/// Partial COUNT(*) emits a BIGINT count per group, after the grouping key.
+#[test]
+fn two_phase_partial_count_emits_bigint_counts() {
+    let plan = translate_partial(
+        aggregate_expr("count", scalar_type(TPrimitiveType::BIGINT), None),
+        scalar_type(TPrimitiveType::BIGINT),
+    )
+    .unwrap();
+    assert_eq!(root(&plan.plan).names, ["name", "state"]);
+    let (name, measure) = sole_measure(&plan.plan);
+    assert_eq!(name, "count");
+    assert!(measure.arguments.is_empty());
+    assert!(matches!(
+        type_kind(measure.output_type.as_ref()),
+        substrait::proto::r#type::Kind::I64(_)
+    ));
+}
+
+/// Merge COUNT sums the partial counts it reads from the exchange: counting them would count
+/// partial rows instead.
+#[test]
+fn two_phase_merge_count_sums_partial_counts() {
+    let plan = translate_merge(
+        merge_aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        ),
+        scalar_type(TPrimitiveType::BIGINT),
+    )
+    .unwrap();
+    assert_eq!(stream_types(&plan), ["VARCHAR", "BIGINT"]);
+    assert_eq!(root(&plan.plan).names, ["name", "state"]);
+    let (name, measure) = sole_measure(&plan.plan);
+    assert_eq!(name, "sum");
+    assert!(!extension_function_names(&plan.plan).contains(&"count".to_string()));
+    let Some(substrait::proto::function_argument::ArgType::Value(argument)) =
+        &measure.arguments[0].arg_type
+    else {
+        panic!("expected a value argument");
+    };
+    assert_eq!(struct_field(argument), 1);
+    assert!(matches!(
+        type_kind(measure.output_type.as_ref()),
+        substrait::proto::r#type::Kind::I64(_)
+    ));
+}
+
+/// A global (no GROUP BY) merge COUNT also sums. It never sees zero rows: every partial
+/// instance of an ungrouped aggregation emits one row, a 0 count when its input was empty, so
+/// the sum is 0 rather than NULL over an empty table.
+#[test]
+fn two_phase_global_merge_count_sums_partial_counts() {
+    let merge = aggregation_node(
+        8,
+        1,
+        Vec::new(),
+        vec![merge_aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    let desc = desc_table(
+        vec![(1, None)],
+        vec![slot(1, 1, "total", scalar_type(TPrimitiveType::BIGINT))],
+    );
+    let plan = translate_with_streams(
+        TPlan::new(vec![merge, exchange_node(7, vec![1])]),
+        desc,
+        &[stream_input(7, &["total"])],
+    )
+    .unwrap();
+    assert_eq!(stream_types(&plan), ["BIGINT"]);
+    assert!(root_aggregate(&plan.plan).groupings.is_empty());
+    assert_eq!(sole_measure(&plan.plan).0, "sum");
+}
+
+/// Partial MIN/MAX emit their input type, a DECIMAL64(15,2) here.
+#[test]
+fn two_phase_partial_min_max_emit_the_input_type() {
+    for function in ["min", "max"] {
+        let plan = translate_partial(
+            aggregate_expr(
+                function,
+                decimal64_15_2(),
+                Some(slot_ref(3, 0, decimal64_15_2())),
+            ),
+            decimal64_15_2(),
+        )
+        .unwrap();
+        assert_eq!(root(&plan.plan).names, ["name", "state"]);
+        let (name, measure) = sole_measure(&plan.plan);
+        assert_eq!(name, function);
+        let substrait::proto::r#type::Kind::Decimal(decimal) =
+            type_kind(measure.output_type.as_ref())
+        else {
+            panic!("expected a decimal partial state");
+        };
+        assert_eq!((decimal.precision, decimal.scale), (15, 2));
+    }
+}
+
+/// Merge MIN/MAX re-apply the same function, and the exchange carries the partial state with
+/// the type the rule gives it (the function's input type), not the descriptor's slot type,
+/// which this test declares wrongly on purpose.
+#[test]
+fn two_phase_merge_min_max_type_the_exchange_by_rule() {
+    for function in ["min", "max"] {
+        let plan = translate_merge(
+            merge_aggregate_expr(function, decimal64_15_2(), slot_ref(2, 1, decimal64_15_2())),
+            scalar_type(TPrimitiveType::DOUBLE),
+        )
+        .unwrap();
+        assert_eq!(stream_types(&plan), ["VARCHAR", "DECIMAL(15,2)"]);
+        let (name, measure) = sole_measure(&plan.plan);
+        assert_eq!(name, function);
+        let Some(substrait::proto::function_argument::ArgType::Value(argument)) =
+            &measure.arguments[0].arg_type
+        else {
+            panic!("expected a value argument");
+        };
+        assert_eq!(struct_field(argument), 1);
+    }
+}
+
+/// A partial MIN whose argument type differs from its return type would emit a column the
+/// merge side does not declare, so it is refused.
+#[test]
+fn two_phase_partial_min_with_a_mismatched_argument_is_rejected() {
+    let err = translate_partial(
+        aggregate_expr(
+            "min",
+            decimal64_15_2(),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        ),
+        decimal64_15_2(),
+    )
+    .unwrap_err();
     let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
         panic!("expected unsupported plan node, got {err:?}");
     };
-    assert!(reason.contains("SUM"), "{reason}");
+    assert!(reason.contains("argument type differs"), "{reason}");
+}
+
+/// A merge aggregation has to read its partial states from an exchange, the only place the
+/// translator types them.
+#[test]
+fn merge_aggregation_without_an_exchange_child_is_rejected() {
+    let merge = aggregation_node(
+        8,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![merge_aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![merge, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap_err();
+    let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+        panic!("expected unsupported plan node, got {err:?}");
+    };
+    assert!(reason.contains("from an exchange"), "{reason}");
 }
 
 /// Descriptor for a grouping-free merge of one DOUBLE measure.
@@ -5652,4 +5968,29 @@ fn a_skew_joins_broadcast_branch_filter_is_not_built() {
         filter.is_broad_cast_join_in_skew = Some(false);
     });
     assert_eq!(plain.len(), 1);
+}
+
+/// DuckDB sums integers into HUGEINT, which cuDF can't hold and a BIGINT exchange refuses, so a
+/// two-phase integer `sum` (here COUNT's merge) is cast back to the declared BIGINT.
+#[test]
+fn two_phase_integer_sums_are_cast_back_to_their_declared_type() {
+    let plan = translate_merge(
+        merge_aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        ),
+        scalar_type(TPrimitiveType::BIGINT),
+    )
+    .unwrap();
+    let casts = root_casts(&plan.plan);
+    assert_eq!(casts.len(), 2, "{casts:?}");
+    assert_eq!(casts[0], None, "the grouping key passes through");
+    assert!(
+        matches!(
+            casts[1].as_ref().and_then(|ty| ty.kind.as_ref()),
+            Some(substrait::proto::r#type::Kind::I64(_))
+        ),
+        "{casts:?}"
+    );
 }

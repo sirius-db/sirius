@@ -2267,6 +2267,7 @@ dependencies = [
  "starrocks-thrift",
  "substrait",
  "thiserror",
+ "thrift",
 ]
 
 [[package]]
