@@ -18,7 +18,7 @@
 
 // Shared construction shortcuts for the sirius::ast expression tests. Two small
 // families live here so the per-test-file copies do not drift:
-//   * Sirius AST node builders   — used by the to_duckdb / clone / substitute tests.
+//   * Sirius AST node builders   — used by the native structure / clone / substitute tests.
 //   * DuckDB bound-expression builders — inputs to the from_duckdb translator tests.
 
 // sirius

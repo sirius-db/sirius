@@ -55,7 +55,8 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
-#include <cub/cub.cuh>
+#include <cub/device/device_memcpy.cuh>
+#include <cuda/cmath>
 #include <cuda_runtime.h>
 
 #include <algorithm>

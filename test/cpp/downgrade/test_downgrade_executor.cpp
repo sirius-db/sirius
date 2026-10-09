@@ -216,7 +216,7 @@ TEST_CASE("Downgrade executor starts and stops cleanly", "[downgrade_executor]")
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  repo_registry.create_for_query(kTestQueryId);
 
   // nullptr memory_space — monitor loop won't trigger, just tests lifecycle
   auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
@@ -230,7 +230,7 @@ TEST_CASE("request_free_memory_and_wait with no repositories returns 0", "[downg
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  repo_registry.create_for_query(kTestQueryId);
 
   auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();

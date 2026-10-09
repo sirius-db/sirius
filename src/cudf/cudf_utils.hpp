@@ -85,6 +85,77 @@ inline std::unique_ptr<cudf::table> ApplyRetentionMask(cudf::table_view const& i
 #endif
 }
 
+/**
+ * @brief Return @p col if it has type @p type, otherwise a copy of it cast to @p type.
+ *
+ * @param col The column, consumed.
+ * @param type The type of the returned column.
+ * @param stream CUDA stream used for device memory operations and kernel launches.
+ * @param mr Device memory resource used to allocate the cast column.
+ *
+ * @return @p col itself if it already has type @p type, otherwise a new column cast with
+ *         `cudf::cast`.
+ */
+inline std::unique_ptr<cudf::column> cast_if_needed(std::unique_ptr<cudf::column> col,
+                                                    cudf::data_type type,
+                                                    ::cuda::stream_ref stream,
+                                                    rmm::device_async_resource_ref mr)
+{
+  if (col->type() == type) { return col; }
+  return cudf::cast(col->view(), type, stream, mr);
+}
+
+/**
+ * @brief Make a column of @p num_rows NULLs with the type of @p like.
+ *
+ * Works for every type, including strings, decimals and nested types, whose children are
+ * reproduced from @p like.
+ *
+ * @param like The column whose type the result has. Its values are not read.
+ * @param num_rows The number of rows of the result.
+ * @param stream CUDA stream used for device memory operations and kernel launches.
+ * @param mr Device memory resource used to allocate the result.
+ *
+ * @return A column of @p num_rows rows that are all NULL.
+ */
+inline std::unique_ptr<cudf::column> make_null_column(cudf::column_view const& like,
+                                                      cudf::size_type num_rows,
+                                                      ::cuda::stream_ref stream,
+                                                      rmm::device_async_resource_ref mr)
+{
+  if (cudf::is_fixed_width(like.type())) {
+    return cudf::make_fixed_width_column(
+      like.type(), num_rows, cudf::mask_state::ALL_NULL, stream, mr);
+  }
+  // Every index of the gather map is out of bounds, so NULLIFY makes every row NULL.
+  auto const out_of_bounds = cudf::numeric_scalar<cudf::size_type>(like.size(), true, stream, mr);
+  auto gather_map          = cudf::make_column_from_scalar(out_of_bounds, num_rows, stream, mr);
+  auto gathered            = cudf::gather(
+    cudf::table_view({like}), gather_map->view(), cudf::out_of_bounds_policy::NULLIFY, stream, mr);
+  return std::move(gathered->release()[0]);
+}
+
+/**
+ * @brief Make a column of @p num_rows rows that all hold @p value.
+ *
+ * @tparam T A numeric type with a `cudf::numeric_scalar`, which sets the column type.
+ * @param value The value of every row.
+ * @param num_rows The number of rows of the result.
+ * @param stream CUDA stream used for device memory operations and kernel launches.
+ * @param mr Device memory resource used to allocate the result.
+ *
+ * @return A column of @p num_rows rows that all hold @p value, with no NULLs.
+ */
+template <typename T>
+std::unique_ptr<cudf::column> make_constant_column(T value,
+                                                   cudf::size_type num_rows,
+                                                   ::cuda::stream_ref stream,
+                                                   rmm::device_async_resource_ref mr)
+{
+  auto const scalar = cudf::numeric_scalar<T>(value, true, stream, mr);
+  return cudf::make_column_from_scalar(scalar, num_rows, stream, mr);
+}
+
 inline bool IsCudfTypeDecimal(const cudf::data_type& type)
 {
   return type.id() == cudf::type_id::DECIMAL32 || type.id() == cudf::type_id::DECIMAL64 ||
