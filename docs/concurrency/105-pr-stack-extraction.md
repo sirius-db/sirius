@@ -8,7 +8,44 @@ The original `concurrency4` branch remains at `7f1615c20d1b82c4cbde03470d362caed
 The stack uses the repository's `stacked/` naming convention and gh-stack (stack #1999).
 All PRs are drafts for review. Merge bottom-up through the repository's merge queue; do not use `gh stack merge` or "Enqueue stack".
 
-## Published layers
+## Current order (2026-10-08)
+
+The memory-progress PR #2001 now follows the benchmark runner #2015. Existing PR numbers
+and branch names are retained; numeric branch prefixes describe the original extraction order.
+
+| Position | PR | Scope |
+|---|---|---|
+| 1 | #1997 | Query errors and workers |
+| 2 | #1998 | Lifecycle contract |
+| 3 | #2000 | Lifecycle integration |
+| 4 | #2002 | Session options |
+| 5 | #2003 | Metadata ownership |
+| 6 | #2004 | Pin publication |
+| 7 | #2005 | CUDA streams |
+| 8 | #2006 | Scan capacity |
+| 9 | #2007 | Runtime health |
+| 10 | #2008 | Concurrent admission |
+| 11 | #2009 | Review record |
+| 12 | #2015 | Benchmark runner: before baseline |
+| 13 | #2001 | Memory progress: after comparison |
+
+### Dependency adjustments
+
+- #2007 retains memory-wait diagnostics around the original blocking reservation path and
+  classifies fatal downgrade errors. #2001 moves the diagnostic guard with requeued work.
+- #2008 owns bounded query IDs and exhaustion tests because admission tickets require them.
+- Memory-pressure cancellation/timeout SQL scenarios and retry-specific pipeline documentation
+  move to #2001. Earlier layers retain blocking GPU reservations and the HOST reservation fallback.
+- Compare #2015 and #2001 with identical client/admission concurrency, datasets and configuration.
+  Record failures and external process timeouts alongside throughput and latency. No performance
+  benefit has been established by this reorder.
+
+The historical validation below describes the original extraction and its order, not independent
+qualification of the reordered intermediate branches. Original branch tips are preserved under
+`backup/pr2001-reorder-20261008/`. The complete reordered implementation is checked against the
+previous combined tip; only documentation should differ after moving the dependency-specific tests.
+
+## Original extraction layers
 
 | Layer | PR | Branch | Commit |
 |---|---|---|---|

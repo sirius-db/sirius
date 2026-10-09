@@ -3,6 +3,8 @@
 > The approved plan below has been implemented as a draft PR stack. See
 > [the extraction record](105-pr-stack-extraction.md) for actual branch/commit identifiers,
 > validation results, source equivalence and remaining qualification gates.
+> The 2026-10-08 reorder moves memory progress (#2001) after the benchmark runner (#2015);
+> the extraction record contains the current order. The plan below retains its historical order.
 
 Work started 2026-09-29; original validation resumed 2026-09-30. The rebase and
 full-stack split proposal below were updated **2026-10-05**. Review this alongside
