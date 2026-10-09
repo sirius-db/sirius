@@ -52,7 +52,7 @@ Hardware availability and capacity are checked when initializing an engine.
 Headers use C99-compatible declarations. The C ABI assumes a matching platform and architecture;
 Sirius and its dependencies must still meet the platform's runtime requirements.
 
-SIRIUS_ABI_VERSION identifies the expected ABI revision. Compare it with sirius_abi_version()
-when loading a library. Breaking C ABI changes increment the revision. New functions may be
-added within a revision, so applications must also select a library providing the symbols they use.
-The API is under active development; this is not yet a promise of a stable release interface.
+SIRIUS_ABI_VERSION and sirius_abi_version() are reserved for future ABI versioning and
+currently return zero. Matching values do not guarantee compatibility during development;
+use matching headers and library releases. We will define the versioning policy before
+promising ABI stability.

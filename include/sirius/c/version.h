@@ -4,13 +4,14 @@
 #pragma once
 #include <sirius/c/export.h>
 #include <stdint.h>
-/** Expected ABI revision. Incompatible C ABI changes increment this value. */
-#define SIRIUS_ABI_VERSION UINT32_C(1)
+/** Reserved for future ABI versioning. Zero denotes an unversioned development API;
+ * matching values do not guarantee compatibility. */
+#define SIRIUS_ABI_VERSION UINT32_C(0)
 #ifdef __cplusplus
 extern "C" {
 #endif
-/** Return the linked library's ABI revision. Matching revisions do not imply
- * that an older library provides functions added by newer headers.
+/** Return the linked library's ABI revision, currently zero (unversioned).
+ * Use matching headers and library releases until ABI versioning is introduced.
  * @code{.c}
  * if (sirius_abi_version() != SIRIUS_ABI_VERSION) { return 1; }
  * @endcode
