@@ -214,6 +214,51 @@ void scan_operator_input::prepare_for_processing(
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
 
   if (batch && requested_memory_space && !stolen_table && !stolen_table_consumed) {
+    // Prefetch can finish conversion before this task prepares its resident input.
+    // Its decode outcome has the same meaning as one produced by convert_to below.
+    auto read_decode_outcome = [&](::cucascade::idata_representation const* data) {
+      // The converter reports what the decode did as a value on the
+      // representation. row_filtered means the whole table-filter conjunction
+      // was applied and every column is compacted to the surviving rows —
+      // materialize_table maps it to filter_state::ROW_FILTERED so the filter
+      // is not re-evaluated. selection_unprofitable means the attempt did not
+      // pay off, so the scan's remaining splits skip it. Off-gate the
+      // converters install the plain representation and both stay false.
+      // Established by src/compression/compressed_scan.cpp:
+      // build_chunk_pushdown_config sets config.covers_whole_filter only when
+      // the request covered the whole filter and no conjunct was dropped or
+      // left untranslated, and decompress_with_pushdown sets
+      // outcome.row_filtered only when a compaction was applied under that
+      // flag. The transactional steal's filter bypass depends on this — if
+      // that gate ever weakens, the steal must stop honoring
+      // pushdown_row_filtered.
+      bool visibility_mask_applied = false;
+      if (auto const* decoded =
+            dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(data)) {
+        auto const& outcome          = decoded->outcome();
+        pushdown_row_filtered        = outcome.row_filtered;
+        pushdown_predicate_columns   = outcome.predicate_columns;
+        pushdown_predicates_enforced = outcome.predicates_enforced;
+        visibility_mask_applied      = outcome.visibility_mask_applied;
+        if (pushdown_selection_unprofitable && outcome.selection_unprofitable) {
+          pushdown_selection_unprofitable->store(true, std::memory_order_relaxed);
+        }
+      }
+      // The decode consumed the mask: clear it, since re-applying selects wrong rows and
+      // clearing re-enables the zero-copy steal below.
+      if (visibility_mask_applied && mvcc_keep_mask.has_mask()) {
+        mvcc_keep_mask = scan_manager::mvcc_chunk_mask{};
+      }
+      if (pushdown_row_filtered && mvcc_keep_mask.has_mask()) {
+        // The keep-mask is positional over the chunk's full row range; a
+        // decode-compacted table no longer aligns with it. A masked chunk may only drop
+        // rows when the decode consumed the mask (cleared above), so throw instead.
+        throw std::runtime_error(
+          "[scan_operator_input::prepare_for_processing] decode-time row filtering is "
+          "incompatible with an unconsumed mvcc keep-mask; the attach must compose the "
+          "visibility mask on masked chunks");
+      }
+    };
     bool needs_upload = false;
     {
       auto ro          = batch->to_read_only();
@@ -225,6 +270,7 @@ void scan_operator_input::prepare_for_processing(
         dynamic_cast<const ::cucascade::gpu_table_representation*>(data) != nullptr;
       needs_upload = data != nullptr &&
                      (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !is_gpu_table);
+      if (!needs_upload) { read_decode_outcome(data); }
     }
     if (needs_upload) {
       auto& registry = ::sirius::converter_registry::get();
@@ -293,48 +339,7 @@ void scan_operator_input::prepare_for_processing(
       }
       mut.convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
-      // The converter reports what the decode did as a value on the
-      // representation. row_filtered means the whole table-filter conjunction
-      // was applied and every column is compacted to the surviving rows —
-      // materialize_table maps it to filter_state::ROW_FILTERED so the filter
-      // is not re-evaluated. selection_unprofitable means the attempt did not
-      // pay off, so the scan's remaining splits skip it. Off-gate the
-      // converters install the plain representation and both stay false.
-      // Established by src/compression/compressed_scan.cpp:
-      // build_chunk_pushdown_config sets config.covers_whole_filter only when
-      // the request covered the whole filter and no conjunct was dropped or
-      // left untranslated, and decompress_with_pushdown sets
-      // outcome.row_filtered only when a compaction was applied under that
-      // flag. The transactional steal's filter bypass depends on this — if
-      // that gate ever weakens, the steal must stop honoring
-      // pushdown_row_filtered.
-      bool visibility_mask_applied = false;
-      if (auto const* decoded =
-            dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(
-              mut.get_data())) {
-        auto const& outcome          = decoded->outcome();
-        pushdown_row_filtered        = outcome.row_filtered;
-        pushdown_predicate_columns   = outcome.predicate_columns;
-        pushdown_predicates_enforced = outcome.predicates_enforced;
-        visibility_mask_applied      = outcome.visibility_mask_applied;
-        if (pushdown_selection_unprofitable && outcome.selection_unprofitable) {
-          pushdown_selection_unprofitable->store(true, std::memory_order_relaxed);
-        }
-      }
-      // The decode consumed the mask: clear it, since re-applying selects wrong rows and
-      // clearing re-enables the zero-copy steal below.
-      if (visibility_mask_applied && mvcc_keep_mask.has_mask()) {
-        mvcc_keep_mask = scan_manager::mvcc_chunk_mask{};
-      }
-      if (pushdown_row_filtered && mvcc_keep_mask.has_mask()) {
-        // The keep-mask is positional over the chunk's full row range; a
-        // decode-compacted table no longer aligns with it. A masked chunk may only drop
-        // rows when the decode consumed the mask (cleared above), so throw instead.
-        throw std::runtime_error(
-          "[scan_operator_input::prepare_for_processing] decode-time row filtering is "
-          "incompatible with an unconsumed mvcc keep-mask; the attach must compose the "
-          "visibility mask on masked chunks");
-      }
+      read_decode_outcome(mut.get_data());
       // Conversion produces a fresh owned table for this split (raw GPU pins already use a plain
       // gpu_table_representation, so they never reach this branch), so a filter-free scan may
       // transfer its columns without touching shared pin storage. A decode-row-filtered split has

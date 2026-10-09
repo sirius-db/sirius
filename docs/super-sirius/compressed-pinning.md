@@ -17,7 +17,11 @@ blocks (`select_plan_blocks`). Scans of a compressed entry decompress the projec
 at task-prepare time via the `compressed_host_representation` /
 `compressed_device_blob` → `gpu_table_representation` converters, column-parallel across
 4 fixed streams (measured strictly better than serial; the stream count is deliberately
-not configurable).
+not configurable). Each conversion takes those streams from the target GPU memory space's
+shared stream pool (`memory_space::acquire_stream()`), so they are not exclusive: the
+decode's waits also cover other work queued on them, other work queued later runs behind the
+decode, and the converters rebind the decoded columns to the task stream (`decompress_chunk`
+in `src/compression/compressed_scan.cpp`).
 
 ## Decode-time equality pushdown
 

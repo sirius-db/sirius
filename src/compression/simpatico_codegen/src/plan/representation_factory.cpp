@@ -1,564 +1,316 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// representation_factory.cpp — per-kind reconstruction of a
-// compressed_representation from a compressor name + its named output columns.
-//
-// Each rep subclass owns its reconstruction-from-stored-buffers via a static
-// ``from_outputs`` factory (declared next to the class in representation.hpp).
-// This file defines those factories and a thin dispatcher,
-// ``simpatico::reconstruct_representation``, that maps a compressor name (or the
-// ``bitextract_<spec>`` prefix) to the matching subclass factory. Every place
-// that has raw stored channels and needs a typed rep funnels through here.
+// representation_factory.cpp — reconstruction of a compressed_representation from a compressor
+// name and its named output columns. One throwing factory validates the channels and adopts them
+// into the matching representation; the loader (reconstruct_representation) and the decoder
+// (reconstruct_decode_representation) differ only in how a dictionary publishes its key width and
+// in how they report errors.
 
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
+#include "decode/decode_session.hpp"
+#include "util/host_observation.hpp"
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/null_mask.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
 
-#include <cuda_runtime.h>
-
+#include <algorithm>
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace simpatico {
-namespace {
-
-// Synchronous device->host read issued on `stream`. Use this instead of a plain
-// `cudaMemcpy(..., cudaMemcpyDeviceToHost)` when the source was just written by
-// a kernel/copy on a non-blocking pool stream: the default stream does not order
-// against pool streams, so a plain sync copy can race and read uninitialised RMM
-// memory. Issuing the D2H on the same `stream` orders it after the producer.
-inline void d2h_sync(void* dst, const void* src, size_t bytes, ::cuda::stream_ref stream)
-{
-  cudaError_t e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream.get());
-  if (e == cudaSuccess) e = cudaStreamSynchronize(stream.get());
-  if (e != cudaSuccess)
-    throw std::runtime_error(std::string("d2h_sync failed: ") + cudaGetErrorString(e));
-}
-
-// Shared validation for the common case: an exact, ordered set of channel
-// names with a matching output-column count. Returns false and sets *err on
-// any mismatch. Kinds with variable arity (dictionary, bitpack, bitextract,
-// identity) validate inline instead.
-bool check_outputs(const char* op,
-                   std::vector<std::string> const& names,
-                   std::vector<std::unique_ptr<cudf::column>> const& outputs,
-                   std::initializer_list<const char*> expected,
-                   std::string* err)
-{
-  if (outputs.size() != expected.size() || names.size() != expected.size()) {
-    if (err) {
-      std::string e =
-        std::string(op) + " expects " + std::to_string(expected.size()) + " output channels (";
-      bool first = true;
-      for (auto* n : expected) {
-        if (!first) e += ", ";
-        e += n;
-        first = false;
-      }
-      *err = e + ")";
-    }
-    return false;
-  }
-  size_t i = 0;
-  for (auto* n : expected) {
-    if (names[i] != n) {
-      if (err) {
-        *err = std::string(op) + " channel " + std::to_string(i) + " must be named '" + n +
-               "' (got '" + names[i] + "')";
-      }
-      return false;
-    }
-    ++i;
-  }
-  return true;
-}
-
-// Validate a single "output" UINT8 channel and adopt its device_buffer. The
-// reconstruction entry points own `outputs`, so releasing the column avoids a
-// redundant device-to-device copy for the byte-stream codecs
-// (ans/bitcomp/snappy/lz4/deflate). Returns nullptr and sets *error_out on
-// validation failure; on success sets *out_size to the payload byte count.
-std::unique_ptr<rmm::device_buffer> copy_output_payload(
-  const char* codec,
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>>& outputs,
-  ::cuda::stream_ref,
-  rmm::device_async_resource_ref,
-  std::string* error_out,
-  std::size_t* out_size)
-{
-  if (!check_outputs(codec, output_names, outputs, {"output"}, error_out)) return nullptr;
-  auto const& payload_col = outputs[0];
-  if (payload_col->type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = std::string(codec) + " 'output' must be UINT8";
-    return nullptr;
-  }
-  auto const comp = static_cast<std::size_t>(payload_col->size());
-  auto contents   = payload_col->release();
-  auto payload    = std::move(contents.data);
-  if (out_size) *out_size = comp;
-  return payload;
-}
-
-}  // namespace
-
-std::unique_ptr<compressed_representation> identity_compressed_representation::from_outputs(
-  std::vector<std::string> const& /*output_names*/,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  ::cuda::stream_ref,
-  rmm::device_async_resource_ref,
-  std::string* error_out)
-{
-  if (outputs.size() != 1) {
-    if (error_out) *error_out = "identity expects exactly one output column";
-    return nullptr;
-  }
-  return std::make_unique<identity_compressed_representation>(std::move(outputs[0]));
-}
 
 namespace {
 
-// Reads a "null_mask" channel column (UINT8 bitmask bytes, as emitted by
-// dictionary/str_split named_channels) into a device_buffer + null count over
-// `num_rows` rows. Returns false and sets *error_out on a malformed channel.
-bool take_null_mask_channel(
-  std::unique_ptr<cudf::column> mask_col,
-  cudf::size_type num_rows,
-  decltype(cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED))* mask_out,
-  cudf::size_type* null_count_out,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out)
+using channel_columns = std::vector<std::unique_ptr<cudf::column>>;
+
+[[noreturn]] void reject(std::string const& message) { throw std::invalid_argument(message); }
+
+// Require exactly the `expected` channel names, in order.
+void require_channels(std::string const& op,
+                      std::vector<std::string> const& names,
+                      std::initializer_list<char const*> expected)
 {
-  if (mask_col->type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = "dictionary null_mask must be UINT8";
-    return false;
+  if (names.size() != expected.size() ||
+      !std::equal(names.begin(), names.end(), expected.begin())) {
+    std::string listed;
+    for (auto const* name : expected)
+      listed += (listed.empty() ? "" : ", ") + std::string{name};
+    reject(op + " outputs must be named '" + listed + "'");
   }
-  if (static_cast<std::size_t>(mask_col->size()) < cudf::bitmask_allocation_size_bytes(num_rows)) {
-    if (error_out) *error_out = "dictionary null_mask is shorter than the row count requires";
-    return false;
-  }
-  auto const* bits =
-    reinterpret_cast<cudf::bitmask_type const*>(mask_col->view().data<std::uint8_t>());
-  *null_count_out = num_rows > 0 ? cudf::null_count(bits, 0, num_rows, stream) : 0;
-  auto contents   = mask_col->release();
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
-  // Keep the source alive until the asynchronous mask copy completes.
-  contents.data->set_stream(stream);
-  *mask_out = cudf::copy_bitmask(bits, 0, num_rows, stream, mr);
-#else
-  *mask_out = std::move(*contents.data);
-#endif
-  return true;
 }
 
-}  // namespace
-
-std::unique_ptr<compressed_representation> dictionary_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out)
+// The single UINT8 `output` payload of an nvCOMP codec, with the uncompressed type, row count, and
+// byte count from its leaf metadata, passed to `make` together with the adopted payload buffer.
+template <typename Meta, typename Make>
+std::unique_ptr<compressed_representation> make_payload(std::string const& codec,
+                                                        std::vector<std::string> const& names,
+                                                        channel_columns& channels,
+                                                        leaf_meta_v const& metadata,
+                                                        Make make)
 {
-  if (output_names.size() != outputs.size()) {
-    if (error_out) *error_out = "dictionary: output_names / outputs size mismatch";
-    return nullptr;
-  }
-  // Accepts a trailing optional "null_mask" channel (UINT8 bitmask bytes of the
-  // decoded column) — reattached below so validity survives channel-based
-  // round-trips (.hpln IO and decomposed plans).
-  bool const has_mask = !output_names.empty() && output_names.back() == "null_mask";
+  require_channels(codec, names, {"output"});
+  if (channels[0]->type().id() != cudf::type_id::UINT8) reject(codec + " 'output' must be UINT8");
+  auto const* meta = std::get_if<Meta>(&metadata);
+  if (!meta) reject(codec + ": missing leaf metadata (uncompressed_size, original_type_id)");
+  auto const type       = cudf::data_type{static_cast<cudf::type_id>(meta->original_type_id)};
+  auto const bytes      = meta->uncompressed_size;
+  auto const rows       = bytes > 0 && cudf::is_fixed_width(type)
+                            ? static_cast<cudf::size_type>(bytes / cudf::size_of(type))
+                            : 0;
+  auto const compressed = static_cast<std::size_t>(channels[0]->size());
+  auto payload = std::make_unique<rmm::device_buffer>(std::move(*channels[0]->release().data));
+  return make(*meta, type, rows, std::move(payload), compressed, bytes);
+}
 
-  // keys_offsets, keys_chars, indices (+ null_mask).
-  if (outputs.size() != (has_mask ? 4u : 3u) || output_names[0] != "keys_offsets" ||
-      output_names[1] != "keys_chars" || output_names[2] != "indices") {
-    if (error_out) {
-      *error_out =
-        "dictionary outputs must be named 'keys_offsets, keys_chars, indices[, null_mask]'";
-    }
-    return nullptr;
-  }
-  auto keys_offsets = std::move(outputs[0]);
-  auto keys_chars   = std::move(outputs[1]);
-  auto indices      = std::move(outputs[2]);
+template <typename Rep, typename Meta>
+std::unique_ptr<compressed_representation> make_simple_payload(
+  std::string const& codec,
+  std::vector<std::string> const& names,
+  channel_columns& channels,
+  leaf_meta_v const& metadata)
+{
+  return make_payload<Meta>(codec, names, channels, metadata, [](Meta const&, auto&&... args) {
+    return std::make_unique<Rep>(std::forward<decltype(args)>(args)...);
+  });
+}
 
-  cudf::size_type num_offsets = keys_offsets->size();
-  cudf::size_type num_keys    = num_offsets > 0 ? static_cast<cudf::size_type>(num_offsets - 1) : 0;
-  if (keys_chars->type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = "dictionary keys_chars must be UINT8";
-    return nullptr;
+// Assemble the dictionary by adopting its channels. An optional trailing `null_mask`
+// channel carries the validity of a nullable column. cuDF's factories retag unsigned indices (for
+// example a narrow field a bitjoin decodes) as the signed type of the same width.
+std::unique_ptr<compressed_representation> make_dictionary(std::vector<std::string> const& names,
+                                                           channel_columns& channels,
+                                                           std::optional<std::int64_t> key_width,
+                                                           ::cuda::stream_ref stream,
+                                                           rmm::device_async_resource_ref mr)
+{
+  bool const has_mask = !names.empty() && names.back() == "null_mask";
+  if (has_mask) {
+    require_channels("dictionary", names, {"keys_offsets", "keys_chars", "indices", "null_mask"});
+  } else {
+    require_channels("dictionary", names, {"keys_offsets", "keys_chars", "indices"});
   }
-
+  auto const offsets_type = channels[0]->type().id();
+  if ((offsets_type != cudf::type_id::INT32 && offsets_type != cudf::type_id::INT64) ||
+      channels[1]->type().id() != cudf::type_id::UINT8) {
+    reject("dictionary: invalid key offsets/chars types");
+  }
+  if (channels[0]->size() < 1 || channels[0]->null_count() != 0) {
+    reject("dictionary: key offsets must be nonempty and null-free");
+  }
+  auto const keys = channels[0]->size() - 1;
+  auto const rows = channels[2]->size();
+  // A positive width fixes the chars extent exactly; anything else is corrupt metadata, not a shape
+  // to decline, because the gather addresses the chars with it.
+  if (key_width &&
+      (*key_width < -1 || (*key_width > 0 && static_cast<std::int64_t>(channels[1]->size()) !=
+                                               std::int64_t{keys} * *key_width))) {
+    reject("dictionary: key width hint does not describe the key channels");
+  }
   auto mask                  = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
-  cudf::size_type null_count = 0;
-  if (has_mask &&
-      !take_null_mask_channel(
-        std::move(outputs[3]), indices->size(), &mask, &null_count, stream, mr, error_out)) {
-    return nullptr;
+  cudf::size_type mask_nulls = 0;
+  if (has_mask) {
+    if (channels[3]->type().id() != cudf::type_id::UINT8 ||
+        static_cast<std::size_t>(channels[3]->size()) < cudf::bitmask_allocation_size_bytes(rows)) {
+      reject("dictionary: invalid null mask channel");
+    }
+    // The host null count decides whether the mask belongs on the dictionary parent.
+    auto const* bits = static_cast<cudf::bitmask_type const*>(channels[3]->view().head<void>());
+    mask_nulls       = rows > 0 ? cudf::null_count(bits, 0, rows, stream) : 0;
+    if (mask_nulls > 0) {
+      auto contents = channels[3]->release();
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+      // Keep the RMM source alive until the copy into cuDF's CUDA mask buffer completes.
+      contents.data->set_stream(stream);
+      mask = cudf::copy_bitmask(bits, 0, rows, stream, mr);
+#else
+      mask = std::move(*contents.data);
+#endif
+    }
   }
-
-  // Hand the chars bytes straight to make_strings_column by moving the
-  // column's underlying device_buffer out — no device-to-device copy needed.
-  auto chars_contents = keys_chars->release();
-  rmm::device_buffer chars_buffer =
-    chars_contents.data ? std::move(*chars_contents.data) : rmm::device_buffer(0, stream, mr);
-
-  auto keys_strings =
-    cudf::make_strings_column(num_keys,
-                              std::move(keys_offsets),
-                              std::move(chars_buffer),
+  auto key_strings =
+    cudf::make_strings_column(keys,
+                              std::move(channels[0]),
+                              std::move(*channels[1]->release().data),
                               0,
                               cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
-
-  auto dict_col =
-    null_count > 0
+  auto dictionary =
+    mask_nulls > 0
       ? cudf::make_dictionary_column(
-          std::move(keys_strings), std::move(indices), std::move(mask), null_count)
-      : cudf::make_dictionary_column(std::move(keys_strings), std::move(indices), stream, mr);
-  // Indices, keys, and chars are then obtained as views from this column via
-  // get_dictionary_child_view(dict_col->view(), ...) / dictionary_column_view.
-  return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
+          std::move(key_strings), std::move(channels[2]), std::move(mask), mask_nulls)
+      : cudf::make_dictionary_column(std::move(key_strings), std::move(channels[2]), stream, mr);
+  if (!key_width) {
+    return dictionary_compressed_representation::from_encoded_column(
+      std::move(dictionary), stream, mr);
+  }
+  auto rep = std::make_unique<dictionary_compressed_representation>(std::move(dictionary));
+  rep->constant_key_width = *key_width;
+  return rep;
 }
 
-// The four buffers are independent leaves that may each be further compressed
-// by `for`/`bitpack`/`fastlanes`/`identity`.
-std::unique_ptr<compressed_representation> alp_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  ::cuda::stream_ref,
-  rmm::device_async_resource_ref,
-  std::string* error_out)
+// Validate `channels` against the codec named `compressor_name` and adopt them into its
+// representation. `key_width` is the dictionary width to publish; when absent it is measured on
+// `stream`, which waits for the stream.
+std::unique_ptr<compressed_representation> reconstruct(std::string const& compressor_name,
+                                                       std::vector<std::string> const& names,
+                                                       channel_columns channels,
+                                                       leaf_meta_v const& meta,
+                                                       std::optional<std::int64_t> key_width,
+                                                       ::cuda::stream_ref stream,
+                                                       rmm::device_async_resource_ref mr)
 {
-  if (!check_outputs("alp",
-                     output_names,
-                     outputs,
-                     {"integers", "exceptions", "exception_positions", "metadata"},
-                     error_out))
-    return nullptr;
-  auto integers            = std::move(outputs[0]);
-  auto exceptions          = std::move(outputs[1]);
-  auto exception_positions = std::move(outputs[2]);
-  auto metadata            = std::move(outputs[3]);
-
-  // Type validation. The (integers, exceptions) pair must match a supported
-  // (int_t, value_t) combination from alp_traits: INT32+FLOAT32 for f32
-  // input, INT64+FLOAT64 for f64. The other two outputs are precision-
-  // independent.
-  bool const is_f32 = integers->type().id() == cudf::type_id::INT32 &&
-                      exceptions->type().id() == cudf::type_id::FLOAT32;
-  bool const is_f64 = integers->type().id() == cudf::type_id::INT64 &&
-                      exceptions->type().id() == cudf::type_id::FLOAT64;
-  if (!is_f32 && !is_f64) {
-    if (error_out)
-      *error_out =
-        "alp (integers, exceptions) must be (INT32,FLOAT32) or "
-        "(INT64,FLOAT64)";
-    return nullptr;
+  if (names.size() != channels.size() ||
+      std::any_of(channels.begin(), channels.end(), [](auto const& column) { return !column; })) {
+    reject("reconstruction: missing output channel for '" + compressor_name + "'");
   }
-  if (exception_positions->type().id() != cudf::type_id::INT32) {
-    if (error_out) *error_out = "alp exception_positions must be INT32";
-    return nullptr;
-  }
-  if (metadata->type().id() != cudf::type_id::UINT16) {
-    if (error_out) *error_out = "alp metadata must be UINT16";
-    return nullptr;
-  }
-  if (exceptions->size() != exception_positions->size()) {
-    if (error_out) *error_out = "alp exceptions and exception_positions must have the same length";
-    return nullptr;
-  }
-
-  cudf::size_type num_rows    = integers->size();
-  cudf::size_type num_vectors = metadata->size();
-  // The exceptions column's type IS the original float type by construction
-  // (alp_traits stores exceptions as the source value_t).
-  cudf::data_type original_type = exceptions->type();
-
-  return std::make_unique<alp_compressed_representation>(original_type,
-                                                         num_rows,
-                                                         num_vectors,
-                                                         std::move(integers),
-                                                         std::move(exceptions),
-                                                         std::move(exception_positions),
-                                                         std::move(metadata));
-}
-
-// Six outputs: right_parts, dict_indices, dict, metadata, exceptions,
-// exception_positions. Column-wide dict + right_bw.
-std::unique_ptr<compressed_representation> alp_rd_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref,
-  std::string* error_out)
-{
-  if (!check_outputs(
-        "alp_rd",
-        output_names,
-        outputs,
-        {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"},
-        error_out))
-    return nullptr;
-  auto right_parts         = std::move(outputs[0]);
-  auto dict_indices        = std::move(outputs[1]);
-  auto dict                = std::move(outputs[2]);
-  auto metadata            = std::move(outputs[3]);
-  auto exceptions          = std::move(outputs[4]);
-  auto exception_positions = std::move(outputs[5]);
-
-  // Type validation. right_parts width selects the precision: UINT32 → f32
-  // input, UINT64 → f64. dict / exceptions / dict_indices / metadata /
-  // exception_positions are all precision-independent (per alp_rd_traits;
-  // dict stays UINT16 because right_bw is clamped so left part fits in 16
-  // bits, and exceptions / dict_indices likewise stay at their f32 widths).
-  cudf::type_id const rp_id = right_parts->type().id();
-  if (rp_id != cudf::type_id::UINT32 && rp_id != cudf::type_id::UINT64) {
-    if (error_out) *error_out = "alp_rd right_parts must be UINT32 (f32) or UINT64 (f64)";
-    return nullptr;
-  }
-  if (dict_indices->type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = "alp_rd dict_indices must be UINT8";
-    return nullptr;
-  }
-  if (dict->type().id() != cudf::type_id::UINT16) {
-    if (error_out) *error_out = "alp_rd dict must be UINT16";
-    return nullptr;
-  }
-  if (metadata->type().id() != cudf::type_id::UINT8 || metadata->size() < 1) {
-    if (error_out) *error_out = "alp_rd metadata must be UINT8 with ≥1 element";
-    return nullptr;
-  }
-  if (exceptions->type().id() != cudf::type_id::UINT16) {
-    if (error_out) *error_out = "alp_rd exceptions must be UINT16";
-    return nullptr;
-  }
-  if (exception_positions->type().id() != cudf::type_id::INT32) {
-    if (error_out) *error_out = "alp_rd exception_positions must be INT32";
-    return nullptr;
-  }
-  if (exceptions->size() != exception_positions->size()) {
-    if (error_out)
-      *error_out = "alp_rd exceptions and exception_positions must have the same length";
-    return nullptr;
-  }
-  if (right_parts->size() != dict_indices->size()) {
-    if (error_out) *error_out = "alp_rd right_parts and dict_indices must have the same length";
-    return nullptr;
-  }
-
-  cudf::size_type num_rows = right_parts->size();
-  // Pull right_bw from the (single-element) metadata column via d2h_sync so
-  // this reads through `stream` (which the caller already arranged to wait on
-  // the metadata column's producing stream). A plain default-stream
-  // `cudaMemcpy` here returned zero from fresh RMM memory in the multistream
-  // decompress path, collapsing decode to `(left << 0) | right_parts`.
-  uint8_t right_bw_val = 0;
-  d2h_sync(&right_bw_val, metadata->view().data<uint8_t>(), sizeof(uint8_t), stream);
-
-  // Derive the original float width from right_parts' element size.
-  cudf::data_type original_type{rp_id == cudf::type_id::UINT64 ? cudf::type_id::FLOAT64
-                                                               : cudf::type_id::FLOAT32};
-
-  return std::make_unique<alp_rd_compressed_representation>(original_type,
-                                                            num_rows,
-                                                            right_bw_val,
-                                                            std::move(right_parts),
-                                                            std::move(dict_indices),
-                                                            std::move(dict),
-                                                            std::move(metadata),
-                                                            std::move(exceptions),
-                                                            std::move(exception_positions));
-}
-
-std::unique_ptr<compressed_representation> str_split_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  ::cuda::stream_ref,
-  rmm::device_async_resource_ref,
-  std::string* error_out)
-{
-  // Variable arity: {offsets, chars} or {offsets, chars, null_mask}.
-  bool const has_mask = outputs.size() == 3;
-  if (outputs.size() != 2 && outputs.size() != 3) {
-    if (error_out) *error_out = "str_split expects 2 (offsets, chars) or 3 (+ null_mask) outputs";
-    return nullptr;
-  }
-  if (output_names[0] != "offsets" || output_names[1] != "chars" ||
-      (has_mask && output_names[2] != "null_mask")) {
-    if (error_out) *error_out = "str_split outputs must be 'offsets, chars[, null_mask]'";
-    return nullptr;
-  }
-  auto offsets       = std::move(outputs[0]);
-  auto chars         = std::move(outputs[1]);
-  auto null_mask     = has_mask ? std::move(outputs[2]) : nullptr;
-  auto const off_tid = offsets->type().id();
-  if (off_tid != cudf::type_id::INT32 && off_tid != cudf::type_id::INT64) {
-    if (error_out) *error_out = "str_split offsets must be INT32 or INT64";
-    return nullptr;
-  }
-  // chars is UINT8 normally, or widened (UINT32/UINT64) to hold >2GB under the
-  // 2^31-element column cap (see str_split_compressor).
-  auto const chars_tid = chars->type().id();
-  bool const chars_ok  = chars_tid == cudf::type_id::UINT8 || chars_tid == cudf::type_id::UINT32 ||
-                        chars_tid == cudf::type_id::UINT64;
-  if (!chars_ok || (null_mask && null_mask->type().id() != cudf::type_id::UINT8)) {
-    if (error_out) *error_out = "str_split chars must be UINT8/UINT32/UINT64, null_mask UINT8";
-    return nullptr;
-  }
-  cudf::size_type const n = offsets->size() > 0 ? offsets->size() - 1 : 0;
-  return std::make_unique<str_split_compressed_representation>(
-    n, std::move(offsets), std::move(chars), std::move(null_mask));
-}
-
-std::unique_ptr<compressed_representation> bitextract_compressed_representation::from_outputs(
-  bitextract_spec_result spec,
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  std::string* error_out)
-{
-  if (spec.fields.empty()) {
-    if (error_out) *error_out = "bitextract: empty spec";
-    return nullptr;
-  }
-  if (spec.fields.size() != outputs.size()) {
-    if (error_out) *error_out = "bitextract: field count mismatch";
-    return nullptr;
-  }
-  for (size_t i = 0; i < spec.fields.size(); ++i) {
-    if (i >= output_names.size() || output_names[i] != spec.fields[i].name) {
-      if (error_out) *error_out = "bitextract: output name mismatch at index " + std::to_string(i);
-      return nullptr;
+  auto const id = op_id_from_name(compressor_name);
+  if (!id) reject("unsupported compressor '" + compressor_name + "' for reconstruction");
+  switch (*id) {
+    case OpId::Identity:
+      if (channels.size() != 1) reject("identity expects exactly one output column");
+      return std::make_unique<identity_compressed_representation>(std::move(channels[0]));
+    case OpId::Dictionary: return make_dictionary(names, channels, key_width, stream, mr);
+    case OpId::Alp: {
+      require_channels("alp", names, {"integers", "exceptions", "exception_positions", "metadata"});
+      auto const integers   = channels[0]->type().id();
+      auto const exceptions = channels[1]->type().id();
+      if (!((integers == cudf::type_id::INT32 && exceptions == cudf::type_id::FLOAT32) ||
+            (integers == cudf::type_id::INT64 && exceptions == cudf::type_id::FLOAT64)) ||
+          channels[2]->type().id() != cudf::type_id::INT32 ||
+          channels[3]->type().id() != cudf::type_id::UINT16 ||
+          channels[1]->size() != channels[2]->size()) {
+        reject("alp: invalid channel types or exception sizes");
+      }
+      // The exceptions keep the original float type by construction.
+      return std::make_unique<alp_compressed_representation>(channels[1]->type(),
+                                                             channels[0]->size(),
+                                                             channels[3]->size(),
+                                                             std::move(channels[0]),
+                                                             std::move(channels[1]),
+                                                             std::move(channels[2]),
+                                                             std::move(channels[3]));
     }
+    case OpId::AlpRd: {
+      require_channels(
+        "alp_rd",
+        names,
+        {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"});
+      auto const right = channels[0]->type().id();
+      if ((right != cudf::type_id::UINT32 && right != cudf::type_id::UINT64) ||
+          channels[1]->type().id() != cudf::type_id::UINT8 ||
+          channels[2]->type().id() != cudf::type_id::UINT16 ||
+          channels[3]->type().id() != cudf::type_id::UINT8 || channels[3]->size() < 1 ||
+          channels[4]->type().id() != cudf::type_id::UINT16 ||
+          channels[5]->type().id() != cudf::type_id::INT32 ||
+          channels[4]->size() != channels[5]->size() ||
+          channels[0]->size() != channels[1]->size()) {
+        reject("alp_rd: invalid channel types or sizes");
+      }
+      // The right-part bit width is the single metadata byte, written on `stream`.
+      std::uint8_t right_bw = 0;
+      read_device_bytes_completed(
+        &right_bw, channels[3]->view().head<void>(), sizeof right_bw, stream);
+      auto const type = cudf::data_type{right == cudf::type_id::UINT64 ? cudf::type_id::FLOAT64
+                                                                       : cudf::type_id::FLOAT32};
+      auto const rows = channels[0]->size();
+      return std::make_unique<alp_rd_compressed_representation>(type,
+                                                                rows,
+                                                                right_bw,
+                                                                std::move(channels[0]),
+                                                                std::move(channels[1]),
+                                                                std::move(channels[2]),
+                                                                std::move(channels[3]),
+                                                                std::move(channels[4]),
+                                                                std::move(channels[5]));
+    }
+    case OpId::StrSplit: {
+      // chars is UINT8, or widened (UINT32/UINT64) to hold more than 2 GB under the 2^31-element
+      // column cap (see str_split_compressor).
+      bool const has_mask = channels.size() == 3;
+      if (has_mask) {
+        require_channels("str_split", names, {"offsets", "chars", "null_mask"});
+      } else {
+        require_channels("str_split", names, {"offsets", "chars"});
+      }
+      auto const offsets = channels[0]->type().id();
+      auto const chars   = channels[1]->type().id();
+      if ((offsets != cudf::type_id::INT32 && offsets != cudf::type_id::INT64) ||
+          (chars != cudf::type_id::UINT8 && chars != cudf::type_id::UINT32 &&
+           chars != cudf::type_id::UINT64) ||
+          (has_mask && channels[2]->type().id() != cudf::type_id::UINT8)) {
+        reject("str_split: invalid channel types");
+      }
+      auto const rows = channels[0]->size() > 0 ? channels[0]->size() - 1 : 0;
+      return std::make_unique<str_split_compressed_representation>(
+        rows,
+        std::move(channels[0]),
+        std::move(channels[1]),
+        has_mask ? std::move(channels[2]) : nullptr);
+    }
+    case OpId::Bitextract: {
+      auto const suffix = strip_bitextract_prefix(compressor_name);
+      auto spec         = parse_bitextract_spec(suffix ? *suffix : std::string_view{});
+      if (spec.fields.empty() || spec.fields.size() != channels.size()) {
+        reject("bitextract: bad spec or field count in '" + compressor_name + "'");
+      }
+      for (std::size_t i = 0; i < channels.size(); ++i) {
+        if (spec.fields[i].name != names[i]) {
+          reject("bitextract: output name mismatch at index " + std::to_string(i));
+        }
+      }
+      return std::make_unique<bitextract_compressed_representation>(std::move(spec),
+                                                                    std::move(channels));
+    }
+    case OpId::Ans:
+      return make_simple_payload<ans_compressed_representation, leaf_meta::ans>(
+        "ans", names, channels, meta);
+    case OpId::Snappy:
+      return make_simple_payload<snappy_compressed_representation, leaf_meta::snappy>(
+        "snappy", names, channels, meta);
+    case OpId::Lz4:
+      return make_simple_payload<lz4_compressed_representation, leaf_meta::lz4>(
+        "lz4", names, channels, meta);
+    case OpId::Deflate:
+      return make_simple_payload<deflate_compressed_representation, leaf_meta::deflate>(
+        "deflate", names, channels, meta);
+    case OpId::Bitcomp:
+      return make_payload<leaf_meta::bitcomp>(
+        "bitcomp", names, channels, meta, [](auto const& bitcomp, auto&&... args) {
+          return std::make_unique<bitcomp_compressed_representation>(
+            std::forward<decltype(args)>(args)..., bitcomp.algorithm);
+        });
+    case OpId::NvcompCascaded:
+      return make_payload<leaf_meta::nvcomp_cascaded>(
+        "nvcomp_cascaded", names, channels, meta, [](auto const& cascaded, auto&&... args) {
+          return std::make_unique<cascaded_compressed_representation>(
+            std::forward<decltype(args)>(args)...,
+            cascaded.num_deltas,
+            cascaded.num_RLEs,
+            cascaded.use_bp);
+        });
+    // The fused ops have no standalone reconstruction; the codegen decode path inverts them.
+    case OpId::Bitpack:
+    case OpId::Delta:
+    case OpId::Rle:
+    case OpId::For:
+    case OpId::Zigzag: break;
   }
-  return std::make_unique<bitextract_compressed_representation>(std::move(spec),
-                                                                std::move(outputs));
+  reject("unsupported compressor '" + compressor_name + "' for reconstruction");
 }
 
-// Single ``output`` channel: trimmed UINT8 payload (no header).
-// uncompressed_size, original_type_id and algorithm come from leaf_meta::bitcomp.
-std::unique_ptr<compressed_representation> bitcomp_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out,
-  leaf_meta_v const& meta)
-{
-  std::size_t comp = 0;
-  auto payload =
-    copy_output_payload("bitcomp", output_names, outputs, stream, mr, error_out, &comp);
-  if (!payload) return nullptr;
-  auto const* bc_meta = std::get_if<leaf_meta::bitcomp>(&meta);
-  if (!bc_meta) {
-    if (error_out)
-      *error_out =
-        "bitcomp: missing leaf_meta::bitcomp (uncompressed_size, original_type_id, algorithm)";
-    return nullptr;
-  }
-  cudf::data_type const orig_type{static_cast<cudf::type_id>(bc_meta->original_type_id)};
-  size_t const uncomp = bc_meta->uncompressed_size;
-  cudf::size_type const n_rows =
-    (uncomp > 0 && cudf::is_fixed_width(orig_type))
-      ? static_cast<cudf::size_type>(uncomp / static_cast<size_t>(cudf::size_of(orig_type)))
-      : 0;
-  return std::make_unique<bitcomp_compressed_representation>(
-    orig_type, n_rows, std::move(payload), comp, uncomp, bc_meta->algorithm);
-}
+}  // namespace
 
-// Single ``output`` channel: trimmed UINT8 payload (no header).
-// uncompressed_size, original_type_id, num_deltas, num_RLEs, use_bp come from
-// leaf_meta::nvcomp_cascaded.
-std::unique_ptr<compressed_representation> cascaded_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out,
-  leaf_meta_v const& meta)
-{
-  std::size_t comp = 0;
-  auto payload =
-    copy_output_payload("nvcomp_cascaded", output_names, outputs, stream, mr, error_out, &comp);
-  if (!payload) return nullptr;
-  auto const* casc_meta = std::get_if<leaf_meta::nvcomp_cascaded>(&meta);
-  if (!casc_meta) {
-    if (error_out)
-      *error_out =
-        "nvcomp_cascaded: missing leaf_meta::nvcomp_cascaded "
-        "(uncompressed_size, original_type_id, num_deltas, num_RLEs, use_bp)";
-    return nullptr;
-  }
-  cudf::data_type const orig_type{static_cast<cudf::type_id>(casc_meta->original_type_id)};
-  size_t const uncomp = casc_meta->uncompressed_size;
-  cudf::size_type const n_rows =
-    (uncomp > 0 && cudf::is_fixed_width(orig_type))
-      ? static_cast<cudf::size_type>(uncomp / static_cast<size_t>(cudf::size_of(orig_type)))
-      : 0;
-  return std::make_unique<cascaded_compressed_representation>(orig_type,
-                                                              n_rows,
-                                                              std::move(payload),
-                                                              comp,
-                                                              uncomp,
-                                                              casc_meta->num_deltas,
-                                                              casc_meta->num_RLEs,
-                                                              casc_meta->use_bp);
-}
-
-// ── Simple nvcomp codecs (Snappy / LZ4 / GDeflate) ───────────────────────────
-// All three share the same from_outputs body: single UINT8 'output' channel,
-// metadata from the matching leaf_meta type.
-
-namespace {
-template <typename RepT, typename MetaT>
-std::unique_ptr<compressed_representation> nvcomp_simple_from_outputs(
-  std::string_view codec_name,
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out,
-  leaf_meta_v const& meta)
-{
-  std::string codec(codec_name);
-  std::size_t comp = 0;
-  auto payload =
-    copy_output_payload(codec.c_str(), output_names, outputs, stream, mr, error_out, &comp);
-  if (!payload) return nullptr;
-  auto const* m = std::get_if<MetaT>(&meta);
-  if (!m) {
-    if (error_out)
-      *error_out = codec + ": missing leaf metadata (uncompressed_size, original_type_id)";
-    return nullptr;
-  }
-  cudf::data_type const orig_type{static_cast<cudf::type_id>(m->original_type_id)};
-  size_t const uncomp = m->uncompressed_size;
-  cudf::size_type const n_rows =
-    (uncomp > 0 && cudf::is_fixed_width(orig_type))
-      ? static_cast<cudf::size_type>(uncomp / static_cast<size_t>(cudf::size_of(orig_type)))
-      : 0;
-  return std::make_unique<RepT>(orig_type, n_rows, std::move(payload), comp, uncomp);
-}
-}  // anonymous namespace
-
-// ── thin dispatcher ───────────────────────────────────────────────────────────
-// Resolves a compressor name to its OpId (via the operator registry, so all
-// parameterised suffix forms are handled uniformly) and dispatches to the
-// matching rep subclass's ``from_outputs`` factory. External linkage (called by
-// the decode driver and the file-read/deserialize path). The fused ops
-// (delta/rle/for/zigzag) have no standalone reconstruction — they are inverted
-// by the codegen decode path — and report ``unsupported`` here.
 std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string const& compressor_name,
   std::vector<std::string> const& output_names,
@@ -568,70 +320,47 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string* error_out,
   leaf_meta_v const& meta)
 {
-  auto const unsupported = [&]() -> std::unique_ptr<compressed_representation> {
-    if (error_out) {
-      *error_out = "unsupported compressor '" + compressor_name + "' for reconstruction";
-    }
+  try {
+    return reconstruct(
+      compressor_name, output_names, std::move(outputs), meta, std::nullopt, stream, mr);
+  } catch (std::invalid_argument const& error) {
+    if (error_out) *error_out = error.what();
     return nullptr;
-  };
-
-  auto id = op_id_from_name(compressor_name);
-  if (!id) return unsupported();
-
-  switch (*id) {
-    case OpId::Unknown: return unsupported();
-    case OpId::Identity:
-      return identity_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out);
-    case OpId::Dictionary:
-      return dictionary_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out);
-    case OpId::Alp:
-      return alp_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out);
-    case OpId::AlpRd:
-      return alp_rd_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out);
-    case OpId::Bitextract: {
-      auto suffix = strip_bitextract_prefix(compressor_name);
-      auto spec   = parse_bitextract_spec(suffix ? *suffix : std::string_view{});
-      if (spec.fields.empty()) {
-        if (error_out) *error_out = "bitextract: bad spec in '" + compressor_name + "'";
-        return nullptr;
-      }
-      return bitextract_compressed_representation::from_outputs(
-        std::move(spec), output_names, std::move(outputs), error_out);
-    }
-    // The simple byte-stream codecs share one body (single UINT8 'output'
-    // channel + (uncompressed_size, type_id) meta) — reconstructed generically.
-    case OpId::Ans:
-      return nvcomp_simple_from_outputs<ans_compressed_representation, leaf_meta::ans>(
-        "ans", output_names, std::move(outputs), stream, mr, error_out, meta);
-    case OpId::Snappy:
-      return nvcomp_simple_from_outputs<snappy_compressed_representation, leaf_meta::snappy>(
-        "snappy", output_names, std::move(outputs), stream, mr, error_out, meta);
-    case OpId::Lz4:
-      return nvcomp_simple_from_outputs<lz4_compressed_representation, leaf_meta::lz4>(
-        "lz4", output_names, std::move(outputs), stream, mr, error_out, meta);
-    case OpId::Deflate:
-      return nvcomp_simple_from_outputs<deflate_compressed_representation, leaf_meta::deflate>(
-        "deflate", output_names, std::move(outputs), stream, mr, error_out, meta);
-    case OpId::Bitcomp:
-      return bitcomp_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out, meta);
-    case OpId::NvcompCascaded:
-      return cascaded_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out, meta);
-    case OpId::StrSplit:
-      return str_split_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out);
-    case OpId::Bitpack:
-    case OpId::Delta:
-    case OpId::Rle:
-    case OpId::For:
-    case OpId::Zigzag: return unsupported();
   }
-  return unsupported();
+}
+
+std::unique_ptr<compressed_representation> reconstruct_decode_representation(
+  PlanNode const& node,
+  std::vector<std::string> const& output_names,
+  std::vector<std::unique_ptr<cudf::column>> channels,
+  decode_frame& frame)
+{
+  return reconstruct(node.op,
+                     output_names,
+                     std::move(channels),
+                     node.meta,
+                     node.dictionary_key_width_hint,
+                     frame.stream(),
+                     frame.mr());
+}
+
+std::unique_ptr<cudf::column> identity_compressed_representation::decompress(
+  decode_frame& frame) const
+{
+  if (channels_.size() != 1 || !channels_[0]) {
+    throw std::invalid_argument("identity decode: missing stored column");
+  }
+  return std::make_unique<cudf::column>(*channels_[0], frame.stream(), frame.mr());
+}
+
+std::unique_ptr<cudf::column> decode_standalone(compressed_representation const& rep,
+                                                decode_frame& frame)
+{
+  auto const* standalone = dynamic_cast<standalone_compressed_representation const*>(&rep);
+  if (!standalone) {
+    throw std::invalid_argument("decode standalone: representation requires the plan bridge");
+  }
+  return standalone->decompress(frame);
 }
 
 std::unique_ptr<cudf::column> decompress_standalone_representation(
@@ -652,7 +381,7 @@ std::unique_ptr<cudf::column> decompress_standalone_representation(
                    " is storage-only and requires the PlanTree decode bridge (e.g. DecodeWalk)";
     return nullptr;
   }
-  return standalone->decompress(stream, mr);
+  return decode_one(column_decode_request{std::cref(*standalone)}, stream, mr);
 }
 
 }  // namespace simpatico

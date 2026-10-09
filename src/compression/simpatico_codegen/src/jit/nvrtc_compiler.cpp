@@ -1,5 +1,7 @@
 #include "codegen/jit/nvrtc_compiler.hpp"
 
+#include "codegen/util/cuda_check.hpp"
+
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
@@ -48,34 +50,10 @@ namespace {
   throw std::runtime_error(msg);
 }
 
-[[noreturn]] void throw_cu(const char* api, CUresult r)
-{
-  const char* name = nullptr;
-  const char* desc = nullptr;
-  cuGetErrorName(r, &name);
-  cuGetErrorString(r, &desc);
-  std::string msg = "cu";
-  msg += api;
-  msg += " failed: ";
-  msg += name ? name : "<unknown>";
-  if (desc) {
-    msg += " (";
-    msg += desc;
-    msg += ")";
-  }
-  throw std::runtime_error(msg);
-}
-
 #define NVRTC_OR_THROW(call)                         \
   do {                                               \
     nvrtcResult _r = (call);                         \
     if (_r != NVRTC_SUCCESS) throw_nvrtc(#call, _r); \
-  } while (0)
-
-#define CU_OR_THROW(call)                        \
-  do {                                           \
-    CUresult _r = (call);                        \
-    if (_r != CUDA_SUCCESS) throw_cu(#call, _r); \
   } while (0)
 
 }  // namespace
@@ -236,13 +214,15 @@ CompiledKernel load_kernel_from_cubin(std::vector<char> cubin,
   // cuLibraryGetKernel returns a device-independent CUkernel handle; the
   // per-device CUfunction is derived lazily via func_for_current_device().
   CUlibrary lib = nullptr;
-  CU_OR_THROW(cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+  simpatico::throw_if_cu_error(
+    cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0),
+    "cuLibraryLoadData");
 
   CUkernel kern = nullptr;
   CUresult r    = cuLibraryGetKernel(&kern, lib, entry_symbol.c_str());
   if (r != CUDA_SUCCESS) {
     cuLibraryUnload(lib);
-    throw_cu("LibraryGetKernel", r);
+    simpatico::throw_if_cu_error(r, "cuLibraryGetKernel");
   }
 
   CompiledKernel out;

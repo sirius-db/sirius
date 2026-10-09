@@ -105,10 +105,23 @@ struct PlanNode {
   std::unordered_map<std::string, std::unique_ptr<compressed_representation>> channels;
 
   // Per-node decode metadata populated by the compress walk from
-  // rep->describe_meta(). Used by reconstruct_representation to supply
+  // rep->describe_meta(). Used by reconstruct_decode_representation to supply
   // information (e.g. uncompressed_size for ANS/Bitcomp) that cannot be
   // recovered from the stored channel buffers alone.
   leaf_meta_v meta{leaf_meta::none{}};
+
+  // Byte width of a `dictionary` node's keys: > 0 when every key has that uniform width, 0 when the
+  // keys are variable-width or empty, -1 when unknown. Written only before the tree is published
+  // and never serialized: the compress walk (plan/compress.cpp) copies the representation's
+  // prepared width, and the reader (api/compressed_table_io.cpp) derives it from the self-stored
+  // representation or a supported identity `keys_offsets` leaf. Loading leaves the hint unknown for
+  // offsets it cannot inspect, including large arrays and INT64 offsets. A `keys_offsets` output
+  // consumed by another node stays -1 on both. Consumed by reconstruct_decode_representation
+  // (plan/representation_factory.cpp), which publishes it on the decode-local representation and
+  // checks that a positive width matches the total key character size, and by the dict_codes gather
+  // specialization (plan/decompress.cpp), which declines a value <= 0. A positive hint must
+  // describe every key; decode does not recheck each offset.
+  std::int64_t dictionary_key_width_hint = -1;
 };
 
 struct PlanTree {
@@ -121,11 +134,20 @@ std::optional<PlanTree> plan_tree_from_dsl(std::string_view dsl, std::string* er
 std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps,
                                              std::string* error_out = nullptr);
 
-// Populate every node's input_sources from the tree's edge wiring (and bitjoin
-// attrs, which carry input order). Called after the tree is built from the DSL
-// or deserialized, so decode has structural value identity without path
-// strings.
+// Populate every node's input_sources from the tree's edge wiring (and bitjoin attrs, which carry
+// input order). Called after the tree is built from the DSL or deserialized, so decode has
+// structural value identity without path strings. Throws std::invalid_argument if an edge or
+// bitjoin input names a channel that its producing node does not output.
 void compute_input_sources(PlanTree& tree);
+
+// The output port that `channel` names on `node`, as numbered in input_sources, or nullopt if
+// `node` does not exist or does not output `channel`. Node 0 (input) has no named outputs: any
+// channel on it names its single value, port 0.
+std::optional<ChannelId> output_port(PlanTree const& tree, NodeId node, std::string const& channel);
+
+// The column stored by the identity leaf for `channel`, an output of `node` that no child consumes,
+// or nullptr when the channel is consumed, absent, or stored by another codec.
+cudf::column const* terminal_identity_channel(PlanNode const& node, std::string const& channel);
 
 std::string dotted_label(PlanTree const& tree, NodeId node);
 

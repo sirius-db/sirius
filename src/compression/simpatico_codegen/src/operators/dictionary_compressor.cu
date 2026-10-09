@@ -4,9 +4,12 @@
  */
 
 #include "codegen/plan/representation.hpp"
+#include "codegen/util/cuda_check.hpp"
 #include "codegen/util/nvtx.hpp"
+#include "constant_width_offsets.hpp"
+#include "decode/decode_session.hpp"
+#include "util/host_observation.hpp"
 
-#include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
@@ -17,29 +20,32 @@
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
-#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <rmm/device_uvector.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/exec_policy.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cub/device/device_reduce.cuh>
+#include <cuda/functional>
 #include <cuda_runtime.h>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
-#include <thrust/logical.h>
 #include <thrust/tabulate.h>
 #include <thrust/transform.h>
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace simpatico {
 
@@ -71,42 +77,61 @@ constexpr size_t MAX_INDICES = static_cast<size_t>(std::numeric_limits<cudf::siz
 constexpr size_t kDictCardCheckMinRows = 1 << 20;
 constexpr double kDictMaxCardFraction  = 0.5;
 
-// Constant key byte-width if every key has the same length, else 0 (STRING: not deducible from
-// dtype).
-int64_t measure_constant_key_width(cudf::strings_column_view const& keys, ::cuda::stream_ref stream)
-{
-  auto const n = keys.size();
-  if (n <= 0) return 0;
-  auto const off = cudf::detail::offsetalator_factory::make_input_iterator(keys.offsets());
-  int64_t w      = 0;
+struct matching_key_width {
+  cudf::detail::input_offsetalator offsets;
+
+  __device__ int64_t operator()(cudf::size_type i) const
   {
-    // offsets[1] - offsets[0], via a 1-element device round trip
-    rmm::device_uvector<int64_t> first(1, stream);
-    auto* d = first.data();
-    thrust::for_each_n(
-      rmm::exec_policy(stream), thrust::counting_iterator<int>(0), 1, [=] __device__(int) {
-        d[0] = off[1] - off[0];
-      });
-    cudaMemcpyAsync(&w, d, sizeof(w), cudaMemcpyDeviceToHost, stream.get());
-    cudaStreamSynchronize(stream.get());
+    auto const width = offsets[1] - offsets[0];
+    return width > 0 && offsets[i + 1] - offsets[i] == width ? width : 0;
   }
-  if (w <= 0) return 0;
-  bool const all_equal =
-    thrust::all_of(rmm::exec_policy(stream),
-                   thrust::counting_iterator<cudf::size_type>(0),
-                   thrust::counting_iterator<cudf::size_type>(n),
-                   [=] __device__(cudf::size_type i) { return off[i + 1] - off[i] == w; });
-  return all_equal ? w : 0;
+};
+
+// The positive uniform key width, or zero for variable-width or empty keys. One CUB reduction
+// writes the result beside its scratch in a single allocation, read back through the calling
+// thread's pinned staging slab; returns after @p stream completes.
+int64_t measure_constant_key_width(cudf::strings_column_view const& keys,
+                                   ::cuda::stream_ref stream,
+                                   rmm::device_async_resource_ref mr)
+{
+  if (keys.size() <= 0) return 0;
+  matching_key_width const matching_width{
+    cudf::detail::offsetalator_factory::make_input_iterator(keys.offsets(), keys.offset())};
+  auto reduce = [&](void* scratch, std::size_t& scratch_bytes, int64_t* result) {
+    throw_if_cuda_error(
+      cub::DeviceReduce::TransformReduce(scratch,
+                                         scratch_bytes,
+                                         thrust::counting_iterator<cudf::size_type>(0),
+                                         result,
+                                         keys.size(),
+                                         cuda::minimum<int64_t>{},
+                                         matching_width,
+                                         std::numeric_limits<int64_t>::max(),
+                                         stream.get()),
+      "dictionary key width reduction");
+  };
+  std::size_t scratch_bytes = 0;
+  reduce(nullptr, scratch_bytes, nullptr);
+  if (scratch_bytes > std::numeric_limits<std::size_t>::max() - sizeof(int64_t)) {
+    throw std::overflow_error("dictionary key width scratch size overflow");
+  }
+  // CUB's queried size includes padding to align the scratch following the result.
+  rmm::device_buffer storage(sizeof(int64_t) + scratch_bytes, stream, mr);
+  auto* const result = static_cast<int64_t*>(storage.data());
+  reduce(static_cast<char*>(storage.data()) + sizeof(int64_t), scratch_bytes, result);
+  int64_t width = 0;
+  read_device_bytes_completed(&width, result, sizeof width, stream);
+  return width;
 }
 
 // Compile-time width lets the stitch loop fully unroll into registers — with a
 // runtime width the byte shuffle spills to local memory.
 template <int W>
 void padded_gather_chunks(
-  uint4 const* pool, int32_t const* ix, char* out, int64_t nbytes, ::cuda::stream_ref stream)
+  uint4 const* pool, int32_t const* ix, char* out, int64_t nbytes, decode_frame& frame)
 {
   int64_t const nchunks = (nbytes + 15) / 16;
-  thrust::for_each_n(rmm::exec_policy(stream),
+  thrust::for_each_n(rmm::exec_policy_nosync(frame.stream(), frame.mr()),
                      thrust::counting_iterator<int64_t>(0),
                      nchunks,
                      [=] __device__(int64_t t) {
@@ -139,32 +164,116 @@ void padded_gather_chunks(
                      });
 }
 
+// Device view of an equals_any predicate's needles packed for one upload: `offsets` holds
+// count + 1 byte offsets into `chars`, the needles' bytes back to back.
+struct needle_view {
+  std::int32_t const* offsets;
+  char const* chars;
+  std::int32_t count;
+};
+
+// The upload's device storage together with its view; the storage is released in stream order once
+// the owner goes out of scope, so it must outlive the enqueue of every kernel that reads the view.
+struct uploaded_needles {
+  rmm::device_buffer storage;
+  needle_view view;
+};
+
+// Per-key membership test: `lut[k]` is true iff key `k` equals some needle byte for byte, the same
+// comparison as cuDF's STRING EQUAL. Keys are read through an offsetalator so INT32 and INT64 key
+// offsets share one instantiation; the offsets are absolute into `key_chars`.
+struct key_matches_any_needle {
+  cudf::detail::input_offsetalator key_offsets;
+  char const* key_chars;
+  needle_view needles;
+
+  __device__ bool operator()(cudf::size_type k) const
+  {
+    auto const key_begin = key_offsets[k];
+    auto const key_size  = key_offsets[k + 1] - key_begin;
+    for (std::int32_t j = 0; j < needles.count; ++j) {
+      auto const needle_begin = needles.offsets[j];
+      if (needles.offsets[j + 1] - needle_begin != key_size) continue;
+      bool equal = true;
+      for (int64_t b = 0; b < key_size && equal; ++b) {
+        equal = key_chars[key_begin + b] == needles.chars[needle_begin + b];
+      }
+      if (equal) return true;
+    }
+    return false;
+  }
+};
+
+// Stage the needles in frame-owned host storage, which lives until the session drains, and upload
+// them once. A pageable host-to-device copy is staged by the runtime without waiting for the
+// stream, so this is the whole cost of the predicate's host side.
+uploaded_needles upload_needles(std::vector<std::string> const& needles, decode_frame& frame)
+{
+  auto const count = needles.size();
+  if (count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+    throw std::length_error("dictionary predicate: too many values");
+  }
+  std::size_t total_chars = 0;
+  for (auto const& needle : needles) {
+    if (needle.size() >
+        static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) - total_chars) {
+      throw std::length_error("dictionary predicate: values exceed the packed size limit");
+    }
+    total_chars += needle.size();
+  }
+  // Offsets first so they stay naturally aligned at the start of both blocks; the chars follow.
+  auto const offsets_bytes = (count + 1) * sizeof(std::int32_t);
+  auto const total_bytes   = offsets_bytes + total_chars;
+  auto const host          = frame.host_array<char>(total_bytes);
+  auto* const host_chars   = host.data() + offsets_bytes;
+  std::vector<std::int32_t> offsets(count + 1);
+  std::int32_t cursor = 0;
+  for (std::size_t j = 0; j < count; ++j) {
+    offsets[j] = cursor;
+    if (!needles[j].empty()) std::memcpy(host_chars + cursor, needles[j].data(), needles[j].size());
+    cursor += static_cast<std::int32_t>(needles[j].size());
+  }
+  offsets[count] = cursor;
+  std::memcpy(host.data(), offsets.data(), offsets_bytes);
+  rmm::device_buffer storage(total_bytes, frame.stream(), frame.mr());
+  throw_if_cuda_error(
+    cudaMemcpyAsync(
+      storage.data(), host.data(), total_bytes, cudaMemcpyHostToDevice, frame.stream().get()),
+    "dictionary predicate: upload values");
+  needle_view const view{static_cast<std::int32_t const*>(storage.data()),
+                         static_cast<char const*>(storage.data()) + offsets_bytes,
+                         static_cast<std::int32_t>(count)};
+  return {std::move(storage), view};
+}
+
 // Constant-width null-free decode: analytic offsets + flat byte gather (skips cudf's
 // batched-memcpy gather, offsets scan, and null-mask pass). nullptr = ineligible.
 std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_view const& keys,
                                                         cudf::column_view const& indices,
-                                                        std::int64_t& cached_width,
-                                                        ::cuda::stream_ref stream,
-                                                        rmm::device_async_resource_ref mr)
+                                                        std::int64_t cached_width,
+                                                        decode_frame& frame)
 {
+  auto const stream = frame.stream();
+  auto const mr     = frame.mr();
   if (indices.null_count() > 0 || keys.parent().null_count() > 0) return nullptr;
   if (indices.type().id() != cudf::type_id::INT32) return nullptr;
-  if (cached_width < 0) cached_width = measure_constant_key_width(keys, stream);
-  int64_t const width = cached_width;
+  int64_t const width =
+    cached_width < 0 ? measure_constant_key_width(keys, stream, mr) : cached_width;
   if (width <= 0) return nullptr;
   auto const n_rows    = indices.size();
   int64_t const nbytes = static_cast<int64_t>(n_rows) * width;
   if (nbytes > std::numeric_limits<cudf::size_type>::max()) return nullptr;
 
-  auto offsets = cudf::make_fixed_width_column(
-    cudf::data_type(cudf::type_id::INT32), n_rows + 1, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto* d_off = offsets->mutable_view().data<int32_t>();
-  thrust::tabulate(rmm::exec_policy(stream), d_off, d_off + n_rows + 1, [=] __device__(int64_t i) {
-    return static_cast<int32_t>(i * width);
-  });
+  auto offsets = make_constant_width_offsets(n_rows, static_cast<std::int32_t>(width), stream, mr);
+  rmm::device_buffer chars(nbytes, stream, mr);
+  auto output =
+    cudf::make_strings_column(n_rows,
+                              std::move(offsets),
+                              std::move(chars),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 
-  rmm::device_uvector<char> chars(nbytes, stream, mr);
-  auto* out      = chars.data();
+  auto* out      = output->mutable_view().head<char>();
   auto const* kc = keys.chars_begin(stream);
   auto const* ix = indices.data<int32_t>();
   // One aligned 16B store per thread, assembled in registers from the rows
@@ -176,10 +285,10 @@ std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_vie
   auto const n_keys     = keys.size();
   bool const big_pool   = static_cast<int64_t>(n_keys) * width > (1 << 20);
   if (width <= 16 && big_pool) {
-    rmm::device_uvector<char> padded(static_cast<int64_t>(n_keys) * 16, stream, mr);
+    rmm::device_buffer padded(static_cast<std::size_t>(n_keys) * 16, stream, mr);
     {
-      auto* p = padded.data();
-      thrust::for_each_n(rmm::exec_policy(stream),
+      auto* p = static_cast<char*>(padded.data());
+      thrust::for_each_n(rmm::exec_policy_nosync(stream, mr),
                          thrust::counting_iterator<int64_t>(0),
                          static_cast<int64_t>(n_keys) * 16,
                          [=] __device__(int64_t i) {
@@ -189,25 +298,25 @@ std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_vie
     }
     auto const* pool = reinterpret_cast<uint4 const*>(padded.data());
     switch (width) {
-      case 1: padded_gather_chunks<1>(pool, ix, out, nbytes, stream); break;
-      case 2: padded_gather_chunks<2>(pool, ix, out, nbytes, stream); break;
-      case 3: padded_gather_chunks<3>(pool, ix, out, nbytes, stream); break;
-      case 4: padded_gather_chunks<4>(pool, ix, out, nbytes, stream); break;
-      case 5: padded_gather_chunks<5>(pool, ix, out, nbytes, stream); break;
-      case 6: padded_gather_chunks<6>(pool, ix, out, nbytes, stream); break;
-      case 7: padded_gather_chunks<7>(pool, ix, out, nbytes, stream); break;
-      case 8: padded_gather_chunks<8>(pool, ix, out, nbytes, stream); break;
-      case 9: padded_gather_chunks<9>(pool, ix, out, nbytes, stream); break;
-      case 10: padded_gather_chunks<10>(pool, ix, out, nbytes, stream); break;
-      case 11: padded_gather_chunks<11>(pool, ix, out, nbytes, stream); break;
-      case 12: padded_gather_chunks<12>(pool, ix, out, nbytes, stream); break;
-      case 13: padded_gather_chunks<13>(pool, ix, out, nbytes, stream); break;
-      case 14: padded_gather_chunks<14>(pool, ix, out, nbytes, stream); break;
-      case 15: padded_gather_chunks<15>(pool, ix, out, nbytes, stream); break;
-      case 16: padded_gather_chunks<16>(pool, ix, out, nbytes, stream); break;
+      case 1: padded_gather_chunks<1>(pool, ix, out, nbytes, frame); break;
+      case 2: padded_gather_chunks<2>(pool, ix, out, nbytes, frame); break;
+      case 3: padded_gather_chunks<3>(pool, ix, out, nbytes, frame); break;
+      case 4: padded_gather_chunks<4>(pool, ix, out, nbytes, frame); break;
+      case 5: padded_gather_chunks<5>(pool, ix, out, nbytes, frame); break;
+      case 6: padded_gather_chunks<6>(pool, ix, out, nbytes, frame); break;
+      case 7: padded_gather_chunks<7>(pool, ix, out, nbytes, frame); break;
+      case 8: padded_gather_chunks<8>(pool, ix, out, nbytes, frame); break;
+      case 9: padded_gather_chunks<9>(pool, ix, out, nbytes, frame); break;
+      case 10: padded_gather_chunks<10>(pool, ix, out, nbytes, frame); break;
+      case 11: padded_gather_chunks<11>(pool, ix, out, nbytes, frame); break;
+      case 12: padded_gather_chunks<12>(pool, ix, out, nbytes, frame); break;
+      case 13: padded_gather_chunks<13>(pool, ix, out, nbytes, frame); break;
+      case 14: padded_gather_chunks<14>(pool, ix, out, nbytes, frame); break;
+      case 15: padded_gather_chunks<15>(pool, ix, out, nbytes, frame); break;
+      case 16: padded_gather_chunks<16>(pool, ix, out, nbytes, frame); break;
     }
   } else {
-    thrust::for_each_n(rmm::exec_policy(stream),
+    thrust::for_each_n(rmm::exec_policy_nosync(stream, mr),
                        thrust::counting_iterator<int64_t>(0),
                        nchunks,
                        [=] __device__(int64_t t) {
@@ -237,12 +346,7 @@ std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_vie
                          }
                        });
   }
-  return cudf::make_strings_column(
-    n_rows,
-    std::move(offsets),
-    chars.release(),
-    0,
-    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
+  return output;
 }
 
 std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
@@ -259,7 +363,8 @@ std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
   }
   if (n == 0) {
     auto empty_dict = cudf::make_empty_column(cudf::data_type(cudf::type_id::DICTIONARY32));
-    return std::make_unique<dictionary_compressed_representation>(std::move(empty_dict));
+    return dictionary_compressed_representation::from_encoded_column(
+      std::move(empty_dict), stream, mr);
   }
 
   if (static_cast<size_t>(n) > kDictCardCheckMinRows) {
@@ -275,41 +380,97 @@ std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
   }
 
   auto dict_col = cudf::dictionary::encode(col, cudf::data_type(cudf::type_id::INT32), stream, mr);
-  cudaStreamSynchronize(stream.get());
-  return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
+  return dictionary_compressed_representation::from_encoded_column(std::move(dict_col), stream, mr);
 }
 
 }  // namespace
 
-std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
-  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+std::unique_ptr<cudf::column> make_constant_width_offsets(cudf::size_type rows,
+                                                          std::int32_t width,
+                                                          ::cuda::stream_ref stream,
+                                                          rmm::device_async_resource_ref mr)
 {
+  if (rows < 0 || width < 0) {
+    throw std::invalid_argument("constant-width offsets: negative row count or width");
+  }
+  if (rows == std::numeric_limits<cudf::size_type>::max() ||
+      static_cast<std::int64_t>(rows) * width > std::numeric_limits<cudf::size_type>::max()) {
+    throw std::overflow_error(
+      "constant-width offsets: offset count or total bytes exceed the INT32 range");
+  }
+  auto offsets = cudf::make_fixed_width_column(
+    cudf::data_type{cudf::type_id::INT32}, rows + 1, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto* const data = offsets->mutable_view().data<std::int32_t>();
+  thrust::tabulate(
+    rmm::exec_policy_nosync(stream, mr), data, data + rows + 1, [=] __device__(int64_t i) {
+      return static_cast<std::int32_t>(i * width);
+    });
+  return offsets;
+}
+
+std::unique_ptr<dictionary_compressed_representation>
+dictionary_compressed_representation::from_encoded_column(std::unique_ptr<cudf::column> dict_col,
+                                                          ::cuda::stream_ref stream,
+                                                          rmm::device_async_resource_ref mr)
+{
+  if (!dict_col) throw std::invalid_argument("dictionary construction: missing column");
+  auto result = std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
+  try {
+    auto const& column = *result->dict_column;
+    result->constant_key_width =
+      column.size() > 0
+        ? measure_constant_key_width(cudf::dictionary_column_view(column.view()).keys(), stream, mr)
+        : 0;
+    stream.sync();
+  } catch (...) {
+    // Keep the column alive until pending work that reads it drains.
+    (void)cudaStreamSynchronize(stream.get());
+    throw;
+  }
+  return result;
+}
+
+std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
+  decode_frame& frame) const
+{
+  auto const stream = frame.stream();
+  auto const mr     = frame.mr();
   nvtx_scoped_range r{"dictionary_decompress"};
   // Decode from the stored dictionary column.
-  if (dict_column == nullptr) { return nullptr; }
+  if (dict_column == nullptr) { throw std::invalid_argument("dictionary decode: missing column"); }
   if (dict_column->size() == 0) {
     return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
   }
   if (cudf::dictionary_column_view(dict_column->view()).keys().size() == 0) {
     // Zero keys with rows present: every row is null (encode drops null rows
     // from the key set), so build the all-null strings column directly.
-    return cudf::make_column_from_scalar(
-      cudf::string_scalar("", false, stream, mr), dict_column->size(), stream, mr);
+    auto const rows = dict_column->size();
+    return cudf::make_strings_column(
+      rows,
+      make_constant_width_offsets(rows, 0, stream, mr),
+      rmm::device_buffer{},
+      rows,
+      cudf::create_null_mask(rows, cudf::mask_state::ALL_NULL, stream, mr));
   }
   if (dict_column->null_count() == 0) {
     cudf::dictionary_column_view dv(dict_column->view());
-    if (auto fast = try_decode_constant_width(
-          cudf::strings_column_view(dv.keys()), dv.indices(), constant_key_width, stream, mr))
-      return fast;
+    if (auto output = try_decode_constant_width(
+          cudf::strings_column_view(dv.keys()), dv.indices(), constant_key_width, frame))
+      return output;
   }
   return cudf::dictionary::decode(dict_column->view(), stream, mr);
 }
 
 std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_predicate(
-  decode_predicate const& pred, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+  decode_predicate const& pred, decode_frame& frame) const
 {
+  auto const stream = frame.stream();
+  auto const mr     = frame.mr();
   nvtx_scoped_range r{"dictionary_decompress_predicate"};
-  if (dict_column == nullptr || !pred.active()) { return nullptr; }
+  if (dict_column == nullptr) {
+    throw std::invalid_argument("dictionary predicate: missing column");
+  }
+  if (!pred.active()) { return nullptr; }
 
   auto const n_rows = dict_column->size();
   auto const bool_t = cudf::data_type{cudf::type_id::BOOL8};
@@ -323,10 +484,10 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
   // Zero keys with rows present: encode drops null rows from the key set, so
   // every row is null and the comparison is null throughout.
   if (n_keys == 0) {
-    auto out =
+    auto output =
       cudf::make_fixed_width_column(bool_t, n_rows, cudf::mask_state::ALL_NULL, stream, mr);
-    out->set_null_count(n_rows);
-    return out;
+    output->set_null_count(n_rows);
+    return output;
   }
   // The index lookup below reads indices[i] unconditionally, so anything other
   // than the INT32 index type encode produces is left to the generic path.
@@ -338,20 +499,22 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
   // the shape to the generic path instead of carrying a tri-state accumulate.
   if (keys.null_count() > 0) { return nullptr; }
 
-  // One bool per distinct value: keys ∈ equals_any. The key set is the column's
-  // whole distinct-value population (four entries for l_shipinstruct), so these
-  // kernels are noise next to the row-length pass below — which is the entire
-  // point: this is the work that replaces the decode gather.
-  std::unique_ptr<cudf::column> lut;
-  for (auto const& value : pred.equals_any) {
-    cudf::string_scalar const needle(value, true, stream);
-    auto hit =
-      cudf::binary_operation(keys, needle, cudf::binary_operator::EQUAL, bool_t, stream, mr);
-    lut = lut ? cudf::binary_operation(
-                  lut->view(), hit->view(), cudf::binary_operator::LOGICAL_OR, bool_t, stream, mr)
-              : std::move(hit);
-  }
-  if (!lut || lut->size() != n_keys) { return nullptr; }
+  // One bool per distinct value: key in equals_any. The key set is the column's whole
+  // distinct-value population (four entries for l_shipinstruct), so this pass is noise next to the
+  // row-length pass below, which is the entire point: this is the work that replaces the decode
+  // gather. No cuDF scalar is constructed, so nothing here waits for the stream or borrows from the
+  // process-global pinned pool; the needles and the table live until the row pass has been queued.
+  auto const needles = upload_needles(pred.equals_any, frame);
+  auto lut =
+    cudf::make_fixed_width_column(bool_t, n_keys, cudf::mask_state::UNALLOCATED, stream, mr);
+  cudf::strings_column_view const key_strings(keys);
+  thrust::tabulate(rmm::exec_policy_nosync(stream, mr),
+                   lut->mutable_view().begin<bool>(),
+                   lut->mutable_view().end<bool>(),
+                   key_matches_any_needle{cudf::detail::offsetalator_factory::make_input_iterator(
+                                            key_strings.offsets(), key_strings.offset()),
+                                          key_strings.chars_begin(stream),
+                                          needles.view});
 
   // Only the *row* validity needs carrying: the keys are non-null (checked
   // above), so a matching code is unambiguously true.
@@ -359,22 +522,22 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
   auto null_mask        = null_count > 0
                             ? cudf::copy_bitmask(dict_column->view(), stream, mr)
                             : cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto out =
+  auto output =
     cudf::make_fixed_width_column(bool_t, n_rows, std::move(null_mask), null_count, stream, mr);
 
-  auto* d_out       = out->mutable_view().data<bool>();
+  auto* d_out       = output->mutable_view().data<bool>();
   auto const* d_lut = lut->view().data<bool>();
   auto const* d_idx = indices.data<int32_t>();
   // Null rows carry an unspecified index (encode does not promise 0), so clamp
   // rather than trust it — the value is masked off either way.
-  thrust::transform(rmm::exec_policy(stream),
+  thrust::transform(rmm::exec_policy_nosync(stream, mr),
                     d_idx,
                     d_idx + n_rows,
                     d_out,
                     [d_lut, n_keys] __device__(int32_t code) {
                       return code >= 0 && code < n_keys ? d_lut[code] : false;
                     });
-  return out;
+  return output;
 }
 
 std::unique_ptr<compressed_representation> dictionary_compressor::compress(

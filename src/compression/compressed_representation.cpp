@@ -145,6 +145,7 @@ std::unique_ptr<cucascade::idata_representation> compressed_host_representation:
                                        _column_sizes));
   // The request is indexed by the selected column list, which the clone shares.
   copy->set_pushdown_scan(_pushdown_scan);
+  copy->set_visibility_mask(_visibility_mask);
   return copy;
 }
 
@@ -312,6 +313,7 @@ std::unique_ptr<cucascade::idata_representation> compressed_device_representatio
                                          _column_sizes));
   // The request is indexed by the selected column list, which the clone shares.
   copy->set_pushdown_scan(_pushdown_scan);
+  copy->set_visibility_mask(_visibility_mask);
   return copy;
 }
 

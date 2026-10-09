@@ -39,6 +39,10 @@ namespace simpatico {
 class compressed_table;
 }  // namespace simpatico
 
+namespace cucascade::memory {
+class memory_space;
+}  // namespace cucascade::memory
+
 namespace sirius {
 
 //===----------------------------------------------------------------------===//
@@ -303,11 +307,21 @@ class decompression_pushdown_scan {
  *
  * Never returns a null table: every way the filtering can decline ends in the
  * plain decode of the same columns.
+ *
+ * The decode uses persistent streams belonging to the calling host thread and current device, and
+ * allocates from @p mr. @p space must be a GPU space on the current device, which is also the
+ * device of @p mr. Allocations through the reservation-aware allocator of @p space use the
+ * reservation associated with @p stream according to its configured tracking scope. The returned
+ * columns may record a private lane for deallocation; callers rebind them and any selection buffers
+ * to @p stream before they can outlive the calling thread (see `compression_converters.cpp`).
+ *
+ * @throw std::logic_error if @p space is not a GPU memory space on the current device
  */
 decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
                                    std::span<const std::size_t> selected,
                                    decompression_pushdown_scan const* scan,
                                    decode_visibility_mask const& keep_mask,
+                                   cucascade::memory::memory_space const& space,
                                    ::cuda::stream_ref stream,
                                    rmm::device_async_resource_ref mr);
 
