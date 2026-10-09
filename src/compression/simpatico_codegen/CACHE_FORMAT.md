@@ -121,6 +121,15 @@ compilation is allowed. No `fsync` or power-failure durability is promised;
 damaged records are rebuilt. Checksums are not authentication: the configured
 cache directory must be trusted.
 
+The record format is independent of the environment identity policy. Header
+digests and NVRTC major/minor select the directory; payload validation and atomic
+publication are unchanged. A version-query error is propagated outside the
+best-effort storage fallback, not treated as an unreadable cache file.
+
+The payload checksum does not bind a record to its request/environment filename:
+moving a complete valid record to another request path still passes validation.
+There is no record-binding or authentication guarantee.
+
 There is no automatic eviction, startup cleanup, or retention bound. With all
 writers stopped, `clear_jit_disk_cache()` best-effort removes these regular files
 under the configured root:
@@ -163,3 +172,9 @@ wrap the query while compilation still uses real NVRTC.
 The Test workflow runs host and GPU coverage using its configured CUDA matrix,
 independently of Sirius's Catch2 suite. Disk hits perform no compiler-file scan
 or builtins-loading probe.
+
+The storage suite also uses real `CompilationIdentity` paths for changed project
+headers, CCCL headers and both NVRTC version components. It checks record isolation
+and narrow explicit cleanup across those environments. The fresh-process tests
+verify that ordinary reuse retains other environments and that explicit cleanup
+does not need a successful NVRTC version query.

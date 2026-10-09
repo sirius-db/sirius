@@ -247,6 +247,39 @@ void concurrent_writers(const fs::path& root)
   }
 }
 
+void environment_namespaces(const fs::path& root)
+{
+  const auto location = root / "environments";
+  const std::array<std::string_view, 1> options{"-arch=sm_120"};
+  const auto request = cache::request_identity({"kernel", "entry", "test.cu", options});
+  const std::array<cache::EnvironmentView, 5> environments{{
+    {"project", "cccl", 13, 4},
+    {"project-edited", "cccl", 13, 4},
+    {"project", "cccl-edited", 13, 4},
+    {"project", "cccl", 14, 4},
+    {"project", "cccl", 13, 5},
+  }};
+  std::vector<fs::path> paths;
+  for (std::size_t index = 0; index < environments.size(); ++index) {
+    const cache::CompilationIdentity identity{cache::environment_identity(environments[index]),
+                                              request};
+    const auto path = location / identity.relative_path();
+    require(!fs::exists(path), "different environment selected an existing record");
+    cache::write_cubin_file_atomic(path.string(), {static_cast<char>('a' + index)});
+    paths.push_back(path);
+  }
+  for (std::size_t index = 0; index < paths.size(); ++index)
+    require(read(paths[index]) == std::vector<char>{static_cast<char>('a' + index)},
+            "publishing an environment changed another environment's record");
+
+  const auto unrelated = paths.front().parent_path() / "keep.txt";
+  touch(unrelated);
+  cache::clear_disk_cache(location.string());
+  for (const auto& path : paths)
+    require(!fs::exists(path), "cleanup missed the version-based environment layout");
+  require(fs::is_regular_file(unrelated), "cleanup removed an unrelated environment file");
+}
+
 void cleanup(const fs::path& root)
 {
   const auto location    = root / "cleanup";
@@ -293,6 +326,7 @@ int main()
     Directory root;
     publication_and_faults(root.path);
     concurrent_writers(root.path);
+    environment_namespaces(root.path);
     cleanup(root.path);
     std::puts("disk cache: publication, faults, concurrency, cleanup passed");
     return 0;

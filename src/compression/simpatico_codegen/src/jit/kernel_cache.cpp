@@ -90,14 +90,20 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
   }
 
   // On-disk cache: a shape another process/run already compiled loads from its
-  // cubin (skips requested-kernel compilation). A corrupt or incompatible file fails
-  // the load and falls through to a fresh compile.
-  std::string path;
+  // cubin (skips requested-kernel compilation). Invalid storage records and
+  // reported CUDA load errors fall through to a fresh compile.
+  const std::string* cdir = nullptr;
   try {
-    const std::string& cdir = disk_cache_dir();
-    if (!cdir.empty()) {
-      const detail::CompilationIdentity identity{detail::cache_environment(), key};
-      path = cdir + "/" + identity.relative_path();
+    cdir = &disk_cache_dir();
+  } catch (...) {
+    // Resolving storage is best effort; an identity-query failure below is not.
+  }
+  std::string path;
+  if (cdir && !cdir->empty()) {
+    // Do not swallow an NVRTC version error in the storage-miss fallback.
+    const detail::CompilationIdentity identity{detail::cache_environment(), key};
+    try {
+      path = *cdir + "/" + identity.relative_path();
       std::vector<char> bytes;
       if (detail::read_cubin_file(path, bytes)) {
         try {
@@ -111,9 +117,9 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
           // fall through to recompile below
         }
       }
+    } catch (...) {
+      path.clear();
     }
-  } catch (...) {
-    path.clear();
   }
 
   auto _t0             = std::chrono::steady_clock::now();
