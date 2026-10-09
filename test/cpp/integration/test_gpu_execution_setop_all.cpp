@@ -25,6 +25,7 @@
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
+#include <utils/transparent_execution_test_utils.hpp>
 
 #include <cstdint>
 #include <string>
@@ -175,6 +176,26 @@ TEST_CASE_METHOD(SetOpAllFixture,
   compare_both("SELECT k, v FROM sbig_a", "SELECT k, v FROM sbig_b");
   compare_gpu_vs_cpu(
     "SELECT count(*), sum(k) FROM (SELECT k FROM sbig_a EXCEPT ALL SELECT k FROM sbig_b) t");
+}
+
+TEST_CASE_METHOD(SetOpAllFixture,
+                 "gpu_execution EXCEPT ALL and INTERSECT ALL over a CTE input wider than its body",
+                 "[integration][gpu_execution][setop_all]")
+{
+  // The CTE's definition is (v VARCHAR, k INTEGER) and its body one INTEGER column. The pin gives
+  // the scan a narrowed sidecar, so the compressed-schema pass runs over the CTE.
+  auto pin = con->Query("CALL pin_table(format='duckdb', name='sb', tier='gpu');");
+  REQUIRE(pin);
+  REQUIRE_FALSE(pin->HasError());
+
+  auto const before = sirius::test::get_compressed_materialization_stats(*con);
+  compare_both("SELECT k FROM sa",
+               "(WITH m AS MATERIALIZED (SELECT v, k FROM sb) "
+               "SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)");
+  auto const after = sirius::test::get_compressed_materialization_stats(*con);
+  REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+
+  REQUIRE_FALSE(con->Query("CALL unpin_table('sb');")->HasError());
 }
 
 TEST_CASE_METHOD(SetOpAllFixture,

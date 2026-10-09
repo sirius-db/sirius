@@ -65,6 +65,12 @@ class sirius_physical_cte : public sirius_physical_operator {
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_sources() const override;
+
+  //! The body's schema (`children[1]`); `types` stays the definition's.
+  [[nodiscard]] const duckdb::vector<sirius::logical_type>& get_output_types() const override
+  {
+    return children[1]->get_output_types();
+  }
 };
 
 }  // namespace op

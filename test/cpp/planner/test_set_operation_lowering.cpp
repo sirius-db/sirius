@@ -423,14 +423,20 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - an ALL form whose CTE input is wider than its body is refused",
+                 "set_operation - an ALL form whose CTE input differs from its body is accepted",
                  "[planner][set_operation][isolated_context]")
 {
-  REQUIRE_THROWS_WITH(lower("SELECT k FROM ia "
-                            "INTERSECT ALL "
-                            "(WITH m AS MATERIALIZED (SELECT k, v FROM ib) "
-                            " SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)"),
-                      ContainsSubstring("INTERSECT ALL input 1 is planned with 2 columns, not 1"));
+  auto const types = sirius_types({duckdb::LogicalType::INTEGER});
+  // Both definitions are wider than the body; "v, k" also puts a VARCHAR at its column 0.
+  for (std::string const definition : {"k, v", "v, k"}) {
+    INFO(definition);
+    auto const plan =
+      lower("SELECT k FROM ia INTERSECT ALL (WITH m AS MATERIALIZED (SELECT " + definition +
+            " FROM ib) SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)");
+    auto const chain = require_replicate_plan(*plan, types, {{1, 0}, {0, 1}});
+    REQUIRE(chain.union_op.children[1]->children.size() == 1);
+    CHECK(chain.union_op.children[1]->children[0]->type == SiriusPhysicalOperatorType::CTE);
+  }
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,

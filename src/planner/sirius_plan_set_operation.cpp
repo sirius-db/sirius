@@ -123,12 +123,15 @@ duckdb::vector<sirius::logical_type> reconcile_input_types(
   duckdb::vector<duckdb::LogicalType> const& declared_types,
   std::string const& name)
 {
+  auto const planned_types = [&](duckdb::idx_t arm) -> auto const& {
+    return arms[arm]->get_output_types();
+  };
   for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
-    if (arms[arm]->types.size() != declared_types.size()) {
+    if (planned_types(arm).size() != declared_types.size()) {
       throw duckdb::NotImplementedException("%s input %d is planned with %d columns, not %d",
                                             name,
                                             arm,
-                                            static_cast<duckdb::idx_t>(arms[arm]->types.size()),
+                                            static_cast<duckdb::idx_t>(planned_types(arm).size()),
                                             static_cast<duckdb::idx_t>(declared_types.size()));
     }
   }
@@ -138,7 +141,7 @@ duckdb::vector<sirius::logical_type> reconcile_input_types(
     auto const narrowed = sirius::from_duckdb(
       sirius_physical_plan_generator::planned_aggregate_type(declared_types[i]));
     for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
-      auto const& planned = arms[arm]->types[i];
+      auto const& planned = planned_types(arm)[i];
       if (planned != declared && planned != narrowed) {
         throw duckdb::NotImplementedException("%s input %d plans column %d as %s, not %s",
                                               name,
@@ -148,14 +151,14 @@ duckdb::vector<sirius::logical_type> reconcile_input_types(
                                               declared.to_string());
       }
     }
-    if (arms[0]->types[i] != arms[1]->types[i]) {
+    if (planned_types(0)[i] != planned_types(1)[i]) {
       throw duckdb::NotImplementedException("%s inputs plan column %d as %s and %s",
                                             name,
                                             i,
-                                            arms[0]->types[i].to_string(),
-                                            arms[1]->types[i].to_string());
+                                            planned_types(0)[i].to_string(),
+                                            planned_types(1)[i].to_string());
     }
-    key_types.push_back(arms[0]->types[i]);
+    key_types.push_back(planned_types(0)[i]);
   }
   return key_types;
 }
