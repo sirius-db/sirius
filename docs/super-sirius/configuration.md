@@ -1,4 +1,4 @@
-# Configuration
+#Configuration
 
 This document covers Super Sirius configuration: the `sirius_config` class, operator parameters, thread pool settings, and DuckDB SET variables.
 
@@ -92,8 +92,8 @@ sirius:
   executor:
     scan_manager:
       num_threads: 4
-      backend: sirius
-      uring_n_reactors: 1
+      backend: native
+      uring_n_reactors: 4
       cache: { mode: none, eviction: lru }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
@@ -217,8 +217,10 @@ members retain their surface defaults before the pair is validated.
 
 > **Mutually exclusive with configured `sirius.memory` sub-blocks.** `sirius.space` is a low-level
 > alternative that declares individual memory spaces directly, bypassing the high-level
-> `sirius.memory` configurator. If any `sirius.space.{gpu,host,disk}` list is non-empty, the
-> configuration loader rejects a simultaneous non-null `sirius.memory.{gpu,host,disk}` sub-block
+> `sirius.memory` configurator. If any `sirius.space.{
+  gpu, host, disk}` list is non-empty, the
+> configuration loader rejects a simultaneous non-null `sirius.memory.{
+  gpu, host, disk}` sub-block
 > instead of silently ignoring it. A null memory sub-block is absent; a non-null mapping selects
 > the high-level path even when the mapping is empty or its individual values are null. Empty
 > `sirius.space` lists do not select the low-level path. This path is generally reserved for
@@ -264,7 +266,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 
 ```yaml
 sirius:
-  # NOTE: do NOT also configure sirius.memory — the loader rejects both paths together.
+#NOTE : do NOT also configure sirius.memory — the loader rejects both paths together.
   space:
     gpu:
       - { device_id: 0, memory_capacity: 40Gi, reservation_limit_fraction: 0.9 }
@@ -314,17 +316,17 @@ Thread pool (default `num_threads: 1`) plus:
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/scan_manager/config.hpp`, `src/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `kvikio/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
 
-The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the Sirius IO layer that feeds the GPU scan operators.
+The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the cuCascade IO layer that feeds the GPU scan operators.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 4 uring reactor threads), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
-| `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
-| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
+| `backend` | enum: `native`, `kvikio` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `native`. `sirius` is a deprecated alias of `native`, still accepted. Values are lowercase. |
+| `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
+| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own libcurl event loop and connection pool. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -335,7 +337,7 @@ sub-config below.
 
 | Value | Effect |
 |-------|--------|
-| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend reactor's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
+| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
 | `0` | The readahead does not run, whatever the cache mode. |
 | `n > 0` | The readahead runs with a budget of `n`, whatever the cache mode. |
 
@@ -353,7 +355,7 @@ deployment is only useful while a pipeline thread could still pick up another sc
 `max_readahead_scans` wins over that substitution.
 
 Both are resolved against a single backend: the live one publishing the widest
-`n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
+`n_max_concurrent_scans`, so the budget and the strategy always describe the same backend.
 
 Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
 
@@ -362,14 +364,33 @@ Six optional nested sub-configs tune the individual backends, the cache, and the
 There are no static chunk-size or `readv`-fusion knobs. The worker chooses physical
 operation sizes dynamically from backlog pressure, available slots, and the pinned block size.
 
+```yaml
+sirius:
+  executor:
+    scan_manager:
+      uring:
+        slices_per_pass: 4
+        range_batch_slices: 8
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `n_max_concurrent_scans` | int | `pipeline.num_threads` | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). When omitted, Sirius sets it to the pipeline pool size: one outstanding scan per pipeline thread, half the REST default's depth, since local disk has no round trip to hide. `0` keeps the readahead off for local reads (cuCascade's own default). An explicit `max_readahead_scans` overrides it. |
+| `slices_per_pass` | int (**0..64**) | 4 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. A reactor works through one request at a time, in queue order; the default `4` keeps a single many-slice request (a whole-split prefetch, a wide demand read) deep — up to 4 slices per pass, bounded by the reactor's free staging slots — without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds such a request to a depth of 1-2 per reactor. |
+| `range_batch_slices` | int (**>= 0**) | 8 | Most slices one queue entry holds when a host-only multi-range read (a whole-split prefetch, the DuckDB-native decoder's column-chunk set) is dispatched to the uring reactors: a local read does not prefer bulk I/O, so the read is queued as several entries of at most this many slices instead of one per reactor. Reads with a device destination are never split. `0` = no split. |
+
+Sirius rejects a negative `range_batch_slices` and a `slices_per_pass` outside 0..64 when it loads the config, naming the
+key. cuCascade does not re-check `slices_per_pass`: a value above 64 would simply behave as no cap, since a reactor has at most 64 staging slots.
+
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
 TLS verification policy and the CA bundle are configured only under
-`scan_manager.object_store`. The REST reactor consumes those values so signing
+`scan_manager.object_store`. The REST backend consumes those values so signing
 and transport use one trust policy; there are no separate REST YAML controls.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `n_max_concurrent_scans` | int | max(8, 2 × `pipeline.num_threads`) | Readahead budget the REST backend publishes, which an unset `max_readahead_scans` defers to. Unset derives it from the pipeline pool, since several splits per pipeline thread give an object-store prefetch time to land; an explicit value wins. |
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe / warmup) and the presigned-URL TTL, which is this value plus 60 s. `0` does not remove the limit: control-plane requests then keep the transport's built-in 30 s limit, and presigned URLs get a 300 s TTL. Data GETs use the stall detector below instead. |
 | `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Stall detector for data GETs: a transfer below this rate for `stall_time_s` consecutive seconds fails and is retried (0 disables). |
 | `stall_time_s` | int (seconds) | 30 | How long a data GET may stay below `stall_speed_limit_bytes` before it is cut loose (0 disables). |
@@ -385,12 +406,12 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
 
-Two REST values are deliberately not YAML keys. **Connections per reactor** is
+Two REST values are deliberately not YAML keys. **Connections per reactor** are
 fixed at 64 — the useful number is a property of one reactor thread, not of a
 deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
-each with its own thread to service them. **Physical GET size** is worker-owned:
-the reactor derives a target between 4 MiB and 16 MiB from its queued logical
-bytes and currently free connections. Large contiguous requests are balanced
+each with its own thread and connection pool. **Physical GET size** is reactor-owned:
+each reactor derives a target between 4 MiB and 16 MiB from the queued logical
+bytes and its currently free connections. Large contiguous requests are balanced
 under the 16 MiB ceiling. Fragmented cache fills are grouped only at whole
 cache-chunk boundaries so a chunk is never published before all of its bytes
 arrive.
@@ -440,23 +461,23 @@ sirius:
   executor:
     scan_manager:
       cache:
-        mode: sirius
+        mode: cucs
         eviction: lru
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mode` | enum: `none`, `os`, `sirius` | `none` | Which cache the read path goes through. Values are lowercase. |
-| `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the Sirius cache. Only meaningful under `mode: sirius`. Values are lowercase. |
-| `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when the cache pool fills to this fraction. |
+| `mode` | enum: `none`, `os`, `cucs` | `none` | Which cache the read path goes through. `sirius` is a deprecated alias of `cucs`, still accepted. Values are lowercase. |
+| `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the prefetching cache. Only meaningful under `mode: cucs`. Values are lowercase. |
+| `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when pinned host-memory allocations (by any user) reach this fraction of capacity. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
 
 `mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
-through the kernel page cache instead. `mode: sirius` reads `O_DIRECT` into Sirius's own
-pinned prefetching cache.
+through the kernel page cache instead. `mode: cucs` reads `O_DIRECT` into cuCascade's
+pinned prefetching cache (`fs_cache`).
 
-`eviction: lru` keeps idle chunks for reuse and evicts least-recently-used ones once the
-pool fills past `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
+`eviction: lru` keeps idle chunks for reuse and sweeps them, in request-creation order, once
+pinned host allocations pass `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
 it goes idle, making the cache a prefetch staging area sized for the reads in flight rather
 than for reuse.
 
@@ -465,7 +486,7 @@ Those two knobs derive the settings below, which are therefore **not** individua
 | Derived setting | Derived from |
 |-----------------|--------------|
 | `uring.use_odirect` | `mode` — true for everything but `os` |
-| whether the prefetching cache is armed | `mode` — only under `sirius` |
+| whether the prefetching cache is armed | `mode` — only under `cucs` |
 | `dispose_on_idle` | `eviction` — true under `idle` |
 | the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
 
@@ -652,7 +673,7 @@ per-pool extras.
 | `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production + IO reactor management |
+| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO reactor threads are separate: `uring_n_reactors`, `rest_n_reactors`) |
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
@@ -897,8 +918,8 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/config.hpp` | Static config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
-| `src/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
-| `src/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs |
+| `cucascade/include/cucascade/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
+| `cucascade/include/cucascade/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs (cuCascade) |
 
 ## Tuned profile: GB300, TPC-H SF1000 host-pinned
 

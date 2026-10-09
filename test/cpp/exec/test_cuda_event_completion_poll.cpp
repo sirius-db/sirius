@@ -119,7 +119,7 @@ struct controlled_stream {
     std::lock_guard lock(mutex);
     callbacks.clear();
   }
-  static sirius::exec::detail::completion_cuda_api api() { return {add, query, synchronize}; }
+  static cucascade::exec::detail::completion_cuda_api api() { return {add, query, synchronize}; }
 };
 
 template <class Fn>

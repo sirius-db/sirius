@@ -36,10 +36,6 @@
 // Every arm builds its own uring ioctx (and, for the prefetch arms, its own
 // cache) so no state leaks across arms.
 
-#include "io/cache/config.hpp"
-#include "io/cache/prefetching_cache.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/uring/uring_ioctx.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
@@ -50,6 +46,11 @@
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/byte_range.hpp>
+#include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -95,7 +96,7 @@ double now_ms(clock_type::time_point t0)
 struct io_stack {
   std::unique_ptr<cucascade::memory::numa_region_pinned_host_memory_resource> upstream;
   std::unique_ptr<cucascade::memory::fixed_size_host_memory_resource> bounce_mr;
-  std::shared_ptr<sirius::io::uring::uring_ioctx> io_ctx;
+  std::shared_ptr<cucascade::io::uring::uring_ioctx> io_ctx;
 };
 
 struct read_result {
@@ -123,7 +124,7 @@ struct read_result {
  * @p decode_wait to stand in for decode work.  Buffers stay alive until after
  * the synchronize.  Each phase is timed separately.
  */
-read_result read_ranges_to_device(sirius::io::sirius_datasource& ds,
+read_result read_ranges_to_device(cucascade::io::datasource& ds,
                                   std::span<const cudf::io::text::byte_range_info> ranges,
                                   rmm::device_async_resource_ref mr,
                                   ::cuda::stream_ref stream,
@@ -206,7 +207,7 @@ std::vector<cudf::io::text::byte_range_info> make_ranges(std::size_t file_size,
 /// One file's datasource plus the ranges every arm reads from it.
 struct file_prep {
   std::string path;
-  std::unique_ptr<sirius::io::sirius_datasource> ds;
+  std::unique_ptr<cucascade::io::datasource> ds;
   std::vector<cudf::io::text::byte_range_info> ranges;
   std::size_t range_bytes{0};
   std::size_t aligned_bytes{0};
@@ -248,23 +249,29 @@ io_stack make_io_stack(std::size_t n_reactors)
                                                                          chunks_per_slab,
                                                                          BOUNCE_POOL_SLABS);
 
-  auto ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-    sirius::io::uring::uring_reactor::reactor_config_type{}, stack.bounce_mr.get());
-  stack.io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(n_reactors, std::move(ctx));
+  auto ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
+    cucascade::io::uring::uring_reactor::reactor_config_type{}, stack.bounce_mr.get());
+  // n_reactors = runner threads that start() spawns.
+  stack.io_ctx = std::make_shared<cucascade::io::uring::uring_ioctx>(n_reactors, std::move(ctx));
   stack.io_ctx->start();
   return stack;
 }
 
-file_prep prep_file(sirius::io::ioctx& io_ctx, std::string const& path, std::size_t target_bytes)
+file_prep prep_file(std::shared_ptr<cucascade::io::ioctx> const& io_ctx,
+                    std::string const& path,
+                    std::size_t target_bytes)
 {
   file_prep prep;
   prep.path   = path;
-  prep.ds     = io_ctx.open_datasource(path);
+  prep.ds     = cucascade::io::open_datasource(io_ctx, path);
   prep.ranges = make_ranges(prep.ds->size(), target_bytes, RANGE_SEED);
+  std::vector<cucascade::io::byte_range> io_ranges;
+  io_ranges.reserve(prep.ranges.size());
   for (auto const& r : prep.ranges) {
     prep.range_bytes += static_cast<std::size_t>(r.size());
+    io_ranges.emplace_back(r.offset(), r.size());
   }
-  for (auto const& r : io_ctx.align_and_coalesce(prep.ranges, HOST_BLOCK_SIZE)) {
+  for (auto const& r : io_ctx->align_and_coalesce(io_ranges, HOST_BLOCK_SIZE)) {
     prep.aligned_bytes += static_cast<std::size_t>(r.size());
   }
   return prep;
@@ -301,7 +308,7 @@ void print_row(arm_result const& r)
             << std::setw(9) << r.reads.sync_ms << std::setw(9) << r.reads.wait_ms << "\n";
 }
 
-/// Pull an integer field out of a @c prefetching_cache::summary string, e.g.
+/// Pull an integer field out of a @c fs_cache::summary string, e.g.
 /// @c hits from @c "global[reads=1 hits=512 ...]".  Returns -1 when absent.
 std::int64_t summary_field(std::string const& summary, std::string const& key)
 {
@@ -441,9 +448,9 @@ int main(int argc, char** argv)
 
   rmm::cuda_stream stream;
 
-  sirius::io::cache::config cache_cfg;
-  cache_cfg.mode                            = sirius::io::cache::cache_mode::sirius;
-  cache_cfg.eviction                        = sirius::io::cache::eviction_policy::lru;
+  cucascade::io::cache::config cache_cfg;
+  cache_cfg.mode                            = cucascade::io::cache::cache_mode::cucs;
+  cache_cfg.eviction                        = cucascade::io::cache::eviction_policy::lru;
   cache_cfg.min_prefetching_budget_fraction = 0.9;
   cache_cfg.eviction_threshold_fraction     = 0.9;
   cache_cfg.apply_mode();
@@ -476,7 +483,7 @@ int main(int argc, char** argv)
 
   {
     auto stack                 = make_io_stack(n_reactors);
-    auto prep                  = prep_file(*stack.io_ctx, paths.front(), bytes_per_file);
+    auto prep                  = prep_file(stack.io_ctx, paths.front(), bytes_per_file);
     double const amplification = prep.range_bytes > 0 ? static_cast<double>(prep.aligned_bytes) /
                                                           static_cast<double>(prep.range_bytes)
                                                       : 0.0;
@@ -498,11 +505,11 @@ int main(int argc, char** argv)
   {
     auto stack = make_io_stack(n_reactors);
     stack.io_ctx->initialize_cache(*mgr, cache_cfg, nullptr);
-    if (!stack.io_ctx->uses_prefetching_cache()) {
+    if (!stack.io_ctx->uses_fs_cache()) {
       std::cerr << "FATAL: prefetching cache did not come up for arm B\n";
       return 2;
     }
-    auto prep = prep_file(*stack.io_ctx, paths.front(), bytes_per_file);
+    auto prep = prep_file(stack.io_ctx, paths.front(), bytes_per_file);
     prep.ds->fadvise(prep.ranges, 0);
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
@@ -510,7 +517,7 @@ int main(int argc, char** argv)
     std::promise<bool> p;
     auto fut = p.get_future();
     b_issued = prep.ds->prefetch_async([&p](bool ok) noexcept { p.set_value(ok); }) ==
-               sirius::io::prefetch_refusal::issued;
+               cucascade::io::prefetch_refusal::issued;
     b_ok                     = fut.get();
     double const prefetch_ms = now_ms(t0);
     auto rr = read_ranges_to_device(*prep.ds, prep.ranges, device_mr, stream, decode_wait);
@@ -528,7 +535,7 @@ int main(int argc, char** argv)
     std::vector<file_prep> preps;
     preps.reserve(n_files);
     for (auto const& p : paths) {
-      preps.push_back(prep_file(*stack.io_ctx, p, bytes_per_file));
+      preps.push_back(prep_file(stack.io_ctx, p, bytes_per_file));
     }
     read_result agg;
     std::size_t bytes = 0;
@@ -548,14 +555,14 @@ int main(int argc, char** argv)
   {
     auto stack = make_io_stack(n_reactors);
     stack.io_ctx->initialize_cache(*mgr, cache_cfg, nullptr);
-    if (!stack.io_ctx->uses_prefetching_cache()) {
+    if (!stack.io_ctx->uses_fs_cache()) {
       std::cerr << "FATAL: prefetching cache did not come up for arm D\n";
       return 2;
     }
     std::vector<file_prep> preps;
     preps.reserve(n_files);
     for (auto const& p : paths) {
-      preps.push_back(prep_file(*stack.io_ctx, p, bytes_per_file));
+      preps.push_back(prep_file(stack.io_ctx, p, bytes_per_file));
     }
     for (auto& f : preps) {
       f.ds->fadvise(f.ranges, 0);
@@ -586,7 +593,7 @@ int main(int argc, char** argv)
         if (preps[k].ds->prefetch_async([&promises, &d_io_end, t0, k](bool ok) noexcept {
               d_io_end[k] = now_ms(t0);
               promises[k].set_value(ok);
-            }) == sirius::io::prefetch_refusal::issued) {
+            }) == cucascade::io::prefetch_refusal::issued) {
           ++issued_ok;
         }
       }

@@ -65,8 +65,6 @@
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
-#include <io/types.hpp>
-#include <io/uring/uring_ioctx.hpp>
 #include <sys/resource.h>
 #include <unistd.h>  // for isatty/fileno
 

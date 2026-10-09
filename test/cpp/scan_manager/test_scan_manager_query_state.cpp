@@ -70,7 +70,7 @@ sirius::scan_manager::scan_manager_config make_local_config()
   sirius::scan_manager::scan_manager_config cfg;
   cfg.thread_pool.num_threads = 2;
   cfg.uring_n_reactors        = 1;
-  cfg.cache.mode              = sirius::io::cache::cache_mode::none;
+  cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
   cfg.apply_cache_mode();
   return cfg;
 }

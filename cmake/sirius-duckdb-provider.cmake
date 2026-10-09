@@ -59,3 +59,14 @@ endif()
 target_link_libraries(
   sirius_duckdb_dependency INTERFACE duckdb_static core_functions_extension
                                      parquet_extension)
+
+# duckdb's vendored moodycamel (namespace duckdb_moodycamel). cuCascade io links
+# this so both sides of the boundary use one moodycamel ABI. IMPORTED (like
+# sirius_duckdb_dependency) because DuckDB's build-tree export() keeps
+# cucascade_io_thirdparty's $<BUILD_INTERFACE:> link to it, and a non-imported
+# target would have to join an export set.
+add_library(sirius_duckdb_moodycamel INTERFACE IMPORTED GLOBAL)
+add_library(duckdb::moodycamel ALIAS sirius_duckdb_moodycamel)
+target_include_directories(
+  sirius_duckdb_moodycamel
+  INTERFACE "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/concurrentqueue")

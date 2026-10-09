@@ -29,13 +29,14 @@
 //   NOTE: there is no IMDS / instance-profile credential chain in the REST
 //   backend -- only static credentials, with session_token for temporary ones.
 
-#include "io/datasource_factory.hpp"
-#include "io/rest/rest_ioctx.hpp"
-#include "io/sirius_datasource.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "scan_manager/config.hpp"
 #include "sirius_config.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/rest/s3/list_parser.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <chrono>
@@ -53,7 +54,7 @@ namespace sirius::bench {
 
 using clock_type = std::chrono::steady_clock;
 
-/// Host pinned pool geometry for the REST reactors' bounce staging.
+/// Host pinned pool geometry for the REST runners' device-read staging.
 inline constexpr std::size_t host_pool_size_v       = 128;
 inline constexpr std::size_t host_initial_pools_v   = 64;
 inline constexpr std::size_t host_region_capacity_v = 32UL << 30;
@@ -73,8 +74,8 @@ struct bench_options {
   std::size_t per_file_gib{1};       ///< GB of data to read per file (random segments)
   std::size_t repeat{3};
 
-  /// Logical request size in MiB. The REST reactor may split a logical request
-  /// further according to its current connection availability and backlog.
+  /// Logical request size in MiB. A REST runner may split a logical request
+  /// further according to its free connections and the queued backlog.
   std::size_t chunk_size_mib{1};
 
   /// Exact GET size in bytes, overriding @c chunk_size_mib when non-zero.  For
@@ -82,10 +83,10 @@ struct bench_options {
   /// autotune one derives it from bandwidth x latency.
   std::size_t chunk_size_bytes{0};
 
-  /// Max concurrent in-flight easy handles per reactor (rest.max_connections).
+  /// Max concurrent in-flight easy handles per REST runner (rest.max_connections).
   std::size_t max_nconnection{128};
 
-  /// Number of REST reactor instances.
+  /// Number of REST runner threads (rest_n_reactors).
   std::size_t n_reactors{1};
 
   /// Share of each GPU's memory the pool may use.  Only matters for benchmarks
@@ -206,9 +207,10 @@ class engine {
  public:
   explicit engine(bench_options const& opts)
   {
-    // Defaults to chunk_bytes so the fixed-size host pool, the REST reactor's
-    // chunk_size and the benchmark's pinned_staging are carved at the same
-    // granularity; host_chunk_mib decouples them when that is not wanted.
+    // Defaults to chunk_bytes so the fixed-size host pool (whose blocks the REST
+    // runners stage device reads into) and the benchmark's pinned_staging are
+    // carved at the same granularity; host_chunk_mib decouples them when that is
+    // not wanted.
     const std::size_t block_size = opts.host_block_bytes();
     cucascade::memory::reservation_manager_configurator builder;
     builder
@@ -226,13 +228,13 @@ class engine {
 
     _cfg = build_scan_manager_config(opts);
 
-    _registry = std::make_unique<io::io_context_registry>(_cfg, *_mgr);
+    _registry = std::make_unique<cucascade::io::io_context_registry>(_cfg.to_io_config(), *_mgr);
     _registry->register_ioctx(
-      io::io_context_type::restful,
+      cucascade::io::io_context_type::restful,
       [](std::string_view path) { return path.starts_with("s3://"); },
-      io::make_rest_ioctx_factory(*_mgr));
+      cucascade::io::make_rest_ioctx_factory(*_mgr));
 
-    _io_ctx = _registry->make_ioctx(io::io_context_type::restful);
+    _io_ctx = _registry->make_ioctx(cucascade::io::io_context_type::restful);
     if (!_io_ctx) {
       throw std::runtime_error(
         "REST ioctx construction failed -- object_store endpoint/region/credentials are "
@@ -250,17 +252,20 @@ class engine {
   engine(engine const&)            = delete;
   engine& operator=(engine const&) = delete;
 
-  [[nodiscard]] io::ioctx& io_ctx() const noexcept { return *_io_ctx; }
-  [[nodiscard]] std::shared_ptr<io::ioctx> io_ctx_ptr() const noexcept { return _io_ctx; }
+  [[nodiscard]] cucascade::io::ioctx& io_ctx() const noexcept { return *_io_ctx; }
+  [[nodiscard]] std::shared_ptr<cucascade::io::ioctx> io_ctx_ptr() const noexcept
+  {
+    return _io_ctx;
+  }
 
   /// The reservation manager backing the ioctx — a benchmark that stages reads
   /// through the prefetching cache needs it to build one.
   [[nodiscard]] memory::sirius_memory_reservation_manager& mgr() const noexcept { return *_mgr; }
   [[nodiscard]] scan_manager::scan_manager_config const& config() const noexcept { return _cfg; }
 
-  [[nodiscard]] io::rest::rest_ioctx& rest() const
+  [[nodiscard]] cucascade::io::rest::rest_ioctx& rest() const
   {
-    auto* r = dynamic_cast<io::rest::rest_ioctx*>(_io_ctx.get());
+    auto* r = dynamic_cast<cucascade::io::rest::rest_ioctx*>(_io_ctx.get());
     if (r == nullptr) { throw std::runtime_error("ioctx is not a rest_ioctx"); }
     return *r;
   }
@@ -284,15 +289,15 @@ class engine {
     cfg.rest.max_connections = opts.max_nconnection;
     cfg.rest_n_reactors      = opts.n_reactors;
 
-    cfg.cache.mode = io::cache::cache_mode::none;
+    cfg.cache.mode = cucascade::io::cache::cache_mode::none;
     cfg.apply_cache_mode();
     return cfg;
   }
 
   std::unique_ptr<memory::sirius_memory_reservation_manager> _mgr;
   scan_manager::scan_manager_config _cfg;
-  std::unique_ptr<io::io_context_registry> _registry;
-  std::shared_ptr<io::ioctx> _io_ctx;
+  std::unique_ptr<cucascade::io::io_context_registry> _registry;
+  std::shared_ptr<cucascade::io::ioctx> _io_ctx;
 };
 
 // ---------------------------------------------------------------------------
@@ -325,7 +330,7 @@ inline std::vector<s3_file> list_prefix(engine& eng,
 
   std::vector<s3_file> files;
   eng.rest().list_objects_paged(
-    bucket, prefix, 1000, [&](io::rest::s3::list_objects_v2_page const& page) {
+    bucket, prefix, 1000, [&](cucascade::io::rest::s3::list_objects_v2_page const& page) {
       for (auto const& e : page.entries) {
         if (e.size == 0) { continue; }
         if (!std::string_view{e.key}.ends_with(".parquet")) { continue; }

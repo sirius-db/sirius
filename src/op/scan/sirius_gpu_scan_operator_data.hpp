@@ -161,15 +161,14 @@ class scan_operator_input : public op::operator_data {
   /// The datasources this split reads through.  Stage reporting wants only
   /// these; going through @ref get_fadvise_hints for it would drag every byte
   /// range along.
-  [[nodiscard]] std::span<const std::shared_ptr<sirius::io::sirius_datasource>> get_datasources()
-    const
+  [[nodiscard]] std::span<const std::shared_ptr<cucascade::io::datasource>> get_datasources() const
   {
     if (!has_scan_metadata()) { return {}; }
     return std::get<std::shared_ptr<scan_info>>(materialization_info)->datasources();
   }
 
   /// Report @p site to the readahead manager and to every hinted datasource.
-  void update(io::cache::scan_stage site) const;
+  void update(cucascade::io::cache::scan_stage site) const;
 
   /**
    * @brief Prepare this split for execution in the requested memory space.

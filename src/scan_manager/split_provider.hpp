@@ -18,7 +18,7 @@
 
 #include "exec/completion_controller.hpp"
 #include "exec/try.hpp"
-#include "io/io_context.hpp"
+#include "io/ioctx_resolver.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/split_connector.hpp"
@@ -63,7 +63,7 @@ class split_provider {
   /// away. Callers that need a shared_ptr can promote via
   /// `provider.get_ingestible().shared_from_this()` (enabled by
   /// @c gpu_ingestible inheriting @c std::enable_shared_from_this).
-  explicit split_provider(op::scan::gpu_ingestible& ingestible, io::ioctx_resolver resolve);
+  explicit split_provider(op::scan::gpu_ingestible& ingestible, sirius::io::ioctx_resolver resolve);
 
   virtual ~split_provider() = default;
 
@@ -117,7 +117,7 @@ class split_provider {
 
   /// Resolves each file's ioctx by path (s3:// -> rest, local -> uring/kvikio),
   /// forwarded into the ingestible so a mixed-scheme scan routes per file.
-  io::ioctx_resolver _resolve;
+  sirius::io::ioctx_resolver _resolve;
 
   exec::completion_token _completion_token;
 };

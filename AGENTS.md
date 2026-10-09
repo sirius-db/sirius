@@ -41,7 +41,7 @@ pixi run pre-commit run -a                 # all formatting/lint hooks
 
 Running tests directly (non-obvious invocations):
 ```bash
-pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"  # by Catch2 tag/test name
+pixi run build/release/test/cpp/sirius_unittest "[path_utils]"  # by Catch2 tag/test name
 ```
 
 `scripts/run_unit_tests.py` runs the unit tests in parallel shards (2 per GPU), then the
@@ -60,6 +60,13 @@ Sirius extension from Python as shown in [docs/README.md](docs/README.md#python-
 `src/planner/` (plan builders + `sirius_physical_plan_generator.cpp`), `src/pipeline/`,
 `src/cuda/` (GPU kernels). **Read `docs/super-sirius/` before modifying Super Sirius code** —
 see its [README](docs/super-sirius/README.md) for reading order.
+
+The I/O layer (`cucascade::io`: io_uring / REST / kvikIO backends, the pinned `fs_cache`,
+`cucascade::io::datasource`) comes from the cuCascade submodule, linked as
+`cuCascade::cucascade_io` (the `cudf::io::datasource` bridge is in `cuCascade::cucascade_cudf`); `src/io/` keeps only Sirius glue (`path_utils`, `ioctx_resolver`,
+`parquet_helpers`, `s3/sirius_httpfs`). The `src/exec/` headers shared with cuCascade
+(`semi_future`, `thread_pool`, ...) are aliases of `cucascade::exec`. The io internals are
+documented in the doc comments of cuCascade's headers under `cucascade/include/cucascade/io/`.
 
 All new work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
 (`src/downgrade/`, `src/creator/`); see `docs/super-sirius/memory-management.md`.

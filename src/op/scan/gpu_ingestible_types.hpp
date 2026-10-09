@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-#include "io/cache/types.hpp"
+#include "exec/invocable.hpp"
 #include "op/scan/owning_table_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 
-#include <io/sirius_datasource.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/cache/types.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -92,7 +93,7 @@ class ingestible_table_info {
 class scan_info : public std::enable_shared_from_this<scan_info> {
  public:
   struct fadvise_entry {
-    std::shared_ptr<sirius::io::sirius_datasource> datasource;
+    std::shared_ptr<cucascade::io::datasource> datasource;
     std::vector<cudf::io::text::byte_range_info> ranges;
   };
 
@@ -110,7 +111,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
 
   [[nodiscard]] std::span<const fadvise_entry> fadvise_hints() const { return _hints; }
 
-  [[nodiscard]] std::span<const std::shared_ptr<sirius::io::sirius_datasource>> datasources() const
+  [[nodiscard]] std::span<const std::shared_ptr<cucascade::io::datasource>> datasources() const
   {
     return _datasources;
   }
@@ -118,7 +119,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   // ---- readahead -----------------------------------------------------------
 
   /// Whether anybody managed to read this split ahead of demand.  Producer-side
-  /// and deliberately separate from @c io::cache::scan_stage, which tracks the
+  /// and deliberately separate from @c cucascade::io::cache::scan_stage, which tracks the
   /// consumer's progress: the two advance independently.
   enum class prefetch_state : int {
     idle       = 0,  ///< no prefetch has been attempted
@@ -174,14 +175,14 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   ///
   /// Monotone, because stages only ever advance and a report that arrives late
   /// must not walk one back.
-  void set_scan_stage(io::cache::scan_stage stage) noexcept
+  void set_scan_stage(cucascade::io::cache::scan_stage stage) noexcept
   {
     auto cur = _scan_stage.load(std::memory_order_relaxed);
     while (stage > cur && !_scan_stage.compare_exchange_weak(
                             cur, stage, std::memory_order_release, std::memory_order_relaxed)) {}
   }
 
-  [[nodiscard]] io::cache::scan_stage get_scan_stage() const noexcept
+  [[nodiscard]] cucascade::io::cache::scan_stage get_scan_stage() const noexcept
   {
     return _scan_stage.load(std::memory_order_acquire);
   }
@@ -191,7 +192,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   /// the executor is doing for itself.
   [[nodiscard]] bool has_fallen_behind() const noexcept
   {
-    return get_scan_stage() >= io::cache::scan_stage::preparing;
+    return get_scan_stage() >= cucascade::io::cache::scan_stage::preparing;
   }
 
   /// Take / give back the readahead ticket this split holds for its own read.
@@ -216,16 +217,16 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   /// reads nothing and settles `ready` having done nothing -- and the reader
   /// then pays for the whole split.
   ///
-  /// @p wait_for_eviction: see @c prefetching_cache::prepare.
+  /// @p wait_for_eviction: see @c cucascade::io::cache::fs_cache::prepare.
   prepare_outcome prepare_for_prefetching(bool wait_for_eviction = false)
   {
     prepare_outcome out;
     for (auto const& ds : _datasources) {
       switch (ds->prepare_prefetch(wait_for_eviction)) {
-        case sirius::io::prepare_result::prepared: ++out.prepared; break;
-        case sirius::io::prepare_result::allocation_failed: ++out.failed; break;
-        case sirius::io::prepare_result::fallen_behind: ++out.fell_behind; break;
-        case sirius::io::prepare_result::nothing_to_prepare: break;
+        case cucascade::io::prepare_result::prepared: ++out.prepared; break;
+        case cucascade::io::prepare_result::allocation_failed: ++out.failed; break;
+        case cucascade::io::prepare_result::fallen_behind: ++out.fell_behind; break;
+        case cucascade::io::prepare_result::nothing_to_prepare: break;
       }
     }
     return out;
@@ -260,16 +261,16 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     std::size_t issued = 0;
     for (auto const& ds : _datasources) {
       switch (ds->prefetch_async([pending](bool ok) noexcept { pending->arrive(ok); })) {
-        case sirius::io::prefetch_refusal::issued:
+        case cucascade::io::prefetch_refusal::issued:
           ++issued;
           pending->issued.fetch_add(1, std::memory_order_relaxed);
           continue;
-        case sirius::io::prefetch_refusal::memory_pressure:
+        case cucascade::io::prefetch_refusal::memory_pressure:
           pending->declined_memory_pressure.fetch_add(1, std::memory_order_relaxed);
           break;
-        case sirius::io::prefetch_refusal::consumer_ahead:
-        case sirius::io::prefetch_refusal::other:
-        case sirius::io::prefetch_refusal::no_cache: break;
+        case cucascade::io::prefetch_refusal::consumer_ahead:
+        case cucascade::io::prefetch_refusal::other:
+        case cucascade::io::prefetch_refusal::no_cache: break;
       }
       pending->declined.fetch_add(1, std::memory_order_relaxed);
     }
@@ -371,9 +372,9 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   };
 
   std::vector<fadvise_entry> _hints;
-  std::vector<std::shared_ptr<sirius::io::sirius_datasource>> _datasources;
+  std::vector<std::shared_ptr<cucascade::io::datasource>> _datasources;
   std::atomic<prefetch_state> _prefetch_state{prefetch_state::idle};
-  std::atomic<io::cache::scan_stage> _scan_stage{io::cache::scan_stage::none};
+  std::atomic<cucascade::io::cache::scan_stage> _scan_stage{cucascade::io::cache::scan_stage::none};
   std::atomic<bool> _holds_readahead_ticket{false};
 
   scan_contract_id contract_id_ = 0;

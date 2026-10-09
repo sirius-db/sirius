@@ -112,8 +112,8 @@ pixi run make test
 Run tests by Catch2 tag or name:
 
 ```bash
-pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"
-pixi run build/release/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
+pixi run build/release/test/cpp/sirius_unittest "[path_utils]"
+pixi run build/release/test/cpp/sirius_unittest "strip_file_scheme folds dot, dot-dot and empty segments"
 ```
 
 ## Using CLion for development

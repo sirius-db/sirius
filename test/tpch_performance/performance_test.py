@@ -59,7 +59,7 @@ PROFILES = {
     # this is measuring.
     "cold": {
         "ordering": "sequential",
-        "cache_mode": "sirius",
+        "cache_mode": "cucs",
         # 'lru', not 'idle': the per-query reset_sirius_cache() below is what
         # makes this profile cold, so the evictor does not also need to drop a
         # chunk the moment nothing is reading it. 'idle' additionally retires
@@ -77,7 +77,7 @@ PROFILES = {
     # leftovers.
     "lukewarm": {
         "ordering": "sequential",
-        "cache_mode": "sirius",
+        "cache_mode": "cucs",
         "eviction": "lru",
         "drop_os_cache_between": False,
         "reset_cache_between": False,
@@ -87,7 +87,7 @@ PROFILES = {
     },
     "hot": {
         "ordering": "grouped",
-        "cache_mode": "sirius",
+        "cache_mode": "cucs",
         # LRU, not idle: back-to-back iterations of one query leave the cache
         # briefly idle between runs, and idle eviction would dispose exactly the
         # chunks the next iteration is about to re-read -- measuring a cold read
@@ -151,13 +151,13 @@ DEFAULT_PROFILE = {
 
 CACHE_CONFIG_PATH = ("sirius", "executor", "scan_manager", "cache")
 
-# --pin parquet pins undecoded column chunks into the prefetching cache, so it
-# needs a cache that keeps them: 'sirius' to have one at all, 'lru' because
+# --pin parquet pins undecoded column chunks into the pinned file cache, so it
+# needs a cache that keeps them: 'cucs' to have one at all, 'lru' because
 # 'idle' drops a chunk the moment nothing is reading it, and a threshold of 1.0
 # so the evictor only starts once the pool is genuinely full. Without these the
 # pin populates the cache and the evictor empties it again.
 PARQUET_PIN_CACHE = {
-    "mode": "sirius",
+    "mode": "cucs",
     "eviction": "lru",
     "eviction_threshold_fraction": 1.0,
 }
@@ -1879,8 +1879,8 @@ def parse_args():
             "'host' selects the cache tier; 'none' disables pinning. Pin is "
             "per-query under the hot profile and a single union-pin at "
             "session start under cold/lukewarm. 'parquet' pins the undecoded "
-            "column-chunk bytes into the Sirius prefetching cache instead of "
-            "materialising on the GPU, so it needs cache.mode='sirius' and "
+            "column-chunk bytes into the pinned file cache instead of "
+            "materialising on the GPU, so it needs cache.mode='cucs' and "
             "--data-source parquet. (default: none)"
         ),
     )

@@ -17,12 +17,13 @@
 #include "op/scan/table_scan/parquet_physical_profile.hpp"
 
 #include "io/parquet_helpers.hpp"
-#include "io/sirius_datasource.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
+
+#include <cucascade/cudf/datasource.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -163,7 +164,7 @@ parquet_encryption_evidence inspect_parquet_encryption(std::span<uint8_t const> 
   }
 }
 std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
-  io::sirius_datasource& source,
+  cucascade::io::datasource& source,
   scan_contract_id contract,
   std::string const& identity,
   cudf::io::parquet_reader_options const& options,

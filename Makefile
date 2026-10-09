@@ -112,7 +112,7 @@ list-presets:
 #                     TPC-H Q1-Q22 suite) with SeaweedFS auto-managed, in strict mode.
 # `make s3-test-large`
 #                     large-fixture gate, run as two processes. Both run the
-#                     SF10 lineitem cases, with cache.mode sirius in the first
+#                     SF10 lineitem cases, with cache.mode cucs in the first
 #                     and cache.mode none in the second
 #                     (SIRIUS_TEST_S3_LARGE=1 makes the harness generate and
 #                     upload lineitem_sf10.parquet; needs the DuckDB CLI from
@@ -175,7 +175,7 @@ s3-test-large:
 	  exit 1; \
 	fi
 	@# Two processes, so SeaweedFS is brought up once per group: first the SF10
-	@# lineitem cases with cache.mode sirius ([large-cache]) plus the SF1 TPC-H
+	@# lineitem cases with cache.mode cucs ([large-cache]) plus the SF1 TPC-H
 	@# suite and the 1001-object glob case, which use cache.mode none; then the
 	@# SF10 lineitem cases with cache.mode none ([large-nocache]). Catch2
 	@# OR-combines specs within one argument via commas (multiple positional args

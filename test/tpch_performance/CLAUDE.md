@@ -218,7 +218,7 @@ It forces three cache settings into the effective config, overriding both `--con
 
 | key | value | why |
 |---|---|---|
-| `cache.mode` | `sirius` | there is no cache to pin into otherwise |
+| `cache.mode` | `cucs` | there is no cache to pin into otherwise |
 | `cache.eviction` | `lru` | `idle` drops a chunk the moment nothing reads it |
 | `cache.eviction_threshold_fraction` | `1.0` | the evictor should not start until the pool is full |
 
@@ -237,9 +237,9 @@ is kept beside it as `config.yml`.
 | `--profile` | `cache.mode` | `cache.eviction` | ordering | between runs |
 |---|---|---|---|---|
 | *(omitted, default)* | *unchanged* | *unchanged* | back-to-back per query | nothing |
-| `cold` | `sirius` | `lru` | round-robin | drop OS cache **and** `CALL reset_sirius_cache()` |
-| `lukewarm` | `sirius` | `lru` | round-robin | nothing |
-| `hot` | `sirius` | `lru` | back-to-back per query | nothing |
+| `cold` | `cucs` | `lru` | round-robin | drop OS cache **and** `CALL reset_sirius_cache()` |
+| `lukewarm` | `cucs` | `lru` | round-robin | nothing |
+| `hot` | `cucs` | `lru` | back-to-back per query | nothing |
 
 **The config is only rewritten when `--profile` is passed.** Omit it and your YAML is used
 exactly as written — no `effective_config.yml` is produced and no sanity check runs.

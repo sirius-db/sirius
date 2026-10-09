@@ -27,7 +27,7 @@
 #include <memory>
 #include <vector>
 
-using sirius::io::cache::scan_stage;
+using cucascade::io::cache::scan_stage;
 using sirius::op::SiriusPhysicalOperatorType;
 using sirius::planner::prefetch_step;
 using sirius::planner::scheduling_mode;

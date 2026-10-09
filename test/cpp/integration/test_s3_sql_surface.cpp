@@ -6,12 +6,7 @@
  */
 
 #include "catch.hpp"
-#include "io/io_context.hpp"
-#include "io/rest/authorizer.hpp"
-#include "io/rest/rest_ioctx.hpp"
-#include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/sirius_httpfs.hpp"
-#include "io/sirius_datasource.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "scan_manager/config.hpp"
 #include "sirius_context.hpp"
@@ -22,6 +17,12 @@
 #include "utils/s3_test_env.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/rest/authorizer.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
+#include <cucascade/io/rest/s3/static_credentials.hpp>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
@@ -327,7 +328,7 @@ class sirius_config_env_guard {
     object_store_.ca_bundle_path = ca_bundle.value_or("");
     object_store_.tls_verify     = tls_verify.value_or(false);
     if (signing_mode.has_value()) {
-      REQUIRE(sirius::io::string_to_enum(*signing_mode, object_store_.s3_signing_mode));
+      REQUIRE(cucascade::io::string_to_enum(*signing_mode, object_store_.s3_signing_mode));
     }
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
@@ -417,7 +418,7 @@ class sirius_config_env_guard {
   }
 
   [[nodiscard]] fs::path const& config_path() const noexcept { return config_path_; }
-  [[nodiscard]] sirius::io::object_store_config const& object_store() const noexcept
+  [[nodiscard]] cucascade::io::object_store_config const& object_store() const noexcept
   {
     return object_store_;
   }
@@ -425,7 +426,7 @@ class sirius_config_env_guard {
  private:
   fs::path dir_;
   fs::path config_path_;
-  sirius::io::object_store_config object_store_;
+  cucascade::io::object_store_config object_store_;
   std::string original_config_env_;
   std::string original_disable_env_;
   bool had_original_config_env_{false};
@@ -768,7 +769,7 @@ duckdb::SiriusContext& require_sirius_context(s3_sql_fixture& fixture)
   return *sirius_ctx;
 }
 
-sirius::io::rest::rest_ioctx& require_rest_ioctx(s3_sql_fixture& fixture, std::string const& uri)
+cucascade::io::rest::rest_ioctx& require_rest_ioctx(s3_sql_fixture& fixture, std::string const& uri)
 {
   return *sirius::test::s3::require_rest_ioctx(
     require_sirius_context(fixture).get_scan_manager().create_datasource(uri));
@@ -780,7 +781,7 @@ void require_kvikio_ioctx(s3_sql_fixture& fixture, std::string const& uri)
   auto datasource  = sirius_ctx.get_scan_manager().create_datasource(uri);
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
-  REQUIRE(datasource->io_ctx()->type() == sirius::io::io_context_type::kvikio);
+  REQUIRE(datasource->io_ctx()->type() == cucascade::io::io_context_type::kvikio);
 }
 
 void require_s3_keys_listed(s3_sql_fixture& fixture,
@@ -1072,23 +1073,23 @@ TEST_CASE("S3 SQL config guard keeps object-store credentials out of YAML", "[s3
     CHECK(yaml.find("signing_mode:") == std::string::npos);
     CHECK(guard.object_store().session_token == "temporary-session-token");
     CHECK(guard.object_store().s3_signing_mode ==
-          sirius::io::object_store_config::signing_mode::header);
+          cucascade::io::object_store_config::signing_mode::header);
   }
 }
 
 TEST_CASE("S3 bench STS session token reaches presigned URLs", "[s3][sigv4]")
 {
-  sirius::io::rest::s3::static_credentials creds;
+  cucascade::io::rest::s3::static_credentials creds;
   creds.access_key_id     = "AKIAFAKEBENCHKEY";
   creds.secret_access_key = "fake-secret-key";
   creds.session_token     = "fake-session-token";
 
-  sirius::io::rest::s3::sigv4_presigned_authorizer authorizer{
+  cucascade::io::rest::s3::sigv4_presigned_authorizer authorizer{
     std::move(creds), "us-east-2", "https://s3.us-east-2.amazonaws.com"};
-  auto request =
-    authorizer.authorize(sirius::io::rest::object_ref{"sirius-bench", "tpch/lineitem_sf10.parquet"},
-                         sirius::io::rest::request_method::GET,
-                         std::chrono::seconds{60});
+  auto request = authorizer.authorize(
+    cucascade::io::rest::object_ref{"sirius-bench", "tpch/lineitem_sf10.parquet"},
+    cucascade::io::rest::request_method::GET,
+    std::chrono::seconds{60});
 
   CHECK(request.headers.empty());
   CHECK(request.url.find("X-Amz-Security-Token=") != std::string::npos);
@@ -1233,7 +1234,7 @@ TEST_CASE("transparent read_parquet over S3 scans through Sirius REST",
     s3_sql_fixture fixture(*env);
     set_gpu_execution(fixture.con, true);
     auto& rest = require_rest_ioctx(fixture, uri);
-    CHECK(rest.type() == sirius::io::io_context_type::restful);
+    CHECK(rest.type() == cucascade::io::io_context_type::restful);
     compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   }
 }
@@ -1375,7 +1376,7 @@ TEST_CASE("S3 LIST keeps its REST context alive while credentials rotate",
   std::size_t pages = 0;
   manager.list_objects_paged(prefix,
                              /*page_size=*/1,
-                             [&](sirius::io::rest::s3::list_objects_v2_page const&) {
+                             [&](cucascade::io::rest::s3::list_objects_v2_page const&) {
                                ++pages;
                                if (pages == 1) {
                                  // Replacing the final scope retires the registry's owner of the
@@ -3091,6 +3092,8 @@ TEST_CASE("gpu_execution large S3 lineitem count matches the local parquet oracl
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
+  // `sirius` is the deprecated spelling of cache.mode `cucs`; one case keeps it so
+  // the alias stays covered end to end.
   s3_sql_fixture fixture(*env, large_sirius_memory_limits("sirius"));
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
@@ -3111,7 +3114,7 @@ TEST_CASE("gpu_execution large S3 lineitem TPC-H Q1 shape matches local CPU",
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  s3_sql_fixture fixture(*env, large_sirius_memory_limits("sirius"));
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("cucs"));
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
@@ -3127,7 +3130,7 @@ TEST_CASE("gpu_execution large S3 lineitem join uses planner cardinality and mat
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  s3_sql_fixture fixture(*env, large_sirius_memory_limits("sirius"));
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("cucs"));
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 

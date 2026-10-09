@@ -123,15 +123,28 @@ set(CUCASCADE_BUILD_SHARED_LIBS OFF)
 set(CUCASCADE_BUILD_STATIC_LIBS ON)
 set(CUCASCADE_BUILD_CUDF ON)
 set(CUCASCADE_WARNINGS_AS_ERRORS OFF)
-set(CUCASCADE_BUILD_IO OFF)
+# cuCascade io's swappable third-party backends are pointed at the copies Sirius
+# already links so both sides of the boundary share one ABI: exec::invocable is
+# absl::AnyInvocable (Sirius's type) and moodycamel is duckdb's vendored fork
+# (namespace duckdb_moodycamel, target from sirius-duckdb-provider.cmake).
+set(CUCASCADE_BUILD_IO ON)
+set(CUCASCADE_USE_ABSEIL_INVOCABLE ON)
+set(CUCASCADE_MOODYCAMEL_TARGET duckdb::moodycamel)
+set(CUCASCADE_MOODYCAMEL_NAMESPACE duckdb_moodycamel)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 endblock()
 # cuCascade has no C++ modules; scanning breaks older compiler caches.
-set_target_properties(
-  cucascade_objects cucascade_cudf_objects cucascade_topology_discovery_objects
-  PROPERTIES CXX_SCAN_FOR_MODULES OFF)
-foreach(target cucascade_objects cucascade_cudf_objects)
-  target_compile_definitions(${target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN)
+# cucascade_io_objects exists only when CUCASCADE_BUILD_IO is ON.
+foreach(target cucascade_objects cucascade_cudf_objects cucascade_topology_discovery_objects
+               cucascade_io_objects)
+  if(TARGET ${target})
+    set_target_properties(${target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+  endif()
+endforeach()
+foreach(target cucascade_objects cucascade_cudf_objects cucascade_io_objects)
+  if(TARGET ${target})
+    target_compile_definitions(${target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN)
+  endif()
 endforeach()
 
 # Name of the NVTX domain every Sirius range is published into. Derived from the

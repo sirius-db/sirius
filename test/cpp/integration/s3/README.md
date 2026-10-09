@@ -1,8 +1,10 @@
 # S3 integration tests
 
-Catch2 tests cover REST range reads, retries, cache reads, scan-manager
-`create_datasource`, `describe_parquet`, and SQL over S3. Loopback routing
-tests run in the default unit suite.
+Catch2 tests cover scan-manager routing and `create_datasource`,
+`describe_parquet`, the `sirius_httpfs` filesystem, and SQL over S3 with and
+without the cache. Loopback routing tests run in the default unit suite. The
+REST backend itself (range reads, retries, SigV4 signing) is cuCascade's and is
+tested in cuCascade.
 
 ## Running the gates
 
@@ -53,7 +55,7 @@ The S3 tag vocabulary is:
 | Gate selection | `[s3]`, `[integration]`, `[sql]`, `[large]`, `[large-cache]`, `[large-nocache]`, `[tpch]`, `[glob-scale]`, `[aws]` |
 | Execution path | `[transparent]` marks the `SET gpu_execution` path |
 | Topics | `[rest]`, `[sigv4]`, `[list]`, `[filesystem]`, `[glob]`, `[routing]`, `[describe_parquet]`, `[config]`, `[footerbind]`, `[pushdown]`, `[nested]`, `[fallback]`, `[kvikio]` |
-| File topics | `[uri_parser]`, `[object_store_config]` |
+| File topics | `[object_store_config]` |
 | Slow cases | `[stress]` |
 
 Use at most two topic tags per case. No make target selects on the

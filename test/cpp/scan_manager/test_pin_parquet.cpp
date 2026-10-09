@@ -24,14 +24,15 @@
 // still pinned and chunks it reclaims are not.
 
 #include "catch.hpp"
-#include "io/cache/prefetching_cache.hpp"
-#include "io/io_context.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "utils/parquet_fixture_utils.hpp"
+
+#include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/io_context.hpp>
 
 #include <cstddef>
 #include <filesystem>
@@ -56,13 +57,13 @@ std::shared_ptr<const sirius::memory::topology_index> single_gpu_index_for_pin()
   return std::make_shared<sirius::memory::topology_index>(topology, std::vector<int>{0});
 }
 
-scan_manager_config config_with_sirius_cache()
+scan_manager_config config_with_cucs_cache()
 {
   scan_manager_config cfg;
   cfg.thread_pool.num_threads = 3;
   cfg.uring_n_reactors        = 1;
-  cfg.cache.mode              = sirius::io::cache::cache_mode::sirius;
-  cfg.cache.eviction          = sirius::io::cache::eviction_policy::lru;
+  cfg.cache.mode              = cucascade::io::cache::cache_mode::cucs;
+  cfg.cache.eviction          = cucascade::io::cache::eviction_policy::lru;
   cfg.apply_cache_mode();
   return cfg;
 }
@@ -78,7 +79,7 @@ std::string missing_parquet() { return "/nonexistent/sirius_pin_rollback.parquet
 
 /// Bytes still held after asking the evictor to reclaim everything it can.
 /// Anything left over is held by a live pin, which is the property under test.
-std::size_t bytes_after_full_eviction(sirius::io::cache::prefetching_cache& cache)
+std::size_t bytes_after_full_eviction(cucascade::io::cache::fs_cache& cache)
 {
   cache.evict_sync(cache.claimed_bytes());
   return cache.claimed_bytes();
@@ -91,7 +92,7 @@ TEST_CASE("a pin that throws part way through pins nothing", "[scan_manager][cac
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
 
-  sirius_scan_manager manager{config_with_sirius_cache(), *memory, topology};
+  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -111,7 +112,7 @@ TEST_CASE("parquet tier pin caches complete footer evidence for every file",
 {
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
-  sirius_scan_manager manager{config_with_sirius_cache(), *memory, topology};
+  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
   sirius::test::scratch_dir directory("pin_parquet_evidence");
   std::vector<std::string> paths;
   for (auto const* name : {"a.parquet", "b.parquet"}) {
@@ -137,7 +138,7 @@ TEST_CASE("a failed re-pin leaves the previous pin intact", "[scan_manager][cach
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
 
-  sirius_scan_manager manager{config_with_sirius_cache(), *memory, topology};
+  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -162,7 +163,7 @@ TEST_CASE("reset_caches drops parquet pins rather than leave them stale",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
 
-  sirius_scan_manager manager{config_with_sirius_cache(), *memory, topology};
+  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());

@@ -37,8 +37,8 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
+#include "io/path_utils.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
-#include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -367,8 +367,12 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   scan_op.delete_inventory.reset();
   auto discovery =
     sirius::op::scan::discover_from_manifests(context, info->table_path, std::move(inventory));
-  info->delete_data = sirius::op::scan::load_delete_payload(
-    context, info->table_path, sirius_ctx->get_scan_manager().io_ctx(), snapshot_id, discovery);
+  info->delete_data =
+    sirius::op::scan::load_delete_payload(context,
+                                          info->table_path,
+                                          sirius_ctx->get_scan_manager().shared_io_ctx(),
+                                          snapshot_id,
+                                          discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();

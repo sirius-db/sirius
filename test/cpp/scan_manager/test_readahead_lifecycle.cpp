@@ -16,13 +16,13 @@
 
 #include "catch.hpp"
 #include "exec/config.hpp"
-#include "io/kvikio/kvikio_context.hpp"
-#include "io/rest/config.hpp"
-#include "io/uring/config.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/query.hpp"
 #include "query_id.hpp"
@@ -33,19 +33,24 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "utils/telemetry_utils.hpp"
 
+#include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/cache/types.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
+
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
-using sirius::io::cache::cache_mode;
-using sirius::io::cache::eviction_policy;
-using sirius::io::cache::scan_stage;
+using cucascade::io::cache::cache_mode;
+using cucascade::io::cache::eviction_policy;
+using cucascade::io::cache::scan_stage;
 using sirius::scan_manager::gatekeeper;
 using sirius::scan_manager::readahead_scan_manager;
 
@@ -68,14 +73,17 @@ constexpr auto PIPELINE_THREADS =
 
 TEST_CASE("each backend publishes its own default scan budget", "[scan_manager][readahead]")
 {
-  // The local (uring) backend defaults to 0 (readahead off): on local NVMe a
-  // prefetch only reorders the executor's own reads against the same device.
-  CHECK(sirius::io::uring::config{}.n_max_concurrent_scans == 0);
-  CHECK(sirius::io::rest::config{}.n_max_concurrent_scans == 2 * PIPELINE_THREADS);
+  // The local (uring) struct default is 0; like REST, sirius_config re-defaults
+  // it at load time (to the pipeline width) unless the config sets it.
+  CHECK(scan_manager_config{}.uring.n_max_concurrent_scans == 0);
+  CHECK_FALSE(scan_manager_config{}.uring.n_max_concurrent_scans_explicit);
+  // cuCascade's rest::config struct default; sirius_config rescales it to the configured
+  // pipeline width at load time unless the config sets it explicitly.
+  CHECK(scan_manager_config{}.rest.n_max_concurrent_scans == 8);
   // kvikIO has no prefetching cache to read ahead into, so it publishes no
   // depth at all and there is no knob that could give it one.
-  sirius::io::kvikio_context kvikio;
-  CHECK_FALSE(kvikio.can_use_prefetching_cache());
+  cucascade::io::kvikio_context kvikio;
+  CHECK_FALSE(kvikio.can_use_fs_cache());
   CHECK(kvikio.n_max_concurrent_scans() == 0);
 }
 
@@ -93,10 +101,10 @@ TEST_CASE("the readahead budget follows the cache mode when unset", "[scan_manag
   };
 
   CHECK(budget_for(cache_mode::none) == 0);
-  // `os` has no prefetching cache, but ordering scans ahead of demand still
-  // warms the page cache, so readahead is on.
+  // `os` keeps the readahead enabled by configuration; it has no pinned cache to
+  // fill (page-cache warming would need cuCascade support).
   CHECK(budget_for(cache_mode::os) == backend_budget);
-  CHECK(budget_for(cache_mode::sirius) == backend_budget);
+  CHECK(budget_for(cache_mode::cucs) == backend_budget);
 }
 
 TEST_CASE("a partially prepared split retries before issuing prefetch",
@@ -147,7 +155,7 @@ TEST_CASE("explicit readahead settings override the selected backend policy",
           "[scan_manager][readahead]")
 {
   scan_manager_config cfg;
-  cfg.cache.mode          = cache_mode::sirius;
+  cfg.cache.mode          = cache_mode::cucs;
   cfg.max_readahead_scans = 3;
   cfg.readahead_strategy  = sirius::scan_manager::prefetch_strategy::eager;
   cfg.pipeline_width      = 9;
@@ -162,11 +170,11 @@ TEST_CASE("explicit readahead settings override the selected backend policy",
 TEST_CASE("apply_cache_mode leaves the other derived knobs alone", "[scan_manager][readahead]")
 {
   scan_manager_config cfg;
-  cfg.cache.mode     = cache_mode::sirius;
+  cfg.cache.mode     = cache_mode::cucs;
   cfg.cache.eviction = eviction_policy::idle;
   cfg.apply_cache_mode();
 
-  CHECK(cfg.cache.use_prefetching_cache());
+  CHECK(cfg.cache.use_fs_cache());
   CHECK(cfg.cache.dispose_on_idle);
   CHECK(cfg.uring.use_odirect);
 }
@@ -642,7 +650,7 @@ scan_manager_config config_with_readahead_budget(std::size_t budget)
   scan_manager_config cfg;
   cfg.thread_pool.num_threads = 2;
   cfg.uring_n_reactors        = 1;
-  cfg.cache.mode              = cache_mode::sirius;
+  cfg.cache.mode              = cache_mode::cucs;
   cfg.max_readahead_scans     = budget;
   cfg.apply_cache_mode();
   return cfg;
@@ -691,10 +699,11 @@ TEST_CASE("the kvikIO backend builds no readahead however the cache is configure
   cfg.thread_pool.num_threads = 2;
   cfg.uring_n_reactors        = 1;
   cfg.backend                 = sirius::scan_manager::io_backend::kvikio;
-  cfg.cache.mode              = cache_mode::sirius;
+  cfg.cache.mode              = cache_mode::cucs;
   cfg.pipeline_width          = PIPELINE_THREADS;
-  // Local readahead is off by default now; opt it back in so this test still
-  // proves kvikIO is dropped despite a sibling backend carrying positive depth.
+  // A bare scan_manager_config skips sirius_config's derivation (uring stays 0);
+  // set the budget so this test still proves kvikIO is dropped despite a
+  // sibling backend carrying positive depth.
   cfg.uring.n_max_concurrent_scans = PIPELINE_THREADS;
   cfg.apply_cache_mode();
   REQUIRE(cfg.uring.n_max_concurrent_scans > 0);
@@ -704,8 +713,164 @@ TEST_CASE("the kvikIO backend builds no readahead however the cache is configure
 
   sirius::scan_manager::sirius_scan_manager manager{cfg, *memory, topology};
   REQUIRE(manager.io_ctx() != nullptr);
-  REQUIRE_FALSE(manager.io_ctx()->can_use_prefetching_cache());
+  REQUIRE_FALSE(manager.io_ctx()->can_use_fs_cache());
 
   manager.prepare_for_query(query.get(), false, std::vector<int>{0});
   CHECK_FALSE(manager.has_readahead_for_testing());
+}
+
+// ===========================================================================
+// the cache mode and the backend's cache gate the readahead
+// ===========================================================================
+//
+// Backend selection only sees the backends serving the query's scan paths, so
+// these need a query with a real scan behind it: an empty query selects no
+// backend at all and reads ahead only on an explicit budget.
+
+namespace {
+
+/// One query, one pipeline, one GPU scan over a local parquet file, so the uring
+/// backend serves it and takes part in readahead backend selection.
+struct local_scan_query {
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::unique_ptr<sirius::op::scan::sirius_gpu_scan_operator> scan_op;
+  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry;
+  std::shared_ptr<sirius::planner::query> query;
+};
+
+local_scan_query make_local_scan_query(sirius::query_id_t query_id)
+{
+  namespace scan = sirius::op::scan;
+  local_scan_query q;
+  sirius::pipeline::pipeline_build_context const build_ctx{nullptr, true};
+  q.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
+  q.pipeline->set_pipeline_id(1);
+  q.pipeline->set_query_id(query_id);
+
+  auto info                 = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->resolved_file_paths = {(std::filesystem::path{SIRIUS_PROJECT_ROOT} /
+                                "test/cpp/integration/data/parquet/nation.parquet")
+                                 .string()};
+  info->names               = {"c0"};
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
+  info->column_ids.push_back(duckdb::ColumnIndex(0));
+  info->scan_output_arity = 1;
+  auto const contract_id  = static_cast<scan::scan_contract_id>(sirius::value_of(query_id)) + 1;
+  info->contract_id       = contract_id;
+  q.scan_op               = std::make_unique<scan::sirius_gpu_scan_operator>(
+    duckdb::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::INTEGER)},
+    0,
+    scan::make_ingestible(std::move(info)),
+    contract_id);
+
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*q.pipeline, *q.scan_op);
+  build_state.add_pipeline_operator(*q.pipeline, *q.scan_op);
+  std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{q.pipeline};
+  sirius::pipeline::assign_operator_ids(pipelines);
+
+  q.telemetry = sirius::test::make_test_telemetry_context();
+  q.query     = std::make_shared<sirius::planner::query>(
+    pipelines,
+    q.telemetry->context(),
+    query_id,
+    sirius::telemetry::query_telemetry_info{
+      q.telemetry->engine_id(), q.telemetry->worker_id(), query_id});
+  return q;
+}
+
+/// The uring backend publishing a positive readahead budget of its own, with no
+/// explicit `max_readahead_scans`: whether the readahead runs is then decided
+/// by backend selection alone.
+scan_manager_config config_with_uring_budget(cache_mode mode)
+{
+  scan_manager_config cfg;
+  cfg.thread_pool.num_threads      = 2;
+  cfg.uring_n_reactors             = 1;
+  cfg.cache.mode                   = mode;
+  cfg.uring.n_max_concurrent_scans = 4;
+  cfg.apply_cache_mode();
+  return cfg;
+}
+
+/// Whether preparing a one-scan local query on @p manager builds a readahead.
+bool local_scan_reads_ahead(sirius::scan_manager::sirius_scan_manager& manager,
+                            sirius::query_id_t query_id)
+{
+  auto q = make_local_scan_query(query_id);
+  manager.prepare_for_query(*q.query, false, std::vector<int>{0});
+  bool const reads_ahead = manager.has_readahead_for_testing();
+  manager.reset(query_id);
+  return reads_ahead;
+}
+
+/// A memory manager whose pinned host blocks are wider than the largest chunk
+/// the prefetching cache supports.  The uring backend still stages through
+/// them, but a requested (`cucs`) cache cannot be built on them.
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager>
+initialize_memory_manager_too_wide_for_cache()
+{
+  sirius::converter_registry::reset_for_testing();
+  constexpr auto block_size = cucascade::io::cache::chunk_state::max_chunk_bytes() * 2;
+  reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(2ull << 30)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_numa_region_capacity(4ull << 30)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.75)
+    // (block size, blocks per pool, initial pools); see sirius_config.cpp.
+    .set_host_pool_features(block_size, 1, 1);
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  sirius::converter_registry::initialize();
+  return manager;
+}
+
+}  // namespace
+
+TEST_CASE("cache.mode os keeps the readahead enabled by configuration", "[scan_manager][readahead]")
+{
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index();
+
+  // `os` builds no pinned cache by design, on a backend that could hold one.  The
+  // readahead stays enabled but has no pinned cache to fill (page-cache warming
+  // would need cuCascade support), so the readahead is built but issues no IO.
+  sirius::scan_manager::sirius_scan_manager manager{
+    config_with_uring_budget(cache_mode::os), *memory, topology};
+  REQUIRE(manager.io_ctx() != nullptr);
+  REQUIRE(manager.io_ctx()->can_use_fs_cache());
+  REQUIRE(manager.io_ctx()->cache() == nullptr);
+
+  // The backend's own budget still reaches the plan.
+  CHECK(local_scan_reads_ahead(manager, sirius::make_query_id(3)));
+}
+
+TEST_CASE("a requested cache that failed to build turns the readahead off",
+          "[scan_manager][readahead]")
+{
+  auto topology = single_gpu_index();
+
+  // Control: the same configuration with its cache built does read ahead, so
+  // the check below is about the cache rather than about the query or budget.
+  {
+    auto memory = initialize_memory_manager(1);
+    sirius::scan_manager::sirius_scan_manager manager{
+      config_with_uring_budget(cache_mode::cucs), *memory, topology};
+    REQUIRE(manager.io_ctx()->cache() != nullptr);
+    CHECK(local_scan_reads_ahead(manager, sirius::make_query_id(4)));
+  }
+
+  // `cucs` asked for a pinned cache the backend could not build: there is
+  // nothing to read ahead into, so the backend has no say and nothing else
+  // publishes a budget.
+  {
+    auto memory = initialize_memory_manager_too_wide_for_cache();
+    sirius::scan_manager::sirius_scan_manager manager{
+      config_with_uring_budget(cache_mode::cucs), *memory, topology};
+    REQUIRE(manager.io_ctx()->can_use_fs_cache());
+    REQUIRE(manager.io_ctx()->cache() == nullptr);
+    CHECK_FALSE(local_scan_reads_ahead(manager, sirius::make_query_id(5)));
+  }
 }

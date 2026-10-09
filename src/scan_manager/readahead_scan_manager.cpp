@@ -16,7 +16,6 @@
 
 #include "scan_manager/readahead_scan_manager.hpp"
 
-#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -24,6 +23,8 @@
 #include "op/sirius_physical_operator.hpp"
 #include "planner/query.hpp"
 #include "planner/query_index.hpp"
+
+#include <cucascade/cudf/datasource.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -221,7 +222,7 @@ void readahead_scan_manager::mark_operator_closed(std::size_t operator_id)
 
 void readahead_scan_manager::update_scan_state(std::size_t,
                                                const op::scan::scan_info* task,
-                                               io::cache::scan_stage stage)
+                                               cucascade::io::cache::scan_stage stage)
 {
   // A zero budget means the backend opted out, so there is no readahead for this
   // read to compete with and no budget to charge it against.
@@ -230,7 +231,7 @@ void readahead_scan_manager::update_scan_state(std::size_t,
   // caller of update() hands us a const view of the split it is reporting on.
   auto* split = const_cast<op::scan::scan_info*>(task);
 
-  if (stage == io::cache::scan_stage::reading) {
+  if (stage == cucascade::io::cache::scan_stage::reading) {
     // A split whose prefetch DID start is already paying for its IO out of the
     // ticket that prefetch holds; charging it twice would throttle the readahead
     // for work it is doing itself.
@@ -245,7 +246,7 @@ void readahead_scan_manager::update_scan_state(std::size_t,
     return;
   }
 
-  if (stage == io::cache::scan_stage::disposed) {
+  if (stage == cucascade::io::cache::scan_stage::disposed) {
     // The read is over, so give the ticket back -- paying down any debt first.
     if (split->give_back_readahead_ticket()) { _gatekeeper.release(); }
     {
@@ -257,7 +258,10 @@ void readahead_scan_manager::update_scan_state(std::size_t,
 }
 
 prefetch_outcome_kind readahead_scan_manager::classify_prefetch(
-  bool allocation_failed, bool split_alive, bool issued_io, io::cache::scan_stage stage) noexcept
+  bool allocation_failed,
+  bool split_alive,
+  bool issued_io,
+  cucascade::io::cache::scan_stage stage) noexcept
 {
   // A hard failure outranks anything the consumer was doing: with no buffers
   // there was never an attempt to be early or late for.
@@ -265,14 +269,17 @@ prefetch_outcome_kind readahead_scan_manager::classify_prefetch(
   // The split is gone, so whatever it was going to be read for already happened.
   if (!split_alive) { return prefetch_outcome_kind::skipped_fell_behind; }
   if (!issued_io) {
-    return stage >= io::cache::scan_stage::preparing ? prefetch_outcome_kind::skipped_fell_behind
-                                                     : prefetch_outcome_kind::nothing_to_issue;
+    return stage >= cucascade::io::cache::scan_stage::preparing
+             ? prefetch_outcome_kind::skipped_fell_behind
+             : prefetch_outcome_kind::nothing_to_issue;
   }
   // IO landed.  `reading` is carved out of "preparing or higher" because it is
   // the more specific case: the consumer is on this split right now and is
   // waiting on the very prefetch that just settled.
-  if (stage == io::cache::scan_stage::reading) { return prefetch_outcome_kind::wait_for_prefetch; }
-  if (stage >= io::cache::scan_stage::preparing) {
+  if (stage == cucascade::io::cache::scan_stage::reading) {
+    return prefetch_outcome_kind::wait_for_prefetch;
+  }
+  if (stage >= cucascade::io::cache::scan_stage::preparing) {
     return prefetch_outcome_kind::skipped_fell_behind;
   }
   return prefetch_outcome_kind::prefetched;
@@ -315,7 +322,7 @@ void readahead_scan_manager::on_prefetch_complete(std::size_t,
     classify_prefetch(allocation_failed,
                       task != nullptr,
                       issued_io,
-                      task ? task->get_scan_stage() : io::cache::scan_stage::disposed));
+                      task ? task->get_scan_stage() : cucascade::io::cache::scan_stage::disposed));
   // Pairs with the acquire in worker_loop.  The slot is free once the IO
   // settles, not once the split is finally read: the budget caps concurrent IO,
   // and a landed prefetch is doing none.

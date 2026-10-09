@@ -7,7 +7,6 @@
 
 #include "catch.hpp"
 #include "io/parquet_helpers.hpp"
-#include "io/templated_ioctx.hpp"
 #include "op/scan/parquet_materialize.hpp"
 #include "utils/utils.hpp"
 
@@ -23,6 +22,11 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/byte_range.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/types.hpp>
 #include <duckdb.hpp>
 
 #include <cstdint>
@@ -306,7 +310,7 @@ cudf::size_type bulk_row_count(fs::path const& path,
 
 /// A backend that prefers bulk IO -- the one thing `prefers_bulk_materialize`
 /// asks a source's datasource.
-class bulk_object final : public sirius::io::io_object {
+class bulk_object final : public cucascade::io::io_object {
  public:
   explicit bulk_object(std::string path = "bulk", std::size_t size = 0)
     : _path(std::move(path)), _size(size)
@@ -322,58 +326,61 @@ class bulk_object final : public sirius::io::io_object {
   std::size_t _size;
 };
 
-class bulk_reactor {
+/// Minimal ioctx: reports @c prefers_bulk_io() and never serves a read (the
+/// tests below only route and validate schemas; none reaches the backend).
+class bulk_context final : public cucascade::io::ioctx {
  public:
-  struct config {
-    [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return 1; }
-    [[nodiscard]] std::size_t merge_gap_size() const noexcept { return 0; }
-    std::size_t n_max_concurrent_scans{0};
-  };
+  ~bulk_context() override { pre_destroy(); }
 
-  using io_object_type                  = bulk_object;
-  using reactor_config_type             = config;
-  static constexpr bool prefers_bulk_io = true;
+  [[nodiscard]] cucascade::io::io_context_type type() const noexcept override
+  {
+    return cucascade::io::io_context_type::restful;
+  }
+  void shutdown() noexcept override {}
+  [[nodiscard]] bool supports(std::string_view) const noexcept override { return true; }
+  [[nodiscard]] bool supports_device_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_device_range_read() const noexcept override { return false; }
+  [[nodiscard]] bool prefers_bulk_io() const noexcept override { return true; }
 
-  [[nodiscard]] config const& get_config() const noexcept { return _config; }
-  void enqueue(std::unique_ptr<sirius::io::grouped_io_request>) noexcept {}
-  [[nodiscard]] std::size_t queued_bytes() const noexcept { return 0; }
-  [[nodiscard]] std::size_t staging_block_size() const noexcept { return 0; }
-  std::size_t host_read(bulk_object const&, std::size_t, std::size_t size, std::uint8_t*) const
-  {
-    return size;
-  }
-  void start() {}
-  void shutdown() {}
-  void interrupt() {}
-  [[nodiscard]] static std::unique_ptr<bulk_object> create_io_object(std::string)
-  {
-    return std::make_unique<bulk_object>();
-  }
-  [[nodiscard]] static bool supports(std::string_view) { return true; }
-  [[nodiscard]] static std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<cudf::io::text::byte_range_info const> ranges, std::optional<std::size_t>)
+  [[nodiscard]] std::vector<cucascade::io::byte_range> align_and_coalesce(
+    std::span<cucascade::io::byte_range const> ranges,
+    std::optional<std::size_t>) const noexcept override
   {
     return {ranges.begin(), ranges.end()};
   }
 
- private:
-  config _config;
-};
-
-class bulk_context final : public sirius::io::templated_ioctx<bulk_reactor> {
- public:
-  using templated_ioctx::templated_ioctx;
-
-  [[nodiscard]] sirius::io::io_context_type type() const noexcept override
+  std::size_t host_read_io(cucascade::io::io_object const&,
+                           std::size_t,
+                           std::size_t size,
+                           std::uint8_t*) override
   {
-    return sirius::io::io_context_type::restful;
+    return size;
+  }
+
+  cucascade::exec::semi_future<std::size_t> mixed_readv_async_io(
+    cucascade::io::io_object const&,
+    std::vector<cucascade::io::prepared_io_slice>&& slices) noexcept override
+  {
+    std::size_t bytes = 0;
+    for (auto const& slice : slices) {
+      bytes += slice.size();
+    }
+    return cucascade::exec::make_semi_future<std::size_t>(bytes);
+  }
+
+ protected:
+  std::shared_ptr<cucascade::io::io_object> create_io_object(std::string path) override
+  {
+    return std::make_shared<bulk_object>(std::move(path));
   }
 };
 
 sirius::op::scan::parquet_source schema_source(fs::path const& path,
                                                std::shared_ptr<bulk_context> const& ioctx)
 {
-  return {std::make_shared<sirius::io::sirius_datasource>(
+  return {std::make_shared<cucascade::io::datasource>(
             ioctx, std::make_shared<bulk_object>(path.string(), fs::file_size(path))),
           std::make_shared<cudf::io::parquet::FileMetaData const>(read_metadata(path)),
           {}};
@@ -393,10 +400,10 @@ TEST_CASE("filtered options still take the bulk materialize route", "[scan][parq
   cudf::io::parquet::experimental::hybrid_scan_reader reader{
     cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), options};
 
-  auto ioctx = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  auto ioctx = std::make_shared<bulk_context>();
   std::vector<sirius::op::scan::parquet_source> sources;
   sources.push_back(sirius::op::scan::parquet_source{
-    std::make_shared<sirius::io::sirius_datasource>(ioctx, std::make_shared<bulk_object>()),
+    std::make_shared<cucascade::io::datasource>(ioctx, std::make_shared<bulk_object>()),
     std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata()),
     reader.all_row_groups(options)});
 
@@ -413,13 +420,13 @@ TEST_CASE("bulk materialize rejects sources whose schemas differ before reading"
   auto const path_b =
     write_parquet(con, dir, "drift_b", "CREATE TABLE drift_b AS SELECT 2.5::DOUBLE AS x, 'b' AS y");
   auto const options = cudf::io::parquet_reader_options::builder().build();
-  auto ioctx         = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  auto ioctx         = std::make_shared<bulk_context>();
   std::vector<sirius::op::scan::parquet_source> sources;
   for (auto const& path : {path_a, path_b}) {
     auto metadata = std::make_shared<cudf::io::parquet::FileMetaData const>(read_metadata(path));
     cudf::io::parquet::experimental::hybrid_scan_reader reader{*metadata, options};
     sources.push_back(sirius::op::scan::parquet_source{
-      std::make_shared<sirius::io::sirius_datasource>(
+      std::make_shared<cucascade::io::datasource>(
         ioctx, std::make_shared<bulk_object>(path.string(), fs::file_size(path))),
       std::move(metadata),
       reader.all_row_groups(options)});
@@ -442,7 +449,7 @@ TEST_CASE("require_same_parquet_schema accepts a shared schema", "[scan][parquet
     write_parquet(con, dir, "shared_a", "CREATE TABLE shared_a AS SELECT 1::INTEGER AS x");
   auto const path_b =
     write_parquet(con, dir, "shared_b", "CREATE TABLE shared_b AS SELECT 2::INTEGER AS x");
-  auto ioctx = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  auto ioctx = std::make_shared<bulk_context>();
   std::vector<sirius::op::scan::parquet_source> const sources{schema_source(path_a, ioctx),
                                                               schema_source(path_b, ioctx)};
 
@@ -458,7 +465,7 @@ TEST_CASE("require_same_parquet_schema rejects column order and extra-column dri
 {
   auto const dir       = fresh_tmp_dir("bulk_schema_columns");
   auto [db_owner, con] = sirius::make_test_db_and_connection();
-  auto ioctx = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  auto ioctx           = std::make_shared<bulk_context>();
 
   SECTION("column order")
   {
@@ -495,7 +502,7 @@ TEST_CASE("require_same_parquet_schema rejects a difference only in writer metad
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   auto const path =
     write_parquet(con, dir, "writer", "CREATE TABLE writer AS SELECT 1::INTEGER AS x");
-  auto ioctx   = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  auto ioctx   = std::make_shared<bulk_context>();
   auto source  = schema_source(path, ioctx);
   auto changed = std::make_shared<cudf::io::parquet::FileMetaData>(*source.metadata);
   std::vector<sirius::op::scan::parquet_source> const sources{source,

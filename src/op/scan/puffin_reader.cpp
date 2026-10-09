@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-#include <io/uri_parser.hpp>
+#include "io/path_utils.hpp"
+
 #include <log/logging.hpp>
 #include <op/scan/puffin_reader.hpp>
 

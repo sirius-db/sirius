@@ -17,11 +17,12 @@
 #pragma once
 
 #include "event/query_event_subscriber.hpp"
-#include "io/cache/types.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "planner/query_index.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/gatekeeper.hpp"
+
+#include <cucascade/io/cache/types.hpp>
 
 #include <array>
 #include <atomic>
@@ -74,8 +75,8 @@ enum class prefetch_outcome_kind : std::uint8_t {
   /// split -- the readahead got there first, which is the point of it.
   prefetched,
   /// The attempt had nothing to issue: a split with no ranges, or a scan with no
-  /// prefetching cache to issue into (@c cache.mode: os warms the page cache and
-  /// nothing else).  Neither a win nor a miss.
+  /// prefetching cache to issue into (@c cache.mode: os, whose readahead has no
+  /// pinned cache to fill).  Neither a win nor a miss.
   nothing_to_issue,
 
   /// Not an outcome -- the enumerator count, so the counters can be an array
@@ -234,7 +235,7 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// Wakes the worker so a freed slot is refilled.
   void update_scan_state(std::size_t operator_id,
                          const op::scan::scan_info* task,
-                         io::cache::scan_stage stage);
+                         cucascade::io::cache::scan_stage stage);
 
   /// Report that @p operator_id's producer has finished: every split it will
   /// ever emit has been registered.  Until this arrives the operator cannot be
@@ -262,14 +263,17 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// stage at completion; @p split_alive is false once the split's weak_ptr has
   /// expired.
   [[nodiscard]] static prefetch_outcome_kind classify_prefetch(
-    bool allocation_failed, bool split_alive, bool issued_io, io::cache::scan_stage stage) noexcept;
+    bool allocation_failed,
+    bool split_alive,
+    bool issued_io,
+    cucascade::io::cache::scan_stage stage) noexcept;
 
   /// This query's readahead outcomes.  Exposed for tests and diagnostics; the
   /// log line built from them is @ref summary.
   [[nodiscard]] readahead_counters const& counters() const noexcept { return _counters; }
 
   /// One-line account of this query's readahead, in the shape
-  /// @c prefetching_cache::summary uses.  Safe to call at any time; the
+  /// @c fs_cache::summary uses.  Safe to call at any time; the
   /// counters are relaxed atomics and a concurrent update only means the line
   /// is a moment stale.
   [[nodiscard]] std::string summary() const;

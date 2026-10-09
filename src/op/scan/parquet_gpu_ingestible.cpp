@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include "io/path_utils.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
 
@@ -22,10 +23,7 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
-#include <io/io_context.hpp>
-#include <io/io_errors.hpp>
 #include <io/parquet_helpers.hpp>
-#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
@@ -62,6 +60,9 @@
 #include <rmm/device_buffer.hpp>
 
 // cucascade
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // duckdb
@@ -73,11 +74,6 @@
 #include <duckdb/planner/expression_iterator.hpp>
 #include <duckdb/planner/filter/conjunction_filter.hpp>
 #include <duckdb/planner/filter/null_filter.hpp>
-
-// uring_reactor MUST be included last among sirius headers: liburing.h,
-// pulled in transitively, defines a BLOCK_SIZE macro that collides with the
-// BLOCK_SIZE static member in <blockingconcurrentqueue.h>.
-#include <io/uring/uring_reactor.hpp>
 
 // standard library
 #include <algorithm>
@@ -375,8 +371,8 @@ class parquet_batch_coalescer : public batch_coalescer {
       _empty_split_fallback = fallback_file{
         file->file_metadata,
         file->file_path,
-        file->datasource ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
-                         : std::shared_ptr<io::sirius_datasource>{},
+        file->datasource ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
+                         : std::shared_ptr<cucascade::io::datasource>{},
         file->partition_values,
         file->disable_filter_pushdown,
         file->reader_options,
@@ -417,8 +413,8 @@ class parquet_batch_coalescer : public batch_coalescer {
       // each slice gets its own datasource (sharing the io_object) — otherwise
       // a later split's fadvise would stomp an earlier one's handle.
       auto slice_ds = file->datasource
-                                 ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
-                                 : std::shared_ptr<io::sirius_datasource>{};
+                                 ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
+                                 : std::shared_ptr<cucascade::io::datasource>{};
       _slices.emplace_back(file->file_metadata,
                            file->file_path,
                            std::move(cur_rgs),
@@ -557,7 +553,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   struct fallback_file {
     std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
     std::string file_path;
-    std::shared_ptr<io::sirius_datasource> datasource;
+    std::shared_ptr<cucascade::io::datasource> datasource;
     std::vector<std::string> partition_values;
     bool disable_filter_pushdown;
     std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
@@ -883,7 +879,7 @@ bool parquet_gpu_ingestible::has_processed_all_metadata() const
 }
 
 std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
-  io::ioctx_resolver resolve)
+  sirius::io::ioctx_resolver resolve)
 {
   if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
   auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
@@ -906,7 +902,10 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
     } catch (duckdb::IOException const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
-    } catch (io::credential_error const& error) {
+    } catch (cucascade::io::credential_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (cucascade::io::object_changed_error const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
     } catch (std::system_error const& error) {
@@ -927,7 +926,9 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path, std::size_t file_index, std::shared_ptr<io::ioctx> const& io_ctx)
+  std::string const& file_path,
+  std::size_t file_index,
+  std::shared_ptr<cucascade::io::ioctx> const& io_ctx)
 {
   if (_execution_completion && _execution_completion->injections &&
       _execution_completion->injections->hold_footer_index == file_index + 1) {
@@ -936,7 +937,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   auto stream = cudf::get_default_stream();
   if (_info->profiles->counters) _info->profiles->counters->parquet_phase(file_path, true);
 
-  // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
+  // Resolve the file to a cucascade::io::datasource (own io backend, prefetch cache and
   // cached metadata). The parquet_footer_probe hint collapses the S3 footer read
   // to one suffix-range GET that resolves the size and stashes the footer, so
   // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
@@ -946,11 +947,16 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // holds a parsed footer for this path, a suffix GET would most likely download
   // bytes nothing consumes, and the open only needs the size; the exact
   // generation lookup below decides reuse. Mirrors describe_parquet.
-  bool const footer_cached = io_ctx->metadata_store().has_path(file_path);
-  std::shared_ptr<io::sirius_datasource> sirius_ds;
+  // The store is keyed by the normalized path, so look up what the open uses.
+  auto const normalized    = sirius::io::strip_file_scheme(file_path);
+  bool const footer_cached = io_ctx->metadata_store().has_path(normalized);
+  std::shared_ptr<cucascade::io::datasource> sirius_ds;
   {
-    sirius_ds = io_ctx->open_datasource(
-      file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
+    sirius_ds =
+      sirius::io::open_datasource(io_ctx,
+                                  normalized,
+                                  footer_cached ? cucascade::io::open_hint::generic
+                                                : cucascade::io::open_hint::parquet_footer_probe);
   }
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
@@ -986,7 +992,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     throw;
   } catch (duckdb::IOException const&) {
     throw;
-  } catch (io::credential_error const&) {
+  } catch (cucascade::io::credential_error const&) {
+    throw;
+  } catch (cucascade::io::object_changed_error const&) {
     throw;
   } catch (std::system_error const&) {
     throw;

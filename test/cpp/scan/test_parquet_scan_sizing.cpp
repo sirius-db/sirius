@@ -17,10 +17,10 @@
 #include <cudf/strings/utilities.hpp>
 
 #include <catch.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/constants.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
-#include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -89,9 +89,9 @@ struct scan_estimates {
 scan_estimates read_estimates(std::unique_ptr<scan::parquet_ingestible_table_info> info)
 {
   auto ingestible = scan::make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto task       = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
 
   auto file = task();
@@ -194,8 +194,8 @@ void check_unmapped_carrier(scan::scan_plan const& plan,
 
 struct carrier_file_fixture {
   sirius::test::scratch_dir scratch{"parquet_carrier_sizing"};
-  std::shared_ptr<sirius::io::kvikio_context> ioctx =
-    std::make_shared<sirius::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::kvikio_context> ioctx =
+    std::make_shared<cucascade::io::kvikio_context>();
 
   carrier_file_fixture()
   {
@@ -281,7 +281,7 @@ struct carrier_file_fixture {
   std::unique_ptr<scan::parquet_file_scan_info> read_file(scan::parquet_gpu_ingestible& reader)
   {
     auto task = reader.next_split_provider(
-      [ctx = ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ctx; });
+      [ctx = ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ctx; });
     REQUIRE(task);
     auto info  = task();
     auto* file = dynamic_cast<scan::parquet_file_scan_info*>(info.get());
@@ -338,10 +338,10 @@ TEST_CASE("parquet scans without a prefetch cache retain advisory ranges",
           "[scan][parquet][prefetch]")
 {
   auto ingestible = scan::make_ingestible(make_nation_info(false));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
-  REQUIRE_FALSE(ioctx->uses_prefetching_cache());
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+  REQUIRE_FALSE(ioctx->uses_fs_cache());
   auto task = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
 
   auto coalescer = ingestible->create_batch_coalescer();

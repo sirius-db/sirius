@@ -15,7 +15,6 @@
  */
 
 #include "catch.hpp"
-#include "io/io_errors.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "sirius_context.hpp"
 #include "transparent/replay_admission.hpp"
@@ -24,6 +23,7 @@
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
+#include <cucascade/io/io_errors.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
@@ -413,7 +413,7 @@ TEST_CASE("late failure classification uses exception types rather than message 
 {
   auto io = std::make_exception_ptr(duckdb::IOException("reader failed"));
   CHECK(classify_failure(io, late_failure_cause::gpu_error).cause == late_failure_cause::reader_io);
-  auto credentials = std::make_exception_ptr(sirius::io::credential_error("signing failed"));
+  auto credentials = std::make_exception_ptr(cucascade::io::credential_error("signing failed"));
   CHECK(classify_failure(credentials, late_failure_cause::gpu_error).cause ==
         late_failure_cause::reader_io);
   auto text_only = std::make_exception_ptr(
