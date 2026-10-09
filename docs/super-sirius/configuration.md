@@ -514,8 +514,11 @@ explicit GPU capacity in YAML, it is computed at startup as
 GPU is visible). When the active YAML memory path explicitly caps GPU capacity, the
 default is narrowed to
 `min(physical-memory default, max(1 byte, smallest resolved GPU capacity / 40))`.
-`max_build_hash_table_bytes` defaults to **2× that batch default**. Explicit
-`operator_params` values are applied afterward and still override each value
+`max_build_hash_table_bytes` defaults to **2× that batch default**.
+`admission_bytes_per_gpu` has its own memory-derived default, the smallest visible GPU's
+memory / 24 clamped to `[1 GiB, 8 GiB]` (0, i.e. off, with no GPU visible); it is **not**
+narrowed by an explicit GPU capacity, because it is a parallelism dial rather than a memory
+budget. Explicit `operator_params` values are applied afterward and still override each value
 individually.
 
 | Parameter | Default | Description |
@@ -539,7 +542,7 @@ individually.
 | `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
-| `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. The row count per scan is the larger of the planner's filtered estimate and the table function's unfiltered row count (DuckDB table row count, Parquet file cardinality), because the planner's filter selectivity under-counts range and `LIKE` filters by several times and under-counting admits too few GPUs. |
+| `admission_bytes_per_gpu` | smallest GPU memory / 24, clamped to [1 GiB, 8 GiB] | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. The default lands at 7.9 GiB on a GB200 (189 GiB), 8 GiB on a GB300, 3.3 GiB on an 80 GB H100, 1.9 GiB on an L40S, 1 GiB on a 24 GB L4; it was anchored on a 4× GB200, where 8 GiB was the largest value that left no TPC-H query at SF100 or SF1000 more than 5% slower than all GPUs, and it keeps sub-second queries on one GPU while being inert for anything larger. The row count per scan is the larger of the planner's filtered estimate and the table function's unfiltered row count (DuckDB table row count, Parquet file cardinality), because the planner's filter selectivity under-counts range and `LIKE` filters by several times and under-counting admits too few GPUs. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output and no source states a width. Parquet scans take the first file's average uncompressed bytes per value for columns stored without a dictionary; DuckDB tables take the statistics' maximum string length plus the 4-byte offset. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
 | `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input must be widened before aggregation. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
@@ -762,7 +765,7 @@ GPU task. Its histogram budget is engine-owned and applies per partition task.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU; `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` |
+| `admission_bytes_per_gpu` | smallest GPU memory / 24, clamped to [1 GiB, 8 GiB] | Target projected scan-output bytes per GPU; `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns when estimating scan output; must be greater than zero |
 
 Both take effect from the next query, since admission runs per query. `topology.gpus_per_query`
@@ -770,6 +773,7 @@ is YAML-only — it is read once when the GPU memory spaces are configured.
 
 ```sql
 SET admission_bytes_per_gpu = 34359738368;  -- 32 GiB
+SET admission_bytes_per_gpu = 0;            -- off: every query gets topology.gpus_per_query GPUs
 ```
 
 ### Dynamic Filters

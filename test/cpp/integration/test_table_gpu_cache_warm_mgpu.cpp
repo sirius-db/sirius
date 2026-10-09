@@ -88,7 +88,8 @@ void write_config(fs::path const& yaml_path)
        "    max_sort_partition_bytes: 0\n"
        "    hash_partition_bytes: 1000000\n"
        "    concat_batch_bytes: 100000000\n"
-       "    max_build_hash_table_bytes: 90000000\n";
+       "    max_build_hash_table_bytes: 90000000\n"
+       "    admission_bytes_per_gpu: 0\n";  // off: both GPUs must take part
 }
 
 /**
