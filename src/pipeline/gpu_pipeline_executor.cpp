@@ -20,6 +20,7 @@
 #include "cucascade/memory/stream_pool.hpp"
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
+#include "expression_evaluator/query_policy.hpp"
 #include "log/logging.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -405,6 +406,10 @@ void gpu_pipeline_executor::process_task(
             completion->report_error("GPU task retry or completion callback failed");
           }
         };
+        auto const& options =
+          pipeline ? pipeline->get_operator_params() : sirius::operator_params{};
+        sirius::scoped_expression_policy query_policy(
+          {options.expression_strategy, options.enable_regex_jit});
         try {
           if (completion) completion->record_task_started();
           task->execute(::cuda::stream_ref{exc_stream.get()});
