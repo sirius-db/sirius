@@ -233,15 +233,11 @@ impl SiriusComputeNodeService {
         let Some(desc) = params.desc_tbl.as_ref() else {
             return Ok(resolved);
         };
-        let is_cached_reference = desc.is_cached == Some(true)
-            && desc.slot_descriptors.as_ref().is_none_or(Vec::is_empty)
-            && desc.tuple_descriptors.is_empty()
-            && desc.table_descriptors.as_ref().is_none_or(Vec::is_empty);
         let mut cache = self
             .descriptor_tables
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if is_cached_reference {
+        if Self::is_cached_reference(desc) {
             resolved.desc_tbl = Some(
                 cache
                     .get(&query_id)
@@ -252,6 +248,15 @@ impl SiriusComputeNodeService {
             cache.insert(query_id, desc.clone());
         }
         Ok(resolved)
+    }
+
+    /// True for the empty table, marked `is_cached`, that StarRocks sends in place of a
+    /// descriptor table it already sent for the query.
+    fn is_cached_reference(desc: &TDescriptorTable) -> bool {
+        desc.is_cached == Some(true)
+            && desc.slot_descriptors.as_ref().is_none_or(Vec::is_empty)
+            && desc.tuple_descriptors.is_empty()
+            && desc.table_descriptors.as_ref().is_none_or(Vec::is_empty)
     }
 
     /// Writes the received fragment params to `$SIRIUS_CN_DUMP_FRAGMENTS/fragment-<seq>.txt`
@@ -313,9 +318,18 @@ impl SiriusComputeNodeService {
             );
         }
 
+        // The FE puts the query's descriptor table in common_param and gives each instance an
+        // empty one marked cached. Like the BE, which prepares common_param before any instance,
+        // cache the shared table for the query first.
+        self.resolve_descriptor_table(common)?;
+
         for (idx, instance) in instances.iter().enumerate() {
             let mut params = instance.clone();
-            if params.desc_tbl.is_none() {
+            if params
+                .desc_tbl
+                .as_ref()
+                .is_none_or(Self::is_cached_reference)
+            {
                 params.desc_tbl = common.desc_tbl.clone();
             }
             if params.query_globals.is_none() {
@@ -583,13 +597,25 @@ mod tests {
 
     #[test]
     fn exec_batch_plan_fragments_translates_tpch_single_node_scans() {
-        // This mirrors FE batch dispatch: shared descriptor metadata in common_param,
-        // with per-instance fragments carrying only their scan plan.
+        // This mirrors FE batch dispatch (`Deployer.execRemoteBatchFragmentsAsync`): the query's
+        // descriptor table is in common_param, and each instance carries its scan plan and an
+        // empty descriptor table marked cached.
+        let query_id = TUniqueId::new(9, 1);
+        let mut desc = tpch_desc_table();
+        desc.is_cached = Some(false);
+        let mut common = fragment_params(None, Some(desc));
+        common.params = Some(exec_params(query_id.clone(), TUniqueId::new(9, 2)));
+        let instance = |plan, instance_id| {
+            let cached = TDescriptorTable::new(None, Vec::new(), None, Some(true));
+            let mut params = fragment_params(Some(plan), Some(cached));
+            params.params = Some(exec_params(query_id.clone(), instance_id));
+            params
+        };
         let batch = TExecBatchPlanFragmentsParams::new(
-            Some(fragment_params(None, Some(tpch_desc_table()))),
+            Some(common),
             Some(vec![
-                fragment_params(Some(scan_plan(0, 0)), None),
-                fragment_params(Some(scan_plan(1, 1)), None),
+                instance(scan_plan(0, 0), TUniqueId::new(9, 2)),
+                instance(scan_plan(1, 1), TUniqueId::new(9, 3)),
             ]),
         );
         let result = call_exec_batch_plan_fragments(
@@ -599,7 +625,13 @@ mod tests {
             serialize_binary(&batch),
         );
 
-        assert_eq!(result.status.unwrap().status_code, TStatusCode::OK.0);
+        let status = result.status.unwrap();
+        assert_eq!(
+            status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            status.error_msgs
+        );
     }
 
     #[test]
