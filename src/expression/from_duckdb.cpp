@@ -309,6 +309,18 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
         return nullptr;
       }
     }
+    duckdb_re2::RE2::Options options;
+    options.set_log_errors(false);
+    duckdb_re2::RE2 const regex(pattern, options);
+    if (!regex.ok()) { return nullptr; }
+    // cuDF can compile empty-only patterns such as (?:) and a{0} into programs that never
+    // replace anything. RE2 bounds every possible match; two empty bounds prove that no
+    // nonempty match is possible. One byte is enough to distinguish this from a* or a?.
+    std::string min_match, max_match;
+    if (regex.PossibleMatchRange(&min_match, &max_match, 1) && min_match.empty() &&
+        max_match.empty()) {
+      return nullptr;
+    }
     auto const& replacement =
       duckdb::StringValue::Get(expr.children[2]->Cast<duckdb::BoundConstantExpression>().value);
     // cuDF's template syntax differs from RE2's. Only translate single-digit backreferences;
@@ -324,13 +336,10 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
     }
     if (has_backrefs && replacement.find("${") != std::string::npos) { return nullptr; }
     if (has_backrefs) {
-      duckdb_re2::RE2::Options options;
-      options.set_log_errors(false);
-      duckdb_re2::RE2 const regex(pattern, options);
       std::string error;
       // RE2 leaves the input unchanged for an out-of-range reference; cuDF throws.
       // Validate against the original captures before adding the GPU wrapper groups.
-      if (!regex.ok() || !regex.CheckRewriteString(replacement, &error)) { return nullptr; }
+      if (!regex.CheckRewriteString(replacement, &error)) { return nullptr; }
     }
   }
   auto arguments = translate_children(expr.children);

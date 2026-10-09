@@ -496,10 +496,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
         _stream,
         _mr);
     } else {
-      // An empty cuDF program performs no replacement; DuckDB's empty pattern matches at
-      // the beginning of every string. With a limit of one, it is equivalent to ^.
-      auto regex_prog =
-        cudf::strings::regex_program::create(pattern_str.empty() ? "^" : pattern_str);
+      auto regex_prog = cudf::strings::regex_program::create(pattern_str);
       return cudf::strings::replace_re(cudf::strings_column_view(input.get_column_view()),
                                        *regex_prog,
                                        cudf::string_scalar(replace_str, true, _stream, _mr),

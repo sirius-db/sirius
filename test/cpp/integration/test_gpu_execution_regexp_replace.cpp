@@ -85,11 +85,10 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
          "regexp_replace(s, '^a', 'X')",
          "regexp_replace(s, 'a$', 'X')",
          "regexp_replace(s, '[0-9]+', '#')",
-         "regexp_replace(s, '', 'X')",
-         "regexp_replace(s, '^', 'X')",
-         "regexp_replace(s, '$', 'X')",
          "regexp_replace(s, 'a*', 'X')",
          "regexp_replace(s, 'a?', 'X')",
+         "regexp_replace(s, 'a{0,1}', 'X')",
+         R"(regexp_replace(s, '\|', 'X'))",
        }) {
     INFO(expression);
     compare_gpu_vs_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
@@ -115,12 +114,45 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
          R"(regexp_replace(s, '([0-9]+)', '<\1>'))",
          R"(regexp_replace(s, '(a*)', '<\1>'))",
          R"(regexp_replace(s, '(a?)', '<\1>'))",
-         R"(regexp_replace(s, '()', '<\1>'))",
          R"(regexp_replace(s, '(a)|(b)', '<\1><\2>'))",
          R"(regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1'))",
        }) {
     INFO(expression);
     compare_gpu_vs_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "regexp_replace empty-only patterns fall back during planning",
+                 "[integration][gpu_execution][regexp_replace][regexp_replace_empty]")
+{
+  run_ok("CREATE TABLE regex_t(s VARCHAR);");
+  run_ok("INSERT INTO regex_t VALUES ('abc'), (''), (NULL), ('a'), ('aba'), ('éa'), ('|abc');");
+  run_ok("CHECKPOINT;");
+  for (auto const* pattern : {"(?:)",
+                              "a{0}",
+                              "",
+                              "()",
+                              "|",
+                              "(?:){2}",
+                              "(a){0}",
+                              "(?:a{0}|())",
+                              "(?:a{0})*",
+                              "^",
+                              "$",
+                              "^$"}) {
+    INFO(pattern);
+    expect_plan_fallback_matches_cpu(std::string{"SELECT regexp_replace(s, '"} + pattern +
+                                     "', 'X') FROM regex_t");
+    expect_plan_fallback_matches_cpu(std::string{"SELECT regexp_replace(s, '("} + pattern +
+                                     R"()', '<\1>') FROM regex_t)");
+  }
+  // These can consume text even though they also match empty input. The escaped pipe is
+  // a literal character, unlike the empty alternation above, and should stay on the GPU.
+  for (auto const* pattern : {"a*", "a?", "a{0,1}", R"(\|)"}) {
+    INFO(pattern);
+    compare_gpu_vs_cpu(std::string{"SELECT regexp_replace(s, '"} + pattern +
+                       "', 'X') FROM regex_t");
   }
 }
 
