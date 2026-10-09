@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -6,6 +5,7 @@ use std::time::Duration;
 
 use crate::ComputeNodeConfig;
 use crate::fe_report::ExecReports;
+use crate::recent_queries::{self, ENDED_NORMALLY, QueryEnds, RecentQueries, is_normal_end};
 /// Remote outputs ship while their fragment runs unless `SIRIUS_CN_STREAM_OUTPUT` is `0`, which
 /// ships them from parked output after the run, as before.
 fn stream_output_enabled() -> bool {
@@ -70,7 +70,9 @@ pub(crate) struct SiriusComputeNodeService {
     /// connections so a `fetch_data` poll sees what an `exec_plan_fragment` buffered.
     results: Arc<ResultStore>,
     /// Descriptor tables retained for StarRocks's per-query cache protocol.
-    descriptor_tables: Arc<Mutex<HashMap<FragmentInstanceId, TDescriptorTable>>>,
+    /// Descriptor tables retained for StarRocks's per-query cache protocol, by query. Dropped
+    /// when the query ends here; otherwise kept for the window that ended queries are.
+    descriptor_tables: Arc<Mutex<RecentQueries<TDescriptorTable>>>,
     /// Exchange rendezvous: receivers wait here until every sender has parked its output.
     exchanges: Arc<LocalExchange>,
     /// This CN's advertised brpc endpoint. A sink destination is local only when host and port
@@ -85,6 +87,56 @@ pub(crate) struct SiriusComputeNodeService {
     reports: Arc<ExecReports>,
     /// Survey mode (`SIRIUS_CN_TRANSLATE_ONLY`): accept and translate every fragment, run none.
     translate_only: bool,
+    /// How each recent query ended on this CN, shared with the exchange and the reports.
+    ends: Arc<QueryEnds>,
+}
+
+/// At most this many queries' descriptor tables are cached; past it the oldest is dropped.
+const CACHED_DESCRIPTOR_TABLES: usize = 4096;
+
+/// A cancel from the FE, as the CN acts on it.
+#[derive(Debug)]
+struct Cancel {
+    /// A normal end (QUERY_FINISHED, LIMIT_REACH): the query succeeded.
+    finished: bool,
+    /// The FE's reason, for logs.
+    reason: &'static str,
+    /// What the query's refusals and reports say: the FE's error message when it sent one.
+    error: String,
+}
+
+impl Cancel {
+    fn of(request: &PCancelPlanFragmentRequest) -> Self {
+        use crate::proto::starrocks::PPlanFragmentCancelReason as Reason;
+        let reason = request
+            .cancel_reason
+            .and_then(|reason| Reason::try_from(reason).ok());
+        let finished = matches!(reason, Some(Reason::QueryFinished | Reason::LimitReach));
+        if finished {
+            let reason = reason.map_or("UNSET", |reason| reason.as_str_name());
+            return Self {
+                finished,
+                reason,
+                error: format!("{ENDED_NORMALLY} ({reason})"),
+            };
+        }
+        let described = match reason {
+            Some(Reason::QueryFinished | Reason::LimitReach) => unreachable!("handled above"),
+            Some(Reason::UserCancel) => "the user cancelled the query",
+            Some(Reason::Timeout) => "the query timed out",
+            Some(Reason::InternalError) | None => "the FE cancelled the query",
+        };
+        let message = request
+            .error_message
+            .as_deref()
+            .filter(|message| !message.is_empty())
+            .unwrap_or(described);
+        Self {
+            finished,
+            reason: reason.map_or("UNSET", |reason| reason.as_str_name()),
+            error: format!("query cancelled: {message}"),
+        }
+    }
 }
 
 /// The runtime filters a fragment run applies, and the plan to run instead if their keys cannot
@@ -138,26 +190,31 @@ impl SiriusComputeNodeService {
         compute_node: &ComputeNodeConfig,
         nixl: Option<Arc<dyn NixlEndpoint>>,
     ) -> Self {
+        let ends = Arc::new(QueryEnds::default());
         Self {
             translator: PlanTranslator::new(),
             executor,
             results: Arc::new(ResultStore::default()),
-            descriptor_tables: Arc::new(Mutex::new(HashMap::new())),
-            exchanges: Arc::new(LocalExchange::default()),
+            descriptor_tables: Arc::new(Mutex::new(RecentQueries::new(
+                recent_queries::REMEMBER_FOR,
+                CACHED_DESCRIPTOR_TABLES,
+            ))),
+            exchanges: Arc::new(LocalExchange::new(Arc::clone(&ends))),
             brpc_address: TNetworkAddress::new(
                 compute_node.advertise_host.to_string(),
                 i32::from(compute_node.brpc_port),
             ),
             nixl,
             filters: Arc::new(RuntimeFilters::default()),
-            reports: Arc::new(ExecReports::default()),
+            reports: Arc::new(ExecReports::new(None, Arc::clone(&ends))),
             translate_only: std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some(),
+            ends,
         }
     }
 
     /// Reports instances' ends only to coordinators on `frontend_host`, the configured FE.
     pub(crate) fn reporting_to(mut self, frontend_host: Option<crate::Host>) -> Self {
-        self.reports = Arc::new(ExecReports::new(frontend_host));
+        self.reports = Arc::new(ExecReports::new(frontend_host, Arc::clone(&self.ends)));
         self
     }
 }
@@ -184,7 +241,7 @@ impl PInternalService for SiriusComputeNodeService {
         .await;
         let status = match outcome {
             Ok(Ok(())) => Self::ok_status(),
-            Ok(Err(err)) => Self::internal_error(err),
+            Ok(Err(status)) => status,
             Err(join_err) => {
                 Self::internal_error(format!("fragment execution task panicked: {join_err}"))
             }
@@ -210,7 +267,7 @@ impl PInternalService for SiriusComputeNodeService {
         .await;
         let status = match outcome {
             Ok(Ok(())) => Self::ok_status(),
-            Ok(Err(err)) => Self::internal_error(err),
+            Ok(Err(status)) => status,
             Err(join_err) => Self::internal_error(format!(
                 "batch fragment execution task panicked: {join_err}"
             )),
@@ -245,7 +302,8 @@ impl PInternalService for SiriusComputeNodeService {
             }
         };
         if outcome.eos {
-            self.reports.delivered(id);
+            self.ends.delivered(id);
+            self.forget_descriptor_table(id);
         }
         match outcome.batch {
             Some(batch) => match batch.to_binary() {
@@ -315,9 +373,11 @@ impl PInternalService for SiriusComputeNodeService {
         Ok(result.into())
     }
 
-    /// Handles the FE's cancel of a failed or finished query. The FE sends one per CN with the
-    /// query id and a dummy instance id, so the whole query is purged. Answers at once: dropping
-    /// parked output waits on the engine thread, which may be running another fragment.
+    /// Handles the FE's cancel of a failed or finished query. The FE sends one per instance it
+    /// still thinks is running, each naming the query, so the first purges the whole query and
+    /// the rest only count. A normal end (QUERY_FINISHED, LIMIT_REACH) releases what the query
+    /// holds quietly; any other reason fails it. Answers at once: dropping parked output waits on
+    /// the engine thread, which may be running another fragment.
     #[instrument(skip_all)]
     async fn cancel_plan_fragment(
         &self,
@@ -328,14 +388,30 @@ impl PInternalService for SiriusComputeNodeService {
             || FragmentInstanceId::from(&request.finst_id),
             FragmentInstanceId::from,
         );
-        let reason = request
-            .error_message
-            .unwrap_or_else(|| "the FE cancelled the query".to_string());
-        // Before the purge, so an instance that fails because of it reports CANCELLED too.
-        self.reports.cancel_query(query, &reason);
+        let cancel = Cancel::of(&request);
+        // Recorded before replying, so a fragment or frame of the query that arrives while the
+        // purge below is still queued is already refused.
+        let cancels = self.ends.cancel(query, &cancel.error);
+        if cancels > 1 {
+            info!(%query, cancels, reason = cancel.reason, "the FE cancelled a query again");
+            return Ok(PCancelPlanFragmentResult {
+                status: Self::ok_status(),
+            }
+            .into());
+        }
+        if cancel.finished {
+            info!(%query, reason = cancel.reason, "the FE ended a finished query");
+        } else {
+            warn!(%query, reason = cancel.reason, error = cancel.error, "the FE cancelled a failed query");
+        }
+        self.reports.cancel_query(query, &cancel.error);
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
-            service.fail_and_purge(query, &format!("query cancelled: {reason}"));
+            if cancel.finished {
+                service.release_query(query, &cancel.error);
+            } else {
+                service.fail_and_purge(query, &cancel.error);
+            }
             service.log_leak_counters("cancel");
         });
         Ok(PCancelPlanFragmentResult {
@@ -389,11 +465,27 @@ impl SiriusComputeNodeService {
         &self,
         protocol: Option<&str>,
         attachment: &[u8],
-    ) -> std::result::Result<(), String> {
-        Self::ensure_binary_protocol(protocol)?;
-        let params = Self::deserialize_binary::<TExecPlanFragmentParams>(attachment)
-            .map_err(|err| format!("failed to deserialize TExecPlanFragmentParams: {err}"))?;
+    ) -> std::result::Result<(), StatusPb> {
+        Self::ensure_binary_protocol(protocol).map_err(Self::internal_error)?;
+        let params =
+            Self::deserialize_binary::<TExecPlanFragmentParams>(attachment).map_err(|err| {
+                Self::internal_error(format!(
+                    "failed to deserialize TExecPlanFragmentParams: {err}"
+                ))
+            })?;
         self.process_fragment(&params)
+            .map_err(|err| self.dispatch_error(&params, err))
+    }
+
+    /// The status a failed dispatch of `params` replies with. Once the FE ended the query (it
+    /// cancelled it, or this CN delivered its last row), the refusal is CANCELLED, which the FE
+    /// ignores after a successful query, rather than an error that would fail or retry a query
+    /// that already returned its rows.
+    fn dispatch_error(&self, params: &TExecPlanFragmentParams, err: String) -> StatusPb {
+        match Self::query_id(params) {
+            Some(query) if self.ends.ended_by_fe(query) => Self::cancelled(err),
+            _ => Self::internal_error(err),
+        }
     }
 
     /// Executes an `ADMIN EXECUTE` script: parse, then run each command on the fragment
@@ -459,6 +551,16 @@ impl SiriusComputeNodeService {
         &self,
         params: &TExecPlanFragmentParams,
     ) -> std::result::Result<(), String> {
+        // A fragment of a query that already ended here, failed or cancelled, never runs: a cancel
+        // can overtake its dispatch. Its reply carries the refusal, so it owes no report.
+        if let Some(instance) = Self::fragment_instance_id(params)
+            && let Some(cause) = self.exchanges.failure(instance)
+        {
+            info!(%instance, cause, "refusing a fragment of a query that already ended");
+            return Err(format!(
+                "{cause} (fragment instance {instance} came after its query ended)"
+            ));
+        }
         self.reports.expect(params);
         let run = || {
             self.run_or_register(params)
@@ -535,6 +637,17 @@ impl SiriusComputeNodeService {
             return Ok(ready.into_iter().collect());
         }
         if self.defer_for_filters(&params) {
+            // A cancel that purged the query after the check at dispatch would leave the scan
+            // waiting, then run it unfiltered; take it back instead.
+            if let Some(instance) = Self::fragment_instance_id(&params)
+                && let Some(cause) = self.exchanges.failure(instance)
+                && self.filters.take(instance).is_some()
+            {
+                return Err(format!(
+                    "{cause} (fragment instance {instance} came after its query ended)"
+                )
+                .into());
+            }
             // The scan runs once its filters' keys arrived; they may be here already.
             self.dispatch_filtered_scans();
             return Ok(Vec::new());
@@ -813,6 +926,23 @@ impl SiriusComputeNodeService {
             .map(FragmentInstanceId::from)
             .ok_or("Failed transmit_chunk is missing finst_id")?;
         let (sender_id, node_id) = (request.sender_id, request.node_id);
+        if is_normal_end(error) {
+            // The query ended normally on the sender's CN: end it here quietly too, reporting
+            // CANCELLED, never an error that would fail a query that succeeded.
+            if self.ends.end_normally(receiver, error) {
+                info!(%receiver, ?sender_id, ?node_id, error, "a remote sender's query ended");
+                let service = self.clone();
+                let error = error.to_string();
+                let _ = std::thread::Builder::new()
+                    .name("exchange-ended".to_string())
+                    .spawn(move || {
+                        service.reports.cancel_query(receiver, &error);
+                        service.release_query(receiver, &error);
+                        service.log_leak_counters("remote sender ended");
+                    });
+            }
+            return Ok(());
+        }
         // Instance ids share their query's hi half, which is all the purge matches on.
         if !self.exchanges.mark_failed(receiver, error) {
             info!(
@@ -929,14 +1059,23 @@ impl SiriusComputeNodeService {
         if is_cached_reference {
             resolved.desc_tbl = Some(
                 cache
-                    .get(&query_id)
+                    .get(query_id.query_hi())
                     .cloned()
                     .ok_or_else(|| format!("descriptor table cache miss for query {query_id}"))?,
             );
         } else {
-            cache.insert(query_id, desc.clone());
+            *cache.get_or_insert_with(query_id.query_hi(), || desc.clone()) = desc.clone();
         }
         Ok(resolved)
+    }
+
+    /// Drops `query`'s (any instance id of it) cached descriptor table: nothing of it runs here
+    /// any more.
+    fn forget_descriptor_table(&self, query: FragmentInstanceId) {
+        self.descriptor_tables
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(query.query_hi());
     }
 
     /// Writes the received fragment params to `$SIRIUS_CN_DUMP_FRAGMENTS/fragment-<seq>.txt`
@@ -1282,7 +1421,19 @@ impl SiriusComputeNodeService {
     /// Receivers and deferred scans dropped here never run, so their remote receivers get a
     /// failure frame in place of the EOS they would have sent.
     fn fail_and_purge(&self, query: FragmentInstanceId, error: &str) {
+        self.purge(query, error, true);
+    }
+
+    /// Frees what `query` still holds after the FE ended it normally: what is left (a LIMIT that
+    /// stopped the query early, say) is dropped quietly, without failure frames or a failure log.
+    /// The query is then refused like a failed one, with `reason`.
+    fn release_query(&self, query: FragmentInstanceId, reason: &str) {
+        self.purge(query, reason, false);
+    }
+
+    fn purge(&self, query: FragmentInstanceId, error: &str, failed: bool) {
         self.results.fail_query(query, error);
+        self.forget_descriptor_table(query);
         let deferred = self.filters.purge_query(query);
         let purged = self.exchanges.purge_query(query, error);
         for params in deferred
@@ -1290,7 +1441,9 @@ impl SiriusComputeNodeService {
             .map(|scan| &scan.params)
             .chain(&purged.receivers)
         {
-            self.fail_remote_hops(params, error);
+            if failed {
+                self.fail_remote_hops(params, error);
+            }
             self.reports.finish(params, Err(error));
         }
         if let Some(nixl) = &self.nixl {
@@ -1303,15 +1456,29 @@ impl SiriusComputeNodeService {
                 warn!(?slot, error = %err, "failed to drop a purged query's parked output");
             }
         }
-        info!(
-            %query,
-            released_buffers = purged.tokens.len(),
-            dropped_parked = purged.slots.len(),
-            dropped_receivers = purged.receivers.len(),
-            deferred_scans = deferred.len(),
-            error,
-            "purged a failed query's exchange state"
-        );
+        let (released_buffers, dropped_parked) = (purged.tokens.len(), purged.slots.len());
+        let (dropped_receivers, deferred_scans) = (purged.receivers.len(), deferred.len());
+        if failed {
+            info!(
+                %query,
+                released_buffers,
+                dropped_parked,
+                dropped_receivers,
+                deferred_scans,
+                error,
+                "purged a failed query's exchange state"
+            );
+        } else {
+            info!(
+                %query,
+                released_buffers,
+                dropped_parked,
+                dropped_receivers,
+                deferred_scans,
+                reason = error,
+                "released a finished query's exchange state"
+            );
+        }
     }
 
     /// Ends `params`' remote hops with a failure frame unless the transport already ended them,
@@ -1331,6 +1498,11 @@ impl SiriusComputeNodeService {
         let Some(nixl) = &self.nixl else {
             return;
         };
+        // Nothing failed: the receivers end with their own cancel from the FE. A failure frame
+        // would make a CN that has not had it yet report a query that succeeded as failed.
+        if is_normal_end(error) {
+            return;
+        }
         let (Some(sink), Some(exec)) = (
             params
                 .fragment
@@ -1497,22 +1669,28 @@ impl SiriusComputeNodeService {
         &self,
         protocol: Option<&str>,
         attachment: &[u8],
-    ) -> std::result::Result<(), String> {
-        Self::ensure_binary_protocol(protocol)?;
-        let batch = Self::deserialize_binary::<TExecBatchPlanFragmentsParams>(attachment)
-            .map_err(|err| format!("failed to deserialize TExecBatchPlanFragmentsParams: {err}"))?;
-        let common = batch
-            .common_param
-            .as_ref()
-            .ok_or_else(|| "TExecBatchPlanFragmentsParams.common_param is missing".to_string())?;
+    ) -> std::result::Result<(), StatusPb> {
+        Self::ensure_binary_protocol(protocol).map_err(Self::internal_error)?;
+        let batch = Self::deserialize_binary::<TExecBatchPlanFragmentsParams>(attachment).map_err(
+            |err| {
+                Self::internal_error(format!(
+                    "failed to deserialize TExecBatchPlanFragmentsParams: {err}"
+                ))
+            },
+        )?;
+        let common = batch.common_param.as_ref().ok_or_else(|| {
+            Self::internal_error("TExecBatchPlanFragmentsParams.common_param is missing")
+        })?;
         let instances = batch.unique_param_per_instance.as_ref().ok_or_else(|| {
-            "TExecBatchPlanFragmentsParams.unique_param_per_instance is missing".to_string()
+            Self::internal_error(
+                "TExecBatchPlanFragmentsParams.unique_param_per_instance is missing",
+            )
         })?;
 
         if instances.is_empty() {
-            return Err(
-                "TExecBatchPlanFragmentsParams.unique_param_per_instance is empty".to_string(),
-            );
+            return Err(Self::internal_error(
+                "TExecBatchPlanFragmentsParams.unique_param_per_instance is empty",
+            ));
         }
 
         for (idx, instance) in instances.iter().enumerate() {
@@ -1534,7 +1712,7 @@ impl SiriusComputeNodeService {
             }
 
             self.process_fragment(&params)
-                .map_err(|err| format!("fragment {idx}: {err}"))?;
+                .map_err(|err| self.dispatch_error(&params, format!("fragment {idx}: {err}")))?;
         }
 
         Ok(())
@@ -2969,13 +3147,23 @@ mod tests {
     }
 
     fn cancel(service: &SiriusComputeNodeService, query: i64) -> StatusPb {
-        // As the FE sends it: the query id, and a dummy instance id.
+        cancel_with(service, query, None, Some("injected"))
+    }
+
+    /// As the FE sends it: the query id, an instance id, the reason, and for INTERNAL_ERROR the
+    /// error that failed the query.
+    fn cancel_with(
+        service: &SiriusComputeNodeService,
+        query: i64,
+        reason: Option<crate::proto::starrocks::PPlanFragmentCancelReason>,
+        message: Option<&str>,
+    ) -> StatusPb {
         let request = PCancelPlanFragmentRequest {
-            finst_id: PUniqueId { hi: 0, lo: 0 },
-            cancel_reason: None,
+            finst_id: PUniqueId { hi: query, lo: 1 },
+            cancel_reason: reason.map(|reason| reason as i32),
             is_pipeline: Some(true),
             query_id: Some(PUniqueId { hi: query, lo: 0 }),
-            error_message: Some("injected".to_string()),
+            error_message: message.map(str::to_string),
         };
         let response = route(
             service,
@@ -3326,7 +3514,6 @@ mod tests {
         let status = exec(&b, &result);
         assert_eq!(status.status_code, TStatusCode::INTERNAL_ERROR.0);
         assert!(status.error_msgs[0].contains("scan exploded"), "{status:?}");
-        assert!(fetch_error(&b, 44, 10).contains("scan exploded"));
         assert!(idle(&b));
     }
 
@@ -3594,10 +3781,374 @@ mod tests {
         assert_eq!(
             report_ends(&frontend.wait_for(2)),
             [
-                (1, TStatusCode::CANCELLED, "injected".to_string()),
-                (2, TStatusCode::CANCELLED, "injected".to_string())
+                (
+                    1,
+                    TStatusCode::CANCELLED,
+                    "query cancelled: injected".to_string()
+                ),
+                (
+                    2,
+                    TStatusCode::CANCELLED,
+                    "query cancelled: injected".to_string()
+                )
             ]
         );
+    }
+
+    #[test]
+    fn a_cancel_before_dispatch_keeps_late_fragments_off_the_gpu() {
+        use crate::proto::starrocks::PPlanFragmentCancelReason as Reason;
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        assert_eq!(
+            cancel_with(&service, 60, Some(Reason::UserCancel), None).status_code,
+            TStatusCode::OK.0
+        );
+        let mut leaf = query_fragment(60, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut leaf, 10, 8060);
+        reports_to(&mut leaf, &frontend, 2);
+        let mut receiver = query_fragment(60, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut receiver, 2, 1);
+        reports_to(&mut receiver, &frontend, 1);
+        for late in [&leaf, &receiver] {
+            let status = exec(&service, late);
+            assert_eq!(status.status_code, TStatusCode::CANCELLED.0);
+            assert!(
+                status.error_msgs[0].starts_with("query cancelled: the user cancelled the query"),
+                "{status:?}"
+            );
+        }
+        assert!(executor.runs.lock().unwrap().is_empty(), "nothing ran");
+        assert!(
+            frontend.wait_for(0).is_empty(),
+            "the replies carried the refusals"
+        );
+        assert!(idle(&service));
+    }
+
+    #[test]
+    fn a_cancel_after_the_query_finished_changes_nothing() {
+        use crate::proto::starrocks::PPlanFragmentCancelReason as Reason;
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let service = SiriusComputeNodeService::new();
+        let mut result = query_fragment(61, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        reports_to(&mut result, &frontend, 1);
+        exec_ok(&service, &result);
+        let mut sender = query_fragment(61, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 8060);
+        reports_to(&mut sender, &frontend, 2);
+        exec_ok(&service, &sender);
+        for _ in 0..2 {
+            route(
+                &service,
+                methods::FETCH_DATA,
+                fetch_request(61, 10),
+                Vec::new(),
+            );
+        }
+        // One cancel per instance the FE still thinks runs; the second is only counted.
+        for _ in 0..2 {
+            let status = cancel_with(&service, 61, Some(Reason::QueryFinished), None);
+            assert_eq!(status.status_code, TStatusCode::OK.0);
+        }
+        assert_eq!(
+            report_ends(&frontend.wait_for(2)),
+            [
+                (1, TStatusCode::OK, String::new()),
+                (2, TStatusCode::OK, String::new())
+            ]
+        );
+        assert_eq!(
+            service.ends.cancels(FragmentInstanceId::from_halves(61, 0)),
+            2,
+            "both cancels counted"
+        );
+        eventually("the release", || {
+            service
+                .exchanges
+                .failure(FragmentInstanceId::from_halves(61, 0))
+                == Some("the query ended normally (QUERY_FINISHED)".to_string())
+        });
+        assert!(idle(&service));
+    }
+
+    /// A failure frame a fake NIXL side sent: where, for which receiver, and the error.
+    type FailureFrame = (SocketAddr, SenderSlot, String);
+
+    /// CN a holds a receiver of `query` that waits for a sender and sends to CN b, as when a LIMIT
+    /// ends a query early; the FE cancels it with `reason` and `message`. Returns the reports and
+    /// the failure frames a sent.
+    fn cancel_a_waiting_receiver(
+        query: i64,
+        reason: crate::proto::starrocks::PPlanFragmentCancelReason,
+        message: Option<&str>,
+    ) -> (Vec<(i32, TStatusCode, String)>, Vec<FailureFrame>) {
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let (a, a_nixl) = nixl_service(Arc::new(StubExecutor));
+        let mut receiver = query_fragment(query, 11, exchange_plan_node(3, 0), stream_sink(2));
+        expect_senders(&mut receiver, 3, 1);
+        send_to(&mut receiver, 10, 18060);
+        reports_to(&mut receiver, &frontend, 1);
+        exec_ok(&a, &receiver);
+        assert_eq!(
+            cancel_with(&a, query, Some(reason), message).status_code,
+            TStatusCode::OK.0
+        );
+        eventually("a to release the query", || idle(&a));
+        let reports = report_ends(&frontend.wait_for(1));
+        let failed = a_nixl.failed.lock().unwrap().clone();
+        (reports, failed)
+    }
+
+    #[test]
+    fn a_normal_end_releases_what_is_left_without_failing_the_query() {
+        use crate::proto::starrocks::PPlanFragmentCancelReason as Reason;
+        for (query, reason, said) in [
+            (
+                62,
+                Reason::QueryFinished,
+                "the query ended normally (QUERY_FINISHED)",
+            ),
+            (
+                63,
+                Reason::LimitReach,
+                "the query ended normally (LIMIT_REACH)",
+            ),
+        ] {
+            let (reports, failed) = cancel_a_waiting_receiver(query, reason, None);
+            assert_eq!(reports, [(1, TStatusCode::CANCELLED, said.to_string())]);
+            assert!(
+                failed.is_empty(),
+                "no failure frame for a query that succeeded"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_kill_or_an_internal_error_fails_the_query() {
+        use crate::proto::starrocks::PPlanFragmentCancelReason as Reason;
+        for (query, reason, message, said) in [
+            (
+                64,
+                Reason::UserCancel,
+                None,
+                "query cancelled: the user cancelled the query",
+            ),
+            (
+                65,
+                Reason::Timeout,
+                None,
+                "query cancelled: the query timed out",
+            ),
+            (
+                66,
+                Reason::InternalError,
+                Some("scan exploded on cn2"),
+                "query cancelled: scan exploded on cn2",
+            ),
+        ] {
+            let (reports, failed) = cancel_a_waiting_receiver(query, reason, message);
+            assert_eq!(reports, [(1, TStatusCode::CANCELLED, said.to_string())]);
+            assert_eq!(
+                failed
+                    .iter()
+                    .map(|(_, slot, error)| (*slot, error.as_str()))
+                    .collect::<Vec<_>>(),
+                [(exchange_slot(query, 10, 2), said)],
+                "the waiting receiver's destination is told"
+            );
+        }
+    }
+
+    /// Dispatches `params` alone in a batch, as the FE's batch dispatch does.
+    fn exec_batch(
+        service: &SiriusComputeNodeService,
+        params: &TExecPlanFragmentParams,
+    ) -> StatusPb {
+        let batch = TExecBatchPlanFragmentsParams::new(
+            Some(fragment_params(None, Some(desc_table()))),
+            Some(vec![params.clone()]),
+        );
+        let response = route(
+            service,
+            methods::EXEC_BATCH_PLAN_FRAGMENTS,
+            PExecBatchPlanFragmentsRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&batch),
+        );
+        PExecBatchPlanFragmentsResult::decode(response.body.as_slice())
+            .unwrap()
+            .status
+            .unwrap()
+    }
+
+    #[test]
+    fn a_fragment_refused_after_the_fe_ended_its_query_replies_cancelled() {
+        // After a normal end the FE ignores CANCELLED but would retry a query that already
+        // returned its rows on any other error, so a late dispatch replies CANCELLED, single or
+        // batched. A query that failed here, with no word from the FE yet, still replies with the
+        // error.
+        use crate::proto::starrocks::PPlanFragmentCancelReason as Reason;
+        let service = SiriusComputeNodeService::new();
+        for (query, reason) in [(67, Reason::QueryFinished), (68, Reason::LimitReach)] {
+            assert_eq!(
+                cancel_with(&service, query, Some(reason), None).status_code,
+                TStatusCode::OK.0
+            );
+            let mut late = query_fragment(query, 11, scan_node(0, 0), stream_sink(2));
+            send_to(&mut late, 10, 8060);
+            let status = exec(&service, &late);
+            assert_eq!(status.status_code, TStatusCode::CANCELLED.0, "{status:?}");
+            assert!(
+                status.error_msgs[0].starts_with(ENDED_NORMALLY),
+                "{status:?}"
+            );
+            let status = exec_batch(&service, &late);
+            assert_eq!(status.status_code, TStatusCode::CANCELLED.0, "{status:?}");
+        }
+        assert!(
+            service
+                .exchanges
+                .mark_failed(FragmentInstanceId::from_halves(69, 0), "scan exploded")
+        );
+        let mut late = query_fragment(69, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut late, 10, 8060);
+        assert_eq!(
+            exec(&service, &late).status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+    }
+
+    #[test]
+    fn a_cancel_refuses_the_query_before_its_purge_runs() {
+        // The purge waits for a blocking thread; the only one is busy. The cancel's reply must
+        // already refuse a fragment of the query arriving in that gap.
+        use crate::proto::starrocks::PPlanFragmentCancelReason as Reason;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let blocker = runtime.spawn_blocking(move || {
+            let _ = gate.recv();
+        });
+        let service = SiriusComputeNodeService::new();
+        let request = PCancelPlanFragmentRequest {
+            finst_id: PUniqueId { hi: 70, lo: 1 },
+            cancel_reason: Some(Reason::UserCancel as i32),
+            is_pipeline: Some(true),
+            query_id: Some(PUniqueId { hi: 70, lo: 0 }),
+            error_message: None,
+        };
+        runtime
+            .block_on(service.cancel_plan_fragment(request, Vec::new()))
+            .unwrap();
+        let mut late = query_fragment(70, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut late, 10, 8060);
+        let refused = service.process_fragment(&late).unwrap_err();
+        assert!(
+            refused.starts_with("query cancelled: the user cancelled the query"),
+            "{refused}"
+        );
+        release.send(()).unwrap();
+        runtime.block_on(blocker).unwrap();
+    }
+
+    /// Fails every run with the given error, before the fragment produces anything.
+    #[derive(Debug)]
+    struct FailingWith(String);
+
+    impl FragmentExecutor for FailingWith {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn run_fragment(&self, _run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn a_normal_end_never_reaches_another_cn_as_a_failure() {
+        // On the sender's CN: a fragment that stops because its query ended normally sends no
+        // failure frame.
+        let ended = format!("{ENDED_NORMALLY} (QUERY_FINISHED)");
+        let (a, a_nixl) = nixl_service(Arc::new(FailingWith(ended.clone())));
+        let mut sender = query_fragment(71, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 18060);
+        assert_ne!(exec(&a, &sender).status_code, TStatusCode::OK.0);
+        assert!(a_nixl.failed.lock().unwrap().is_empty());
+
+        // On a receiving CN, should such a frame come anyway: the waiting receiver ends quietly,
+        // reporting CANCELLED, and passes nothing on.
+        let frontend = crate::fe_report::fake_frontend::FakeFrontend::start(TStatusCode::OK);
+        let (b, b_nixl) = nixl_service(Arc::new(StubExecutor));
+        let mut receiver = query_fragment(72, 10, exchange_plan_node(2, 0), stream_sink(3));
+        expect_senders(&mut receiver, 2, 1);
+        send_to(&mut receiver, 12, 18060);
+        reports_to(&mut receiver, &frontend, 1);
+        exec_ok(&b, &receiver);
+        let failed = NixlEnvelope::Failed {
+            error: ended.clone(),
+        };
+        let params = nixl_chunk::failed_params(exchange_slot(72, 10, 2));
+        assert_eq!(
+            transmit(&b, params, failed).0.status_code,
+            TStatusCode::OK.0
+        );
+        assert_eq!(
+            report_ends(&frontend.wait_for(1)),
+            [(1, TStatusCode::CANCELLED, ended)]
+        );
+        eventually("b to release the query", || idle(&b));
+        assert!(b_nixl.failed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_query_that_ended_frees_its_descriptor_table() {
+        use crate::proto::starrocks::PPlanFragmentCancelReason as Reason;
+        let service = SiriusComputeNodeService::new();
+        let cached = |query| {
+            service
+                .descriptor_tables
+                .lock()
+                .unwrap()
+                .get(FragmentInstanceId::from_halves(query, 0).query_hi())
+                .is_some()
+        };
+        // Once its result sink delivered the last row.
+        let mut result = query_fragment(73, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        exec_ok(&service, &result);
+        let mut sender = query_fragment(73, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 8060);
+        exec_ok(&service, &sender);
+        assert!(cached(73));
+        for _ in 0..2 {
+            route(
+                &service,
+                methods::FETCH_DATA,
+                fetch_request(73, 10),
+                Vec::new(),
+            );
+        }
+        assert!(!cached(73));
+
+        // Once the FE cancels it.
+        let mut waiting = query_fragment(74, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut waiting, 2, 1);
+        exec_ok(&service, &waiting);
+        assert!(cached(74));
+        cancel_with(&service, 74, Some(Reason::UserCancel), None);
+        eventually("the purge", || !cached(74));
     }
 
     #[test]
