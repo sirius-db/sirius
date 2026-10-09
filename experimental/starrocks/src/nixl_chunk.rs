@@ -208,7 +208,7 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
     fn local_md(&self) -> Vec<u8>;
 
     /// Receive buffers for a batch with `layout`, without waiting for memory.
-    fn allocate(&self, layout: &[u8]) -> Result<AllocReply, String>;
+    fn allocate(&self, layout: &[u8]) -> Result<AllocReply, AllocError>;
 
     /// Frees a receive token that will not be pushed. Unknown and consumed tokens are ignored.
     fn release(&self, token: u64);
@@ -240,6 +240,23 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
     /// [`stream`](Self::stream) already end each hop they were given this way when it fails.
     /// Best effort, and returns without waiting for the peer.
     fn fail(&self, peer: SocketAddr, slot: SenderSlot, error: &str);
+}
+
+/// Why a receive allocation failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AllocError {
+    /// The receive pool has no room now; it may have once memory is freed.
+    PoolFull(String),
+    /// Anything else, which waiting would not change.
+    Failed(String),
+}
+
+impl From<AllocError> for String {
+    fn from(err: AllocError) -> Self {
+        match err {
+            AllocError::PoolFull(err) | AllocError::Failed(err) => err,
+        }
+    }
 }
 
 /// One remote output streamed while its fragment runs.

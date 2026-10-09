@@ -31,6 +31,8 @@ use crate::fragment_executor::{
 };
 use crate::local_exchange::RemoteBatch;
 use crate::parked_registry::ParkedRegistry;
+use crate::result_store::FragmentInstanceId;
+use crate::running_query::{PendingFree, PendingFrees, RunningQuery};
 
 /// One fragment execution handed to the engine thread.
 struct ExecuteRequest {
@@ -55,6 +57,8 @@ struct ExecuteRequest {
     /// The plan and stream schemas without the runtime filters, run instead when their keys
     /// cannot be copied.
     fallback: Option<(Vec<u8>, Vec<StreamInputSchema>)>,
+    /// The query the fragment belongs to, so a purge of it can stop the run.
+    query: Option<FragmentInstanceId>,
     /// Channel the engine thread sends the result (or a flattened error) back on.
     respond: Sender<Result<Option<FragmentResult>, String>>,
 }
@@ -72,10 +76,12 @@ enum EngineRequest {
         keys: FilterKeys,
         respond: Sender<Result<KeyStats, String>>,
     },
-    /// Drop one destination's claim on parked output.
+    /// Drop one destination's claim on parked output. Without `respond` nobody waits for it, and
+    /// `pending` marks the drop done once the engine thread got to it.
     DropParked {
         slot: SenderSlot,
-        respond: Sender<Result<(), String>>,
+        respond: Option<Sender<Result<(), String>>>,
+        pending: Option<PendingFree>,
     },
     /// Pin a table into the engine's scan cache (driven by `ADMIN EXECUTE ON <id> '<script>'`).
     /// Deliberately funneled through this channel: pinning mutates the scan registry inside its
@@ -110,7 +116,30 @@ pub struct SiriusEngine {
     /// Parked sender fragments, published by the engine thread after every request so a reader
     /// never waits behind a running fragment.
     parked: Arc<AtomicUsize>,
+    /// The query of the run in progress, so a purge interrupts that run and no other.
+    running: Arc<RunningQuery>,
+    /// Stops the run in progress from any thread.
+    interrupter: Arc<Interrupter>,
+    /// Parked output whose drop is queued, and interrupted runs that have not returned.
+    frees: Arc<PendingFrees>,
 }
+
+/// The engine's [`sirius::Interrupter`], which has no `Debug` of its own.
+struct Interrupter(sirius::Interrupter);
+
+impl std::fmt::Debug for Interrupter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Interrupter")
+    }
+}
+
+/// How often a purge repeats its interrupt while the run it targets has not returned: one that
+/// lands before the run's gate opens is dropped.
+const INTERRUPT_EVERY: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// How long a purge goes on interrupting a run that does not return (one blocked waiting for a
+/// memory reservation, say), so its pending free is not held for good.
+const INTERRUPT_FOR: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl SiriusEngine {
     /// Brings up the engine on a dedicated thread (fail-fast) and returns a handle.
@@ -123,16 +152,21 @@ impl SiriusEngine {
         let (ready_tx, ready_rx) = channel();
         let parked = Arc::new(AtomicUsize::new(0));
         let published = Arc::clone(&parked);
+        let running = Arc::new(RunningQuery::default());
+        let engine_running = Arc::clone(&running);
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
-            .spawn(move || engine_thread(config, request_rx, ready_tx, published))
+            .spawn(move || engine_thread(config, request_rx, ready_tx, published, engine_running))
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
-            Ok(Ok(direct_exchange)) => Ok(Self {
+            Ok(Ok((direct_exchange, interrupter))) => Ok(Self {
                 requests: Mutex::new(Some(request_tx)),
                 thread: Mutex::new(Some(thread)),
                 direct_exchange: direct_exchange.map(Arc::new),
                 parked,
+                running,
+                interrupter: Arc::new(Interrupter(interrupter)),
+                frees: Arc::default(),
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
@@ -150,16 +184,21 @@ impl SiriusEngine {
         request: impl FnOnce(Sender<Result<T, String>>) -> EngineRequest,
     ) -> Result<T, String> {
         let (respond_tx, respond_rx) = channel();
+        self.send(request(respond_tx))?;
+        respond_rx
+            .recv()
+            .map_err(|_| "sirius-engine thread dropped the response".to_string())?
+    }
+
+    /// Queues one request for the engine thread.
+    fn send(&self, request: EngineRequest) -> Result<(), String> {
         self.requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .ok_or_else(|| "sirius-engine is shutting down".to_string())?
-            .send(request(respond_tx))
-            .map_err(|_| "sirius-engine thread is not running".to_string())?;
-        respond_rx
-            .recv()
-            .map_err(|_| "sirius-engine thread dropped the response".to_string())?
+            .send(request)
+            .map_err(|_| "sirius-engine thread is not running".to_string())
     }
 }
 
@@ -168,13 +207,17 @@ impl SiriusEngine {
 fn engine_thread(
     config: Option<PathBuf>,
     requests: Receiver<EngineRequest>,
-    ready: Sender<Result<Option<sirius::DirectExchange>, String>>,
+    ready: Sender<Result<(Option<sirius::DirectExchange>, sirius::Interrupter), String>>,
     published: Arc<AtomicUsize>,
+    running: Arc<RunningQuery>,
 ) {
     let context = match build_context(config) {
         Ok(context) => {
             // A send error means the caller is already gone; nothing to serve.
-            if ready.send(Ok(context.direct_exchange())).is_err() {
+            if ready
+                .send(Ok((context.direct_exchange(), context.interrupter())))
+                .is_err()
+            {
                 return;
             }
             context
@@ -197,23 +240,35 @@ fn engine_thread(
                     stream_inputs: &request.stream_inputs,
                     filters: &request.filters,
                 };
-                let result = match (
-                    run_fragment(&context, &mut parked, &request, planned),
-                    &request.fallback,
-                ) {
-                    (Err(RunError::Filter(err)), Some((bytes, stream_inputs))) => {
-                        // Nothing was consumed yet: the keys are copied before any input moves.
-                        warn!(error = %err, "runtime filter keys unavailable; running unfiltered");
-                        let unfiltered = PlanToRun {
-                            bytes,
-                            stream_inputs,
-                            filters: &[],
-                        };
-                        run_fragment(&context, &mut parked, &request, unfiltered)
-                    }
-                    (result, _) => result,
-                }
-                .map_err(String::from);
+                let result = running
+                    .run_as(request.query, || {
+                        match (
+                            run_fragment(&context, &mut parked, &request, planned),
+                            &request.fallback,
+                        ) {
+                            (Err(RunError::Filter(err)), Some((bytes, stream_inputs))) => {
+                                // Nothing was consumed yet: the keys are copied before any input
+                                // moves.
+                                warn!(
+                                    error = %err,
+                                    "runtime filter keys unavailable; running unfiltered"
+                                );
+                                let unfiltered = PlanToRun {
+                                    bytes,
+                                    stream_inputs,
+                                    filters: &[],
+                                };
+                                run_fragment(&context, &mut parked, &request, unfiltered)
+                            }
+                            (result, _) => result,
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        Err(RunError::Failed(
+                            "the fragment's query was purged before it ran".to_string(),
+                        ))
+                    })
+                    .map_err(String::from);
                 if result.is_err() {
                     // A failed fragment may stop before relaying every input; release them all so
                     // the senders' GPU batches are freed. An input already relayed is gone and
@@ -230,8 +285,23 @@ fn engine_thread(
             EngineRequest::KeyStats { keys, respond } => {
                 let _ = respond.send(key_stats(&context, &mut parked, &keys));
             }
-            EngineRequest::DropParked { slot, respond } => {
-                let _ = respond.send(parked.release(&slot));
+            EngineRequest::DropParked {
+                slot,
+                respond,
+                pending,
+            } => {
+                let released = parked.release(&slot);
+                match respond {
+                    Some(respond) => {
+                        let _ = respond.send(released);
+                    }
+                    None => {
+                        if let Err(err) = released {
+                            warn!(?slot, error = %err, "failed to drop a purged query's parked output");
+                        }
+                    }
+                }
+                drop(pending);
             }
             EngineRequest::PinTable { spec, respond } => {
                 info!(name = %spec.name, tier = spec.tier.as_str(), "pin_table starting");
@@ -689,6 +759,7 @@ impl FragmentExecutor for SiriusEngine {
             drains: None,
             filters: Vec::new(),
             fallback: None,
+            query: None,
         })?
         .ok_or_else(|| "result fragment returned no rows".to_string())
     }
@@ -708,6 +779,7 @@ impl FragmentExecutor for SiriusEngine {
                 fallback: run
                     .fallback
                     .map(|plan| (plan.to_substrait_bytes(), plan.stream_inputs.clone())),
+                query: run.query,
                 respond,
             })
         })
@@ -718,7 +790,54 @@ impl FragmentExecutor for SiriusEngine {
     }
 
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
-        self.call(|respond| EngineRequest::DropParked { slot, respond })
+        self.call(|respond| EngineRequest::DropParked {
+            slot,
+            respond: Some(respond),
+            pending: None,
+        })
+    }
+
+    fn drop_parked_later(&self, slot: SenderSlot) {
+        let request = EngineRequest::DropParked {
+            slot,
+            respond: None,
+            pending: Some(self.frees.begin()),
+        };
+        if let Err(err) = self.send(request) {
+            warn!(?slot, error = %err, "failed to queue a parked output's drop");
+        }
+    }
+
+    fn interrupt(&self, query: FragmentInstanceId) {
+        self.running.purge(query);
+        if !self.running.is_running(query) {
+            return;
+        }
+        let (running, interrupter) = (Arc::clone(&self.running), Arc::clone(&self.interrupter));
+        let pending = self.frees.begin();
+        let spawned = std::thread::Builder::new()
+            .name("engine-interrupt".to_string())
+            .spawn(move || {
+                let started = Instant::now();
+                let sent =
+                    running.interrupt_while_running(query, INTERRUPT_EVERY, INTERRUPT_FOR, || {
+                        interrupter.0.interrupt()
+                    });
+                drop(pending);
+                info!(
+                    %query,
+                    interrupts = sent,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "interrupted a purged query's run"
+                );
+            });
+        if let Err(err) = spawned {
+            warn!(%query, error = %err, "cannot interrupt a purged query's run");
+        }
+    }
+
+    fn pending_frees(&self) -> Option<Arc<PendingFrees>> {
+        Some(Arc::clone(&self.frees))
     }
 
     fn key_stats(&self, keys: &FilterKeys) -> Result<KeyStats, String> {
@@ -940,6 +1059,7 @@ mod tests {
                     drains: None,
                     filters: Vec::new(),
                     fallback: None,
+                    query: None,
                     respond,
                 })
             })
@@ -1001,6 +1121,32 @@ mod tests {
         let result = engine.execute(&plan).expect("execute fragment on GPU");
         let total_rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
+
+        // A purged query's runs never start, and other queries' still run. Checked here rather
+        // than in a test of its own: two engines in one process don't fit the GPU together.
+        let run = |query| {
+            engine.run_fragment(FragmentRun {
+                plan: &plan,
+                inputs: Vec::new(),
+                remote_inputs: Vec::new(),
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: Vec::new(),
+                drains: None,
+                filters: Vec::new(),
+                fallback: None,
+                query: Some(query),
+            })
+        };
+        engine.interrupt(FragmentInstanceId::from_halves(90, 0));
+        let refused = run(FragmentInstanceId::from_halves(90, 5)).unwrap_err();
+        assert!(refused.contains("purged before it ran"), "{refused}");
+        let result = run(FragmentInstanceId::from_halves(91, 5))
+            .expect("another query still runs")
+            .expect("a result fragment returns rows");
+        let rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 3);
+        assert_eq!(engine.pending_frees().unwrap().pending(), 0);
 
         // A `base_schema` that prunes and reorders the file's columns must bind by name, not by
         // file position (exercises the Substrait reader's `local_files` projection). The fixture
@@ -1075,6 +1221,7 @@ mod tests {
                 drains: None,
                 filters: Vec::new(),
                 fallback: None,
+                query: None,
             })
             .expect("park the sender output");
         assert!(parked.is_none(), "a sender fragment returns no rows");
@@ -1090,6 +1237,7 @@ mod tests {
                 drains: None,
                 filters: Vec::new(),
                 fallback: None,
+                query: None,
             })
             .expect("relay into the receiver")
             .expect("the receiver returns rows");
@@ -1108,6 +1256,7 @@ mod tests {
                 drains: None,
                 filters: Vec::new(),
                 fallback: None,
+                query: None,
             })
         };
         park().expect("park the sender output");
@@ -1122,6 +1271,7 @@ mod tests {
                 drains: None,
                 filters: Vec::new(),
                 fallback: None,
+                query: None,
             })
             .expect_err("an overflowing hash key fails the receiver");
         park().expect("the failed receiver released its input");

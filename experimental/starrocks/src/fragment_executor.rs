@@ -15,6 +15,7 @@ use starrocks_plan_translator::TranslatedPlan;
 
 use crate::local_exchange::RemoteBatch;
 use crate::result_store::FragmentInstanceId;
+pub use crate::running_query::PendingFrees;
 
 /// Where one sender fragment's output is parked until its receiver runs.
 ///
@@ -193,6 +194,8 @@ pub struct FragmentRun<'a> {
     /// The plan without its runtime filters, run instead when the keys cannot be copied (their
     /// receiver took them first, say). Filters only drop rows the join would drop anyway.
     pub fallback: Option<&'a TranslatedPlan>,
+    /// The query the fragment belongs to, so a purge of it can stop the run.
+    pub query: Option<FragmentInstanceId>,
 }
 
 /// Runs a translated fragment, either parking its output for a downstream fragment or returning
@@ -238,6 +241,22 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     /// default parks nothing, so there is nothing to drop.
     fn drop_parked(&self, _slot: SenderSlot) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Drops one destination's claim on parked output without waiting for it: the drop runs
+    /// once the engine is free, and counts in [`pending_frees`](Self::pending_frees) until then.
+    fn drop_parked_later(&self, slot: SenderSlot) {
+        let _ = self.drop_parked(slot);
+    }
+
+    /// Stops the run of `query` in progress, if any, and keeps any run of it still queued from
+    /// starting. Returns at once; never touches another query's run. The default runs nothing
+    /// it could stop.
+    fn interrupt(&self, _query: FragmentInstanceId) {}
+
+    /// GPU memory a purge asked to free that is not free yet, when the executor defers frees.
+    fn pending_frees(&self) -> Option<Arc<PendingFrees>> {
+        None
     }
 
     /// Sender fragments still parked, freed or not. The default parks nothing.
