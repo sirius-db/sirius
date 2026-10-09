@@ -432,8 +432,8 @@ The GPU executor catches the **base** `task_reschedule_exception` and:
 4. Marks the original task as rescheduled (skips pipeline completion tracking)
 5. Transitions intermediate data from idle to `task_created` state
 6. Creates a new rescheduled task via `create_rescheduled_task()` virtual factory
-7. Assigns a retry deadline 50 ms in the future
-8. Returns the new task to the shared scheduler and releases the worker slot during backoff
+7. Sleeps 50 ms for backoff
+8. Reschedules the new task back through the manager loop
 
 If max retries are exceeded, the error propagates and terminates the query.
 
