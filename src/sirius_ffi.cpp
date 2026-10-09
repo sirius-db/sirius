@@ -437,14 +437,16 @@ std::size_t DirectExchange::outstanding() const { return exchange_->outstanding(
 void DirectExchange::key_stats(std::uint64_t token,
                                std::uint32_t column,
                                std::uint64_t& rows,
+                               std::uint64_t& distinct,
                                std::int64_t& min,
                                std::int64_t& max) const
 {
-  sirius::exec::direct_exchange::key_stats stats{rows, min, max};
+  sirius::exec::direct_exchange::key_stats stats{rows, distinct, min, max};
   exchange_->add_key_stats(*exchange_->peek_batch(token), static_cast<int>(column), stats);
-  rows = stats.rows;
-  min  = stats.min;
-  max  = stats.max;
+  rows     = stats.rows;
+  distinct = stats.distinct;
+  min      = stats.min;
+  max      = stats.max;
 }
 
 OutputDrain::OutputDrain(std::shared_ptr<sirius::exec::batch_stream> stream,
@@ -729,18 +731,20 @@ std::unique_ptr<OutputDrain> Fragment::output_drain(std::uint64_t stream_id) con
 void Fragment::output_key_stats(std::uint64_t stream_id,
                                 std::uint32_t column,
                                 std::uint64_t& rows,
+                                std::uint64_t& distinct,
                                 std::int64_t& min,
                                 std::int64_t& max) const
 {
   impl_->require_built("output_key_stats()");
   auto& exchange = impl_->ctx.require_exchange();
-  sirius::exec::direct_exchange::key_stats stats{rows, min, max};
+  sirius::exec::direct_exchange::key_stats stats{rows, distinct, min, max};
   for (auto const& batch : impl_->fragment->peek_output(stream_id)) {
     exchange.add_key_stats(*batch, static_cast<int>(column), stats);
   }
-  rows = stats.rows;
-  min  = stats.min;
-  max  = stats.max;
+  rows     = stats.rows;
+  distinct = stats.distinct;
+  min      = stats.min;
+  max      = stats.max;
 }
 
 std::size_t Fragment::copy_output_column(Fragment& source,

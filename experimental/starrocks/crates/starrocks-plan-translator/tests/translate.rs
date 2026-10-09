@@ -5479,7 +5479,8 @@ fn a_scan_reports_the_runtime_filters_it_probes() {
         probed,
         vec![starrocks_plan_translator::runtime_filter::ProbedFilter {
             filter_id: 7,
-            scan_node_id: 0
+            scan_node_id: 0,
+            broadcast: true,
         }]
     );
     let plain = params(
@@ -5652,4 +5653,111 @@ fn a_skew_joins_broadcast_branch_filter_is_not_built() {
         filter.is_broad_cast_join_in_skew = Some(false);
     });
     assert_eq!(plain.len(), 1);
+}
+
+#[test]
+fn filters_a_join_cant_build_are_reported_with_their_reason() {
+    use starrocks_plan_translator::runtime_filter::{SkipReason, SkippedFilter, skipped_builds};
+    use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    let filter = |id, mode| {
+        let mut filter = runtime_filter(
+            id,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            mode,
+        );
+        filter.expr_order = Some(0);
+        filter
+    };
+    let mut skew = filter(9, Mode::BROADCAST);
+    skew.is_broad_cast_join_in_skew = Some(true);
+    let mut expression_key = filter(10, Mode::BROADCAST);
+    expression_key.build_expr = Some(arithmetic(
+        TExprOpcode::ADD,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+    ));
+    join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![
+        filter(7, Mode::BROADCAST),
+        filter(8, Mode::PARTITIONED),
+        skew,
+        expression_key,
+    ]);
+    let plan = |join| {
+        params(
+            Some(TPlan::new(vec![
+                join,
+                exchange_node(10, vec![0]),
+                exchange_node(11, vec![1]),
+            ])),
+            Some(join_desc()),
+            None,
+        )
+    };
+    let skipped = |id, reason| SkippedFilter {
+        filter_id: id,
+        node_id: 2,
+        reason,
+    };
+    assert_eq!(
+        skipped_builds(&plan(join.clone())).unwrap(),
+        vec![
+            skipped(8, SkipReason::NotBroadcast),
+            skipped(9, SkipReason::Skew),
+            skipped(10, SkipReason::KeyNotSlot),
+        ]
+    );
+    // Every filter of a null-safe key is reported as such.
+    join.hash_join_node.as_mut().unwrap().eq_join_conjuncts[0].opcode =
+        Some(TExprOpcode::EQ_FOR_NULL);
+    assert!(
+        skipped_builds(&plan(join))
+            .unwrap()
+            .contains(&skipped(7, SkipReason::NullSafe))
+    );
+}
+
+#[test]
+fn probes_no_compute_node_filters_are_reported_with_their_reason() {
+    use starrocks_plan_translator::runtime_filter::{SkipReason, SkippedFilter, skipped_probes};
+    use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
+    let probe = |id| {
+        runtime_filter(
+            id,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            Mode::BROADCAST,
+        )
+    };
+    // The join's probe side is a scan probing filter 7, which the join builds, and filter 8,
+    // built elsewhere. The build exchange is a target of filter 7 too.
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![probe(7)]);
+    let mut scan = scan_node(0, 0);
+    scan.probe_runtime_filters = Some(vec![probe(7), probe(8)]);
+    let mut build = exchange_node(11, vec![1]);
+    build.probe_runtime_filters = Some(vec![probe(7)]);
+    let fragment = params(
+        Some(TPlan::new(vec![join, scan, build])),
+        Some(join_desc()),
+        None,
+    );
+    let skipped = |filter_id, node_id, reason| SkippedFilter {
+        filter_id,
+        node_id,
+        reason,
+    };
+    assert_eq!(
+        skipped_probes(&fragment),
+        vec![
+            skipped(7, 0, SkipReason::SameFragment),
+            skipped(8, 0, SkipReason::NonLeafFragment),
+            skipped(7, 11, SkipReason::TargetNotScan),
+        ]
+    );
+    // A leaf scan's filters are decided when it runs.
+    assert!(skipped_probes(&probing_scan_params()).is_empty());
 }

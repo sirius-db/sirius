@@ -171,9 +171,11 @@ class direct_exchange {
   /// @throws rmm::out_of_memory when it cannot be reserved, even after making room.
   void bring_to_gpu(cucascade::data_batch& batch);
 
-  /// Non-null rows, minimum and maximum of one integer column.
+  /// Non-null rows, distinct keys, minimum and maximum of one integer column. `distinct` is
+  /// counted per batch and summed: exact for one batch, at least the true count across batches.
   struct key_stats {
     std::uint64_t rows{0};
+    std::uint64_t distinct{0};
     std::int64_t min{std::numeric_limits<std::int64_t>::max()};
     std::int64_t max{std::numeric_limits<std::int64_t>::min()};
   };

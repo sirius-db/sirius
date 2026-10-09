@@ -531,14 +531,15 @@ TEST_CASE("FFI copies a key column out of parked and received batches without ta
   };
 
   // A parked sender's output.
-  auto parked        = scan();
-  std::uint64_t rows = 0;
-  std::int64_t min   = std::numeric_limits<std::int64_t>::max();
-  std::int64_t max   = std::numeric_limits<std::int64_t>::min();
-  parked->output_key_stats(0, 0, rows, min, max);
-  CHECK(std::tuple{rows, min, max} ==
-        std::tuple{std::uint64_t{5}, std::int64_t{1}, std::int64_t{5}});
-  CHECK_THROWS_WITH(parked->output_key_stats(0, 1, rows, min, max),
+  auto parked            = scan();
+  std::uint64_t rows     = 0;
+  std::uint64_t distinct = 0;
+  std::int64_t min       = std::numeric_limits<std::int64_t>::max();
+  std::int64_t max       = std::numeric_limits<std::int64_t>::min();
+  parked->output_key_stats(0, 0, rows, distinct, min, max);
+  CHECK(std::tuple{rows, distinct, min, max} ==
+        std::tuple{std::uint64_t{5}, std::uint64_t{5}, std::int64_t{1}, std::int64_t{5}});
+  CHECK_THROWS_WITH(parked->output_key_stats(0, 1, rows, distinct, min, max),
                     Catch::Matchers::ContainsSubstring("out of range"));
 
   // A batch received from a remote sender and sealed, as the CN does on arrival.
@@ -562,12 +563,13 @@ TEST_CASE("FFI copies a key column out of parked and received batches without ta
     exchange->release(token);
     exchange->seal(remote);
   }
-  rows = 0;
-  min  = std::numeric_limits<std::int64_t>::max();
-  max  = std::numeric_limits<std::int64_t>::min();
-  exchange->key_stats(remote, 0, rows, min, max);
-  CHECK(std::tuple{rows, min, max} ==
-        std::tuple{std::uint64_t{5}, std::int64_t{1}, std::int64_t{5}});
+  rows     = 0;
+  distinct = 0;
+  min      = std::numeric_limits<std::int64_t>::max();
+  max      = std::numeric_limits<std::int64_t>::min();
+  exchange->key_stats(remote, 0, rows, distinct, min, max);
+  CHECK(std::tuple{rows, distinct, min, max} ==
+        std::tuple{std::uint64_t{5}, std::uint64_t{5}, std::int64_t{1}, std::int64_t{5}});
 
   // A receiver reads both copies; the sources keep their batches.
   auto receiver = sirius::ffi::make_fragment(*ctx);
@@ -582,10 +584,37 @@ TEST_CASE("FFI copies a key column out of parked and received batches without ta
   CHECK(copied == std::vector<std::int64_t>{1, 1, 2, 2, 3, 3, 4, 4, 5, 5});
   CHECK(parked->output_row_count(0) == 5);
   rows = 0;
-  exchange->key_stats(remote, 0, rows, min, max);
+  exchange->key_stats(remote, 0, rows, distinct, min, max);
   CHECK(rows == 5);
-  CHECK_THROWS_WITH(exchange->key_stats(remote + 1, 0, rows, min, max),
+  CHECK_THROWS_WITH(exchange->key_stats(remote + 1, 0, rows, distinct, min, max),
                     Catch::Matchers::ContainsSubstring("no sealed batch"));
   exchange->release(remote);
   CHECK(exchange->outstanding() == 0);
+
+  // Repeated keys count once: a build side that repeats a few keys is a small filter.
+  auto const repeated_path = scratch.file("repeated.parquet");
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    auto copied = con.Query("COPY (SELECT (range % 3 + 8)::BIGINT AS a FROM range(1000)) TO " +
+                            sirius::test::sql_literal(repeated_path) + " (FORMAT PARQUET)");
+    REQUIRE(copied);
+    REQUIRE_FALSE(copied->HasError());
+  }
+  auto repeated = sirius::ffi::make_fragment(*ctx);
+  repeated->declare_output(0);
+  repeated->build(local_files_plan(repeated_path));
+  repeated->run();
+  rows     = 0;
+  distinct = 0;
+  min      = std::numeric_limits<std::int64_t>::max();
+  max      = std::numeric_limits<std::int64_t>::min();
+  repeated->output_key_stats(0, 0, rows, distinct, min, max);
+  CHECK(rows == 1000);
+  CHECK(min == 8);
+  CHECK(max == 10);
+  // Counted per batch, so at least the 3 distinct keys and at most 3 per batch.
+  CHECK(distinct >= 3);
+  CHECK(distinct <= 3 * repeated->output_batch_count(0));
 }

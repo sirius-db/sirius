@@ -26,7 +26,9 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/reduction/unique_count.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -539,7 +541,16 @@ void direct_exchange::add_key_stats(cucascade::data_batch& batch, int column, ke
     RMM_CUDA_TRY(cudaStreamWaitEvent(stream.value(), writer, 0));
   }
   auto const [lo, hi] = cudf::minmax(col, stream, _gpu.get_default_allocator());
+  // Sort, then count runs: cudf::distinct_count's hash table can hit NVIDIA/cuCollections#834.
+  auto const sorted   = cudf::sort(cudf::table_view{std::vector<cudf::column_view>{col}},
+                                   {cudf::order::ASCENDING},
+                                   {},
+                                 stream,
+                                 _gpu.get_default_allocator());
+  auto const distinct = cudf::unique_count(
+    sorted->view().column(0), cudf::null_policy::EXCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
   stats.rows += static_cast<std::uint64_t>(valid);
+  stats.distinct += static_cast<std::uint64_t>(distinct);
   stats.min = std::min(stats.min, integer_value(*lo, stream));
   stats.max = std::max(stats.max, integer_value(*hi, stream));
 }
