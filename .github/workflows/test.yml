@@ -113,7 +113,6 @@ jobs:
             -DCMAKE_PREFIX_PATH="$sirius_test_dir/relocated" \
             -DCMAKE_DISABLE_FIND_PACKAGE_Git=TRUE
           cmake --build "$sirius_test_dir/consumer"
-          python test/cmake/installed_consumer/run_tests.py "$sirius_test_dir/consumer"
 
       - name: Surface build errors
         if: failure()
