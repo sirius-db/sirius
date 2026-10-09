@@ -46,7 +46,6 @@
 #include <data/sirius_converter_registry.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
-#include <expression/ast/to_duckdb.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>

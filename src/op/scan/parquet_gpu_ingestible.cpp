@@ -21,7 +21,10 @@
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
+#include <helper/type_conversions.hpp>
 #include <io/io_context.hpp>
+#include <io/io_errors.hpp>
+#include <io/parquet_helpers.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
@@ -31,7 +34,6 @@
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_materialize.hpp>
 #include <op/scan/parquet_metadata.hpp>
-#include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
@@ -49,6 +51,7 @@
 #include <cudf/strings/utilities.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 #include <cudf/version_config.hpp>
@@ -62,6 +65,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // duckdb
+#include <duckdb/common/exception.hpp>
 #include <duckdb/common/hive_partitioning.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
@@ -83,7 +87,9 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <new>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -334,12 +340,14 @@ class parquet_batch_coalescer : public batch_coalescer {
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                           std::shared_ptr<scan_plan const> plan,
-                          scan_contract_id contract_id)
+                          scan_contract_id contract_id,
+                          std::shared_ptr<physical_check_counters> counters)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
       _needs_assembly(needs_output_assembly(*_plan)),
-      _contract_id(contract_id)
+      _contract_id(contract_id),
+      _counters(std::move(counters))
   {
   }
 
@@ -376,10 +384,19 @@ class parquet_batch_coalescer : public batch_coalescer {
         std::vector<split_dependencies>(file->dependencies().begin(), file->dependencies().end())};
     }
 
-    if (!_slices.empty() && (_partition_values != file->partition_values ||
+    bool const schema_changed =
+      !file->row_groups.empty() && !_slices.empty() &&
+      (_run_original_schema != file->original_schema || _run_arrow_schema != file->arrow_schema);
+    if (!_slices.empty() && (schema_changed || _partition_values != file->partition_values ||
                              _disable_pushdown != file->disable_filter_pushdown ||
                              _run_reader_options != file->reader_options)) {
       emitted.push_back(emit_current());
+      if (schema_changed && _counters)
+        _counters->split_flushed_for_schema.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!file->row_groups.empty()) {
+      _run_original_schema = file->original_schema;
+      _run_arrow_schema    = file->arrow_schema;
     }
     _run_reader_options = file->reader_options;
     _partition_values   = file->partition_values;
@@ -514,6 +531,9 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::shared_ptr<scan_plan const> _plan;
   const bool _needs_assembly;
   const scan_contract_id _contract_id;
+  std::shared_ptr<physical_check_counters> _counters;
+  std::vector<uint8_t> _run_original_schema;
+  std::string _run_arrow_schema;
 
   std::vector<row_group_slice> _slices;
   std::vector<split_materializer_certificate> _certificates;
@@ -522,7 +542,6 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::size_t _acc_working_bytes = 0;
   std::size_t _acc_run_count     = 0;
   int64_t _acc_rows              = 0;
-  std::size_t _emit_count        = 0;  // [coalesce-debug] running count of emitted batches
   std::vector<std::string> _partition_values;
   bool _disable_pushdown = false;
   /// Reader options of the current run. Projected and natural reads cannot share
@@ -842,8 +861,11 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
-  return std::make_unique<parquet_batch_coalescer>(
-    _info->approximate_batch_size, _reader_options, _plan, _info->contract_id);
+  return std::make_unique<parquet_batch_coalescer>(_info->approximate_batch_size,
+                                                   _reader_options,
+                                                   _plan,
+                                                   _info->contract_id,
+                                                   _info->profiles->counters);
 }
 
 //===----------------------------------------------------------------------===//
@@ -869,7 +891,29 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   // The resolver returns a valid ioctx or throws if no backend supports the path.
   auto io_ctx = resolve(file_path);
   return [this, file_path, idx, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
-    return build_file_scan_info(file_path, idx, io_ctx);
+    try {
+      return build_file_scan_info(file_path, idx, io_ctx);
+    } catch (unsupported_physical_input const&) {
+      throw;
+    } catch (transparent::classified_execution_error const&) {
+      throw;
+    } catch (duckdb::IOException const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (io::credential_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (std::system_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (cudf::logic_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (duckdb::InterruptException const&) {
+      throw;
+    } catch (std::bad_alloc const&) {
+      throw;
+    }
   };
 }
 
@@ -879,7 +923,12 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   std::string const& file_path, std::size_t file_index, std::shared_ptr<io::ioctx> const& io_ctx)
 {
+  if (_execution_completion && _execution_completion->injections &&
+      _execution_completion->injections->hold_footer_index == file_index + 1) {
+    _execution_completion->hold_footer_for_testing(file_index + 1);
+  }
   auto stream = cudf::get_default_stream();
+  if (_info->profiles->counters) _info->profiles->counters->parquet_phase(file_path, true);
 
   // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
   // cached metadata). The parquet_footer_probe hint collapses the S3 footer read
@@ -908,46 +957,163 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // Obtain footer metadata — from the datasource's cached parquet_metadata when
   // present, else by fetching and parsing the footer.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  parquet_encryption_evidence encryption;
+  std::shared_ptr<parquet_metadata> resolved_metadata;
   std::size_t footer_len = 0;
-  if (sirius_ds) {
-    if (auto cached = sirius_ds->metadata()) {
-      if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
-        file_metadata = pm->file_metadata();
-        footer_len    = pm->footer_byte_len();
-      }
+  try {
+    // The carrier projection is only known to match after parsing this footer.
+    bool cache_hit = false;
+    resolved_metadata =
+      resolve_parquet_metadata(*sirius_ds,
+                               _info->contract_id,
+                               file_path,
+                               _plan->carrier_batch_index ? *_natural_reader_options : opts,
+                               &cache_hit);
+    if (_info->profiles->counters)
+      _info->profiles->counters->parquet_metadata(file_path, cache_hit);
+    file_metadata = resolved_metadata->file_metadata();
+    encryption    = resolved_metadata->encryption_evidence;
+    footer_len    = resolved_metadata->footer_byte_len();
+  } catch (unsupported_physical_input const& error) {
+    if (_info->profiles->counters && !_info->physical_schema)
+      _info->profiles->counters->record(error.reason);
+    throw;
+  } catch (duckdb::IOException const&) {
+    throw;
+  } catch (io::credential_error const&) {
+    throw;
+  } catch (std::system_error const&) {
+    throw;
+  } catch (duckdb::InterruptException const&) {
+    throw;
+  } catch (std::bad_alloc const&) {
+    throw;
+  } catch (std::logic_error const&) {
+    throw;
+  } catch (std::exception const& error) {
+    if (_info->physical_schema && !_info->physical_schema->fields.empty()) {
+      if (_info->profiles->counters)
+        _info->profiles->counters->record(verdict_reason::iceberg_schema_footers_unreadable);
+      throw unsupported_physical_input(
+        _info->contract_id,
+        file_path,
+        verdict_reason::iceberg_schema_footers_unreadable,
+        "iceberg_scan declines the GPU scan path: the iceberg schema probe could not read this "
+        "table's data-file footers (" +
+          std::string(error.what()) +
+          "), so the files could not be proven to carry the table's current schema");
+    }
+    throw;
+  }
+  // Mutate a private descriptor, never the published metadata store or file.
+  if (!_info->injections.synthetic_parquet_codec.empty()) {
+    auto copy = std::make_shared<cudf::io::parquet::FileMetaData>(*file_metadata);
+    for (auto& group : copy->row_groups) {
+      for (auto& column : group.columns)
+        column.meta_data.codec = cudf::io::parquet::Compression::LZO;
+      if (_info->injections.synthetic_parquet_codec == "LZO:first_row_group") break;
+    }
+    file_metadata = std::move(copy);
+  }
+  if (_info->injections.strip_encryption_evidence) encryption = {};
+  auto const& metadata = *file_metadata;
+  std::unordered_map<std::string, std::vector<std::size_t>> leaves_by_name;
+  if (!metadata.row_groups.empty()) {
+    auto const& columns = metadata.row_groups.front().columns;
+    for (std::size_t leaf = 0; leaf < columns.size(); ++leaf) {
+      auto const& path = columns[leaf].meta_data.path_in_schema;
+      if (!path.empty()) leaves_by_name[path.front()].push_back(leaf);
     }
   }
-  if (!file_metadata) {
-    // The normal path: this metadata task owns its file's footer fetch + parse.
-    // One task per file, all dispatched before any consumer runs, so the parses
-    // overlap each other rather than a pipeline's data traffic.  A prior bind
-    // (or a pin) may have already stored the metadata, in which case the branch
-    // above serves it and this costs nothing.
-    auto footer = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
-    footer_len  = footer->size();
-    // The carrier projection is only known to match this file after the footer
-    // is parsed, so the parse itself runs without a column selection.
-    hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
-                                     _plan->carrier_batch_index ? *_natural_reader_options : opts);
-    file_metadata =
-      std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
-    // Park the parse in the ioctx metadata store so a later scan of the same
-    // file skips the footer fetch + Thrift parse (the read above already
-    // dereferences *sirius_ds, so it is non-null here). Best-effort.
-    [[maybe_unused]] auto const stored =
-      sirius_ds->store_metadata(std::make_shared<parquet_metadata>(file_metadata, footer_len));
+  auto leaves_for = [&](std::string const& name) -> std::vector<std::size_t> const& {
+    static std::vector<std::size_t> const empty;
+    auto found = leaves_by_name.find(name);
+    return found == leaves_by_name.end() ? empty : found->second;
+  };
+  validation_set schema_validation;
+  if (_info->physical_schema) {
+    auto checked = check_iceberg_file_schema(metadata,
+                                             *_info->physical_schema,
+                                             file_path,
+                                             resolved_metadata->original_logical_annotations);
+    if (!checked.approved) {
+      if (_info->profiles->counters) _info->profiles->counters->record(checked.reason);
+      throw unsupported_physical_input(_info->contract_id, file_path, checked.reason, checked.text);
+    }
+    schema_validation = checked.validation;
   }
-  auto const& metadata = *file_metadata;
+  // An encrypted ColumnMetaData is opaque: names/statistics needed to resolve
+  // the working set are absent. The store already retained the raw evidence;
+  // refuse this prerequisite without misreporting an absent projection column.
+  if (encryption.columns_encrypted &&
+      std::any_of(metadata.row_groups.begin(), metadata.row_groups.end(), [](auto const& group) {
+        return std::any_of(group.columns.begin(), group.columns.end(), [](auto const& column) {
+          return column.meta_data.path_in_schema.empty();
+        });
+      })) {
+    if (_info->profiles->counters)
+      _info->profiles->counters->record(verdict_reason::parquet_encrypted);
+    throw unsupported_physical_input(
+      _info->contract_id,
+      file_path,
+      verdict_reason::parquet_encrypted,
+      "Encrypted Parquet column metadata is not GPU-decodable: " + file_path);
+  }
 
   // The carrier is chosen from the bind schema; a file that lacks it (schema
   // evolution) or has no row groups to resolve it against reads its natural
   // batch.
   bool const carrier_unavailable =
     _plan->carrier_batch_index.has_value() &&
-    detail::leaf_indices_for_column(metadata, _plan->data_columns[*_plan->carrier_batch_index].name)
-      .empty();
+    leaves_for(_plan->data_columns[*_plan->carrier_batch_index].name).empty();
   if (carrier_unavailable) { opts = *_natural_reader_options; }
   bool const file_projected = _plan->is_projected() && !carrier_unavailable;
+
+  effective_reader_projection effective;
+  effective.natural_read = !file_projected;
+  for (std::size_t d = 0; d < _plan->data_columns.size(); ++d) {
+    auto const& column = _plan->data_columns[d];
+    effective.names.push_back(column.name);
+    effective.bound_types.push_back(
+      _info->bound_types.empty() ? sirius::to_duckdb(_info->returned_types.at(column.primary_idx))
+                                 : _info->bound_types.at(column.primary_idx));
+    effective.projected.push_back(static_cast<uint32_t>(d));
+  }
+  auto physical_contract        = _info->physical_contract;
+  physical_contract.contract_id = _info->contract_id;
+  physical_contract.profiles    = _info->profiles;
+
+  // Statistics are typed by the predicate's bound input. Check those types
+  // before handing statistics to cuDF; checking only retained groups would let
+  // a mismatched predicate incorrectly prune the very group that must refuse.
+  std::set<std::size_t> pruning_columns;
+  std::function<void(duckdb::Expression const&)> collect = [&](auto const& expression) {
+    if (expression.expression_class == duckdb::ExpressionClass::BOUND_REF) {
+      pruning_columns.insert(expression.template Cast<duckdb::BoundReferenceExpression>().index);
+    }
+    duckdb::ExpressionIterator::EnumerateChildren(expression, collect);
+  };
+  if (_static_pushdown_expression) collect(*_static_pushdown_expression);
+  for (auto const& predicate : _null_prune_predicates)
+    pruning_columns.insert(predicate.batch_index);
+  if (!pruning_columns.empty() && !metadata.row_groups.empty()) {
+    auto schema = sirius::io::parquet_helpers::extract_schema(
+      metadata, true, resolved_metadata->original_logical_annotations);
+    for (auto d : pruning_columns) {
+      if (d >= effective.names.size()) continue;  // virtual predicate, never footer-pruned
+      auto found = std::find(schema.names.begin(), schema.names.end(), effective.names[d]);
+      if (found == schema.names.end() ||
+          schema.types[std::distance(schema.names.begin(), found)] != effective.bound_types[d]) {
+        if (_info->profiles->counters)
+          _info->profiles->counters->record(verdict_reason::parquet_type_unqualified, 1);
+        throw unsupported_physical_input(
+          _info->contract_id,
+          file_path,
+          verdict_reason::parquet_type_unqualified,
+          "Parquet pruning column '" + effective.names[d] + "' has unqualified type drift");
+      }
+    }
+  }
 
   // FLBA-decimal pushdown probe: cudf's row-group stats filter cannot compare a
   // fixed_point_scalar AST literal against FLBA / BYTE_ARRAY decimal stats, so
@@ -1030,11 +1196,16 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     selected_chunk_indices.reserve(data_column_names.size());
     selected_chunk_decoded_width.reserve(data_column_names.size());
     for (std::size_t k = 0; k < data_column_names.size(); ++k) {
-      auto leaves = detail::leaf_indices_for_column(metadata, data_column_names[k]);
+      auto const& leaves = leaves_for(data_column_names[k]);
       if (leaves.empty()) {
-        throw std::runtime_error("[parquet_gpu_ingestible] Projected column '" +
-                                 data_column_names[k] +
-                                 "' not found in parquet file: " + file_path);
+        if (_info->profiles->counters)
+          _info->profiles->counters->record(verdict_reason::parquet_type_unqualified);
+        throw unsupported_physical_input(_info->contract_id,
+                                         file_path,
+                                         verdict_reason::parquet_type_unqualified,
+                                         "[parquet_gpu_ingestible] Projected column '" +
+                                           data_column_names[k] +
+                                           "' not found in parquet file: " + file_path);
       }
       // Decoded byte width for this data column: fixed-width types use their
       // cuDF decoded width; VARCHAR (fixed_width_byte_size()==0) and nested
@@ -1109,8 +1280,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
         continue;
       }
 
-      auto const leaves =
-        detail::leaf_indices_for_column(metadata, _plan->batch_column_name(pred.batch_index));
+      auto const& leaves = leaves_for(_plan->batch_column_name(pred.batch_index));
       if (leaves.size() != 1) { continue; }
       auto const chunk_index = leaves.front();
       auto const& first_rg   = metadata.row_groups.front();
@@ -1152,6 +1322,20 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       }
     }
   }
+
+  std::vector<std::size_t> retained(row_group_indices.begin(), row_group_indices.end());
+  auto profile = check_parquet_split_profile(metadata,
+                                             encryption,
+                                             physical_contract,
+                                             effective,
+                                             retained,
+                                             _info->semantic_columns,
+                                             resolved_metadata->original_logical_annotations);
+  if (_info->profiles->counters)
+    _info->profiles->counters->record(profile.reason, profile.type_mismatches);
+  profile.validation |= schema_validation;
+  if (!profile.approved)
+    throw unsupported_physical_input(_info->contract_id, file_path, profile.reason, profile.text);
 
   // Hive partition values for this file, in scan_plan::partition_columns order.
   // Each split synthesizes one scalar-backed column per entry, so every row of
@@ -1287,6 +1471,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 
   auto out                     = std::make_unique<parquet_file_scan_info>();
   out->file_metadata           = file_metadata;
+  out->original_schema         = resolved_metadata->original_schema;
+  out->arrow_schema            = resolved_metadata->arrow_schema;
   out->file_path               = file_path;
   out->file_index              = file_index;
   out->datasource              = std::move(sirius_ds);
@@ -1335,8 +1521,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
   out->set_contract_payload(
     _info->contract_id,
-    {{_info->contract_id, 0, std::move(input_identity), "parquet", "footer"}},
-    {{file_metadata, out->datasource, std::nullopt}});
+    {{_info->contract_id, 0, std::move(input_identity), profile.profile, profile.validation}},
+    {{file_metadata,
+      out->datasource,
+      std::nullopt,
+      _info->profiles,
+      std::make_shared<parquet_input_approval const>(
+        parquet_input_approval{footer_len, std::move(retained)})}});
 
   return out;
 }
@@ -1469,9 +1660,12 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
         std::vector<cudf::io::parquet::FileMetaData> one_metadata{*slice.file_metadata};
         auto one_opts = *split.reader_options;
         one_opts.set_row_groups({{rg_index}});
+        if (_info->profiles->counters) _info->profiles->counters->reader_call(slice.file_path);
         if (reader_filter_root) { one_opts.set_filter(*reader_filter_root); }
         auto [decoded, metadata] = cudf::io::read_parquet(
           std::move(one_source), std::move(one_metadata), one_opts, stream, mr_ref);
+        if (_info->profiles->counters)
+          _info->profiles->counters->parquet_phase(slice.file_path, false);
         if (decoded->num_rows() != run.num_rows) {
           throw sirius::internal_exception(
             "parquet virtual scan: decoded row count does not match footer");
@@ -1517,6 +1711,9 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       sources.push_back(
         parquet_source{slice.datasource, slice.file_metadata, slice.row_group_indices});
     }
+    if (!all_slices_pruned && _info->profiles->counters)
+      for (auto const& slice : split.rg_slices)
+        _info->profiles->counters->reader_call(slice.file_path);
     bool const bulk = !all_slices_pruned && prefers_bulk_materialize(sources, opts);
     if (bulk) {
       table = materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
@@ -1551,6 +1748,9 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
                                      stream,
                                      mr_ref);
     }
+    if (!all_slices_pruned && _info->profiles->counters)
+      for (auto const& slice : split.rg_slices)
+        _info->profiles->counters->parquet_phase(slice.file_path, false);
   }
 
   // Hive-partition scans assemble inline here: partition_values are per-split

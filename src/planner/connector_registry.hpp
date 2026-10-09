@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "transparent/plan_source_policy.hpp"
 
 #include <duckdb/function/table_function.hpp>
@@ -40,6 +41,7 @@ enum class dynamic_filter_apply_mode;
 }  // namespace op
 }  // namespace sirius
 namespace sirius::planner {
+struct scan_contract_provenance;
 using scan_lowering =
   duckdb::unique_ptr<op::sirius_physical_operator> (*)(op::sirius_physical_table_scan&,
                                                        operator_params const&,
@@ -62,15 +64,36 @@ struct connector {
   transparent::byte_source_class byte_source;
   bool permits_cpu_replay;
   bool selector_outside_bind_data;
-  std::optional<std::string> (*decline_reason)(duckdb::LogicalGet&, duckdb::ClientContext&);
+  op::scan::pre_capture_result (*decline_reason)(duckdb::LogicalGet&,
+                                                 duckdb::ClientContext&,
+                                                 scan_contract_provenance&);
   std::optional<provider_profile> provider;
+  op::scan::certification_result (*certify)(op::scan::bound_table_scan const&,
+                                            op::sirius_physical_table_scan const&,
+                                            duckdb::ClientContext&,
+                                            scan_contract_provenance&) = nullptr;
 };
 
+enum class lookup_decline : uint8_t {
+  none,
+  unknown_function,
+  bind_data_mismatch,
+  catalog_entry_missing,
+  no_trusted_reference,
+  callback_mismatch
+};
+struct lookup_outcome {
+  connector const* entry = nullptr;
+  lookup_decline decline = lookup_decline::none;
+};
+lookup_outcome lookup_connector_classified(duckdb::LogicalGet const&, duckdb::ClientContext&);
 connector const* lookup_connector(duckdb::LogicalGet const&, duckdb::ClientContext&);
 connector const* lookup_connector(duckdb::PhysicalTableScan const&, duckdb::ClientContext&);
 connector const* lookup_connector(duckdb::TableFunction const&,
                                   duckdb::FunctionData const*,
                                   duckdb::ClientContext&);
+//! Whether an Iceberg bind exposes a complete table schema with integer field IDs.
+bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data);
 std::span<connector const> registered_connectors();
 
 // Register at Sirius load; bootstrap Iceberg trust during extension loading, never in lookup.
@@ -92,6 +115,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> lower_iceberg_scan(
   operator_params const&,
   duckdb::ClientContext&,
   op::scan::dynamic_filter_apply_mode);
-std::optional<std::string> registered_iceberg_decline_reason(duckdb::LogicalGet&,
-                                                             duckdb::ClientContext&);
+op::scan::pre_capture_result registered_iceberg_decline_reason(duckdb::LogicalGet&,
+                                                               duckdb::ClientContext&,
+                                                               scan_contract_provenance&);
 }  // namespace sirius::planner

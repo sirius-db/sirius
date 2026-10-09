@@ -99,8 +99,8 @@ Supported queries run on the GPU automatically, just as they do in the DuckDB sh
 
 Sirius supports one active engine context per process; this is not enforced at runtime.
 Connections to the same DuckDB database instance share that context.
-Destroy the first `duckdb::DuckDB` instance and release all its connections and owning
-handles before creating another. See the [Context API documentation](../include/sirius/context/context.hpp)
+Close all connections to the first database instance and release any objects that
+keep it alive before creating another instance. See the [Context API documentation](../include/sirius/context/context.hpp)
 for process-wide configuration and lifetime restrictions.
 
 The default Pixi environment includes DuckDB's Python package. Its DuckDB version must match

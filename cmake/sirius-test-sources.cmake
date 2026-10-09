@@ -1,11 +1,17 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/scan/test_native_physical_matrix.cpp
+    test/cpp/scan/test_parquet_physical_profile.cpp
     test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp
     test/cpp/integration/test_transparent_read_view.cpp
     test/cpp/scan/test_split_certificates.cpp
+    test/cpp/transparent/test_late_failure.cpp
     test/cpp/transparent/test_plan_source_policy.cpp
     test/cpp/scan/test_scan_contracts.cpp
+    test/cpp/scan/test_scan_verdicts.cpp
+    test/cpp/scan/test_certification_cost.cpp
+    test/cpp/integration/test_transparent_verdicts.cpp
     test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
@@ -43,7 +49,6 @@ set(TEST_SOURCES
     test/cpp/expression/test_ast_substitute.cpp
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
-    test/cpp/expression/test_ast_to_duckdb.cpp
     test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_value.cpp
@@ -72,7 +77,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_dynamic_filter_multi_partition.cpp
     test/cpp/integration/test_gpu_execution_expression_fallback.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
-    test/cpp/integration/test_gpu_execution_grouping_sets_fallback.cpp
+    test/cpp/integration/test_gpu_execution_grouping_sets.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_unsigned_narrowing.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp

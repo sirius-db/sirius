@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
@@ -207,6 +208,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
+    REQUIRE(setting_count(con, "sirius_test_inject_scan_verdict") == 0);
+    REQUIRE(setting_count(con, "sirius_test_budget_declines") == 0);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
@@ -265,6 +268,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
+    REQUIRE(setting_count(con, "sirius_test_inject_scan_verdict") == 0);
+    REQUIRE(setting_count(con, "sirius_test_budget_declines") == 0);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
@@ -649,10 +654,11 @@ TEST_CASE("SiriusContext init failure restores the cuDF pinned resource",
 
   // And the pinned resource must not dangle at the freed slab allocator: an
   // allocate/deallocate through whatever cuDF now points at must succeed.
-  auto pinned = cudf::get_pinned_memory_resource();
-  void* p     = pinned.allocate_sync(256);
+  auto pinned              = cudf::get_pinned_memory_resource();
+  constexpr auto alignment = alignof(std::max_align_t);
+  void* p                  = pinned.allocate_sync(256, alignment);
   CHECK(p != nullptr);
-  pinned.deallocate_sync(p, 256);
+  pinned.deallocate_sync(p, 256, alignment);
 }
 
 TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][config]")

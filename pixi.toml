@@ -10,7 +10,7 @@ platforms = [
   { name = "linux-64-cuda12", platform = "linux-64", cuda = "12" },
   { name = "linux-aarch64-cuda12", platform = "linux-aarch64", cuda = "12" },
 ]
-requires-pixi = ">=0.71"
+requires-pixi = ">=0.78"
 
 [activation]
 scripts = ["scripts/pixi_activate.sh"]
@@ -62,11 +62,13 @@ sqlite = "3.*"
 rust-src = "*"
 liburing = "*"
 openssl = "*"
+xxhash = "0.8.*"
 libcurl = "*"
 pnpm = "*"
 python = "3.14.*"
 pyarrow = ">=14"
 seaweedfs = ">=4.48"
+fastavro = "1.12.2.*"
 
 [tasks]
 
@@ -164,12 +166,17 @@ tar -xzf build/docs/theme.tar.gz --strip-components=1 -C build/docs/theme doxyge
 inputs = ["pixi.toml"]
 outputs = ["build/docs/theme/doxygen-awesome.css", "build/docs/theme/LICENSE"]
 
+[feature.docs.tasks.docs-c]
+description = "Build the Sirius public C API reference in build/docs/c/html."
+cmd = "rm -rf build/docs/c && doxygen docs/c/Doxyfile"
+depends-on = ["docs-theme"]
+
 [feature.docs.tasks.docs-cpp]
 description = "Build the Sirius public C++ API reference in build/docs/html."
 cmd = "rm -rf build/docs/html && doxygen docs/api/Doxyfile"
 depends-on = ["docs-theme"]
 
 [feature.docs.tasks.docs]
-description = "Build the combined C++ and Rust documentation site in build/docs/site."
-cmd = "rm -rf build/docs/site && mkdir -p build/docs/site && cp -R build/docs/html build/docs/site/cpp && cp -R build/docs/rust-target/doc build/docs/site/rust && cp docs/site/index.html build/docs/site/index.html && cp docs/site/rust/index.html build/docs/site/rust/index.html"
-depends-on = ["docs-cpp", "docs-rust"]
+description = "Build the combined C, C++ and Rust documentation site in build/docs/site."
+cmd = "rm -rf build/docs/site && mkdir -p build/docs/site && cp -R build/docs/c/html build/docs/site/c && cp -R build/docs/html build/docs/site/cpp && cp -R build/docs/rust-target/doc build/docs/site/rust && cp docs/site/index.html build/docs/site/index.html && cp docs/site/rust/index.html build/docs/site/rust/index.html"
+depends-on = ["docs-c", "docs-cpp", "docs-rust"]

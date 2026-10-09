@@ -6,9 +6,9 @@
  */
 #pragma once
 
+#include <sirius/c/context/context.h>
 #include <sirius/context/config.hpp>
 #include <sirius/error.hpp>
-#include <sirius/export.hpp>
 
 #include <expected>
 #include <memory>
@@ -37,13 +37,14 @@ namespace sirius {
  * ownership. The configuration supplied to create() need not outlive the context.
  * Do not destroy the context concurrently with its use.
  */
-class SIRIUS_EXPORT Context {
+class Context {
  public:
   /**
    * @brief Create an initialized engine from a validated configuration.
    * @param config Requested engine settings; hardware limits are checked here.
    * @return An owned context, or an Error with code ErrorCode::context_initialization
    *         or ErrorCode::allocation_failure. Allocation failures have an empty message.
+   * An unrecoverable failure during rollback can terminate the process, as in destruction.
    *
    * @code{.cpp}
    * #include <sirius/context/config_builder.hpp>
@@ -66,7 +67,19 @@ class SIRIUS_EXPORT Context {
    * @endcode
    */
   [[nodiscard]] static std::expected<std::unique_ptr<Context>, Error> create(
-    const ContextConfig& config) noexcept;
+    const ContextConfig& config) noexcept
+  {
+    try {
+      // Allocate the consumer's wrapper before starting the engine.
+      auto context             = std::unique_ptr<Context>(new Context);
+      sirius_error* diagnostic = nullptr;
+      auto status = sirius_context_create(config.handle_, &context->handle_, &diagnostic);
+      if (status != SIRIUS_SUCCESS) { return std::unexpected(Error::from_c(status, diagnostic)); }
+      return context;
+    } catch (const std::bad_alloc&) {
+      return std::unexpected(Error{ErrorCode::allocation_failure, {}});
+    }
+  }
 
   /// Release the engine and its resources without throwing.
   /// An unrecoverable failure to stop workers or destroy resources terminates the process.
@@ -81,7 +94,7 @@ class SIRIUS_EXPORT Context {
   ///   // Use the context if creation succeeded.
   /// } // The owned context is destroyed on leaving this scope.
   /// @endcode
-  ~Context() noexcept;
+  ~Context() noexcept { sirius_context_destroy(handle_); }
 
   Context(const Context&)            = delete;
   Context& operator=(const Context&) = delete;
@@ -89,9 +102,8 @@ class SIRIUS_EXPORT Context {
   Context& operator=(Context&&)      = delete;
 
  private:
-  struct Impl;
-  explicit Context(std::unique_ptr<Impl> impl) noexcept;
-  std::unique_ptr<Impl> impl_;
+  Context() noexcept        = default;
+  ::sirius_context* handle_ = nullptr;
 };
 
 }  // namespace sirius

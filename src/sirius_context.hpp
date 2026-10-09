@@ -24,6 +24,8 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -42,9 +44,11 @@
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -334,9 +338,42 @@ class SiriusContext : public ClientContextState {
     uint64_t classification_failures          = 0;
     uint64_t read_view_mismatches             = 0;
     uint64_t certificate_mismatches           = 0;
+    uint64_t certificate_incompletes          = 0;
     uint64_t execution_rebuilds               = 0;
     uint64_t checkpoint_revalidation_failures = 0;
     uint64_t lease_held_at_replay             = 0;
+    static constexpr std::size_t semantic_reason_count =
+      static_cast<std::size_t>(sirius::op::scan::verdict_reason::callback_mismatch) + 1;
+    std::array<uint64_t, semantic_reason_count> semantic_declines{};
+    std::array<uint64_t, 3> semantic_verdicts{};
+    uint64_t certification_added_time_us_sum = 0;
+    uint64_t certification_added_time_us_max = 0;
+    uint64_t certification_added_bytes       = 0;
+    uint64_t inherited_capture_bytes         = 0;
+    uint64_t certification_borrowed_files    = 0;
+    uint64_t delete_preparation_time_us      = 0;
+    std::array<uint64_t, 2> budget_exceeded{};
+    uint64_t setting_lookups_per_attempt = 0;
+    std::array<uint64_t, 8> late_failures{};
+    std::array<uint64_t, 8> late_replays{};
+    std::array<uint64_t, 6> late_failure_no_replay{};
+    uint64_t late_replay_not_read_only  = 0;
+    uint64_t discarded_speculative_work = 0;
+    uint64_t window_tasks_started       = 0;
+    std::map<std::string, uint64_t> parquet_reader_calls, native_decoder_calls;
+    std::map<std::string, uint64_t> readahead_registrations;
+    uint64_t prefetcher_conversions = 0;
+    std::map<uint64_t, sirius::op::scan::scan_publication_observation> publications_by_query;
+    uint64_t iceberg_manifest_walks       = 0;
+    uint64_t iceberg_dv_manifest_reads    = 0;
+    uint64_t iceberg_delete_payload_loads = 0;
+    uint64_t iceberg_inventory_bytes_peak = 0;
+    uint64_t split_physical_checks        = 0;
+    uint64_t split_flushed_for_schema     = 0;
+    std::array<uint64_t, semantic_reason_count> split_physical_rejections{};
+    uint64_t parquet_type_mismatch_observed = 0;
+    uint64_t parquet_type_refusals          = 0;
+    std::unordered_map<uint64_t, uint64_t> scan_lowerings;
   };
 
   SiriusContext();
@@ -425,6 +462,7 @@ class SiriusContext : public ClientContextState {
     internal_connection& operator=(const internal_connection&) = delete;
 
     unique_ptr<MaterializedQueryResult> Query(const string& sql);
+    unique_ptr<QueryResult> SendQuery(const string& sql);
 
    private:
     struct implementation;
@@ -443,6 +481,7 @@ class SiriusContext : public ClientContextState {
                                              std::string_view phase,
                                              uint64_t iteration = 0);
   std::function<void()> cpu_replay_hook_for_testing;
+  std::function<void()> cpu_replay_query_hook_for_testing;
   void before_cpu_replay_for_testing(ClientContext& context);
 
   /// \brief Whether the given connection is inside an internal-query bracket.
@@ -552,6 +591,19 @@ class SiriusContext : public ClientContextState {
     /// releaser; all window logging is best-effort and can neither retain the
     /// slot nor poison the runtime.
     void finish();
+    [[nodiscard]] sirius::transparent::failure_cause failure() const
+    {
+      return completion_->failure();
+    }
+    [[nodiscard]] bool non_rollbackable_state() const
+    {
+      return completion_->non_rollbackable_state;
+    }
+    [[nodiscard]] std::shared_ptr<sirius::op::scan::test_injections const> injections() const
+    {
+      return completion_->injections;
+    }
+    void report_failure(std::exception_ptr error) { completion_->report_error(std::move(error)); }
 
     /// \brief This window's query id — the key its data repositories are registered under.
     /// Pass it to the execution path (sirius_execute_query) so operators wire into this
@@ -578,6 +630,7 @@ class SiriusContext : public ClientContextState {
     scope_state state_   = scope_state::ACTIVE;
     lease_release_result lease_release_;
     bool inject_cleanup_failure_ = false;
+    std::shared_ptr<sirius::pipeline::completion_handler> completion_;
   };
 
   /// \brief Terminate the Sirius context, releasing all resources.
@@ -721,6 +774,7 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
+  void record_transparent_certificate_incomplete() noexcept;
 
   /// \brief Record a CPU/candidate bound read-view comparison failure.
   void record_transparent_read_view_mismatch() noexcept;
@@ -732,6 +786,24 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
+  void record_scan_certification(sirius::op::scan::eligibility_certificate const& certificate);
+  void record_certification_budget(bool time, bool bytes, uint64_t lookups);
+  std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters() const
+  {
+    return physical_counters_;
+  }
+  void record_scan_lowering(uint64_t contract);
+  void record_delete_preparation(uint64_t elapsed_us);
+  std::shared_ptr<sirius::pipeline::completion_handler> window_completion(
+    sirius::query_id_t id) const;
+  void record_late_failure(sirius::transparent::late_failure_cause cause) noexcept;
+  void record_late_replay(sirius::transparent::late_failure_cause cause, bool read_only) noexcept;
+  void record_late_refusal(sirius::transparent::late_failure_condition condition) noexcept;
+  std::shared_ptr<std::atomic<uint64_t>> window_task_counter() const
+  {
+    return window_tasks_started_;
+  }
+  void record_semantic_decline(sirius::op::scan::verdict_reason reason) noexcept;
 
   /// Shared event source for planning, pinning, and execution observations.
   [[nodiscard]] sirius::event::query_event_publisher& get_event_publisher() const noexcept
@@ -873,12 +945,28 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
+  std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =
+    std::make_shared<sirius::op::scan::physical_check_counters>();
+  mutable std::mutex window_completions_mutex_;
+  std::map<uint64_t, std::shared_ptr<sirius::pipeline::completion_handler>> window_completions_;
+  std::array<std::atomic<uint64_t>, 8> late_failures_{};
+  std::array<std::atomic<uint64_t>, 8> late_replays_{};
+  std::array<std::atomic<uint64_t>, 6> late_failure_no_replay_{};
+  std::atomic<uint64_t> late_replay_not_read_only_{0};
+  std::atomic<uint64_t> discarded_speculative_work_{0};
+  std::shared_ptr<std::atomic<uint64_t>> window_tasks_started_ =
+    std::make_shared<std::atomic<uint64_t>>(0);
+  mutable std::mutex certification_stats_mutex_;
+  transparent_execution_stats certification_stats_;
   std::atomic<uint64_t> transparent_classification_failure_count_{0};
   std::atomic<uint64_t> transparent_read_view_mismatch_count_{0};
   std::atomic<uint64_t> transparent_certificate_mismatch_count_{0};
+  std::atomic<uint64_t> transparent_certificate_incomplete_count_{0};
   std::atomic<uint64_t> transparent_execution_rebuild_count_{0};
   std::atomic<uint64_t> checkpoint_revalidation_failure_count_{0};
   std::atomic<uint64_t> lease_held_at_replay_count_{0};
+  std::array<std::atomic<uint64_t>, transparent_execution_stats::semantic_reason_count>
+    semantic_decline_counts_{};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

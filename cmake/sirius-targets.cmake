@@ -1,9 +1,3 @@
-# Keep the public context API's C++23 requirement local.
-add_library(sirius_public_api OBJECT src/context_config.cpp src/context.cpp)
-target_compile_features(sirius_public_api PRIVATE cxx_std_23)
-set_target_properties(sirius_public_api PROPERTIES POSITION_INDEPENDENT_CODE ON
-                                                   CXX_VISIBILITY_PRESET hidden)
-
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
 add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)
@@ -17,14 +11,6 @@ if(NOT PROJECT_IS_TOP_LEVEL)
   build_loadable_extension(sirius CPP src/sirius_extension_entry.cpp
                            $<TARGET_OBJECTS:sirius_objects>)
 endif()
-
-# Link the public context API implementation into every Sirius artifact.
-foreach(_target sirius_core sirius_shared sirius_extension
-                sirius_loadable_extension)
-  if(TARGET ${_target})
-    target_sources(${_target} PRIVATE $<TARGET_OBJECTS:sirius_public_api>)
-  endif()
-endforeach()
 
 # The standalone FFI constructs an embedded DuckDB, which needs the no-op static
 # extension loader retained regardless of archive ordering.
@@ -101,7 +87,7 @@ if(BUILD_WITH_CTRACK)
   list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
 endif()
 
-foreach(_target sirius_objects sirius_public_api sirius_core sirius_extension
+foreach(_target sirius_objects sirius_core sirius_extension
                 sirius_loadable_extension sirius_shared)
   if(NOT TARGET ${_target})
     continue()
@@ -112,18 +98,15 @@ foreach(_target sirius_objects sirius_public_api sirius_core sirius_extension
     set(_link_scope "")
   endif()
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
-  if(NOT _target STREQUAL "sirius_public_api")
-    set_target_properties(
-      ${_target}
-      PROPERTIES CXX_STANDARD 20
-                 CXX_STANDARD_REQUIRED ON
-                 CUDA_STANDARD 20
-                 CUDA_STANDARD_REQUIRED ON
-                 CUDA_SEPARABLE_COMPILATION ON)
-    if(NOT _target STREQUAL "sirius_objects")
-      set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS
-                                                  ON)
-    endif()
+  set_target_properties(
+    ${_target}
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CUDA_STANDARD 20
+               CUDA_STANDARD_REQUIRED ON
+               CUDA_SEPARABLE_COMPILATION ON)
+  if(NOT _target STREQUAL "sirius_objects")
+    set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   endif()
 
   # cuco's device APIs need nvcc's extended device lambda; cuco compiles its own
@@ -239,10 +222,6 @@ set_target_properties(
              SOVERSION 0
              INSTALL_RPATH "$ORIGIN"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
-target_compile_features(sirius_shared INTERFACE cxx_std_23)
-# Installed static consumers use the public headers too. Keep this requirement
-# out of DuckDB's in-tree build graph.
-target_compile_features(sirius_core INTERFACE "$<INSTALL_INTERFACE:cxx_std_23>")
 target_link_libraries(
   sirius_shared
   PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
