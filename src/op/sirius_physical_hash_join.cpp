@@ -49,6 +49,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "planner/gpu_admission.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
@@ -843,17 +844,42 @@ cross_schedule_kind peek_cross_schedule_kind(std::vector<partition_cross_schedul
   return cross_schedule_kind::done;
 }
 
-partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
-                                                        bool is_build_side,
-                                                        bool build_foldable,
-                                                        std::vector<int> const& active_gpu_ids,
-                                                        std::size_t single_partition_rotation,
-                                                        uint64_t hash_partition_bytes,
-                                                        uint64_t max_build_hash_table_bytes,
-                                                        uint64_t max_broadcast_join_size,
-                                                        duckdb::JoinType join_type,
-                                                        HASH_JOIN_MODE join_mode,
-                                                        double estimated_probe_to_build_ratio)
+int larger_side_num_partitions(uint64_t total_bytes,
+                               std::optional<uint64_t> other_side_bytes,
+                               uint64_t hash_partition_bytes,
+                               int natural)
+{
+  if (hash_partition_bytes == 0) {
+    throw std::invalid_argument("hash_partition_bytes must be greater than zero");
+  }
+  if (!other_side_bytes.has_value() || *other_side_bytes <= total_bytes) { return natural; }
+  auto const ceil_div  = [](uint64_t a, uint64_t b) { return a / b + (a % b != 0 ? 1 : 0); };
+  auto const natural_u = static_cast<uint64_t>(std::max(1, natural));
+  // What the other side needs to fit one CONCAT batch per partition.
+  uint64_t const wanted = std::max(natural_u, ceil_div(*other_side_bytes, hash_partition_bytes));
+  // Never shrink the sizing side's partitions below hash_partition_bytes / divisor; an
+  // over-estimated other side is bounded here, and a zero-byte sizing side stays at `natural`.
+  uint64_t const min_partition_bytes =
+    std::max<uint64_t>(1, hash_partition_bytes / config::JOIN_LARGER_SIDE_MIN_PARTITION_DIVISOR);
+  uint64_t const cap   = std::max(natural_u, ceil_div(total_bytes, min_partition_bytes));
+  uint64_t const count = std::min<uint64_t>(std::min(wanted, cap),
+                                            static_cast<uint64_t>(std::numeric_limits<int>::max()));
+  return static_cast<int>(count);
+}
+
+partition_strategy compute_hash_join_partition_strategy(
+  uint64_t total_bytes,
+  bool is_build_side,
+  bool build_foldable,
+  std::vector<int> const& active_gpu_ids,
+  std::size_t single_partition_rotation,
+  uint64_t hash_partition_bytes,
+  uint64_t max_build_hash_table_bytes,
+  uint64_t max_broadcast_join_size,
+  duckdb::JoinType join_type,
+  HASH_JOIN_MODE join_mode,
+  double estimated_probe_to_build_ratio,
+  std::optional<uint64_t> other_side_bytes_estimate)
 {
   // Without a GPU list (engine-free tests) plan as a single GPU and leave partitions unpinned.
   int const num_gpus = std::max(1, static_cast<int>(active_gpu_ids.size()));
@@ -861,14 +887,17 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   int const natural = natural_num_partitions(total_bytes, hash_partition_bytes, num_gpus);
 
   // Only the build side can drive broadcast / BUILD_PROBE. Right-family joins are probe-driven
-  // (probe partition sizes the join), so they always take the plain STANDARD natural count.
+  // (probe partition sizes the join), so they always take the STANDARD count: natural, raised by
+  // larger-side sizing when the build side is known to be bigger.
   if (!is_build_side) {
-    return partition_strategy{natural,
+    int const count = larger_side_num_partitions(
+      total_bytes, other_side_bytes_estimate, hash_partition_bytes, natural);
+    return partition_strategy{count,
                               /*broadcast=*/false,
                               /*build_probe=*/false,
-                              natural == 1 ? partition_placement::unpinned(1)
-                                           : partition_placement::round_robin(
-                                               static_cast<std::size_t>(natural), active_gpu_ids)};
+                              count == 1 ? partition_placement::unpinned(1)
+                                         : partition_placement::round_robin(
+                                             static_cast<std::size_t>(count), active_gpu_ids)};
   }
 
   bool const is_mark         = join_type == duckdb::JoinType::MARK;
@@ -920,9 +949,15 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
     return partition_strategy{
       static_cast<int>(placement.num_partitions()), broadcast, build_probe, std::move(placement)};
   }
-  int const num_partitions = build_probe                  ? build_probe_partitions
-                             : (is_mark && num_gpus <= 1) ? 1
-                                                          : natural;
+  // STANDARD / MIXED_JOIN take the natural count, raised by larger-side sizing when the probe is
+  // known or estimated to be bigger than the build (one hash build per partition instead of one
+  // per probe batch). BUILD_PROBE builds once per slot already and keeps its own count.
+  int const num_partitions =
+    build_probe ? build_probe_partitions
+    : (is_mark && num_gpus <= 1)
+      ? 1
+      : larger_side_num_partitions(
+          total_bytes, other_side_bytes_estimate, hash_partition_bytes, natural);
   // A lone BUILD_PROBE partition picks its GPU by rotation so several small joins in one query
   // spread across GPUs instead of all landing on the first. STANDARD builds its hash table
   // within each task, so a lone partition can follow input locality.
@@ -966,7 +1001,31 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
     static_cast<double>(probe_card_est) / build_card_est;
   // Unnumbered operators (unit-test fixtures) have no id to rotate by.
   std::size_t const rotation = operator_id != invalid_operator_id ? operator_id : 0;
-  auto const strategy        = compute_hash_join_partition_strategy(in.total_bytes,
+
+  // Larger-side sizing: the other side's total. Measured or projected by PARTITION when it can
+  // be, else planner rows x estimated row width of that child's output; never below the bytes the
+  // other side has already delivered.
+  std::optional<uint64_t> other_side_estimate;
+  if (larger_side_partitioning) {
+    uint64_t const other_measured =
+      in.combined_total_bytes > in.total_bytes ? in.combined_total_bytes - in.total_bytes : 0;
+    uint64_t estimate = 0;
+    if (in.sibling_total_bytes_estimate.has_value()) {
+      estimate = *in.sibling_total_bytes_estimate;
+    } else {
+      std::size_t const other_idx = in.is_build_side ? 0 : 1;
+      if (children.size() > other_idx && children[other_idx]) {
+        auto const& other = *children[other_idx];
+        estimate          = planner::accumulate_scan_bytes(
+          0,
+          other.estimated_cardinality,
+          planner::estimate_bytes_per_row(other.types, avg_variable_column_bytes));
+      }
+    }
+    other_side_estimate = std::max(estimate, other_measured);
+  }
+
+  auto const strategy = compute_hash_join_partition_strategy(in.total_bytes,
                                                              in.is_build_side,
                                                              in.build_foldable,
                                                              active_gpu_ids(),
@@ -976,7 +1035,8 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                                              _max_broadcast_join_size,
                                                              join_type,
                                                              _join_mode,
-                                                             estimated_probe_to_build_ratio);
+                                                             estimated_probe_to_build_ratio,
+                                                             other_side_estimate);
 
   if (join_type == duckdb::JoinType::MARK && num_gpus() > 1 && in.is_build_side &&
       in.total_bytes >= partition_small_table_bytes(num_gpus())) {
@@ -1016,7 +1076,8 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
 
   SIRIUS_LOG_DEBUG(
     "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), build side {} "
-    "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {} placement {}",
+    "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {} "
+    "other_side_est {} placement {}",
     this->get_operator_id(),
     strategy.num_partitions,
     num_gpus(),
@@ -1026,6 +1087,7 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
     (strategy.broadcast ? " [broadcast]" : ""),
     build_card_est,
     probe_card_est,
+    other_side_estimate.has_value() ? std::to_string(*other_side_estimate) : std::string{"-"},
     strategy.placement.to_string());
   return strategy;
 }

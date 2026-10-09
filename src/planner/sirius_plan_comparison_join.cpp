@@ -663,6 +663,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
     hj.runtime_distinct_build_probe = op_params.enable_runtime_distinct_build_probe;
+    hj.larger_side_partitioning     = op_params.enable_join_larger_side_partitioning;
+    hj.avg_variable_column_bytes    = op_params.avg_variable_column_bytes;
 
     // --- Detect build-side key uniqueness ---
     // Gate: only for pure equal conditions (not_distinct_from needs null_equality::EQUAL).

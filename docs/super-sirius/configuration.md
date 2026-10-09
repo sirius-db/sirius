@@ -557,6 +557,7 @@ individually.
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
+| `enable_join_larger_side_partitioning` | false | Size `STANDARD` / `MIXED_JOIN` hash-join partitions from the larger join side instead of the sizing side alone. The other side's total is the sibling PARTITION's measured bytes when its producer has finished, else its runtime projection (with `enable_runtime_size_estimation`), else planner rows × estimated row width (`avg_variable_column_bytes` per variable-width column). When it exceeds the sizing side, the count is raised to `ceil(other / hash_partition_bytes)` so every partition is one build batch × one probe batch and its hash table is built once instead of once per streamed batch; capped so the sizing side's partitions never fall below `hash_partition_bytes / 16`. Broadcast and `BUILD_PROBE` joins are unaffected. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
@@ -769,6 +770,7 @@ SET enable_compressed_materialization = false;
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
+| `enable_join_larger_side_partitioning` | false | Size STANDARD hash-join partitions from the larger join side (test-options build only) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan

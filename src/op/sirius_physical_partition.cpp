@@ -635,12 +635,27 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       // size from the combined input.
       auto const this_bytes    = compute_total_bytes();
       auto const sibling_bytes = sibling.compute_total_bytes();
+      // The non-sizing side's total, when it can be known now: measured once its producer has
+      // finished, else its runtime projection (only with size estimation enabled). Both locks are
+      // held and neither helper takes the operator lock.
+      auto& other_partition = _drives_partition_count ? sibling : *this;
+      std::optional<uint64_t> other_total_estimate;
+      if (other_partition.ports.size() == 1) {
+        auto other_port = other_partition.ports.begin()->second;
+        if (other_port->src_pipeline && other_port->src_pipeline->is_pipeline_finished()) {
+          other_total_estimate = other_partition.compute_total_bytes();
+        }
+      }
+      if (!other_total_estimate.has_value()) {
+        other_total_estimate = other_partition.estimated_total_input_bytes();
+      }
       auto const sizing_totals = sizing_partition.compute_input_totals();
       partition_sizing_input const in{sizing_totals.bytes,
                                       sizing_partition._is_build,
                                       has_build_concat(*this) || has_build_concat(sibling),
                                       sirius::memory::saturating_add(this_bytes, sibling_bytes),
-                                      sizing_totals.rows};
+                                      sizing_totals.rows,
+                                      other_total_estimate};
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy      = consumer->get_partition_strategy(in);
