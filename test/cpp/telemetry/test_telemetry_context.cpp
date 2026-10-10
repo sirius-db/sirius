@@ -16,11 +16,13 @@
 
 #include "catch.hpp"
 #include "duckdb.hpp"
+#include "scan/test_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_extension.hpp"
 #include "telemetry/nvtx_injection.hpp"
 #include "telemetry/telemetry_context.hpp"
 #include "utils/child_process_environment.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <dlfcn.h>
 #include <spawn.h>
@@ -70,7 +72,7 @@ class scoped_env_restore {
   std::optional<std::string> original_;
 };
 
-std::string uuid_str(const uuid::UUID& id) { return std::string(uuid::to_string(id)); }
+std::string uuid_str(const quent::Uuid& id) { return quent::to_string(id); }
 
 /// Read every line of every ndjson file that the quent context wrote.
 std::vector<std::string> read_all_telemetry_lines(const std::filesystem::path& dir,
@@ -218,8 +220,38 @@ TEST_CASE("static NVTX injection path resolves the host initializer", "[telemetr
   CHECK(::dlclose(handle) == 0);
 }
 
-TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telemetry_context]")
+TEST_CASE("telemetry_context without a memory manager uses the fallback GPU group",
+          "[telemetry_context]")
 {
+  const auto out_dir = std::filesystem::temp_directory_path() /
+                       ("sirius_telemetry_nomgr_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(out_dir);
+  telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = out_dir.string();
+  config.engine_name      = "test-engine";
+
+  std::string worker_id, fallback_id;
+  {
+    auto context = telemetry_context::create(make_quent_context(config), config, nullptr);
+    REQUIRE(context->get_memory_context() != nullptr);
+    const auto& gpu0 = context->gpu_device_telemetry_handles(0);
+    // No manager means no declared devices: every ordinal resolves to the one fallback group.
+    REQUIRE(gpu0.device.id() == context->gpu_device_telemetry_handles(1).device.id());
+    worker_id   = uuid_str(context->worker_id().raw());
+    fallback_id = uuid_str(gpu0.device.id().raw());
+  }
+  const auto lines = read_all_telemetry_lines(out_dir);
+  REQUIRE(any_line_with_all(lines, {"shared-thread-group", worker_id}));
+  REQUIRE(any_line_with_all(lines, {"\"gpu-fallback\"", worker_id, fallback_id}));
+  std::filesystem::remove_all(out_dir);
+}
+
+TEST_CASE("telemetry_context nests threads under per-GPU device groups",
+          "[telemetry_context][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  auto manager       = initialize_memory_manager(2);
   const auto out_dir = std::filesystem::temp_directory_path() /
                        ("sirius_telemetry_test_" + std::to_string(::getpid()));
   std::filesystem::remove_all(out_dir);
@@ -229,60 +261,59 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
   config.output_directory = out_dir.string();
   config.engine_name      = "test-engine";
 
-  std::string engine_id;
-  std::string gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id, shared_id;
+  std::string worker_id;
+  std::string gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id;
   {
     auto context =
-      telemetry_context::create(make_quent_context(config), config, /*manager=*/nullptr, {0, 1});
-    engine_id    = uuid_str(context->engine_id());
-    gpu0_id      = uuid_str(context->gpu_device_group_id(0));
-    gpu1_id      = uuid_str(context->gpu_device_group_id(1));
-    gpu0_exec_id = uuid_str(context->executor_thread_group_id(0));
-    gpu0_mgr_id  = uuid_str(context->manager_thread_group_id(0));
-    shared_id    = uuid_str(context->shared_group_id());
+      telemetry_context::create(std::move(make_quent_context(config)), config, manager.get());
+    const auto& gpu0 = context->gpu_device_telemetry_handles(0);
+    worker_id        = uuid_str(context->worker_id().raw());
+    gpu0_id          = uuid_str(gpu0.device.id().raw());
+    gpu1_id          = uuid_str(context->gpu_device_telemetry_handles(1).device.id().raw());
+    gpu0_exec_id     = uuid_str(gpu0.executor_threads.id().raw());
+    gpu0_mgr_id      = uuid_str(gpu0.manager_threads.id().raw());
 
-    // Every id is distinct and none collapses onto the engine.
-    const std::vector<std::string> ids{
-      engine_id, gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id, shared_id};
+    // Every declared resource has its own id.
+    const std::vector<std::string> ids{worker_id, gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id};
     for (size_t i = 0; i < ids.size(); i++) {
       for (size_t j = i + 1; j < ids.size(); j++) {
         REQUIRE(ids[i] != ids[j]);
       }
     }
 
-    // Unknown devices fall back to the engine group instead of orphaning.
-    REQUIRE(context->gpu_device_group_id(99) == context->engine_id());
-    REQUIRE(context->executor_thread_group_id(99) == context->engine_id());
-    REQUIRE(context->manager_thread_group_id(99) == context->engine_id());
+    // Unknown devices reuse one fallback group.
+    const auto& fallback = context->gpu_device_telemetry_handles(99);
+    REQUIRE(fallback.device.id() == context->gpu_device_telemetry_handles(99).device.id());
+    REQUIRE(fallback.device.id() != gpu0.device.id());
 
-    // Emit one thread of each kind the way the executors do.
-    ExecutorThreadHandleWrapper exec_thread{
-      *context, "test-gpu0-exec-0", context->executor_thread_group_id(0)};
-    TaskManagerLoopThreadHandleWrapper manager_thread{
-      *context, "gpu-0-exec-manager", context->manager_thread_group_id(0)};
-    TaskManagerLoopThreadHandleWrapper scheduler_thread{
-      *context, "task-scheduler-thread", context->shared_group_id()};
-    TaskQueueHandleWrapper task_queue{
-      *context, "gpu_pipeline-task-queue", context->gpu_device_group_id(0)};
-  }  // wrappers exit, then the context drops and flushes the ndjson files
+    // Emit the same resource references as the GPU executor.
+    auto exec_thread = context->context().executor_thread_observer()->handle();
+    exec_thread.spawned({.label = "test-gpu0-exec-0", .group_id = gpu0.executor_threads.id()});
+    auto manager_thread = context->context().task_manager_loop_thread_observer()->handle();
+    manager_thread.spawned({.label = "gpu-0-exec-manager", .group_id = gpu0.manager_threads.id()});
+    auto task_queue = context->context().task_queue_observer()->handle();
+    task_queue.created({.worker_id     = context->worker_id(),
+                        .gpu_device_id = gpu0.device.id(),
+                        .label         = "gpu_pipeline-task-queue"});
+
+    task_queue.exit();
+    manager_thread.exit();
+    exec_thread.exit();
+  }  // Handles exit, then the context flushes the ndjson files.
 
   const auto lines = read_all_telemetry_lines(out_dir);
   REQUIRE(!lines.empty());
 
-  // Device groups are declared under the engine, with matching ids.
-  REQUIRE(any_line_with_all(lines, {"\"gpu-0\"", engine_id, gpu0_id}));
-  REQUIRE(any_line_with_all(lines, {"\"gpu-1\"", engine_id, gpu1_id}));
-  // Per-thread-type buckets are declared under the gpu-0 device group.
-  REQUIRE(any_line_with_all(lines, {"\"executor_thread\"", gpu0_id, gpu0_exec_id}));
-  REQUIRE(any_line_with_all(lines, {"\"task_manager_loop_thread\"", gpu0_id, gpu0_mgr_id}));
-  // The shared group hangs off the engine.
-  REQUIRE(any_line_with_all(lines, {"\"shared\"", engine_id, shared_id}));
-
-  // Threads and queues point at their group, not at the engine.
+  // Device groups are declared under the worker, with matching ids.
+  REQUIRE(any_line_with_all(lines, {"\"gpu-0\"", worker_id, gpu0_id}));
+  REQUIRE(any_line_with_all(lines, {"\"gpu-1\"", worker_id, gpu1_id}));
+  // Thread groups are declared under the gpu-0 device group or worker.
+  REQUIRE(any_line_with_all(lines, {"gpu-0-executor-threads", gpu0_id, gpu0_exec_id}));
+  REQUIRE(any_line_with_all(lines, {"gpu-0-manager-threads", gpu0_id, gpu0_mgr_id}));
+  REQUIRE(any_line_with_all(lines, {"shared-thread-group", worker_id}));
+  // Threads and queues point at their declared GPU resources.
   REQUIRE(any_line_with_all(lines, {"test-gpu0-exec-0", gpu0_exec_id}));
-  REQUIRE(!any_line_with_all(lines, {"test-gpu0-exec-0", engine_id}));
   REQUIRE(any_line_with_all(lines, {"gpu-0-exec-manager", gpu0_mgr_id}));
-  REQUIRE(any_line_with_all(lines, {"task-scheduler-thread", shared_id}));
   REQUIRE(any_line_with_all(lines, {"gpu_pipeline-task-queue", gpu0_id}));
 
   std::filesystem::remove_all(out_dir);

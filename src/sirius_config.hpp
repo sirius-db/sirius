@@ -255,9 +255,6 @@ struct operator_params {
 
 struct telemetry_config {
   bool enable_quent{true};
-  /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
-  /// Roughly doubles telemetry volume; no-op when enable_quent is false.
-  bool enable_batch_events{true};
   /// Capture NVTX ranges (Sirius and libcudf) into Quent; no-op when
   /// enable_quent is false.
   bool enable_nvtx{false};

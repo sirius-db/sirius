@@ -21,202 +21,187 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius_config.hpp"
-#include "telemetry-bridge/gen/operator.rs.h"
-#include "telemetry-bridge/gen/plan.rs.h"
-#include "telemetry-bridge/gen/port.rs.h"
-#include "telemetry/batch_telemetry.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx_injection.hpp"
 
 #include <unistd.h>
 
 #include <format>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace sirius::telemetry {
 
-rust::Box<quent::Context> make_quent_context(const sirius::telemetry_config& config)
+quent::Context make_quent_context(const sirius::telemetry_config& config)
 {
   detail::configure_nvtx_injection(config.enable_quent && config.enable_nvtx,
                                    config.nvtx_injection_lib);
-  return quent::create_context([&config] {
-    if (!config.enable_quent) { return quent::ExporterOptions::none(); }
-    if (config.exporter == "ndjson") {
-      return quent::ExporterOptions::ndjson(config.output_directory);
-    }
-    if (config.exporter == "msgpack") {
-      return quent::ExporterOptions::msgpack(config.output_directory);
-    }
-    if (config.exporter == "postcard") {
-      return quent::ExporterOptions::postcard(config.output_directory);
-    }
-    throw std::invalid_argument(std::format("unknown Quent exporter: {}", config.exporter));
-  }());
+  if (not config.enable_quent) { return quent::Context::none(); }
+
+  const auto capture =
+    config.enable_nvtx ? quent::NvtxCapture::Enabled : quent::NvtxCapture::Disabled;
+  if (config.exporter == "ndjson") {
+    return quent::Context::ndjson(config.output_directory, capture);
+  }
+  if (config.exporter == "msgpack") {
+    return quent::Context::msgpack(config.output_directory, capture);
+  }
+  if (config.exporter == "postcard") {
+    return quent::Context::postcard(config.output_directory, capture);
+  }
+  throw std::invalid_argument(std::format("unknown Quent exporter: {}", config.exporter));
 }
 
 std::shared_ptr<const telemetry_context> telemetry_context::create(
-  rust::Box<quent::Context>&& context,
+  quent::Context&& context,
   const sirius::telemetry_config& config,
-  const cucascade::memory::memory_reservation_manager* manager,
-  const std::vector<int>& gpu_device_ids)
+  const cucascade::memory::memory_reservation_manager* manager)
 {
   return std::shared_ptr<telemetry_context>(
-    new telemetry_context(std::move(context), config, manager, gpu_device_ids));
+    new telemetry_context(std::move(context), config, manager));
 }
 
-telemetry_context::telemetry_context(rust::Box<quent::Context>&& context,
-                                     const sirius::telemetry_config& config,
-                                     const cucascade::memory::memory_reservation_manager* manager,
-                                     const std::vector<int>& gpu_device_ids)
-  : engine_uuid_(uuid::now_v7()),
-    worker_uuid_(uuid::now_v7()),
-    query_group_uuid_(uuid::now_v7()),
-    shared_group_uuid_(uuid::now_v7()),
-    engine_name_(config.engine_name),
+telemetry_context::telemetry_context(quent::Context&& context,
+                                     const telemetry_config& config,
+                                     const cucascade::memory::memory_reservation_manager* manager)
+  : engine_name_(config.engine_name),
     context_(std::move(context)),
-    engine_observer_(quent::engine::create_observer(*context_)),
-    worker_observer_(quent::worker::create_observer(*context_)),
-    query_group_observer_(quent::query_group::create_observer(*context_))
+    engine_handle_(context_.engine_observer()->handle()),
+    worker_handle_(context_.worker_observer()->handle()),
+    default_query_group_handle_(context_.query_group_observer()->handle()),
+    shared_thread_group_handle_(context_.thread_group_observer()->handle())
 {
-  engine_observer_->init(engine_uuid_,
-                         quent::engine::Init{
-                           .implementation =
-                             quent::engine::Implementation{
-                               .name              = config.engine_name,
-                               .version           = "",
-                               .custom_attributes = {},
-                             },
-                           .instance_name = config.engine_name,
-                         });
-
-  worker_observer_->init(worker_uuid_,
-                         quent::worker::Init{
-                           .parent_engine_id = engine_uuid_,
-                           .instance_name    = std::format("worker-{}", getpid()),
-                         });
-
-  memory_context_ = std::make_shared<memory_context>(engine_uuid_, *context_, manager);
+  engine_handle_.init({.label = config.engine_name});
+  worker_handle_.init({
+    .parent_engine_id = engine_handle_.id(),
+    .process_id       = std::format("{}", getpid()),
+    .tag              = "worker",
+  });
 
   // One session-scoped query group under this engine; every query in this context is reported
   // under it, so a whole run shows up as a single group rather than one group per query.
-  query_group_observer_->declaration(
-    query_group_uuid_,
-    quent::query_group::Declaration{
-      .instance_name = std::format("{}-session-{}", config.engine_name, getpid()),
-      .engine_id     = engine_uuid_,
-    });
+  default_query_group_handle_.declaration({
+    .label     = std::format("{}-default-session-{}", config.engine_name, getpid()),
+    .engine_id = engine_handle_.id(),
+  });
 
   // Per-GPU device groups plus per-thread-type buckets underneath, so the
   // viewer renders threads as an engine -> gpu-N -> thread-type tree instead
   // of a flat sibling list. Threads with no single GPU go under `shared`.
-  auto gpu_device_observer   = quent::gpu_device::create_observer(*context_);
-  auto thread_group_observer = quent::thread_group::create_observer(*context_);
+  auto gpu_device_observer   = context_.gpu_device_observer();
+  auto thread_group_observer = context_.thread_group_observer();
 
-  thread_group_observer->declaration(shared_group_uuid_,
-                                     quent::thread_group::Declaration{
-                                       .instance_name   = "shared",
-                                       .parent_group_id = engine_uuid_,
-                                     });
+  shared_thread_group_handle_.declaration({
+    .label         = "shared-thread-group",
+    .worker_id     = worker_handle_.id(),
+    .gpu_device_id = std::nullopt,
+  });
 
-  for (const int device_id : gpu_device_ids) {
-    const gpu_device_group_ids ids{
-      .device           = uuid::now_v7(),
-      .executor_threads = uuid::now_v7(),
-      .manager_threads  = uuid::now_v7(),
-    };
-    gpu_device_observer->declaration(ids.device,
-                                     quent::gpu_device::Declaration{
-                                       .instance_name   = std::format("gpu-{}", device_id),
-                                       .parent_group_id = engine_uuid_,
-                                       .ordinal         = static_cast<uint32_t>(device_id),
-                                     });
-    thread_group_observer->declaration(ids.executor_threads,
-                                       quent::thread_group::Declaration{
-                                         .instance_name   = "executor_thread",
-                                         .parent_group_id = ids.device,
-                                       });
-    thread_group_observer->declaration(ids.manager_threads,
-                                       quent::thread_group::Declaration{
-                                         .instance_name   = "task_manager_loop_thread",
-                                         .parent_group_id = ids.device,
-                                       });
-    gpu_group_ids_.emplace(device_id, ids);
+  std::unordered_map<int, quent::gpu_device::GpuDeviceId> device_id_to_quent_id;
+  if (manager) {
+    for (const auto* gpu_memory_space :
+         manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      int device_id          = gpu_memory_space->get_device_id();
+      auto gpu_device_handle = gpu_device_observer->handle();
+      gpu_device_handle.declaration({
+        .label     = std::format("gpu-{}", device_id),
+        .worker_id = worker_handle_.id(),
+        .ordinal   = static_cast<uint32_t>(device_id),
+      });
+
+      auto manager_thread_group = thread_group_observer->handle();
+      manager_thread_group.declaration({
+        .label         = std::format("gpu-{}-manager-threads", device_id),
+        .worker_id     = worker_handle_.id(),
+        .gpu_device_id = gpu_device_handle.id(),
+      });
+
+      auto executor_thread_group = thread_group_observer->handle();
+      executor_thread_group.declaration({
+        .label         = std::format("gpu-{}-executor-threads", device_id),
+        .worker_id     = worker_handle_.id(),
+        .gpu_device_id = gpu_device_handle.id(),
+      });
+
+      device_id_to_quent_id.emplace(device_id, gpu_device_handle.id());
+      gpu_group_ids_.emplace(device_id,
+                             gpu_device_telemtry_handles{
+                               .device           = std::move(gpu_device_handle),
+                               .manager_threads  = std::move(manager_thread_group),
+                               .executor_threads = std::move(executor_thread_group),
+                             });
+    }
   }
+
+  memory_context_ =
+    std::make_shared<memory_context>(worker_handle_.id(), context_, manager, device_id_to_quent_id);
 
   SIRIUS_LOG_INFO("Telemetry context initialized (engine={}, {} GPU device group(s))",
                   config.engine_name,
                   gpu_group_ids_.size());
 }
 
-uuid::UUID telemetry_context::query_group_id_for(
+const quent::query_group::QueryGroupId telemetry_context::query_group_id_for(
   const std::optional<std::string>& session_label) const
 {
-  if (!session_label.has_value() || session_label->empty()) { return query_group_uuid_; }
+  if (!session_label.has_value() || session_label->empty()) {
+    return default_query_group_handle_.id();
+  }
   const std::lock_guard lock(labeled_groups_mutex_);
   auto it = labeled_group_ids_.find(*session_label);
   if (it == labeled_group_ids_.end()) {
-    auto group_uuid = uuid::now_v7();
-    query_group_observer_->declaration(
-      group_uuid,
-      quent::query_group::Declaration{
-        .instance_name = std::format("{}-{}", engine_name_, *session_label),
-        .engine_id     = engine_uuid_,
-      });
-    it = labeled_group_ids_.emplace(*session_label, std::move(group_uuid)).first;
+    auto session_query_group_handle = context_.query_group_observer()->handle();
+    session_query_group_handle.declaration({
+      .label     = std::format("{}-{}", engine_name_, *session_label),
+      .engine_id = engine_handle_.id(),
+    });
+    it = labeled_group_ids_.emplace(*session_label, session_query_group_handle.id()).first;
   }
   return it->second;
 }
-
-const uuid::UUID& telemetry_context::gpu_device_group_id(int device_id) const
+const telemetry_context::gpu_device_telemtry_handles&
+telemetry_context::gpu_device_telemetry_handles(int device_id) const
 {
   if (const auto it = gpu_group_ids_.find(device_id); it != gpu_group_ids_.end()) {
-    return it->second.device;
+    return it->second;
   }
-  SIRIUS_LOG_WARN("Telemetry: no device group declared for GPU {}; falling back to engine group",
-                  device_id);
-  return engine_uuid_;
-}
-
-const uuid::UUID& telemetry_context::executor_thread_group_id(int device_id) const
-{
-  if (const auto it = gpu_group_ids_.find(device_id); it != gpu_group_ids_.end()) {
-    return it->second.executor_threads;
-  }
-  SIRIUS_LOG_WARN("Telemetry: no device group declared for GPU {}; falling back to engine group",
-                  device_id);
-  return engine_uuid_;
-}
-
-const uuid::UUID& telemetry_context::manager_thread_group_id(int device_id) const
-{
-  if (const auto it = gpu_group_ids_.find(device_id); it != gpu_group_ids_.end()) {
-    return it->second.manager_threads;
-  }
-  SIRIUS_LOG_WARN("Telemetry: no device group declared for GPU {}; falling back to engine group",
-                  device_id);
-  return engine_uuid_;
+  SIRIUS_LOG_WARN(
+    "Telemetry: no device group declared for GPU {}; falling back to fallback GPU device group",
+    device_id);
+  return fallback_gpu_device_telemtry_handles();
 }
 
 telemetry_context::~telemetry_context()
 {
   memory_context_.reset();
-  worker_observer_->exit(worker_uuid_);
-  engine_observer_->exit(engine_uuid_);
+  for (auto& [device_id, handles] : gpu_group_ids_) {
+    exit_from_destructor(handles.executor_threads, "gpu executor thread group");
+    exit_from_destructor(handles.manager_threads, "gpu manager thread group");
+  }
+  if (fallback_gpu_device_handles_) {
+    exit_from_destructor(fallback_gpu_device_handles_->executor_threads, "fallback executor group");
+    exit_from_destructor(fallback_gpu_device_handles_->manager_threads, "fallback manager group");
+  }
+  exit_from_destructor(shared_thread_group_handle_, "shared thread group");
+  exit_from_destructor(worker_handle_, "worker");
+  exit_from_destructor(engine_handle_, "engine");
 }
 
 void emit_plan_telemetry(const quent::Context& context,
                          const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
-                         const uuid::UUID plan_id,
+                         const quent::Uuid plan_id,
                          const query_telemetry_info telemetry_info)
 {
-  auto operator_obs = quent::operator_::create_observer(context);
-  auto port_obs     = quent::port::create_observer(context);
-  auto plan_obs     = quent::plan::create_observer(context);
+  auto operator_observer                 = context.operator_observer();
+  auto port_observer                     = context.port_observer();
+  quent::Handle<quent::Plan> plan_handle = context.plan_observer()->handle();
 
   // Collect edges while iterating
-  rust::Vec<quent::plan::Edges> edges;
+  std::vector<quent::records::Edge> edges;
 
   for (const auto& pipeline : pipelines) {
     const auto pipeline_uuid         = pipeline->pipeline_uuid();
@@ -236,27 +221,25 @@ void emit_plan_telemetry(const quent::Context& context,
       return chain;
     }();
 
-    operator_obs->declaration(
-      pipeline_uuid,
-      quent::operator_::Declaration{
-        .plan_id             = plan_id,
-        .parent_operator_ids = {},
-        .instance_name       = operator_chain,
-        .type_name           = std::format("Pipeline Id {}", pipeline->get_pipeline_id()),
-        .custom_attributes   = {},
-      });
+    quent::Handle<quent::Operator> operator_handle =
+      operator_observer->handle(quent::operator_::OperatorId{pipeline_uuid});
+    operator_handle.declaration({
+      .plan_id           = plan_handle.id(),
+      .label             = operator_chain,
+      .type_name         = std::format("Pipeline Id {}", pipeline->get_pipeline_id()),
+      .custom_attributes = {},
+    });
 
     // Receiver ports on pipeline source operators.
     if (auto source = pipeline->get_source()) {
       for (std::string_view port_id : source->get_port_ids()) {
         if (const op::sirius_physical_operator::port* port = source->get_port(port_id)) {
-          port_obs->declaration(port->source_port_uuid,
-                                quent::port::Declaration{
-                                  .operator_id   = pipeline_uuid,
-                                  .instance_name = std::format("{}_receiver", port_id),
-                                });
-          batch_telemetry_registry::instance().register_consumer_port(
-            port->repo, pipeline_uuid, port->source_port_uuid);
+          quent::Handle<quent::Port> port_handle =
+            port_observer->handle(quent::port::PortId{port->source_port_uuid});
+          port_handle.declaration({
+            .operator_id = operator_handle.id(),
+            .label       = std::format("{}_receiver", port_id),
+          });
         }
       }
     }
@@ -265,34 +248,30 @@ void emit_plan_telemetry(const quent::Context& context,
     for (const auto& [next_operator, next_operator_port_name, pseudo_sink_port_uuid] :
          pipeline->get_next_ports_after_sink()) {
       // Declare the pseudo-sink port
-      port_obs->declaration(pseudo_sink_port_uuid,
-                            quent::port::Declaration{
-                              .operator_id   = pipeline_uuid,
-                              .instance_name = std::format("{}_sender", next_operator_port_name),
-                            });
+      quent::Handle<quent::Port> pseudo_sink_port_handle =
+        port_observer->handle(quent::port::PortId{pseudo_sink_port_uuid});
+      pseudo_sink_port_handle.declaration({
+        .operator_id = operator_handle.id(),
+        .label       = std::format("{}_sender", next_operator_port_name),
+      });
 
       // Find the target port on the downstream operator
       if (const op::sirius_physical_operator::port* target_port =
             next_operator->get_port(next_operator_port_name)) {
-        edges.push_back(quent::plan::Edges{
-          .source = pseudo_sink_port_uuid,
-          .target = target_port->source_port_uuid,
+        edges.push_back(quent::records::Edge{
+          .source = pseudo_sink_port_handle.id(),
+          .target = quent::port::PortId(target_port->source_port_uuid),
         });
       }
     }
   }
 
-  plan_obs->declaration(plan_id,
-                        quent::plan::Declaration{
-                          .parent =
-                            quent::plan::Parent{
-                              .query_id = telemetry_info.telemetry_query_id,
-                              .plan_id  = uuid::new_nil(),  // no parent plan
-                            },
-                          .instance_name = "pipeline_plan",
-                          .edges         = std::move(edges),
-                          .worker_id     = telemetry_info.worker_id,
-                        });
+  plan_handle.declaration({
+    .query_id  = quent::query::QueryId{telemetry_info.telemetry_query_id},
+    .label     = "pipeline_plan",
+    .edges     = std::move(edges),
+    .worker_id = quent::worker::WorkerId{telemetry_info.worker_id},
+  });
 }
 
 }  // namespace sirius::telemetry

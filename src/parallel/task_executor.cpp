@@ -38,23 +38,35 @@ itask_executor::itask_executor(
     // pipeline::index_keys_for.
     _task_queue(&pipeline::index_keys_for),
     _telemetry_context(std::move(telemetry_context)),
-    _task_queue_telemetry(std::make_unique<telemetry::TaskQueueHandleWrapper>(
-      *_telemetry_context,
-      _config.thread_name_prefix + "-task-queue",
-      device_id.has_value() ? _telemetry_context->gpu_device_group_id(*device_id)
-                            : _telemetry_context->engine_id()))
+    _task_queue_telemetry(_telemetry_context->context().task_queue_observer()->handle())
+
 {
+  _task_queue_telemetry.created({
+    .worker_id = _telemetry_context->worker_id(),
+    .gpu_device_id =
+      device_id.has_value()
+        ? std::optional(_telemetry_context->gpu_device_telemetry_handles(*device_id).device.id())
+        : std::nullopt,
+    .label = _config.thread_name_prefix + "-task-queue",
+  });
 }
 
-itask_executor::~itask_executor() { stop(); }
+itask_executor::~itask_executor()
+{
+  stop();
+  telemetry::exit_from_destructor(_task_queue_telemetry, "executor task queue");
+}
 
 void itask_executor::schedule(std::unique_ptr<itask> task)
 {
   if (task) {
     if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
-      pipeline_task->telemetry_handle().queued({
-        .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
-        .queue_capacity_entries = 1,
+      pipeline_task->telemetry_fsm().queued({
+        .queue =
+          {
+            .target = _task_queue_telemetry.id(),
+            .data   = {.entries = 1},
+          },
       });
     }
   }

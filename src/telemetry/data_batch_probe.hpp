@@ -17,9 +17,7 @@
 #pragma once
 
 #include "log/logging.hpp"
-#include "telemetry-bridge/gen/data_batch.rs.h"
-#include "telemetry-bridge/gen/memory.rs.h"
-#include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/memory_context.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -38,7 +36,7 @@ namespace sirius::telemetry {
 //! in unit tests, or when pipelines are built without an engine).
 struct batch_telemetry_info {
   const telemetry_context* context = nullptr;
-  uuid::UUID producer_pipeline_uuid{};
+  quent::Uuid producer_pipeline_uuid{};
 };
 
 /**
@@ -81,8 +79,12 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
 
   ~quent_data_batch_probe() override
   {
-    handle_->destructed();
-    handle_->exit();
+    try {
+      handle_.destructed();
+      handle_.exit();
+    } catch (...) {
+      log_current_exception("destructor");
+    }
   }
 
   void created([[maybe_unused]] const uint64_t batch_id,
@@ -96,11 +98,12 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
         return;
       }
 
-      handle_->stationary({
-        .memory_resource_id    = (*maybe_memory_handle).get().uuid(),
-        .memory_capacity_bytes = data.get_size_in_bytes(),
+      handle_.stationary({
+        .memory = {.target = {(*maybe_memory_handle).get().id()},
+                   .data   = {.bytes = data.get_size_in_bytes()}},
       });
     } catch (...) {
+      log_current_exception("created");
     }
   }
 
@@ -135,15 +138,15 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
         return;
       }
 
-      handle_->in_transit({
-        .source_memory_resource_id    = (*maybe_source_memory_handle).get().uuid(),
-        .source_memory_capacity_bytes = data_size,
-        .dest_memory_resource_id      = (*maybe_dest_memory_handle).get().uuid(),
-        .dest_memory_capacity_bytes   = data_size,
-        .channel_resource_id          = (*maybe_channel_handle).get().uuid(),
-        .channel_capacity_bytes       = data_size,
+      handle_.in_transit({
+        .source_memory = {.target = {(*maybe_source_memory_handle).get().id()},
+                          .data   = {.bytes = data_size}},
+        .dest_memory   = {.target = {(*maybe_dest_memory_handle).get().id()},
+                          .data   = {.bytes = data_size}},
+        .channel = {.target = {(*maybe_channel_handle).get().id()}, .data = {.bytes = data_size}},
       });
     } catch (...) {
+      log_current_exception("conversion_started");
     }
   }
 
@@ -158,11 +161,12 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
         return;
       }
 
-      handle_->stationary({
-        .memory_resource_id    = (*maybe_memory_handle).get().uuid(),
-        .memory_capacity_bytes = data.get_size_in_bytes(),
+      handle_.stationary({
+        .memory = {.target = {(*maybe_memory_handle).get().id()},
+                   .data   = {.bytes = data.get_size_in_bytes()}},
       });
     } catch (...) {
+      log_current_exception("conversion_completed");
     }
   }
 
@@ -177,15 +181,27 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
                         new_data.get_memory_space().to_string());
         return;
       }
-      handle_->stationary({
-        .memory_resource_id    = (*maybe_memory_handle).get().uuid(),
-        .memory_capacity_bytes = new_data.get_size_in_bytes(),
+      handle_.stationary({
+        .memory = {.target = {(*maybe_memory_handle).get().id()},
+                   .data   = {.bytes = new_data.get_size_in_bytes()}},
       });
     } catch (...) {
+      log_current_exception("data_replaced");
     }
   }
 
  private:
+  /// Logs the in-flight exception. Call only from inside a `catch` block.
+  static void log_current_exception(std::string_view where) noexcept
+  {
+    try {
+      throw;
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN("data batch probe {} failed: {}", where, e.what());
+    } catch (...) {
+      SIRIUS_LOG_WARN("data batch probe {} failed with an unknown exception", where);
+    }
+  }
   /**
    * @brief Construct a probe that forwards state transitions to a telemetry observer.
    *
@@ -198,17 +214,20 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
    */
   quent_data_batch_probe(const telemetry_context& ctx,
                          const uint64_t batch_id,
-                         uuid::UUID producer_pipeline_uuid)
-    : handle_(quent::data_batch::create(ctx.context(),
-                                        {
-                                          .instance_name          = "batch",
-                                          .data_batch_id          = batch_id,
-                                          .producer_pipeline_uuid = producer_pipeline_uuid,
-                                        })),
+                         quent::Uuid producer_pipeline_uuid)
+    : handle_(ctx.context()
+                .data_batch_observer()
+                ->handle()
+                .constructed({
+                  .data_batch_id        = batch_id,
+                  .producer_pipeline_id = quent::operator_::OperatorId(producer_pipeline_uuid),
+                })
+                .into_dynamic()),
       memory_context_(ctx.get_memory_context())
   {
   }
-  rust::Box<quent::data_batch::DataBatchHandle> handle_;
+
+  quent::DynamicFsmHandle<quent::DataBatch> handle_;
   std::shared_ptr<const memory_context> memory_context_;
 };
 

@@ -26,6 +26,7 @@
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 
 #include <cucascade/memory/topology_discovery.hpp>
 
@@ -238,10 +239,10 @@ class task_scheduler {
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
   sirius::creator::task_creator* _task_creator{nullptr};
   /// Observer of query event transitions. Never null.
-  std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
-    std::make_shared<sirius::event::query_event_publisher>()};
+  std::shared_ptr<event::query_event_publisher> _query_event_publisher{
+    std::make_shared<event::query_event_publisher>()};
+  quent::Handle<quent::TaskQueue> _task_queue_telemetry;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
-  std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };
 
 }  // namespace pipeline

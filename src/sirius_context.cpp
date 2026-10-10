@@ -38,7 +38,6 @@
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
-#include "telemetry/batch_telemetry.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/plan_source_policy.hpp"
@@ -554,20 +553,6 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
     executor->drain();
   }
 
-  // Close out batch placements still alive (un-consumed repo contents,
-  // result-collector outputs) before their repositories are cleared.
-  // Best-effort: telemetry failure must not abort the remaining mandatory
-  // steps or poison the runtime.
-  try {
-    sirius::telemetry::batch_telemetry_registry::instance().on_query_end();
-  } catch (std::exception& e) {
-    try {
-      SIRIUS_LOG_WARN("batch telemetry on_query_end failed (ignored): {}", e.what());
-    } catch (...) {
-    }
-  } catch (...) {
-  }
-
   // Drop THIS query's data repositories, leaving any other in-flight query's untouched.
   // Any batches still present are leaked — operators should have popped everything.
   // Safe to clear here because the downgrade executors were drained above, so nothing still
@@ -895,16 +880,8 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
   active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
                        active_gpu_ids.end());
-  telemetry_context_ = sirius::telemetry::telemetry_context::create(std::move(quent_context),
-                                                                    config_.get_telemetry_config(),
-                                                                    memory_manager_.get(),
-                                                                    active_gpu_ids);
-
-  if (config_.get_telemetry_config().enable_quent &&
-      config_.get_telemetry_config().enable_batch_events) {
-    sirius::telemetry::batch_telemetry_registry::instance().install(telemetry_context_,
-                                                                    *memory_manager_);
-  }
+  telemetry_context_ = sirius::telemetry::telemetry_context::create(
+    std::move(quent_context), config_.get_telemetry_config(), memory_manager_.get());
 
   {
     auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
@@ -1183,7 +1160,6 @@ void SiriusContext::terminate()
   task_scheduler_.reset();
   task_creator_.reset();
   downgrade_executors_.clear();
-  sirius::telemetry::batch_telemetry_registry::instance().uninstall();
   telemetry_context_.reset();
 
   peer_access_enabled_pairs_.clear();

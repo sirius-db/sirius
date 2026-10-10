@@ -126,7 +126,7 @@ query_context make_query(sirius::query_id_t query_id, std::string const& file)
 
   ctx.tctx = sirius::test::make_test_telemetry_context();
   sirius::telemetry::query_telemetry_info tinfo{
-    ctx.tctx->engine_id(), ctx.tctx->worker_id(), query_id};
+    quent::now_v7(), ctx.tctx->worker_id().raw(), query_id};
   ctx.query =
     std::make_shared<sirius::planner::query>(pipelines, ctx.tctx->context(), query_id, tinfo);
   return ctx;
@@ -278,7 +278,7 @@ TEST_CASE("a query with no GPU scan operators registers nothing", "[scan_manager
 
   auto tctx           = sirius::test::make_test_telemetry_context();
   auto const query_id = sirius::make_query_id(7);
-  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
+  sirius::telemetry::query_telemetry_info tinfo{quent::now_v7(), tctx->worker_id().raw(), query_id};
   sirius::planner::query empty{std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
                                tctx->context(),
                                query_id,

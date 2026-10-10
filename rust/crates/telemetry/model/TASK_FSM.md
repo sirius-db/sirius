@@ -1,7 +1,5 @@
 # Task FSM
 
-Source: [src/task.rs](src/task.rs)
-
 ```mermaid
 flowchart LR
     start((entry))

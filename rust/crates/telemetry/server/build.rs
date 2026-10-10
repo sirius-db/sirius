@@ -1,6 +1,4 @@
-use quent_query_engine_ui::QueryBundle;
-use quent_query_engine_ui::{OperatorFilter, QueryFilter};
-use quent_simulator_ui::EntityRef;
+use quent_query_engine_ui::{EntityRef, OperatorFilter, QueryBundle, QueryFilter};
 use quent_ui::timeline::{
     request::{BulkTimelineRequest, SingleTimelineRequest},
     response::{BulkTimelinesResponse, SingleTimelineResponse},

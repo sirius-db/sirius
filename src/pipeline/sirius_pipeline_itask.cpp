@@ -16,10 +16,8 @@
 
 #include "pipeline/sirius_pipeline_itask.hpp"
 
-#include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry/telemetry_context.hpp"
 
-#include <format>
 #include <memory>
 #include <utility>
 
@@ -30,14 +28,17 @@ sirius_pipeline_itask::sirius_pipeline_itask(
   std::unique_ptr<sirius_pipeline_task_local_state> local_state,
   std::shared_ptr<sirius_pipeline_task_global_state> global_state)
   : itask(task_id, std::move(local_state), global_state),
-    _telemetry_task_handle(
-      quent::task::create(global_state->get_telemetry_context().context(),
-                          {
-                            .instance_name = std::format("task-{}", task_id),
-                            .pipeline_uuid = global_state->get_pipeline()
-                                               ? global_state->get_pipeline()->pipeline_uuid()
-                                               : uuid::new_nil(),
-                          }))
+    _telemetry_fsm(
+      global_state->get_telemetry_context()
+        .context()
+        .task_observer()
+        ->handle()
+        .created({.pipeline_uuid = quent::operator_::OperatorId(
+                    global_state->get_pipeline() ? global_state->get_pipeline()->pipeline_uuid()
+                                                 : quent::nil_uuid())
+
+        })
+        .into_dynamic())
 {
 }
 
@@ -45,16 +46,16 @@ sirius_pipeline_itask::~sirius_pipeline_itask()
 {
   if (_telemetry_finalized) { return; }
 
-  _telemetry_task_handle->finalizing({
-    .instance_name = "",
-    .success       = false,
-  });
-  _telemetry_task_handle->exit();
-}
-
-quent::task::TaskHandle& sirius_pipeline_itask::telemetry_handle() noexcept
-{
-  return *_telemetry_task_handle;
+  try {
+    _telemetry_fsm.finalizing({
+      .success = false,
+    });
+    _telemetry_fsm.exit();
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN("sirius_pipeline_itask destructor failed: {}", e.what());
+  } catch (...) {
+    SIRIUS_LOG_WARN("sirius_pipeline_itask destructor failed with an unknown exception");
+  }
 }
 
 }  // namespace sirius::pipeline

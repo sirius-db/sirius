@@ -28,8 +28,10 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "planner/query.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
 
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -37,6 +39,7 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -53,10 +56,15 @@ task_scheduler::task_scheduler(
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
   // Shared with every gpu_pipeline_executor's queue so both agree on which query a task
   // belongs to; see pipeline::index_keys_for.
-  : _task_queue(&index_keys_for), _telemetry_context(std::move(telemetry_context))
+  : _task_queue(&index_keys_for),
+    _task_queue_telemetry(telemetry_context->context().task_queue_observer()->handle()),
+    _telemetry_context(std::move(telemetry_context))
 {
-  _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
-    *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
+  _task_queue_telemetry.created({
+    .worker_id     = quent::worker::WorkerId{_telemetry_context->worker_id()},
+    .gpu_device_id = std::nullopt,
+    .label         = "task-scheduler-gpu-queue",
+  });
 
   // Self-publisher: schedule() uses this to wake management_eventloop when a
   // new task is pushed, so the loop can re-run the matcher against any device
@@ -99,15 +107,17 @@ task_scheduler::task_scheduler(
   }
 }
 
-task_scheduler::~task_scheduler() { stop(); }
+task_scheduler::~task_scheduler()
+{
+  stop();
+  telemetry::exit_from_destructor(_task_queue_telemetry, "scheduler task queue");
+}
 
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-    pipeline_task->telemetry_handle().queued({
-      .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
-      .queue_capacity_entries = 1,
-    });
+    pipeline_task->telemetry_fsm().queued(
+      {.queue = {.target = _task_queue_telemetry.id(), .data = {.entries = 1}}});
   }
   _task_queue.push(std::move(task));
   if (_self_publisher) {
@@ -282,8 +292,15 @@ void task_scheduler::drain_query_tasks(sirius::query_id_t query_id)
 
 void task_scheduler::management_eventloop()
 {
-  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
-    *_telemetry_context, "task-scheduler-thread", _telemetry_context->shared_group_id()};
+  quent::Handle<quent::TaskManagerLoopThread> scheduler_thread_telemetry_handle =
+    _telemetry_context->context().task_manager_loop_thread_observer()->handle();
+  scheduler_thread_telemetry_handle.spawned({
+    .label    = "task-scheduler-thread",
+    .group_id = _telemetry_context->shared_group_id(),
+  });
+  absl::Cleanup exit_scheduler_thread = [&scheduler_thread_telemetry_handle] {
+    telemetry::exit_from_destructor(scheduler_thread_telemetry_handle, "scheduler thread");
+  };
 
   // Each pass tops up the two things the matcher needs — known ready devices
   // and a non-empty queue — sleeping only for whichever is missing. The queue
@@ -374,10 +391,9 @@ void task_scheduler::management_eventloop()
       }
 
       if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-        pipeline_task->telemetry_handle().routing({
-          .instance_name              = "",
-          .preferred_device_id        = device_id,
-          .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+        pipeline_task->telemetry_fsm().routing({
+          .preferred_device_id = device_id,
+          .manager_thread      = {scheduler_thread_telemetry_handle.id()},
         });
       }
 

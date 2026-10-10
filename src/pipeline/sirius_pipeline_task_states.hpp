@@ -26,6 +26,7 @@
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius {
@@ -71,8 +72,14 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   explicit sirius_pipeline_task_global_state(
     std::shared_ptr<sirius_pipeline> pipeline,
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
-    : _pipeline(std::move(pipeline)), _telemetry_context(std::move(telemetry_context))
   {
+    // TODO(dhruv9vats): the pipeline must to valid at construction; fix tests that break
+    // this contract.
+    // if (not pipeline) { throw std::invalid_argument("pipeline must be valid"); }
+
+    if (not telemetry_context) { throw std::invalid_argument("telemetry_context must be valid"); }
+    _pipeline          = std::move(pipeline);
+    _telemetry_context = std::move(telemetry_context);
   }
 
   [[nodiscard]] const sirius_pipeline* get_pipeline() const { return _pipeline.get(); }

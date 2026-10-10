@@ -17,7 +17,6 @@
 #pragma once
 
 #include "log/logging.hpp"
-#include "telemetry/batch_telemetry.hpp"
 
 #include <cuda/stream>
 
@@ -134,7 +133,7 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         // INT64 offsets promotion of host->GPU reconstruction, and a GPU->GPU copy preserves the
         // source's column types (a GPU-resident source is already normalized — the same-space
         // fast path above depends on that invariant).
-        // TODO(dhruv9vats): thread operator batch telemetry to cloned batch
+        // TODO(dhruv9vats): attach a DataBatch probe so compute IDs resolve to a traced clone.
         auto clone = read_accessor.clone_to<cucascade::gpu_table_representation>(
           registry, get_next_batch_id(), target_space, stream);
         return lock_to_new_batch{
@@ -168,7 +167,7 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
           // (that would steal it from the device that just materialized it) — clone instead. The
           // clone happens under the exclusive lock we already hold; pinning the state here avoids
           // yet another non-atomic lock transition.
-          // TODO(dhruv9vats): thread operator batch telemetry to cloned batch
+          // TODO(dhruv9vats): attach a DataBatch probe so compute IDs resolve to a traced clone.
           auto clone = mut_accessor.clone_to<cucascade::gpu_table_representation>(
             registry, sirius::get_next_batch_id(), target_space, stream);
           return lock_to_new_batch{
@@ -179,11 +178,6 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         }
         mut_accessor.convert_to<cucascade::gpu_table_representation>(
           registry, target_space, stream);
-        telemetry::batch_telemetry_registry::instance().on_tier_change(
-          mut_accessor.get_batch_id(),
-          target_space->get_tier(),
-          target_space->get_id().device_id,
-          mut_accessor.get_data()->get_size_in_bytes());
 
         // exclusive mutable access dropped.
       }
@@ -215,11 +209,6 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
             mut_accessor.convert_to<cucascade::host_data_representation>(
               registry, target_space, stream);
           }
-          telemetry::batch_telemetry_registry::instance().on_tier_change(
-            mut_accessor.get_batch_id(),
-            target_space->get_tier(),
-            target_space->get_id().device_id,
-            mut_accessor.get_data()->get_size_in_bytes());
         }
         // exclusive mutable access dropped.
       }

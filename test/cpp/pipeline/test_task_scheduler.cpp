@@ -110,6 +110,19 @@ TEST_CASE("Task scheduler can start and stop gracefully", "[task_scheduler]")
   REQUIRE_NOTHROW(executor.stop());
 }
 
+TEST_CASE("Task scheduler records its worker after taking telemetry ownership",
+          "[task_scheduler][telemetry]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  auto telemetry       = sirius::test::make_test_telemetry_context();
+  const auto worker_id = telemetry->worker_id();
+
+  // Construction emits the queue record after taking ownership of telemetry.
+  REQUIRE_NOTHROW(task_scheduler(gpu_config, *manager, telemetry));
+  REQUIRE(telemetry->worker_id() == worker_id);
+}
+
 TEST_CASE("Task scheduler derives GPU executor affinity from topology", "[task_scheduler][config]")
 {
   auto manager = initialize_memory_manager(1);
