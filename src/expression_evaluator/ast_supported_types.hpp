@@ -31,14 +31,40 @@
 
 namespace sirius {
 
-/// CAST return types that are currently safe to lower into a cuDF AST.
-inline constexpr std::array<duckdb::LogicalTypeId, 3> supported_ast_cast_types{
-  {duckdb::LogicalTypeId::UBIGINT, duckdb::LogicalTypeId::BIGINT, duckdb::LogicalTypeId::DOUBLE}};
-
-/// Sirius-typed mirror of supported_ast_cast_types — same set of CAST target
-/// types as above, expressed via sirius::type_id for native AST consumers.
-inline constexpr std::array<sirius::type_id, 3> supported_ast_cast_types_native{
-  {sirius::type_id::UBIGINT, sirius::type_id::BIGINT, sirius::type_id::DOUBLE}};
+/// Whether a semantic CAST from @p source to @p target may lower to a cuDF AST CAST_TO_* op. These
+/// ops convert like static_cast: they truncate floats toward zero and wrap integers, where DuckDB
+/// rounds and range-checks. An integer target therefore takes only BOOLEAN and integer sources
+/// whose values all fit; HUGEINT and UHUGEINT run as INT64 and UINT64 on the GPU.
+constexpr bool cast_lowers_to_cudf_ast(sirius::type_id source, sirius::type_id target)
+{
+  switch (target) {
+    case sirius::type_id::DOUBLE: return true;
+    case sirius::type_id::BIGINT:
+      switch (source) {
+        case sirius::type_id::BOOLEAN:
+        case sirius::type_id::TINYINT:
+        case sirius::type_id::SMALLINT:
+        case sirius::type_id::INTEGER:
+        case sirius::type_id::BIGINT:
+        case sirius::type_id::HUGEINT:
+        case sirius::type_id::UTINYINT:
+        case sirius::type_id::USMALLINT:
+        case sirius::type_id::UINTEGER: return true;
+        default: return false;
+      }
+    case sirius::type_id::UBIGINT:
+      switch (source) {
+        case sirius::type_id::BOOLEAN:
+        case sirius::type_id::UTINYINT:
+        case sirius::type_id::USMALLINT:
+        case sirius::type_id::UINTEGER:
+        case sirius::type_id::UBIGINT:
+        case sirius::type_id::UHUGEINT: return true;
+        default: return false;
+      }
+    default: return false;
+  }
+}
 
 /// BOUND_FUNCTION names that are currently safe to lower into a cuDF AST.
 inline constexpr std::array<function_id, 6> supported_ast_functions{function_id::add,

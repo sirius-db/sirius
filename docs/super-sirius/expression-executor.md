@@ -235,23 +235,41 @@ so sentinel handling has one implementation. The evaluator boundary regressions
 are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
 tagged `[timestamp_extraction]`.
 
-### Decimal casts
+### Numeric casts
 
-Semantic casts from FLOAT, DOUBLE or DECIMAL to DECIMAL go through `cast_to_decimal()`
-(`src/expression_evaluator/cast_to_decimal.hpp`), not `cudf::cast`, which truncates toward zero
-and does not check the target precision. The helper follows DuckDB:
+`cudf::cast` truncates toward zero and wraps values that do not fit, where DuckDB rounds and
+range-checks. Semantic casts from an integer, FLOAT, DOUBLE or DECIMAL to a DECIMAL or integer type
+therefore go through `cast_to_decimal()` and `cast_to_integer()`
+(`src/expression_evaluator/checked_cast.hpp`), which compose cuDF operations to follow DuckDB:
 
-- FLOAT and DOUBLE compute `round(double(x) * 10^scale)` in FP64 with DuckDB's own power-of-ten
-  table, so each step is the same correctly rounded IEEE operation as on the CPU. FLOAT results are
-  narrowed back to FLOAT before they are stored, as DuckDB does.
-- DECIMAL to a smaller scale rounds half away from zero (`cudf::round_decimal` with `HALF_UP`).
-  Scaling up is exact.
-- A non-NULL value that needs more than the target precision, NaN, or an infinity fails the cast:
-  `CAST` throws `sirius::invalid_input_exception`, so the query replays on the CPU and raises
-  DuckDB's conversion error, and `TRY_CAST` returns NULL. Checking for failed rows synchronizes the
-  stream.
+- FLOAT and DOUBLE to DECIMAL compute `round(double(x) * 10^scale)` in FP64 with DuckDB's own
+  power-of-ten table, so each step is the same correctly rounded IEEE operation as on the CPU.
+  FLOAT results are narrowed back to FLOAT before they are stored, as DuckDB does.
+- FLOAT and DOUBLE to an integer round to the nearest integer, ties to even (`RINT`, DuckDB's
+  `std::nearbyint`): `CAST(2.5 AS INTEGER)` is 2 and `CAST(-2.675 AS INTEGER)` is -3.
+- DECIMAL to a smaller scale, and DECIMAL to an integer, round half away from zero
+  (`cudf::round_decimal` with `HALF_UP`): `CAST(2.5::DECIMAL(18,4) AS INTEGER)` is 3. Scaling up
+  is exact.
+- Integers convert exactly once they fit: within the target's range, or below
+  `10^(precision - scale)` in magnitude for a DECIMAL.
+- A non-NULL value that does not fit, NaN, or an infinity fails the cast: `CAST` throws
+  `sirius::invalid_input_exception`, so the query replays on the CPU and raises DuckDB's conversion
+  error, and `TRY_CAST` returns NULL. Checking for failed rows synchronizes the stream; casts that
+  cannot fail, such as integer widening, skip the check.
+- The GPU evaluates every conjunct of a filter on every row, so a `CAST` in a filter also sees rows
+  that another conjunct, or DuckDB's scan filter, would discard first. If one of those rows fails,
+  the query replays on the CPU and returns DuckDB's result.
+- HUGEINT and UHUGEINT run as INT64 and UINT64, so a value outside those types may be valid in
+  DuckDB. A cast to them throws for such a value even under `TRY_CAST`, and the CPU replay
+  decides.
 
-The SQL comparisons against DuckDB are tagged `[decimal_cast]`.
+The cuDF AST `CAST_TO_INT64`, `CAST_TO_UINT64` and `CAST_TO_FLOAT64` ops convert like
+`static_cast`. `cast_lowers_to_cudf_ast()` (`ast_supported_types.hpp`) admits a semantic cast to the
+AST only when that matches DuckDB: any cast to DOUBLE, and casts to BIGINT or UBIGINT from BOOLEAN
+or integer types whose values all fit. The evaluator, the AST op counter, the hash join's null-safe
+key routing and `gpu_expression_translator` all use it through `ast::cast::lowers_to_cudf_ast()`.
+
+The SQL comparisons against DuckDB are tagged `[decimal_cast]` and `[integer_cast]`.
 
 ### Rounding
 
@@ -279,7 +297,7 @@ The following translate directly into cuDF AST nodes:
 | Comparison | `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NOT DISTINCT FROM` (via `NULL_EQUALS`) |
 | Logical | `AND`, `OR` (Kleene `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR`), `NOT` |
 | BETWEEN | Translated to `(val >= lower) AND (val <= upper)` |
-| Casting | Fixed-width types: `UBIGINT`, `BIGINT`, `DOUBLE` (see `supported_ast_cast_types`) |
+| Casting | To `DOUBLE`, and to `BIGINT`/`UBIGINT` from integers that fit (see `cast_lowers_to_cudf_ast`) |
 
 Anything outside this set is an AST breaker and forces materialization at that node.
 
@@ -332,7 +350,7 @@ This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass the condi
 | `src/expression_evaluator/expression_evaluator.cpp` | Driver: strategy dispatch, AST tree management, temp lifetimes |
 | `src/expression_evaluator/specializations/*.cpp` | Per-Sirius-AST-alternative dispatch (comparison, case, function, …) |
 | `src/expression_evaluator/expression_evaluator_strategy.hpp` | `expression_evaluator_strategy` enum + string conversions |
-| `src/expression_evaluator/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |
+| `src/expression_evaluator/ast_supported_types.hpp` | AST-eligible casts and functions (`cast_lowers_to_cudf_ast`, `supported_ast_functions`) |
 | `src/expression_evaluator/gpu_expression_translator_internal.hpp` | Sirius AST → cuDF AST translator (mixed joins, parquet pushdown) |
 | `src/expression_evaluator/gpu_expression_translator.cpp` | Translator implementation |
 | `src/expression/ast/node.hpp` | `sirius::ast::node` variant; per-alternative headers included from here |

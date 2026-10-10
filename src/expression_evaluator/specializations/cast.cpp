@@ -16,8 +16,7 @@
 
 // sirius
 #include <expression/ast/node.hpp>
-#include <expression_evaluator/ast_supported_types.hpp>
-#include <expression_evaluator/cast_to_decimal.hpp>
+#include <expression_evaluator/checked_cast.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
 #include <helper/numeric_narrowing.hpp>
@@ -29,9 +28,6 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
-
-// standard library
-#include <algorithm>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
@@ -52,21 +48,25 @@ cudf::ast::ast_operator cast_op_to_ast(sirius::type_id id)
   }
 }
 
+/// Sources whose casts to DECIMAL and integer types go through the checked casts.
+bool is_checked_numeric(cudf::type_id id)
+{
+  auto const type = cudf::data_type{id};
+  return cudf::is_integral_not_bool(type) || cudf::is_floating_point(type) ||
+         cudf::is_fixed_point(type);
+}
+
 }  // namespace
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, evaluation_mode mode)
 {
-  auto const ast_supported =
-    std::find(supported_ast_cast_types_native.begin(),
-              supported_ast_cast_types_native.end(),
-              alt.target_type.id()) != supported_ast_cast_types_native.end();
-
-  auto const ast_op_count = alt.cudf_ast_op_count();
+  auto const ast_supported = alt.lowers_to_cudf_ast();
+  auto const ast_op_count  = alt.cudf_ast_op_count();
 
   // Carrier restores must reach the materialized branch, the only path authorized to use the
-  // physical representation tunnel. Semantic casts may use the cuDF AST path.
-  if (ast_supported && alt.kind == sirius::ast::cast_kind::semantic &&
-      _strategy != expression_evaluator_strategy::MATERIALIZE &&
+  // physical representation tunnel. Semantic casts that cannot round or overflow may use the cuDF
+  // AST path.
+  if (ast_supported && _strategy != expression_evaluator_strategy::MATERIALIZE &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto child            = evaluate(*alt.child, evaluation_mode::AST);
     auto const& cast_expr = _ast_tree.emplace<cudf::ast::operation>(
@@ -98,9 +98,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
        source_type == cudf::type_id::TIMESTAMP_SECONDS) &&
       return_type.id() == cudf::type_id::TIMESTAMP_MICROSECONDS) {
     result_column = temporal::cast_to_microseconds_checked(child.get_column_view(), _stream, _mr);
-  } else if (alt.kind == sirius::ast::cast_kind::semantic && cudf::is_fixed_point(return_type) &&
-             (cudf::is_floating_point(child.get_column_view().type()) ||
-              cudf::is_fixed_point(child.get_column_view().type()))) {
+  } else if (alt.kind == sirius::ast::cast_kind::semantic && is_checked_numeric(source_type) &&
+             cudf::is_fixed_point(return_type)) {
     // cudf::cast truncates where DuckDB rounds, and does not check the target precision.
     result_column = cast_to_decimal(child.get_column_view(),
                                     return_type,
@@ -108,6 +107,15 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
                                     alt.try_cast,
                                     _stream,
                                     _mr);
+  } else if (alt.kind == sirius::ast::cast_kind::semantic && is_checked_numeric(source_type) &&
+             cudf::is_integral_not_bool(return_type)) {
+    // cudf::cast truncates where DuckDB rounds, and wraps values that do not fit. HUGEINT and
+    // UHUGEINT run as INT64 and UINT64, so a value outside them may still be valid in DuckDB:
+    // throw so the query replays on the CPU, even for TRY_CAST.
+    auto const wide_target = alt.target_type.id() == sirius::type_id::HUGEINT ||
+                             alt.target_type.id() == sirius::type_id::UHUGEINT;
+    result_column = cast_to_integer(
+      child.get_column_view(), return_type, alt.try_cast && !wide_target, _stream, _mr);
   } else {
     // Only planner-certified carrier restoration may tunnel through a narrowed representation.
     result_column = alt.kind == sirius::ast::cast_kind::carrier_restore
