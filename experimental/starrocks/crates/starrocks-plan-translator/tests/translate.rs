@@ -5771,7 +5771,7 @@ fn filters_a_join_cant_build_are_reported_with_their_reason() {
 }
 
 #[test]
-fn probes_no_compute_node_filters_are_reported_with_their_reason() {
+fn probes_no_compute_node_filters_are_reported_and_the_rest_are_probed() {
     use starrocks_plan_translator::runtime_filter::{SkipReason, SkippedFilter, skipped_probes};
     use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
     let probe = |id| {
@@ -5805,11 +5805,17 @@ fn probes_no_compute_node_filters_are_reported_with_their_reason() {
         skipped_probes(&fragment),
         vec![
             skipped(7, 0, SkipReason::SameFragment),
-            skipped(8, 0, SkipReason::NonLeafFragment),
             skipped(7, 11, SkipReason::TargetNotScan),
         ]
     );
-    // A leaf scan's filters are decided when it runs.
+    // Filter 8, built in another fragment, is decided when this one runs, as a leaf scan's are.
+    assert_eq!(
+        starrocks_plan_translator::runtime_filter::probed_filters(&fragment)
+            .iter()
+            .map(|probe| (probe.filter_id, probe.scan_node_id))
+            .collect::<Vec<_>>(),
+        vec![(8, 0)]
+    );
     assert!(skipped_probes(&probing_scan_params()).is_empty());
 }
 

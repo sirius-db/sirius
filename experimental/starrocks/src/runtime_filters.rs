@@ -25,7 +25,7 @@ use starrocks_thrift::runtime_filter::TRuntimeFilterParams;
 use starrocks_thrift::types::TNetworkAddress;
 
 use crate::fragment_executor::KeyStats;
-use crate::local_exchange::ExchangeKey;
+use crate::local_exchange::{ExchangeKey, ReadyFragment};
 use crate::result_store::FragmentInstanceId;
 
 /// Logs that this CN applies runtime filter `filter_id` to a scan of `instance`.
@@ -108,6 +108,34 @@ pub(crate) struct DeferredScan {
     /// The filters it waits for, with where their keys arrive.
     pub(crate) filters: Vec<(i32, BuildSite)>,
     pub(crate) deferred_at: Instant,
+    /// For a fragment that reads exchanges: its inputs, all complete, which it runs on.
+    pub(crate) ready: Option<ReadyFragment>,
+}
+
+/// A fragment that reads exchanges and will wait for the filters its scans probe once its
+/// inputs are complete.
+#[derive(Debug)]
+pub(crate) struct PendingReceiver {
+    pub(crate) filters: Vec<(i32, BuildSite)>,
+}
+
+/// Where a fragment's output goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FragmentOutput {
+    /// One exchange of the query.
+    Exchange(i32),
+    /// The query's result.
+    Result,
+    /// Any other sink (multicast, a table): the dependency check can't follow it.
+    Unknown,
+}
+
+/// What the dependency check needs of a fragment that reads exchanges: the exchanges it reads,
+/// and where its output goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FragmentShape {
+    pub(crate) exchanges: Vec<i32>,
+    pub(crate) sink: FragmentOutput,
 }
 
 /// A partitioned join's instance on this CN, holding a share of a filter's keys in its build
@@ -146,6 +174,12 @@ struct State {
     topologies: HashMap<(u64, i32), FilterTopology>,
     /// Filter exchanges one of whose holders gave up: their scans run unfiltered.
     abandoned: HashSet<ExchangeKey>,
+    /// Fragments that read exchanges and will wait for their filters once their inputs are
+    /// complete, by instance.
+    pending: HashMap<FragmentInstanceId, PendingReceiver>,
+    /// The fragments that read exchanges on this CN, by `(query, exchange id)` of each exchange
+    /// they read. Exchange ids are plan node ids, unique within a query.
+    shapes: HashMap<(u64, i32), FragmentShape>,
     /// Queries purged, by [`FragmentInstanceId::query_hi`], oldest first: nothing more is
     /// recorded for them.
     purged: VecDeque<u64>,
@@ -303,8 +337,88 @@ impl RuntimeFilters {
             .collect()
     }
 
-    pub(crate) fn defer(&self, instance: FragmentInstanceId, scan: DeferredScan) {
-        self.lock().deferred.insert(instance, scan);
+    /// Defers `scan`, unless its query was purged: then it comes back for the caller to free.
+    pub(crate) fn defer(
+        &self,
+        instance: FragmentInstanceId,
+        scan: DeferredScan,
+    ) -> Result<(), Box<DeferredScan>> {
+        let mut state = self.lock();
+        if state.purged.contains(&instance.query_hi()) {
+            return Err(Box::new(scan));
+        }
+        state.deferred.insert(instance, scan);
+        Ok(())
+    }
+
+    /// Records that receiver `instance` waits for `filters` once its inputs are complete.
+    pub(crate) fn defer_receiver(&self, instance: FragmentInstanceId, pending: PendingReceiver) {
+        let mut state = self.lock();
+        if !state.purged.contains(&instance.query_hi()) {
+            state.pending.insert(instance, pending);
+        }
+    }
+
+    /// Takes receiver `instance`'s filters, if it waits for some.
+    pub(crate) fn take_pending(&self, instance: FragmentInstanceId) -> Option<PendingReceiver> {
+        self.lock().pending.remove(&instance)
+    }
+
+    /// Records a fragment of `query` that reads exchanges, for [`Self::independent`].
+    pub(crate) fn record_shape(&self, query: FragmentInstanceId, shape: FragmentShape) {
+        let mut state = self.lock();
+        if state.purged.contains(&query.query_hi()) {
+            return;
+        }
+        for &exchange in &shape.exchanges {
+            state
+                .shapes
+                .entry((query.query_hi(), exchange))
+                .or_insert_with(|| shape.clone());
+        }
+    }
+
+    /// Whether build exchange `build` can complete without the output of a fragment whose output
+    /// goes to `sink`, from the fragments recorded here.
+    ///
+    /// Each fragment sends its output to one exchange, so the fragments downstream of it form one
+    /// chain to the root. The build exchange depends on the fragment only if its sender is on
+    /// that chain, so if the chain enters the build's own fragment through `build` itself. A
+    /// chain that enters it through another exchange, or never does, leaves the build free. A
+    /// link this CN hasn't seen, or a sink it can't follow, proves nothing.
+    pub(crate) fn independent(
+        &self,
+        query: FragmentInstanceId,
+        sink: FragmentOutput,
+        build: i32,
+    ) -> Result<(), String> {
+        let state = self.lock();
+        let mut next = sink;
+        // A plan is a tree; the bound only guards a malformed one.
+        for _ in 0..1024 {
+            let exchange = match next {
+                FragmentOutput::Exchange(exchange) => exchange,
+                FragmentOutput::Result => return Ok(()),
+                FragmentOutput::Unknown => return Err("unsupported sink".to_string()),
+            };
+            let shape = state
+                .shapes
+                .get(&(query.query_hi(), exchange))
+                .ok_or_else(|| {
+                    format!("the fragment reading exchange {exchange} isn't on this CN yet")
+                })?;
+            if shape.exchanges.contains(&build) {
+                return if exchange == build {
+                    Err(format!(
+                        "build exchange {build} reads this fragment's output"
+                    ))
+                } else {
+                    Ok(())
+                };
+            }
+            next = shape.sink;
+        }
+        Err("the fragment graph has a cycle".to_string())
     }
 
     /// Takes every deferred scan whose filters' keys are all `ready`. `ready` runs without this
@@ -352,6 +466,10 @@ impl RuntimeFilters {
         state
             .abandoned
             .retain(|key| key.fragment_instance_id.query_hi() != query_hi);
+        state
+            .pending
+            .retain(|instance, _| instance.query_hi() != query_hi);
+        state.shapes.retain(|(query, _), _| *query != query_hi);
         if !state.purged.contains(&query_hi) {
             state.purged.push_back(query_hi);
             if state.purged.len() > PURGED_QUERIES {
@@ -565,6 +683,7 @@ mod tests {
             params: params(),
             filters,
             deferred_at: Instant::now(),
+            ready: None,
         }
     }
 
@@ -577,7 +696,7 @@ mod tests {
         assert!(filters.sites(instance(10, 1), &[0]).is_empty());
         let sites = filters.sites(instance(9, 5), &[0, 1, 2]);
         assert_eq!(sites.len(), 2, "filter 2 is not built on this CN");
-        filters.defer(instance(9, 5), scan(sites));
+        filters.defer(instance(9, 5), scan(sites)).unwrap();
         assert_eq!(filters.deferred(), 1);
 
         assert!(filters.take_ready(|site| site.key.node_id == 13).is_empty());
@@ -592,7 +711,7 @@ mod tests {
         filters.record_builds(instance(9, 1), vec![built(0, 13)]);
         filters.record_builds(instance(10, 1), vec![built(0, 13)]);
         let sites = filters.sites(instance(9, 5), &[0]);
-        filters.defer(instance(9, 5), scan(sites));
+        filters.defer(instance(9, 5), scan(sites)).unwrap();
         assert_eq!(filters.purge_query(instance(9, 0)).len(), 1);
         assert_eq!(filters.deferred(), 0);
         assert!(filters.sites(instance(9, 5), &[0]).is_empty());
@@ -669,6 +788,33 @@ mod tests {
         };
         assert_eq!(ShareHeader::parse(&header.names()), Some(header));
         assert_eq!(ShareHeader::parse(&["rf_key".to_string()]), None);
+    }
+
+    #[test]
+    fn a_build_is_independent_only_along_a_chain_this_cn_can_follow() {
+        let filters = RuntimeFilters::default();
+        let shape = |exchanges: Vec<i32>, sink| FragmentShape { exchanges, sink };
+        // Exchange 15 feeds a fragment sending to 17; 17 and the build exchange 26 feed the root's
+        // input fragment; 40 feeds a fragment with a multicast sink.
+        filters.record_shape(
+            instance(9, 0),
+            shape(vec![15], FragmentOutput::Exchange(17)),
+        );
+        filters.record_shape(instance(9, 0), shape(vec![17, 26], FragmentOutput::Result));
+        filters.record_shape(instance(9, 0), shape(vec![40], FragmentOutput::Unknown));
+        let independent = |sink| filters.independent(instance(9, 0), sink, 26);
+        assert_eq!(independent(FragmentOutput::Exchange(15)), Ok(()));
+        assert_eq!(independent(FragmentOutput::Result), Ok(()));
+        assert!(independent(FragmentOutput::Exchange(26)).is_err());
+        assert!(independent(FragmentOutput::Exchange(99)).is_err());
+        assert_eq!(
+            independent(FragmentOutput::Unknown),
+            Err("unsupported sink".to_string())
+        );
+        assert_eq!(
+            independent(FragmentOutput::Exchange(40)),
+            Err("unsupported sink".to_string())
+        );
     }
 
     #[test]

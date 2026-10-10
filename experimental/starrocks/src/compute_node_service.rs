@@ -31,10 +31,11 @@ use crate::proto::starrocks::{
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FragmentInstanceId, ResultStore};
 use crate::runtime_filters::{
-    self, BuildSite, DeferredScan, FILTER_STREAM_BASE, FilterTopology, HeldShare, RuntimeFilters,
+    self, BuildSite, DeferredScan, FILTER_STREAM_BASE, FilterTopology, FragmentOutput,
+    FragmentShape, HeldShare, PendingReceiver, RuntimeFilters,
 };
 use starrocks_plan_translator::runtime_filter::{
-    self, BuildDistribution, FilterInput, ProbeKeys, ProbedFilter, SHARE_KEYS,
+    self, BuildDistribution, FilterInput, ProbeKeys, ProbedFilter, SHARE_KEYS, SkipReason,
 };
 use starrocks_plan_translator::{
     ExchangeInput, PlanTranslator, StreamInputColumn, StreamInputSchema, TranslatedPlan,
@@ -505,8 +506,27 @@ impl SiriusComputeNodeService {
                     Ok(_) => {}
                     Err(err) => warn!(error = %err, "ignoring a receiver's runtime filters"),
                 }
-                // A receiver's own probe targets are never filtered (`skipped_probes`).
+                // A receiver never waits for a partitioned join's shares.
                 self.close_filter_exchanges(id, &params, &[]);
+                self.filters.record_shape(
+                    query,
+                    FragmentShape {
+                        exchanges: expected_senders
+                            .iter()
+                            .map(|(node_id, _)| *node_id)
+                            .collect(),
+                        sink: Self::fragment_output(&params),
+                    },
+                );
+                let filters = self.receiver_filter_sites(&params, query, id);
+                if !filters.is_empty() {
+                    info!(
+                        instance = %id,
+                        filters = ?filters.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                        "deferring a scan until its runtime filters arrive"
+                    );
+                    self.filters.defer_receiver(id, PendingReceiver { filters });
+                }
             }
             let ready = self
                 .exchanges
@@ -609,17 +629,28 @@ impl SiriusComputeNodeService {
             filters = ?waiting,
             "deferring a scan until its runtime filters arrive"
         );
-        self.filters.defer(
+        let deferred = self.filters.defer(
             instance,
             DeferredScan {
                 params: params.clone(),
                 filters: sites,
                 deferred_at: std::time::Instant::now(),
+                ready: None,
             },
         );
+        if deferred.is_err() {
+            // Its query was purged meanwhile: it never runs.
+            return true;
+        }
+        self.start_filter_timer(instance);
+        true
+    }
+
+    /// Runs deferred scan `instance` unfiltered if it still waits once the wait limit is over.
+    fn start_filter_timer(&self, instance: FragmentInstanceId) {
         let service = self.clone();
         let wait = self.filter_wait;
-        let _ = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("runtime-filter-timer".to_string())
             .spawn(move || {
                 std::thread::sleep(wait);
@@ -628,7 +659,116 @@ impl SiriusComputeNodeService {
                     service.run_deferred(scan, false, None);
                 }
             });
-        true
+        if let Err(err) = spawned {
+            self.timer_not_started(instance, &err.to_string());
+        }
+    }
+
+    /// Runs deferred scan `instance` unfiltered now: without its timer nothing would run it if
+    /// its filters never came, and a waiting receiver would hold its inputs for good.
+    fn timer_not_started(&self, instance: FragmentInstanceId, error: &str) {
+        if let Some(scan) = self.filters.take(instance) {
+            warn!(%instance, error, "cannot time a runtime filter wait; scanning unfiltered");
+            self.run_deferred(scan, false, None);
+        }
+    }
+
+    /// The broadcast join filters the scans of receiver `instance` can wait for: built by
+    /// another receiver on this CN, from a build exchange that doesn't depend on this fragment's
+    /// output. Waiting on a build that needs this fragment's output would hold both until the
+    /// wait limit. Logs why each other filter isn't waited for.
+    fn receiver_filter_sites(
+        &self,
+        params: &TExecPlanFragmentParams,
+        query: FragmentInstanceId,
+        instance: FragmentInstanceId,
+    ) -> Vec<(i32, BuildSite)> {
+        let sink = Self::fragment_output(params);
+        let mut sites: Vec<(i32, BuildSite)> = Vec::new();
+        for probe in runtime_filter::probed_filters(params) {
+            if sites.iter().any(|(id, _)| *id == probe.filter_id) {
+                continue;
+            }
+            let skip = |reason: &str, detail: &str| {
+                runtime_filters::log_skipped(
+                    Some(query),
+                    Some(instance),
+                    probe.filter_id,
+                    Some(probe.scan_node_id),
+                    reason,
+                    detail,
+                );
+            };
+            match probe.distribution {
+                BuildDistribution::Broadcast => {
+                    let Some((_, site)) = self.filters.sites(query, &[probe.filter_id]).pop()
+                    else {
+                        skip("not_built_on_this_cn", "");
+                        continue;
+                    };
+                    match self.filters.independent(query, sink, site.key.node_id) {
+                        Ok(()) => sites.push((probe.filter_id, site)),
+                        Err(detail) => skip("deadlock_unproven", &detail),
+                    }
+                }
+                BuildDistribution::Partitioned => skip(
+                    SkipReason::NonLeafFragment.as_str(),
+                    "a partitioned join's filter",
+                ),
+                BuildDistribution::Other => skip("not_broadcast", ""),
+            }
+        }
+        sites
+    }
+
+    /// Where `params`' fragment sends its output.
+    fn fragment_output(params: &TExecPlanFragmentParams) -> FragmentOutput {
+        let Some(sink) = params
+            .fragment
+            .as_ref()
+            .and_then(|fragment| fragment.output_sink.as_ref())
+        else {
+            return FragmentOutput::Unknown;
+        };
+        match (sink.type_, sink.stream_sink.as_ref()) {
+            (TDataSinkType::DATA_STREAM_SINK, Some(stream)) => {
+                FragmentOutput::Exchange(stream.dest_node_id)
+            }
+            (TDataSinkType::RESULT_SINK, _) => FragmentOutput::Result,
+            _ => FragmentOutput::Unknown,
+        }
+    }
+
+    /// Holds back ready receiver `ready` if it waits for runtime filters: it runs once their
+    /// keys are here, or unfiltered at the wait limit. Returns it when it doesn't wait.
+    fn park_for_filters(&self, ready: ReadyFragment) -> Option<ReadyFragment> {
+        let instance = Self::fragment_instance_id(&ready.params)?;
+        let Some(pending) = self.filters.take_pending(instance) else {
+            return Some(ready);
+        };
+        let scan = DeferredScan {
+            params: ready.params.clone(),
+            filters: pending.filters,
+            deferred_at: std::time::Instant::now(),
+            ready: Some(ready),
+        };
+        match self.filters.defer(instance, scan) {
+            Ok(()) => {
+                self.start_filter_timer(instance);
+                // Its filters' keys may be here already.
+                self.dispatch_filtered_scans();
+            }
+            // Its query was purged meanwhile: free its inputs.
+            Err(scan) => self.release_inputs(scan.ready),
+        }
+        None
+    }
+
+    /// Frees a ready receiver's inputs it will never run on.
+    fn release_inputs(&self, ready: Option<ReadyFragment>) {
+        if let Some(ready) = ready {
+            drop(self.take_ready_inputs(ready.inputs));
+        }
     }
 
     /// Where scan `instance` receives the shares of the partitioned join filter `probe`, and how
@@ -1011,9 +1151,22 @@ impl SiriusComputeNodeService {
     /// Runs a deferred scan with the filters whose keys are worth applying, or unfiltered.
     fn run_deferred(&self, scan: DeferredScan, filtered: bool, held: Option<&HeldKeys>) {
         let query = Self::query_id(&scan.params);
-        let ran = self.run_with_filters(&scan, filtered, held);
+        let DeferredScan {
+            params,
+            filters,
+            deferred_at,
+            ready,
+        } = scan;
+        let ran = self.run_with_filters(
+            &params,
+            &filters,
+            deferred_at,
+            ready.map(|ready| ready.inputs),
+            filtered,
+            held,
+        );
         // The keys were copied, or never will be: the shares go now.
-        for (_, site) in &scan.filters {
+        for (_, site) in &filters {
             if site.shares.is_some() {
                 self.drop_shares(site.key);
             }
@@ -1028,35 +1181,55 @@ impl SiriusComputeNodeService {
         self.log_leak_counters("filtered scan");
     }
 
+    /// Runs a deferred scan's fragment, on `ready_inputs` for one that reads exchanges, with the
+    /// filters whose keys are worth applying, or unfiltered.
     fn run_with_filters(
         &self,
-        scan: &DeferredScan,
+        params: &TExecPlanFragmentParams,
+        filters: &[(i32, BuildSite)],
+        deferred_at: std::time::Instant,
+        ready_inputs: Option<Vec<ReadyExchangeInput>>,
         filtered: bool,
         held: Option<&HeldKeys>,
     ) -> std::result::Result<Vec<ReadyFragment>, String> {
-        let params = &scan.params;
+        let mut receiver = ready_inputs
+            .map(|inputs| self.take_ready_inputs(inputs))
+            .transpose()?;
+        let exchanges = receiver
+            .as_ref()
+            .map(|receiver| receiver.exchanges.clone())
+            .unwrap_or_default();
+        let (inputs_in, remote_in) = receiver
+            .as_mut()
+            .map(|receiver| {
+                (
+                    std::mem::take(&mut receiver.inputs),
+                    std::mem::take(&mut receiver.remote),
+                )
+            })
+            .unwrap_or_default();
         let dump_seq = Self::dump_fragment(params);
         let (query, instance) = (Self::query_id(params), Self::fragment_instance_id(params));
         let skip = |filter_id: i32, reason: &str, detail: &str| {
             runtime_filters::log_skipped(query, instance, filter_id, None, reason, detail);
         };
         if !filtered {
-            for (filter_id, _) in &scan.filters {
+            for (filter_id, _) in filters {
                 skip(*filter_id, "timeout", "");
             }
         }
         let unfiltered = self
-            .translate_fragment_logged(params, &[], dump_seq)
+            .translate_fragment_logged(params, &exchanges, dump_seq)
             .inspect_err(|err| {
-                for (filter_id, _) in scan.filters.iter().filter(|_| filtered) {
+                for (filter_id, _) in filters.iter().filter(|_| filtered) {
                     skip(*filter_id, "untranslatable", err);
                 }
             })?;
-        let waited_ms = scan.deferred_at.elapsed().as_millis() as u64;
+        let waited_ms = deferred_at.elapsed().as_millis() as u64;
         let mut inputs = Vec::new();
         let mut runs = Vec::new();
         let mut applying = Vec::new();
-        for (filter_id, site) in scan.filters.iter().filter(|_| filtered) {
+        for (filter_id, site) in filters.iter().filter(|_| filtered) {
             let (sources, exact) = match self.filter_keys(site, held) {
                 FilterKeysState::Ready { sources, exact } => (sources, exact),
                 FilterKeysState::Unusable { reason, detail } => {
@@ -1124,7 +1297,7 @@ impl SiriusComputeNodeService {
         } else {
             match self
                 .translator
-                .translate_fragment_with_inputs(params, &[], &inputs)
+                .translate_fragment_with_inputs(params, &exchanges, &inputs)
             {
                 Ok(plan) => Some(plan),
                 Err(err) => {
@@ -1135,7 +1308,7 @@ impl SiriusComputeNodeService {
                 }
             }
         };
-        match &filtered_plan {
+        let ran = match &filtered_plan {
             Some(plan) => {
                 // Only the key streams the plan reads; a filter of another scan type stays
                 // unbound. Bounds are a predicate on the scan the filter was deferred for.
@@ -1162,8 +1335,8 @@ impl SiriusComputeNodeService {
                 self.execute_fragment(
                     params,
                     plan,
-                    Vec::new(),
-                    Vec::new(),
+                    inputs_in,
+                    remote_in,
                     FilterPlan {
                         filters: runs,
                         fallback: Some(&unfiltered),
@@ -1173,11 +1346,18 @@ impl SiriusComputeNodeService {
             None => self.execute_fragment(
                 params,
                 &unfiltered,
-                Vec::new(),
-                Vec::new(),
+                inputs_in,
+                remote_in,
                 FilterPlan::default(),
             ),
+        };
+        if ran.is_ok()
+            && let Some(receiver) = receiver.as_mut()
+        {
+            // The engine relayed every parked input and released it.
+            receiver.guard.slots.clear();
         }
+        ran
     }
 
     /// Answers one SRNX request on the brpc thread, never waiting on the engine or the transport
@@ -1672,9 +1852,15 @@ impl SiriusComputeNodeService {
                 .params
                 .as_ref()
                 .map(|exec| FragmentInstanceId::from(&exec.query_id));
-            if runtime_filters::enabled() {
+            let ready = if runtime_filters::enabled() {
                 self.use_keys_before_run(&ready);
-            }
+                match self.park_for_filters(ready) {
+                    Some(ready) => ready,
+                    None => continue,
+                }
+            } else {
+                ready
+            };
             match self.execute_ready_fragment(ready) {
                 Ok(next) => queue.extend(next),
                 Err(err) => {
@@ -1696,13 +1882,15 @@ impl SiriusComputeNodeService {
     fn fail_and_purge(&self, query: FragmentInstanceId, error: &str) {
         self.results.fail_query(query, error);
         let deferred = self.filters.purge_query(query);
-        for scan in &deferred {
+        let purged_scans = deferred.len();
+        for scan in deferred {
             let instance = Self::fragment_instance_id(&scan.params);
             for (filter_id, _) in &scan.filters {
                 runtime_filters::log_skipped(Some(query), instance, *filter_id, None, "purged", "");
             }
+            self.release_inputs(scan.ready);
         }
-        let deferred = deferred.len();
+        let deferred = purged_scans;
         let purged = self.exchanges.purge_query(query, error);
         if let Some(nixl) = &self.nixl {
             for &token in &purged.tokens {
@@ -1747,13 +1935,39 @@ impl SiriusComputeNodeService {
         &self,
         ready: ReadyFragment,
     ) -> std::result::Result<Vec<ReadyFragment>, String> {
+        let ReceiverInputs {
+            mut guard,
+            exchanges,
+            inputs,
+            remote,
+        } = self.take_ready_inputs(ready.inputs)?;
+        let dump_seq = Self::dump_fragment(&ready.params);
+        let translated = self.translate_fragment_logged(&ready.params, &exchanges, dump_seq)?;
+        let next = self.execute_fragment(
+            &ready.params,
+            &translated,
+            inputs,
+            remote,
+            FilterPlan::default(),
+        )?;
+        // The engine relayed every parked input and released it.
+        guard.slots.clear();
+        Ok(next)
+    }
+
+    /// A ready receiver's inputs as the engine takes them, bound to their exchanges, under a
+    /// guard that frees them unless the run relays them.
+    fn take_ready_inputs(
+        &self,
+        ready: Vec<ReadyExchangeInput>,
+    ) -> std::result::Result<ReceiverInputs, String> {
         let mut guard = ReadyInputsGuard {
             nixl: self.nixl.clone(),
             executor: Arc::clone(&self.executor),
             tokens: Vec::new(),
             slots: Vec::new(),
         };
-        for source in ready.inputs.iter().flat_map(|input| &input.sources) {
+        for source in ready.iter().flat_map(|input| &input.sources) {
             match source {
                 SenderSource::Remote { batches, .. } => {
                     guard.tokens.extend(batches.iter().map(|batch| batch.token))
@@ -1761,34 +1975,27 @@ impl SiriusComputeNodeService {
                 SenderSource::LocalParked { slot, .. } => guard.slots.push(*slot),
             }
         }
-        let exchange_inputs = Self::exchange_inputs(&ready.inputs)?;
-        let mut inputs = Vec::with_capacity(ready.inputs.len());
-        let mut remote_inputs = Vec::new();
-        for input in ready.inputs {
+        let exchanges = Self::exchange_inputs(&ready)?;
+        let mut inputs = Vec::with_capacity(ready.len());
+        let mut remote = Vec::new();
+        for input in ready {
             let mut slots = Vec::new();
             for source in input.sources {
                 match source {
                     SenderSource::LocalParked { slot, .. } => slots.push(slot),
                     SenderSource::Remote {
                         sender_id, batches, ..
-                    } => remote_inputs.push((input.node_id, sender_id, batches)),
+                    } => remote.push((input.node_id, sender_id, batches)),
                 }
             }
             inputs.push((input.node_id, slots));
         }
-        let dump_seq = Self::dump_fragment(&ready.params);
-        let translated =
-            self.translate_fragment_logged(&ready.params, &exchange_inputs, dump_seq)?;
-        let next = self.execute_fragment(
-            &ready.params,
-            &translated,
+        Ok(ReceiverInputs {
+            guard,
+            exchanges,
             inputs,
-            remote_inputs,
-            FilterPlan::default(),
-        )?;
-        // The engine relayed every parked input and released it.
-        guard.slots.clear();
-        Ok(next)
+            remote,
+        })
     }
 
     /// Binds each exchange to its senders' output names, which must agree across senders.
@@ -2093,6 +2300,14 @@ impl SiriusComputeNodeService {
             error_msgs: vec![message.into()],
         }
     }
+}
+
+/// A ready receiver's inputs, taken for a run: see `take_ready_inputs`.
+struct ReceiverInputs {
+    guard: ReadyInputsGuard,
+    exchanges: Vec<ExchangeInput>,
+    inputs: Vec<(i32, Vec<SenderSlot>)>,
+    remote: Vec<(i32, i32, Vec<RemoteBatch>)>,
 }
 
 /// Frees a ready receiver's inputs when dropped, whichever step failed: translation, a pre-run
@@ -2727,6 +2942,8 @@ mod tests {
         outputs: Mutex<Vec<(Vec<String>, Vec<SenderSlot>)>>,
         /// Whether reading keys fails.
         unreadable_keys: bool,
+        /// Parked outputs dropped.
+        dropped: Mutex<Vec<SenderSlot>>,
     }
 
     impl FilterRecorder {
@@ -2736,6 +2953,7 @@ mod tests {
                 runs: Mutex::new(Vec::new()),
                 outputs: Mutex::new(Vec::new()),
                 unreadable_keys: false,
+                dropped: Mutex::new(Vec::new()),
             }
         }
 
@@ -2782,6 +3000,11 @@ mod tests {
                 return Err("injected: keys unreadable".to_string());
             }
             Ok(self.stats)
+        }
+
+        fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
+            self.dropped.lock().unwrap().push(slot);
+            Ok(())
         }
     }
 
@@ -3504,6 +3727,226 @@ mod tests {
         assert!(scan_ran_within_3s(&service), "the scan waited");
         let runs = runs_within_3s(&executor, 3);
         assert!(filtered_scan_run(&runs).is_none(), "{runs:?}");
+    }
+
+    /// Instance 40 of `query`: a join of a scan probing `id_filter` with exchange 30 (one
+    /// sender), sending to exchange `sink_node` of instance `sink_instance`. `filter_builder`'s
+    /// instance 1 builds the filter.
+    fn nonleaf_prober(query: i64, sink_node: i32, sink_instance: i64) -> TExecPlanFragmentParams {
+        let builder = filter_builder(query);
+        let mut join = builder.fragment.unwrap().plan.unwrap().nodes[0].clone();
+        join.node_id = 41;
+        let hash_join = join.hash_join_node.as_mut().unwrap();
+        hash_join.build_runtime_filters = None;
+        hash_join.eq_join_conjuncts = vec![starrocks_thrift::plan_nodes::TEqJoinCondition {
+            left: slot_ref_expr(1, 0),
+            right: slot_ref_expr(3, 1),
+            opcode: Some(starrocks_thrift::opcodes::TExprOpcode::EQ),
+        }];
+        let mut scan = scan_node(0, 0);
+        scan.probe_runtime_filters = Some(vec![id_filter()]);
+        let plan = TPlan::new(vec![join, scan, exchange_plan_node(30, 1)]);
+        let mut params = fragment_params(Some(plan), Some(tpch_desc_table()));
+        params.fragment.as_mut().unwrap().output_sink = Some(stream_sink(sink_node));
+        params.params = Some(exec_params(
+            TUniqueId::new(query, 0),
+            TUniqueId::new(query, 40),
+        ));
+        expect_senders(&mut params, 30, 1);
+        send_to(&mut params, sink_instance, 8060);
+        params
+    }
+
+    /// Instance 50 of `query`: the only sender to `nonleaf_prober`'s exchange 30.
+    fn nonleaf_input(query: i64) -> TExecPlanFragmentParams {
+        let mut params = query_fragment(query, 50, scan_node(12, 1), stream_sink(30));
+        params.desc_tbl = Some(tpch_desc_table());
+        send_to(&mut params, 40, 8060);
+        params
+    }
+
+    /// The run of `nonleaf_prober` among `runs`: the one reading exchange 30.
+    fn nonleaf_run(runs: &[RecordedRun]) -> Option<&RecordedRun> {
+        runs.iter().find(|(streams, _, _)| streams.contains(&30))
+    }
+
+    #[test]
+    fn a_fragment_reading_exchanges_waits_for_a_filter_built_on_its_cn() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        exec_ok(&service, &filter_builder(61));
+        // Its output goes to exchange 1, not to the filter's build exchange 2.
+        exec_ok(&service, &nonleaf_prober(61, 1, 1));
+        exec_ok(&service, &nonleaf_input(61));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            nonleaf_run(&executor.runs.lock().unwrap()).is_none(),
+            "its inputs are here, its filter isn't"
+        );
+        assert_eq!(service.filters.deferred(), 1);
+
+        exec_ok(&service, &build_sender(61));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let run = loop {
+            if let Some(run) = nonleaf_run(&executor.runs.lock().unwrap()) {
+                break Some(run.clone());
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let (streams, filters, fallback) = run.expect("it ran once its filter was built");
+        assert!(streams.contains(&FILTER_STREAM_BASE), "{streams:?}");
+        assert!(fallback);
+        assert_eq!(
+            filters[0].keys.sources,
+            vec![KeySource::Parked(SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from_halves(61, 1),
+                node_id: 2,
+                sender_id: 0,
+            })]
+        );
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
+    #[test]
+    fn a_fragment_whose_filter_build_may_need_its_output_does_not_wait() {
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FilterRecorder::new(sparse_keys())),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        service.run_or_register(&filter_builder(62)).unwrap();
+        // Its output feeds the filter's own build exchange: waiting would hold both.
+        let logs = captured_logs(|| service.run_or_register(&nonleaf_prober(62, 2, 1)).unwrap());
+        assert!(
+            logs.contains(r#"filter_id=0 node=0 outcome="skipped" reason="deadlock_unproven""#),
+            "{logs}"
+        );
+        assert!(logs.contains("reads this fragment's output"), "{logs}");
+        // Its output goes to a fragment this CN hasn't seen: nothing proves it safe.
+        let mut unknown = nonleaf_prober(62, 99, 7);
+        unknown.params.as_mut().unwrap().fragment_instance_id = TUniqueId::new(62, 41);
+        let logs = captured_logs(|| service.run_or_register(&unknown).unwrap());
+        assert!(
+            logs.contains(r#"outcome="skipped" reason="deadlock_unproven""#)
+                && logs.contains("isn't on this CN"),
+            "{logs}"
+        );
+        assert!(
+            service
+                .filters
+                .take_pending(FragmentInstanceId::from_halves(62, 40))
+                .is_none()
+        );
+        assert!(
+            service
+                .filters
+                .take_pending(FragmentInstanceId::from_halves(62, 41))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_fragment_reading_exchanges_runs_unfiltered_when_its_filter_is_late() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let mut service = short_wait_service(executor.clone());
+        service.filter_wait = Duration::from_millis(300);
+        exec_ok(&service, &filter_builder(63));
+        exec_ok(&service, &nonleaf_prober(63, 1, 1));
+        exec_ok(&service, &nonleaf_input(63));
+        assert!(
+            nonleaf_run(&executor.runs.lock().unwrap()).is_none(),
+            "it waits for its filter first"
+        );
+        assert_eq!(service.filters.deferred(), 1);
+        let runs = runs_within_3s(&executor, 2);
+        let (streams, filters, fallback) = nonleaf_run(&runs).expect("it ran unfiltered");
+        assert_eq!(streams, &vec![30]);
+        assert!(filters.is_empty());
+        assert!(!fallback);
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
+    #[test]
+    fn a_fragment_with_a_sink_the_check_cant_follow_does_not_wait() {
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FilterRecorder::new(sparse_keys())),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        service.run_or_register(&filter_builder(66)).unwrap();
+        let mut multicast = nonleaf_prober(66, 1, 1);
+        let sink = multicast
+            .fragment
+            .as_mut()
+            .unwrap()
+            .output_sink
+            .as_mut()
+            .unwrap();
+        sink.type_ = TDataSinkType::MULTI_CAST_DATA_STREAM_SINK;
+        sink.stream_sink = None;
+        // It fails later as unsupported; what matters is it isn't proven safe to wait.
+        let logs = captured_logs(|| {
+            let _ = service.run_or_register(&multicast);
+        });
+        assert!(
+            logs.contains(
+                r#"outcome="skipped" reason="deadlock_unproven" detail="unsupported sink""#
+            ),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn a_waiting_fragment_whose_timer_cannot_start_runs_unfiltered_at_once() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        exec_ok(&service, &filter_builder(67));
+        exec_ok(&service, &nonleaf_prober(67, 1, 1));
+        exec_ok(&service, &nonleaf_input(67));
+        assert_eq!(service.filters.deferred(), 1);
+        service.timer_not_started(FragmentInstanceId::from_halves(67, 40), "injected");
+        let runs = executor.runs.lock().unwrap().clone();
+        let (streams, filters, _) = nonleaf_run(&runs).expect("it ran at once");
+        assert_eq!(streams, &vec![30]);
+        assert!(filters.is_empty());
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
+    #[test]
+    fn purging_a_query_frees_a_fragment_waiting_on_its_inputs_for_a_filter() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        exec_ok(&service, &filter_builder(64));
+        exec_ok(&service, &nonleaf_prober(64, 1, 1));
+        exec_ok(&service, &nonleaf_input(64));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(service.filters.deferred(), 1);
+        let logs = captured_logs(|| {
+            service.fail_and_purge(FragmentInstanceId::from_halves(64, 0), "injected")
+        });
+        assert!(logs.contains(r#"reason="purged""#), "{logs}");
+        assert_eq!(service.filters.deferred(), 0);
+        // The input it held is freed, not left parked.
+        assert!(executor.dropped.lock().unwrap().contains(&SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(64, 40),
+            node_id: 30,
+            sender_id: 0,
+        }));
+        assert_eq!(service.exchanges.counts(), ExchangeCounts::default());
+
+        // One still waiting for its inputs is forgotten too.
+        exec_ok(&service, &filter_builder(65));
+        exec_ok(&service, &nonleaf_prober(65, 1, 1));
+        service.fail_and_purge(FragmentInstanceId::from_halves(65, 0), "injected");
+        assert!(
+            service
+                .filters
+                .take_pending(FragmentInstanceId::from_halves(65, 40))
+                .is_none()
+        );
     }
 
     #[test]
