@@ -56,8 +56,11 @@ enum class late_failure_cause : uint8_t {
   oom_exhausted,
   retry_exhausted,
   gpu_error,
-  other
+  other,
+  resource
 };
+inline constexpr std::size_t late_failure_cause_count =
+  static_cast<std::size_t>(late_failure_cause::resource) + 1;
 // One bounded, best-effort decision record, including policy/cleanup early exits.
 struct late_failure_trace {
   ~late_failure_trace() noexcept;

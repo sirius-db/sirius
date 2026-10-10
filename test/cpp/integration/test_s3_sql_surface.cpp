@@ -13,7 +13,9 @@
 #include "io/s3/sirius_httpfs.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "scan_manager/config.hpp"
+#include "scan_manager/preparation_test_support.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
@@ -3544,6 +3546,113 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
         std::lock_guard lock(hits_mutex);
         CHECK(hits[uri] > 0);
       }
+    }
+  }
+}
+
+TEST_CASE("S3 Puffin open failures retain their phase and replay veto on both preparation routes",
+          "[s3][integration][iceberg][scan_preparation][s3_dv]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  s3_sql_fixture fixture(*env);
+  auto& con = fixture.con;
+  set_gpu_execution(con, false);
+  require_query_ok(con, "LOAD avro");
+  require_query_ok(con, "LOAD iceberg");
+  require_query_ok(con, "SET unsafe_enable_version_guessing=true");
+  sirius::test::scratch_dir directory("s3_dv");
+  std::string const prefix = "preparation-dv";
+  auto remote              = "s3://" + env->bucket + "/" + prefix;
+  auto shell_quote         = [](std::string const& value) {
+    std::string result(1, '\'');
+    for (char c : value) {
+      if (c == '\'') {
+        result += '\'';
+        result += '\\';
+        result += '\'';
+        result += '\'';
+      } else {
+        result += c;
+      }
+    }
+    return result + '\'';
+  };
+  auto command = "python3 -B test/cpp/integration/data/generate_inventory_fixtures.py " +
+                 shell_quote(directory.path().string()) + " " + shell_quote(remote);
+  REQUIRE(std::system(command.c_str()) == 0);
+  auto local = directory.path() / "dv_bounded";
+  for (auto const& entry : fs::recursive_directory_iterator(local)) {
+    if (!entry.is_regular_file()) continue;
+    auto key = prefix + "/dv_bounded/" + fs::relative(entry.path(), local).generic_string();
+    if (!sirius::test::put_s3_test_object(key, read_binary_file(entry.path()))) {
+      if (sirius::test::s3::skip_or_fail_unless(false, "managed S3 backend required for DV upload"))
+        return;
+    }
+  }
+  // Bind the fixture's exact snapshot; remote reads remain GPU-only.
+  auto metadata_bytes = read_binary_file(local / "metadata/v1.metadata.json");
+  std::string metadata(metadata_bytes.begin(), metadata_bytes.end());
+  auto key = metadata.find("current-snapshot-id");
+  REQUIRE(key != std::string::npos);
+  auto colon = metadata.find(':', key);
+  REQUIRE(colon != std::string::npos);
+  auto snapshot = std::stoll(metadata.substr(colon + 1));
+  auto sql      = "SELECT fruit, count FROM iceberg_scan(" +
+             sql_quote(remote + "/dv_bounded/metadata/v1.metadata.json") +
+             ", snapshot_from_id=" + std::to_string(snapshot) + ")";
+  auto& context         = require_sirius_context(fixture);
+  auto counters         = context.physical_counters();
+  auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  provider->grant_bytes = 1024 * 1024;
+  struct reset_hooks {
+    decltype(counters) value;
+    ~reset_hooks()
+    {
+      value->preparation_provider_for_testing.reset();
+      value->iceberg_preparation_route_for_testing = {};
+      value->iceberg_dv_phase_for_testing          = {};
+    }
+  } reset{counters};
+  counters->preparation_provider_for_testing = provider;
+  set_gpu_execution(con, true);
+  for (bool deferred : {false, true}) {
+    for (bool fallback : {false, true}) {
+      provider->return_null = !deferred;
+      size_t routes = 0, reads_started = 0;
+      bool selected = !deferred;
+      std::string opened_path;
+      counters->iceberg_preparation_route_for_testing = [&](auto, bool route) {
+        ++routes;
+        selected = route;
+      };
+      counters->iceberg_dv_phase_for_testing = [&](auto const& path, bool start) {
+        if (start) {
+          opened_path = path;
+          ++reads_started;
+        }
+      };
+      require_query_ok(con,
+                       std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"));
+      auto before = context.get_transparent_execution_stats();
+      auto result = con.Query(sql);
+      REQUIRE(result);
+      REQUIRE(result->HasError());
+      INFO(result->GetError());
+      CHECK(routes == 1);
+      CHECK(selected == deferred);
+      CHECK(opened_path == remote + "/dv_bounded/data/a.puffin");
+      CHECK(reads_started == 1);
+      CHECK(result->GetError().find("Cannot open file") != std::string::npos);
+      auto after = context.get_transparent_execution_stats();
+      auto cause = static_cast<size_t>(sirius::transparent::late_failure_cause::reader_io);
+      CHECK(after.late_failures[cause] == before.late_failures[cause] + (deferred ? 1 : 0));
+      CHECK(after.late_replays[cause] == before.late_replays[cause]);
+      CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+      CHECK(after.fallbacks == before.fallbacks);
+
+      CHECK(provider->outstanding() == 0);
+      CHECK(provider->seen->allocated_bytes == 0);
     }
   }
 }

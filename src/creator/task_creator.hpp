@@ -244,6 +244,8 @@ class task_creator {
   /// occupying). Only fulfills the completion future; task_scheduler::drain_after_error(),
   /// called by the query thread once it observes the error, does the actual draining.
   void report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error);
+  void report_fatal_error(sirius::query_id_t query_id,
+                          scan_manager::preparation_failure const& error);
 
   /**
    * @brief Get the next task id.

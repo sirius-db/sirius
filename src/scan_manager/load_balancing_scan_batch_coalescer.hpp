@@ -25,8 +25,10 @@
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "scan_manager/balancing_strategy.hpp"
 #include "scan_manager/mvcc_chunk_mask.hpp"
+#include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_connector.hpp"
+#include "scan_manager/split_provider.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
 
@@ -71,6 +73,7 @@ struct databatch_provider {
 /**
  * @brief Pipeline-ordered sequencer for @c fadvise(opportunistic) calls.
  *
+ * In the standalone worker path:
  * Each pipeline registers a per-pipeline slot (a @c metadata_processing_state)
  * holding a blocking queue its split provider feeds and the coalescer,
  * balancer and connector used to place and forward the resulting splits.  A
@@ -84,16 +87,26 @@ struct databatch_provider {
  * time for the head-of-line pipeline before later pipelines start competing for
  * the buffer pool.
  *
+ * In the query-thread path, disk metadata is read on the scan workers and
+ * preparation_coordinator coalesces and publishes ready inputs on the query
+ * thread. Earlier pipelines retain an output credit; later pipelines need not
+ * wait for them to close before making progress.
+ *
  * Usage:
  *   - scan_manager calls @c register_pipeline(scan_op, balancer) once per
  *     pipeline that needs opportunistic prefetching; the returned slot pointer
  *     drives that pipeline's splits.  Its split provider is wired up via
+ *     @c register_coordinator_source (query-thread metadata scan),
  *     @c get_split_provider_bridge (live metadata scan) or
  *     @c use_cached_entries_for_pipeline (cached-batch replay).
- *   - scan_manager calls @c spawn_workers(dispatcher) once, after all slots
+ *   - In the standalone worker path, scan_manager calls
+ *     @c spawn_workers(dispatcher) once, after all slots
  *     have been registered, to launch the sequencer task.  The task processes
  *     slots in registration order until either all slots are drained or the
  *     stop_token fires.
+ *   - In the query-thread path, @c prepare_cached_workers keeps cached-batch
+ *     replay on the worker executor; execute runs the preparation coordinator
+ *     after the GPU consumers start.
  */
 class load_balancing_scan_batch_coalescer {
  public:
@@ -124,6 +137,7 @@ class load_balancing_scan_batch_coalescer {
       batch_provider = std::move(provider);
     }
 
+    std::shared_ptr<preparation_gate> publication;
     std::size_t op_id{0};
     std::size_t pipeline_id{0};
     using provider_value_t = exec::try_t<std::unique_ptr<op::scan::scan_info>>;
@@ -156,6 +170,36 @@ class load_balancing_scan_batch_coalescer {
     std::shared_ptr<balancing_strategy> balancer,
     std::shared_ptr<readahead_scan_manager> readahead = nullptr);
 
+  void register_coordinator_source(op::scan::sirius_gpu_scan_operator*,
+                                   split_provider&,
+                                   preparation_coordinator&);
+  // Legacy cached providers may block: keep their executor and count their owner window.
+  std::vector<exec::invocable<void(std::stop_token)>> prepare_cached_workers(
+    preparation_coordinator& coordinator)
+  {
+    std::vector<exec::invocable<void(std::stop_token)>> work;
+    for (auto id : _pipeline_order) {
+      auto state = _slots.at(id);
+      if (!state->batch_provider) continue;
+      if (state->publication) throw std::logic_error("cached slot already has a coordinator owner");
+      state->publication = coordinator.publication_gate();
+      auto use           = coordinator.external_use();
+      if (!use) continue;
+      work.emplace_back(
+        [this, id, use = std::move(use)](std::stop_token stop) { slot_loop(id, stop); });
+    }
+    return work;
+  }
+  void close_all_slots() noexcept
+  {
+    for (auto const& [id, state] : _slots) {
+      try {
+        if (state->readahead) state->readahead->mark_operator_closed(state->op_id);
+      } catch (...) {
+      }
+      state->connector->close();
+    }
+  }
   void use_cached_entries_for_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
                                        std::unique_ptr<databatch_provider> provider);
 
@@ -191,7 +235,8 @@ class load_balancing_scan_batch_coalescer {
                                     bool invalidate_witness                           = false,
                                     bool native_pin                                   = false,
                                     std::shared_ptr<readahead_scan_manager> readahead = nullptr,
-                                    std::size_t operator_id                           = 0);
+                                    std::size_t operator_id                           = 0,
+                                    std::shared_ptr<preparation_gate> publication     = {});
 
   /// Spawn one sequencer task per slot on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when the
@@ -211,6 +256,9 @@ class load_balancing_scan_batch_coalescer {
   template <class Dispatcher>
   void spawn_workers(Dispatcher& dispatcher)
   {
+    for (auto const& [id, state] : _slots)
+      if (state->publication)
+        throw std::logic_error("coordinator slots cannot spawn legacy consumers");
     for (auto pipeline_id : _pipeline_order) {
       dispatcher.enqueue(
         [this, pipeline_id](std::stop_token const& stop) { slot_loop(pipeline_id, stop); });

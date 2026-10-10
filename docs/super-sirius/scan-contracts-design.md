@@ -19,7 +19,7 @@ Scan contracts validate GPU scan inputs, split ownership, checkpoint protection,
 3. During physical tree construction, acquire native checkpoint leases before preparing storage metadata and retain any early scan refusal.
 4. Once the tree completes, record one verdict for each registered scan in the planning attempt before lowering any scan.
 5. Produce physical evidence for each input unit as its metadata becomes available, then validate it before GPU consumption.
-6. Drain scan work and release leases before any CPU replay.
+6. Publish only ready, validated inputs; drain preparation and GPU work and release leases before any CPU replay.
 
 ## Verdict at planning
 
@@ -73,11 +73,25 @@ Cached batches use pin identity, layout, structure, and applicable iteration and
 
 In tests, the scan statistics retain each query's readahead registrations by file and its successful memory-prefetch conversions after the query state is drained. These observations do not change scan admission or publication.
 
+## Preparation and publication
+
+Each execution attempt owns its preparation units. A unit identifies one scan input and stays pending until all required evidence is ready: footer approval, native segment checks, a delete set, or checkpoint state. Readiness alone does not authorize publication. The gate rechecks cancellation and validates the split before prefetch initialization or connector insertion.
+
+Eligible Iceberg deletion-vector scans share one host-memory admission for the statement. The reservation covers retained descriptors and delete positions plus bounded temporary decode work, including allocation granularity. Buffers use the reserved backing, and immutable per-file delete sets retain it until their last consumer releases it. A prepared execution consumes its admission once; a later execution needs a fresh admission.
+
+Unbounded inputs, the statement deletion-vector limit, or insufficient host capacity select eager delete loading before deferred execution starts. Positional-delete files keep their existing loading path. This route decision does not itself select CPU fallback. Once deferred work starts, read, validation, and allocation failures use the normal failure and replay rules; they never become an empty delete set.
+
+Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
+
+### Preparation limits
+
+Preparation limits default to values derived from the scan worker count. They bound active jobs, units, pending results, and coalescing work. By default, coordinator waits check interruption every 10 ms; draining an active read can take longer. An underfilled batch becomes due 10 ms after its first retained input, without waiting for later metadata. New arrivals do not reset that deadline. Publication still requires output capacity and can be delayed by scheduling. The limits and timing values accept startup YAML overrides under [`sirius.executor.scan_manager.preparation`](configuration.md#siriusexecutorscan_managerpreparation); a zero residence disables timed publication.
+
 ## Native checkpoint lease
 
 Native scans and pinning acquire a shared checkpoint lease before inspecting storage layouts. Stored ranges are revalidated before decoding. The lease lasts through cleanup; idle prepared statements hold none.
 
-An active lease makes `CHECKPOINT` fail and `FORCE CHECKPOINT` wait. A waiting forced checkpoint blocks new transactions except read-only ones until it is interrupted or the checkpoint keys are released.
+An active lease makes `CHECKPOINT` fail and `FORCE CHECKPOINT` wait. A waiting forced checkpoint blocks new transactions except read-only ones until it is interrupted or the checkpoint keys are released. Sirius starts internal metadata transactions read-only and rejects an internal read-write start while its execution window holds checkpoint leases, avoiding a wait on its own protection.
 
 Failed cleanup retains checkpoint keys until the Sirius runtime is destroyed and prevents CPU fallback. Interrupting `FORCE CHECKPOINT` ends its wait but does not release Sirius's keys.
 

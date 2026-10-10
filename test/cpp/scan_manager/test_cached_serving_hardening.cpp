@@ -73,6 +73,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -1938,4 +1939,63 @@ TEST_CASE("Resident dequeue backstop rejects a stale query before processing",
   REQUIRE_THROWS_AS(scan.get_next_task_input_data(), certificate_incomplete);
   CHECK(observer.get_transparent_execution_stats().certificate_incompletes == 1);
   CHECK(observer.get_transparent_execution_stats().certificate_mismatches == 0);
+}
+
+TEST_CASE("Cached workers reject a returned batch when connection interruption is observed",
+          "[cached_serving][scan_preparation][interrupt]")
+{
+  enum class cancel_at { before_read, after_read, size_estimate };
+  auto point = GENERATE(cancel_at::before_read, cancel_at::after_read, cancel_at::size_estimate);
+  auto& e    = env();
+  bool interrupted = point == cancel_at::before_read;
+  struct interrupting_representation : cucascade::gpu_table_representation {
+    using gpu_table_representation::gpu_table_representation;
+    bool* interrupted = nullptr;
+    std::size_t get_size_in_bytes() const override
+    {
+      if (interrupted) { *interrupted = true; }
+      return gpu_table_representation::get_size_in_bytes();
+    }
+  };
+  struct interrupting_provider : databatch_provider {
+    scripted_provider scripted;
+    std::function<void()> on_return;
+    databatch_provider::batch get_next_batch() override
+    {
+      auto next = scripted.get_next_batch();
+      on_return();
+      return next;
+    }
+  } provider;
+  if (point == cancel_at::size_estimate) {
+    auto column = make_gpu_column(*e.gpu_space, {7, 7, 7, 7});
+    auto repr   = std::make_unique<interrupting_representation>(
+      cudf::table_view(std::vector<cudf::column_view>{column->view()}),
+      column,
+      column->alloc_size(),
+      *e.gpu_space,
+      ::cuda::stream_ref{cudaStream_t{}});
+    provider.on_return = [&, representation = repr.get()] {
+      representation->interrupted = &interrupted;
+    };
+    provider.scripted.batches = {
+      cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr))};
+  } else {
+    provider.scripted.batches = {make_test_batch(e, 4)};
+    provider.on_return        = [&] { interrupted = true; };
+  }
+  auto gate         = std::make_shared<sirius::scan_manager::preparation_gate>();
+  gate->interrupted = [&] { return interrupted; };
+  std::exception_ptr failure;
+  gate->report_error = [&](auto error) { failure = error; };
+  split_connector connector;
+  std::stop_source stop;
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), false, 0, 0, nullptr, false, false, nullptr, 0, gate);
+  REQUIRE(failure);
+  CHECK_THROWS_AS(std::rethrow_exception(failure), duckdb::InterruptException);
+  CHECK_THROWS_AS(connector.get_next_split(), duckdb::InterruptException);
+  CHECK(connector.peek_resident_batches().empty());
+  CHECK(provider.scripted.served == (point == cancel_at::before_read ? 0 : 1));
+  CHECK(gate->closed);
 }

@@ -21,7 +21,9 @@
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -352,20 +354,6 @@ void SiriusContext::QueryEnd()
   // The DuckDB query-end callback releases no slot or repository state: slot ownership is
   // scope-bound and the mandatory cleanup runs inside the execution window
   // (StandaloneQueryScope::finish), before the result is exposed.
-  //
-  // The iceberg delete-data memo is the one thing that must still be dropped here rather than
-  // in run_mandatory_cleanup(). It is populated at PLAN time, and this scan path deliberately
-  // declines unsupported iceberg tables at plan time — those queries never open an execution
-  // window, so a clear living only in the window would never run for them. An entry that
-  // outlives its query can serve a previous snapshot's deletes, i.e. return rows the table has
-  // since removed. This hook fires per statement for GPU and CPU queries alike.
-  //
-  // The internal-query bracket is checked by the QueryEnd(ClientContext&) overload above this
-  // one, which is the only path DuckDB delivers (client_context.cpp calls QueryEnd(ctx, error)).
-  // The memo is filled by internal connections during planning, so a clear that ran for those
-  // would drop the entry the plan just built; iceberg_delete_data_uncached_read_count() is the
-  // assertion that holds this honest.
-  sirius::op::scan::clear_iceberg_delete_data_cache();
 }
 
 void SiriusContext::QueryEnd(ClientContext& context)
@@ -385,10 +373,47 @@ bool SiriusContext::is_internal_query_active(ClientContext& context) noexcept
   return conn_state && conn_state->is_internal_query_active();
 }
 
-struct SiriusContext::internal_connection::implementation {
-  explicit implementation(ClientContext& outer) : connection(*outer.db), guard(*connection.context)
+void SiriusContext::InternalQueryGuard::before_transaction_start(ClientContext& outer,
+                                                                 AttachedDatabase const& database,
+                                                                 bool read_only)
+{
+  if (read_only) { return; }
+  auto ctx = outer.registered_state->Get<SiriusContext>("sirius_state");
+  if (!ctx) { return; }
+  std::optional<sirius::query_id_t> query_id;
   {
-    auto result = connection.Query("BEGIN TRANSACTION READ ONLY");
+    std::lock_guard lock(ctx->window_completions_mutex_);
+    if (ctx->active_window_ && ctx->active_window_->outer == &outer) {
+      query_id = ctx->active_window_->query_id;
+    }
+  }
+  // Snapshot first: never nest the window mutex with the scan-manager key mutex.
+  // This gate enforces transaction ordering, not ClientContext thread safety.
+  if (query_id && ctx->get_scan_manager().holds_checkpoint_key(*query_id, database)) {
+    throw NotImplementedException(
+      "Sirius internal non-read-only transaction start rejected: query/window=%llu "
+      "database=%s holds a checkpoint key",
+      static_cast<unsigned long long>(sirius::value_of(*query_id)),
+      database.GetName());
+  }
+}
+
+struct SiriusContext::internal_connection::implementation {
+  implementation(ClientContext& outer, AttachedDatabase& database, bool read_only)
+    : connection(*outer.db), guard(*connection.context)
+  {
+    auto result = connection.Query(read_only ? "BEGIN TRANSACTION READ ONLY" : "BEGIN TRANSACTION");
+    if (!read_only) {
+      if (!result || result->HasError()) {
+        throw InvalidInputException("Sirius test internal read-write probe could not start");
+      }
+      // Component-only probe: BEGIN is lazy, so enter the database manager too.
+      // Never expose a writable internal_connection, even to a test caller.
+      MetaTransaction::Get(*connection.context).GetTransaction(database);
+      throw InvalidInputException(
+        "Sirius test internal read-write probe completed; "
+        "internal connections must be read-only");
+    }
     if (!result || result->HasError()) {
       throw InvalidInputException(
         "Sirius internal connection could not start a read-only transaction: " +
@@ -462,7 +487,23 @@ unique_ptr<QueryResult> SiriusContext::internal_connection::SendQuery(const stri
 
 SiriusContext::internal_connection SiriusContext::open_internal_connection(ClientContext& outer)
 {
-  return internal_connection(make_uniq<internal_connection::implementation>(outer));
+  bool read_only = true;
+  if (auto ctx = outer.registered_state->Get<SiriusContext>("sirius_state")) {
+    std::lock_guard lock(ctx->window_completions_mutex_);
+    if (ctx->active_window_ && ctx->active_window_->outer == &outer) {
+      read_only = ctx->active_window_->internal_start_read_only;
+    }
+  }
+  // These lookups inspect the committed database map and search path only; using
+  // GetDatabase(outer, name) here could start a transaction before the gate.
+  auto database =
+    DatabaseManager::Get(*outer.db).GetDatabase(DatabaseManager::GetDefaultDatabase(outer));
+  if (!database) {
+    throw InvalidInputException("Sirius internal connection target database is unavailable");
+  }
+  InternalQueryGuard::before_transaction_start(outer, *database, read_only);
+  return internal_connection(
+    make_uniq<internal_connection::implementation>(outer, *database, read_only));
 }
 
 void SiriusContext::observe_native_checkpoint_for_testing(ClientContext& context,
@@ -540,8 +581,9 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
   //
   // On the transparent path the plan those pointers target is already gone: sirius_interface::
   // cleanup_internal destroys the engine before this window's finish(). A streaming_fragment's
-  // engine outlives the window, so its plan is still alive. Either way this only stops task
-  // creation from touching the plan; it never frees it.
+  // engine outlives the window, so its plan is still alive. Engine completion and its destructor
+  // drain plan users before releasing the plan; this reset covers setup paths and already-quiescent
+  // queries. Either way this only stops task creation from touching the plan; it never frees it.
   if (task_creator_) { task_creator_->reset(query_id); }
 
   // With the producer stopped, drop whatever it already queued for this query, for the same
@@ -730,12 +772,24 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
                 static_cast<unsigned long long>(sirius::value_of(window_id_)),
                 static_cast<unsigned long long>(query_ordinal_));
 
+  bool internal_start_read_only = true;
+  Value internal_start_mode;
+  if (context.TryGetCurrentSetting("sirius_test_internal_start_mode", internal_start_mode)) {
+    auto const mode = internal_start_mode.ToString();
+    if (mode != "read_only" && mode != "read_write") {
+      throw InvalidInputException(
+        "sirius_test_internal_start_mode must be read_only or read_write");
+    }
+    internal_start_read_only = mode == "read_only";
+  }
   ctx_.acquire_query_lifecycle_slot(&context);
   log_window_event("begin", "-");
   try {
     {
       std::lock_guard lock(ctx_.window_completions_mutex_);
       ctx_.window_completions_.emplace(sirius::value_of(window_id_), completion_);
+      ctx_.active_window_.emplace(
+        active_execution_window{&context, window_id_, internal_start_read_only});
     }
     ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
     lease_release_.state = lease_release_state::cleanup_failed;
@@ -1356,7 +1410,8 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
   sirius::query_id_t query_id,
   std::shared_ptr<sirius::pipeline::completion_handler> handler,
-  sirius::telemetry::query_telemetry_info telemetry_info)
+  sirius::telemetry::query_telemetry_info telemetry_info,
+  std::function<bool()> interrupted)
 {
   throw_if_not_initialized();
   auto query = duckdb::make_shared_ptr<sirius::planner::query>(
@@ -1370,7 +1425,8 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   scan_manager_->prepare_for_query(*query,
                                    config_.get_operator_params().enable_pinned_zone_map_pruning,
                                    task_creator_->get_active_gpu_ids(query_id),
-                                   handler);
+                                   handler,
+                                   std::move(interrupted));
   return query;
 }
 
@@ -2039,6 +2095,10 @@ void SiriusContext::release_query_lifecycle_slot() noexcept
   // Unlocking a std::mutex from a thread that does not hold it is undefined behaviour.
   D_ASSERT(holder_thread_hash_.load(std::memory_order_relaxed) ==
            (std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1));
+  {
+    std::lock_guard lock(window_completions_mutex_);
+    active_window_.reset();
+  }
   holder_thread_hash_.store(0, std::memory_order_relaxed);
   query_lifecycle_held_.store(false, std::memory_order_release);
   query_lifecycle_mutex_.unlock();

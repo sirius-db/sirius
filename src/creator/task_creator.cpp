@@ -477,6 +477,14 @@ void task_creator::report_fatal_error(sirius::query_id_t query_id, std::exceptio
   report_fatal_error(state ? state->completion_handler : nullptr, std::move(error));
 }
 
+void task_creator::report_fatal_error(sirius::query_id_t query_id,
+                                      scan_manager::preparation_failure const& error)
+{
+  auto state = get_query_task_global_state(query_id);
+  // Report-only, just like the exception overload. The query thread owns stop/drain.
+  if (state && state->completion_handler) state->completion_handler->report_error(error);
+}
+
 void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
 {
   if (_config.strategy != request_type::lookahead) { return; }

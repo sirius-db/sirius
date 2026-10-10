@@ -19,6 +19,8 @@
 // states, the prepare loop and the evictor are the engine's own.
 
 #include "catch.hpp"
+#include "duckdb/common/exception.hpp"
+#include "event/query_event_publisher.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
 #include "io/sirius_datasource.hpp"
@@ -26,14 +28,18 @@
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
+#include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
+#include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <regex>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using sirius::scan_manager::scan_manager_config;
@@ -276,4 +282,89 @@ TEST_CASE("scan inputs populate the cache without a readahead manager",
   REQUIRE(second_ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
   INFO(cache->summary());
   CHECK(global_counter(cache->summary(), "hits") > 0);
+}
+
+TEST_CASE("Deferred scan inputs initialize prefetch only when admitted",
+          "[cache][scan][scan_preparation]")
+{
+  using sirius::op::scan::scan_info;
+  using sirius::op::scan::scan_operator_input;
+  struct interrupting_info : scan_info {
+    using scan_info::scan_info;
+    bool* interrupted = nullptr;
+    std::size_t estimated_bytes() const noexcept override
+    {
+      if (interrupted) *interrupted = true;
+      return 4096;
+    }
+  };
+  temp_data_file file(8ull << 20);
+  auto memory = initialize_memory_manager(1);
+  sirius_scan_manager manager{dispose_on_idle_config(), *memory, single_gpu_index_for_dispose()};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+  auto ds = manager.create_datasource(file.path.string());
+  std::vector<scan_info::fadvise_entry> hints{{ds, {cudf::io::text::byte_range_info{0, 4096}}}};
+  auto info      = std::make_shared<scan_info>(hints);
+  auto publisher = std::make_shared<sirius::event::query_event_publisher>();
+  // No operator is registered: trying to enqueue readahead must fail.
+  auto readahead = std::make_shared<sirius::scan_manager::readahead_scan_manager>(*publisher, 1);
+  bool fail_registration = false, discard = false, cached_cancel = false;
+  SECTION("cached worker observes interruption after sizing an insert-delta input")
+  {
+    cached_cancel = true;
+  }
+  SECTION("cancelled construction leaves no cache request") { discard = true; }
+  SECTION("admitted initialization prepares the buffers") { readahead.reset(); }
+  SECTION("failed registration disposes a partially initialized request")
+  {
+    fail_registration = true;
+  }
+  if (cached_cancel) {
+    using namespace sirius::scan_manager;
+    struct single_input : databatch_provider {
+      batch next;
+      batch get_next_batch() override { return std::exchange(next, {}); }
+    } provider;
+    bool interrupted        = false;
+    auto delta              = std::make_unique<interrupting_info>(hints);
+    delta->interrupted      = &interrupted;
+    provider.next.scan_info = std::move(delta);
+    auto gate               = std::make_shared<preparation_gate>();
+    gate->interrupted       = [&] { return interrupted; };
+    split_connector connector;
+    std::stop_source stop;
+    load_balancing_scan_batch_coalescer::drain_cached_provider(
+      provider, connector, stop.get_token(), false, 0, 0, nullptr, false, false, nullptr, 0, gate);
+    CHECK_THROWS_AS(connector.get_next_split(), duckdb::InterruptException);
+    CHECK(gate->closed);
+    CHECK(cache->generation_count(file.path.string()) == 0);
+    CHECK(cache->claimed_bytes() == 0);
+    CHECK(ds->prepare_prefetch(false) == sirius::io::prepare_result::nothing_to_prepare);
+    return;
+  }
+  auto input = std::make_unique<scan_operator_input>(
+    info, readahead, 0, 0, scan_operator_input::prefetch_start::deferred);
+  CHECK(cache->generation_count(file.path.string()) == 0);
+  CHECK(cache->claimed_bytes() == 0);
+  CHECK(ds->prepare_prefetch(false) == sirius::io::prepare_result::nothing_to_prepare);
+  if (!discard) {
+    if (fail_registration) {
+      CHECK_THROWS_AS(input->initialize_prefetch(), std::out_of_range);
+    } else {
+      REQUIRE_NOTHROW(input->initialize_prefetch());
+      CHECK(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+    }
+    CHECK(cache->generation_count(file.path.string()) == 1);
+    CHECK(cache->claimed_bytes() > 0);
+    CHECK_THROWS_AS(input->initialize_prefetch(), std::logic_error);
+  }
+  input.reset();
+  CHECK(info->get_scan_stage() == sirius::io::cache::scan_stage::disposed);
+  if (discard) {
+    CHECK(cache->generation_count(file.path.string()) == 0);
+    CHECK(cache->claimed_bytes() == 0);
+  } else {
+    CHECK(ds->prepare_prefetch(false) == sirius::io::prepare_result::fallen_behind);
+  }
 }

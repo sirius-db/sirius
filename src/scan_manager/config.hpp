@@ -24,6 +24,7 @@
 #include "io/object_store_config.hpp"
 #include "io/rest/config.hpp"
 #include "io/uring/config.hpp"
+#include "scan_manager/preparation_options.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -205,6 +206,7 @@ struct memory_prefetcher_config {
  *  - @c object_store — object-store credentials and endpoint.
  */
 struct scan_manager_config {
+  preparation_config preparation;
   exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
                                        .thread_name_prefix = "scan_manager"};
   /// IO backend that serves managed reads.
@@ -305,4 +307,10 @@ struct scan_manager_config {
   }
 };
 
+// Validate before any pool/reactor starts. Both defaults and explicit C++ overrides use this path.
+inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
+{
+  (void)config.preparation.resolve(config.thread_pool.num_threads);
+  return config;
+}
 }  // namespace sirius::scan_manager

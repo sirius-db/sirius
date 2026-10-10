@@ -45,6 +45,7 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -173,10 +174,19 @@ TEST_CASE("two queries register independently and reset drops only one",
 
   // B is still live and still serving: its connector yields its splits and closes normally
   // (a closed-by-A connector would have ended the stream with no splits at all).
-  std::size_t b_splits = 0;
-  while (auto split = b.scan_op->get_split_connector().get_next_split()) {
-    ++b_splits;
+  auto consumer = std::async(std::launch::async, [&] {
+    std::size_t count = 0;
+    while (auto split = b.scan_op->get_split_connector().get_next_split())
+      ++count;
+    return count;
+  });
+  try {
+    manager.run_preparation_on_query_thread(b.query->query_id());
+  } catch (...) {
+    manager.reset(b.query->query_id());
+    throw;
   }
+  auto b_splits = consumer.get();
   REQUIRE(b_splits > 0);
 
   manager.reset(b.query->query_id());
@@ -215,8 +225,18 @@ TEST_CASE("concurrent queries do not collide on operator id", "[scan_manager][qu
     return paths;
   };
 
-  auto a_paths = drain_paths(*a.scan_op);
-  auto b_paths = drain_paths(*b.scan_op);
+  std::future<std::vector<std::string>> a_consumer, b_consumer;
+  try {
+    a_consumer = std::async(std::launch::async, [&] { return drain_paths(*a.scan_op); });
+    b_consumer = std::async(std::launch::async, [&] { return drain_paths(*b.scan_op); });
+    manager.run_preparation_on_query_thread(a.query->query_id());
+    manager.run_preparation_on_query_thread(b.query->query_id());
+  } catch (...) {
+    manager.reset_all();
+    throw;
+  }
+  auto a_paths = a_consumer.get();
+  auto b_paths = b_consumer.get();
 
   REQUIRE_FALSE(a_paths.empty());
   REQUIRE_FALSE(b_paths.empty());

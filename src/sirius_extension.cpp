@@ -3198,6 +3198,12 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     Value(""));
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sirius_test_internal_start_mode",
+                    "component-only internal transaction start probe: read_only or read_write",
+                    LogicalType::VARCHAR,
+                    Value("read_only"));
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "sirius_test_sync_native_checkpoint",
                     "enable the native checkpoint test observer for this session",
                     LogicalType::BOOLEAN,

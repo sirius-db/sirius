@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "scan_manager/preparation.hpp"
 #include "transparent/replay_admission.hpp"
 
 #include <atomic>
@@ -23,9 +24,11 @@
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 namespace sirius::pipeline {
 
@@ -33,8 +36,8 @@ namespace sirius::pipeline {
  * @brief Handles query completion signaling with thread-safe state management.
  *
  * This class manages a promise/future pair for signaling query completion.
- * It ensures that the completion state is only set once using atomic operations,
- * allowing safe concurrent access from multiple executor threads.
+ * Terminal decisions are serialized; atomic flags allow executor threads to check
+ * completion without taking the terminal lock.
  */
 class completion_handler {
  public:
@@ -67,28 +70,20 @@ class completion_handler {
     std::exception_ptr error,
     transparent::late_failure_cause fallback = transparent::late_failure_cause::other) noexcept
   {
-    bool expected = false;
-    if (_completed.compare_exchange_strong(expected, true)) {
-      try {
-        {
-          std::lock_guard lock(failure_mutex_);
-          // Save only the terminal winner, before waking the query thread. Allocation failure
-          // in diagnostics must never prevent delivery of the original error.
-          try {
-            failure_ = transparent::classify_failure(error, fallback);
-          } catch (...) {
-            failure_.cause = fallback;
-          }
-        }
-        {
-          std::lock_guard lock(publication_mutex_);
-          _has_error.store(true);
-        }
-        published_changed_.notify_all();
-        _promise.set_exception(error);
-      } catch (...) {
-        // Promise already satisfied or other error - ignore
-      }
+    finish_error(std::move(error), fallback, nullptr);
+  }
+
+  void report_error(scan_manager::preparation_failure const& error) noexcept
+  {
+    try {
+      error.validate();
+      auto original = error.original;
+      if (!original)
+        original = std::make_exception_ptr(
+          transparent::classified_execution_error(error.cause, error.detail));
+      finish_error(std::move(original), error.cause, &error);
+    } catch (...) {
+      report_error(std::current_exception());
     }
   }
 
@@ -109,20 +104,61 @@ class completion_handler {
     }
   }
 
+  // Register once before any worker/GPU submission. Late registration cannot retract success.
+  void set_preparation_stop_callback(std::function<void(bool)> callback)
+  {
+    auto observer = std::make_shared<std::function<void(bool)> const>(std::move(callback));
+    bool terminal = false, error = false;
+    {
+      std::lock_guard lock(terminal_mutex_);
+      if (preparation_stop_) throw std::logic_error("preparation observer already bound");
+      preparation_stop_ = observer;
+      terminal          = gpu_done_ || _completed.load();
+      error             = _has_error.load();
+    }
+    if (terminal) (*observer)(error);
+  }
+  void begin_preparation()
+  {
+    std::lock_guard lock(terminal_mutex_);
+    if (preparation_active_ || gpu_done_ || _completed.load())
+      throw std::logic_error("preparation must register before query work starts");
+    preparation_active_    = true;
+    inputs_closed_         = false;
+    preparation_quiescent_ = false;
+  }
+  void close_preparation_inputs() noexcept
+  {
+    std::lock_guard lock(terminal_mutex_);
+    inputs_closed_ = true;
+    maybe_complete();
+  }
+  void preparation_quiescent() noexcept
+  {
+    std::lock_guard lock(terminal_mutex_);
+    preparation_quiescent_ = true;
+    maybe_complete();
+  }
   /**
-   * @brief Mark the query as successfully completed.
+   * @brief Mark GPU work completed; registered preparation must also finish for success.
    *
    * Sets the promise value to signal completion. Only the first call has effect;
    * subsequent calls are ignored.
    */
   void mark_completed() noexcept
   {
-    bool expected = false;
-    if (_completed.compare_exchange_strong(expected, true)) {
+    std::shared_ptr<std::function<void(bool)> const> stop;
+    {
+      std::lock_guard lock(terminal_mutex_);
+      gpu_done_ = true;
+      stop      = preparation_stop_;
+      maybe_complete();
+    }
+    if (stop) {
       try {
-        _promise.set_value();
+        (*stop)(false);
       } catch (...) {
-        // Promise already satisfied or other error - ignore
+        report_error(std::current_exception());
       }
     }
   }
@@ -162,6 +198,11 @@ class completion_handler {
       return publications_ > 0 || has_error();
     }) && publications_ > 0;
   }
+  bool wait_for_error_for_testing(std::chrono::milliseconds timeout)
+  {
+    std::unique_lock lock(publication_mutex_);
+    return published_changed_.wait_for(lock, timeout, [&] { return has_error(); });
+  }
   void release_footer_for_testing(uint64_t file)
   {
     std::lock_guard lock(publication_mutex_);
@@ -180,18 +221,81 @@ class completion_handler {
     std::lock_guard lock(failure_mutex_);
     return failure_;
   }
+  [[nodiscard]] std::optional<op::scan::verdict_reason> failure_reason() const
+  {
+    std::lock_guard lock(failure_mutex_);
+    return failure_reason_;
+  }
   std::shared_ptr<op::scan::test_injections const> injections;
   std::atomic<uint64_t> injected_oom_attempts{0};
   std::atomic<uint64_t> injected_launch_attempts{0};
+  std::thread::id execution_owner;      // Set by execute before scan preparation is armed.
   bool non_rollbackable_state = false;  // Latched by the query thread before task submission.
 
  private:
+  // terminal -> failure -> publication. Never hold these locks while draining workers.
+  void finish_error(std::exception_ptr error,
+                    transparent::late_failure_cause fallback,
+                    scan_manager::preparation_failure const* preparation) noexcept
+  {
+    std::unique_lock terminal_lock(terminal_mutex_);
+    if (_completed.load()) return;
+    {
+      std::lock_guard lock(failure_mutex_);
+      // Save only the terminal winner, before waking the query thread. Allocation failure
+      // in diagnostics must never prevent delivery of the original error.
+      failure_reason_ = preparation ? preparation->reason : std::nullopt;
+      try {
+        failure_ = preparation ? scan_manager::classify_failure(*preparation)
+                               : transparent::classify_failure(error, fallback);
+      } catch (...) {
+        failure_.cause = fallback;
+      }
+    }
+    {
+      std::lock_guard lock(publication_mutex_);
+      _has_error.store(true);
+    }
+    _completed.store(true);
+    published_changed_.notify_all();
+    try {
+      _promise.set_exception(error);
+    } catch (...) {
+    }
+    auto stop = preparation_stop_;
+    terminal_lock.unlock();
+    if (stop) {
+      try {
+        (*stop)(true);
+      } catch (...) {
+      }
+    }
+  }
+  // Called with terminal_mutex_. Errors and cancellation do not wait for preparation closure.
+  void maybe_complete() noexcept
+  {
+    if (_completed.load() || !gpu_done_ ||
+        (preparation_active_ && (!inputs_closed_ || !preparation_quiescent_)))
+      return;
+    _completed.store(true);
+    try {
+      _promise.set_value();
+    } catch (...) {
+    }
+  }
+  std::shared_ptr<std::function<void(bool)> const> preparation_stop_;
+  std::mutex terminal_mutex_;
+  bool gpu_done_              = false;
+  bool preparation_active_    = false;
+  bool inputs_closed_         = false;
+  bool preparation_quiescent_ = false;
   std::mutex publication_mutex_;
   std::condition_variable published_changed_;
   uint64_t publications_    = 0;
   uint64_t released_footer_ = 0;
   mutable std::mutex failure_mutex_;
   transparent::failure_cause failure_;
+  std::optional<op::scan::verdict_reason> failure_reason_;
   std::shared_ptr<std::atomic<uint64_t>> tasks_started_;
   std::promise<void> _promise;
   std::atomic<bool> _completed{false};

@@ -34,6 +34,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -45,13 +47,19 @@ struct LogicalType;
 namespace duckdb {
 class AttachedDatabase;
 }
+namespace sirius::scan_manager {
+struct scan_envelope;
+class reservation_provider;
+struct admission_decision;
+}  // namespace sirius::scan_manager
 namespace sirius::io {
 class sirius_datasource;
 }
 
 namespace sirius::op::scan {
 class scan_info;
-}
+struct iceberg_delete_set;
+}  // namespace sirius::op::scan
 namespace sirius::transparent {
 class read_view_registry;
 }
@@ -184,12 +192,17 @@ enum class verdict_reason : uint16_t {
   bind_data_mismatch,
   catalog_entry_missing,
   no_trusted_reference,
-  callback_mismatch
+  callback_mismatch,
+  iceberg_delete_corrupt
 };
 
 struct scan_publication_observation {
   std::map<std::string, uint64_t> readahead_registrations;
   uint64_t prefetcher_conversions = 0;
+  std::thread::id execute_owner, preparation_owner, preparation_runner, preparation_publisher;
+  uint64_t preparation_runs = 0;
+  size_t partial_emissions  = 0;
+  std::chrono::microseconds max_residence{0};
 };
 
 struct physical_check_counters {
@@ -204,6 +217,13 @@ struct physical_check_counters {
   std::function<void(std::string const&, bool)> parquet_phase_for_testing;
   std::function<void(std::string const&, bool)> parquet_metadata_for_testing;
   std::function<void()> after_certify_for_testing;
+  std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
+  std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
+  std::function<void(std::string_view, scan_manager::admission_decision const&)>
+    iceberg_statement_route_for_testing;
+  std::shared_ptr<scan_manager::reservation_provider> preparation_provider_for_testing;
+  std::optional<uint64_t> statement_dv_limit_for_testing;
+  std::function<void(scan_manager::scan_envelope&)> preparation_envelope_for_testing;
   void parquet_phase(std::string const& file, bool footer) const
   {
     if (track_units && parquet_phase_for_testing) parquet_phase_for_testing(file, footer);
@@ -245,7 +265,8 @@ struct physical_check_counters {
     ++native_decoder_calls[group];
   }
   std::atomic<uint64_t> checks{0};
-  std::array<std::atomic<uint64_t>, static_cast<std::size_t>(verdict_reason::callback_mismatch) + 1>
+  std::array<std::atomic<uint64_t>,
+             static_cast<std::size_t>(verdict_reason::iceberg_delete_corrupt) + 1>
     rejections{};
   std::atomic<uint64_t> type_mismatches{0};
   std::atomic<uint64_t> type_refusals{0};
@@ -462,6 +483,7 @@ struct split_dependencies {
   std::optional<uint64_t> checkpoint_iteration;
   std::shared_ptr<physical_profile_table> profiles;
   std::shared_ptr<parquet_input_approval const> parquet_approval;
+  std::shared_ptr<iceberg_delete_set const> delete_set;
 };
 enum class certificate_evidence_scope : uint8_t { none, binding_correspondence };
 struct eligibility_certificate {
