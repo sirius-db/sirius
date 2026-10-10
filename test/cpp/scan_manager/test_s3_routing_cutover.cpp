@@ -267,6 +267,9 @@ struct range_fault_policy {
   std::size_t fail_first_gets{0};
   bool fail_all_gets{false};
   int fail_status{503};
+  /// Strong validator sent on HEAD 200, GET 206 and GET 200 when non-empty. Empty keeps the
+  /// object tagless: every open then gets a per-open identity and shares nothing across opens.
+  std::string etag;
 };
 
 class range_s3_server {
@@ -363,8 +366,8 @@ class range_s3_server {
     std::string response;
     if (is_head) {
       _head_count.fetch_add(1, std::memory_order_relaxed);
-      response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
-                 "\r\nConnection: close\r\n\r\n";
+      response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) + "\r\n" +
+                 etag_header() + "Connection: close\r\n\r\n";
       send_all(fd, response);
     } else if (is_get) {
       auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
@@ -382,12 +385,13 @@ class range_s3_server {
         auto const len = end - start + 1;
         response       = "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(len) +
                    "\r\nContent-Range: bytes " + std::to_string(start) + "-" + std::to_string(end) +
-                   "/" + std::to_string(_object.size()) + "\r\nConnection: close\r\n\r\n";
+                   "/" + std::to_string(_object.size()) + "\r\n" + etag_header() +
+                   "Connection: close\r\n\r\n";
         send_all(fd, response);
         send_all(fd, _object.data() + start, len);
       } else {
-        response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
-                   "\r\nConnection: close\r\n\r\n";
+        response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) + "\r\n" +
+                   etag_header() + "Connection: close\r\n\r\n";
         send_all(fd, response);
         send_all(fd, _object.data(), _object.size());
       }
@@ -397,6 +401,11 @@ class range_s3_server {
         "Connection: close\r\n\r\n";
       send_all(fd, response);
     }
+  }
+
+  [[nodiscard]] std::string etag_header() const
+  {
+    return _fault.etag.empty() ? std::string{} : "ETag: " + _fault.etag + "\r\n";
   }
 
   static void send_all(int fd, std::string_view bytes)
@@ -834,7 +843,14 @@ TEST_CASE("describe_parquet probes the S3 footer on a cold bind and reuses the m
   auto const fixture_path = project_root() / "test/cpp/integration/data/parquet/nation.parquet";
   auto parquet_bytes      = read_binary_file(fixture_path);
   auto const object_size  = parquet_bytes.size();
-  range_s3_server server(std::move(parquet_bytes));
+  // The parsed footer is shared across opens only for an object with a usable strong validator:
+  // a tagless open gets a per-open identity and caches nothing beyond itself. The same strong
+  // ETag must therefore come back from the probe GET and from the warm bind's HEAD.
+  range_fault_policy fault;
+  fault.etag            = GENERATE(std::string{"\"nation-generation\""}, std::string{});
+  bool const strong_tag = !fault.etag.empty();
+  CAPTURE(fault.etag);
+  range_s3_server server(std::move(parquet_bytes), fault);
   scan_manager_fixture fixture;
   sirius_scan_manager manager{
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native),
@@ -856,14 +872,17 @@ TEST_CASE("describe_parquet probes the S3 footer on a cold bind and reuses the m
   CHECK(server.get_count() == 1);
   CHECK(server.suffix_get_count() == 1);
 
-  // Warm bind: the parsed footer is in the ioctx metadata store, so the open takes
-  // open_hint::generic (a HEAD for the size) and downloads no footer bytes.
+  // Warm bind: the path is known to the metadata store, so the open takes open_hint::generic (a
+  // HEAD for the size). With a strong tag the stored footer is found under the same identity and
+  // no footer bytes are downloaded; without one the open has a fresh identity and reads the
+  // footer again — one GET, since cuDF's speculative tail read (64 KiB by default) covers this
+  // small file's footer in a single range.
   auto const second = manager.describe_parquet(uri);
   CHECK(second.object_size == first.object_size);
   CHECK(second.total_num_rows == first.total_num_rows);
   CHECK(second.names == first.names);
   CHECK(server.head_count() == 1);
-  CHECK(server.get_count() == 1);
+  CHECK(server.get_count() == (strong_tag ? 1 : 2));
 }
 
 TEST_CASE("routed S3 cache fill at the object tail is clipped to EOF", "[s3][routing]")
