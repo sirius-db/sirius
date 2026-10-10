@@ -71,6 +71,9 @@ seaweedfs = ">=4.48"
 fastavro = "1.12.2.*"
 
 [tasks]
+# Differential fuzzer; see test/fuzz/README.md. Drives the DuckDB shell from the build.
+fuzz = { cmd = "PYTHONPATH=$PIXI_PROJECT_ROOT/test/fuzz python -m siriusfuzz", description = "Sirius fuzzer: run|doctor|replay|recheck|show-config|selftest (paths resolve from the current directory)" }
+fuzz-test = { cmd = "python -m unittest discover -s tests -t .", cwd = "test/fuzz", description = "Unit tests for the fuzzer harness (no GPU needed)" }
 
 [tasks.duckdb]
 description = "Start the local DuckDB shell with Sirius loaded."
