@@ -75,10 +75,19 @@ impl<'a> ExprNodeCursor<'a> {
             )));
         }
 
-        let children = (0..node.num_children)
-            .map(|_| self.translate_next(ctx))
-            .collect::<Result<Vec<_>>>()?;
+        let mut children = Vec::with_capacity(node.num_children as usize);
+        // The FE's type of each child, which arithmetic needs to widen decimal operands.
+        let mut child_types = Vec::with_capacity(node.num_children as usize);
+        for _ in 0..node.num_children {
+            if let Some(child) = self.nodes.get(self.idx) {
+                child_types.push(&child.type_);
+            }
+            children.push(self.translate_next(ctx)?);
+        }
 
+        if node.node_type == TExprNodeType::ARITHMETIC_EXPR {
+            return translate_arithmetic(node, children, &child_types, ctx);
+        }
         translate_expr_node(node, children, ctx)
     }
 
@@ -114,7 +123,6 @@ fn translate_expr_node(
         TExprNodeType::COMPOUND_PRED => translate_compound_pred(node, children, ctx),
         TExprNodeType::CAST_EXPR => translate_cast(node, children),
         TExprNodeType::IS_NULL_PRED => translate_is_null(node, children, ctx),
-        TExprNodeType::ARITHMETIC_EXPR => translate_arithmetic(node, children, ctx),
         TExprNodeType::IN_PRED => translate_in_pred(node, children, ctx),
         TExprNodeType::CASE_EXPR => translate_case(node, children),
         TExprNodeType::FUNCTION_CALL => translate_function_call(node, children, ctx),
@@ -251,22 +259,22 @@ fn translate_decimal_literal(node: &TExprNode, children: Vec<Expression>) -> Res
             Ok(literal(expression::literal::LiteralType::Decimal(
                 expression::literal::Decimal {
                     value: value.to_vec(),
-                    precision: decimal.precision,
+                    // DuckDB stores a DECIMAL of precision 4 or less as INT16, which the GPU
+                    // can't hold; StarRocks types small constants that way (`0.2` is
+                    // DECIMAL(1,1)). Widening the precision keeps the value and the scale.
+                    precision: decimal.precision.max(MIN_LITERAL_DECIMAL_PRECISION),
                     scale: decimal.scale,
                 },
             )))
-        }
-        Some(substrait::proto::r#type::Kind::Fp64(_)) => {
-            let value = lit.value.parse::<f64>().map_err(|_| {
-                TranslateError::malformed(format!("invalid decimal literal {:?}", lit.value))
-            })?;
-            Ok(literal(expression::literal::LiteralType::Fp64(value)))
         }
         _ => Err(TranslateError::malformed(
             "DECIMAL_LITERAL has non-numeric type",
         )),
     }
 }
+
+/// The smallest precision a decimal literal is given: DuckDB stores 5 and up as INT32 or wider.
+const MIN_LITERAL_DECIMAL_PRECISION: i32 = 5;
 
 /// Converts a StarRocks `DATE_LITERAL` into a Substrait date literal.
 ///
@@ -324,6 +332,7 @@ fn epoch_days_from_date_str(value: &str) -> Result<i32> {
 fn translate_arithmetic(
     node: &TExprNode,
     children: Vec<Expression>,
+    child_types: &[&starrocks_thrift::types::TTypeDesc],
     ctx: &mut ExprContext<'_>,
 ) -> Result<Expression> {
     let opcode = node.opcode.ok_or(TranslateError::MissingField {
@@ -344,37 +353,135 @@ fn translate_arithmetic(
         }
     };
     expect_child_count(node, &children, 2)?;
-    // Decimal arithmetic is evaluated in FP64: the Sirius GPU expression path cannot consume
-    // decimal arithmetic, and refusing it instead -- which is what this replaced -- rejects every
-    // TPC-H revenue query. The result is approximate and is NOT cast back: a project's output slot
-    // may be declared DECIMAL while the expression yields FP64. The emitted `Cast` and
-    // `ScalarFunction` nodes do carry the FP64 type; the mismatch is with anything that derives a
-    // row's schema from the frontend's slot types instead (a stream receiver, the result
-    // encoding), which still expects DECIMAL -- tracked in #1687. Sums of money columns therefore
-    // differ from StarRocks in the last few digits (~1e-14 relative) and render as a double. A
-    // decimal-native GPU path is the real fix.
-    let decimal = is_decimal(&node.type_)?;
-    let children = if decimal {
-        children
-            .into_iter()
-            .map(|input| Expression {
-                rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
-                    r#type: Some(type_mapper::fp64_type(true)),
-                    input: Some(Box::new(input)),
-                    failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
-                }))),
-            })
-            .collect()
-    } else {
-        children
-    };
-    let output_type = if decimal {
-        type_mapper::fp64_type(node.is_nullable.unwrap_or(true))
-    } else {
-        type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?
-    };
+    let output_type = type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?;
     let anchor = ctx.registry.register_function(URN_ARITHMETIC, name);
-    Ok(scalar_function(anchor, children, output_type))
+    if !is_decimal(&node.type_)? {
+        return Ok(scalar_function(anchor, children, output_type));
+    }
+    match opcode {
+        // Decimal `+ - *` are exact in DuckDB and on the GPU, with the scale StarRocks gives
+        // them. DuckDB binds the result type, and the result is cast to the FE's: that gives
+        // every slot, exchange column and SUM input the type the FE declared. The FE casts the
+        // operands of `+ -` to the result's precision, so DuckDB's result is never narrower.
+        TExprOpcode::ADD | TExprOpcode::SUBTRACT => Ok(cast(
+            output_type.clone(),
+            scalar_function(anchor, children, output_type),
+        )),
+        // DuckDB computes the product of two operands at most 18 wide in 64 bits, capped at
+        // DECIMAL(18) (DECIMAL(15,2) * DECIMAL(16,2) is DECIMAL(18,4)): the CPU raises an error
+        // past 10^18 and the GPU wraps. StarRocks multiplies in its result's width,
+        // DECIMAL128(31,4) for revenue. A product the FE types wider than 18 therefore gets its
+        // operands widened to DECIMAL(38, s) at their own scale, so DuckDB binds a DECIMAL128
+        // product, exact, before the cast to the FE's type.
+        TExprOpcode::MULTIPLY => {
+            let children = if decimal_precision(&node.type_)? > MAX_DECIMAL64_PRECISION {
+                children
+                    .into_iter()
+                    .zip(child_types)
+                    .map(|(input, child_type)| widen_decimal128(input, child_type))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                children
+            };
+            Ok(cast(
+                output_type.clone(),
+                scalar_function(anchor, children, output_type),
+            ))
+        }
+        // `/` and MOD stay in FP64: DuckDB divides decimals only in DOUBLE, and Substrait's
+        // `divide` binds to DuckDB's integer `//`, which has no decimal overload. A zero divisor
+        // gives NULL, as in StarRocks, instead of an infinity or NaN that the cast below would
+        // refuse. The quotient is cast to the FE's type so it meets the decimal slots around it
+        // as declared.
+        //
+        // Needs sirius-db/sirius#2124: that cast reduces a DOUBLE to a decimal scale and must
+        // round. Without it the GPU truncates, and a quotient can be one unit low in its last
+        // digit.
+        _ => {
+            let fp64 = type_mapper::fp64_type(true);
+            let mut children = children.into_iter().map(|input| cast(fp64.clone(), input));
+            let (dividend, divisor) = (children.next().unwrap(), children.next().unwrap());
+            let zero_check = ctx.registry.register_function(URN_COMPARISON, "equal");
+            Ok(cast(
+                output_type,
+                scalar_function(
+                    anchor,
+                    vec![dividend, null_if_zero(divisor, zero_check)],
+                    fp64,
+                ),
+            ))
+        }
+    }
+}
+
+/// The widest precision DuckDB stores in 64 bits.
+const MAX_DECIMAL64_PRECISION: i32 = 18;
+
+/// The precision of a decimal type descriptor.
+fn decimal_precision(type_desc: &starrocks_thrift::types::TTypeDesc) -> Result<i32> {
+    match type_mapper::map_type_desc(type_desc, true)?.kind {
+        Some(substrait::proto::r#type::Kind::Decimal(decimal)) => Ok(decimal.precision),
+        _ => Err(TranslateError::malformed("expected a decimal type")),
+    }
+}
+
+/// Casts a decimal operand to DECIMAL(38) at its own scale; any other operand is left alone.
+fn widen_decimal128(
+    input: Expression,
+    fe_type: &starrocks_thrift::types::TTypeDesc,
+) -> Result<Expression> {
+    match type_mapper::map_type_desc(fe_type, true)?.kind {
+        Some(substrait::proto::r#type::Kind::Decimal(decimal)) => Ok(cast(
+            Type {
+                kind: Some(substrait::proto::r#type::Kind::Decimal(
+                    substrait::proto::r#type::Decimal {
+                        precision: 38,
+                        ..decimal
+                    },
+                )),
+            },
+            input,
+        )),
+        _ => Ok(input),
+    }
+}
+
+/// `NULL` where an FP64 divisor is zero, else the divisor.
+fn null_if_zero(divisor: Expression, equal: u32) -> Expression {
+    let fp64 = type_mapper::fp64_type(true);
+    let is_zero = scalar_function(
+        equal,
+        vec![
+            divisor.clone(),
+            literal(expression::literal::LiteralType::Fp64(0.0)),
+        ],
+        type_mapper::bool_type(),
+    );
+    Expression {
+        rex_type: Some(expression::RexType::IfThen(Box::new(expression::IfThen {
+            ifs: vec![expression::if_then::IfClause {
+                r#if: Some(is_zero),
+                then: Some(literal(expression::literal::LiteralType::Null(fp64))),
+            }],
+            r#else: Some(Box::new(divisor)),
+        }))),
+    }
+}
+
+/// A throwing cast of `input` to `ty`, or `input` itself when it already is a cast to `ty`.
+pub(crate) fn cast(ty: Type, input: Expression) -> Expression {
+    if let Some(expression::RexType::Cast(existing)) = &input.rex_type
+        && existing.r#type.as_ref() == Some(&ty)
+    {
+        return input;
+    }
+    Expression {
+        rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+            r#type: Some(ty),
+            input: Some(Box::new(input)),
+            failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+        }))),
+    }
 }
 
 /// Returns whether a StarRocks type descriptor is any decimal flavour.
@@ -674,9 +781,10 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
     }
     let return_primitive = type_mapper::scalar_primitive(&function.ret_type)?;
     let decimal_result = is_decimal(&function.ret_type)?;
-    // Decimal SUM/AVG are lowered to FP64 below because the Sirius GPU expression/aggregate
-    // path cannot consume decimal arithmetic; every other avg return type (temporal avg's
-    // StarRocks-specific rounding, in particular) has no GPU lowering.
+    // A decimal AVG is computed in FP64 below: DuckDB's avg(DECIMAL) returns DOUBLE, and
+    // StarRocks' exact DECIMAL128(38, s+6) result needs a decimal division the engine lacks.
+    // Every other avg return type (temporal avg's StarRocks-specific rounding, in particular)
+    // has no GPU lowering. A decimal SUM stays decimal: it is exact, DECIMAL(38,s) in both.
     if name == "avg" && return_primitive != TPrimitiveType::DOUBLE && !decimal_result {
         return Err(TranslateError::UnsupportedExpression {
             node_type: root.node_type,
@@ -692,16 +800,10 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
         .map(|_| cursor.translate_next(ctx))
         .collect::<Result<Vec<_>>>()?;
     cursor.ensure_consumed()?;
-    if decimal_result && matches!(name, "sum" | "avg") {
+    if decimal_result && name == "avg" {
         arguments = arguments
             .into_iter()
-            .map(|input| Expression {
-                rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
-                    r#type: Some(type_mapper::fp64_type(true)),
-                    input: Some(Box::new(input)),
-                    failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
-                }))),
-            })
+            .map(|input| cast(type_mapper::fp64_type(true), input))
             .collect();
     }
 
