@@ -2021,12 +2021,19 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
   std::string_view path, sirius::io::open_hint hint)
 {
-  auto file_path = normalize_path(std::string(path));
-  auto io_ctx    = ioctx_for_path(file_path);
+  return open_datasource_on(ioctx_for_path(path), path, hint);
+}
+
+std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::open_datasource_on(
+  std::shared_ptr<sirius::io::ioctx> const& io_ctx,
+  std::string_view path,
+  sirius::io::open_hint hint,
+  sirius::io::datasource_cache_mode mode)
+{
   if (!io_ctx) { return nullptr; }  // no backend supports the path
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
-  return io_ctx->open_datasource(file_path, hint);
+  return io_ctx->open_datasource(normalize_path(std::string(path)), hint, mode);
 }
 
 void sirius_scan_manager::list_objects_paged(

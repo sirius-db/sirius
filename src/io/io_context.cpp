@@ -82,7 +82,8 @@ void ioctx::initialize_cache(
 
 void ioctx::shutdown_cache() noexcept { _cache.reset(); }
 
-std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path)
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path,
+                                                          datasource_cache_mode mode)
 {
   // Create the backend-appropriate io_object (local fds / object-store HEAD /
   // ...) and wrap it in a sirius_datasource bound to this ioctx.  Datasource
@@ -96,21 +97,24 @@ std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path)
   // delete-file reads, duckdb_native_gpu_ingestible) bypassed it entirely. An
   // un-stripped URI reaches the local reactor's "unsupported path" throw, which
   // becomes a RUNTIME fallback rather than a clean plan-time decline.
-  return std::make_unique<sirius_datasource>(shared_from_this(),
-                                             create_io_object(strip_file_scheme(path)));
-}
-
-std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path, open_hint hint)
-{
-  return std::make_unique<sirius_datasource>(shared_from_this(),
-                                             create_io_object(strip_file_scheme(path), hint));
+  return std::make_unique<sirius_datasource>(
+    shared_from_this(), create_io_object(strip_file_scheme(path)), mode);
 }
 
 std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path,
-                                                          std::uint64_t known_size)
+                                                          open_hint hint,
+                                                          datasource_cache_mode mode)
 {
-  return std::make_unique<sirius_datasource>(shared_from_this(),
-                                             create_io_object(strip_file_scheme(path), known_size));
+  return std::make_unique<sirius_datasource>(
+    shared_from_this(), create_io_object(strip_file_scheme(path), hint), mode);
+}
+
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path,
+                                                          std::uint64_t known_size,
+                                                          datasource_cache_mode mode)
+{
+  return std::make_unique<sirius_datasource>(
+    shared_from_this(), create_io_object(strip_file_scheme(path), known_size), mode);
 }
 
 std::shared_ptr<io_object> ioctx::create_io_object(std::string path, open_hint /*hint*/)
