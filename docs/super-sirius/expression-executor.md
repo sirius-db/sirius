@@ -235,6 +235,24 @@ so sentinel handling has one implementation. The evaluator boundary regressions
 are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
 tagged `[timestamp_extraction]`.
 
+### Decimal casts
+
+Semantic casts from FLOAT, DOUBLE or DECIMAL to DECIMAL go through `cast_to_decimal()`
+(`src/expression_evaluator/cast_to_decimal.hpp`), not `cudf::cast`, which truncates toward zero
+and does not check the target precision. The helper follows DuckDB:
+
+- FLOAT and DOUBLE compute `round(double(x) * 10^scale)` in FP64 with DuckDB's own power-of-ten
+  table, so each step is the same correctly rounded IEEE operation as on the CPU. FLOAT results are
+  narrowed back to FLOAT before they are stored, as DuckDB does.
+- DECIMAL to a smaller scale rounds half away from zero (`cudf::round_decimal` with `HALF_UP`).
+  Scaling up is exact.
+- A non-NULL value that needs more than the target precision, NaN, or an infinity fails the cast:
+  `CAST` throws `sirius::invalid_input_exception`, so the query replays on the CPU and raises
+  DuckDB's conversion error, and `TRY_CAST` returns NULL. Checking for failed rows synchronizes the
+  stream.
+
+The SQL comparisons against DuckDB are tagged `[decimal_cast]`.
+
 ### Rounding
 
 `round(x)` and `round(x, n)` on FLOAT and DOUBLE map to `function_id::round` and run in

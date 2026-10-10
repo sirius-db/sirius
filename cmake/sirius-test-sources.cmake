@@ -90,6 +90,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
     test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
+    test/cpp/integration/test_gpu_execution_decimal_cast.cpp
     test/cpp/integration/test_gpu_execution_round.cpp
     test/cpp/integration/test_gpu_execution_substring.cpp
     test/cpp/integration/test_parquet_bloom_filter_pushdown.cpp
