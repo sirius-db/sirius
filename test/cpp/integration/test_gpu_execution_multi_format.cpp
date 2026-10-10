@@ -4430,3 +4430,51 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
             << " total_p50_us=" << totals[samples / 2 - 1]
             << " total_p95_us=" << totals[(samples * 95 + 99) / 100 - 1] << '\n';
 }
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Understated DV envelopes fail during parsing after successful admission",
+                 "[integration][scan_preparation][iceberg][understated_envelope]")
+{
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  preparation_measurement observed(counters, true);
+  struct reset_hook {
+    decltype(counters) value;
+    ~reset_hook() { value->preparation_envelope_for_testing = {}; }
+  } reset{counters};
+  size_t injected                            = 0;
+  counters->preparation_envelope_for_testing = [&](auto& envelope) {
+    for (auto& unit : envelope.units) {
+      unit.blob          = 1;
+      unit.footer_parser = 1;
+      unit.roaring       = 0;
+      ++injected;
+    }
+  };
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result =
+    con->Query("SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_bounded")));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(injected == 1);
+  REQUIRE(observed.admissions.size() == 1);
+  CHECK(observed.admissions.front().decision.deferred);
+  CHECK(result->GetError().find("preparation allocation exceeds proved envelope") !=
+        std::string::npos);
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto cause = static_cast<size_t>(sirius::transparent::late_failure_cause::resource);
+  CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+  CHECK(after.late_replays[cause] == before.late_replays[cause]);
+  CHECK(after.preparation_legacy_route == before.preparation_legacy_route);
+  REQUIRE(observed.puffin.size() == 1);
+  CHECK(std::get<1>(observed.puffin.front()));
+  CHECK(std::get<2>(observed.puffin.front()).opens == 1);
+  CHECK_FALSE(observed.publication().first_publication.has_value());
+  CHECK(observed.provider->outstanding() == 0);
+  CHECK(observed.provider->seen->allocated_bytes == 0);
+
+  counters->preparation_envelope_for_testing = {};
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_bounded")),
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}

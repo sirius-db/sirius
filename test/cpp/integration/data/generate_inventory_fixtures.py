@@ -221,4 +221,34 @@ for variant, names in (
     if variant == "dv_missing_payload":
         (dest / "data/a.puffin").unlink()
 
+
+# Optional remote root keeps metadata, manifests, data and Puffin on the same backend.
+if len(sys.argv) > 2:
+    remote = sys.argv[2].rstrip("/")
+    local_prefix = str(out)
+
+    def relocate(value):
+        if isinstance(value, str):
+            return (
+                remote + value[len(local_prefix) :]
+                if value.startswith(local_prefix + "/")
+                else value
+            )
+        if isinstance(value, list):
+            return [relocate(item) for item in value]
+        if isinstance(value, dict):
+            return {key: relocate(item) for key, item in value.items()}
+        return value
+
+    for path in out.rglob("*.json"):
+        path.write_text(json.dumps(relocate(json.loads(path.read_text())), indent=2))
+    # Rewrite data/delete manifests before recording their new sizes in manifest lists.
+    avro = list(out.rglob("*.avro"))
+    for path in sorted(avro, key=lambda p: p.name.startswith("snap-")):
+        schema, metadata, rows = read(path)
+        if rows and "manifest_path" in rows[0]:
+            for row in rows:
+                row["manifest_length"] = Path(row["manifest_path"]).stat().st_size
+        write(path, schema, metadata, relocate(rows))
+
 print(out)

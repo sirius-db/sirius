@@ -451,7 +451,10 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
   auto* selected = counters->track_units && counters->preparation_provider_for_testing
                      ? counters->preparation_provider_for_testing.get()
                      : &provider;
-  auto ledger    = std::make_unique<preparation_ledger>(*selected);
+  if (counters->track_units && counters->preparation_envelope_for_testing)
+    for (auto& envelope : envelopes)
+      counters->preparation_envelope_for_testing(envelope);
+  auto ledger = std::make_unique<preparation_ledger>(*selected);
   admission_decision decision;
   bool route_allowed =
     counters->track_units && counters->statement_dv_limit_for_testing

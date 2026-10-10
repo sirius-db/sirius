@@ -48,6 +48,7 @@ namespace duckdb {
 class AttachedDatabase;
 }
 namespace sirius::scan_manager {
+struct scan_envelope;
 class reservation_provider;
 struct admission_decision;
 }  // namespace sirius::scan_manager
@@ -235,6 +236,7 @@ struct physical_check_counters {
   bool preparation_timing_for_testing = false;
   std::shared_ptr<scan_manager::reservation_provider> preparation_provider_for_testing;
   std::optional<uint64_t> statement_dv_limit_for_testing;
+  std::function<void(scan_manager::scan_envelope&)> preparation_envelope_for_testing;
   void parquet_phase(std::string const& file, bool footer) const
   {
     if (track_units && parquet_phase_for_testing) parquet_phase_for_testing(file, footer);

@@ -89,7 +89,7 @@ Preparation limits are internal C++ settings derived from the scan worker count.
 
 Optional test observations record planning completion, first ready input, first publication, queue peaks, admission bytes and permits, and legacy/deferred route reasons. Datasource counters separate preparation reads from execution reads; Puffin counters include opens, requested and returned bytes, and failures.
 
-The hidden `[preparation_cost]` test accepts one SELECT through `SIRIUS_TEST_PREPARATION_COST_SQL_FILE`, checks results against CPU execution, and reports warm-query samples with observations enabled and disabled. `test/scripts/compare_query_cost.py` alternates baseline and candidate runs and reports median and P95 latency. `test/scripts/trace_query_io.py` saves file-read syscall evidence separately from timing runs. Missing observations are reported explicitly; datasource bytes and file syscalls are not a complete measure of physical storage traffic.
+The hidden `[preparation_cost]` test accepts one SELECT through `SIRIUS_TEST_PREPARATION_COST_SQL_FILE`, checks results against CPU execution, and reports warm-query samples with observations enabled and disabled. Run `pixi run python -B test/scripts/run_query_cost.py compare <arguments>` to alternate baseline and candidate runs and report median and P95 latency, or use `trace <arguments>` to save file-read syscall evidence separately from timing runs. Missing observations are reported explicitly; datasource bytes and file syscalls are not a complete measure of physical storage traffic.
 
 ## Native checkpoint lease
 
