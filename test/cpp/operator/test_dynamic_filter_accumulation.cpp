@@ -136,8 +136,13 @@ std::unique_ptr<cudf::column> make_probe(std::vector<T> const& values,
       if (valid[row]) { words[row / 32] |= cudf::bitmask_type{1} << (row % 32); }
     }
     auto const nulls = static_cast<cudf::size_type>(std::ranges::count(valid, false));
-    column->set_null_mask(
-      rmm::device_buffer{words.data(), words.size() * sizeof(cudf::bitmask_type), stream}, nulls);
+    auto mask = cudf::create_null_mask(column->size(), cudf::mask_state::UNINITIALIZED, stream);
+    REQUIRE(cudaMemcpyAsync(mask.data(),
+                            words.data(),
+                            words.size() * sizeof(cudf::bitmask_type),
+                            cudaMemcpyHostToDevice,
+                            stream.get()) == cudaSuccess);
+    column->set_null_mask(std::move(mask), nulls);
   }
   stream.sync();
   return column;
