@@ -175,8 +175,8 @@ fn q15_partial_max_translates() {
     let names = function_names(&plan);
     assert!(names.contains(&"max".to_string()), "{names:?}");
     assert!(names.contains(&"sum".to_string()), "{names:?}");
-    // supplier key and the partial revenue sum, a DECIMAL128(38,4) lowered to FP64.
-    assert_eq!(stream_types(&plan, 8), ["INTEGER", "DOUBLE"]);
+    // supplier key and the partial revenue sum, the FE's DECIMAL128(38,4).
+    assert_eq!(stream_types(&plan, 8), ["INTEGER", "DECIMAL(38,4)"]);
 }
 
 /// Join ops of the recorded fragment's hash joins, in plan order.
@@ -457,13 +457,13 @@ fn q10_partial_aggregation_follows_its_intermediate_tuple_order() {
     // The sink partitions on slots 1, 2, 6, 5, 35, 3, 8, which are columns 0..7 in descriptor
     // order (by slot id they would be 0, 1, 4, 3, 6, 2, 5).
     assert_eq!(plan.output_partition_columns, Some((0..7).collect()));
-    // The one aggregate, the revenue sum, is column 7 = slot 39, sent as FP64.
+    // The one aggregate, the revenue sum, is column 7 = slot 39, sent as DECIMAL(38,4).
     assert_eq!(plan.output_names.len(), 8);
-    assert_eq!(measure_kinds(top_aggregate(&plan)), ["fp64"]);
+    assert_eq!(measure_kinds(top_aggregate(&plan)), ["decimal"]);
 }
 
 /// q22's partial aggregation emits `count(*)` and then `sum(c_acctbal)` after its one key,
-/// typed by the partial-state rule as BIGINT and FP64, in aggregate order.
+/// typed by the partial-state rule as BIGINT and DECIMAL(38,2), in aggregate order.
 #[test]
 fn q22_partial_aggregates_follow_their_intermediate_tuple_order() {
     let params = load(AGG_COLUMN_ORDER, "q22-partial");
@@ -476,7 +476,7 @@ fn q22_partial_aggregates_follow_their_intermediate_tuple_order() {
 
     let plan = translate(AGG_COLUMN_ORDER, "q22-partial").unwrap();
     assert_eq!(plan.output_partition_columns, Some(vec![0]));
-    assert_eq!(measure_kinds(top_aggregate(&plan)), ["i64", "fp64"]);
+    assert_eq!(measure_kinds(top_aggregate(&plan)), ["i64", "decimal"]);
 }
 
 /// The contract for a finalizing aggregation, on its output tuple. q10's merge aggregation reads
@@ -508,7 +508,7 @@ fn q10_merge_aggregation_follows_its_output_tuple_order() {
             "VARCHAR",
             "VARCHAR",
             "VARCHAR",
-            "DOUBLE"
+            "DECIMAL(38,4)"
         ]
     );
 
@@ -541,7 +541,10 @@ fn q22_merge_aggregates_read_their_partial_states_in_order() {
     assert_eq!(descriptor_order(&params, agg.output_tuple_id), [37, 38, 39]);
 
     let plan = translate(AGG_COLUMN_ORDER, "q22-merge").unwrap();
-    assert_eq!(stream_types(&plan, 15), ["VARCHAR", "BIGINT", "DOUBLE"]);
+    assert_eq!(
+        stream_types(&plan, 15),
+        ["VARCHAR", "BIGINT", "DECIMAL(38,2)"]
+    );
     assert_eq!(measure_fields(top_aggregate(&plan)), [1, 2]);
 }
 
@@ -596,18 +599,31 @@ fn q01_two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
             "sum", "sum", "sum", "sum", "sum", "count", "sum", "count", "sum", "count", "count"
         ]
     );
+    // The four sums ship as the FE's DECIMAL128(38,s); each AVG as an FP64 sum and a count.
     assert_eq!(
         measure_kinds(aggregate),
         [
-            "fp64", "fp64", "fp64", "fp64", "fp64", "i64", "fp64", "i64", "fp64", "i64", "i64"
+            "decimal", "decimal", "decimal", "decimal", "fp64", "i64", "fp64", "i64", "fp64",
+            "i64", "i64"
         ]
     );
     assert_eq!(partial.output_names.len(), 13);
     assert_eq!(
         stream_types(&merge, 3),
         [
-            "VARCHAR", "VARCHAR", "DOUBLE", "DOUBLE", "DOUBLE", "DOUBLE", "DOUBLE", "BIGINT",
-            "DOUBLE", "BIGINT", "DOUBLE", "BIGINT", "BIGINT"
+            "VARCHAR",
+            "VARCHAR",
+            "DECIMAL(38,2)",
+            "DECIMAL(38,2)",
+            "DECIMAL(38,4)",
+            "DECIMAL(38,6)",
+            "DOUBLE",
+            "BIGINT",
+            "DOUBLE",
+            "BIGINT",
+            "DOUBLE",
+            "BIGINT",
+            "BIGINT"
         ]
     );
     // The merge sums every shipped column once: the four sums, each AVG's sum and count, and
@@ -743,8 +759,357 @@ fn q18_top_n_materializes_slots_of_another_tuple() {
     // Sort tuple 16: o_totalprice, o_orderdate, c_custkey, c_name, o_orderkey, sum.
     let fields: Vec<_> = project.expressions.iter().map(field).collect();
     assert_eq!(fields, [4, 3, 1, 0, 2, 5]);
+    // Under it, the aggregation (past the projection that pins its decimal sum's type).
+    assert!(
+        rels[sort + 2..]
+            .iter()
+            .find(|rel| !matches!(rel.rel_type, Some(rel::RelType::Project(_))))
+            .is_some_and(|rel| matches!(rel.rel_type, Some(rel::RelType::Aggregate(_))))
+    );
+}
+
+/// Fragments covering each decimal shape of the TPC-H plans (revenue products and sums, the FE's
+/// own DOUBLE comparison, division, AVG, decimal join and group keys).
+const DECIMAL: &str = "tpch-sf1000-decimal";
+
+/// Every expression of the plan's relations, each followed by its subexpressions.
+fn expressions(plan: &TranslatedPlan) -> Vec<&substrait::proto::Expression> {
+    use substrait::proto::expression::RexType;
+    use substrait::proto::{Expression, function_argument, rel};
+
+    fn walk<'a>(expr: &'a Expression, out: &mut Vec<&'a Expression>) {
+        out.push(expr);
+        match expr.rex_type.as_ref() {
+            Some(RexType::ScalarFunction(function)) => {
+                for argument in &function.arguments {
+                    if let Some(function_argument::ArgType::Value(value)) = &argument.arg_type {
+                        walk(value, out);
+                    }
+                }
+            }
+            Some(RexType::Cast(cast)) => walk(cast.input.as_ref().unwrap(), out),
+            Some(RexType::IfThen(if_then)) => {
+                for clause in &if_then.ifs {
+                    walk(clause.r#if.as_ref().unwrap(), out);
+                    walk(clause.then.as_ref().unwrap(), out);
+                }
+                if let Some(otherwise) = if_then.r#else.as_deref() {
+                    walk(otherwise, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for rel in rels(plan) {
+        let roots: Vec<&Expression> = match rel.rel_type.as_ref().unwrap() {
+            rel::RelType::Project(project) => project.expressions.iter().collect(),
+            rel::RelType::Filter(filter) => filter.condition.as_deref().into_iter().collect(),
+            rel::RelType::Join(join) => join
+                .expression
+                .as_deref()
+                .into_iter()
+                .chain(join.post_join_filter.as_deref())
+                .collect(),
+            rel::RelType::Aggregate(aggregate) => aggregate
+                .grouping_expressions
+                .iter()
+                .chain(aggregate.measures.iter().flat_map(|measure| {
+                    measure
+                        .measure
+                        .as_ref()
+                        .unwrap()
+                        .arguments
+                        .iter()
+                        .filter_map(|argument| match argument.arg_type.as_ref() {
+                            Some(function_argument::ArgType::Value(value)) => Some(value),
+                            _ => None,
+                        })
+                }))
+                .collect(),
+            rel::RelType::Sort(sort) => sort
+                .sorts
+                .iter()
+                .filter_map(|field| field.expr.as_ref())
+                .collect(),
+            _ => Vec::new(),
+        };
+        for root in roots {
+            walk(root, &mut out);
+        }
+    }
+    out
+}
+
+/// The (precision, scale) of every cast to a decimal in the plan.
+fn decimal_casts(plan: &TranslatedPlan) -> Vec<(i32, i32)> {
+    use substrait::proto::expression::RexType;
+    use substrait::proto::r#type::Kind;
+    expressions(plan)
+        .into_iter()
+        .filter_map(|expr| match expr.rex_type.as_ref() {
+            Some(RexType::Cast(cast)) => match cast.r#type.as_ref()?.kind.as_ref()? {
+                Kind::Decimal(decimal) => Some((decimal.precision, decimal.scale)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether anything in the plan is typed FP64: a cast, a function's output, a literal, a
+/// measure or a read schema.
+fn uses_fp64(plan: &TranslatedPlan) -> bool {
+    format!("{:?}", plan.plan.relations).contains("Fp64(")
+}
+
+/// The scalar functions of the plan named `name`.
+fn calls<'a>(
+    plan: &'a TranslatedPlan,
+    name: &str,
+) -> Vec<&'a substrait::proto::expression::ScalarFunction> {
+    use substrait::proto::expression::RexType;
+    use substrait::proto::extensions::simple_extension_declaration::MappingType;
+    let anchors: Vec<u32> = plan
+        .plan
+        .extensions
+        .iter()
+        .filter_map(|declaration| match declaration.mapping_type.as_ref() {
+            Some(MappingType::ExtensionFunction(function)) if function.name == name => {
+                Some(function.function_anchor)
+            }
+            _ => None,
+        })
+        .collect();
+    expressions(plan)
+        .into_iter()
+        .filter_map(|expr| match expr.rex_type.as_ref() {
+            Some(RexType::ScalarFunction(function))
+                if anchors.contains(&function.function_reference) =>
+            {
+                Some(function)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The value expression of a function's `index`th argument.
+fn argument(
+    function: &substrait::proto::expression::ScalarFunction,
+    index: usize,
+) -> &substrait::proto::Expression {
+    match function.arguments[index].arg_type.as_ref() {
+        Some(substrait::proto::function_argument::ArgType::Value(value)) => value,
+        other => panic!("expected a value argument, got {other:?}"),
+    }
+}
+
+/// The target type of a cast expression, as a DuckDB type name.
+fn cast_target(expr: &substrait::proto::Expression) -> String {
+    use substrait::proto::expression::RexType;
+    use substrait::proto::r#type::Kind;
+    let Some(RexType::Cast(cast)) = expr.rex_type.as_ref() else {
+        panic!("expected a cast, got {expr:?}");
+    };
+    match cast.r#type.as_ref().unwrap().kind.as_ref().unwrap() {
+        Kind::Decimal(decimal) => format!("DECIMAL({},{})", decimal.precision, decimal.scale),
+        Kind::Fp64(_) => "DOUBLE".to_string(),
+        other => panic!("unexpected cast target {other:?}"),
+    }
+}
+
+/// The input of a cast expression.
+fn cast_input(expr: &substrait::proto::Expression) -> &substrait::proto::Expression {
+    match expr.rex_type.as_ref() {
+        Some(substrait::proto::expression::RexType::Cast(cast)) => cast.input.as_ref().unwrap(),
+        _ => panic!("expected a cast, got {expr:?}"),
+    }
+}
+
+/// The (precision, scale) of every decimal literal in the plan.
+fn decimal_literals(plan: &TranslatedPlan) -> Vec<(i32, i32)> {
+    use substrait::proto::expression::RexType;
+    use substrait::proto::expression::literal::LiteralType;
+    expressions(plan)
+        .into_iter()
+        .filter_map(|expr| match expr.rex_type.as_ref() {
+            Some(RexType::Literal(literal)) => match literal.literal_type.as_ref()? {
+                LiteralType::Decimal(decimal) => Some((decimal.precision, decimal.scale)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The revenue expression `l_extendedprice * (1 - l_discount)` is DECIMAL end to end, as is the
+/// SUM over it: no FP64 anywhere in the fragment. The FE types `1 - l_discount` DECIMAL64(16,2)
+/// and the product DECIMAL128(31,4); DuckDB would bind both narrower, so each is cast to the FE's
+/// type, a widening. Before, the operands were cast to FP64, and the FE's cast of `1 - l_discount`
+/// to DECIMAL(16,2) turned 0.9299999999999999 into 0.92 on the GPU, about 0.1% off.
+#[test]
+fn revenue_is_computed_and_summed_in_decimal() {
+    for name in ["q03-revenue", "q05-partial", "q15-partial", "q14-partial"] {
+        let plan = translate(DECIMAL, name).unwrap();
+        assert!(!uses_fp64(&plan), "{name}");
+        let casts = decimal_casts(&plan);
+        assert!(casts.contains(&(16, 2)), "{name}: {casts:?}");
+        assert!(casts.contains(&(31, 4)), "{name}: {casts:?}");
+        // Every product the FE types wider than 18 digits is computed in DECIMAL128: its
+        // operands are widened to DECIMAL(38) at their own scale.
+        let products = calls(&plan, "multiply");
+        assert!(!products.is_empty(), "{name}");
+        for product in products {
+            for index in 0..2 {
+                assert!(
+                    cast_target(argument(product, index)).starts_with("DECIMAL(38,"),
+                    "{name}: {product:?}"
+                );
+            }
+        }
+        assert!(
+            measure_kinds(top_aggregate(&plan))
+                .iter()
+                .all(|kind| *kind == "decimal"),
+            "{name}"
+        );
+    }
+}
+
+/// q01's charge is a three-factor product, `revenue * (1 + l_tax)`, which the FE types
+/// DECIMAL128(38,6) and sums as DECIMAL128(38,6). The AVGs stay in FP64.
+#[test]
+fn q01_three_factor_product_is_decimal_and_avg_stays_fp64() {
+    let plan = translate(TWO_PHASE_AVG, "q01-partial").unwrap();
+    let casts = decimal_casts(&plan);
+    assert!(casts.contains(&(31, 4)), "{casts:?}");
+    assert!(casts.contains(&(38, 6)), "{casts:?}");
+    let aggregate = top_aggregate(&plan);
+    assert_eq!(
+        measure_kinds(aggregate),
+        [
+            "decimal", "decimal", "decimal", "decimal", "fp64", "i64", "fp64", "i64", "fp64",
+            "i64", "i64"
+        ]
+    );
+}
+
+/// q15 keeps the supplier whose revenue equals the maximum revenue. Both sides are DECIMAL(38,4)
+/// sums now, exact and independent of summation order, so the `=` holds on every run; in FP64 the
+/// two sums of the same rows could differ by an ulp and match nothing.
+#[test]
+fn q15_revenue_equality_compares_exact_decimals() {
+    let join = translate(DECIMAL, "q15-join").unwrap();
+    assert!(!uses_fp64(&join));
+    assert_eq!(stream_types(&join, 3), ["INTEGER", "DECIMAL(38,4)"]);
+    assert_eq!(stream_types(&join, 14), ["DECIMAL(38,4)"]);
+    assert!(!calls(&join, "equal").is_empty());
+
+    let max = translate(DECIMAL, "q15-merge-max").unwrap();
+    assert!(!uses_fp64(&max));
+    assert_eq!(stream_types(&max, 12), ["DECIMAL(38,4)"]);
+    assert_eq!(measure_names(&max, top_aggregate(&max)), ["max"]);
+}
+
+/// q14's `100.00 * sum / sum`: the multiplication is decimal (DECIMAL(38,6), with the literal
+/// kept at DECIMAL(5,2)), the division runs in FP64 until the engine has an exact decimal
+/// division, with a zero divisor giving NULL, and its quotient is cast to the FE's
+/// DECIMAL128(38,12), the result column's type.
+#[test]
+fn q14_division_runs_in_fp64_and_its_result_is_decimal() {
+    let plan = translate(DECIMAL, "q14-merge").unwrap();
+    assert_eq!(stream_types(&plan, 8), ["DECIMAL(38,4)", "DECIMAL(38,4)"]);
+    let divide = calls(&plan, "divide");
+    assert_eq!(divide.len(), 1);
+    let (numerator, denominator) = (argument(divide[0], 0), argument(divide[0], 1));
+    assert_eq!(cast_target(numerator), "DOUBLE");
+    assert_eq!(cast_target(cast_input(numerator)), "DECIMAL(38,6)");
+    // The divisor is NULL where it is zero, as StarRocks' division gives NULL.
     assert!(matches!(
-        rels[sort + 2].rel_type,
-        Some(rel::RelType::Aggregate(_))
+        denominator.rex_type,
+        Some(substrait::proto::expression::RexType::IfThen(_))
     ));
+    assert!(decimal_casts(&plan).contains(&(38, 12)));
+    assert!(decimal_literals(&plan).contains(&(5, 2)));
+    assert_eq!(plan.output_names.len(), 1);
+}
+
+/// q11 compares a DECIMAL(38,2) sum with a DECIMAL(38,12) threshold, whose common type would need
+/// precision 48, so the FE itself casts both sides to DOUBLE. Those casts are kept; the threshold
+/// is still computed in decimal, and both exchanges carry decimals.
+#[test]
+fn q11_keeps_the_fes_double_comparison() {
+    let root = translate(DECIMAL, "q11-root").unwrap();
+    assert_eq!(stream_types(&root, 10), ["INTEGER", "DECIMAL(38,2)"]);
+    assert_eq!(stream_types(&root, 25), ["DECIMAL(38,12)"]);
+    let comparison = calls(&root, "gt");
+    assert_eq!(comparison.len(), 1);
+    assert_eq!(cast_target(argument(comparison[0], 0)), "DOUBLE");
+    assert_eq!(cast_target(argument(comparison[0], 1)), "DOUBLE");
+
+    let threshold = translate(DECIMAL, "q11-threshold").unwrap();
+    assert!(!uses_fp64(&threshold));
+    assert!(decimal_casts(&threshold).contains(&(38, 12)));
+    assert!(decimal_literals(&threshold).contains(&(10, 10)));
+}
+
+/// q17's `0.2 * avg(l_quantity)`: the AVG runs in FP64 and is cast to the FE's DECIMAL128(38,8);
+/// the literal `0.2`, DECIMAL(1,1) in the FE, is widened to precision 5; the product is cast to
+/// the FE's DECIMAL128(38,9), the type the join compares `l_quantity` with.
+#[test]
+fn q17_avg_feeds_a_decimal_comparison() {
+    let plan = translate_after(
+        TWO_PHASE_AVG,
+        "q17-merge",
+        &[(4, &translate(TWO_PHASE_AVG, "q17-partial").unwrap())],
+    )
+    .unwrap();
+    let casts = decimal_casts(&plan);
+    assert!(casts.contains(&(38, 8)), "{casts:?}");
+    assert!(casts.contains(&(38, 9)), "{casts:?}");
+    assert!(decimal_literals(&plan).contains(&(5, 1)));
+    assert!(!calls(&plan, "lt").is_empty());
+}
+
+/// q22's global AVG crosses an exchange to the fragment that compares it with each customer's
+/// balance. The merge casts the FP64 average to the FE's DECIMAL128(38,8), and the receiver
+/// declares that column DECIMAL(38,8), so the two agree.
+#[test]
+fn q22_avg_crosses_the_exchange_as_the_fes_decimal() {
+    let merge = translate_after(
+        TWO_PHASE_AVG,
+        "q22-merge-avg",
+        &[(6, &translate(TWO_PHASE_AVG, "q22-partial-avg").unwrap())],
+    )
+    .unwrap();
+    assert!(decimal_casts(&merge).contains(&(38, 8)));
+    let receiver = translate(DECIMAL, "q22-cross-join").unwrap();
+    assert_eq!(stream_types(&receiver, 8), ["DECIMAL(38,8)"]);
+    let comparison = calls(&receiver, "gt");
+    assert!(
+        comparison
+            .iter()
+            .any(|function| cast_target(argument(function, 0)) == "DECIMAL(38,8)"),
+        "{comparison:?}"
+    );
+}
+
+/// Decimal join and group keys stay exact decimals: q02 joins on `ps_supplycost = min(...)`,
+/// q10 groups by `c_acctbal`, and q18 groups by `o_totalprice` and filters `sum > 300` with a
+/// DECIMAL(38,2) literal.
+#[test]
+fn decimal_join_and_group_keys_stay_decimal() {
+    for (dir, name) in [
+        (TWO_PHASE_AGG, "q02-merge"),
+        (TWO_PHASE_AGG, "q02-partial"),
+        (AGG_COLUMN_ORDER, "q10-merge"),
+        (SLOT_LAYOUT, "q18-partial-topn"),
+    ] {
+        let plan = translate(dir, name).unwrap();
+        assert!(!uses_fp64(&plan), "{name}");
+    }
+    let q18 = translate(SLOT_LAYOUT, "q18-partial-topn").unwrap();
+    assert!(decimal_literals(&q18).contains(&(38, 2)));
 }

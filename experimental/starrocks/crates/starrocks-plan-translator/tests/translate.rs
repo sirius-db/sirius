@@ -2580,17 +2580,38 @@ fn decimal_literal_encodes_little_endian_unscaled_value() {
     }
 }
 
-/// A decimal literal wider than 18 digits follows the slot rule and is emitted as FP64.
+/// A decimal literal wider than 18 digits stays an exact decimal (q18's `300`, q17's `7.0`).
 #[test]
-fn wide_decimal_literal_is_lowered_to_fp64() {
+fn wide_decimal_literal_stays_decimal() {
     let plan = filter_with_conjunct(binary_pred(
         TExprOpcode::EQ,
         slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
-        decimal_literal("1.5", 19, 2),
+        decimal_literal("1.5", 38, 2),
     ));
     match literal_type(scalar_arg(filter_condition(&plan), 1)) {
-        expression::literal::LiteralType::Fp64(value) => assert_eq!(*value, 1.5),
-        other => panic!("expected fp64 literal, got {other:?}"),
+        expression::literal::LiteralType::Decimal(decimal) => {
+            assert_eq!((decimal.precision, decimal.scale), (38, 2));
+            assert_eq!(decimal.value[..2], [150, 0]);
+        }
+        other => panic!("expected a decimal literal, got {other:?}"),
+    }
+}
+
+/// DuckDB stores a DECIMAL of precision 4 or less as INT16, which the GPU can't hold, so a
+/// small literal (q17's `0.2` is DECIMAL(1,1)) is widened to precision 5 at the same scale.
+#[test]
+fn small_decimal_literal_is_widened_to_precision_5() {
+    let plan = filter_with_conjunct(binary_pred(
+        TExprOpcode::EQ,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        decimal_literal("0.2", 1, 1),
+    ));
+    match literal_type(scalar_arg(filter_condition(&plan), 1)) {
+        expression::literal::LiteralType::Decimal(decimal) => {
+            assert_eq!((decimal.precision, decimal.scale), (5, 1));
+            assert_eq!(decimal.value[0], 2);
+        }
+        other => panic!("expected a decimal literal, got {other:?}"),
     }
 }
 
@@ -4285,12 +4306,13 @@ fn translate_merge_avg(names: &[&str], state_tuple: i32) -> Result<TranslatedPla
 }
 
 /// DuckDB name of the column types the tests here use.
-fn duckdb_name(ty: Option<&substrait::proto::Type>) -> &'static str {
+fn duckdb_name(ty: Option<&substrait::proto::Type>) -> String {
     use substrait::proto::r#type::Kind;
     match type_kind(ty) {
-        Kind::Varchar(_) => "VARCHAR",
-        Kind::I64(_) => "BIGINT",
-        Kind::Fp64(_) => "DOUBLE",
+        Kind::Varchar(_) => "VARCHAR".to_string(),
+        Kind::I64(_) => "BIGINT".to_string(),
+        Kind::Fp64(_) => "DOUBLE".to_string(),
+        Kind::Decimal(decimal) => format!("DECIMAL({},{})", decimal.precision, decimal.scale),
         other => panic!("unexpected type {other:?}"),
     }
 }
@@ -4391,17 +4413,24 @@ fn two_phase_partial_avg_ships_a_sum_and_a_count() {
 fn two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
     let partial = translate_partial_avg();
     let aggregate = root_aggregate(&partial.plan);
-    let mut emitted = vec!["VARCHAR"];
+    let mut emitted = vec!["VARCHAR".to_string()];
     emitted.extend(
         aggregate
             .measures
             .iter()
             .map(|measure| duckdb_name(measure.measure.as_ref().unwrap().output_type.as_ref())),
     );
+    // The decimal SUM ships as DECIMAL(38,2), the FE's own intermediate type.
     assert_eq!(
         emitted,
         [
-            "VARCHAR", "DOUBLE", "BIGINT", "DOUBLE", "BIGINT", "BIGINT", "DOUBLE"
+            "VARCHAR",
+            "DOUBLE",
+            "BIGINT",
+            "DOUBLE",
+            "BIGINT",
+            "BIGINT",
+            "DECIMAL(38,2)"
         ]
     );
 
@@ -4411,8 +4440,9 @@ fn two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
 }
 
 /// Merge AVG sums the shipped sums and counts and divides; the count sum is cast back to
-/// BIGINT like every two-phase integer sum, then to FP64 for the division. Each later measure
-/// reads its column past the AVG counts, and the output is the merge's tuple again.
+/// BIGINT like every two-phase integer sum, then to FP64 for the division. A decimal AVG's FP64
+/// quotient is cast to the FE's DECIMAL128(38,8). Each later measure reads its column past the
+/// AVG counts, and the output is the merge's tuple again.
 #[test]
 fn two_phase_merge_avg_divides_the_summed_sums_by_the_summed_counts() {
     let merge = translate_merge_avg(&["c0", "c1", "c2", "c3", "c4", "c5", "c6"], 1).unwrap();
@@ -4433,7 +4463,13 @@ fn two_phase_merge_avg_divides_the_summed_sums_by_the_summed_counts() {
     };
     // name, avg_id, avg_price, n (the count sum cast back to BIGINT), total.
     assert_eq!(project.expressions.len(), 5);
-    for (expr, (sum, count)) in project.expressions[1..3].iter().zip([(1, 2), (3, 4)]) {
+    let Some(expression::RexType::Cast(avg_price)) = project.expressions[2].rex_type.as_ref()
+    else {
+        panic!("expected the decimal AVG cast to its FE type");
+    };
+    assert_eq!(duckdb_name(avg_price.r#type.as_ref()), "DECIMAL(38,8)");
+    let quotients = [&project.expressions[1], avg_price.input.as_deref().unwrap()];
+    for (expr, (sum, count)) in quotients.into_iter().zip([(1, 2), (3, 4)]) {
         let function = scalar_fn(expr);
         assert_eq!(
             resolved_function(&merge.plan, function.function_reference).1,
@@ -4459,6 +4495,10 @@ fn two_phase_merge_avg_divides_the_summed_sums_by_the_summed_counts() {
         panic!("expected the merged count cast back to BIGINT");
     };
     assert_eq!(duckdb_name(count.r#type.as_ref()), "BIGINT");
+    let Some(expression::RexType::Cast(total)) = project.expressions[4].rex_type.as_ref() else {
+        panic!("expected the merged decimal sum cast to its FE type");
+    };
+    assert_eq!(duckdb_name(total.r#type.as_ref()), "DECIMAL(38,2)");
 }
 
 /// A sender that shipped one column per slot (no AVG count) doesn't match the exchange row the
@@ -4478,7 +4518,13 @@ fn two_phase_merge_avg_reading_states_through_another_tuple_widens_the_exchange_
     assert_eq!(
         stream_types(&merge),
         [
-            "VARCHAR", "DOUBLE", "BIGINT", "DOUBLE", "BIGINT", "BIGINT", "DOUBLE"
+            "VARCHAR",
+            "DOUBLE",
+            "BIGINT",
+            "DOUBLE",
+            "BIGINT",
+            "BIGINT",
+            "DECIMAL(38,2)"
         ]
     );
     assert_eq!(measure_fields(&merge.plan), [1, 2, 3, 4, 5, 6].map(Some));
@@ -5044,59 +5090,176 @@ fn assert_fp64_cast(expr: &substrait::proto::Expression) {
     );
 }
 
-/// Verifies decimal arithmetic is lowered to throwing FP64 casts for the GPU expression
-/// evaluator, and that the result type is FP64 even when the FE result slot stays DECIMAL
-/// (precision <= 18, where `map_type_desc` alone would keep it decimal).
-#[test]
-fn decimal_arithmetic_is_lowered_to_fp64() {
-    for decimal in [
-        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4)),
-        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(18), Some(2)),
-    ] {
-        let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
-        arith.opcode = Some(TExprOpcode::MULTIPLY);
-        let mut nodes = vec![arith];
-        nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
-        nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
+/// Translates `left <opcode> right` as the fragment's only output, both operands slot 1 of
+/// tuple 0 typed `operand`, the node typed `result`, and returns the output expression.
+fn decimal_arithmetic_output(
+    opcode: TExprOpcode,
+    operand: TTypeDesc,
+    result: TTypeDesc,
+) -> substrait::proto::Expression {
+    let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, result, 2);
+    arith.opcode = Some(opcode);
+    let mut nodes = vec![arith];
+    nodes.extend(slot_ref(1, 0, operand.clone()).nodes);
+    nodes.extend(slot_ref(1, 0, operand).nodes);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![TExpr::new(nodes)]),
+    ))
+    .unwrap();
+    let rel::RelType::Project(project) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected output project");
+    };
+    project.expressions[0].clone()
+}
 
-        let translated = translate_fragment(&params(
-            Some(TPlan::new(vec![scan_node(0, 0)])),
-            Some(base_desc()),
-            Some(vec![TExpr::new(nodes)]),
-        ))
-        .unwrap();
-        let rel::RelType::Project(project) = root(&translated.plan)
-            .input
-            .as_ref()
-            .unwrap()
-            .rel_type
-            .as_ref()
-            .unwrap()
-        else {
-            panic!("expected output project");
-        };
-        let expression::RexType::ScalarFunction(function) =
-            project.expressions[0].rex_type.as_ref().unwrap()
-        else {
-            panic!("expected arithmetic function");
-        };
-        assert_eq!(function.arguments.len(), 2, "{decimal:?}");
-        for argument in &function.arguments {
-            let substrait::proto::function_argument::ArgType::Value(value) =
-                argument.arg_type.as_ref().unwrap()
-            else {
-                panic!("expected a value argument");
-            };
-            assert_fp64_cast(value);
-        }
-        assert!(
-            matches!(
-                function.output_type.as_ref().unwrap().kind,
-                Some(substrait::proto::r#type::Kind::Fp64(_))
-            ),
-            "{decimal:?}"
+/// The cast an expression is, with its target.
+fn as_cast(expr: &substrait::proto::Expression) -> &expression::Cast {
+    let Some(expression::RexType::Cast(cast)) = expr.rex_type.as_ref() else {
+        panic!("expected a cast, got {expr:?}");
+    };
+    assert_eq!(
+        cast.failure_behavior,
+        expression::cast::FailureBehavior::ThrowException as i32
+    );
+    cast
+}
+
+/// The (precision, scale) of a decimal type.
+fn decimal_of(ty: Option<&substrait::proto::Type>) -> (i32, i32) {
+    let Some(substrait::proto::r#type::Kind::Decimal(decimal)) = ty.unwrap().kind.as_ref() else {
+        panic!("expected a decimal type, got {ty:?}");
+    };
+    (decimal.precision, decimal.scale)
+}
+
+/// The value expression of a scalar function's arguments.
+fn value_arguments(function: &expression::ScalarFunction) -> Vec<&substrait::proto::Expression> {
+    function
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(value) => value,
+            other => panic!("expected a value argument, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Decimal `+` and `-` stay decimal: the operands are passed as they are (the FE has cast them
+/// to the result's precision), and the result is cast to the FE's type.
+#[test]
+fn decimal_add_and_subtract_stay_decimal_and_are_cast_to_the_fe_type() {
+    for opcode in [TExprOpcode::ADD, TExprOpcode::SUBTRACT] {
+        let output = decimal_arithmetic_output(
+            opcode,
+            scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(16), Some(2)),
+            scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(16), Some(2)),
         );
+        let cast = as_cast(&output);
+        assert_eq!(decimal_of(cast.r#type.as_ref()), (16, 2), "{opcode:?}");
+        for value in value_arguments(scalar_fn(cast.input.as_ref().unwrap())) {
+            assert!(
+                matches!(value.rex_type, Some(expression::RexType::Selection(_))),
+                "{opcode:?}: operand {value:?}"
+            );
+        }
     }
+}
+
+/// A decimal product the FE types wider than 18 digits (revenue's DECIMAL128(31,4)) is computed
+/// in DECIMAL128: each operand is widened to DECIMAL(38) at its own scale, because DuckDB would
+/// compute DECIMAL(15,2) * DECIMAL(16,2) in 64 bits as DECIMAL(18,4), where the GPU wraps past
+/// 10^18. The product is then cast to the FE's type.
+#[test]
+fn a_wide_decimal_product_is_computed_in_decimal128() {
+    let output = decimal_arithmetic_output(
+        TExprOpcode::MULTIPLY,
+        decimal64_15_2(),
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4)),
+    );
+    let cast = as_cast(&output);
+    assert_eq!(decimal_of(cast.r#type.as_ref()), (31, 4));
+    for value in value_arguments(scalar_fn(cast.input.as_ref().unwrap())) {
+        let widened = as_cast(value);
+        assert_eq!(decimal_of(widened.r#type.as_ref()), (38, 2));
+        assert!(matches!(
+            widened.input.as_ref().unwrap().rex_type,
+            Some(expression::RexType::Selection(_))
+        ));
+    }
+}
+
+/// A decimal product the FE keeps within 18 digits is computed as DuckDB binds it.
+#[test]
+fn a_narrow_decimal_product_is_not_widened() {
+    let output = decimal_arithmetic_output(
+        TExprOpcode::MULTIPLY,
+        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(9), Some(2)),
+        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(18), Some(4)),
+    );
+    let cast = as_cast(&output);
+    assert_eq!(decimal_of(cast.r#type.as_ref()), (18, 4));
+    for value in value_arguments(scalar_fn(cast.input.as_ref().unwrap())) {
+        assert!(matches!(
+            value.rex_type,
+            Some(expression::RexType::Selection(_))
+        ));
+    }
+}
+
+/// Decimal `/` stays in FP64 until the engine has an exact decimal division: the operands are
+/// cast to DOUBLE, and the quotient is cast to the FE's decimal type.
+#[test]
+fn decimal_division_runs_in_fp64_and_is_cast_to_the_fe_type() {
+    let output = decimal_arithmetic_output(
+        TExprOpcode::DIVIDE,
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(4)),
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(10)),
+    );
+    let cast = as_cast(&output);
+    assert_eq!(decimal_of(cast.r#type.as_ref()), (38, 10));
+    let function = scalar_fn(cast.input.as_ref().unwrap());
+    assert!(matches!(
+        function.output_type.as_ref().unwrap().kind,
+        Some(substrait::proto::r#type::Kind::Fp64(_))
+    ));
+    assert_fp64_cast(value_arguments(function)[0]);
+}
+
+/// A zero divisor gives NULL, as in StarRocks, rather than an infinity or NaN that the cast to
+/// the decimal result type would refuse: the divisor is `IF(divisor = 0, NULL, divisor)`.
+#[test]
+fn a_zero_decimal_divisor_gives_null() {
+    let output = decimal_arithmetic_output(
+        TExprOpcode::DIVIDE,
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(4)),
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(10)),
+    );
+    let function = scalar_fn(as_cast(&output).input.as_ref().unwrap());
+    let divisor = value_arguments(function)[1];
+    let Some(expression::RexType::IfThen(guard)) = divisor.rex_type.as_ref() else {
+        panic!("expected the divisor guarded against zero, got {divisor:?}");
+    };
+    assert_eq!(guard.ifs.len(), 1);
+    let condition = guard.ifs[0].r#if.as_ref().unwrap();
+    assert_fp64_cast(scalar_arg(condition, 0));
+    assert!(matches!(
+        literal_type(scalar_arg(condition, 1)),
+        expression::literal::LiteralType::Fp64(zero) if *zero == 0.0
+    ));
+    assert!(matches!(
+        literal_type(guard.ifs[0].then.as_ref().unwrap()),
+        expression::literal::LiteralType::Null(_)
+    ));
+    assert_fp64_cast(guard.r#else.as_ref().unwrap());
 }
 
 /// Translates a one-phase aggregation with one measure over a BIGINT slot and returns that
@@ -5139,7 +5302,8 @@ fn single_measure_argument(name: &str, ret_type: TTypeDesc) -> substrait::proto:
     value.clone()
 }
 
-/// Verifies a decimal AVG argument is lowered to a throwing FP64 cast for GPU execution.
+/// A decimal AVG still runs in FP64 (DuckDB's avg(DECIMAL) returns DOUBLE): its argument is
+/// cast to DOUBLE.
 #[test]
 fn decimal_avg_is_lowered_to_fp64() {
     assert_fp64_cast(&single_measure_argument(
@@ -5148,14 +5312,17 @@ fn decimal_avg_is_lowered_to_fp64() {
     ));
 }
 
-/// Verifies a decimal SUM argument is lowered the same way, including when the FE result slot
-/// stays DECIMAL (precision <= 18).
+/// A decimal SUM stays decimal: its argument is passed as it is.
 #[test]
-fn decimal_sum_is_lowered_to_fp64() {
-    assert_fp64_cast(&single_measure_argument(
+fn decimal_sum_argument_stays_decimal() {
+    let argument = single_measure_argument(
         "sum",
-        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(18), Some(2)),
-    ));
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+    );
+    assert!(
+        matches!(argument.rex_type, Some(expression::RexType::Selection(_))),
+        "{argument:?}"
+    );
 }
 
 /// Verifies an avg that lowers to neither the DOUBLE nor the decimal path (temporal avg, with

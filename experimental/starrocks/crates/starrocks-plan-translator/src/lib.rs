@@ -51,7 +51,7 @@
 //! | `COMPOUND_PRED`   | boolean function (`and`, `or`, `not`) |
 //! | `CAST_EXPR`       | cast (throwing failure behavior) |
 //! | `IS_NULL_PRED`    | `is_null` / `is_not_null` |
-//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply`/`divide`/`modulus` (decimal operands in FP64) |
+//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply` (decimal: exact, cast to the FE type), `divide`/`modulus` (decimal: FP64, zero divisor gives NULL) |
 //! | `IN_PRED`         | singular-or-list (wrapped in `not` for `NOT IN`) |
 //! | `CASE_EXPR`       | if-then chain (no leading case operand) |
 //! | `FUNCTION_CALL`   | allowlisted scalar functions (`like`, `if`, `substring`, `year`, ...) |
@@ -70,11 +70,15 @@
 //! non-scalar type nodes. `JSON`/`VARIANT` are surfaced as strings until richer
 //! support lands.
 //!
-//! Decimal arithmetic is **not exact**. `ARITHMETIC_EXPR` over decimal operands, and decimal
-//! `sum`/`avg`, are evaluated in FP64 because the GPU expression and aggregate paths cannot
-//! consume decimal arithmetic; decimal slots of precision &gt; 18 likewise map to FP64. Results
-//! are not cast back, so a column the frontend declared DECIMAL can arrive as a double and
-//! differ from StarRocks in its final digits.
+//! Decimals stay DECIMAL(p,s) at every precision up to 38. Decimal `+ - *`, SUM, MIN, MAX and
+//! comparisons are exact, and each arithmetic result and decimal SUM is cast to the type the
+//! frontend declared, which DuckDB's binder would otherwise narrow. A product the frontend types
+//! wider than 18 digits is computed in DECIMAL128, as StarRocks does. The decimal outputs of a
+//! result fragment are cast to the frontend's types too, so they print as StarRocks' decimals.
+//! Decimal AVG and `/` are the exception: DuckDB computes them only in DOUBLE, so they run in
+//! FP64 and their results are cast to the declared decimal type. That cast must round, which
+//! needs sirius-db/sirius#2124; without it the GPU truncates, and a result can be one unit low in
+//! its last digit.
 //!
 //! # Adding a node
 //!

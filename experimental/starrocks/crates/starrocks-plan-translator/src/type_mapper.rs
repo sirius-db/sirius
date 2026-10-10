@@ -191,19 +191,15 @@ pub fn map_scalar_type(scalar: &TScalarType, nullable: bool) -> Result<Type> {
                     reason: "decimal precision above 38 has no safe v1 Substrait mapping",
                 });
             }
-            if precision <= 18 {
-                r#type::Kind::Decimal(r#type::Decimal {
-                    precision,
-                    scale: scalar.scale.unwrap_or(0),
-                    type_variation_reference: 0,
-                    nullability: n,
-                })
-            } else {
-                r#type::Kind::Fp64(r#type::Fp64 {
-                    type_variation_reference: 0,
-                    nullability: n,
-                })
-            }
+            // Every width maps to DECIMAL(p,s): the engine stores precision 19-38 as decimal128
+            // and computes it exactly. StarRocks' storage width (DECIMAL32/64/128) is not
+            // carried; DuckDB picks the storage from the precision alone.
+            r#type::Kind::Decimal(r#type::Decimal {
+                precision,
+                scale: scalar.scale.unwrap_or(0),
+                type_variation_reference: 0,
+                nullability: n,
+            })
         }
         TPrimitiveType::DECIMAL256 => {
             return Err(TranslateError::UnsupportedType {
@@ -273,16 +269,18 @@ mod tests {
         TScalarType::new(TPrimitiveType::DECIMAL128, None, Some(precision), Some(2))
     }
 
-    /// Precision 18 is the last width kept as DECIMAL; 19 and up lower to FP64.
+    /// Every precision up to 38 stays DECIMAL(p,s), including the decimal128 widths that SUM,
+    /// AVG and products produce; 39 and up are refused.
     #[test]
-    fn decimal_precision_boundary_is_18() {
-        assert!(matches!(
-            map_scalar_type(&decimal(18), true).unwrap().kind,
-            Some(r#type::Kind::Decimal(_))
-        ));
-        assert!(matches!(
-            map_scalar_type(&decimal(19), true).unwrap().kind,
-            Some(r#type::Kind::Fp64(_))
-        ));
+    fn decimals_up_to_precision_38_stay_decimal() {
+        for precision in [1, 9, 18, 19, 31, 38] {
+            let Some(r#type::Kind::Decimal(decimal)) =
+                map_scalar_type(&decimal(precision), true).unwrap().kind
+            else {
+                panic!("precision {precision} did not map to DECIMAL");
+            };
+            assert_eq!((decimal.precision, decimal.scale), (precision, 2));
+        }
+        assert!(map_scalar_type(&decimal(39), true).is_err());
     }
 }
