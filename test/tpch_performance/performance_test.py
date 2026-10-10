@@ -177,7 +177,7 @@ TPCH_TABLES = (
     "supplier",
 )
 
-BUILD_PATH = os.environ.get("SIRIUS_BUILD_PATH", "build/release")
+BUILD_PATH = os.environ.get("SIRIUS_BUILD_PATH", "sirius-duckdb/build/release")
 
 EXTENSION_PATH = os.path.join(
     REPO_ROOT, BUILD_PATH, "extension/sirius/sirius.duckdb_extension"
@@ -1116,14 +1116,11 @@ def _build_precmd_temp_sql(
     sql_path = os.path.join(qdir, f"{precmd}.sql")
     timing_path = os.path.join(qdir, "timings.csv")
 
-    # NOTE: the DuckDB CLI (build/release/duckdb) statically links the Sirius
-    # extension, so gpu_execution is already registered at startup. An explicit
-    # `LOAD '<ext>'` here throws "Table Function gpu_execution already exists".
-    # (Only the in-process path, which uses the vanilla Python duckdb module,
-    # needs LOAD.) The scaffolding (temp table, views, INSERTs, COPY) runs on
-    # plain DuckDB; gpu_execution is toggled on only around the query iterations
-    # so the LAG() window-function COPY is never routed through Sirius.
+    # Load before timing; scaffolding stays on DuckDB's CPU execution path.
+    extension = EXTENSION_PATH.replace("'", "''")
     parts = [
+        f"LOAD '{extension}';",
+        "SET gpu_execution = false;",
         "CREATE TEMP TABLE _timings (seq INTEGER, step VARCHAR, ts TIMESTAMP);",
         "INSERT INTO _timings VALUES (0, 'start', current_timestamp);",
     ]
@@ -1150,10 +1147,8 @@ def _build_precmd_temp_sql(
 
     parts.append("SET gpu_execution = true;")
     # Open the nsys capture range BEFORE the first (cold) iteration so the cold
-    # run is profiled too. The one-time GPU memory-pool init happens at process
-    # startup (the statically-linked extension inits before any SQL runs), so it
-    # is still outside this range — only query execution (cold + every hot
-    # iteration) is captured.
+    # run is profiled too. LOAD initializes the GPU pools before this range;
+    # only query execution (cold + every hot iteration) is captured.
     if precmd == "nsys":
         parts.append("CALL profiler_start();")
     query_sql = query_sql.rstrip().rstrip(";") + ";"
@@ -1249,7 +1244,7 @@ def run_nsys_profile(
     if s3_input is None and not os.path.isfile(DUCKDB_BIN):
         raise SystemExit(
             f"DuckDB binary not found at {DUCKDB_BIN}. "
-            "Build with `pixi run -e clang make release` first."
+            "Build sirius-duckdb first (see sirius-duckdb/README.md)."
         )
     if not shutil.which("nsys"):
         raise SystemExit("nsys (NVIDIA Nsight Systems) not found in PATH.")
@@ -1425,7 +1420,7 @@ def run_gdb(
     if not os.path.isfile(DUCKDB_BIN):
         raise SystemExit(
             f"DuckDB binary not found at {DUCKDB_BIN}. "
-            "Build with `pixi run -e clang make release` first."
+            "Build sirius-duckdb first (see sirius-duckdb/README.md)."
         )
     if not shutil.which("gdb"):
         raise SystemExit("gdb not found in PATH.")

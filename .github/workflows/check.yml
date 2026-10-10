@@ -28,6 +28,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Check DuckDB source revisions
+        run: |
+          [[ "$(git rev-parse HEAD:duckdb)" == "$(git rev-parse HEAD:sirius-duckdb/duckdb)" ]]
+
       - name: Test thread sweep harness
         run: |
           set -o pipefail
@@ -132,9 +136,10 @@ jobs:
       - name: Init vcpkg with full history for version overrides
         if: matrix.build.environment == 'vcpkg'
         run: |
-          git submodule update --init vcpkg
-          if [[ "$(git -C vcpkg rev-parse --is-shallow-repository)" == "true" ]]; then
-            git -C vcpkg fetch --unshallow
+          git submodule update --init sirius-duckdb/vcpkg
+          git submodule update --init --depth=1 sirius-duckdb/extension-ci-tools
+          if [[ "$(git -C sirius-duckdb/vcpkg rev-parse --is-shallow-repository)" == "true" ]]; then
+            git -C sirius-duckdb/vcpkg fetch --unshallow
           fi
 
       - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
@@ -220,25 +225,24 @@ jobs:
 
       - name: Build (vcpkg)
         if: matrix.build.environment == 'vcpkg'
+        env:
+          VCPKG_CUDA_ARCHITECTURES: "100"
         run: |
           set -o pipefail
-          pixi run --locked -e vcpkg cmake -S . -B build/vcpkg-release -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=100 \
-            -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_BUILD=ON -DCPM_LOCAL_PACKAGES_ONLY=ON \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
-            -DSIRIUS_BUILD_STATIC=ON -DSIRIUS_BUILD_TESTS=OFF 2>&1 | tee /tmp/vcpkg.log
-          pixi run --locked -e vcpkg cmake --build build/vcpkg-release --target sirius_library 2>&1 | tee -a /tmp/vcpkg.log
+          pixi run --locked -e vcpkg sirius-duckdb/vcpkg/vcpkg install \
+            --x-manifest-root=sirius-duckdb --x-feature=static \
+            --x-install-root=build/static-dependencies --clean-buildtrees-after-build \
+            2>&1 | tee /tmp/vcpkg.log
 
       - name: Check the installed static package
         if: matrix.build.environment == 'vcpkg'
         run: |
-          pixi run --locked -e vcpkg cmake --install build/vcpkg-release --component sirius_library --prefix "$PWD/build/static-stage"
-          mv build/static-stage build/static-install
+          mkdir -p build
+          mv build/static-dependencies build/static-install
           pixi run --locked -e vcpkg cmake -S test/cmake/installed_consumer -B build/static-consumer -G Ninja \
-            -DCMAKE_PREFIX_PATH="$PWD/build/static-install" -DSIRIUS_TARGET=sirius::sirius_static \
-            -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_INSTALLED_DIR="$PWD/build/vcpkg-release/vcpkg_installed" -DVCPKG_MANIFEST_INSTALL=OFF
+            -DSIRIUS_TARGET=sirius::sirius_static \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_INSTALLED_DIR="$PWD/build/static-install" -DVCPKG_MANIFEST_INSTALL=OFF
           pixi run --locked -e vcpkg cmake --build build/static-consumer
           readelf -d build/static-consumer/consumer > build/static-consumer/dynamic.txt
           while read -r library; do

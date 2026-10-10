@@ -42,6 +42,10 @@ struct partition_sizing_input {
   /// partition has no sibling). A consumer whose task holds both join inputs at once sizes from
   /// this rather than `total_bytes`; one whose task holds only the sizing side uses `total_bytes`.
   uint64_t combined_total_bytes;
+  /// Rows waiting on the sizing partition's input port (projected alongside `total_bytes` when
+  /// the bytes are a projection). Best effort: batches whose representation does not record a
+  /// row count are counted at the bytes-per-row of the batches that do.
+  uint64_t total_rows = 0;
 };
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is

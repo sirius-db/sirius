@@ -38,6 +38,7 @@
 #include <catch.hpp>
 
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <unordered_set>
@@ -183,4 +184,60 @@ TEST_CASE("decimal sum widening - a non-decimal candidate is rejected",
                                         cudf::get_default_stream(),
                                         cudf::get_current_device_resource_ref());
   CHECK_THROWS_AS(widened({ints->view()}, {0}), sirius::internal_exception);
+}
+
+namespace {
+
+using sirius::op::decimal_sum_candidate;
+using sirius::op::decimal_sum_may_overflow;
+using sirius::op::decimal_sums_to_widen;
+
+std::unordered_set<int> to_widen(std::vector<cudf::column_view> const& columns,
+                                 std::vector<decimal_sum_candidate> const& candidates)
+{
+  return decimal_sums_to_widen(cudf::table_view(columns),
+                               candidates,
+                               cudf::get_default_stream(),
+                               cudf::get_current_device_resource_ref());
+}
+
+}  // namespace
+
+TEST_CASE("decimal sum widening - a plan-time bound decides from the row count alone",
+          "[aggregate][decimal_sum_overflow]")
+{
+  auto const d64t = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+  auto const d32t = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+  CHECK_FALSE(decimal_sum_may_overflow(d64t, 0, std::numeric_limits<uint64_t>::max()));
+  CHECK_FALSE(decimal_sum_may_overflow(d64t, 1, static_cast<uint64_t>(kMax64)));  // == limit
+  CHECK(decimal_sum_may_overflow(d64t, 2, static_cast<uint64_t>(kMax64)));
+  CHECK(decimal_sum_may_overflow(d64t, 1, uint64_t{1} << 63));  // |INT64_MIN|
+  // A batch has fewer than 2^31 rows, so a magnitude up to 2^32 never overflows DECIMAL64.
+  CHECK_FALSE(decimal_sum_may_overflow(d64t, kMax32, uint64_t{1} << 32));
+  CHECK_FALSE(decimal_sum_may_overflow(d32t, 2, static_cast<uint64_t>(kMax32) / 2));  // 2^31 - 2
+  CHECK(decimal_sum_may_overflow(d32t, 3, static_cast<uint64_t>(kMax32) / 2));
+  CHECK_THROWS_AS(decimal_sum_may_overflow(cudf::data_type{cudf::type_id::INT64}, 1, 1),
+                  sirius::internal_exception);
+}
+
+TEST_CASE("decimal sum widening - bounded columns are decided on the host, the rest measured",
+          "[aggregate][decimal_sum_overflow]")
+{
+  auto const big   = d64({kMax64, 0});  // 2 rows * (2^63 - 1) > limit when measured
+  auto const small = d64({5, 7});
+  auto const ids   = [](std::initializer_list<int> columns) {
+    return std::unordered_set<int>(columns);
+  };
+  // A bound is the planner's promise about the values; the column itself is not read.
+  CHECK(to_widen({big->view()}, {{0, static_cast<uint64_t>(kMax64)}}) == ids({0}));
+  CHECK(to_widen({small->view()}, {{0, 7}}).empty());
+  // Without a bound the batch is measured.
+  CHECK(to_widen({big->view()}, {{0, std::nullopt}}) == ids({0}));
+  CHECK(to_widen({small->view()}, {{0, std::nullopt}}).empty());
+  // One unproven candidate sends its whole column to measurement.
+  CHECK(to_widen({big->view()}, {{0, 1}, {0, std::nullopt}}) == ids({0}));
+  // Several bounded candidates on one column take the largest bound.
+  CHECK(to_widen({small->view()}, {{0, 1}, {0, static_cast<uint64_t>(kMax64)}}) == ids({0}));
+  // Columns are independent: a measured column beside a bounded one.
+  CHECK(to_widen({big->view(), small->view()}, {{0, std::nullopt}, {1, 7}}) == ids({0}));
 }

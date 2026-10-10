@@ -210,6 +210,11 @@ struct operator_params {
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
+  /// Decide decimal SUM widening from base-table statistics at plan time: an aggregate input with
+  /// a proven magnitude bound skips the per-batch min/max scan and its stream synchronization
+  /// (planner::resolve_decimal_sum_input_bounds). Off: every batch is measured.
+  bool enable_decimal_sum_stats_bound = true;
+
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is

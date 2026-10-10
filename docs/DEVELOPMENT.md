@@ -1,10 +1,9 @@
 # Developing Sirius
 
-Since SiriusDB is an extension to DuckDB, the CMake project source is actually the `duckdb` directory (a submodule of
-this project), which then pulls in SiriusDB as an extension. We use
-
-- symlinked sirius-specific `CMakePresets.json` (at `cmake/CMakePresets.json`) to version control the build config.
-- [pixi](https://pixi.prefix.dev/) to manage build dependencies.
+The root CMake project builds the Sirius library and its C++ tests.
+The separate `sirius-duckdb/` project builds the DuckDB extension against the
+installed library. We use `CMakePresets.json` for the engine build configuration
+and [Pixi](https://pixi.prefix.dev/) to manage build dependencies.
 
 ## Public API documentation
 
@@ -58,10 +57,12 @@ git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 ```
 
-Build with Pixi (uses all available cores). The default target is `release` (GCC Release):
+Build with Pixi (uses all available cores). The default builds Sirius, its C++ tests,
+and the shared DuckDB extension in GCC Release mode:
 
 ```bash
-pixi run make                        # GCC Release (default)
+pixi run make                        # Sirius and DuckDB extension (GCC Release)
+pixi run make release                # Sirius and C++ tests only
 pixi run make clang-relwithdebinfo   # Clang RelWithDebInfo
 pixi run make clang-debug            # Clang Debug
 ```
@@ -72,16 +73,18 @@ If the build exhausts memory, reduce parallelism:
 CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make
 ```
 
-Run the Sirius-linked DuckDB binary — the extension is statically built in and loads automatically:
+The extension can also be built separately using [its Makefile](../sirius-duckdb/README.md).
+
+Start the built DuckDB shell with Sirius loaded:
 
 ```bash
-./build/release/duckdb
+pixi run duckdb
 ```
 
 Alternatively, load the extension into an existing DuckDB shell:
 
 ```sql
-LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';
 ```
 
 ## Pre-commit
@@ -109,8 +112,8 @@ pixi run make test
 Run tests by Catch2 tag or name:
 
 ```bash
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[uri_parser]"
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
+pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"
+pixi run build/release/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
 ```
 
 ## Using CLion for development

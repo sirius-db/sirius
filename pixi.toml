@@ -72,6 +72,10 @@ fastavro = "1.12.2.*"
 
 [tasks]
 
+[tasks.duckdb]
+description = "Start the local DuckDB shell with Sirius loaded."
+cmd = '''sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"'''
+
 [tasks.clion-env]
 description = "Generate the Pixi environment file used by CLion."
 cmd = "mkdir -p build && pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh"

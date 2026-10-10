@@ -2937,6 +2937,16 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
+static void SetEnableDecimalSumStatsBound(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                              = lock_operator_params_slot(context);
+  params->enable_decimal_sum_stats_bound = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DECIMAL_SUM_STATS_BOUND to {}",
+                   params->enable_decimal_sum_stats_bound);
+}
+
 static void SetUseHwDecompression(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -3238,6 +3248,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
                     SetEnablePinnedZoneMapPruning);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_decimal_sum_stats_bound",
+                    "decide decimal SUM widening from base-table statistics at plan time; off "
+                    "measures every batch",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_decimal_sum_stats_bound),
+                    SetEnableDecimalSumStatsBound);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_dynamic_filter",
