@@ -17,6 +17,7 @@
 // sirius
 #include <expression/ast/node.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
+#include <expression_evaluator/cast_to_decimal.hpp>
 #include <expression_evaluator/date_cast.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
@@ -28,6 +29,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
 
 // standard library
 #include <algorithm>
@@ -106,6 +108,11 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
              return_type.id() == cudf::type_id::TIMESTAMP_MICROSECONDS) {
     // Carrier restores were handled above; only semantic casts reach this branch.
     result_column = temporal::cast_to_microseconds_checked(input, _stream, _mr);
+  } else if (alt.kind == sirius::ast::cast_kind::semantic && cudf::is_fixed_point(return_type) &&
+             (cudf::is_floating_point(input.type()) || cudf::is_fixed_point(input.type()))) {
+    // cudf::cast truncates where DuckDB rounds, and does not check the target precision.
+    result_column = cast_to_decimal(
+      input, return_type, alt.target_type.decimal_precision(), alt.try_cast, _stream, _mr);
   } else {
     result_column = cudf::cast(input, return_type, _stream, _mr);
   }
