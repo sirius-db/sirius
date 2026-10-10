@@ -9,7 +9,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("tool", choices=("compare", "trace"))
+    parser.add_argument("tool", choices=("compare", "trace", "io-report"))
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     directory = Path(__file__).resolve().parent
@@ -22,6 +22,7 @@ def main():
     script = {
         "compare": "compare_query_cost.py",
         "trace": "trace_query_io.py",
+        "io-report": "summarize_query_io.py",
     }[args.tool]
     return subprocess.run(
         [sys.executable, "-B", str(directory / script), *args.arguments]

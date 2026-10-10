@@ -27,6 +27,7 @@
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "utils/cold_file_cache.hpp"
 #include "yyjson.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
@@ -55,6 +56,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <transparent/read_view_registry.hpp>
@@ -91,6 +93,29 @@
 namespace fs = std::filesystem;
 
 namespace {
+template <typename... Values>
+struct scoped_test_reset {
+  std::tuple<Values&...> values;
+  ~scoped_test_reset()
+  {
+    std::apply([](auto&... value) { ((value = {}), ...); }, values);
+  }
+};
+template <typename... Values>
+auto reset_after_test(Values&... values)
+{
+  return scoped_test_reset<Values...>{{values...}};
+}
+
+std::string io_path_hex(std::string const& path)
+{
+  std::string result;
+  for (unsigned char c : path) {
+    result += "0123456789abcdef"[c >> 4];
+    result += "0123456789abcdef"[c & 15];
+  }
+  return result;
+}
 struct sql_file_counts {
   uint64_t opens = 0, reads = 0, bytes = 0;
 };
@@ -134,6 +159,27 @@ struct scoped_sql_file_logs {
         result->GetValue(3, row).GetValue<uint64_t>()};
     return counts;
   }
+  void print_paths(std::string const& root, std::array<int64_t, 3> window)
+  {
+    manager.Flush();
+    duckdb::SiriusContext::InternalQueryGuard guard(*con.context);
+    auto prefix = duckdb::StringUtil::Replace(root + "/", "'", "''");
+    auto result = con.Query("SELECT CASE WHEN epoch_us(timestamp) < " + std::to_string(window[1]) +
+                            " THEN 'planning' ELSE 'execution_window' END AS phase, path, "
+                            "count(*) FILTER (WHERE op='OPEN'), count(*) FILTER (WHERE op='READ'), "
+                            "coalesce(sum(bytes) FILTER (WHERE op='READ'),0) "
+                            "FROM duckdb_logs_parsed('FileSystem') WHERE starts_with(path, '" +
+                            prefix + "') AND epoch_us(timestamp) >= " + std::to_string(window[0]) +
+                            " AND epoch_us(timestamp) < " + std::to_string(window[2]) +
+                            " GROUP BY phase, path");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    for (duckdb::idx_t row = 0; row < result->RowCount(); ++row)
+      std::cout << " sql_file=" << result->GetValue(0, row).ToString() << ':'
+                << io_path_hex(result->GetValue(1, row).ToString()) << ':'
+                << result->GetValue(2, row).ToString() << ':' << result->GetValue(3, row).ToString()
+                << ':' << result->GetValue(4, row).ToString();
+  }
   sql_file_counts metadata_reads(std::string const& table)
   {
     return file_reads(table + "/metadata").at("total");
@@ -175,11 +221,22 @@ struct preparation_measurement {
       puffin.emplace_back(path, charged, stats);
     };
     this->counters->parquet_datasource_for_testing =
-      [this](auto const&, auto* datasource, bool in_plan) {
+      [this](auto const& path, auto* datasource, bool in_plan) {
+        auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count();
+        auto tid = ::syscall(SYS_gettid);
+        std::lock_guard lock(mutex);
         if (!datasource) {
+          open_starts[{tid, path}] = now;
           ++(in_plan ? planning_opens : preparation_opens);
           return;
         }
+        auto key   = std::pair{tid, path};
+        auto start = open_starts.at(key);
+        open_starts.erase(key);
+        open_scopes.emplace_back(in_plan, tid, start, now, path);
+        local_backend_only &= datasource->io_ctx()->type() == sirius::io::io_context_type::uring;
         datasource->read_statistics_for_testing(in_plan ? planning : preparation, execution);
         ++datasources;
       };
@@ -237,6 +294,9 @@ struct preparation_measurement {
   std::shared_ptr<read_statistics> execution   = std::make_shared<read_statistics>();
   std::atomic<size_t> datasources{0}, footer_hits{0}, footer_misses{0};
   std::atomic<size_t> planning_opens{0}, preparation_opens{0};
+  bool local_backend_only = true;
+  std::map<std::pair<long, std::string>, int64_t> open_starts;
+  std::vector<std::tuple<bool, long, int64_t, int64_t, std::string>> open_scopes;
   std::mutex mutex;
   std::vector<std::tuple<std::string, bool, sirius::op::scan::puffin_read_statistics>> puffin;
   std::vector<std::pair<uint64_t, bool>> routes;
@@ -3284,10 +3344,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     ++pauses;
     REQUIRE_FALSE(sibling.Query("SELECT 1")->HasError());
   };
-  struct reset_hook {
-    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
-    ~reset_hook() { counters->after_certify_for_testing = {}; }
-  } reset{counters};
+  auto reset  = reset_after_test(counters->after_certify_for_testing);
   auto before = sirius::test::get_transparent_execution_stats(*con);
   expect_iceberg_rows(
     query, gpu_route::gpu, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
@@ -3500,10 +3557,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   sirius::test::scoped_setting one_byte_scan_batch(*con, "scan_task_batch_size", 1);
   auto state    = sirius::test::get_registered_sirius_context(*con);
   auto counters = state->physical_counters();
-  struct reset_hook {
-    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
-    ~reset_hook() { counters->parquet_phase_for_testing = {}; }
-  } reset{counters};
+  auto reset    = reset_after_test(counters->parquet_phase_for_testing);
   std::mutex mutex;
   std::condition_variable changed;
   bool held = false, decoded = false, observed = false;
@@ -3540,15 +3594,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   std::atomic<bool> dv_finished = false, order_ok = true;
   std::atomic<size_t> reads = 0, decodes = 0;
   std::thread::id reader;
-  struct reset_hooks {
-    decltype(counters) value;
-    ~reset_hooks()
-    {
-      value->iceberg_preparation_route_for_testing = {};
-      value->iceberg_dv_phase_for_testing          = {};
-      value->parquet_phase_for_testing             = {};
-    }
-  } reset{counters};
+  auto reset = reset_after_test(counters->iceberg_preparation_route_for_testing,
+                                counters->iceberg_dv_phase_for_testing,
+                                counters->parquet_phase_for_testing);
   counters->iceberg_preparation_route_for_testing = [&](auto, bool deferred) {
     CHECK(std::this_thread::get_id() == owner);
     REQUIRE(deferred);
@@ -3588,15 +3636,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   provider->return_null = fault == 0;
   provider->seen->fail_allocation = fault == 2;
   auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
-  struct reset_hooks {
-    decltype(counters) value;
-    ~reset_hooks()
-    {
-      value->preparation_provider_for_testing.reset();
-      value->iceberg_preparation_route_for_testing = {};
-    }
-  } reset{counters};
-  size_t legacy                                   = 0;
+  auto reset    = reset_after_test(counters->preparation_provider_for_testing,
+                                counters->iceberg_preparation_route_for_testing);
+  size_t legacy = 0;
   counters->preparation_provider_for_testing      = provider;
   counters->iceberg_preparation_route_for_testing = [&](auto, bool deferred) {
     CHECK_FALSE(deferred);
@@ -3624,14 +3666,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
   provider->grant_bytes = 1024 * 1024;
   auto counters         = sirius::test::get_registered_sirius_context(*con)->physical_counters();
-  struct reset_hooks {
-    decltype(counters) value;
-    ~reset_hooks()
-    {
-      value->preparation_provider_for_testing.reset();
-      value->iceberg_dv_phase_for_testing = {};
-    }
-  } reset{counters};
+  auto reset            = reset_after_test(counters->preparation_provider_for_testing,
+                                counters->iceberg_dv_phase_for_testing);
   counters->preparation_provider_for_testing = provider;
   counters->iceberg_dv_phase_for_testing     = [&](auto const&, bool start) {
     if (start) provider->seen->fail_allocation = true;
@@ -3671,14 +3707,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   std::condition_variable changed;
   std::set<std::string> earlier_files;
   bool overlapped = false;
-  struct reset_hooks {
-    decltype(counters) value;
-    ~reset_hooks()
-    {
-      value->iceberg_dv_phase_for_testing = {};
-      value->parquet_phase_for_testing    = {};
-    }
-  } reset{counters};
+  auto reset =
+    reset_after_test(counters->iceberg_dv_phase_for_testing, counters->parquet_phase_for_testing);
   counters->iceberg_dv_phase_for_testing = [&](std::string const& file, bool start) {
     if (!start || !file.ends_with("c.puffin")) return;
     std::unique_lock lock(mutex);
@@ -3714,10 +3744,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   std::mutex mutex;
   std::condition_variable changed;
   bool earlier_decoded = false, overlapped = false;
-  struct reset_hook {
-    decltype(counters) value;
-    ~reset_hook() { value->parquet_phase_for_testing = {}; }
-  } reset{counters};
+  auto reset                          = reset_after_test(counters->parquet_phase_for_testing);
   counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
     std::unique_lock lock(mutex);
     if (footer && file.ends_with("c.parquet")) {
@@ -3757,14 +3784,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
   provider->grant_bytes = 1024 * 1024;
   auto counters         = sirius::test::get_registered_sirius_context(*con)->physical_counters();
-  struct reset_hooks {
-    decltype(counters) value;
-    ~reset_hooks()
-    {
-      value->preparation_provider_for_testing.reset();
-      value->statement_dv_limit_for_testing.reset();
-    }
-  } reset{counters};
+  auto reset            = reset_after_test(counters->preparation_provider_for_testing,
+                                counters->statement_dv_limit_for_testing);
   counters->preparation_provider_for_testing = provider;
   counters->statement_dv_limit_for_testing   = limit;
   auto first                                 = inventory_fixture("dv_bounded");
@@ -3838,12 +3859,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 {
   sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
   sirius::test::scoped_setting small_batch(*con, "scan_task_batch_size", 1);
-  auto state    = sirius::test::get_registered_sirius_context(*con);
-  auto counters = state->physical_counters();
-  struct reset_hook {
-    decltype(counters) value;
-    ~reset_hook() { value->iceberg_dv_phase_for_testing = {}; }
-  } reset{counters};
+  auto state                             = sirius::test::get_registered_sirius_context(*con);
+  auto counters                          = state->physical_counters();
+  auto reset                             = reset_after_test(counters->iceberg_dv_phase_for_testing);
   counters->iceberg_dv_phase_for_testing = [](std::string const& file, bool start) {
     if (start && file.ends_with("c.puffin"))
       throw sirius::transparent::classified_execution_error(
@@ -3886,14 +3904,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   provider->grant_bytes = 1024 * 1024;
   auto counters         = sirius::test::get_registered_sirius_context(*con)->physical_counters();
   std::atomic<unsigned> dv_reads{0};
-  struct reset_hooks {
-    decltype(counters) value;
-    ~reset_hooks()
-    {
-      value->preparation_provider_for_testing.reset();
-      value->iceberg_dv_phase_for_testing = {};
-    }
-  } reset{counters};
+  auto reset = reset_after_test(counters->preparation_provider_for_testing,
+                                counters->iceberg_dv_phase_for_testing);
   counters->preparation_provider_for_testing = provider;
   counters->iceberg_dv_phase_for_testing     = [&](auto const&, bool start) {
     if (start) ++dv_reads;
@@ -3978,16 +3990,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   provider->provider.return_null = !deferred;
   auto state                     = sirius::test::get_registered_sirius_context(*con);
   auto counters                  = state->physical_counters();
-  struct reset_hooks {
-    decltype(counters) value;
-    ~reset_hooks()
-    {
-      value->preparation_provider_for_testing.reset();
-      value->iceberg_dv_phase_for_testing          = {};
-      value->parquet_phase_for_testing             = {};
-      value->iceberg_preparation_route_for_testing = {};
-    }
-  } reset{counters};
+  auto reset                     = reset_after_test(counters->preparation_provider_for_testing,
+                                counters->iceberg_dv_phase_for_testing,
+                                counters->parquet_phase_for_testing,
+                                counters->iceberg_preparation_route_for_testing);
   std::mutex mutex;
   std::condition_variable changed;
   bool entered = false, release = false;
@@ -4318,7 +4324,16 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto statements = con->ExtractStatements(sql);
   REQUIRE(statements.size() == 1);
   REQUIRE(statements.front()->type == duckdb::StatementType::SELECT_STATEMENT);
-  auto const observe = GENERATE(false, true);
+  auto const* cold_files    = std::getenv("SIRIUS_TEST_PREPARATION_COST_COLD_FILES");
+  bool const cold           = cold_files && *cold_files;
+  auto const* selected_mode = std::getenv("SIRIUS_TEST_PREPARATION_COST_OBSERVATIONS");
+  std::vector<int> modes{0, 1};
+  if (cold) {
+    REQUIRE(selected_mode);
+    REQUIRE((std::string{selected_mode} == "enabled" || std::string{selected_mode} == "disabled"));
+    modes = {std::string{selected_mode} == "enabled"};
+  }
+  bool const observe = GENERATE_COPY(Catch::Generators::from_range(modes)) != 0;
   auto counters      = sirius::test::get_registered_sirius_context(*con)->physical_counters();
   REQUIRE_FALSE(counters->preparation_provider_for_testing);
   sirius::util::env_guard test_options{"SIRIUS_ENABLE_TEST_OPTIONS", "0"};
@@ -4326,17 +4341,18 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto restore_tracking  = std::shared_ptr<void>(
     nullptr, [counters, previous_tracking](void*) { counters->track_units = previous_tracking; });
   duckdb::unique_ptr<duckdb::MaterializedQueryResult> reference;
-  {
+  auto read_reference = [&] {
     sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
     reference = con->Query(sql);
     REQUIRE(reference);
     INFO((reference->HasError() ? reference->GetError() : ""));
     REQUIRE_FALSE(reference->HasError());
-  }
-  auto expected = collect_rows(*reference);
+  };
+  if (!cold) read_reference();
+  auto expected = reference ? collect_rows(*reference) : decltype(collect_rows(*reference)){};
   sirius::test::scoped_setting gpu(*con, "gpu_execution", true);
   sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
-  constexpr int warmups = 8, samples = 40;
+  int const warmups = cold ? 0 : 8, samples = cold ? 1 : 40;
   using clock = preparation_measurement::clock;
   auto micros = [](auto duration) {
     return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
@@ -4363,6 +4379,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     }
     std::unique_ptr<preparation_measurement> observed;
     if (observe) observed = std::make_unique<preparation_measurement>(counters);
+    sirius::test::cold_cache_result cache;
+    if (cold) cache = sirius::test::evict_file_cache(cold_files);
     auto before = sirius::test::get_transparent_execution_stats(*con);
     rusage usage_begin{}, usage_end{};
     REQUIRE(getrusage(RUSAGE_SELF, &usage_begin) == 0);
@@ -4377,16 +4395,21 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE(result);
     INFO((result->HasError() ? result->GetError() : ""));
     REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->names == reference->names);
-    REQUIRE(result->types == reference->types);
-    REQUIRE((observed ? observed->fetch(*result) : collect_rows(*result)) == expected);
+    auto rows  = observed ? observed->fetch(*result) : collect_rows(*result);
     auto after = sirius::test::get_transparent_execution_stats(*con);
+    if (!cold) {
+      REQUIRE(result->names == reference->names);
+      REQUIRE(result->types == reference->types);
+      REQUIRE(rows == expected);
+    }
     require_route(before, after, gpu_route::gpu);
     if (sample < 0) continue;
     auto total = micros(end - begin);
     totals.push_back(total);
-    std::cout << "PREPARATION_COST_SAMPLE sample=" << sample << " cache=warm"
+    std::cout << "PREPARATION_COST_SAMPLE sample=" << sample
+              << " cache=" << (cold ? "cold" : "warm")
               << " observations=" << (observe ? "enabled" : "disabled") << " total_us=" << total
+              << " query_return_us=" << total << " result_mode=materialized"
               << " wall_begin_us=" << wall_begin << " wall_end_us=" << wall_end
               << " query_thread_cpu_us=" << cpu_us
               << " process_cpu_us=" << process_cpu(usage_end) - process_cpu(usage_begin)
@@ -4397,6 +4420,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
               << " manifest_walks=" << after.iceberg_manifest_walks - before.iceberg_manifest_walks
               << " payload_loads="
               << after.iceberg_delete_payload_loads - before.iceberg_delete_payload_loads;
+    if (cold)
+      std::cout << " cold_files=" << cache.files << " cold_bytes=" << cache.bytes
+                << " cold_pages=" << cache.pages << " cold_resident_pages=0";
     if (observed) {
       auto publication = observed->publication();
       auto event       = [&](char const* name, auto value) {
@@ -4439,19 +4465,39 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
         std::cout << " puffin=" << (charged ? "preparation" : "planning") << ':' << stats.opens
                   << ':' << stats.requests << ':' << stats.bytes_requested << ':'
                   << stats.bytes_returned << ':' << stats.failures;
+      REQUIRE(observed->open_starts.empty());
+      std::cout << " datasource_backend=" << (observed->local_backend_only ? "uring" : "mixed");
+      for (auto const& [planning, tid, start, end, path] : observed->open_scopes)
+        std::cout << " datasource_open=" << (planning ? "planning" : "preparation") << ':' << tid
+                  << ':' << start << ':' << end << ':' << io_path_hex(path);
+      for (auto const& [path, charged, stats] : observed->puffin)
+        std::cout << " puffin_file=" << (charged ? "preparation" : "planning") << ':'
+                  << io_path_hex(path) << ':' << stats.opens << ':' << stats.requests << ':'
+                  << stats.bytes_requested << ':' << stats.bytes_returned << ':' << stats.failures;
       std::cout << " datasource_planning_open_attempts=" << observed->planning_opens.load()
                 << " datasource_preparation_open_attempts=" << observed->preparation_opens.load();
       for (auto const& [phase, reads] : {std::pair{"planning", observed->planning},
                                          std::pair{"preparation", observed->preparation},
-                                         std::pair{"execution", observed->execution}})
+                                         std::pair{"execution", observed->execution}}) {
+        auto const& physical = *reads->physical;
+        CHECK(physical.unobserved_completions.load() == 0);
+        CHECK(physical.requests.load() == physical.completions.load());
+        std::cout << " local_backend_" << phase << '=' << physical.requests.load() << ':'
+                  << physical.completions.load() << ':' << physical.bytes_requested.load() << ':'
+                  << physical.bytes_returned.load() << ':' << physical.failures.load() << ':'
+                  << physical.short_reads.load() << ':' << physical.retries.load() << ':'
+                  << physical.unobserved_completions.load();
         std::cout << " datasource_" << phase << '=' << reads->requests.load() << ':'
                   << reads->bytes_requested.load() << ':' << reads->bytes_returned.load() << ':'
                   << reads->failures.load();
+      }
       if (sql_logs) {
         auto counts = sql_logs->file_reads(
           table,
           std::array<int64_t, 3>{
             wall_begin, observed->wall_plan_end.value_or(wall_begin), wall_end});
+        sql_logs->print_paths(table,
+                              {wall_begin, observed->wall_plan_end.value_or(wall_begin), wall_end});
         auto const& total_counts = counts.at("total");
         std::cout << " sql_files=" << total_counts.opens << ':' << total_counts.reads << ':'
                   << total_counts.bytes;
@@ -4471,12 +4517,22 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
         std::cout << " sql_files=unobserved";
     } else
       std::cout << " deferred_scans=unobserved";
-    std::cout << " backend_io=unobserved reservation_peak=unobserved\n";
+    std::cout << " backend_io=" << (observe ? "local_uring_pread_only" : "unobserved")
+              << " reservation_peak=unobserved\n";
+    if (cold) {
+      // Keep the CPU reference out of both the cold query and its observations.
+      observed.reset();
+      read_reference();
+      REQUIRE(result->names == reference->names);
+      REQUIRE(result->types == reference->types);
+      REQUIRE(rows == collect_rows(*reference));
+    }
   }
   std::sort(totals.begin(), totals.end());
-  std::cout << "PREPARATION_COST_SUMMARY cache=warm samples=" << samples << " warmups=" << warmups
+  std::cout << "PREPARATION_COST_SUMMARY cache=" << (cold ? "cold" : "warm")
+            << " samples=" << samples << " warmups=" << warmups
             << " observations=" << (observe ? "enabled" : "disabled") << " percentile=nearest_rank"
-            << " total_p50_us=" << totals[samples / 2 - 1]
+            << " total_p50_us=" << totals[(samples + 1) / 2 - 1]
             << " total_p95_us=" << totals[(samples * 95 + 99) / 100 - 1] << '\n';
 }
 
@@ -4486,11 +4542,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 {
   auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
   preparation_measurement observed(counters, true);
-  struct reset_hook {
-    decltype(counters) value;
-    ~reset_hook() { value->preparation_envelope_for_testing = {}; }
-  } reset{counters};
-  size_t injected                            = 0;
+  auto reset      = reset_after_test(counters->preparation_envelope_for_testing);
+  size_t injected = 0;
   counters->preparation_envelope_for_testing = [&](auto& envelope) {
     for (auto& unit : envelope.units) {
       unit.blob          = 1;

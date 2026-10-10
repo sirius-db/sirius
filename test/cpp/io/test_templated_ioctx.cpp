@@ -141,6 +141,11 @@ TEST_CASE("Datasource counters survive async completion and separate split reads
   auto prepared = footer->host_read_async(0, 16, bytes);
   auto executed = data->host_read_async(16, 8, bytes + 16);
   REQUIRE(reactor->requests.size() == 2);
+  CHECK(reactor->requests[0]->coordinator->physical_reads ==
+        (enabled ? preparation->physical : nullptr));
+  CHECK(reactor->requests[1]->coordinator->physical_reads ==
+        (enabled ? execution->physical : nullptr));
+  CHECK_FALSE(physical_reads_for_testing);
   CHECK(preparation->bytes_returned == 0);
   footer.reset();
   data.reset();

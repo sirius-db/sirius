@@ -18,6 +18,7 @@
 
 #include "cuda/device_copy_batch.hpp"
 #include "exec/semi_future.hpp"
+#include "io/physical_read_statistics.hpp"
 #include "io/types.hpp"
 
 #include <rmm/cuda_device.hpp>
@@ -63,6 +64,8 @@ class grouped_coordinator final {
     : _bytes_requested(bytes_requested), _tasks_remaining(initial_tasks)
   {
   }
+
+  std::shared_ptr<physical_read_statistics> const physical_reads = physical_reads_for_testing;
 
   grouped_coordinator(grouped_coordinator const&)            = delete;
   grouped_coordinator& operator=(grouped_coordinator const&) = delete;

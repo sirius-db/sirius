@@ -140,6 +140,7 @@ bool sirius_datasource::is_device_read_preferred(size_t) const
 
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
+  scoped_physical_reads observe(_read_statistics ? _read_statistics->physical : nullptr);
   if (_read_statistics) _read_statistics->requested(size);
   try {
     auto n = [&] {
@@ -168,6 +169,7 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
+  scoped_physical_reads observe(_read_statistics ? _read_statistics->physical : nullptr);
   return bridge_semi_to_std(
     [&] {
       if (uses_prefetching_cache()) {
@@ -222,6 +224,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          cudf_datasource_stream_t stream_arg)
 {
+  scoped_physical_reads observe(_read_statistics ? _read_statistics->physical : nullptr);
   ::cuda::stream_ref stream{stream_arg};
   return bridge_semi_to_std(
     [&] {
@@ -238,6 +241,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
 std::future<size_t> sirius_datasource::device_read_ranges_async(std::span<const slice> ranges,
                                                                 ::cuda::stream_ref stream)
 {
+  scoped_physical_reads observe(_read_statistics ? _read_statistics->physical : nullptr);
   return bridge_semi_to_std(
     [&] {
       if (uses_prefetching_cache()) {
@@ -253,6 +257,7 @@ std::future<size_t> sirius_datasource::device_read_ranges_async(std::span<const 
 
 std::future<size_t> sirius_datasource::host_read_ranges_async(std::span<const slice> ranges)
 {
+  scoped_physical_reads observe(_read_statistics ? _read_statistics->physical : nullptr);
   return bridge_semi_to_std(
     [&] {
       if (uses_prefetching_cache()) {
@@ -325,6 +330,7 @@ prepare_result sirius_datasource::prepare_prefetch(bool wait_for_eviction)
 
 prefetch_refusal sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
 {
+  scoped_physical_reads observe(_read_statistics ? _read_statistics->physical : nullptr);
   if (!_cache_handle || !uses_prefetching_cache()) {
     on_done(false);
     return prefetch_refusal::no_cache;

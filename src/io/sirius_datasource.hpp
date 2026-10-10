@@ -19,6 +19,7 @@
 #include "exec/invocable.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
+#include "io/physical_read_statistics.hpp"
 #include "io/types.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -100,6 +101,8 @@ enum class prepare_result : std::uint8_t {
 class sirius_datasource : public cudf::io::datasource {
  public:
   struct read_statistics {
+    std::shared_ptr<physical_read_statistics> physical =
+      std::make_shared<physical_read_statistics>();
     std::atomic<uint64_t> requests{0}, bytes_requested{0}, bytes_returned{0}, failures{0};
     void requested(size_t bytes)
     {

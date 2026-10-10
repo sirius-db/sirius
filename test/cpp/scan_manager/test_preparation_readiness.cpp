@@ -140,6 +140,26 @@ struct sink {
     if (consumed) consumed();
   }
 };
+auto finite_jobs(size_t count,
+                 std::function<std::unique_ptr<sirius::op::scan::scan_info>(int)> make_input)
+{
+  return [count,
+          make_input = std::move(make_input),
+          next       = 0]() mutable -> std::optional<preparation_coordinator::job> {
+    auto id = next++;
+    if (static_cast<size_t>(id) >= count) return {};
+    return preparation_coordinator::job{[make_input, id] { return make_input(id); }, {}};
+  };
+}
+auto single_job(std::function<std::unique_ptr<sirius::op::scan::scan_info>()> make_input,
+                std::shared_ptr<preparation_unit> unit = {})
+{
+  return [job     = preparation_coordinator::job{std::move(make_input), std::move(unit)},
+          claimed = false]() mutable -> std::optional<preparation_coordinator::job> {
+    if (std::exchange(claimed, true)) return {};
+    return std::move(job);
+  };
+}
 struct fixture {
   sirius::exec::static_thread_pool pool;
   sirius::exec::scoped_dispatcher dispatcher;
@@ -340,17 +360,12 @@ TEST_CASE("Ready partial batches publish while every preparation worker is block
   auto a   = std::make_shared<accumulator>();
   auto out = std::make_shared<sink>();
   auto h1 = f.make_hold(), h2 = f.make_hold();
-  int next = 0;
-  f.source(a, out, [&]() -> std::optional<preparation_coordinator::job> {
-    int id = next++;
-    if (id >= 3) return {};
-    return preparation_coordinator::job{[=] {
-                                          if (id == 1) h1->wait();
-                                          if (id == 2) h2->wait();
-                                          return std::make_unique<tagged>(id);
-                                        },
-                                        {}};
-  });
+
+  f.source(a, out, finite_jobs(3, [=](int id) {
+             if (id == 1) h1->wait();
+             if (id == 2) h2->wait();
+             return std::make_unique<tagged>(id);
+           }));
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(h1->await());
@@ -421,17 +436,11 @@ TEST_CASE("A partial emission is not EOS and subsequent input forms another batc
   fixture f;
   auto out = std::make_shared<sink>();
   auto h   = f.make_hold();
-  int next = 0;
-  f.source(
-    std::make_shared<accumulator>(), out, [&]() -> std::optional<preparation_coordinator::job> {
-      int id = next++;
-      if (id >= 2) return {};
-      return preparation_coordinator::job{[=] {
-                                            if (id == 1) h->wait();
-                                            return std::make_unique<tagged>(id);
-                                          },
-                                          {}};
-    });
+
+  f.source(std::make_shared<accumulator>(), out, finite_jobs(2, [=](int id) {
+             if (id == 1) h->wait();
+             return std::make_unique<tagged>(id);
+           }));
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(h->await());
@@ -450,16 +459,11 @@ TEST_CASE("Publication is refused after cancellation wins during input construct
   fixture f;
   auto out          = std::make_shared<sink>();
   auto construction = f.make_hold();
-  int next          = 0;
   auto awaitable    = f.completion.get_awaitable();
-  f.source(
-    std::make_shared<accumulator>(1),
-    out,
-    [&]() -> std::optional<preparation_coordinator::job> {
-      if (next++) return {};
-      return preparation_coordinator::job{[] { return std::make_unique<tagged>(7); }, {}};
-    },
-    construction);
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           single_job([] { return std::make_unique<tagged>(7); }),
+           construction);
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(construction->await());
@@ -482,19 +486,17 @@ TEST_CASE("Unresolved typed input forbids scan input construction until the whol
   required.set(3);
   auto unit = f.coordinator.admit_unit({3, 1}, required);
   REQUIRE(unit);
-  int next = 0;
   std::promise<void> returned;
   auto stage = returned.get_future();
-  f.source(
-    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
-      if (next++) return {};
-      return preparation_coordinator::job{[&] {
-                                            unit->complete_input(checkpoint_input{7});
-                                            returned.set_value();
-                                            return std::make_unique<tagged>(1);
-                                          },
-                                          unit};
-    });
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           single_job(
+             [&] {
+               unit->complete_input(checkpoint_input{7});
+               returned.set_value();
+               return std::make_unique<tagged>(1);
+             },
+             unit));
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(stage.wait_for(1s) == std::future_status::ready);
@@ -547,7 +549,7 @@ TEST_CASE("Claim and partial submission failures release reserved completion slo
   auto read      = f.make_hold();
   auto awaitable = f.completion.get_awaitable();
   std::atomic<int> submitted{0};
-  int next = 0;
+
   std::string expected_error;
   SECTION("claim throws")
   {
@@ -566,16 +568,10 @@ TEST_CASE("Claim and partial submission failures release reserved completion slo
         throw std::runtime_error("submit injected");
       }
     });
-    f.source(
-      std::make_shared<accumulator>(), out, [&]() -> std::optional<preparation_coordinator::job> {
-        int id = next++;
-        if (id >= 2) return {};
-        return preparation_coordinator::job{[read, id] {
-                                              read->wait();
-                                              return std::make_unique<tagged>(id);
-                                            },
-                                            {}};
-      });
+    f.source(std::make_shared<accumulator>(), out, finite_jobs(2, [read](int id) {
+               read->wait();
+               return std::make_unique<tagged>(id);
+             }));
   }
   auto query_guard = f.shutdown_guard();
   f.start();
@@ -592,16 +588,10 @@ TEST_CASE("Non-cancellable reads keep their owner alive until drain finishes",
   fixture f;
   auto out = std::make_shared<sink>();
   auto h   = f.make_hold();
-  int next = 0;
-  f.source(
-    std::make_shared<accumulator>(), out, [&]() -> std::optional<preparation_coordinator::job> {
-      if (next++) return {};
-      return preparation_coordinator::job{[=] {
-                                            h->wait();
-                                            return std::make_unique<tagged>(1);
-                                          },
-                                          {}};
-    });
+  f.source(std::make_shared<accumulator>(), out, single_job([=] {
+             h->wait();
+             return std::make_unique<tagged>(1);
+           }));
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(h->await());
@@ -620,17 +610,11 @@ TEST_CASE("GPU completion without a ready event still stops preparation and sett
   fixture f;
   auto out  = std::make_shared<sink>();
   auto h    = f.make_hold();
-  int next  = 0;
   auto done = f.completion.get_awaitable();
-  f.source(
-    std::make_shared<accumulator>(), out, [&]() -> std::optional<preparation_coordinator::job> {
-      if (next++) return {};
-      return preparation_coordinator::job{[=] {
-                                            h->wait();
-                                            return std::make_unique<tagged>(1);
-                                          },
-                                          {}};
-    });
+  f.source(std::make_shared<accumulator>(), out, single_job([=] {
+             h->wait();
+             return std::make_unique<tagged>(1);
+           }));
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(h->await());
@@ -649,10 +633,10 @@ TEST_CASE("Production defaults publish retained input while later metadata remai
   REQUIRE(options.underfilled_batch_residence);
   auto residence = *options.underfilled_batch_residence;
   fixture f(2, 4, k_interrupt_check_interval, false, options);
-  auto out      = std::make_shared<sink>();
-  auto a        = std::make_shared<accumulator>();
-  auto h        = f.make_hold();
-  int next      = 0;
+  auto out = std::make_shared<sink>();
+  auto a   = std::make_shared<accumulator>();
+  auto h   = f.make_hold();
+
   auto tick     = std::make_shared<std::atomic<int>>(0);
   auto origin   = accumulator::clock::now();
   auto clock    = [tick, origin] { return origin + std::chrono::milliseconds(tick->load()); };
@@ -664,15 +648,10 @@ TEST_CASE("Production defaults publish retained input while later metadata remai
   a->on_retained = [retained, notified] {
     if (!notified->exchange(true)) retained->set_value();
   };
-  f.source(a, out, [&]() -> std::optional<preparation_coordinator::job> {
-    int id = next++;
-    if (id >= 2) return {};
-    return preparation_coordinator::job{[=] {
-                                          if (id == 1) h->wait();
-                                          return std::make_unique<tagged>(id);
-                                        },
-                                        {}};
-  });
+  f.source(a, out, finite_jobs(2, [=](int id) {
+             if (id == 1) h->wait();
+             return std::make_unique<tagged>(id);
+           }));
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(reached.wait_for(1s) == std::future_status::ready);
@@ -704,17 +683,11 @@ TEST_CASE("Cancellation racing with a deadline never publishes after recognition
     }
     auto out = std::make_shared<sink>();
     auto h   = f.make_hold();
-    int next = 0;
-    f.source(
-      std::make_shared<accumulator>(), out, [&]() -> std::optional<preparation_coordinator::job> {
-        int id = next++;
-        if (id >= 2) return {};
-        return preparation_coordinator::job{[=] {
-                                              if (id == 1) h->wait();
-                                              return std::make_unique<tagged>(id);
-                                            },
-                                            {}};
-      });
+
+    f.source(std::make_shared<accumulator>(), out, finite_jobs(2, [=](int id) {
+               if (id == 1) h->wait();
+               return std::make_unique<tagged>(id);
+             }));
     auto query_guard = f.shutdown_guard();
     auto done        = f.completion.get_awaitable();
     f.start();
@@ -760,19 +733,14 @@ TEST_CASE("GPU completion cannot hide an accepted preparation failure",
           "[scan_preparation][coordinator]")
 {
   fixture f;
-  auto out     = std::make_shared<sink>();
-  auto read    = f.make_hold();
-  bool claimed = false;
-  f.source(
-    std::make_shared<accumulator>(), out, [&]() -> std::optional<preparation_coordinator::job> {
-      if (std::exchange(claimed, true)) return {};
-      return preparation_coordinator::job{
-        [read]() -> std::unique_ptr<sirius::op::scan::scan_info> {
-          read->wait();
-          throw std::runtime_error("accepted read failed after GPU done");
-        },
-        {}};
-    });
+  auto out  = std::make_shared<sink>();
+  auto read = f.make_hold();
+  f.source(std::make_shared<accumulator>(),
+           out,
+           single_job([read]() -> std::unique_ptr<sirius::op::scan::scan_info> {
+             read->wait();
+             throw std::runtime_error("accepted read failed after GPU done");
+           }));
   auto future      = f.completion.get_awaitable();
   auto query_guard = f.shutdown_guard();
   f.start();
@@ -791,22 +759,14 @@ TEST_CASE("Later scans cannot consume the last output credit needed by the first
 {
   fixture f(2, 2);
   auto first = std::make_shared<sink>(), later = std::make_shared<sink>();
-  auto blocked       = f.make_hold();
-  bool first_claimed = false, later_claimed = false;
-  f.source(
-    std::make_shared<accumulator>(1), first, [&]() -> std::optional<preparation_coordinator::job> {
-      if (std::exchange(first_claimed, true)) return {};
-      return preparation_coordinator::job{[blocked] {
-                                            blocked->wait();
-                                            return std::make_unique<tagged>(1);
-                                          },
-                                          {}};
-    });
-  f.source(
-    std::make_shared<accumulator>(1), later, [&]() -> std::optional<preparation_coordinator::job> {
-      if (std::exchange(later_claimed, true)) return {};
-      return preparation_coordinator::job{[] { return std::make_unique<tagged>(2, 100); }, {}};
-    });
+  auto blocked = f.make_hold();
+  f.source(std::make_shared<accumulator>(1), first, single_job([blocked] {
+             blocked->wait();
+             return std::make_unique<tagged>(1);
+           }));
+  f.source(std::make_shared<accumulator>(1), later, single_job([] {
+             return std::make_unique<tagged>(2, 100);
+           }));
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(blocked->await());
@@ -894,19 +854,11 @@ TEST_CASE("Expired partial batch parks at a full output window and resumes on co
   fixture f(2, 1);
   auto out   = std::make_shared<sink>();
   auto later = f.make_hold();
-  int next   = 0;
-  f.source(std::make_shared<retaining_coalescer>(),
-           out,
-           [&]() -> std::optional<preparation_coordinator::job> {
-             int id = next++;
-             if (id >= 2) return {};
-             return preparation_coordinator::job{[=] {
-                                                   if (id == 1) later->wait();
-                                                   return std::make_unique<tagged>(id,
-                                                                                   id == 0 ? 2 : 0);
-                                                 },
-                                                 {}};
-           });
+
+  f.source(std::make_shared<retaining_coalescer>(), out, finite_jobs(2, [=](int id) {
+             if (id == 1) later->wait();
+             return std::make_unique<tagged>(id, id == 0 ? 2 : 0);
+           }));
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(out->await(1));
@@ -926,9 +878,9 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
           "[scan_preparation][coordinator]")
 {
   fixture f;
-  auto out       = std::make_shared<sink>();
-  auto coalescer = std::make_shared<accumulator>(1);
-  bool claimed = false, fail_construct = false, fail_close = false, normal_close_failure = false;
+  auto out            = std::make_shared<sink>();
+  auto coalescer      = std::make_shared<accumulator>(1);
+  bool fail_construct = false, fail_close = false, normal_close_failure = false;
   bool fail_initialize = false, destroyed_outside_gate = false;
   struct observed_input : sirius::op::scan::scan_operator_input {
     using scan_operator_input::scan_operator_input;
@@ -967,10 +919,7 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
   }
   preparation_coordinator::source source;
   source.coalescer = coalescer;
-  source.claim     = [&]() -> std::optional<preparation_coordinator::job> {
-    if (std::exchange(claimed, true)) return {};
-    return preparation_coordinator::job{[] { return std::make_unique<tagged>(1); }, {}};
-  };
+  source.claim     = single_job([] { return std::make_unique<tagged>(1); });
   source.construct = [&](std::unique_ptr<sirius::op::scan::scan_info> batch) {
     if (fail_construct) throw std::runtime_error("construct injected");
     auto input = std::make_unique<observed_input>(
@@ -1033,19 +982,17 @@ TEST_CASE("An accepted failure callback drains before GPU completion can publish
   auto callback = f.make_hold();
   required_input_set required;
   required.set(static_cast<size_t>(required_input::delete_set));
-  auto unit    = f.coordinator.admit_unit({91, 1}, required);
-  bool claimed = false;
+  auto unit = f.coordinator.admit_unit({91, 1}, required);
   std::promise<void> metadata;
   auto ready = metadata.get_future();
-  f.source(
-    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
-      if (std::exchange(claimed, true)) return {};
-      return preparation_coordinator::job{[&] {
-                                            metadata.set_value();
-                                            return std::make_unique<tagged>(1);
-                                          },
-                                          unit};
-    });
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           single_job(
+             [&] {
+               metadata.set_value();
+               return std::make_unique<tagged>(1);
+             },
+             unit));
   auto done    = f.completion.get_awaitable();
   auto cleanup = f.shutdown_guard();
   f.start();
@@ -1091,17 +1038,11 @@ TEST_CASE("Exhausted enumeration cannot close before accepted out-of-order resul
   fixture f;
   auto out   = std::make_shared<sink>();
   auto first = f.make_hold(), last = f.make_hold();
-  int next = 0;
-  f.source(
-    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
-      int id = next++;
-      if (id >= 2) return {};
-      return preparation_coordinator::job{[=] {
-                                            (id == 0 ? first : last)->wait();
-                                            return std::make_unique<tagged>(id);
-                                          },
-                                          {}};
-    });
+
+  f.source(std::make_shared<accumulator>(1), out, finite_jobs(2, [=](int id) {
+             (id == 0 ? first : last)->wait();
+             return std::make_unique<tagged>(id);
+           }));
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(first->await());
@@ -1120,17 +1061,11 @@ TEST_CASE("A single result and output slot preserves progress across multiple sc
 {
   fixture f(1, 1);
   auto first = std::make_shared<sink>(), last = std::make_shared<sink>();
-  bool first_claimed = false, last_claimed = false;
+  f.source(std::make_shared<accumulator>(1), first, single_job([] {
+             return std::make_unique<tagged>(1);
+           }));
   f.source(
-    std::make_shared<accumulator>(1), first, [&]() -> std::optional<preparation_coordinator::job> {
-      if (std::exchange(first_claimed, true)) return {};
-      return preparation_coordinator::job{[] { return std::make_unique<tagged>(1); }, {}};
-    });
-  f.source(
-    std::make_shared<accumulator>(1), last, [&]() -> std::optional<preparation_coordinator::job> {
-      if (std::exchange(last_claimed, true)) return {};
-      return preparation_coordinator::job{[] { return std::make_unique<tagged>(2); }, {}};
-    });
+    std::make_shared<accumulator>(1), last, single_job([] { return std::make_unique<tagged>(2); }));
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(first->await(1));
@@ -1189,13 +1124,10 @@ TEST_CASE("Cancelling a pending unit synchronizes with and wakes the query owner
   auto out = std::make_shared<sink>();
   required_input_set required;
   required.set(static_cast<size_t>(required_input::delete_set));
-  auto unit    = f.coordinator.admit_unit({72, 1}, required);
-  bool claimed = false;
-  f.source(
-    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
-      if (std::exchange(claimed, true)) return {};
-      return preparation_coordinator::job{[] { return std::make_unique<tagged>(1); }, unit};
-    });
+  auto unit = f.coordinator.admit_unit({72, 1}, required);
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           single_job([] { return std::make_unique<tagged>(1); }, unit));
   auto cleanup = f.shutdown_guard();
   f.start();
   auto deadline = std::chrono::steady_clock::now() + 1s;
@@ -1372,17 +1304,11 @@ TEST_CASE("Optional preparation timestamps retain the first ready input and publ
   fixture f(1, 4, k_interrupt_check_interval, enabled);
   auto out  = std::make_shared<sink>();
   auto held = f.make_hold();
-  int next  = 0;
-  f.source(
-    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
-      int id = next++;
-      if (id >= 2) return {};
-      return preparation_coordinator::job{[=] {
-                                            if (id == 1) held->wait();
-                                            return std::make_unique<tagged>(id);
-                                          },
-                                          {}};
-    });
+
+  f.source(std::make_shared<accumulator>(1), out, finite_jobs(2, [=](int id) {
+             if (id == 1) held->wait();
+             return std::make_unique<tagged>(id);
+           }));
   auto guard = f.shutdown_guard();
   CHECK_FALSE(f.coordinator.snapshot().first_ready);
   CHECK_FALSE(f.coordinator.snapshot().first_publication);

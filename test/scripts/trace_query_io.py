@@ -157,6 +157,7 @@ def main():
     windows = query_windows((source / "run.log").read_text())
     totals = Counter()
     phases = {}
+    file_kinds = {}
     files = sorted(source.glob("trace.*"))
     if not files:
         raise RuntimeError(
@@ -165,7 +166,7 @@ def main():
     with (args.output / "calls.csv").open("w", newline="") as output:
         writer = csv.DictWriter(
             output,
-            fieldnames="pid sample observations phase start_us end_us call path requested_bytes returned_bytes status".split(),
+            fieldnames="pid sample observations phase file_kind start_us end_us call path requested_bytes returned_bytes status".split(),
         )
         writer.writeheader()
         for file in files:
@@ -190,11 +191,26 @@ def main():
                         totals["outside_filter"] += 1
                         continue
                     attribution = attribute_call(call, windows)
-                    writer.writerow(dict(call, pid=file.suffix[1:], **attribution))
+                    suffix = Path(call["path"]).suffix.lower()
+                    kind = {
+                        ".puffin": "puffin",
+                        ".parquet": "parquet",
+                        ".avro": "metadata",
+                        ".json": "metadata",
+                        ".text": "metadata",
+                    }.get(suffix, "other")
+                    writer.writerow(
+                        dict(call, pid=file.suffix[1:], file_kind=kind, **attribution)
+                    )
                     key = ":".join(
                         attribution[k] for k in ("observations", "sample", "phase")
                     )
                     phase = phases.setdefault(key, Counter())
+                    by_kind = file_kinds.setdefault(f"{key}:{kind}", Counter())
+                    by_kind[call["call"]] += 1
+                    by_kind[call["status"]] += 1
+                    by_kind["requested_bytes"] += call["requested_bytes"]
+                    by_kind["returned_bytes"] += call["returned_bytes"]
                     phase[call["call"]] += 1
                     phase[call["status"]] += 1
                     phase["requested_bytes"] += call["requested_bytes"]
@@ -211,6 +227,8 @@ def main():
         "file_syscalls": dict(totals),
         "backend_physical_io": "unobserved",
         "file_syscalls_by_sample_phase": phases,
+        "file_syscalls_by_sample_phase_file_kind": file_kinds,
+        "file_kind_attribution": "filename suffix only; does not identify the caller or I/O backend",
         "phase_attribution": "query windows; preparation/execution overlap is not separated",
         "coverage": "openat/read/pread64 only; file syscalls are not storage-device reads",
     }
