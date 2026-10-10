@@ -19,7 +19,7 @@
 //!
 //! | function    | partial-state columns           | merge step                     |
 //! |-------------|---------------------------------|--------------------------------|
-//! | `sum`       | BIGINT or DOUBLE                | `sum`                          |
+//! | `sum`       | BIGINT, DOUBLE or DECIMAL(38,s) | `sum`                          |
 //! | `count`     | BIGINT                          | `sum` of the counts            |
 //! | `min`/`max` | the input type                  | the same function              |
 //! | `avg`       | DOUBLE sum, then a BIGINT count | `sum` of each, then sum / count |
@@ -125,8 +125,8 @@ impl PartialState {
 /// same columns. Neither trusts the descriptor's slot type: StarRocks warns that a node's slot
 /// types do not always say what it emits, and a partial `avg` slot is VARBINARY. The types are
 /// what Sirius emits:
-/// - `sum` over decimals is lowered to FP64 by `expr_translator::aggregate_call`, and an
-///   integer sum comes back as BIGINT;
+/// - `sum` over decimals is the FE's `DECIMAL128(38,s)`, which DuckDB's exact decimal sum also
+///   returns, and an integer sum comes back as BIGINT;
 /// - `count` is BIGINT. Merging counts has to add them up; a `count` on the merge side would
 ///   count the partial rows instead;
 /// - `min`/`max` keep their input type, which StarRocks also uses as their return type;
@@ -146,7 +146,7 @@ pub(crate) fn partial_state(
     match function.name.function_name.as_str() {
         "sum" => {
             let ty = if is_decimal(&function.ret_type)? {
-                type_mapper::fp64_type(true)
+                type_mapper::map_type_desc(&function.ret_type, true)?
             } else {
                 match type_mapper::scalar_primitive(&function.ret_type)? {
                     TPrimitiveType::BIGINT => type_mapper::i64_type(true),

@@ -943,17 +943,23 @@ fn translate_aggregation(
                     }
                     _ => (call.name.clone(), final_type()?),
                 };
-                // A two-phase integer `sum` is cast back to its declared type; see
-                // `finish_aggregation`.
-                let cast = (phase != AggPhase::OneShot
+                // Some results are cast to their declared type; see `finish_aggregation`.
+                let decimal_avg = function_name == "avg" && is_decimal(&output_type);
+                let cast = ((phase != AggPhase::OneShot
                     && function_name == "sum"
                     && is_integer(&output_type))
-                .then(|| output_type.clone());
+                    || (function_name == "sum" && is_decimal(&output_type))
+                    || decimal_avg)
+                    .then(|| output_type.clone());
                 measures.push(aggregate_measure(
                     ctx.registry,
                     &function_name,
                     call.arguments,
-                    output_type,
+                    if decimal_avg {
+                        type_mapper::fp64_type(true)
+                    } else {
+                        output_type
+                    },
                     call.distinct,
                 ));
                 outputs.push((
@@ -1062,6 +1068,12 @@ fn aggregate_measure(
 ///   column, and a HUGEINT literal can't reach the GPU. StarRocks sums integers into BIGINT, so
 ///   a two-phase plan casts each integer `sum` (including COUNT's merge, a `sum` of counts) back
 ///   to the type the shared partial-state rule declares.
+/// - A decimal `sum` is cast to the FE's `DECIMAL128(38,s)`. DuckDB's exact decimal sum returns
+///   the same type, so this only pins it.
+/// - AVG is computed in FP64 (`expr_translator::aggregate_call`); a decimal AVG is cast to the
+///   FE's `DECIMAL128(38, s+6)`, so its slot holds the type the FE declared. Needs
+///   sirius-db/sirius#2124: that cast reduces a DOUBLE to a decimal scale and must round; without
+///   it the GPU truncates, and an average can be one unit low in its last digit.
 /// - A merged AVG is its summed sums divided by its summed counts. The count sum is cast back
 ///   to BIGINT the same way, then to FP64 for the division.
 fn finish_aggregation(
@@ -1117,6 +1129,8 @@ fn finish_aggregation(
                 if ty.kind == fp64.kind {
                     average
                 } else {
+                    // A decimal AVG: rounding to its scale needs sirius-db/sirius#2124 (see
+                    // above).
                     cast_to(ty, average)
                 }
             }
@@ -1135,6 +1149,10 @@ fn cast_to(ty: substrait::proto::Type, input: Expression) -> Expression {
             failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
         }))),
     }
+}
+
+fn is_decimal(ty: &substrait::proto::Type) -> bool {
+    matches!(ty.kind, Some(substrait::proto::r#type::Kind::Decimal(_)))
 }
 
 fn is_integer(ty: &substrait::proto::Type) -> bool {
@@ -1752,7 +1770,18 @@ fn project_exprs_with_context(
     let mut expressions = Vec::with_capacity(exprs.len());
     for expr in exprs {
         let mut expr_ctx = ctx.expr_context(&input.layout);
-        expressions.push(expr.translate(&mut expr_ctx)?);
+        let mut expression = expr.translate(&mut expr_ctx)?;
+        // A decimal output is cast to the type the FE declared for it, so the result carries
+        // StarRocks' precision and scale and prints as that decimal (#1687).
+        if let Some(root) = expr.nodes.first()
+            && expr_translator::is_decimal(&root.type_)?
+        {
+            expression = expr_translator::cast(
+                type_mapper::map_type_desc(&root.type_, root.is_nullable.unwrap_or(true))?,
+                expression,
+            );
+        }
+        expressions.push(expression);
     }
     let bindings = exprs.iter().map(|expr| match expr.nodes.as_slice() {
         [node] if node.node_type == TExprNodeType::SLOT_REF => node
