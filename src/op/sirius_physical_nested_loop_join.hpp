@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
@@ -185,21 +186,23 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
  protected:
   std::mutex batches_to_processed_mutex;
-  std::size_t current_partition_index = 0;
-  std::size_t num_batches_to_process  = 0;
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
+  //! Sizes of the batches in left_batch_ids and right_batch_ids. Read for a cross product only.
+  std::vector<std::vector<batch_rows_and_bytes>> left_batch_sizes;
+  std::vector<std::vector<batch_rows_and_bytes>> right_batch_sizes;
 
   //! One task: a pair of input batches and, for a cross product, a slice of the left batch.
   struct pair_task {
-    std::size_t partition;
-    std::size_t left;   //!< index into left_batch_ids[partition]
-    std::size_t right;  //!< index into right_batch_ids[partition]
-    std::size_t slice;
-    std::size_t num_slices;
+    std::size_t partition  = 0;
+    std::size_t left       = 0;  //!< index into left_batch_ids[partition]
+    std::size_t right      = 0;  //!< index into right_batch_ids[partition]
+    std::size_t slice      = 0;
+    std::size_t num_slices = 0;  //!< 0 until the task's pair is reached
   };
-  //! Every task, in the order they are handed out. Built with the batch ID snapshot.
-  std::vector<pair_task> pair_tasks;
+  //! The next task to hand out. Tasks run over partitions, then left batches, then right batches,
+  //! then slices.
+  pair_task next_task;
   uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
 };
 

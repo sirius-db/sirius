@@ -285,7 +285,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
   auto* default_port = get_port("default");
   auto* build_port   = get_port("build");
 
-  // One-time initialization: snapshot all batch IDs from both ports and list the tasks.
+  // One-time initialization: snapshot all batch IDs from both ports.
   if (left_batch_ids.empty() && right_batch_ids.empty()) {
     if (!default_port || !default_port->repo || !build_port || !build_port->repo) {
       return nullptr;
@@ -310,38 +310,51 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
       }
       return result;
     };
-    left_batch_ids.reserve(default_port->repo->num_partitions());
-    right_batch_ids.reserve(build_port->repo->num_partitions());
-    for (size_t p = 0; p < default_port->repo->num_partitions(); p++) {
+    auto const num_partitions = default_port->repo->num_partitions();
+    left_batch_ids.reserve(num_partitions);
+    right_batch_ids.reserve(num_partitions);
+    for (size_t p = 0; p < num_partitions; p++) {
       left_batch_ids.push_back(default_port->repo->get_batch_ids(p));
       right_batch_ids.push_back(build_port->repo->get_batch_ids(p));
       // Only a cross product is split, so only its batch sizes are read.
-      std::vector<batch_rows_and_bytes> left_sizes;
-      std::vector<batch_rows_and_bytes> right_sizes;
       if (conditions.empty()) {
-        left_sizes  = sizes(*default_port->repo, left_batch_ids[p], p);
-        right_sizes = sizes(*build_port->repo, right_batch_ids[p], p);
-      }
-      for (std::size_t left = 0; left < left_batch_ids[p].size(); left++) {
-        for (std::size_t right = 0; right < right_batch_ids[p].size(); right++) {
-          auto const num_slices =
-            conditions.empty()
-              ? cross_join_num_slices(left_sizes[left], right_sizes[right], cross_join_task_bytes)
-              : std::size_t{1};
-          for (std::size_t slice = 0; slice < num_slices; slice++) {
-            pair_tasks.push_back({p, left, right, slice, num_slices});
-          }
-        }
+        left_batch_sizes.push_back(sizes(*default_port->repo, left_batch_ids[p], p));
+        right_batch_sizes.push_back(sizes(*build_port->repo, right_batch_ids[p], p));
       }
     }
-    num_batches_to_process = pair_tasks.size();
   }
 
-  if (current_partition_index >= num_batches_to_process) { return nullptr; }
+  // Skip partitions without a pair of batches.
+  while (
+    next_task.partition < left_batch_ids.size() &&
+    (left_batch_ids[next_task.partition].empty() || right_batch_ids[next_task.partition].empty())) {
+    next_task.partition++;
+  }
+  if (next_task.partition >= left_batch_ids.size()) { return nullptr; }
 
-  auto const& task      = pair_tasks[current_partition_index++];
-  auto const& left_ids  = left_batch_ids[task.partition];
-  auto const& right_ids = right_batch_ids[task.partition];
+  auto const& left_ids  = left_batch_ids[next_task.partition];
+  auto const& right_ids = right_batch_ids[next_task.partition];
+  if (next_task.num_slices == 0) {
+    next_task.num_slices =
+      conditions.empty()
+        ? cross_join_num_slices(left_batch_sizes[next_task.partition][next_task.left],
+                                right_batch_sizes[next_task.partition][next_task.right],
+                                cross_join_task_bytes)
+        : std::size_t{1};
+  }
+  auto const task = next_task;
+  if (++next_task.slice == next_task.num_slices) {
+    next_task.slice      = 0;
+    next_task.num_slices = 0;
+    if (++next_task.right == right_ids.size()) {
+      next_task.right = 0;
+      if (++next_task.left == left_ids.size()) {
+        next_task.left = 0;
+        next_task.partition++;
+      }
+    }
+  }
+
   // Tasks are handed out in order, so a left batch is last used by the last slice of its pair with
   // the last right batch, and a right batch by the last slice of its pair with the last left batch.
   bool const last_slice = task.slice + 1 == task.num_slices;
