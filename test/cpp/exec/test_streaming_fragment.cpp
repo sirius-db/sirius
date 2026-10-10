@@ -33,8 +33,10 @@
 #include <utils/sirius_test_env.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -1164,6 +1166,71 @@ TEST_CASE_METHOD(fragment_fixture,
     con->Rollback();
   } catch (...) {
     other_con->Rollback();
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-14: an interrupt from another thread stops a run retrying out-of-memory
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-14: an interrupt stops a run retrying out-of-memory, and the next run works",
+                 "[integration][streaming_fragment][interrupt]")
+{
+  auto set = [&](const std::string& sql) {
+    auto result = con->Query(sql);
+    REQUIRE_FALSE(result->HasError());
+  };
+  // Uninterrupted, the run would retry for about 20 s before giving up.
+  set("SET sirius_test_inject_gpu_task_oom=1000000");
+  set("SET sirius_test_gpu_task_retry_limit=2000");
+  set("SET sirius_test_gpu_task_retry_backoff_ms=10");
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  auto tasks_started = sirius_ctx->window_task_counter();
+
+  con->BeginTransaction();
+  try {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+    spec.outputs     = {0};
+    streaming_fragment stuck(*con->context, std::move(spec));
+    stuck.build();
+
+    auto const tasks_before = tasks_started->load();
+    auto run                = std::async(std::launch::async, [&] { stuck.run(); });
+    auto const deadline     = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (tasks_started->load() < tasks_before + 3 &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(tasks_started->load() >= tasks_before + 3);  // retrying out-of-memory
+
+    auto const interrupted_at = std::chrono::steady_clock::now();
+    con->Interrupt();
+    REQUIRE(run.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    CHECK(std::chrono::steady_clock::now() - interrupted_at < std::chrono::seconds(2));
+    REQUIRE_THROWS_AS(run.get(), duckdb::InterruptException);
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+
+  set("SET sirius_test_inject_gpu_task_oom=0");
+  con->BeginTransaction();
+  try {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+    spec.outputs     = {0};
+    streaming_fragment next(*con->context, std::move(spec));
+    next.build();
+    next.run();
+    REQUIRE(drain_row_count(next, 0) == kLeafRows);
+    con->Rollback();
+  } catch (...) {
     con->Rollback();
     throw;
   }

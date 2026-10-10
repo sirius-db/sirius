@@ -702,6 +702,12 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   if (completion_->injections) ctx.record_certification_budget(false, false, 10);
   completion_->non_rollbackable_state =
     completion_->injections && completion_->injections->non_rollbackable_state;
+  // Lets the GPU executor stop this query's tasks once another thread interrupts the connection.
+  // Weak: the handler can outlive the client.
+  completion_->interrupt_check = [client = weak_ptr<ClientContext>(context.shared_from_this())] {
+    auto const locked = client.lock();
+    return locked && locked->IsInterrupted();
+  };
   Value inject;
   inject_cleanup_failure_ =
     context.TryGetCurrentSetting("sirius_test_inject_checkpoint_cleanup_failure", inject) &&

@@ -20,6 +20,7 @@
 #include "cucascade/memory/stream_pool.hpp"
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
+#include "duckdb/common/exception.hpp"
 #include "log/logging.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -44,6 +45,23 @@
 #include <utility>
 namespace sirius {
 namespace pipeline {
+
+namespace {
+
+// True when the task's query was interrupted, and the caller must drop the task instead of
+// running or retrying it. The query fails with DuckDB's InterruptException, so its thread drains
+// and releases it like any other failure.
+bool fail_if_interrupted(completion_handler* completion, uint64_t task_id)
+{
+  if (!completion || !completion->is_interrupted()) { return false; }
+  if (!completion->has_error()) {
+    SIRIUS_LOG_INFO("GPU Pipeline Executor: query interrupted, dropping task {}", task_id);
+  }
+  completion->report_error(std::make_exception_ptr(duckdb::InterruptException()));
+  return true;
+}
+
+}  // namespace
 
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
@@ -139,6 +157,10 @@ void gpu_pipeline_executor::manager_loop()
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
       throw sirius::internal_exception(
         "GPU Pipeline Executor: a non-gpu_pipeline_task reached the GPU executor queue");
+    }
+    // Before the reservation: an interrupted query must not wait for memory or force a downgrade.
+    if (fail_if_interrupted(gpu_task->get_completion_handler().get(), gpu_task->get_task_id())) {
+      continue;
     }
     // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
     // another device, which prepare clones into this space) are counted in the reservation.
@@ -362,6 +384,8 @@ void gpu_pipeline_executor::manager_loop()
        completion = std::move(completion),
        pipeline]() mutable {
         try {
+          // The reservation may have waited long enough for the query to be interrupted.
+          if (fail_if_interrupted(completion.get(), task->get_task_id())) { return; }
           if (completion) completion->record_task_started();
           task->execute(::cuda::stream_ref{exc_stream.get()});
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
@@ -369,6 +393,8 @@ void gpu_pipeline_executor::manager_loop()
           // Only THIS query's error state suppresses the reschedule. Previously one query's
           // failure silently stopped every other query's tasks from rescheduling.
           if (completion && completion->has_error()) { return; }
+          // Without this an interrupted query keeps retrying until the retry cap.
+          if (fail_if_interrupted(completion.get(), task->get_task_id())) { return; }
           auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
           if (!gpu_task) {
             SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for reschedule");

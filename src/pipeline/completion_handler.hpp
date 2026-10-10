@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -180,6 +181,14 @@ class completion_handler {
     std::lock_guard lock(failure_mutex_);
     return failure_;
   }
+
+  /// Whether the query's client asked to cancel it (DuckDB's `Connection::Interrupt()`). The GPU
+  /// executor checks this before it runs or retries one of the query's tasks.
+  [[nodiscard]] bool is_interrupted() const { return interrupt_check && interrupt_check(); }
+
+  /// Set by the query thread before task submission, like `injections`. Unset, the query is never
+  /// interrupted (executor unit tests build handlers without a client).
+  std::function<bool()> interrupt_check;
   std::shared_ptr<op::scan::test_injections const> injections;
   std::atomic<uint64_t> injected_oom_attempts{0};
   std::atomic<uint64_t> injected_launch_attempts{0};
