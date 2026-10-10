@@ -653,6 +653,14 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   // Check for failure in translating child
   if (!child_expr) { return std::nullopt; }
 
+  // CAST_TO_* truncates and wraps; semantic casts that would round or overflow have no AST form.
+  if (alt.kind == sirius::ast::cast_kind::semantic && !alt.lowers_to_cudf_ast()) {
+    SIRIUS_LOG_DEBUG("[expression_translator] Unsupported cast from type_id {} to type_id {}",
+                     static_cast<int>(alt.child->return_type().id()),
+                     static_cast<int>(alt.target_type.id()));
+    return std::nullopt;
+  }
+
   // Construct the CAST expression, if possible
   // CuDF AST only supports casts to INT64, UINT64, FLOAT64
   auto const cudf_return_type = sirius::get_cudf_type(alt.target_type);

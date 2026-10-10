@@ -905,7 +905,9 @@ TEST_CASE("translator: CAST to INT64", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: CAST(col(0) AS BIGINT)
-  auto cast_expr = make_cast(make_ref(0), logical_type::make(type_id::BIGINT), /*try_cast=*/false);
+  auto cast_expr = make_cast(make_ref_typed(0, logical_type::make(type_id::INTEGER)),
+                             logical_type::make(type_id::BIGINT),
+                             /*try_cast=*/false);
 
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *cast_expr);
@@ -951,6 +953,24 @@ TEST_CASE("translator: unsupported CAST returns nullopt", "[expression_translato
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *cast_expr);
   REQUIRE_FALSE(ast_tree.has_value());
+}
+
+TEST_CASE("translator: CAST that rounds or overflows returns nullopt", "[expression_translator]")
+{
+  // CAST_TO_INT64 and CAST_TO_UINT64 truncate floats and wrap integers, where DuckDB rounds and
+  // range-checks.
+  auto const [source, target] = GENERATE(table<logical_type, type_id>({
+    {logical_type::make(type_id::DOUBLE), type_id::BIGINT},
+    {logical_type::make(type_id::FLOAT), type_id::BIGINT},
+    {logical_type::make_decimal(18, 4), type_id::BIGINT},
+    {logical_type::make(type_id::DOUBLE), type_id::UBIGINT},
+    {logical_type::make(type_id::BIGINT), type_id::UBIGINT},
+    {logical_type::make(type_id::UBIGINT), type_id::BIGINT},
+  }));
+  auto cast_expr =
+    make_cast(make_ref_typed(0, source), logical_type::make(target), /*try_cast=*/false);
+  auto translator = make_translator();
+  REQUIRE_FALSE(translate(translator, *cast_expr).has_value());
 }
 
 //===----------------------------------------------------------------------===//
@@ -1403,7 +1423,9 @@ TEST_CASE("translator: CAST(col(0) AS BIGINT) + 100", "[expression_translator]")
   auto tv                     = table->view();
 
   // Build: CAST(col(0) AS BIGINT) + 100
-  auto cast_expr = make_cast(make_ref(0), logical_type::make(type_id::BIGINT), /*try_cast=*/false);
+  auto cast_expr = make_cast(make_ref_typed(0, logical_type::make(type_id::INTEGER)),
+                             logical_type::make(type_id::BIGINT),
+                             /*try_cast=*/false);
 
   std::vector<std::unique_ptr<ast_node>> args;
   args.push_back(std::move(cast_expr));
