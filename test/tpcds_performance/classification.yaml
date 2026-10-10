@@ -1,0 +1,6 @@
+# Small SF1 classification run. Capacities are not benchmark tuning.
+sirius:
+  topology: { num_gpus: 1 }
+  memory:
+    gpu: { usage_limit_bytes: 8Gi }
+    host: { capacity_bytes: 4Gi }
