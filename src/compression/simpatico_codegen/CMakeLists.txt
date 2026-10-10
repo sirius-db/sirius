@@ -13,6 +13,7 @@ if(NOT TARGET nvcomp::nvcomp)
 endif()
 
 include(cmake/jit_header_manifest.cmake)
+include(cmake/cache_identity.cmake)
 
 # Embed the project headers the runtime NVRTC JIT #includes as raw-string
 # literals, so a binary distribution needs no simpatico source tree on disk.
@@ -92,6 +93,7 @@ add_library(
   src/operators/nvcomp_batched_codec.cu
   # Plain-CUDA JIT host
   src/jit/nvrtc_compiler.cpp
+  src/jit/cache_identity.cpp
   src/jit/kernel_cache.cpp
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
@@ -146,8 +148,10 @@ target_compile_definitions(
 # nvrtc_compiler.cpp #includes the generated embedded_headers.h from here.
 add_dependencies(simpatico simpatico_embedded_headers)
 target_include_directories(
-  simpatico PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  simpatico
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+          "${CMAKE_CURRENT_BINARY_DIR}/generated"
+          "${SIMPATICO_XXHASH_INCLUDE_DIR}")
 # In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC
 # (nvrtc::nvrtc_static) so the extension carries no libnvrtc.so runtime dep.
 # Standalone / pixi builds use the toolkit's shared NVRTC target.
@@ -167,14 +171,8 @@ else()
   set(SIMPATICO_CUDART_LIB CUDA::cudart)
 endif()
 target_link_libraries(
-  simpatico
-  PUBLIC cudf::cudf
-         rmm::rmm
-         nvcomp::nvcomp
-         ${SIMPATICO_CUDART_LIB}
-         ${SIMPATICO_NVRTC_LIB}
-         CUDA::cuda_driver
-         ${CMAKE_DL_LIBS})
+  simpatico PUBLIC cudf::cudf rmm::rmm nvcomp::nvcomp ${SIMPATICO_CUDART_LIB}
+                   ${SIMPATICO_NVRTC_LIB} CUDA::cuda_driver)
 
 function(add_codegen_host_test name)
   add_executable(${name} tests/${name}.cpp)

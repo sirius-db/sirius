@@ -1,5 +1,7 @@
 #include "codegen/jit/nvrtc_compiler.hpp"
 
+#include "compilation_request.hpp"
+
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
@@ -25,6 +27,23 @@
 #include "codegen/jit/embedded_headers.h"
 
 namespace codegen::jit {
+
+detail::CompilationRequest::CompilationRequest(const std::string& source,
+                                               const std::string& entry,
+                                               const CompileOptions& opts)
+  : source(source), entry(entry)
+{
+  if (opts.arch_cc <= 0) throw std::invalid_argument("NVRTC architecture must be positive");
+  std::snprintf(architecture.data(), architecture.size(), "-arch=sm_%d", opts.arch_cc);
+  options = {"-std=c++20", architecture.data(), "--no-source-include", "-default-device"};
+  for (std::size_t i = 0; i < options.size(); ++i)
+    option_views[i] = options[i];
+}
+
+detail::RequestView detail::CompilationRequest::identity_view() const
+{
+  return {source, entry, program_name, option_views};
+}
 
 int arch_cc_for_current_device()
 {
@@ -79,6 +98,21 @@ namespace {
   } while (0)
 
 }  // namespace
+
+const detail::Digest& detail::cache_environment()
+{
+  static const Digest identity = [] {
+    int major = 0, minor = 0;
+    NVRTC_OR_THROW(nvrtcVersion(&major, &minor));
+    // Both linkage modes use the reported version. Same-version compiler
+    // patches intentionally retain reuse; header contents have their own digests.
+    return environment_identity({kEmbeddedJitHeadersIdentity,
+                                 kCcclEmbeddedHeadersIdentity,
+                                 static_cast<uint32_t>(major),
+                                 static_cast<uint32_t>(minor)});
+  }();
+  return identity;
+}
 
 CUfunction CompiledKernel::func_for_current_device() const
 {
@@ -142,6 +176,13 @@ CompiledKernel compile_plain_kernel(const std::string& source,
                                     const std::string& entry_symbol,
                                     const CompileOptions& opts)
 {
+  return detail::compile_request(detail::CompilationRequest(source, entry_symbol, opts));
+}
+
+CompiledKernel detail::compile_request(const CompilationRequest& request)
+{
+  const auto& source       = request.source;
+  const auto& entry_symbol = request.entry;
   if (source.empty()) { throw std::runtime_error("compile_plain_kernel: empty source"); }
   if (entry_symbol.empty()) {
     throw std::runtime_error("compile_plain_kernel: empty entry_symbol");
@@ -168,22 +209,13 @@ CompiledKernel compile_plain_kernel(const std::string& source,
   nvrtcProgram prog = nullptr;
   NVRTC_OR_THROW(nvrtcCreateProgram(&prog,
                                     source.c_str(),
-                                    "codegen_jit.cu",
+                                    CompilationRequest::program_name,
                                     static_cast<int>(hdr_names.size()),
                                     hdr_sources.data(),
                                     hdr_names.data()));
 
-  const std::string arch_opt = "-arch=sm_" + std::to_string(opts.arch_cc);
-
-  std::vector<const char*> nvrtc_opts = {
-    "-std=c++20",
-    arch_opt.c_str(),
-    "--no-source-include",
-    "-default-device",
-  };
-
   nvrtcResult compile_result =
-    nvrtcCompileProgram(prog, static_cast<int>(nvrtc_opts.size()), nvrtc_opts.data());
+    nvrtcCompileProgram(prog, static_cast<int>(request.options.size()), request.options.data());
 
   // Capture the log unconditionally so warnings on success and errors
   // on failure surface to callers symmetrically.

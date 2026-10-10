@@ -2,6 +2,9 @@
 
 #include <array>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
@@ -15,12 +18,15 @@ static void require(bool condition, const char* message)
 int main(int argc, char** argv)
 {
   try {
-    // Test-only bridge for comparing CMake's xxhsum output with the runtime
-    // implementation, including files larger than its streaming buffer.
+    // Test-only file adapter for comparing CMake's xxhsum output with the
+    // runtime hash. Production no longer reads compiler files for identity.
     if (argc == 3 && std::string_view(argv[1]) == "--hash-file") {
-      Digest digest{};
-      require(file_identity(argv[2], digest), "file hashing failed");
-      std::puts(hex_digest(digest).c_str());
+      require(std::filesystem::is_regular_file(argv[2]), "not a regular file");
+      std::ifstream input(argv[2], std::ios::binary);
+      require(bool(input), "file open failed");
+      const std::string content{std::istreambuf_iterator<char>(input), {}};
+      require(!input.bad(), "file read failed");
+      std::puts(hex_digest(content_identity(content)).c_str());
       return 0;
     }
     require(argc == 1, "unexpected arguments");
@@ -66,24 +72,26 @@ int main(int argc, char** argv)
     changed.entry  = request.entry;
     require(request_identity(request) != request_identity(changed), "embedded NUL boundary");
 
-    EnvironmentView environment{
-      "embedded-libcudf", "project-bytes", "cccl-bytes", "compiler-build-1", 13030, 13030};
+    EnvironmentView environment{"project-bytes", "cccl-bytes", 13, 4};
     const auto env = environment_identity(environment);
-    for (int component = 0; component < 6; ++component) {
+    require(env == environment_identity(environment), "environment stability");
+    for (int component = 0; component < 4; ++component) {
       auto variant = environment;
       switch (component) {
-        case 0: variant.provider = "nvrtc-bundled"; break;
-        case 1: variant.project_headers = "project-byteS"; break;
-        case 2: variant.cccl_headers = "cccl-byteS"; break;
-        case 3: variant.compiler = "compiler-build-2"; break;
-        case 4: ++variant.cuda_runtime; break;
-        case 5: ++variant.driver; break;
+        case 0: variant.project_headers = "project-byteS"; break;
+        case 1: variant.cccl_headers = "cccl-byteS"; break;
+        case 2: ++variant.nvrtc_major; break;
+        case 3: ++variant.nvrtc_minor; break;
       }
       require(env != environment_identity(variant), "environment component omitted");
       require(CompilationIdentity{env, expected}.relative_path() !=
                 CompilationIdentity{environment_identity(variant), expected}.relative_path(),
               "persistent path omitted environment");
     }
+    require(environment_identity({"a|b", "c", 13, 4}) != environment_identity({"a", "b|c", 13, 4}),
+            "environment header boundaries");
+    require(environment_identity({"project-bytes", "cccl-bytes", 1, 34}) != env,
+            "NVRTC major/minor boundaries");
     require(CompilationIdentity{env, expected}.relative_path() ==
               "v2/" + hex_digest(env) + "/" + hex_digest(expected) + ".cubin",
             "versioned path");

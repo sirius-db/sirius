@@ -188,25 +188,39 @@ auto result = simpatico::explore_column_compression(col_view, cfg, stream, mr);
 ## JIT kernel cache
 
 The fused compress/decompress kernels are generated as CUDA-C++ source at runtime — one
-kernel per compression-tree *shape* — then compiled with NVRTC and cached so a given shape
-is compiled only once. The beam-search explorer alone enumerates hundreds of thousands of
-candidate shapes, so this cache is what makes runtime codegen practical.
+kernel per compression-tree *shape* — then compiled with NVRTC and cached for reuse. The
+beam-search explorer enumerates hundreds of thousands of candidate shapes, so this cache is
+what makes runtime codegen practical.
 
-There are two levels, both keyed by the same tuple: a 64-bit FNV-1a digest of the rendered
-source (plus the kernel entry symbol), the GPU architecture (`sm_XX`), the CUDA runtime
-version, and the driver version. Header contents are not currently part of the key; after
-changing JIT headers, restart with an empty or disabled disk cache.
+Both cache levels use one compilation identity, specified in [CACHE_FORMAT.md](CACHE_FORMAT.md).
+The request identifies the rendered source, entry symbol, program name, architecture, and
+actual ordered NVRTC options. The environment identifies both project JIT headers and the
+complete CCCL bundle, plus the reported NVRTC major/minor version. XXH3-128 makes
+accidental collisions unlikely, not impossible.
 
-1. **In-memory** (per process, thread-safe): `shape → compiled kernel`. A shape compiled
-   during `compress` is reused by `decompress` in the same process.
+1. **In-memory** (per process, thread-safe): request digest → compiled kernel. The embedded
+   environment is fixed within the binary, so it is not copied or rehashed on warm lookups.
 2. **On-disk** (persistent, shared across processes and runs): each cubin is stored as
-   `<dir>/<digest>_a<arch>_c<cudart>_d<driver>.cubin`, published atomically (write to a
-   pid-unique temp, then `rename`) so concurrent processes never observe a half-written
-   file. On a hit the cubin is loaded directly, skipping NVRTC. A corrupt or
-   toolchain-incompatible file simply fails to load and falls through to a fresh compile.
+   `<dir>/v2/<environment-id>/<request-id>.cubin`. On a hit the cubin is loaded directly,
+   skipping compilation of the requested kernel. A reported CUDA load error falls through
+   to a fresh compile. This layer still stores raw cubins; malformed files are not
+   validated before CUDA loading. Record validation is the separate storage-hardening layer.
 
 Lookup order per shape: in-memory → on-disk → NVRTC compile (a fresh compile then populates
-both levels).
+both levels). Concurrent cold requests may compile redundantly.
+
+Shared and static builds use `nvrtcVersion` major/minor; same-version compiler patches
+intentionally retain disk reuse. Compiler/builtins files and static archives are not hashed,
+and no loader/procfs scan or builtins-loading probe is needed. CUDA runtime/driver tags,
+provider/linkage labels, and host-object epochs are not identity inputs. The target SM is
+already keyed through the effective compiler options; a compatible CUDA driver is still
+required. A version-query failure reports the NVRTC error, rather than identifying the
+compiler as version zero. Disk-disabled compilation and memory hits do not query the version.
+Replacing the compiler or runtime while a process is running is not supported.
+
+Old flat cache entries are ignored but not deleted; nothing reclaims their space, since other
+builds may still use them. Header providers remain embedded and libcudf-aligned on CUDA 12
+and 13; NVRTC bundled-header adoption is separate work.
 
 ### Self-contained JIT (no header tree at runtime)
 
@@ -245,7 +259,7 @@ As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the 
 | Variable | Effect |
 | --- | --- |
 | `SIMPATICO_JIT_CACHE_DIR` | On-disk cache location. Default: `${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit`. Set to `off`, `0`, or empty to disable the on-disk cache (in-memory only). |
-| `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms` per process at exit. |
+| `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms` for requested kernels at exit. |
 | `CODEGEN_JIT_DUMP_CUBIN` | Debug: if set to a path, writes the compiled cubin there. |
 | `CODEGEN_JIT_DUMP_ENCODE_SOURCE` / `CODEGEN_JIT_DUMP_DECODE_SOURCE` | Debug: if set to a path, writes the rendered encode/decode CUDA source there. |
 
