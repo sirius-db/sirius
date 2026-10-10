@@ -19,7 +19,6 @@
 #include "exec/invocable.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
-#include "io/physical_read_statistics.hpp"
 #include "io/types.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -32,11 +31,9 @@
 
 #include <cuda/stream>
 
-#include <atomic>
 #include <cstdint>
 #include <exception>
 #include <span>
-#include <utility>
 
 namespace sirius::io {
 
@@ -100,28 +97,6 @@ enum class prepare_result : std::uint8_t {
 
 class sirius_datasource : public cudf::io::datasource {
  public:
-  struct read_statistics {
-    std::shared_ptr<physical_read_statistics> physical =
-      std::make_shared<physical_read_statistics>();
-    std::atomic<uint64_t> requests{0}, bytes_requested{0}, bytes_returned{0}, failures{0};
-    void requested(size_t bytes)
-    {
-      requests.fetch_add(1, std::memory_order_relaxed);
-      bytes_requested.fetch_add(bytes, std::memory_order_relaxed);
-    }
-    void completed(size_t bytes, bool failed = false)
-    {
-      bytes_returned.fetch_add(bytes, std::memory_order_relaxed);
-      if (failed) failures.fetch_add(1, std::memory_order_relaxed);
-    }
-  };
-  // Installed before reading; split duplicates receive their own phase's counters.
-  void read_statistics_for_testing(std::shared_ptr<read_statistics> current,
-                                   std::shared_ptr<read_statistics> splits)
-  {
-    _read_statistics  = std::move(current);
-    _split_statistics = std::move(splits);
-  }
   explicit sirius_datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_obj);
 
   ~sirius_datasource() override;
@@ -241,7 +216,6 @@ class sirius_datasource : public cudf::io::datasource {
  private:
   std::shared_ptr<ioctx> _io_ctx;
   std::shared_ptr<io_object> _io_object;
-  std::shared_ptr<read_statistics> _read_statistics, _split_statistics;
   /// Handle of the most recent insert into the prefetching cache, or empty
   /// if none was made.  Disposing it lets the cache reclaim the request.
   cache::cache_handle _cache_handle;

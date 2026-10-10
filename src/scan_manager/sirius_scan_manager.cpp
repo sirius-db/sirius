@@ -1406,17 +1406,11 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   auto const hint =
     footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
 
-  if (_physical_counters && _physical_counters->track_units &&
-      _physical_counters->parquet_datasource_for_testing)
-    _physical_counters->parquet_datasource_for_testing(uri, nullptr, true);
   auto datasource = create_datasource(uri, hint);
   if (!datasource) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
   }
-  if (_physical_counters && _physical_counters->track_units &&
-      _physical_counters->parquet_datasource_for_testing)
-    _physical_counters->parquet_datasource_for_testing(uri, datasource.get(), true);
 
   // Resolve through the shared path so describe_parquet publishes the same
   // complete footer evidence as scans and pinned parquet tables, including the
@@ -1487,9 +1481,7 @@ void sirius_scan_manager::prepare_for_query(
 
   auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
 
-  auto preparation           = _config.preparation.resolve(_config.thread_pool.num_threads);
-  preparation.collect_timing = _physical_counters && _physical_counters->track_units &&
-                               _physical_counters->preparation_timing_for_testing;
+  auto preparation         = _config.preparation.resolve(_config.thread_pool.num_threads);
   auto state               = std::make_shared<query_scan_manager_state>(std::move(preparation));
   state->query_token       = sirius::value_of(query_id);
   state->physical_counters = _physical_counters;
@@ -2030,14 +2022,8 @@ void sirius_scan_manager::run_preparation_on_query_thread(sirius::query_id_t id)
     observation.preparation_runner    = stats.runner;
     observation.preparation_publisher = stats.publisher;
     observation.preparation_runs      = stats.runs;
-    observation.jobs_peak             = stats.jobs_peak;
-    observation.results_peak          = stats.results_peak;
-    observation.output_peak           = stats.output_peak;
     observation.partial_emissions     = stats.partial_emissions;
     observation.max_residence         = stats.max_residence;
-    observation.max_deadline_lateness = stats.max_deadline_lateness;
-    observation.first_ready           = stats.first_ready;
-    observation.first_publication     = stats.first_publication;
   }
 }
 

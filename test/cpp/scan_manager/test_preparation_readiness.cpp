@@ -25,7 +25,6 @@
 #include <array>
 #include <condition_variable>
 #include <future>
-#include <iostream>
 #include <mutex>
 using namespace sirius::scan_manager;
 using namespace std::chrono_literals;
@@ -169,14 +168,13 @@ struct fixture {
   explicit fixture(size_t workers                               = 2,
                    size_t slots                                 = 4,
                    std::chrono::milliseconds interrupt_interval = k_interrupt_check_interval,
-                   bool collect_timing                          = false,
                    std::optional<preparation_options> options   = std::nullopt)
     : pool(static_cast<int>(workers)),
       dispatcher(pool),
       coordinator(completion,
                   dispatcher,
                   options.value_or(preparation_options{
-                    workers, slots, slots, workers, 1, 20ms, interrupt_interval, collect_timing}))
+                    workers, slots, slots, workers, 1, 20ms, interrupt_interval}))
   {
   }
   std::thread owner;
@@ -268,90 +266,6 @@ struct fixture {
   }
 };
 }  // namespace
-TEST_CASE("Measure residence latency and batch count under controlled metadata arrivals",
-          "[.][scan_preparation][preparation_residence_cost]")
-{
-  using clock = std::chrono::steady_clock;
-  struct sample {
-    int delay, scenario;
-    int64_t first_us, total_us;
-    size_t batches;
-  };
-  std::vector<sample> samples;
-  std::array delays{0, 2, 5, 10, 20};
-  for (int repetition = 0; repetition < 20; ++repetition) {
-    for (int scenario = 0; scenario < 3; ++scenario) {
-      for (int index = 0; index < static_cast<int>(delays.size()); ++index) {
-        auto delay   = delays[repetition % 2 ? delays.size() - 1 - index : index];
-        auto options = preparation_config{}.resolve(2);
-        options.underfilled_batch_residence =
-          delay ? std::optional{std::chrono::milliseconds(delay)} : std::nullopt;
-        options.collect_timing = true;
-        fixture f(2, 4, k_interrupt_check_interval, true, options);
-        auto out   = std::make_shared<sink>();
-        auto a     = std::make_shared<accumulator>(16);
-        auto count = scenario == 0 ? 64 : scenario == 1 ? 24 : 2;
-        int next   = 0;
-        f.source(a, out, [&]() -> std::optional<preparation_coordinator::job> {
-          auto id = next++;
-          if (id >= count) return {};
-          return preparation_coordinator::job{[=] {
-                                                if (scenario == 1) std::this_thread::sleep_for(2ms);
-                                                if (scenario == 2 && id == 1)
-                                                  std::this_thread::sleep_for(40ms);
-                                                return std::make_unique<tagged>(id);
-                                              },
-                                              {}};
-        });
-        auto guard = f.shutdown_guard();
-        auto begin = clock::now();
-        f.start();
-        size_t consumed = 0;
-        while (!out->closed.load()) {
-          REQUIRE(clock::now() - begin < 2s);
-          auto published = out->count();
-          while (consumed < published) {
-            out->consume();
-            ++consumed;
-          }
-          std::this_thread::sleep_for(100us);
-        }
-        f.finish();
-        REQUIRE_FALSE(f.completion.has_error());
-        auto stats = f.coordinator.snapshot();
-        REQUIRE(stats.first_ready);
-        REQUIRE(stats.first_publication);
-        samples.push_back(
-          {delay,
-           scenario,
-           std::chrono::duration_cast<std::chrono::microseconds>(*stats.first_publication -
-                                                                 *stats.first_ready)
-             .count(),
-           std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - begin).count(),
-           out->count()});
-      }
-    }
-  }
-  for (int scenario = 0; scenario < 3; ++scenario) {
-    for (int delay : delays) {
-      std::vector<int64_t> first, total, batches;
-      for (auto const& s : samples) {
-        if (s.scenario != scenario || s.delay != delay) continue;
-        first.push_back(s.first_us);
-        total.push_back(s.total_us);
-        batches.push_back(s.batches);
-      }
-      std::sort(first.begin(), first.end());
-      std::sort(total.begin(), total.end());
-      std::sort(batches.begin(), batches.end());
-      std::cout << "RESIDENCE_COST scenario=" << scenario << " limit_ms=" << delay
-                << " samples=" << first.size() << " first_p50_us=" << first[9]
-                << " first_p95_us=" << first[18] << " total_p95_us=" << total[18]
-                << " batches_p50=" << batches[9] << '\n';
-    }
-  }
-}
-
 TEST_CASE("Ready partial batches publish while every preparation worker is blocked",
           "[scan_preparation][coordinator]")
 {
@@ -479,7 +393,7 @@ TEST_CASE("Publication is refused after cancellation wins during input construct
 TEST_CASE("Unresolved typed input forbids scan input construction until the whole unit is ready",
           "[scan_preparation][coordinator]")
 {
-  fixture f(2, 4, k_interrupt_check_interval, true);
+  fixture f(2, 4);
   auto out = std::make_shared<sink>();
   required_input_set required;
   required.set(2);
@@ -502,14 +416,10 @@ TEST_CASE("Unresolved typed input forbids scan input construction until the whol
   REQUIRE(stage.wait_for(1s) == std::future_status::ready);
   CHECK(f.coordinator.unit_state_snapshot({3, 1})->state == unit_state::pending);
   CHECK(out->count() == 0);
-  CHECK_FALSE(f.coordinator.snapshot().first_ready);
-  CHECK_FALSE(f.coordinator.snapshot().first_publication);
   REQUIRE(unit->complete_input(
     delete_set_input{std::make_shared<sirius::op::scan::iceberg_delete_set const>("file")}));
   REQUIRE(out->await(1));
   CHECK(unit->record().state == unit_state::ready);
-  CHECK(f.coordinator.snapshot().first_ready.has_value());
-  CHECK(f.coordinator.snapshot().first_publication.has_value());
   f.coordinator.request_stop(stop_reason::normal_eos);
   CHECK_FALSE(f.coordinator.admit_unit({3, 2}, required));
   CHECK(unit->record().state == unit_state::ready);
@@ -632,7 +542,7 @@ TEST_CASE("Production defaults publish retained input while later metadata remai
   auto options = preparation_config{}.resolve(2);
   REQUIRE(options.underfilled_batch_residence);
   auto residence = *options.underfilled_batch_residence;
-  fixture f(2, 4, k_interrupt_check_interval, false, options);
+  fixture f(2, 4, k_interrupt_check_interval, options);
   auto out = std::make_shared<sink>();
   auto a   = std::make_shared<accumulator>();
   auto h   = f.make_hold();
@@ -1295,33 +1205,4 @@ TEST_CASE("Observed interruption stops claims and publication while owned work d
   CHECK(out->preparations == 0);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
   CHECK_THROWS_AS(f.coordinator.set_interrupt_check({}), std::logic_error);
-}
-
-TEST_CASE("Optional preparation timestamps retain the first ready input and publication",
-          "[scan_preparation][coordinator][observation]")
-{
-  auto enabled = GENERATE(false, true);
-  fixture f(1, 4, k_interrupt_check_interval, enabled);
-  auto out  = std::make_shared<sink>();
-  auto held = f.make_hold();
-
-  f.source(std::make_shared<accumulator>(1), out, finite_jobs(2, [=](int id) {
-             if (id == 1) held->wait();
-             return std::make_unique<tagged>(id);
-           }));
-  auto guard = f.shutdown_guard();
-  CHECK_FALSE(f.coordinator.snapshot().first_ready);
-  CHECK_FALSE(f.coordinator.snapshot().first_publication);
-  f.start();
-  REQUIRE(out->await(1));
-  REQUIRE(held->await());
-  auto first = f.coordinator.snapshot();
-  CHECK(bool(first.first_ready) == enabled);
-  CHECK(bool(first.first_publication) == enabled);
-  if (enabled) CHECK(*first.first_ready <= *first.first_publication);
-  held->release();
-  REQUIRE(out->await(2));
-  auto last = f.coordinator.snapshot();
-  CHECK(last.first_ready == first.first_ready);
-  CHECK(last.first_publication == first.first_publication);
 }

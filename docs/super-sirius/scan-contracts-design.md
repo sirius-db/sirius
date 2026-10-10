@@ -83,17 +83,9 @@ Unbounded inputs, the statement deletion-vector limit, or insufficient host capa
 
 Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
 
-### Limits and diagnostics
+### Preparation limits
 
 Preparation limits default to values derived from the scan worker count. They bound active jobs, units, pending results, and coalescing work. By default, coordinator waits check interruption every 10 ms; draining an active read can take longer. An underfilled batch becomes due 10 ms after its first retained input, without waiting for later metadata. New arrivals do not reset that deadline. Publication still requires output capacity and can be delayed by scheduling. The limits and timing values accept startup YAML overrides under [`sirius.executor.scan_manager.preparation`](configuration.md#siriusexecutorscan_managerpreparation); a zero residence disables timed publication.
-
-Optional test observations record planning completion, first ready input, first publication, queue peaks, admission bytes and permits, and legacy/deferred route reasons. Datasource counters separate preparation reads from execution reads; Puffin counters include opens, requested and returned bytes, and failures.
-
-The hidden `[preparation_cost]` test accepts one SELECT through `SIRIUS_TEST_PREPARATION_COST_SQL_FILE`, checks results against CPU execution, and reports warm-query samples with observations enabled and disabled. Run `pixi run python -B test/scripts/run_query_cost.py compare <arguments>` to alternate baseline and candidate runs and report median and P95 latency, or use `trace <arguments>` to save file-read syscall evidence separately from timing runs. Comparison output retains all per-scan observations and records binary and explicit configuration hashes; `--candidate-deferred-scans N` requires the expected routes without legacy scans. `total_us` measures the materialized `Query()` call; client timestamps describe fetching that result, not streaming latency. Local backend observations count submitted io_uring and pread requests and their actual returned bytes, attributed to the initiating datasource phase (planning, preparation, or execution). Short reads, retries, failures, and missing completions are separate counts. These are OS reads, not device traffic; remote backends remain outside this coverage.
-
-Use `io-report --trace <directory> --output <json>` to join traces with per-file observations and backend completions for SQL filesystem, datasource, and direct Puffin I/O. It separates logical requests from physical opens, read calls, and returned bytes by phase, and rejects incomplete or ambiguous coverage.
-
-For cold runs, add `--cold-files <list>` with one absolute local path per line covering all table metadata, Parquet, and Puffin files. Each sample uses a fresh process, flushes and evicts the listed files, and verifies zero resident pages before the query; the CPU result check runs afterward. The runner saves file hashes and rejects failed eviction or changed inputs. `--blocks` is the number of cold samples per side and observation mode; use at least 20 for acceptance. This measures local OS page-cache coldness, not disk or controller caches.
 
 ## Native checkpoint lease
 

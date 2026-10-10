@@ -24,7 +24,6 @@
 #include <io/uring/types.hpp>
 #include <io/uring/uring_reactor.hpp>
 #include <sys/uio.h>
-#include <unistd.h>
 
 #include <array>
 #include <chrono>
@@ -39,66 +38,6 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
-
-TEST_CASE("io_uring observes returned bytes on real asynchronous reads",
-          "[physical_reads][uring_readv]")
-{
-  char path[] = "/tmp/sirius-physical-XXXXXX";
-  auto fd     = ::mkstemp(path);
-  REQUIRE(fd >= 0);
-  struct cleanup_file {
-    int fd;
-    char const* path;
-    ~cleanup_file()
-    {
-      ::close(fd);
-      ::unlink(path);
-    }
-  } cleanup{fd, path};
-  std::array<uint8_t, 8192> source{};
-  source.fill(42);
-  REQUIRE(::write(fd, source.data(), source.size()) == source.size());
-  cucascade::memory::numa_region_pinned_host_memory_resource upstream{-1};
-  cucascade::memory::fixed_size_host_memory_resource mr{
-    -1, upstream, 128UL << 20, 128UL << 20, 4UL << 20, 4, 0};
-  using reactor_type = sirius::io::uring::uring_reactor;
-  auto ctx = std::make_shared<reactor_type::reactor_context>(sirius::io::uring::config{}, &mr);
-  reactor_type reactor{ctx, "physical_reads"};
-  reactor.start();
-  auto stats = std::make_shared<sirius::io::physical_read_statistics>();
-  std::array<uint8_t, 8192> destination{};
-  {
-    sirius::io::scoped_physical_reads scope(stats);
-    auto coordinator = std::make_shared<sirius::io::grouped_coordinator>(source.size(), 1);
-    auto future      = coordinator->get_future();
-    std::vector<sirius::io::prepared_io_slice> slices;
-    slices.emplace_back(sirius::io::range{0, source.size()},
-                        sirius::io::host_buffer{destination.data()});
-    reactor.enqueue(sirius::io::grouped_io_request::create(
-      reactor_type::create_io_object(path), std::move(slices), std::move(coordinator)));
-    REQUIRE(std::move(future).get() == source.size());
-  }
-  reactor.shutdown();
-  CHECK(destination == source);
-  CHECK(stats->requests > 0);
-  CHECK(stats->requests == stats->completions);
-  CHECK(stats->bytes_requested == source.size());
-  CHECK(stats->bytes_returned == source.size());
-  CHECK(stats->failures == 0);
-  CHECK(stats->unobserved_completions == 0);
-  // Synchronous pread reports a short read and the following EOF attempt separately.
-  auto sync_stats = std::make_shared<sirius::io::physical_read_statistics>();
-  {
-    sirius::io::scoped_physical_reads scope(sync_stats);
-    auto object = reactor_type::create_io_object(path);
-    CHECK(reactor.host_read(*object, 8190, 8, destination.data()) == 2);
-  }
-  CHECK(sync_stats->requests == 2);
-  CHECK(sync_stats->bytes_requested == 14);
-  CHECK(sync_stats->bytes_returned == 2);
-  CHECK(sync_stats->short_reads == 2);
-  CHECK(sync_stats->retries == 1);
-}
 
 using sirius::io::file_descriptor;
 using sirius::io::grouped_coordinator;

@@ -397,13 +397,9 @@ bool preparation_coordinator::state::publish_batch(lock_type& lock)
       gate->check_interrupted();
       if (!gate->closed && !completion->has_error()) {
         if (source.hooks.prepare_publish) source.hooks.prepare_publish(publication);
-        auto first_publication = stats.first_publication;
-        if (options.collect_timing && !first_publication)
-          first_publication = std::chrono::steady_clock::now();
         source.hooks.publish(publication);
-        stats.first_publication = first_publication;
-        stats.publisher         = std::this_thread::get_id();
-        ticket.published        = true;
+        stats.publisher  = std::this_thread::get_id();
+        ticket.published = true;
         if (batch.deadline_retained) {
           auto residence =
             std::chrono::duration_cast<std::chrono::microseconds>(now() - *batch.deadline_retained);
@@ -441,8 +437,6 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
       if (record.state == unit_state::cancelled) slot.input.reset();
     }
     source.active_result = index;
-    if (slot.input && options.collect_timing && !stats.first_ready)
-      stats.first_ready = std::chrono::steady_clock::now();
     lock.unlock();
     auto step = slot.input
                   ? source.hooks.coalescer->advance(*slot.input, slot.cursor, options.drain_quantum)

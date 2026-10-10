@@ -54,7 +54,7 @@ class preparation_coordinator {
            partial_emissions = 0;
     std::thread::id owner, runner, publisher;
     std::chrono::microseconds max_residence{0}, max_deadline_lateness{0};
-    std::optional<std::chrono::steady_clock::time_point> first_ready, first_publication;
+
     lifecycle phase = lifecycle::constructed;
   };
   preparation_coordinator(pipeline::completion_handler&,

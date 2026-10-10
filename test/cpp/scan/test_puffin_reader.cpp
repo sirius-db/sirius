@@ -91,11 +91,9 @@ DeletionVectorRef fixture_ref()
           .record_count          = kCardinality};
 }
 
-std::vector<int64_t> read_for_test(DeletionVectorRef ref,
-                                   bool charged,
-                                   physical_check_counters const* counters = nullptr)
+std::vector<int64_t> read_for_test(DeletionVectorRef ref, bool charged)
 {
-  if (!charged) return read_deletion_vector(ref, counters);
+  if (!charged) return read_deletion_vector(ref);
   using namespace sirius::scan_manager;
   test::test_reservation_provider provider;
   auto path = ref.puffin_path;
@@ -116,7 +114,7 @@ std::vector<int64_t> read_for_test(DeletionVectorRef ref,
   auto permit = ledger.acquire_permit({1, 1});
   REQUIRE(permit);
   auto allocator = ledger.allocator(permit);
-  auto result    = read_deletion_vector_charged(ref, allocator, counters);
+  auto result    = read_deletion_vector_charged(ref, allocator);
   return {result->positions.begin(), result->positions.end()};
 }
 
@@ -668,55 +666,5 @@ TEST_CASE("Charged Puffin matches legacy Roaring validation and diagnostics",
     auto legacy = error(false);
     REQUIRE_FALSE(legacy.empty());
     CHECK(error(true) == legacy);
-  }
-}
-
-TEST_CASE("Puffin read counters report once without changing reader diagnostics",
-          "[scan][iceberg][observation]")
-{
-  auto charged = GENERATE(false, true);
-  auto enabled = GENERATE(false, true);
-  physical_check_counters counters;
-  counters.track_units = enabled;
-  unsigned reports     = 0;
-  bool matching_path = false, matching_route = false;
-  puffin_read_statistics observed;
-  counters.puffin_reads_for_testing = [&](auto const& path, bool actual, auto const& stats) {
-    ++reports;
-    observed       = stats;
-    matching_path  = path == fixture_ref().puffin_path;
-    matching_route = actual == charged;
-  };
-  CHECK(read_for_test(fixture_ref(), charged, &counters) == read_for_test(fixture_ref(), charged));
-  CHECK(reports == (enabled ? 1 : 0));
-  if (enabled) {
-    CHECK(matching_path);
-    CHECK(matching_route);
-    CHECK(observed.opens == 1);
-    CHECK(observed.requests == 6);
-    CHECK(observed.bytes_requested == observed.bytes_returned);
-    CHECK(observed.failures == 0);
-  }
-  auto ref = fixture_ref();
-  ref.puffin_path += ".missing";
-  auto error = [&](physical_check_counters const* stats) {
-    try {
-      (void)read_for_test(ref, charged, stats);
-    } catch (std::exception const& failure) {
-      return std::string(failure.what());
-    }
-    return std::string{};
-  };
-  counters.puffin_reads_for_testing = [&](auto const&, bool, auto const& stats) {
-    observed = stats;
-    throw std::runtime_error("observation failure");
-  };
-  auto expected = error(nullptr);
-  REQUIRE_FALSE(expected.empty());
-  CHECK(error(&counters) == expected);
-  if (enabled) {
-    CHECK(observed.opens == 1);
-    CHECK(observed.requests == 0);
-    CHECK(observed.failures == 1);
   }
 }

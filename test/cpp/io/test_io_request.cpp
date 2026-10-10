@@ -22,133 +22,13 @@
 // stopping new dispatch on the first error and still draining published work.
 // The tests below exercise those ordering and ownership requirements directly.
 
-#include "utils/cold_file_cache.hpp"
-
 #include <atomic>
 #include <cstddef>
 #include <exception>
-#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <thread>
 #include <vector>
-
-TEST_CASE("physical reads retain their phase across workers and retries", "[physical_reads]")
-{
-  using namespace sirius::io;
-  auto planning  = std::make_shared<physical_read_statistics>();
-  auto execution = std::make_shared<physical_read_statistics>();
-  std::shared_ptr<grouped_coordinator> first;
-  {
-    scoped_physical_reads scope(planning);
-    first = std::make_shared<grouped_coordinator>(8, 1);
-    {
-      scoped_physical_reads nested(execution);
-      CHECK(std::make_shared<grouped_coordinator>(8, 1)->physical_reads == execution);
-    }
-    CHECK(physical_reads_for_testing == planning);
-  }
-  CHECK_FALSE(physical_reads_for_testing);
-  std::thread worker([&] {
-    scoped_physical_reads current(execution);
-    physical_read_attempt read;
-    read.submitted(first->physical_reads, 8);
-    read.completed(-EINTR);
-    read.submitted(first->physical_reads, 8);
-    read.completed(3);
-    read.submitted(first->physical_reads, 5);
-    read.completed(5);
-    read.completed(5);  // Duplicate completion must not inflate bytes.
-  });
-  worker.join();
-  CHECK(planning->requests == 3);
-  CHECK(planning->completions == 3);
-  CHECK(planning->bytes_requested == 21);
-  CHECK(planning->bytes_returned == 8);
-  CHECK(planning->failures == 1);
-  CHECK(planning->short_reads == 1);
-  CHECK(planning->retries == 2);
-  CHECK(execution->requests == 0);
-}
-
-TEST_CASE("unreaped physical reads remain explicitly unobserved", "[physical_reads]")
-{
-  using namespace sirius::io;
-  auto stats = std::make_shared<physical_read_statistics>();
-  {
-    physical_read_attempt pending;
-    pending.submitted(stats, 4096);
-    physical_read_attempt moved(std::move(pending));
-  }
-  CHECK(stats->requests == 1);
-  CHECK(stats->completions == 0);
-  CHECK(stats->bytes_returned == 0);
-  CHECK(stats->unobserved_completions == 1);
-}
-
-TEST_CASE("cold cache verifies eviction and rejects invalid manifests", "[physical_reads]")
-{
-  // /tmp may be tmpfs, whose resident pages cannot be evicted with DONTNEED.
-  char directory[] = "./sirius-cold-XXXXXX";
-  REQUIRE(::mkdtemp(directory));
-  auto absolute = std::filesystem::absolute(directory).string();
-  auto data     = absolute + "/data";
-  auto manifest = absolute + "/files";
-  struct cleanup_files {
-    std::string data, manifest, directory;
-    ~cleanup_files()
-    {
-      ::unlink(data.c_str());
-      ::unlink(manifest.c_str());
-      ::rmdir(directory.c_str());
-    }
-  } cleanup{data, manifest, directory};
-  {
-    std::ofstream output(data);
-    output << std::string(8193, 'x');
-  }
-  {
-    std::ofstream output(manifest);
-    output << data << '\n';
-  }
-  auto result = sirius::test::evict_file_cache(manifest);
-  CHECK(result.files == 1);
-  CHECK(result.bytes == 8193);
-  CHECK(result.pages > 0);
-  {
-    auto fd = ::open(data.c_str(), O_RDONLY);
-    REQUIRE(fd >= 0);
-    auto* pinned = ::mmap(nullptr, 8193, PROT_READ, MAP_SHARED, fd, 0);
-    ::close(fd);
-    REQUIRE(pinned != MAP_FAILED);
-    struct unmap {
-      void* address;
-      ~unmap()
-      {
-        ::munlock(address, 8193);
-        ::munmap(address, 8193);
-      }
-    } cleanup_mapping{pinned};
-    REQUIRE(::mlock(pinned, 8193) == 0);
-    CHECK_THROWS_WITH(sirius::test::evict_file_cache(manifest),
-                      "cold-cache eviction left resident pages");
-  }
-  {
-    std::ofstream output(manifest);
-  }
-  CHECK_THROWS_WITH(sirius::test::evict_file_cache(manifest), "empty cold-cache file list");
-  {
-    std::ofstream output(manifest);
-    output << "relative/path\n";
-  }
-  CHECK_THROWS_WITH(sirius::test::evict_file_cache(manifest),
-                    "cold-cache file list requires absolute local paths");
-  {
-    std::ofstream output(manifest);
-    output << data << "-missing\n";
-  }
-  CHECK_THROWS(sirius::test::evict_file_cache(manifest));
-}
 
 using sirius::io::grouped_coordinator;
 using sirius::io::io_op_request;

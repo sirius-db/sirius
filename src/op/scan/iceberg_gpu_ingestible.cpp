@@ -160,8 +160,7 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
                                        allocator,
                                        descriptor.path,
                                        prepared.path_owner(),
-                                       prepared.contract,
-                                       counters.get());
+                                       prepared.contract);
   } catch (unsupported_physical_input const& error) {
     if (counters) counters->record(error.reason);
     throw;

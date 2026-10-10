@@ -3611,7 +3611,7 @@ TEST_CASE("S3 Puffin open failures retain their phase and replay veto on both pr
     {
       value->preparation_provider_for_testing.reset();
       value->iceberg_preparation_route_for_testing = {};
-      value->puffin_reads_for_testing              = {};
+      value->iceberg_dv_phase_for_testing          = {};
     }
   } reset{counters};
   counters->preparation_provider_for_testing = provider;
@@ -3619,18 +3619,18 @@ TEST_CASE("S3 Puffin open failures retain their phase and replay veto on both pr
   for (bool deferred : {false, true}) {
     for (bool fallback : {false, true}) {
       provider->return_null = !deferred;
-      size_t routes = 0, opens = 0, failures = 0;
-      bool selected = !deferred, charged = !deferred;
+      size_t routes = 0, reads_started = 0;
+      bool selected = !deferred;
       std::string opened_path;
       counters->iceberg_preparation_route_for_testing = [&](auto, bool route) {
         ++routes;
         selected = route;
       };
-      counters->puffin_reads_for_testing = [&](auto const& path, bool bounded, auto const& stats) {
-        opened_path = path;
-        charged     = bounded;
-        opens += stats.opens;
-        failures += stats.failures;
+      counters->iceberg_dv_phase_for_testing = [&](auto const& path, bool start) {
+        if (start) {
+          opened_path = path;
+          ++reads_started;
+        }
       };
       require_query_ok(con,
                        std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"));
@@ -3641,17 +3641,16 @@ TEST_CASE("S3 Puffin open failures retain their phase and replay veto on both pr
       INFO(result->GetError());
       CHECK(routes == 1);
       CHECK(selected == deferred);
-      CHECK(charged == deferred);
       CHECK(opened_path == remote + "/dv_bounded/data/a.puffin");
-      CHECK(opens == 1);
-      CHECK(failures == 1);
+      CHECK(reads_started == 1);
+      CHECK(result->GetError().find("Cannot open file") != std::string::npos);
       auto after = context.get_transparent_execution_stats();
       auto cause = static_cast<size_t>(sirius::transparent::late_failure_cause::reader_io);
       CHECK(after.late_failures[cause] == before.late_failures[cause] + (deferred ? 1 : 0));
       CHECK(after.late_replays[cause] == before.late_replays[cause]);
       CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
       CHECK(after.fallbacks == before.fallbacks);
-      CHECK(after.preparation_legacy_route == before.preparation_legacy_route + (deferred ? 0 : 1));
+
       CHECK(provider->outstanding() == 0);
       CHECK(provider->seen->allocated_bytes == 0);
     }

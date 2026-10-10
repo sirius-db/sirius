@@ -144,8 +144,7 @@ class unique_ring {
 
   void seen(io_uring_cqe* cqe) const noexcept { io_uring_cqe_seen(_ring.get(), cqe); }
 
-  template <typename Accepted>
-  void submit(std::size_t expected, std::size_t& inflight, Accepted&& accepted)
+  void submit(std::size_t expected, std::size_t& inflight)
   {
     std::size_t submitted = 0;
     while (submitted < expected) {
@@ -155,7 +154,6 @@ class unique_ring {
         throw std::system_error(std::error_code{error, std::generic_category()},
                                 "uring_reactor: io_uring_submit");
       }
-      accepted(submitted, static_cast<std::size_t>(rc));
       submitted += static_cast<std::size_t>(rc);
       inflight += static_cast<std::size_t>(rc);
     }
@@ -220,8 +218,6 @@ struct io_slot {
 
   int index;
   bool fixed_supported;
-  physical_read_attempt physical_read;
-  size_t submitted_bytes{0};
   bool used_fixed{false};
   std::size_t bytes_read{0};
   slot_state state{slot_state::idle};
@@ -232,7 +228,6 @@ struct io_slot {
 
   void reset() noexcept
   {
-    physical_read.reset();
     op.reset();
     resume_iovecs.clear();
     bytes_read = 0;
@@ -256,9 +251,6 @@ struct io_slot {
            !resume_iovecs.empty());
     auto& request = op->request;
 
-    submitted_bytes = 0;
-    for (auto const& iov : resume_iovecs)
-      submitted_bytes += iov.iov_len;
     auto const offset        = request.io_rng.offset + bytes_read;
     bool const can_use_fixed = op->needs_staging() && op->staging_blocks == 1 &&
                                resume_iovecs.size() == 1 && bytes_read == 0 && fixed_supported;
@@ -608,14 +600,11 @@ std::size_t uring_reactor::host_read(local_io_object const& file,
                                      std::uint8_t* destination)
 {
   std::size_t completed = 0;
-  physical_read_attempt observation;
   while (completed < bytes) {
-    observation.submitted(physical_reads_for_testing, bytes - completed);
     auto const result = ::pread(file.buffered_handle(),
                                 destination + completed,
                                 bytes - completed,
                                 static_cast<off_t>(offset + completed));
-    observation.completed(result);
     if (result < 0) {
       if (errno == EINTR) continue;
       throw std::system_error(errno, std::generic_category(), "uring_reactor::host_read");
@@ -830,7 +819,6 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         auto& slot = slots[index];
         if (slot.op == nullptr || slot.state != slot_state::reading) continue;
 
-        slot.physical_read.completed(result);
         if (result < 0) {
           auto const errc = -result;
           if (slot.op->use_odirect && detail::is_odirect_runtime_error(errc)) {
@@ -894,13 +882,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
 
     auto submit_slots = [&](std::vector<int> const& indexes) {
       if (indexes.empty()) return;
-      ring.submit(indexes.size(), inflight, [&](size_t begin, size_t count) noexcept {
-        for (size_t i = begin; i < begin + count; ++i) {
-          auto& slot = slots[indexes[i]];
-          slot.physical_read.submitted(slot.op->request.coordinator->physical_reads,
-                                       slot.submitted_bytes);
-        }
-      });
+      ring.submit(indexes.size(), inflight);
     };
 
     auto resubmit_incomplete = [&]() {

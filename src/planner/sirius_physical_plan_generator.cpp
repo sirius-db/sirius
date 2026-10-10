@@ -501,8 +501,6 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
   if (counters->track_units && counters->iceberg_statement_route_for_testing)
     counters->iceberg_statement_route_for_testing(route_reason, decision);
   for (auto const& c : scans) {
-    if (!c.info->deferred)
-      counters->preparation_legacy_route.fetch_add(1, std::memory_order_relaxed);
     if (counters->track_units && counters->iceberg_preparation_route_for_testing)
       counters->iceberg_preparation_route_for_testing(c.scan->contract_id, bool(c.info->deferred));
   }
@@ -1931,9 +1929,6 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_iceberg_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
-  if (auto counters = read_views->profiles->counters;
-      counters && counters->track_units && counters->scan_plan_complete_for_testing)
-    counters->scan_plan_complete_for_testing();
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(

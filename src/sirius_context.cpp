@@ -1514,8 +1514,6 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
   }
   snapshot.iceberg_manifest_walks =
     physical_counters_->iceberg_manifest_walks.load(std::memory_order_relaxed);
-  snapshot.preparation_legacy_route =
-    physical_counters_->preparation_legacy_route.load(std::memory_order_relaxed);
   snapshot.iceberg_dv_manifest_reads =
     physical_counters_->iceberg_dv_manifest_reads.load(std::memory_order_relaxed);
   snapshot.iceberg_delete_payload_loads =

@@ -30,7 +30,6 @@ struct preparation_options {
   size_t max_inflight_jobs, max_active_units, max_pending_results, max_control_work, drain_quantum;
   std::optional<std::chrono::milliseconds> underfilled_batch_residence;
   std::chrono::milliseconds interrupt_check_interval = k_interrupt_check_interval;
-  bool collect_timing                                = false;
 };
 // YAML and C++ overrides; omitted limits are derived from the scan worker count.
 struct preparation_config {

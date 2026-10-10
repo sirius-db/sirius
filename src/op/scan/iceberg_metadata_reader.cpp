@@ -556,8 +556,7 @@ void materialize_positional_deletes(duckdb::ClientContext& context,
                               .content_offset        = dv_entry.content_offset,
                               .content_size_in_bytes = dv_entry.content_size_in_bytes,
                               .referenced_data_file  = dv_entry.referenced_data_file,
-                              .record_count          = dv_entry.record_count},
-                             counters.get());
+                              .record_count          = dv_entry.record_count});
       if (counters && counters->track_units && counters->iceberg_dv_phase_for_testing)
         counters->iceberg_dv_phase_for_testing(dv_entry.file_path, false);
 

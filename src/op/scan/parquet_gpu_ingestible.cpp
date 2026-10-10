@@ -989,16 +989,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // bytes nothing consumes, and the open only needs the size; the exact
   // generation lookup below decides reuse. Mirrors describe_parquet.
   bool const footer_cached = io_ctx->metadata_store().has_path(file_path);
-  std::shared_ptr<io::sirius_datasource> sirius_ds;
-  {
-    auto counters = _info->profiles->counters;
-    if (counters && counters->track_units && counters->parquet_datasource_for_testing)
-      counters->parquet_datasource_for_testing(file_path, nullptr, false);
-    sirius_ds = io_ctx->open_datasource(
-      file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
-    if (sirius_ds && counters && counters->track_units && counters->parquet_datasource_for_testing)
-      counters->parquet_datasource_for_testing(file_path, sirius_ds.get(), false);
-  }
+  auto sirius_ds           = io_ctx->open_datasource(
+    file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }
