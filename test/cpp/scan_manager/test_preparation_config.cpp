@@ -33,7 +33,7 @@ TEST_CASE("Preparation options have finite defaults and preserve post-resolution
   CHECK(defaults.max_control_work > 0);
   CHECK(defaults.drain_quantum > 0);
   CHECK(defaults.interrupt_check_interval == std::chrono::milliseconds(10));
-  CHECK_FALSE(defaults.underfilled_batch_residence.has_value());  // benchmark precedes activation
+  CHECK(defaults.underfilled_batch_residence == std::chrono::milliseconds(10));
   config.preparation.interrupt_check_interval    = std::chrono::milliseconds(3);
   config.preparation.max_inflight_jobs           = 2;
   config.preparation.max_active_units            = 7;

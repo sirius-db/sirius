@@ -3705,6 +3705,51 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Production residence publishes ready data before a blocked footer resumes",
+                 "[integration][scan_preparation][iceberg][default_residence]")
+{
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  preparation_measurement observed(counters);
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool earlier_decoded = false, overlapped = false;
+  struct reset_hook {
+    decltype(counters) value;
+    ~reset_hook() { value->parquet_phase_for_testing = {}; }
+  } reset{counters};
+  counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
+    std::unique_lock lock(mutex);
+    if (footer && file.ends_with("c.parquet")) {
+      if (!changed.wait_for(lock, std::chrono::seconds(20), [&] { return earlier_decoded; }))
+        throw std::runtime_error("ready data did not decode while the later footer was blocked");
+      overlapped = true;
+    } else if (!footer && !file.ends_with("c.parquet")) {
+      earlier_decoded = true;
+      changed.notify_all();
+    }
+  };
+  std::vector<std::vector<std::string>> expected;
+  for (int i = 0; i < 3; ++i)
+    for (auto row : std::vector<std::vector<std::string>>{
+           {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}})
+      expected.push_back(std::move(row));
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_three")),
+                      gpu_route::gpu,
+                      expected);
+  CHECK(overlapped);
+  REQUIRE(observed.routes.size() == 1);
+  CHECK(observed.routes.front().second);
+  auto publication = observed.publication();
+  CHECK(publication.partial_emissions > 0);
+  REQUIRE(sirius::scan_manager::k_underfilled_batch_residence);
+  CHECK(publication.max_residence >= *sirius::scan_manager::k_underfilled_batch_residence);
+  REQUIRE(publication.first_ready);
+  REQUIRE(publication.first_publication);
+  CHECK(*publication.first_publication >= *publication.first_ready);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "A statement admits all DV scans once or keeps all legacy and releases idle plans",
                  "[integration][scan_preparation][iceberg][statement_admission]")
 {
@@ -3831,6 +3876,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "GPU prepared statements own and renew deferred reservations",
                  "[integration][scan_preparation][iceberg][prepared_statement]")
 {
+  // PendingQuery schedules tasks immediately; keep its plan idle until Execute().
+  // Restore through a separate connection because one section releases con first.
+  duckdb::Connection settings(duckdb::DatabaseInstance::GetDatabase(*con->context));
+  sirius::test::scoped_setting single_duckdb_thread(settings, "threads", 1);
   REQUIRE_FALSE(con->Query("SET gpu_execution=true")->HasError());
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
   auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();

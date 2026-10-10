@@ -21,9 +21,11 @@
 #include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 
+#include <algorithm>
 #include <array>
 #include <condition_variable>
 #include <future>
+#include <iostream>
 #include <mutex>
 using namespace sirius::scan_manager;
 using namespace std::chrono_literals;
@@ -147,13 +149,14 @@ struct fixture {
   explicit fixture(size_t workers                               = 2,
                    size_t slots                                 = 4,
                    std::chrono::milliseconds interrupt_interval = k_interrupt_check_interval,
-                   bool collect_timing                          = false)
+                   bool collect_timing                          = false,
+                   std::optional<preparation_options> options   = std::nullopt)
     : pool(static_cast<int>(workers)),
       dispatcher(pool),
       coordinator(completion,
                   dispatcher,
-                  preparation_options{
-                    workers, slots, slots, workers, 1, 20ms, interrupt_interval, collect_timing})
+                  options.value_or(preparation_options{
+                    workers, slots, slots, workers, 1, 20ms, interrupt_interval, collect_timing}))
   {
   }
   std::thread owner;
@@ -245,6 +248,90 @@ struct fixture {
   }
 };
 }  // namespace
+TEST_CASE("Measure residence latency and batch count under controlled metadata arrivals",
+          "[.][scan_preparation][preparation_residence_cost]")
+{
+  using clock = std::chrono::steady_clock;
+  struct sample {
+    int delay, scenario;
+    int64_t first_us, total_us;
+    size_t batches;
+  };
+  std::vector<sample> samples;
+  std::array delays{0, 2, 5, 10, 20};
+  for (int repetition = 0; repetition < 20; ++repetition) {
+    for (int scenario = 0; scenario < 3; ++scenario) {
+      for (int index = 0; index < static_cast<int>(delays.size()); ++index) {
+        auto delay   = delays[repetition % 2 ? delays.size() - 1 - index : index];
+        auto options = preparation_config{}.resolve(2);
+        options.underfilled_batch_residence =
+          delay ? std::optional{std::chrono::milliseconds(delay)} : std::nullopt;
+        options.collect_timing = true;
+        fixture f(2, 4, k_interrupt_check_interval, true, options);
+        auto out   = std::make_shared<sink>();
+        auto a     = std::make_shared<accumulator>(16);
+        auto count = scenario == 0 ? 64 : scenario == 1 ? 24 : 2;
+        int next   = 0;
+        f.source(a, out, [&]() -> std::optional<preparation_coordinator::job> {
+          auto id = next++;
+          if (id >= count) return {};
+          return preparation_coordinator::job{[=] {
+                                                if (scenario == 1) std::this_thread::sleep_for(2ms);
+                                                if (scenario == 2 && id == 1)
+                                                  std::this_thread::sleep_for(40ms);
+                                                return std::make_unique<tagged>(id);
+                                              },
+                                              {}};
+        });
+        auto guard = f.shutdown_guard();
+        auto begin = clock::now();
+        f.start();
+        size_t consumed = 0;
+        while (!out->closed.load()) {
+          REQUIRE(clock::now() - begin < 2s);
+          auto published = out->count();
+          while (consumed < published) {
+            out->consume();
+            ++consumed;
+          }
+          std::this_thread::sleep_for(100us);
+        }
+        f.finish();
+        REQUIRE_FALSE(f.completion.has_error());
+        auto stats = f.coordinator.snapshot();
+        REQUIRE(stats.first_ready);
+        REQUIRE(stats.first_publication);
+        samples.push_back(
+          {delay,
+           scenario,
+           std::chrono::duration_cast<std::chrono::microseconds>(*stats.first_publication -
+                                                                 *stats.first_ready)
+             .count(),
+           std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - begin).count(),
+           out->count()});
+      }
+    }
+  }
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    for (int delay : delays) {
+      std::vector<int64_t> first, total, batches;
+      for (auto const& s : samples) {
+        if (s.scenario != scenario || s.delay != delay) continue;
+        first.push_back(s.first_us);
+        total.push_back(s.total_us);
+        batches.push_back(s.batches);
+      }
+      std::sort(first.begin(), first.end());
+      std::sort(total.begin(), total.end());
+      std::sort(batches.begin(), batches.end());
+      std::cout << "RESIDENCE_COST scenario=" << scenario << " limit_ms=" << delay
+                << " samples=" << first.size() << " first_p50_us=" << first[9]
+                << " first_p95_us=" << first[18] << " total_p95_us=" << total[18]
+                << " batches_p50=" << batches[9] << '\n';
+    }
+  }
+}
+
 TEST_CASE("Ready partial batches publish while every preparation worker is blocked",
           "[scan_preparation][coordinator]")
 {
@@ -555,10 +642,13 @@ TEST_CASE("GPU completion without a ready event still stops preparation and sett
   f.finish();
   CHECK(out->count() == 0);
 }
-TEST_CASE("A deterministic clock drives the coordinator at the original absolute deadline",
+TEST_CASE("Production defaults publish retained input while later metadata remains blocked",
           "[scan_preparation][coordinator]")
 {
-  fixture f;
+  auto options = preparation_config{}.resolve(2);
+  REQUIRE(options.underfilled_batch_residence);
+  auto residence = *options.underfilled_batch_residence;
+  fixture f(2, 4, k_interrupt_check_interval, false, options);
   auto out      = std::make_shared<sink>();
   auto a        = std::make_shared<accumulator>();
   auto h        = f.make_hold();
@@ -586,15 +676,17 @@ TEST_CASE("A deterministic clock drives the coordinator at the original absolute
   auto query_guard = f.shutdown_guard();
   f.start();
   REQUIRE(reached.wait_for(1s) == std::future_status::ready);
-  tick->store(19);
+  REQUIRE(h->await());
+  tick->store(residence.count() - 1);
   f.coordinator.wake_for_testing();
   std::this_thread::sleep_for(5ms);
   CHECK(out->count() == 0);
-  tick->store(20);
+  tick->store(residence.count());
   f.coordinator.wake_for_testing();
   REQUIRE(out->await(1));
-  CHECK(f.coordinator.snapshot().max_residence == 20ms);
+  CHECK(f.coordinator.snapshot().max_residence == residence);
   CHECK(f.coordinator.snapshot().max_deadline_lateness == 0ms);
+  CHECK_FALSE(out->closed.load());
   tick->store(100);
   f.coordinator.wake_for_testing();
   std::this_thread::sleep_for(5ms);

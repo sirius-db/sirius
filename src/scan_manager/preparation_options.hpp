@@ -22,9 +22,9 @@
 #include <stdexcept>
 
 namespace sirius::scan_manager {
-// Intentionally unset until performance measurements establish a production wait limit.
+// Bound the wait for more metadata without flushing every small completion separately.
 inline constexpr std::optional<std::chrono::milliseconds> k_underfilled_batch_residence =
-  std::nullopt;
+  std::chrono::milliseconds{10};
 inline constexpr std::chrono::milliseconds k_interrupt_check_interval{10};
 struct preparation_options {
   size_t max_inflight_jobs, max_active_units, max_pending_results, max_control_work, drain_quantum;
@@ -32,7 +32,7 @@ struct preparation_options {
   std::chrono::milliseconds interrupt_check_interval = k_interrupt_check_interval;
   bool collect_timing                                = false;
 };
-// C++ construction seam only. No SQL, YAML or environment configuration keys.
+// YAML and C++ overrides; omitted limits are derived from the scan worker count.
 struct preparation_config {
   std::optional<size_t> max_inflight_jobs, max_active_units, max_pending_results, max_control_work,
     drain_quantum;
