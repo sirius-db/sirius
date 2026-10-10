@@ -223,6 +223,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
     REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
     REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
@@ -289,6 +290,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
   }
 
@@ -310,6 +312,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
+    REQUIRE(setting_count(con, "cross_join_task_bytes") == 1);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 1);
     duckdb::Value native_enabled;
     auto native_setting =
@@ -931,6 +934,7 @@ void require_shared_operator_defaults(const sirius::operator_params& params, uin
   REQUIRE(params.scan_task_batch_size == batch);
   REQUIRE(params.hash_partition_bytes == batch);
   REQUIRE(params.concat_batch_bytes == batch);
+  REQUIRE(params.cross_join_task_bytes == batch);
   REQUIRE(params.sort_sample_bytes == batch);
   REQUIRE(params.max_build_hash_table_bytes == 2 * batch);
 }
@@ -1036,6 +1040,7 @@ TEST_CASE("explicit operator batch values override effective-capacity defaults",
   REQUIRE(params.concat_batch_bytes == 3 * mib);
   REQUIRE(params.sort_sample_bytes == 4 * mib);
   REQUIRE(params.max_build_hash_table_bytes == 5 * mib);
+  REQUIRE(params.cross_join_task_bytes == 6 * mib);
 }
 
 TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",

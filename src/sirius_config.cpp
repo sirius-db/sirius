@@ -77,6 +77,7 @@ constexpr batch_setting batch_settings[] = {
   {"scan_task_batch_size", &operator_params::scan_task_batch_size, 1},
   {"hash_partition_bytes", &operator_params::hash_partition_bytes, 1},
   {"concat_batch_bytes", &operator_params::concat_batch_bytes, 1},
+  {"cross_join_task_bytes", &operator_params::cross_join_task_bytes, 1},
   {"sort_sample_bytes", &operator_params::sort_sample_bytes, 1},
   {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 2}};
 
@@ -334,6 +335,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     throw std::runtime_error("'operator_params.hash_partition_bytes': must be greater than zero");
   }
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
+  r.optional("cross_join_task_bytes", yaml::bytes(opt.cross_join_task_bytes));
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));

@@ -2883,15 +2883,7 @@ namespace {
 /// representation (a host pin may mix compressed and uncompressed chunks).
 std::size_t pinned_host_chunk_rows(cucascade::idata_representation const& chunk)
 {
-  if (auto const* compressed =
-        dynamic_cast<sirius::compressed_host_representation const*>(&chunk)) {
-    return static_cast<std::size_t>(compressed->num_rows());
-  }
-  auto const& host_table = chunk.cast<cucascade::host_data_representation>().get_host_table();
-  if (host_table && !host_table->columns.empty()) {
-    return static_cast<std::size_t>(host_table->columns.front().num_rows);
-  }
-  return 0;
+  return sirius::representation_num_rows(chunk).value_or(0);
 }
 
 }  // namespace
