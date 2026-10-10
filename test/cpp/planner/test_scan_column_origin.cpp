@@ -15,14 +15,15 @@
  */
 
 /**
- * @file test_build_key_domain.cpp
- * @brief Tests positional lineage resolution for build-key domains.
+ * @file test_scan_column_origin.cpp
+ * @brief Tests shared column tracing and its dynamic-filter domain consumer.
  *
  * The CPU-only fixtures use disjoint ordinal and cardinality ranges so resolving the wrong scan or
  * coordinate produces an unmistakable result.
  */
 
 #include "planner/dynamic_filter/build_key_domain.hpp"
+#include "planner/scan_column_origin.hpp"
 
 #include <catch.hpp>
 #include <duckdb/planner/bound_result_modifier.hpp>
@@ -31,6 +32,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_aggregate.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <duckdb/planner/operator/logical_cross_product.hpp>
 #include <duckdb/planner/operator/logical_cteref.hpp>
 #include <duckdb/planner/operator/logical_distinct.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
@@ -51,10 +53,32 @@
 #include <vector>
 
 using sirius::planner::build_key_domain_cardinalities;
+using sirius::planner::origin_policy;
+using sirius::planner::resolve_scan_column_origin;
 using sirius::planner::detail::resolve_build_key_scans;
-using sirius::planner::detail::resolve_pass_through_scan;
 
 namespace {
+
+// Structural tests exercise the shared tracer; the domain tests below exercise its consumer.
+duckdb::LogicalGet const* resolve_pass_through_scan(duckdb::LogicalOperator const& subtree,
+                                                    std::size_t ordinal)
+{
+  auto const origin = resolve_scan_column_origin(subtree, ordinal, origin_policy::row_subset);
+  return origin ? origin->get : nullptr;
+}
+
+constexpr auto kValues = origin_policy::value_preserving;
+constexpr auto kRows   = origin_policy::row_subset;
+using at               = std::pair<duckdb::idx_t, std::size_t>;
+
+std::optional<at> origin_of(duckdb::LogicalOperator const& op,
+                            std::size_t ordinal,
+                            origin_policy policy)
+{
+  auto const origin = resolve_scan_column_origin(op, ordinal, policy);
+  if (!origin) { return std::nullopt; }
+  return at{origin->get->table_index, origin->ordinal};
+}
 
 // Assign each table a distinct cardinality so resolving the wrong scan is visible.
 constexpr std::size_t stub_cardinality_of(duckdb::idx_t table_index)
@@ -145,17 +169,6 @@ duckdb::JoinCondition make_condition(duckdb::unique_ptr<duckdb::Expression> left
   return condition;
 }
 
-// Require each resolvable output ordinal to reach the expected scan.
-void require_all_ordinals_resolve_to(duckdb::LogicalOperator const& subtree,
-                                     std::size_t output_width,
-                                     duckdb::LogicalGet const* expected)
-{
-  for (auto const ordinal : std::views::iota(std::size_t{0}, output_width)) {
-    auto const* resolved = resolve_pass_through_scan(subtree, ordinal);
-    if (resolved != nullptr) { REQUIRE(resolved == expected); }
-  }
-}
-
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -163,7 +176,7 @@ void require_all_ordinals_resolve_to(duckdb::LogicalOperator const& subtree,
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("walk resolves a plain base scan and refuses ordinals past its width",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto get = make_get(/*table_index=*/0, /*width=*/3);
   get->ResolveOperatorTypes();
@@ -175,7 +188,7 @@ TEST_CASE("walk resolves a plain base scan and refuses ordinals past its width",
 }
 
 TEST_CASE("walk uses the projected scan width when projection_ids narrow the scan",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto get            = make_get(/*table_index=*/0, /*width=*/4);
   get->projection_ids = {2};  // scan output is one column
@@ -186,7 +199,7 @@ TEST_CASE("walk uses the projected scan width when projection_ids narrow the sca
   REQUIRE(resolve_pass_through_scan(*get, 3) == nullptr);
 }
 
-TEST_CASE("walk refuses a table-in-out scan wholesale", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk refuses a table-in-out scan wholesale", "[planner][scan_column_origin]")
 {
   // A GET with projected input appends its child's columns after the scan columns, so "the base
   // table's row count" is not meaningful for any ordinal of this node.
@@ -205,7 +218,7 @@ TEST_CASE("walk refuses a table-in-out scan wholesale", "[dynamic_filter][build_
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("walk resolves a projection pass-through at a non-identity position",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto get        = make_get(/*table_index=*/0, /*width=*/3);
   auto const* raw = get.get();
@@ -220,7 +233,7 @@ TEST_CASE("walk resolves a projection pass-through at a non-identity position",
   REQUIRE(resolve_pass_through_scan(*projection, 2) == nullptr);  // past the projection width
 }
 
-TEST_CASE("walk applies the FILTER projection map", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk applies the FILTER projection map", "[planner][scan_column_origin]")
 {
   // The child projection makes the map observable: mapped resolution lands on a pass-through
   // reference, identity resolution lands on a computed expression and refuses.
@@ -248,7 +261,7 @@ TEST_CASE("walk applies the FILTER projection map", "[dynamic_filter][build_key_
   }
 }
 
-TEST_CASE("walk applies the ORDER_BY projection map", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk applies the ORDER_BY projection map", "[planner][scan_column_origin]")
 {
   auto get = make_get(/*table_index=*/0, /*width=*/2);
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
@@ -275,7 +288,7 @@ TEST_CASE("walk applies the ORDER_BY projection map", "[dynamic_filter][build_ke
 }
 
 TEST_CASE("walk passes through LIMIT, TOP_N, and DISTINCT by identity",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto make_traced_child = [] {
     auto get        = make_get(/*table_index=*/0, /*width=*/2);
@@ -311,7 +324,7 @@ TEST_CASE("walk passes through LIMIT, TOP_N, and DISTINCT by identity",
   }
 }
 
-TEST_CASE("walk resolves aggregate group ordinals only", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk resolves aggregate group ordinals only", "[planner][scan_column_origin]")
 {
   auto make_aggregate = [](duckdb::unique_ptr<duckdb::LogicalOperator> child) {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
@@ -339,18 +352,19 @@ TEST_CASE("walk resolves aggregate group ordinals only", "[dynamic_filter][build
 
     REQUIRE(resolve_pass_through_scan(*aggregate, 1) == nullptr);
   }
-  SECTION("multiple grouping sets refuse even at a group ordinal")
+  SECTION("multiple grouping sets preserve values but can repeat rows")
   {
     auto aggregate = make_aggregate(make_get(/*table_index=*/0, /*width=*/2));
-    aggregate->grouping_sets.push_back(duckdb::GroupingSet{});
+    aggregate->grouping_sets.push_back(duckdb::GroupingSet{0});
     aggregate->grouping_sets.push_back(duckdb::GroupingSet{});
     aggregate->ResolveOperatorTypes();
 
     REQUIRE(resolve_pass_through_scan(*aggregate, 0) == nullptr);
+    CHECK(origin_of(*aggregate, 0, kValues) == at{0, 1});
   }
 }
 
-TEST_CASE("walk composes a three-level stack", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk composes a three-level stack", "[planner][scan_column_origin]")
 {
   // GET(width 3) -> FILTER(map {2, 0}) -> PROJECTION([ref 1]): projection output 0 reads filter
   // output 1, the map sends 1 to child ordinal 0, which is within the scan. Every level's remap
@@ -374,86 +388,88 @@ TEST_CASE("walk composes a three-level stack", "[dynamic_filter][build_key_domai
 // Joins
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("walk continues through row-subset joins to the emitted side",
-          "[dynamic_filter][build_key_domain]")
+TEST_CASE("scan column origin - inner join forwards both sides only for values",
+          "[planner][scan_column_origin]")
 {
-  auto const semi_like_left = {duckdb::JoinType::SEMI, duckdb::JoinType::ANTI};
-  for (auto const join_type : semi_like_left) {
-    auto left            = make_get(/*table_index=*/0, /*width=*/2);
-    auto const* left_raw = left.get();
-    auto right           = make_get(/*table_index=*/1, /*width=*/2);
-    auto join            = make_join(join_type, std::move(left), std::move(right));
-    join->ResolveOperatorTypes();
-
-    // Output is only the left block.
-    REQUIRE(join->types.size() == 2);
-    REQUIRE(resolve_pass_through_scan(*join, 0) == left_raw);
-    REQUIRE(resolve_pass_through_scan(*join, 1) == left_raw);
-    REQUIRE(resolve_pass_through_scan(*join, 2) == nullptr);
-  }
-
-  auto const semi_like_right = {duckdb::JoinType::RIGHT_SEMI, duckdb::JoinType::RIGHT_ANTI};
-  for (auto const join_type : semi_like_right) {
-    auto left             = make_get(/*table_index=*/0, /*width=*/2);
-    auto right            = make_get(/*table_index=*/1, /*width=*/3);
-    auto const* right_raw = right.get();
-    auto join             = make_join(join_type, std::move(left), std::move(right));
-    join->ResolveOperatorTypes();
-
-    // Output is only the right block.
-    REQUIRE(join->types.size() == 3);
-    require_all_ordinals_resolve_to(*join, 3, right_raw);
-    REQUIRE(resolve_pass_through_scan(*join, 0) == right_raw);
-  }
-}
-
-TEST_CASE("walk continues through MARK's left block and refuses the mark column",
-          "[dynamic_filter][build_key_domain]")
-{
-  auto left            = make_get(/*table_index=*/0, /*width=*/2);
-  auto const* left_raw = left.get();
-  auto right           = make_get(/*table_index=*/1, /*width=*/2);
-  auto join            = make_join(duckdb::JoinType::MARK, std::move(left), std::move(right));
+  auto join = make_join(duckdb::JoinType::INNER, make_get(0, 2), make_get(1, 3));
   join->ResolveOperatorTypes();
-
-  REQUIRE(join->types.size() == 3);  // left block + appended BOOLEAN mark
-  REQUIRE(resolve_pass_through_scan(*join, 0) == left_raw);
-  REQUIRE(resolve_pass_through_scan(*join, 1) == left_raw);
-  REQUIRE(resolve_pass_through_scan(*join, 2) == nullptr);  // the mark column
-}
-
-TEST_CASE("walk continues through SINGLE's left block and refuses its right block",
-          "[dynamic_filter][build_key_domain]")
-{
-  auto left            = make_get(/*table_index=*/0, /*width=*/2);
-  auto const* left_raw = left.get();
-  auto right           = make_get(/*table_index=*/1, /*width=*/3);
-  auto join            = make_join(duckdb::JoinType::SINGLE, std::move(left), std::move(right));
-  join->ResolveOperatorTypes();
-
   REQUIRE(join->types.size() == 5);
-  REQUIRE(resolve_pass_through_scan(*join, 0) == left_raw);
-  REQUIRE(resolve_pass_through_scan(*join, 1) == left_raw);
-  // Right-block values may repeat across left rows, so every right ordinal refuses.
-  for (auto const ordinal : std::views::iota(std::size_t{2}, std::size_t{5})) {
-    REQUIRE(resolve_pass_through_scan(*join, ordinal) == nullptr);
+  CHECK(origin_of(*join, 1, kValues) == at{0, 1});
+  CHECK(origin_of(*join, 2, kValues) == at{1, 0});
+  CHECK(origin_of(*join, 4, kValues) == at{1, 2});
+  CHECK_FALSE(origin_of(*join, 5, kValues).has_value());
+  for (std::size_t ordinal = 0; ordinal < 5; ++ordinal) {
+    CHECK_FALSE(origin_of(*join, ordinal, kRows).has_value());
   }
 }
 
-TEST_CASE("walk refuses row-multiplying and DELIM joins on every ordinal",
-          "[dynamic_filter][build_key_domain]")
+TEST_CASE("scan column origin - projection maps select the forwarded columns",
+          "[planner][scan_column_origin]")
 {
-  SECTION("INNER refuses both sides")
-  {
-    auto join = make_join(duckdb::JoinType::INNER,
-                          make_get(/*table_index=*/0, /*width=*/2),
-                          make_get(/*table_index=*/1, /*width=*/2));
-    join->ResolveOperatorTypes();
+  auto join = make_join(duckdb::JoinType::LEFT, make_get(0, 3), make_get(1, 3), {2}, {0, 2});
+  join->ResolveOperatorTypes();
+  REQUIRE(join->types.size() == 3);
+  CHECK(origin_of(*join, 0, kValues) == at{0, 2});
+  CHECK(origin_of(*join, 1, kValues) == at{1, 0});
+  CHECK(origin_of(*join, 2, kValues) == at{1, 2});
+  CHECK_FALSE(origin_of(*join, 3, kValues).has_value());
+}
 
-    for (auto const ordinal : std::views::iota(std::size_t{0}, join->types.size())) {
-      REQUIRE(resolve_pass_through_scan(*join, ordinal) == nullptr);
+TEST_CASE("scan column origin - semi, anti and mark joins emit the left block only",
+          "[planner][scan_column_origin]")
+{
+  for (auto const type : {duckdb::JoinType::SEMI, duckdb::JoinType::ANTI, duckdb::JoinType::MARK}) {
+    auto join = make_join(type, make_get(0, 2), make_get(1, 2));
+    join->ResolveOperatorTypes();
+    for (auto const policy : {kValues, kRows}) {
+      CHECK(origin_of(*join, 0, policy) == at{0, 0});
+      CHECK(origin_of(*join, 1, policy) == at{0, 1});
+      // MARK's appended BOOLEAN and anything past the left block come from no scan column.
+      CHECK_FALSE(origin_of(*join, 2, policy).has_value());
+      CHECK_FALSE(origin_of(*join, 3, policy).has_value());
     }
   }
+}
+
+TEST_CASE("scan column origin - right semi and anti joins emit the right block only",
+          "[planner][scan_column_origin]")
+{
+  for (auto const type : {duckdb::JoinType::RIGHT_SEMI, duckdb::JoinType::RIGHT_ANTI}) {
+    auto join = make_join(type, make_get(0, 2), make_get(1, 2), {}, {1});
+    join->ResolveOperatorTypes();
+    REQUIRE(join->types.size() == 1);
+    for (auto const policy : {kValues, kRows}) {
+      CHECK(origin_of(*join, 0, policy) == at{1, 1});
+      CHECK_FALSE(origin_of(*join, 1, policy).has_value());
+    }
+  }
+}
+
+TEST_CASE("scan column origin - single join pads the right side", "[planner][scan_column_origin]")
+{
+  auto join = make_join(duckdb::JoinType::SINGLE, make_get(0, 1), make_get(1, 1));
+  join->ResolveOperatorTypes();
+  REQUIRE(join->types.size() == 2);
+  CHECK(origin_of(*join, 0, kValues) == at{0, 0});
+  CHECK(origin_of(*join, 0, kRows) == at{0, 0});
+  CHECK(origin_of(*join, 1, kValues) == at{1, 0});
+  CHECK_FALSE(origin_of(*join, 1, kRows).has_value());
+}
+
+TEST_CASE("scan column origin - cross product forwards both sides only for values",
+          "[planner][scan_column_origin]")
+{
+  auto product = duckdb::make_uniq<duckdb::LogicalCrossProduct>(make_get(0, 2), make_get(1, 1));
+  product->ResolveOperatorTypes();
+  REQUIRE(product->types.size() == 3);
+  CHECK(origin_of(*product, 1, kValues) == at{0, 1});
+  CHECK(origin_of(*product, 2, kValues) == at{1, 0});
+  CHECK_FALSE(origin_of(*product, 3, kValues).has_value());
+  CHECK_FALSE(origin_of(*product, 0, kRows).has_value());
+}
+
+TEST_CASE("row-subset tracing refuses LEFT and DELIM joins", "[planner][scan_column_origin]")
+{
   SECTION("LEFT refuses")
   {
     auto join = make_join(duckdb::JoinType::LEFT,
@@ -474,7 +490,7 @@ TEST_CASE("walk refuses row-multiplying and DELIM joins on every ordinal",
 }
 
 TEST_CASE("walk locates join ordinals through non-empty projection maps",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   SECTION("SEMI with a left projection map")
   {
@@ -568,31 +584,11 @@ TEST_CASE("walk locates join ordinals through non-empty projection maps",
   }
 }
 
-TEST_CASE("walk never resolves an ordinal to the opposite join side",
-          "[dynamic_filter][build_key_domain]")
-{
-  // Two GETs with different table indexes under one modelled join: a recurse-into-every-child
-  // default would resolve the wrong GET for refused ordinals.
-  auto left             = make_get(/*table_index=*/0, /*width=*/2);
-  auto const* left_raw  = left.get();
-  auto right            = make_get(/*table_index=*/1, /*width=*/3);
-  auto const* right_raw = right.get();
-  auto join             = make_join(duckdb::JoinType::SINGLE, std::move(left), std::move(right));
-  join->ResolveOperatorTypes();
-
-  REQUIRE(join->types.size() == 5);
-  for (auto const ordinal : std::views::iota(std::size_t{0}, join->types.size())) {
-    auto const* resolved = resolve_pass_through_scan(*join, ordinal);
-    REQUIRE(resolved != right_raw);
-    if (resolved != nullptr) { REQUIRE(resolved == left_raw); }
-  }
-}
-
 //===----------------------------------------------------------------------===//
 // Unmodelled operators
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("walk refuses unmodelled operators", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk refuses unmodelled operators", "[planner][scan_column_origin]")
 {
   SECTION("WINDOW")
   {

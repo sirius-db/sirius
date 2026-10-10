@@ -24,7 +24,10 @@
 #include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cstdint>
 #include <memory>
+#include <optional>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -39,10 +42,14 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
     duckdb::vector<sirius::logical_type> types,
     duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list,
     std::size_t estimated_cardinality,
-    duckdb::TupleDataValidityType distinct_validity);
+    duckdb::TupleDataValidityType distinct_validity,
+    std::vector<std::optional<std::uint64_t>> aggregate_input_max_abs = {});
 
   //! The aggregates that have to be computed
   duckdb::vector<std::unique_ptr<sirius::ast::node>> aggregates;
+  /// Parallel to aggregates: the plan-time bound on |unscaled value| of a decimal SUM or AVG input
+  /// (planner::resolve_decimal_sum_input_bounds); nullopt when unproven.
+  std::vector<std::optional<std::uint64_t>> aggregate_input_max_abs;
 
   //! Schema emitted by the per-task partial aggregate. AVG expands to SUM + COUNT here; the
   //! MERGE_AGGREGATE above this operator collapses those carriers to the declared SQL schema.
