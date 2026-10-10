@@ -34,6 +34,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_recursive_cte.cpp` (materialized CTE refs only — recursive CTEs are unsupported) |
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
+| `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (`ALL` forms only) | `REPLICATE` over `PROJECTION`, `HASH_GROUP_BY` and `UNION` | `src/planner/sirius_plan_set_operation.cpp` |
 
 **Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
 `LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_RECURSIVE_CTE`
@@ -66,6 +67,26 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 - **COUNT(DISTINCT)** — implemented via `COLLECT_SET` aggregation, then counting unique rows
 - **HUGEINT downcast** — HUGEINT types are downcast to BIGINT (cuDF doesn't support int128)
 - **Unsupported aggregate expressions** — `translate_expressions()` rejects any aggregate expression `from_duckdb` cannot translate (see *Unsupported expressions* above), and `can_use_partitioned_aggregate()` declines on a failed translation
+
+### Set Operation Planning
+
+**File:** `src/planner/sirius_plan_set_operation.cpp`
+
+`create_plan(LogicalSetOperation&)` sends `EXCEPT` and `INTERSECT` to `plan_except_intersect`. It lowers only the `ALL` forms, and it lowers them by counting rows rather than by joining, as Spark does. A distinct row seen `m` times in the left input and `n` times in the right is emitted `max(m - n, 0)` times for `EXCEPT ALL` and `min(m, n)` times for `INTERSECT ALL`:
+
+1. Each input is projected to its columns followed by constant `TINYINT` tags. `EXCEPT ALL` uses one tag (`1` on the left, `-1` on the right); `INTERSECT ALL` uses two (`1, 0` on the left, `0, 1` on the right).
+2. A `UNION` merges the two tagged inputs.
+3. A `HASH_GROUP_BY` on every column sums each tag into a `BIGINT`: `m - n` for `EXCEPT ALL`, `m` and `n` for `INTERSECT ALL`.
+4. A `PROJECTION` keeps the columns and appends the copy count as a `CASE` expression: `CASE WHEN s > 0 THEN s ELSE 0 END` or `CASE WHEN m < n THEN m ELSE n END`.
+5. `REPLICATE` repeats each row by that count and drops the count column. Its byte cap is `concat_batch_bytes` (0 means no byte cap) and its row cap is `INT32_MAX`.
+
+The builder throws `NotImplementedException`, so the query falls back to CPU, for:
+
+- the distinct forms of `EXCEPT` and `INTERSECT` (the dispatch switch in `create_plan()` refuses them as well);
+- nested-type columns;
+- keys DuckDB compares through a collation or normalization, such as a collated `VARCHAR` or an `INTERVAL`, because the GPU would compare raw values;
+- `FLOAT` and `DOUBLE` keys, because a group keeps only one of its `-0.0` and `+0.0` rows, where DuckDB returns each input's own rows;
+- inputs whose planned column types differ from each other or from the declared types. The one allowed difference is an aggregate result DuckDB types as `HUGEINT` and Sirius plans as `BIGINT`.
 
 ### Filter Pushdown
 

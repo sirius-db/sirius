@@ -31,7 +31,10 @@
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_filter.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "op/sirius_physical_replicate.hpp"
+#include "op/sirius_physical_union.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
 
 #include <cudf/types.hpp>
@@ -39,6 +42,7 @@
 #include <catch.hpp>
 #include <duckdb/common/enums/join_type.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -165,6 +169,73 @@ auto recording_endpoint_factory(std::vector<sirius::op::sirius_physical_operator
     endpoints.push_back(wrapper.get());
     return wrapper;
   };
+}
+
+// Arm `a`'s key `k` is its scan's column kSetOpAllArmKeys[a][k].
+constexpr std::size_t kSetOpAllKeyCount = 2;
+constexpr std::array<std::array<std::size_t, kSetOpAllKeyCount>, 2> kSetOpAllArmKeys{
+  {{2, 0}, {1, 3}}};
+
+struct set_operation_all_plan {
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> root;
+  std::array<sirius::op::sirius_physical_operator*, 2> arm_scans{};
+};
+
+// The shape `plan_set_operation_all` lowers a two-key EXCEPT ALL (one tag) or INTERSECT ALL (two
+// tags) to: REPLICATE -> copy-count PROJECTION -> HASH_GROUP_BY -> UNION of tagged arm projections.
+// A cast stands in for the copy count's CASE: both are computed, not plain references.
+set_operation_all_plan make_set_operation_all(std::size_t tag_count)
+{
+  auto const tinyint = sirius::logical_type::make(sirius::type_id::TINYINT);
+  auto const bigint  = sirius::logical_type::make(sirius::type_id::BIGINT);
+  set_operation_all_plan plan;
+
+  auto union_node = duckdb::make_uniq<sirius::op::sirius_physical_union>(
+    duckdb::vector<sirius::logical_type>(kSetOpAllKeyCount + tag_count, int_type()),
+    /*estimated_cardinality=*/0);
+  for (std::size_t arm = 0; arm < 2; ++arm) {
+    auto scan           = make_scan(/*width=*/4);
+    plan.arm_scans[arm] = scan.get();
+    auto select_list =
+      make_select_list(make_reference(static_cast<std::uint32_t>(kSetOpAllArmKeys[arm][0])),
+                       make_reference(static_cast<std::uint32_t>(kSetOpAllArmKeys[arm][1])));
+    for (std::size_t tag = 0; tag < tag_count; ++tag) {
+      select_list.push_back(std::make_unique<sirius::ast::node>(
+        sirius::ast::constant{sirius::value{std::int8_t{1}}, tinyint}));
+    }
+    auto tagged = make_projection(std::move(select_list));
+    tagged->children.push_back(std::move(scan));
+    union_node->children.push_back(std::move(tagged));
+  }
+
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> sums;
+  for (std::size_t tag = 0; tag < tag_count; ++tag) {
+    std::vector<std::unique_ptr<sirius::ast::node>> arguments;
+    arguments.push_back(make_reference(static_cast<std::uint32_t>(kSetOpAllKeyCount + tag)));
+    sums.push_back(std::make_unique<sirius::ast::node>(sirius::ast::aggregate{
+      sirius::aggregate_id::sum, std::move(arguments), bigint, /*distinct=*/false}));
+  }
+  duckdb::vector<sirius::logical_type> aggregate_types(kSetOpAllKeyCount, int_type());
+  aggregate_types.insert(aggregate_types.end(), tag_count, bigint);
+  auto aggregate = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
+    std::move(aggregate_types),
+    std::move(sums),
+    make_select_list(make_reference(0), make_reference(1)),
+    /*estimated_cardinality=*/0);
+  aggregate->children.push_back(std::move(union_node));
+
+  auto count_projection =
+    make_projection(make_select_list(make_reference(0),
+                                     make_reference(1),
+                                     make_cast(static_cast<std::uint32_t>(kSetOpAllKeyCount))));
+  count_projection->children.push_back(std::move(aggregate));
+
+  plan.root = duckdb::make_uniq<sirius::op::sirius_physical_replicate>(
+    duckdb::vector<sirius::logical_type>(kSetOpAllKeyCount, int_type()),
+    sirius::op::gpu_replicate_impl::limits{.max_rows = 1024, .max_bytes = 1 << 20},
+    /*estimated_cardinality=*/0);
+  plan.root->children.push_back(std::move(count_projection));
+  return plan;
 }
 
 }  // namespace
@@ -710,4 +781,78 @@ TEST_CASE("a second placement descends past the endpoint the first placed",
   REQUIRE(first_endpoints[0]->children[0].get() == second_endpoints[0]);
   REQUIRE(second_endpoints[0]->children.size() == 1);
   REQUIRE(second_endpoints[0]->children[0].get() == scan_node);
+}
+
+// ---------------------------------------------------------------------------------------------
+// EXCEPT ALL / INTERSECT ALL (REPLICATE over a grouped tag sum)
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("descent_steps maps a REPLICATE output to the same input column",
+          "[dynamic_filter][placement][discovery]")
+{
+  auto const plan = make_set_operation_all(/*tag_count=*/1);
+
+  auto const steps = descent_steps(*plan.root, /*output_ordinal=*/1, kSipOff);
+  REQUIRE(steps.size() == 1);
+  REQUIRE(steps[0].child_index == 0);
+  REQUIRE(steps[0].child_ordinal == 1);
+
+  // Ordinal kSetOpAllKeyCount is the copy count in REPLICATE's input, not an output.
+  REQUIRE(descent_steps(*plan.root, kSetOpAllKeyCount, kSipOff).empty());
+}
+
+TEST_CASE("trace_probe_key reaches both arms of an INTERSECT ALL or EXCEPT ALL probe side",
+          "[dynamic_filter][placement][discovery]")
+{
+  for (std::size_t const tag_count : {std::size_t{2}, std::size_t{1}}) {
+    INFO("tag_count = " << tag_count);
+    auto const plan = make_set_operation_all(tag_count);
+    for (std::size_t key = 0; key < kSetOpAllKeyCount; ++key) {
+      INFO("key = " << key);
+      auto const terminals = trace_probe_key(*plan.root, key, kSipOn);
+      REQUIRE(terminals.size() == 2);
+      for (std::size_t arm = 0; arm < 2; ++arm) {
+        REQUIRE(terminals[arm].node == plan.arm_scans[arm]);
+        REQUIRE(terminals[arm].ordinal == kSetOpAllArmKeys[arm][key]);
+      }
+    }
+  }
+}
+
+TEST_CASE("place_endpoint splices one endpoint below each arm of an EXCEPT ALL",
+          "[dynamic_filter][placement][discovery]")
+{
+  auto plan        = make_set_operation_all(/*tag_count=*/1);
+  auto* const root = plan.root.get();
+
+  std::vector<sirius::op::sirius_physical_operator*> endpoints;
+  auto const placed =
+    place_endpoint(std::move(plan.root), /*a0=*/0, kSipOff, recording_endpoint_factory(endpoints));
+
+  REQUIRE(placed.subtree.get() == root);
+  REQUIRE(placed.site_ordinals ==
+          std::vector<std::size_t>{kSetOpAllArmKeys[0][0], kSetOpAllArmKeys[1][0]});
+  REQUIRE(endpoints.size() == 2);
+  REQUIRE(endpoints[0]->children[0].get() == plan.arm_scans[0]);
+  REQUIRE(endpoints[1]->children[0].get() == plan.arm_scans[1]);
+}
+
+TEST_CASE("descent below REPLICATE refuses the copy count and the tag columns",
+          "[dynamic_filter][placement][discovery]")
+{
+  constexpr std::size_t tag_count = 2;
+  auto const plan                 = make_set_operation_all(tag_count);
+  auto const& count_projection    = *plan.root->children[0];
+  auto const& aggregate           = *count_projection.children[0];
+  auto const& union_node          = *aggregate.children[0];
+
+  REQUIRE(descent_steps(count_projection, kSetOpAllKeyCount, kSipOn).empty());
+  for (std::size_t tag = 0; tag < tag_count; ++tag) {
+    auto const ordinal = kSetOpAllKeyCount + tag;
+    INFO("ordinal = " << ordinal);
+    REQUIRE(descent_steps(aggregate, ordinal, kSipOn).empty());
+    for (auto const& tagged : union_node.children) {
+      REQUIRE(descent_steps(*tagged, ordinal, kSipOn).empty());
+    }
+  }
 }

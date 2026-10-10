@@ -214,6 +214,17 @@ Implements LIMIT/OFFSET using atomic counters for parallel execution.
 - **Mechanism:** Each task atomically claims a portion of the remaining limit via `claim()`. When the limit is exhausted, the pipeline terminates early.
 - **Empty output:** A task whose input batches yield no rows emits one 0-row batch, like a scan of an empty table, so a downstream ungrouped aggregate still returns its row. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
 
+### `sirius_physical_replicate` — `REPLICATE`
+**File:** `src/op/sirius_physical_replicate.hpp`
+
+Repeats each input row by a count column, then drops that column. The count is always the last input column; row `i` appears `count[i]` times, copies adjacent, in input order. The operator does not know what the count means. Today only the `EXCEPT ALL` / `INTERSECT ALL` lowering builds it (see [set operation planning](physical-plan-generation.md#set-operation-planning)).
+
+- **GPU execution:** two passes per input batch in `gpu_replicate_impl` (`src/op/replicate/gpu_replicate_impl.cu`). `plan_slices` takes an `INT64` prefix sum of the counts and a byte prefix weighted by `cudf::row_bit_count`, then cuts the output into slices of at most `max_rows` rows and at most `max_bytes` bytes plus one row. `materialize` copies one slice with one `cudf::repeat` call. `cudf::repeat` sums its counts in 32 bits without checking, so planning in 64 bits and capping a slice at `INT32_MAX` rows keeps every call exact.
+- **Output batches:** one per slice, on the input batch's memory space. An input with no copies gives one empty batch, so downstream operators still see the schema.
+- **Key members:** `_output_limits` (`gpu_replicate_impl::limits`). The planner sets `max_rows` to `INT32_MAX` and `max_bytes` to `concat_batch_bytes`, reading 0 as no cap (`SIZE_MAX`).
+- **Errors:** a null or negative count, a non-integer count column, or a batch of the wrong width throws `sirius::internal_exception`. These are planner bugs, not reasons to fall back.
+- **Memory:** one `execute` holds the whole expansion of its input batches, so the limits shape output batches but do not bound peak memory. A key with very many copies is still one task.
+
 ## Blocking Operators
 
 These operators buffer input before producing output. They are both sinks and sources.
@@ -320,7 +331,8 @@ Conditional MARK joins produce the same three-valued mark as the hash join, via 
 `UNION ALL` only — bag concatenation, so the operator computes nothing and `execute` is the
 identity. N-ary: `a UNION ALL b UNION ALL c` binds to one `LogicalSetOperation`, so every path loops
 over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the plan builder
-(`src/planner/sirius_plan_set_operation.cpp`), as is `allow_out_of_order = false`.
+(`src/planner/sirius_plan_set_operation.cpp`), as is `allow_out_of_order = false`. The
+`EXCEPT ALL` / `INTERSECT ALL` lowering also uses `UNION` to merge its two tagged inputs.
 
 - **One port per arm.** `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, feeding a distinct
   `"union_{i}"` port. The distinct names are required: `add_port` is last-writer-wins and the
@@ -535,6 +547,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | FILTER | Relational | `expression_evaluator::select()` |
 | PROJECTION | Relational | `expression_evaluator::evaluate()` |
 | STREAMING_LIMIT | Relational | Atomic claim-based |
+| REPLICATE | Relational | `gpu_replicate_impl::plan_slices()` + `materialize()`; one `cudf::repeat` per output batch |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |
 | SORT_SAMPLE | Sort | Sample + boundary computation |
@@ -549,7 +562,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |
-| UNION | Set op | `UNION ALL` only; N-ary identity fan-in, no data touched |
+| UNION | Set op | `UNION ALL`, and the tagged inputs of `EXCEPT ALL` / `INTERSECT ALL`; N-ary identity fan-in, no data touched |
 | PARTITION | Pipeline | Hash/range partitioning |
 | CONCAT | Pipeline | Partition reassembly |
 | PASSTHROUGH_SINK | Pipeline | UNION arm terminator; forwards batches unpartitioned |

@@ -146,7 +146,7 @@ struct operator_params {
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
 
-  /// Target size (bytes) for the concat operator output batch.
+  /// Target size (bytes) for the concat operator output batch; also caps REPLICATE output batches.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
