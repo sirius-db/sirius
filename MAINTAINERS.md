@@ -5,6 +5,7 @@
 | Felipe Aramburu | NVIDIA | felipeblazing |
 | Rodrigo Aramburu | NVIDIA | roaramburu |
 | Amin Aramoon | NVIDIA | aminaramoon |
+| James Bourbeau | NVIDIA | jrbourbeau |
 | Matthijs Brobbel | NVIDIA | mbrobbel |
 | Pradeep Garigipati | NVIDIA | 9prady9 |
 | Joost Hoozemans | NVIDIA | joosthooz |
