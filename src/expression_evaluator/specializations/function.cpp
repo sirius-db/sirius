@@ -471,19 +471,36 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
             input.get_column_view(), _stream, _mr);
         }
       }
-      auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
+      // replace_with_backrefs has no replacement-count parameter. Anchor a lazy prefix to
+      // the beginning of the input so the program can match only once, at the first original
+      // match. Restore the prefix in the replacement; cuDF preserves the unmatched suffix.
+      // [\s\S] includes newlines without changing the original pattern's dot semantics.
+      // Group 1 is the prefix, group 2 is the whole original match (RE2's \0), and original
+      // capture groups move by two. Braced references avoid treating e.g. \12 as group 12:
+      // DuckDB interprets it as group 1 followed by the literal character '2'.
+      auto const first_pattern      = std::string{"^([\\s\\S]*?)("} + pattern_str + ")";
+      auto regex_prog               = cudf::strings::regex_program::create(first_pattern);
+      std::string first_replacement = "${1}";
+      for (std::size_t i = 0; i < replace_str.size(); ++i) {
+        if (replace_str[i] == '\\') {
+          auto const group = replace_str[++i] - '0';
+          first_replacement += "${" + std::to_string(group + 2) + "}";
+        } else {
+          first_replacement += replace_str[i];
+        }
+      }
       return cudf::strings::replace_with_backrefs(
         cudf::strings_column_view(input.get_column_view()),
         *regex_prog,
-        std::string_view(replace_str),
+        first_replacement,
         _stream,
         _mr);
     } else {
-      auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
+      auto regex_prog = cudf::strings::regex_program::create(pattern_str);
       return cudf::strings::replace_re(cudf::strings_column_view(input.get_column_view()),
                                        *regex_prog,
                                        cudf::string_scalar(replace_str, true, _stream, _mr),
-                                       std::nullopt,
+                                       1,
                                        _stream,
                                        _mr);
     }

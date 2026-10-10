@@ -53,11 +53,13 @@
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <re2/re2.h>
 
 // standard library
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -274,6 +276,76 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   }
   if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
   if (*func_id_opt == function_id::round && !gpu_supports_round(expr)) { return nullptr; }
+  if (*func_id_opt == function_id::regexp_replace) {
+    // The GPU implementation supports constant patterns/replacements and DuckDB's default
+    // options only. In particular, never silently discard the fourth (options) argument.
+    if (expr.children.size() != 3) { return nullptr; }
+    for (std::size_t i = 1; i < 3; ++i) {
+      if (expr.children[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+        return nullptr;
+      }
+      auto const& value = expr.children[i]->Cast<duckdb::BoundConstantExpression>().value;
+      if (value.IsNull() || value.type() != duckdb::LogicalType::VARCHAR) { return nullptr; }
+    }
+    auto const& pattern =
+      duckdb::StringValue::Get(expr.children[1]->Cast<duckdb::BoundConstantExpression>().value);
+    // RE2's shorthand classes and word boundaries are ASCII-only; cuDF's are Unicode-aware.
+    // cuDF also does not implement POSIX classes. Skip escaped characters so a literal \\w
+    // remains supported, but reject these constructs wherever they occur in the pattern.
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+      if (pattern[i] == '\\' && i + 1 < pattern.size()) {
+        switch (pattern[++i]) {
+          case 'w':
+          case 'W':
+          case 'd':
+          case 'D':
+          case 's':
+          case 'S':
+          case 'b':
+          case 'B': return nullptr;
+          default: break;
+        }
+      } else if (pattern.compare(i, 2, "[:") == 0) {
+        return nullptr;
+      } else if (pattern[i] == '$') {
+        // cuDF also matches $ before a trailing newline; RE2's default is end-of-text only.
+        // Conservatively reject every unescaped $, including literals in character classes.
+        return nullptr;
+      }
+    }
+    duckdb_re2::RE2::Options options;
+    options.set_log_errors(false);
+    duckdb_re2::RE2 const regex(pattern, options);
+    if (!regex.ok()) { return nullptr; }
+    // cuDF can compile empty-only patterns such as (?:) and a{0} into programs that never
+    // replace anything. RE2 bounds every possible match; two empty bounds prove that no
+    // nonempty match is possible. One byte is enough to distinguish this from a* or a?.
+    std::string min_match, max_match;
+    if (regex.PossibleMatchRange(&min_match, &max_match, 1) && min_match.empty() &&
+        max_match.empty()) {
+      return nullptr;
+    }
+    auto const& replacement =
+      duckdb::StringValue::Get(expr.children[2]->Cast<duckdb::BoundConstantExpression>().value);
+    // cuDF's template syntax differs from RE2's. Only translate single-digit backreferences;
+    // leave escaped backslashes and invalid rewrite escapes to DuckDB. Braced references are
+    // reserved for the translated cuDF template below, but are literal text in DuckDB.
+    bool has_backrefs = false;
+    for (std::size_t i = 0; i < replacement.size(); ++i) {
+      if (replacement[i] != '\\') { continue; }
+      if (++i == replacement.size() || replacement[i] < '0' || replacement[i] > '9') {
+        return nullptr;
+      }
+      has_backrefs = true;
+    }
+    if (has_backrefs && replacement.find("${") != std::string::npos) { return nullptr; }
+    if (has_backrefs) {
+      std::string error;
+      // RE2 leaves the input unchanged for an out-of-range reference; cuDF throws.
+      // Validate against the original captures before adding the GPU wrapper groups.
+      if (!regex.CheckRewriteString(replacement, &error)) { return nullptr; }
+    }
+  }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(expr.return_type);
