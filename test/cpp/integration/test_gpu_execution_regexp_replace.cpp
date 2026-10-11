@@ -14,6 +14,18 @@
  * limitations under the License.
  */
 
+/**
+ * @file test_gpu_execution_regexp_replace.cpp
+ * @brief GPU regexp_replace matches DuckDB.
+ *
+ * DuckDB replaces only the first match unless the options contain 'g', and reads patterns as RE2.
+ * The GPU used to replace every match and drop the options. These cases compare GPU and CPU
+ * results over a parquet file for first-match and global replacement, every option DuckDB
+ * accepts, backreferences, anchors, newlines, non-ASCII text, empty strings and NULLs, and check
+ * that each query ran on the GPU. Distinct results must stay distinct grouping keys. Column
+ * arguments and RE2 syntax that cuDF reads differently fall back at plan time.
+ */
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
@@ -64,7 +76,188 @@ void create_regexp_replace_table(RegexpReplaceFixture& fx)
   fx.run_ok("CHECKPOINT;");
 }
 
+// Writes the test strings to parquet and returns the FROM clause that reads them.
+std::string create_strings(RegexpReplaceFixture& fx)
+{
+  auto const path = fx.temp_db_path + ".regexp_replace.parquet";
+  fx.run_ok(
+    "COPY (SELECT * FROM (VALUES"
+    " (1, 'aaa0'), (2, 'abcabc'), (3, ''), (4, NULL), (5, 'no match here'),"
+    " (6, 'AaA aAa'), (7, 'line1' || chr(10) || 'line2' || chr(10)), (8, 'a.b*c+d?e'),"
+    " (9, 'foo123bar456'), (10, 'héllo wörld ñ'), (11, 'ab' || chr(10)), (12, 'xyzxyz'),"
+    " (13, 'tab' || chr(9) || 'v' || chr(11) || 'r' || chr(13) || 'end'), (14, 'aaaa'),"
+    " (15, 'Hello World HELLO'), (16, 'back\\slash\\1'), (17, '٣٤٥ digits 789'),"
+    " (18, 'café CAFÉ'), (19, 'ab ab'), (20, 'ba'), (21, 'kelvin ' || chr(8490) || ' long ' ||"
+    " chr(383) || ' Ks'), (22, 'http://www.example.com/a' || chr(10)), (23, 'a'),"
+    " (24, '[x]{y}(z)|^$'), (25, 'http://www.example.com/path')"
+    ") v(id, s)) TO '" +
+    path + "' (FORMAT PARQUET);");
+  return "read_parquet('" + path + "')";
+}
+
 }  // namespace
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "gpu_execution regexp_replace replaces the first match like DuckDB",
+                 "[integration][gpu_execution][projection][regexp_replace]")
+{
+  // Exercise regexp_replace before the unsupported v2 rewrite to regexp_extract (#2146).
+  sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
+  auto const strings = create_strings(*this);
+  for (auto const* call : {
+         R"(regexp_replace(s, 'a', 'b'))",
+         R"(regexp_replace(s, '[0-9]', '#'))",
+         R"(regexp_replace(s, 'x', 'y'))",
+         R"(regexp_replace(s, 'no such text', 'y'))",
+         R"(regexp_replace(s, 'a+', '<\0>'))",
+         R"(regexp_replace(s, 'a|ab', 'X'))",
+         R"(regexp_replace(s, 'ab|a', 'X'))",
+         R"(regexp_replace(s, 'a+?', 'X'))",
+         R"(regexp_replace(s, '(\w+) (\w+)', '\2 \1'))",
+         R"(regexp_replace(s, '(a)(b)?', '[\2\1]'))",
+         R"(regexp_replace(s, '(a|ab)(c|bcd)', '[\1|\2]'))",
+         R"(regexp_replace(s, 'b', '\\'))",
+         R"(regexp_replace(s, 'b', '$1${1}'))",
+         R"(regexp_replace(s, 'b', ''))",
+       }) {
+    CAPTURE(call);
+    compare_gpu_vs_cpu(std::string("SELECT id, ") + call + " AS r FROM " + strings);
+  }
+  compare_gpu_vs_cpu("SELECT id FROM " + strings + " WHERE regexp_replace(s, 'a', 'b') = 'baa0'");
+  // The ClickBench Q28 kernel is case-sensitive, so 'i' must take the generic path.
+  for (auto const* options : {"", "i", "g", "s"}) {
+    CAPTURE(options);
+    compare_gpu_vs_cpu(
+      std::string(
+        R"(SELECT id, regexp_replace(upper(s), '^https?://(?:www\.)?([^/]+)/.*$', '\1', ')") +
+      options + "') AS r FROM " + strings);
+  }
+  compare_gpu_vs_cpu(
+    "SELECT id, upper(regexp_replace(regexp_replace(s, 'a', 'b'), 'b', 'c', 'g'))"
+    " AS r FROM " +
+    strings);
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "gpu_execution regexp_replace honours DuckDB's options",
+                 "[integration][gpu_execution][projection][regexp_replace]")
+{
+  auto const strings = create_strings(*this);
+  for (auto const* options : {"g",
+                              "i",
+                              "gi",
+                              "c",
+                              "gc",
+                              "ic",
+                              "ci",
+                              "s",
+                              "gs",
+                              "m",
+                              "n",
+                              "p",
+                              "sm",
+                              "l",
+                              "gl",
+                              "li",
+                              "g i",
+                              " g\t"}) {
+    CAPTURE(options);
+    for (auto const* pattern_and_replacement : {
+           R"('a', 'b')",
+           R"('hello', '#')",
+           R"('ks', '#')",
+           R"('[a-c]', '-')",
+           R"('[^a ]', '-')",
+           R"('a.', '<\0>')",
+           R"('.', '_')",
+           R"('([a-z]+) ([a-z]+)', '\2 \1')",
+           R"('a.b', '#')",
+           R"('[x]', '#')",
+         }) {
+      CAPTURE(pattern_and_replacement);
+      // Under 'l' a backreference to a group the literal pattern lacks falls back.
+      if (std::string(options).find('l') != std::string::npos &&
+          std::string(pattern_and_replacement).find(R"(\1)") != std::string::npos) {
+        continue;
+      }
+      compare_gpu_vs_cpu(std::string("SELECT id, regexp_replace(s, ") + pattern_and_replacement +
+                         ", '" + options + "') AS r FROM " + strings);
+    }
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "gpu_execution regexp_replace reads RE2 anchors, classes and escapes like DuckDB",
+                 "[integration][gpu_execution][projection][regexp_replace]")
+{
+  auto const strings = create_strings(*this);
+  for (auto const* pattern : {R"(^a)",
+                              R"(c$)",
+                              R"(b$)",
+                              R"(2$)",
+                              R"(\Aa)",
+                              R"(.\z)",
+                              R"(^https?://(?:www\.)?([^/]+)/.*$)",
+                              R"(a^b)",
+                              R"(\d+)",
+                              R"(\w+)",
+                              R"(\s)",
+                              R"(\S+)",
+                              R"(\W)",
+                              R"(\D)",
+                              R"([\d\s])",
+                              R"([^\n]+)",
+                              R"(\n)",
+                              R"(\t|\x0b|\r)",
+                              R"(\.|\*|\+|\?)",
+                              R"(\[x\]|\{y\}|\(z\)|\||\^|\$)",
+                              R"([]x])",
+                              R"([\-\]])",
+                              R"(é|ñ)",
+                              R"([à-ÿ]+)",
+                              R"(x{2}|y{1,}|z{1,2}?)",
+                              R"((?:ab)+)",
+                              R"(a\x41)"}) {
+    CAPTURE(pattern);
+    for (auto const* options : {"", "g"}) {
+      CAPTURE(options);
+      compare_gpu_vs_cpu(std::string("SELECT id, regexp_replace(s, '") + pattern + "', '<\\0>', '" +
+                         options + "') AS r FROM " + strings);
+    }
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "gpu_execution regexp_replace falls back at plan time for what the GPU cannot "
+                 "reproduce",
+                 "[integration][gpu_execution][projection][regexp_replace]")
+{
+  auto const strings = create_strings(*this);
+  // Column arguments: the GPU compiles one regex per call.
+  // s itself would not do: DuckDB v2 rejects the backslash in row 16 as a replacement.
+  expect_plan_fallback_matches_cpu(
+    "SELECT id, regexp_replace(s, 'a', CAST(id AS VARCHAR)) AS r FROM " + strings);
+  expect_plan_fallback_matches_cpu(
+    "SELECT id, regexp_replace(s, p, 'X') AS r FROM (SELECT id, s,"
+    " CASE WHEN id % 2 = 0 THEN 'a' ELSE 'b' END AS p FROM " +
+    strings + ")");
+  for (auto const* call : {
+         // Empty matches after the first, which cuDF places differently.
+         R"(regexp_replace(s, '', 'X', 'g'))",
+         R"(regexp_replace(s, 'a*', 'X', 'g'))",
+         R"(regexp_replace(s, '(a?)', '<\1>', 'g'))",
+         // RE2's \b is ASCII; cuDF's counts é as a word character.
+         R"(regexp_replace(s, '\bl', 'X', 'g'))",
+         // Syntax cuDF rejects.
+         R"(regexp_replace(s, '\pL+', '#', 'g'))",
+         R"(regexp_replace(s, 'a{1000}', '#'))",
+         // Case folding beyond ASCII.
+         R"(regexp_replace(s, 'É', '#', 'gi'))",
+       }) {
+    CAPTURE(call);
+    expect_plan_fallback_matches_cpu(std::string("SELECT id, ") + call + " AS r FROM " + strings);
+  }
+}
 
 TEST_CASE_METHOD(RegexpReplaceFixture,
                  "gpu_execution regexp_replace replaces only the first match",
@@ -95,6 +288,8 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
     "SELECT regexp_replace(s, '[A-Z]', '') AS k, count(*) FROM regex_t GROUP BY k");
   compare_gpu_vs_cpu("SELECT regexp_replace(s, '[A-Z]', '') AS k FROM regex_t GROUP BY k");
   compare_gpu_vs_cpu("SELECT s, count(*) FROM regex_t GROUP BY s");
+  compare_gpu_vs_cpu(
+    "SELECT regexp_replace(s, '[A-Z]', '', 'g') AS k, count(*) FROM regex_t GROUP BY k");
 }
 
 TEST_CASE_METHOD(RegexpReplaceFixture,
@@ -255,8 +450,9 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
     expect_plan_fallback_matches_cpu(std::string{"SELECT regexp_replace(s, '("} + pattern +
                                      R"()', '<\1>') FROM regex_t)");
   }
-  // These can consume text even though they also match empty input. The escaped pipe is
-  // a literal character, unlike the empty alternation above, and should stay on the GPU.
+  // These can consume text even though they also match empty input, and replace only the first
+  // match, which is at the start. The escaped pipe is a literal character, unlike the empty
+  // alternation above. All stay on the GPU.
   for (auto const* pattern : {"a*", "a?", "a{0,1}", R"(\|)"}) {
     INFO(pattern);
     compare_gpu_vs_cpu(std::string{"SELECT regexp_replace(s, '"} + pattern +
@@ -265,7 +461,7 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
 }
 
 TEST_CASE_METHOD(RegexpReplaceFixture,
-                 "regexp_replace incompatible character classes fall back during planning",
+                 "regexp_replace character classes keep RE2's ASCII meaning",
                  "[integration][gpu_execution][regexp_replace][regexp_replace_classes]")
 {
   run_ok("CREATE TABLE regex_t(s VARCHAR);");
@@ -273,16 +469,18 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
     "INSERT INTO regex_t VALUES ('éa'), ('x٣y'), ('a' || chr(160) || 'b'),"
     " ('Ωmega'), ('abc'), ('a b'), (''), (NULL);");
   run_ok("CHECKPOINT;");
-  for (auto const* pattern : {R"(\w)",
-                              R"(\W)",
-                              R"(\d)",
-                              R"(\D)",
-                              R"(\s)",
-                              R"(\S)",
-                              R"(\b)",
+  // RE2's Perl classes are ASCII-only; the GPU spells them out as ASCII sets.
+  for (auto const* pattern :
+       {R"(\w)", R"(\W)", R"(\d)", R"(\D)", R"(\s)", R"(\S)", R"([\w])", R"(\\\w)"}) {
+    INFO(pattern);
+    compare_gpu_vs_cpu(std::string{"SELECT regexp_replace(s, '"} + pattern +
+                       "', 'X') FROM regex_t");
+    compare_gpu_vs_cpu(std::string{"SELECT regexp_replace(s, '("} + pattern +
+                       R"()', '<\1>') FROM regex_t)");
+  }
+  // cuDF's word boundaries are Unicode-aware, and it does not implement POSIX classes.
+  for (auto const* pattern : {R"(\b)",
                               R"(\B)",
-                              R"([\w])",
-                              R"(\\\w)",
                               "[[:alpha:]]",
                               "[[:digit:]]",
                               "[[:space:]]",
@@ -337,34 +535,20 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
 }
 
 TEST_CASE_METHOD(RegexpReplaceFixture,
-                 "regexp_replace options and unsupported rewrites fall back during planning",
+                 "regexp_replace rewrites cuDF would misread and dynamic arguments fall back",
                  "[integration][gpu_execution][regexp_replace]")
 {
   create_regexp_replace_table(*this);
-  // Four-argument calls were never supported by the evaluator. All explicit options must
-  // retain DuckDB semantics, including global replacement and combinations of flags.
-  for (auto const* options : {"", "g", "c", "i", "l", "m", "n", "p", "s", "gi", "gs"}) {
-    INFO(options);
-    expect_plan_fallback_matches_cpu(std::string{"SELECT id, regexp_replace(s, 'a.', 'X', '"} +
-                                     options + "') FROM regex_t");
-    auto const backreference_query =
-      std::string{R"(SELECT id, regexp_replace(s, '(a)', '<\1>', ')"} + options + "') FROM regex_t";
-    if (std::string{options} == "l") {
-      // Literal mode removes the capture group, making this rewrite invalid in v2.
-      expect_regex_fallback_error_matches_cpu(*this, backreference_query);
-    } else {
-      expect_plan_fallback_matches_cpu(backreference_query);
-    }
-  }
+  // Literal mode removes the capture group, making this rewrite invalid in v2.
+  expect_regex_fallback_error_matches_cpu(
+    *this, R"(SELECT id, regexp_replace(s, '(a)', '<\1>', 'l') FROM regex_t)");
   for (auto const* expression : {
-         R"(regexp_replace(s, '(a)', '\\1'))",
          R"(regexp_replace(s, '(a)', '\1${1}'))",
          "regexp_replace(s, s, 'X')",
-         "regexp_replace(s, 'a', s)",
        }) {
     INFO(expression);
     expect_plan_fallback_matches_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
   }
-  expect_plan_fallback_matches_cpu(
-    "SELECT regexp_replace(s, '[A-Z]', '', 'g') AS k, count(*) FROM regex_t GROUP BY k");
+  // An escaped backslash makes the rewrite literal text.
+  compare_gpu_vs_cpu(R"(SELECT id, regexp_replace(s, '(a)', '\\1') FROM regex_t)");
 }

@@ -19,12 +19,12 @@
 #include <expression/ast/node.hpp>
 #include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>
+#include <expression/gpu_regexp_replace.hpp>
 #include <expression/substring_slice.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
-#include <expression_evaluator/regex/cudf_regex_pattern.hpp>
 #include <expression_evaluator/regex/regex_playground.hpp>
 #include <expression_evaluator/round_floating_point.hpp>
 #include <helper/logical_type.hpp>
@@ -62,7 +62,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <optional>
-#include <regex>
 #include <string>
 #include <tuple>
 #include <variant>
@@ -454,59 +453,43 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     return evaluate_result(std::move(result_column));
   }
   if (resolved_id == function_id::regexp_replace) {
-    // The input should be <input column, pattern string scalar, replace string scalar>
-    D_ASSERT(args.size() == 3);
-    D_ASSERT(args[1]->holds<sirius::ast::constant>());
-    D_ASSERT(args[2]->holds<sirius::ast::constant>());
+    // Planning admits constant pattern, replacement and options that translate_gpu_regexp_replace
+    // maps onto DuckDB's semantics.
+    D_ASSERT(args.size() == 3 || args.size() == 4);
+    auto const constant_string = [&](std::size_t i) -> std::string const& {
+      return std::get<std::string>(args[i]->get<sirius::ast::constant>().payload);
+    };
+    auto const plan = translate_gpu_regexp_replace(
+      constant_string(1), constant_string(2), args.size() == 4 ? constant_string(3) : "");
+    if (!plan) {
+      throw internal_exception(
+        "[expression_evaluator:function] regexp_replace arguments the GPU cannot run reached "
+        "evaluation");
+    }
 
     auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
-    D_ASSERT(!input.is_scalar());
-
-    auto const& pattern_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
-    auto const& replace_str = std::get<std::string>(args[2]->get<sirius::ast::constant>().payload);
-    // The planner validated the RE2 pattern; give cuDF RE2's end-of-text anchor semantics.
-    auto const cudf_pattern = ::sirius::regex::to_cudf_regex_pattern(pattern_str);
-    auto const has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
-    if (has_backrefs) {
-      if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
-        if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
-          return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
-            input.get_column_view(), _stream, _mr);
-        }
-      }
-      // replace_with_backrefs has no replacement-count parameter. Anchor a lazy prefix to
-      // the beginning of the input so the program can match only once, at the first original
-      // match. Restore the prefix in the replacement; cuDF preserves the unmatched suffix.
-      // [\s\S] includes newlines without changing the original pattern's dot semantics.
-      // Group 1 is the prefix, group 2 is the whole original match (RE2's \0), and original
-      // capture groups move by two. Braced references avoid treating e.g. \12 as group 12:
-      // DuckDB interprets it as group 1 followed by the literal character '2'.
-      auto const first_pattern      = std::string{"^([\\s\\S]*?)("} + cudf_pattern + ")";
-      auto regex_prog               = cudf::strings::regex_program::create(first_pattern);
-      std::string first_replacement = "${1}";
-      for (std::size_t i = 0; i < replace_str.size(); ++i) {
-        if (replace_str[i] == '\\') {
-          auto const group = replace_str[++i] - '0';
-          first_replacement += "${" + std::to_string(group + 2) + "}";
-        } else {
-          first_replacement += replace_str[i];
-        }
-      }
-      return cudf::strings::replace_with_backrefs(
-        cudf::strings_column_view(input.get_column_view()),
-        *regex_prog,
-        first_replacement,
-        _stream,
-        _mr);
-    } else {
-      auto regex_prog = cudf::strings::regex_program::create(cudf_pattern);
-      return cudf::strings::replace_re(cudf::strings_column_view(input.get_column_view()),
-                                       *regex_prog,
-                                       cudf::string_scalar(replace_str, true, _stream, _mr),
-                                       1,
-                                       _stream,
-                                       _mr);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
     }
+    auto const strings = cudf::strings_column_view(input.get_column_view());
+    // Compare the translation, which also reflects the options.
+    if (duckdb::Config::ENABLE_REGEX_JIT_IMPL && plan->flags == cudf::strings::regex_flags{} &&
+        plan->pattern == R"(^https?://(?:www\.)?([^/]+)/.*\Z)" && plan->replacement == "${1}") {
+      return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
+        input.get_column_view(), _stream, _mr);
+    }
+    auto const regex_prog = cudf::strings::regex_program::create(plan->pattern, plan->flags);
+    if (plan->backrefs) {
+      return cudf::strings::replace_with_backrefs(
+        strings, *regex_prog, plan->replacement, _stream, _mr);
+    }
+    return cudf::strings::replace_re(strings,
+                                     *regex_prog,
+                                     cudf::string_scalar(plan->replacement, true, _stream, _mr),
+                                     plan->max_replace_count,
+                                     _stream,
+                                     _mr);
   }
 
   //----------Struct Functions----------//

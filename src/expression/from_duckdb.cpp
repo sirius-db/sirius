@@ -35,6 +35,7 @@
 #include "expression/ast/unary_op.hpp"
 #include "expression/date_trunc_unit.hpp"
 #include "expression/function_id.hpp"
+#include "expression/gpu_regexp_replace.hpp"
 #include "expression/join_condition.hpp"  // sirius::comparison_type, sirius::from_duckdb(ExpressionType)
 #include "expression/substring_slice.hpp"
 #include "expression/value.hpp"         // sirius::from_duckdb(Value const&, logical_type const&)
@@ -55,7 +56,6 @@
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include <re2/re2.h>
 
 // standard library
 #include <cstddef>
@@ -251,6 +251,29 @@ bool gpu_supports_round(duckdb::BoundFunctionExpression const& expr)
   return !value.IsNull() && value.type().id() == duckdb::LogicalTypeId::INTEGER;
 }
 
+std::optional<std::string> varchar_constant(duckdb::Expression const& expr)
+{
+  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return std::nullopt; }
+  auto const& value = expr.Cast<duckdb::BoundConstantExpression>().GetValue();
+  if (value.IsNull() || value.type().id() != duckdb::LogicalTypeId::VARCHAR) {
+    return std::nullopt;
+  }
+  return duckdb::StringValue::Get(value);
+}
+
+// The GPU evaluator compiles one regex per call, so the pattern, replacement and options must be
+// constants that translate_gpu_regexp_replace maps onto DuckDB's semantics.
+bool gpu_supports_regexp_replace(duckdb::BoundFunctionExpression const& expr)
+{
+  if (expr.GetChildren().size() != 3 && expr.GetChildren().size() != 4) { return false; }
+  auto const pattern     = varchar_constant(*expr.GetChildren()[1]);
+  auto const replacement = varchar_constant(*expr.GetChildren()[2]);
+  auto const options     = expr.GetChildren().size() == 4 ? varchar_constant(*expr.GetChildren()[3])
+                                                          : std::optional<std::string>{""};
+  return pattern && replacement && options &&
+         translate_gpu_regexp_replace(*pattern, *replacement, *options).has_value();
+}
+
 std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& expr)
 {
   // Optional scan predicates are hints; the required predicate remains in the plan.
@@ -289,74 +312,8 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   }
   if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
   if (*func_id_opt == function_id::round && !gpu_supports_round(expr)) { return nullptr; }
-  if (*func_id_opt == function_id::regexp_replace) {
-    // The GPU implementation supports constant patterns/replacements and DuckDB's default
-    // options only. In particular, never silently discard the fourth (options) argument.
-    if (expr.GetChildren().size() != 3) { return nullptr; }
-    for (std::size_t i = 1; i < 3; ++i) {
-      if (expr.GetChildren()[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
-        return nullptr;
-      }
-      auto const& value = expr.GetChildren()[i]->Cast<duckdb::BoundConstantExpression>().GetValue();
-      if (value.IsNull() || value.type() != duckdb::LogicalType::VARCHAR) { return nullptr; }
-    }
-    auto const& pattern = duckdb::StringValue::Get(
-      expr.GetChildren()[1]->Cast<duckdb::BoundConstantExpression>().GetValue());
-    // RE2's shorthand classes and word boundaries are ASCII-only; cuDF's are Unicode-aware.
-    // cuDF also does not implement POSIX classes. Skip escaped characters so a literal \\w
-    // remains supported, but reject these constructs wherever they occur in the pattern.
-    for (std::size_t i = 0; i < pattern.size(); ++i) {
-      if (pattern[i] == '\\' && i + 1 < pattern.size()) {
-        switch (pattern[++i]) {
-          case 'w':
-          case 'W':
-          case 'd':
-          case 'D':
-          case 's':
-          case 'S':
-          case 'b':
-          case 'B': return nullptr;
-          default: break;
-        }
-      } else if (pattern.compare(i, 2, "[:") == 0) {
-        return nullptr;
-      } else if (pattern.compare(i, 2, "(?") == 0 && pattern.compare(i, 3, "(?:") != 0) {
-        // cuDF only supports non-capturing groups among the (?...) forms. Inline flags such
-        // as (?m) would also change the anchor semantics the evaluator relies on.
-        return nullptr;
-      }
-    }
-    duckdb_re2::RE2::Options options;
-    options.set_log_errors(false);
-    duckdb_re2::RE2 const regex(pattern, options);
-    if (!regex.ok()) { return nullptr; }
-    // cuDF can compile empty-only patterns such as (?:) and a{0} into programs that never
-    // replace anything. RE2 bounds every possible match; two empty bounds prove that no
-    // nonempty match is possible. One byte is enough to distinguish this from a* or a?.
-    std::string min_match, max_match;
-    if (regex.PossibleMatchRange(&min_match, &max_match, 1) && min_match.empty() &&
-        max_match.empty()) {
-      return nullptr;
-    }
-    auto const& replacement = duckdb::StringValue::Get(
-      expr.GetChildren()[2]->Cast<duckdb::BoundConstantExpression>().GetValue());
-    // cuDF's template syntax differs from RE2's. Only translate single-digit backreferences;
-    // leave escaped backslashes and invalid rewrite escapes to DuckDB. Braced references are
-    // reserved for the translated cuDF template below, but are literal text in DuckDB.
-    bool has_backrefs = false;
-    for (std::size_t i = 0; i < replacement.size(); ++i) {
-      if (replacement[i] != '\\') { continue; }
-      if (++i == replacement.size() || replacement[i] < '0' || replacement[i] > '9') {
-        return nullptr;
-      }
-      has_backrefs = true;
-    }
-    if (has_backrefs && replacement.find("${") != std::string::npos) { return nullptr; }
-    if (has_backrefs) {
-      std::string error;
-      // Validate against the original captures before adding the GPU wrapper groups.
-      if (!regex.CheckRewriteString(replacement, &error)) { return nullptr; }
-    }
+  if (*func_id_opt == function_id::regexp_replace && !gpu_supports_regexp_replace(expr)) {
+    return nullptr;
   }
   auto arguments = translate_children(expr.GetChildren());
   if (!arguments) { return nullptr; }
