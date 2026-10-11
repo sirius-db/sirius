@@ -245,12 +245,14 @@ def probe_identity(cli, directory, timeout):
 
 def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, report):
     config = run_dir / "sirius.yaml"
+    # Four default I/O reactors reserve 64 MiB each. Leave host-memory headroom
+    # for query metadata and results instead of forcing unrelated OOM fallbacks.
     config.write_text(
         """sirius:
   topology: {num_gpus: 1}
   memory:
     gpu: {usage_limit_bytes: 1Gi}
-    host: {capacity_bytes: 256Mi, initial_number_pools: 1, pool_size: 16, block_size: 1Mi}
+    host: {capacity_bytes: 1Gi, initial_number_pools: 1, pool_size: 16, block_size: 1Mi}
     disk: {capacity_bytes: 1Gi, downgrade_root_dirs: "./spill"}
   telemetry: {enable_quent: false}
 """
