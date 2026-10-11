@@ -107,6 +107,98 @@ TEST_CASE("Unqualified bounds and overflow route to legacy before any request",
   CHECK_FALSE(ledger.admit(s, host).deferred);
   CHECK(provider.seen->requests == 0);
 }
+TEST_CASE("Parallel DV admission backs off without losing the one-permit route",
+          "[scan_preparation][ledger]")
+{
+  enum class response { reject, partial, allocation_failure };
+  auto mode     = GENERATE(response::reject, response::partial, response::allocation_failure);
+  auto capacity = GENERATE(208u, 144u, 112u, 111u);
+  struct budget_provider : reservation_provider {
+    uint64_t capacity;
+    response mode;
+    std::vector<uint64_t> requests;
+    test_reservation_provider backing;
+    budget_provider(uint64_t capacity, response mode) : capacity(capacity), mode(mode) {}
+    std::optional<reservation_grant> request(memory_space_id space, uint64_t bytes) override
+    {
+      CHECK(backing.outstanding() == 0);  // Failed grants must be released before retrying.
+      requests.push_back(bytes);
+      if (bytes > capacity) {
+        if (mode == response::reject) return std::nullopt;
+        if (mode == response::allocation_failure) throw std::bad_alloc();
+      }
+      backing.grant_bytes = std::min(bytes, capacity);
+      return backing.request(space, bytes);
+    }
+  } provider(capacity, mode);
+  {
+    preparation_ledger ledger(provider);
+    std::array scans{scan_envelope{std::vector<unit_envelope>(4, {8, 8, 16, 20}), 0, 0, true}};
+    auto d = ledger.admit(scans, host, 4);
+    CHECK(d.sigma_retained == 80);
+    CHECK(d.w == 32);
+    CHECK(provider.requests.front() == 208);
+    REQUIRE(d.deferred == (capacity >= 112));
+    if (d.deferred) {
+      auto expected = (capacity - 80) / 32;
+      CHECK(d.n_permits == expected);
+      CHECK(d.c_obtained >= d.sigma_retained + d.n_permits * d.w);
+      CHECK(provider.backing.outstanding() == 1);
+      std::vector<w_permit> permits;
+      for (uint64_t i = 0; i < 4; ++i)
+        ledger.register_unit({1, i}, 20);
+      for (uint64_t i = 0; i < expected; ++i) {
+        permits.push_back(ledger.acquire_permit({1, i}));
+        REQUIRE(permits.back());
+      }
+      if (expected < 4) CHECK_FALSE(ledger.acquire_permit({1, expected}));
+      auto previous = ledger.permits_in_flight();
+      permits.front().release();
+      CHECK(ledger.permits_in_flight() == previous - 1);
+      CHECK(ledger.acquire_permit({1, 0}));
+    } else {
+      CHECK(d.n_permits == 0);
+      CHECK(provider.backing.outstanding() == 0);
+    }
+    auto expected_requests = mode == response::partial && capacity >= 112
+                               ? std::vector<uint64_t>{208}
+                             : capacity >= 208 ? std::vector<uint64_t>{208}
+                             : capacity >= 144 ? std::vector<uint64_t>{208, 144}
+                                               : std::vector<uint64_t>{208, 144, 112};
+    CHECK(provider.requests == expected_requests);
+  }
+  CHECK(provider.backing.outstanding() == 0);
+}
+
+TEST_CASE("DV permits are capped by work and configured concurrency even with an overgrant",
+          "[scan_preparation][ledger]")
+{
+  auto limit = GENERATE(1u, 2u, 8u);
+  test_reservation_provider provider;
+  provider.grant_bytes = 4096;
+  preparation_ledger ledger(provider);
+  std::array scans{scan_envelope{std::vector<unit_envelope>(3, {8, 8, 16, 20}), 0, 0, true}};
+  auto d = ledger.admit(scans, host, limit);
+  REQUIRE(d.deferred);
+  CHECK(d.n_permits == std::min(limit, 3u));
+  CHECK(d.c_requested == 60 + 32 * std::min(limit, 3u));
+  CHECK(provider.seen->requests == 1);
+}
+
+TEST_CASE("Parallel temporary capacity overflow preserves a representable single permit",
+          "[scan_preparation][ledger]")
+{
+  test_reservation_provider provider;
+  provider.grant_bytes = std::numeric_limits<uint64_t>::max();
+  preparation_ledger ledger(provider);
+  auto w = std::numeric_limits<uint64_t>::max() / 2 + 1;
+  std::array scans{scan_envelope{{{w, 0, 0, 0}, {w, 0, 0, 0}}, 0, 0, true}};
+  auto d = ledger.admit(scans, host, 2);
+  REQUIRE(d.deferred);
+  CHECK(d.c_requested == w);
+  CHECK(d.n_permits == 1);
+}
+
 TEST_CASE("Scans without DV work need no temporary-memory permits", "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
@@ -236,7 +328,9 @@ TEST_CASE("Temporary-memory permits are independent and closure rejects further 
   test_reservation_provider provider;
   provider.grant_bytes = 84;
   preparation_ledger ledger(provider);
-  REQUIRE(ledger.admit(sample(), host).n_permits == 2);
+  auto scans = sample();
+  scans[0].units.push_back({8, 8, 16, 0});
+  REQUIRE(ledger.admit(scans, host, 2).n_permits == 2);
   ledger.register_unit({1, 1}, 20);
   ledger.register_unit({1, 2}, 0);
   ledger.register_unit({1, 3}, 0);

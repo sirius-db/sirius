@@ -1067,15 +1067,19 @@ TEST_CASE(
   "charged results",
   "[scan_preparation][coordinator][ledger]")
 {
-  auto cancel = GENERATE(false, true);
+  auto cancel  = GENERATE(false, true);
+  auto permits = GENERATE(1u, 2u);
   fixture f;
-  auto out     = std::make_shared<sink>();
-  auto blocked = f.make_hold();
+  auto out            = std::make_shared<sink>();
+  auto blocked        = f.make_hold();
+  auto second_blocked = f.make_hold();
   sirius::scan_manager::test::test_reservation_provider provider;
-  provider.grant_bytes = 48;
+  provider.grant_bytes = 32 + 16 * permits;
   preparation_ledger ledger(provider);
   std::array envelope{scan_envelope{{{16, 0, 0, 16}, {16, 0, 0, 16}}, 0, 0, true}};
-  REQUIRE(ledger.admit(envelope, memory_space_id(cucascade::memory::Tier::HOST, 0)).n_permits == 1);
+  REQUIRE(
+    ledger.admit(envelope, memory_space_id(cucascade::memory::Tier::HOST, 0), permits).n_permits ==
+    permits);
   struct input : tagged {
     std::shared_ptr<sirius::op::scan::iceberg_delete_set const> deletes;
     input(int id, decltype(deletes) set) : tagged(id), deletes(std::move(set)) {}
@@ -1109,6 +1113,7 @@ TEST_CASE(
         auto set       = std::make_shared<sirius::op::scan::iceberg_delete_set const>(
           "file", std::move(positions), 2, 1);
         if (id == 0) blocked->wait();
+        if (id == 1 && permits == 2) second_blocked->wait();
         return std::make_unique<input>(id, std::move(set));
       },
       {}};
@@ -1134,11 +1139,13 @@ TEST_CASE(
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(blocked->await());
-  CHECK(ledger.permits_in_flight() == 1);
+  if (permits == 2) REQUIRE(second_blocked->await());
+  CHECK(ledger.permits_in_flight() == permits);
   CHECK(out->count() == 0);
   CHECK_FALSE(out->closed);
   if (cancel) f.coordinator.request_stop(stop_reason::user_cancel);
   blocked->release();
+  second_blocked->release();
   if (!cancel) {
     REQUIRE(out->await(1));
     out->consume();

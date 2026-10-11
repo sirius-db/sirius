@@ -155,16 +155,19 @@ struct allocation_owner {
 };
 }  // namespace
 admission_decision preparation_ledger::admit(std::span<scan_envelope const> scans,
-                                             memory_space_id space)
+                                             memory_space_id space,
+                                             uint32_t max_permits)
 {
   if (admitted_) throw std::logic_error("preparation admission is single use");
   admitted_ = true;
   admission_decision d;
   if (space.tier != cucascade::memory::Tier::HOST)
     throw std::invalid_argument("preparation requires HOST");
+  if (!max_permits) throw std::invalid_argument("preparation needs a positive permit limit");
   try {
     auto quantum             = provider_.allocation_granularity(space);
     d.allocation_granularity = quantum;
+    uint64_t units           = 0;
     for (auto const& scan : scans) {
       if (!scan.qualified) return d;
       d.sigma_retained = add(d.sigma_retained, round(scan.retained_descriptors, quantum));
@@ -173,33 +176,52 @@ admission_decision preparation_ledger::admit(std::span<scan_envelope const> scan
         auto unit_w = add(add(round(unit.blob, quantum), round(unit.footer_parser, quantum)),
                           round(unit.roaring, quantum));
         if (unit.positions && !unit_w) return d;
+        if (unit_w) units = add(units, 1);
         d.sigma_retained = add(d.sigma_retained, round(unit.positions, quantum));
         d.w              = std::max(d.w, unit_w);
       }
     }
-    auto requested = add(d.sigma_retained, d.w);
-    d.c_requested  = requested;
-    state_         = std::make_shared<ledger_state>();
-    if (requested) {
-      auto grant = provider_.request(space, requested);
-      if (!grant) {
-        d.reason = admission_reason::no_grant;
-        state_.reset();
-        return d;
-      }
-      d.c_obtained = grant->bytes;
-      if (!grant->handle || grant->space != space || grant->bytes < requested) {
-        provider_.release(std::move(*grant));
-        state_.reset();
-        d.reason = admission_reason::short_grant;
-        return d;
-      }
-      state_->grant = std::move(grant);
-    }
-    d.n_permits =
-      d.w ? static_cast<uint32_t>(std::min<uint64_t>((d.c_obtained - d.sigma_retained) / d.w,
-                                                     std::numeric_limits<uint32_t>::max()))
+    auto minimum = add(d.sigma_retained, d.w);
+    auto permits =
+      d.w ? std::min<uint64_t>(
+              {units, max_permits, (std::numeric_limits<uint64_t>::max() - d.sigma_retained) / d.w})
           : 0;
+    state_ = std::make_shared<ledger_state>();
+    for (;;) {
+      d.c_requested = d.sigma_retained + permits * d.w;
+      d.c_obtained  = 0;
+      if (!d.c_requested) break;
+      std::optional<reservation_grant> grant;
+      try {
+        grant = provider_.request(space, d.c_requested);
+      } catch (std::bad_alloc const&) {
+        // A smaller reservation can still preserve the original one-permit route.
+      }
+      d.reason = grant ? admission_reason::short_grant : admission_reason::no_grant;
+      if (grant) {
+        d.c_obtained = grant->bytes;
+        bool valid   = grant->handle && grant->space == space;
+        if (valid && grant->bytes >= minimum) {
+          // Partial grants can reduce concurrency; overgrants cannot increase the limit.
+          d.n_permits =
+            d.w ? static_cast<uint32_t>(std::min(permits, (grant->bytes - d.sigma_retained) / d.w))
+                : 0;
+          state_->grant = std::move(grant);
+          break;
+        }
+        provider_.release(std::move(*grant));
+        if (!valid) {
+          state_.reset();
+          return d;
+        }
+      }
+      if (permits <= 1) {
+        state_.reset();
+        return d;
+      }
+      // Bound admission work even with a very large configured worker count.
+      permits = std::max<uint64_t>(1, permits / 2);
+    }
     state_->retained_limit = d.sigma_retained;
     state_->w              = d.w;
     state_->permits        = d.n_permits;

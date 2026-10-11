@@ -3848,13 +3848,18 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto reset                     = reset_after_test(counters->preparation_provider_for_testing,
                                 counters->iceberg_dv_phase_for_testing,
                                 counters->parquet_phase_for_testing,
+                                counters->iceberg_statement_route_for_testing,
                                 counters->iceberg_preparation_route_for_testing);
   std::mutex mutex;
   std::condition_variable changed;
-  bool entered = false, release = false;
+  bool release = false;
+  std::atomic<unsigned> expected_reads{1};
   std::atomic<unsigned> started{0}, finished{0}, footers{0}, decoded{0};
   std::atomic<unsigned> routes{0};
   std::atomic<bool> actual_route_matches{true};
+  counters->iceberg_statement_route_for_testing = [&](auto, auto const& decision) {
+    expected_reads = deferred ? decision.n_permits : 1;
+  };
   counters->iceberg_preparation_route_for_testing = [&](auto, bool actual) {
     if (actual != deferred) actual_route_matches = false;
     ++routes;
@@ -3867,7 +3872,6 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     }
     ++started;
     std::unique_lock lock(mutex);
-    entered = true;
     changed.notify_all();
     if (!changed.wait_for(lock, std::chrono::seconds(10), [&] { return release; }))
       throw std::runtime_error("held DV read was not released");
@@ -3888,7 +3892,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   });
   {
     std::unique_lock lock(mutex);
-    REQUIRE(changed.wait_for(lock, std::chrono::seconds(2), [&] { return entered; }));
+    REQUIRE(changed.wait_for(
+      lock, std::chrono::seconds(2), [&] { return started == expected_reads && started > 0; }));
   }
   con->Interrupt();
   CHECK(routes > 0);
@@ -3899,16 +3904,16 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(query.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
   CHECK(provider->provider.outstanding() == (deferred ? 1 : 0));
   CHECK(state->get_scan_manager().num_active_queries() == (deferred ? 1 : 0));
-  CHECK(started == 1);
+  CHECK(started == expected_reads);
   cleanup.reset();
   REQUIRE(query.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
   auto result = query.get();
   REQUIRE(result);
   REQUIRE(result->HasError());
   CHECK(result->GetErrorType() == duckdb::ExceptionType::INTERRUPT);
-  CHECK(started == (deferred ? 1 : 3));
-  CHECK(finished == (deferred ? 1 : 3));
-  CHECK(footers == (deferred ? 1 : 0));
+  CHECK(started == (deferred ? expected_reads.load() : 3));
+  CHECK(finished == (deferred ? expected_reads.load() : 3));
+  CHECK(footers == (deferred ? expected_reads.load() : 0));
   CHECK(decoded == 0);
   CHECK(provider->provider.outstanding() == 0);
   CHECK(provider->provider.seen->allocated_bytes == 0);
@@ -4050,6 +4055,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "[integration][scan_preparation][iceberg][prepared_admission]")
 {
   auto scarce   = GENERATE(false, true);
+  auto three    = GENERATE(false, true);
   auto context  = sirius::test::get_registered_sirius_context(*con);
   auto counters = context->physical_counters();
   REQUIRE_FALSE(counters->preparation_provider_for_testing);
@@ -4072,11 +4078,12 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     };
   sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
   auto before = sirius::test::get_transparent_execution_stats(*con);
-  auto result = con->Query("SELECT count(*) FROM " + pinned_scan(inventory_fixture("dv_bounded")));
+  auto result = con->Query("SELECT count(*) FROM " +
+                           pinned_scan(inventory_fixture(three ? "dv_three" : "dv_bounded")));
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : ""));
   REQUIRE_FALSE(result->HasError());
-  CHECK(observed.fetch(*result) == std::vector<std::vector<std::string>>{{"3"}});
+  CHECK(observed.fetch(*result) == std::vector<std::vector<std::string>>{{three ? "9" : "3"}});
   auto after = sirius::test::get_transparent_execution_stats(*con);
   require_route(before, after, gpu_route::gpu);
   REQUIRE(observed.admissions.size() == 1);
@@ -4085,13 +4092,20 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(record.route_reason == (scarce ? "host_admission" : "deferred"));
   CHECK(d.deferred == !scarce);
   CHECK(d.allocation_granularity == block);
-  CHECK(d.c_requested == 4 * block);
-  CHECK(d.c_requested == d.sigma_retained + d.w);
+  auto const& config    = context->get_config().get_scan_manager_config();
+  auto limits           = config.preparation.resolve(config.thread_pool.num_threads);
+  auto expected_permits = std::min<size_t>({three ? 3u : 1u,
+                                            static_cast<size_t>(config.thread_pool.num_threads),
+                                            limits.max_inflight_jobs,
+                                            limits.max_active_units,
+                                            limits.max_pending_results});
+  CHECK(d.c_requested == d.sigma_retained + (scarce ? 1 : expected_permits) * d.w);
   CHECK(d.c_requested % d.allocation_granularity == 0);
   REQUIRE(observed.routes.size() == 1);
   CHECK(observed.routes.front().second == !scarce);
 
   if (!scarce) {
+    CHECK(d.n_permits == expected_permits);
     CHECK(d.c_obtained == d.c_requested);
     REQUIRE(d.w > 0);
     CHECK(d.n_permits == (d.c_obtained - d.sigma_retained) / d.w);

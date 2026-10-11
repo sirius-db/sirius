@@ -173,7 +173,10 @@ class preparation_ledger {
   ~preparation_ledger() { close(); }
   preparation_ledger(preparation_ledger const&)            = delete;
   preparation_ledger& operator=(preparation_ledger const&) = delete;
-  admission_decision admit(std::span<scan_envelope const>, memory_space_id);
+  // Request bounded parallel work; failed large requests back off to one permit.
+  admission_decision admit(std::span<scan_envelope const>,
+                           memory_space_id,
+                           uint32_t max_permits = 1);
   // Bind file-local retained limits during registration, before any execution work.
   void register_unit(unit_key, uint64_t retained_limit);
   void retire_unit(unit_key key) noexcept;

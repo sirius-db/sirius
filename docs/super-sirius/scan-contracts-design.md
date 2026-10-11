@@ -79,6 +79,8 @@ Each execution attempt owns its preparation units. A unit identifies one scan in
 
 Eligible Iceberg deletion-vector scans share one host-memory admission for the statement. The reservation covers retained descriptors and delete positions plus bounded temporary decode work, including allocation granularity. Buffers use the reserved backing, and immutable per-file delete sets retain it until their last consumer releases it. A prepared execution consumes its admission once; a later execution needs a fresh admission.
 
+Temporary capacity is requested for multiple DV jobs, bounded by the DV unit count, scan workers, and preparation job, active-unit, and result-slot limits. If a request fails, admission halves the target concurrency down to one job. A valid partial grant is used only when it covers all retained results and at least one job's temporary bound; its size limits the admitted concurrency. Only one successful reservation is retained.
+
 Unbounded inputs, the statement deletion-vector limit, or insufficient host capacity select eager delete loading before deferred execution starts. Positional-delete files keep their existing loading path. This route decision does not itself select CPU fallback. Once deferred work starts, read, validation, and allocation failures use the normal failure and replay rules; they never become an empty delete set.
 
 Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.

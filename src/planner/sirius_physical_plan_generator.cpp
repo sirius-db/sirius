@@ -463,7 +463,15 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
   if (qualified && route_allowed && !envelopes.empty()) {
     auto spaces =
       sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    if (!spaces.empty()) decision = ledger->admit(envelopes, spaces.front()->get_id());
+    if (!spaces.empty()) {
+      auto const& config = sirius_ctx->get_config().get_scan_manager_config();
+      auto limits        = config.preparation.resolve(config.thread_pool.num_threads);
+      auto permits       = std::min<size_t>({static_cast<size_t>(config.thread_pool.num_threads),
+                                             limits.max_inflight_jobs,
+                                             limits.max_active_units,
+                                             limits.max_pending_results});
+      decision = ledger->admit(envelopes, spaces.front()->get_id(), static_cast<uint32_t>(permits));
+    }
   }
   std::string_view route_reason = !qualified           ? "unqualified_envelope"
                                   : !route_allowed     ? "statement_dv_limit"
