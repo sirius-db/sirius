@@ -2645,7 +2645,14 @@ fn aggregate_expr(name: &str, ret_type: TTypeDesc, child: Option<TExpr>) -> TExp
     let num_children = child.as_ref().map(|_| 1).unwrap_or(0);
     let mut node = base_expr_node(TExprNodeType::AGG_EXPR, ret_type.clone(), num_children);
     node.agg_expr = Some(TAggregateExpr::new(false));
-    node.fn_ = Some(builtin_function(name, ret_type));
+    let mut function = builtin_function(name, ret_type);
+    // The FE records the argument's type, which a decimal AVG's sum takes its scale from.
+    function.arg_types = child
+        .as_ref()
+        .and_then(|child| child.nodes.first())
+        .map(|argument| vec![argument.type_.clone()])
+        .unwrap_or_default();
+    node.fn_ = Some(function);
     let mut nodes = vec![node];
     if let Some(child) = child {
         nodes.extend(child.nodes);
@@ -4151,11 +4158,16 @@ fn translate_merge_avg(names: &[&str], state_tuple: i32) -> Result<TranslatedPla
                 scalar_type(TPrimitiveType::DOUBLE),
                 slot_ref(2, state_tuple, scalar_type(TPrimitiveType::VARBINARY)),
             ),
-            merge_aggregate_expr(
-                "avg",
-                decimal128(38, 8),
-                slot_ref(3, state_tuple, scalar_type(TPrimitiveType::VARBINARY)),
-            ),
+            {
+                let mut avg = merge_aggregate_expr(
+                    "avg",
+                    decimal128(38, 8),
+                    slot_ref(3, state_tuple, scalar_type(TPrimitiveType::VARBINARY)),
+                );
+                // The FE names the original argument's type on the merge node too.
+                avg.nodes[0].fn_.as_mut().unwrap().arg_types = vec![decimal64_15_2()];
+                avg
+            },
             merge_aggregate_expr(
                 "count",
                 scalar_type(TPrimitiveType::BIGINT),
@@ -4246,21 +4258,46 @@ fn two_phase_partial_avg_ships_a_sum_and_a_count() {
         [Some(0), Some(0), Some(2), Some(2), None, Some(2)]
     );
     let aggregate = root_aggregate(&plan.plan);
-    for measure in &aggregate.measures[..4] {
-        let Some(substrait::proto::function_argument::ArgType::Value(argument)) =
-            &measure.measure.as_ref().unwrap().arguments[0].arg_type
-        else {
-            panic!("expected a value argument");
-        };
-        let Some(expression::RexType::Cast(cast)) = argument.rex_type.as_ref() else {
-            panic!("expected the AVG input cast to FP64, got {argument:?}");
+    let argument = |index: usize| match &aggregate.measures[index]
+        .measure
+        .as_ref()
+        .unwrap()
+        .arguments[0]
+        .arg_type
+    {
+        Some(substrait::proto::function_argument::ArgType::Value(argument)) => argument,
+        other => panic!("expected a value argument, got {other:?}"),
+    };
+    // The integer AVG (DOUBLE result) sums its input cast to FP64.
+    for index in 0..2 {
+        let Some(expression::RexType::Cast(cast)) = argument(index).rex_type.as_ref() else {
+            panic!("expected the AVG input cast to FP64");
         };
         assert_eq!(duckdb_name(cast.r#type.as_ref()), "DOUBLE");
+    }
+    // The decimal AVG sums its input exactly, as DECIMAL(38,2).
+    for index in 2..4 {
         assert!(matches!(
-            cast.input.as_ref().unwrap().rex_type,
+            argument(index).rex_type,
             Some(expression::RexType::Selection(_))
         ));
     }
+    let kinds: Vec<_> = aggregate
+        .measures
+        .iter()
+        .map(|measure| duckdb_name(measure.measure.as_ref().unwrap().output_type.as_ref()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "DOUBLE",
+            "BIGINT",
+            "DECIMAL(38,2)",
+            "BIGINT",
+            "BIGINT",
+            "DECIMAL(38,2)"
+        ]
+    );
     // Each AVG's count has no slot of its own, so it is named after its position.
     assert_eq!(
         root(&plan.plan).names,
@@ -4278,7 +4315,7 @@ fn two_phase_partial_avg_ships_a_sum_and_a_count() {
 
 /// Both fragments derive the exchange row from the same rule, so the partial step's columns
 /// are the merge step's stream, column for column, although the FE types each AVG slot
-/// VARBINARY.
+/// VARBINARY: an FP64 sum for the integer AVG, an exact DECIMAL(38,2) sum for the decimal one.
 #[test]
 fn two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
     let partial = translate_partial_avg();
@@ -4297,7 +4334,7 @@ fn two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
             "VARCHAR",
             "DOUBLE",
             "BIGINT",
-            "DOUBLE",
+            "DECIMAL(38,2)",
             "BIGINT",
             "BIGINT",
             "DECIMAL(38,2)"
@@ -4310,8 +4347,8 @@ fn two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
 }
 
 /// Merge AVG sums the shipped sums and counts and divides; the count sum is cast back to
-/// BIGINT like every two-phase integer sum, then to FP64 for the division. A decimal AVG's FP64
-/// quotient is cast to the FE's DECIMAL128(38,8). Each later measure reads its column past the
+/// BIGINT like every two-phase integer sum. An integer AVG divides in FP64; a decimal AVG
+/// divides exactly, to the FE's DECIMAL128(38,8). Each later measure reads its column past the
 /// AVG counts, and the output is the merge's tuple again.
 #[test]
 fn two_phase_merge_avg_divides_the_summed_sums_by_the_summed_counts() {
@@ -4333,34 +4370,46 @@ fn two_phase_merge_avg_divides_the_summed_sums_by_the_summed_counts() {
     };
     // name, avg_id, avg_price, n (the count sum cast back to BIGINT), total.
     assert_eq!(project.expressions.len(), 5);
-    let Some(expression::RexType::Cast(avg_price)) = project.expressions[2].rex_type.as_ref()
-    else {
-        panic!("expected the decimal AVG cast to its FE type");
+    // The integer AVG divides in FP64.
+    let avg_id = &project.expressions[1];
+    let function = scalar_fn(avg_id);
+    assert_eq!(
+        resolved_function(&merge.plan, function.function_reference).1,
+        "divide"
+    );
+    assert_eq!(duckdb_name(function.output_type.as_ref()), "DOUBLE");
+    assert_eq!(struct_field(scalar_arg(avg_id, 0)), 1);
+    // cast(cast(count AS BIGINT) AS DOUBLE)
+    let Some(expression::RexType::Cast(to_double)) = scalar_arg(avg_id, 1).rex_type.as_ref() else {
+        panic!("expected the count cast to FP64");
     };
-    assert_eq!(duckdb_name(avg_price.r#type.as_ref()), "DECIMAL(38,8)");
-    let quotients = [&project.expressions[1], avg_price.input.as_deref().unwrap()];
-    for (expr, (sum, count)) in quotients.into_iter().zip([(1, 2), (3, 4)]) {
-        let function = scalar_fn(expr);
-        assert_eq!(
-            resolved_function(&merge.plan, function.function_reference).1,
-            "divide"
-        );
-        assert_eq!(duckdb_name(function.output_type.as_ref()), "DOUBLE");
-        assert_eq!(struct_field(scalar_arg(expr, 0)), sum);
-        // cast(cast(count AS BIGINT) AS DOUBLE)
-        let Some(expression::RexType::Cast(to_double)) = scalar_arg(expr, 1).rex_type.as_ref()
-        else {
-            panic!("expected the count cast to FP64");
-        };
-        assert_eq!(duckdb_name(to_double.r#type.as_ref()), "DOUBLE");
-        let Some(expression::RexType::Cast(to_bigint)) =
-            to_double.input.as_ref().unwrap().rex_type.as_ref()
-        else {
-            panic!("expected the count sum cast back to BIGINT");
-        };
-        assert_eq!(duckdb_name(to_bigint.r#type.as_ref()), "BIGINT");
-        assert_eq!(struct_field(to_bigint.input.as_ref().unwrap()), count);
-    }
+    assert_eq!(duckdb_name(to_double.r#type.as_ref()), "DOUBLE");
+    let Some(expression::RexType::Cast(to_bigint)) =
+        to_double.input.as_ref().unwrap().rex_type.as_ref()
+    else {
+        panic!("expected the count sum cast back to BIGINT");
+    };
+    assert_eq!(struct_field(to_bigint.input.as_ref().unwrap()), 2);
+    // The decimal AVG divides its exact sum by its count with `sirius_decimal_divide` at the FE's
+    // scale; the function returns the FE's DECIMAL(38,8), so no cast follows.
+    let avg_price = &project.expressions[2];
+    let function = scalar_fn(avg_price);
+    assert_eq!(
+        resolved_function(&merge.plan, function.function_reference).1,
+        "sirius_decimal_divide"
+    );
+    assert_eq!(duckdb_name(function.output_type.as_ref()), "DECIMAL(38,8)");
+    assert_eq!(struct_field(scalar_arg(avg_price, 0)), 3);
+    let Some(expression::RexType::Cast(count_sum)) = scalar_arg(avg_price, 1).rex_type.as_ref()
+    else {
+        panic!("expected the count sum cast back to BIGINT");
+    };
+    assert_eq!(duckdb_name(count_sum.r#type.as_ref()), "BIGINT");
+    assert_eq!(struct_field(count_sum.input.as_ref().unwrap()), 4);
+    assert!(matches!(
+        literal_type(scalar_arg(avg_price, 2)),
+        expression::literal::LiteralType::I32(8)
+    ));
     let Some(expression::RexType::Cast(count)) = project.expressions[3].rex_type.as_ref() else {
         panic!("expected the merged count cast back to BIGINT");
     };
@@ -4391,7 +4440,7 @@ fn two_phase_merge_avg_reading_states_through_another_tuple_widens_the_exchange_
             "VARCHAR",
             "DOUBLE",
             "BIGINT",
-            "DOUBLE",
+            "DECIMAL(38,2)",
             "BIGINT",
             "BIGINT",
             "DECIMAL(38,2)"
@@ -5050,7 +5099,13 @@ fn decimal_arithmetic_output(
     else {
         panic!("expected output project");
     };
+    DIVIDE_PLAN.with(|plan| *plan.borrow_mut() = extension_function_names(&translated.plan));
     project.expressions[0].clone()
+}
+
+thread_local! {
+    /// The extension function names of the last `decimal_arithmetic_output` plan.
+    static DIVIDE_PLAN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The cast an expression is, with its target.
@@ -5147,40 +5202,58 @@ fn a_narrow_decimal_product_is_not_widened() {
     }
 }
 
-/// Decimal `/` stays in FP64 until the engine has an exact decimal division: the operands are
-/// cast to DOUBLE, and the quotient is cast to the FE's decimal type.
+/// Decimal `/` is exact: `sirius_decimal_divide(dividend, divisor, scale)` at the FE's result
+/// scale, with the operands as they are. It returns DECIMAL(38, scale), the FE's type, so no
+/// cast follows. It rounds half away from zero and gives NULL for a zero divisor, as StarRocks'
+/// division does.
 #[test]
-fn decimal_division_runs_in_fp64_and_is_cast_to_the_fe_type() {
+fn decimal_division_is_sirius_decimal_divide() {
     let output = decimal_arithmetic_output(
         TExprOpcode::DIVIDE,
         scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(4)),
         scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(10)),
     );
+    let function = scalar_fn(&output);
+    let plan_names = DIVIDE_PLAN.with(|plan| plan.borrow().clone());
+    assert!(
+        plan_names.contains(&"sirius_decimal_divide".to_string()),
+        "{plan_names:?}"
+    );
+    assert_eq!(decimal_of(function.output_type.as_ref()), (38, 10));
+    let arguments = value_arguments(function);
+    assert_eq!(arguments.len(), 3);
+    for operand in &arguments[..2] {
+        assert!(
+            matches!(operand.rex_type, Some(expression::RexType::Selection(_))),
+            "{operand:?}"
+        );
+    }
+    assert!(matches!(
+        literal_type(arguments[2]),
+        expression::literal::LiteralType::I32(10)
+    ));
+}
+
+/// A decimal MOD stays in FP64, with a zero divisor giving NULL, as in StarRocks, rather than
+/// the NaN that the cast to the decimal result type would refuse.
+#[test]
+fn a_zero_decimal_modulus_divisor_gives_null() {
+    let output = decimal_arithmetic_output(
+        TExprOpcode::MOD,
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(4)),
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(4)),
+    );
     let cast = as_cast(&output);
-    assert_eq!(decimal_of(cast.r#type.as_ref()), (38, 10));
+    assert_eq!(decimal_of(cast.r#type.as_ref()), (38, 4));
     let function = scalar_fn(cast.input.as_ref().unwrap());
     assert!(matches!(
         function.output_type.as_ref().unwrap().kind,
         Some(substrait::proto::r#type::Kind::Fp64(_))
     ));
-    assert_fp64_cast(value_arguments(function)[0]);
-}
-
-/// A zero divisor gives NULL, as in StarRocks, rather than an infinity or NaN that the cast to
-/// the decimal result type would refuse: the divisor is `IF(divisor = 0, NULL, divisor)`.
-#[test]
-fn a_zero_decimal_divisor_gives_null() {
-    let output = decimal_arithmetic_output(
-        TExprOpcode::DIVIDE,
-        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(4)),
-        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(10)),
-    );
-    let function = scalar_fn(as_cast(&output).input.as_ref().unwrap());
     let divisor = value_arguments(function)[1];
     let Some(expression::RexType::IfThen(guard)) = divisor.rex_type.as_ref() else {
         panic!("expected the divisor guarded against zero, got {divisor:?}");
     };
-    assert_eq!(guard.ifs.len(), 1);
     let condition = guard.ifs[0].r#if.as_ref().unwrap();
     assert_fp64_cast(scalar_arg(condition, 0));
     assert!(matches!(
@@ -5191,7 +5264,6 @@ fn a_zero_decimal_divisor_gives_null() {
         literal_type(guard.ifs[0].then.as_ref().unwrap()),
         expression::literal::LiteralType::Null(_)
     ));
-    assert_fp64_cast(guard.r#else.as_ref().unwrap());
 }
 
 /// Translates a one-phase aggregation with one measure over a BIGINT slot and returns that
@@ -5234,13 +5306,65 @@ fn single_measure_argument(name: &str, ret_type: TTypeDesc) -> substrait::proto:
     value.clone()
 }
 
-/// A decimal AVG still runs in FP64 (DuckDB's avg(DECIMAL) returns DOUBLE): its argument is
-/// cast to DOUBLE.
+/// A one-phase decimal AVG is StarRocks' exact average: the DECIMAL(38,2) sum and the count of
+/// its argument, divided by `sirius_decimal_divide` at the FE's scale, DECIMAL128(38,8).
+/// DuckDB's avg(DECIMAL) would return DOUBLE.
 #[test]
-fn decimal_avg_is_lowered_to_fp64() {
-    assert_fp64_cast(&single_measure_argument(
-        "avg",
-        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(8)),
+fn a_one_phase_decimal_avg_divides_its_exact_sum_by_its_count() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "avg",
+            decimal128(38, 8),
+            Some(slot_ref(3, 0, decimal64_15_2())),
+        )],
+    );
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 0, "price", decimal64_15_2()),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "avg_price", decimal128(38, 8)),
+        ],
+    );
+    let plan = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(measure_names(&plan.plan), ["sum", "count"]);
+    let aggregate = root_aggregate(&plan.plan);
+    assert_eq!(
+        decimal_of(
+            aggregate.measures[0]
+                .measure
+                .as_ref()
+                .unwrap()
+                .output_type
+                .as_ref()
+        ),
+        (38, 2)
+    );
+    assert_eq!(root(&plan.plan).names, ["name", "avg_price"]);
+    let Some(rel::RelType::Project(project)) =
+        root(&plan.plan).input.as_ref().unwrap().rel_type.as_ref()
+    else {
+        panic!("expected the projection that finishes the average");
+    };
+    let quotient = scalar_fn(&project.expressions[1]);
+    assert_eq!(
+        resolved_function(&plan.plan, quotient.function_reference).1,
+        "sirius_decimal_divide"
+    );
+    assert_eq!(decimal_of(quotient.output_type.as_ref()), (38, 8));
+    assert!(matches!(
+        literal_type(scalar_arg(&project.expressions[1], 2)),
+        expression::literal::LiteralType::I32(8)
     ));
 }
 
