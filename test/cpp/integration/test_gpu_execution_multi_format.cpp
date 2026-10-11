@@ -1792,7 +1792,9 @@ TEST_CASE_METHOD(
   auto reason = static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_delete_corrupt);
   CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
   CHECK(after.late_replays[cause] == before.late_replays[cause] + 1);
-  CHECK(after.split_physical_rejections[reason] == before.split_physical_rejections[reason] + 1);
+  // Both misbound files may fail validation before preparation stops.
+  CHECK(after.split_physical_rejections[reason] >= before.split_physical_rejections[reason] + 1);
+  CHECK(after.split_physical_rejections[reason] <= before.split_physical_rejections[reason] + 2);
 }
 
 //===----------------------------------------------------------------------===//
