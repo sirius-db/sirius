@@ -298,6 +298,41 @@ pub fn skipped_builds(params: &TExecPlanFragmentParams) -> Result<Vec<SkippedFil
         .collect())
 }
 
+/// A partitioned join's filter that `params`' fragment builds but no compute node can
+/// ([`skipped_builds`]). Its probing scans wait for every share, so they must be told that none
+/// comes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnbuiltShare {
+    /// Filter id, unique within the query.
+    pub filter_id: i32,
+    /// The join that would build it.
+    pub join_node_id: i32,
+    /// The FE's merge node for the filter, which knows its probers.
+    pub merge_node: TNetworkAddress,
+    pub reason: SkipReason,
+}
+
+/// The partitioned join filters among [`skipped_builds`] that name a merge node, through which
+/// their probers can be found. Probers of a filter without one don't wait for it.
+pub fn unbuilt_shares(params: &TExecPlanFragmentParams) -> Result<Vec<UnbuiltShare>> {
+    let nodes = plan_nodes(params);
+    if nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let children = child_indices(nodes)?;
+    Ok(join_builds(nodes, &children)
+        .filter(|build| BuildDistribution::of(build.filter) == BuildDistribution::Partitioned)
+        .filter_map(|build| {
+            Some(UnbuiltShare {
+                filter_id: build.filter.filter_id?,
+                join_node_id: build.join_node_id,
+                merge_node: merge_node(build.filter)?,
+                reason: build.skip_reason()?,
+            })
+        })
+        .collect())
+}
+
 /// Probe targets in `params`' fragment that a compute node never filters: a target that isn't a
 /// scan, and a scan probing a filter a join of its own fragment builds. Other scans aren't
 /// listed; whether they're filtered is decided when they run ([`probed_filters`]).
