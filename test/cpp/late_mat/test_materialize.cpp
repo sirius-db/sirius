@@ -27,12 +27,16 @@
 // repeats, and that path — dedup, materialize in table order, gather back — has
 // three places to permute the result and no way to notice from row counts.
 
+#include "operator/operator_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
@@ -40,6 +44,7 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <late_mat/materialize.hpp>
 
 #include <cstdint>
@@ -47,6 +52,7 @@
 #include <numeric>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 using sirius::late_mat::batch_source;
@@ -199,6 +205,99 @@ rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, ::cuda::st
   }
   return buf;
 }
+
+/// A pinned column whose batches live on the GPUs asked for: row i holds i, as
+/// INT32 and as its decimal text. Each batch is allocated on its own GPU with
+/// that GPU's stream and allocator, as the pin path does.
+struct spread_pin {
+  struct batch {
+    std::unique_ptr<cudf::column> ints;
+    std::unique_ptr<cudf::column> strings;
+    cucascade::memory::memory_space* space;
+  };
+  std::vector<batch> batches;
+  pinned_column_view ints;
+  pinned_column_view strings;
+
+  explicit spread_pin(
+    std::vector<std::pair<std::int64_t, cucascade::memory::memory_space*>> const& placement)
+  {
+    std::int64_t next = 0;
+    for (auto const& [rows, space] : placement) {
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{space->get_device_id()}};
+      auto const stream = space->acquire_stream();
+      auto const mr     = space->get_default_allocator();
+
+      std::vector<std::int32_t> host(static_cast<std::size_t>(rows));
+      std::iota(host.begin(), host.end(), static_cast<std::int32_t>(next));
+      std::vector<std::int32_t> offsets{0};
+      std::string chars;
+      for (std::int64_t r = 0; r < rows; ++r) {
+        chars += std::to_string(next + r);
+        offsets.push_back(static_cast<std::int32_t>(chars.size()));
+      }
+      next += rows;
+
+      auto ints = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                            static_cast<cudf::size_type>(rows),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream,
+                                            mr);
+      cudaMemcpyAsync(ints->mutable_view().data<std::int32_t>(),
+                      host.data(),
+                      host.size() * sizeof(std::int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream.get());
+      auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                   static_cast<cudf::size_type>(offsets.size()),
+                                                   cudf::mask_state::UNALLOCATED,
+                                                   stream,
+                                                   mr);
+      cudaMemcpyAsync(offsets_col->mutable_view().data<std::int32_t>(),
+                      offsets.data(),
+                      offsets.size() * sizeof(std::int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream.get());
+      rmm::device_buffer chars_buf(chars.size(), stream, mr);
+      cudaMemcpyAsync(
+        chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.get());
+      cudaStreamSynchronize(stream.get());
+      auto strings = cudf::make_strings_column(
+        static_cast<cudf::size_type>(rows),
+        std::move(offsets_col),
+        std::move(chars_buf),
+        0,
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
+      batches.push_back({std::move(ints), std::move(strings), space});
+    }
+
+    ints.dtype    = cudf::data_type{cudf::type_id::INT32};
+    strings.dtype = cudf::data_type{cudf::type_id::STRING};
+    for (auto const& b : batches) {
+      batch_source int_src;
+      int_src.uncompressed = b.ints->view();
+      int_src.num_rows     = b.ints->size();
+      int_src.memory_space = b.space;
+      ints.batches.push_back(int_src);
+
+      batch_source str_src;
+      str_src.uncompressed = b.strings->view();
+      str_src.num_rows     = b.strings->size();
+      str_src.memory_space = b.space;
+      strings.batches.push_back(str_src);
+    }
+  }
+
+  ~spread_pin()
+  {
+    // Free each batch on the GPU that allocated it.
+    for (auto& b : batches) {
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{b.space->get_device_id()}};
+      b.ints.reset();
+      b.strings.reset();
+    }
+  }
+};
 
 }  // namespace
 
@@ -361,4 +460,48 @@ TEST_CASE("a column whose batches disagree with the prepared layout is refused",
     layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), 2, true});
 
   REQUIRE_THROWS(materialize(pin.view, prepared, stream, mr));
+}
+
+TEST_CASE("a batch pinned on another GPU is gathered there and comes back in the caller's order",
+          "[late_mat][materialize][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  auto mgr     = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto* space0 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* space1 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 1);
+  REQUIRE(space0 != nullptr);
+  REQUIRE(space1 != nullptr);
+
+  // The consumer runs on GPU 0; the middle batch is pinned on GPU 1.
+  spread_pin pin({{kChunk, space0}, {kChunk, space1}, {kChunk, space0}});
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{0}};
+  auto const stream = space0->acquire_stream();
+  auto const mr     = space0->get_default_allocator();
+  auto const layout = pinned_table_layout::from_batch_rows({kChunk, kChunk, kChunk});
+
+  // Unsorted, with repeats, touching every batch -- the remote one more than
+  // once, so its gather map has more than one row and its rows interleave with
+  // the local batches' on the way back into the caller's order.
+  std::vector<std::uint64_t> const ids{
+    2 * kChunk + 7, kChunk + 3, 5, kChunk + 3, kChunk + 1000, 2 * kChunk + 7, 0};
+  auto d_ids = upload_ids(ids, stream);
+  prepared_selection const prepared(layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(ids.size()),
+                                                false});
+
+  auto const before = sirius::late_mat::remote_batches_materialized();
+  auto ints         = materialize(pin.ints, prepared, stream, mr);
+  auto strings      = materialize(pin.strings, prepared, stream, mr);
+  cudaStreamSynchronize(stream.get());
+  // One remote batch per column, or the path under test did not run.
+  REQUIRE(sirius::late_mat::remote_batches_materialized() == before + 2);
+
+  std::vector<std::int32_t> const expected_ints(ids.begin(), ids.end());
+  REQUIRE(read_back(ints->view()) == expected_ints);
+  std::vector<std::string> expected_strings;
+  for (auto const id : ids) {
+    expected_strings.push_back(std::to_string(id));
+  }
+  REQUIRE(read_back_strings(strings->view()) == expected_strings);
 }
