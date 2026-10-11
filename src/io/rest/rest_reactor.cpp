@@ -19,6 +19,7 @@
 #include "cucascade/cuda/event.hpp"
 #include "exec/thread_util.hpp"
 #include "io/details/slot_pool.hpp"
+#include "io/io_errors.hpp"
 #include "io/rest/curl_handle.hpp"
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
@@ -40,6 +41,7 @@
 #include <deque>
 #include <format>
 #include <limits>
+#include <new>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -139,19 +141,6 @@ std::string match_header(std::string_view line, std::string_view name)
   return std::string(val);
 }
 
-/// Header callback: capture Content-Range and Retry-After.
-size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
-{
-  auto* hc           = static_cast<header_capture*>(userdata);
-  size_t const bytes = size * nitems;
-  std::string_view line(buffer, bytes);
-  if (auto v = match_header(line, "content-range"); !v.empty()) {
-    hc->content_range = std::move(v);
-  }
-  if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
-  return bytes;
-}
-
 /// True iff @p line is an HTTP status line ("HTTP/..."), i.e. the start of a
 /// (possibly interim) response's header block within one transfer.
 bool is_http_status_line(std::string_view line) noexcept
@@ -160,10 +149,26 @@ bool is_http_status_line(std::string_view line) noexcept
          ascii_lower(line[2]) == 't' && ascii_lower(line[3]) == 'p' && line[4] == '/';
 }
 
+/// Header callback: capture Content-Range, Retry-After and ETag of the response
+/// block currently being received; a new status line starts a new block.
+size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
+{
+  auto* hc           = static_cast<header_capture*>(userdata);
+  size_t const bytes = size * nitems;
+  std::string_view line(buffer, bytes);
+  if (is_http_status_line(line)) { hc->reset(); }
+  if (auto v = match_header(line, "content-range"); !v.empty()) {
+    hc->content_range = std::move(v);
+  }
+  if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
+  if (auto v = match_header(line, "etag"); !v.empty()) { hc->etag = std::move(v); }
+  return bytes;
+}
+
 /// Per-attempt capture for the blocking HEAD: Retry-After for backoff plus the
-/// object's ETag.  Separate from @c header_capture so the async data-GET path
-/// parses nothing it does not consume.  The ETag resets on every status line,
-/// so interim responses (proxy CONNECT) within one transfer leave no residue.
+/// object's ETag.  Kept apart from @c header_capture, whose Content-Range the
+/// HEAD never receives.  The ETag resets on every status line, so interim
+/// responses (proxy CONNECT) within one transfer leave no residue.
 struct head_capture {
   std::string retry_after;
   std::string etag;
@@ -310,16 +315,35 @@ void apply_request_opts(CURL* h, const config& cfg, bool data_transfer = false)
 
 /// Build a header list from the authorizer's headers (empty in presigned mode)
 /// plus an optional Range header.
+/// Build the request header list, or throw: a request is never sent with a
+/// partially assembled header set.  @p range and @p if_match are optional.
 curl_slist_ptr build_header_list(std::vector<std::pair<std::string, std::string>> const& headers,
-                                 std::string const* range)
+                                 std::string const* range,
+                                 std::string const* if_match = nullptr)
 {
-  curl_slist* list = nullptr;
+  curl_slist_ptr list;
+  auto append = [&list](char const* line) {
+    auto* next = curl_slist_append(list.get(), line);
+    if (next == nullptr) { throw std::bad_alloc(); }
+    std::ignore = list.release();
+    list.reset(next);
+  };
   for (auto const& [k, v] : headers) {
-    std::string const h = k + ": " + v;
-    list                = curl_slist_append(list, h.c_str());
+    append((k + ": " + v).c_str());
   }
-  if (range != nullptr) { list = curl_slist_append(list, range->c_str()); }
-  return curl_slist_ptr{list};
+  if (range != nullptr) { append(range->c_str()); }
+  if (if_match != nullptr) { append(if_match->c_str()); }
+  return list;
+}
+
+/// The validator a data GET for @p obj must be conditioned on and checked
+/// against: the open's strong ETag, or empty when the open has none (such a
+/// generation reads unconditionally and is never reused across opens).
+std::string_view conditional_tag(io_object const* obj) noexcept
+{
+  if (obj == nullptr) { return {}; }
+  auto const tag = obj->validation_tag();
+  return rest_io_object::is_strong_tag(tag) ? tag : std::string_view{};
 }
 
 /// "Range: bytes=<lo>-<hi>" (inclusive end) for [offset, offset+size).
@@ -1424,8 +1448,10 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       slot.sink.reset();
       slot.hc.reset();
       auto const range = range_header(slot.req->op->io_rng.offset, slot.req->op->io_rng.size);
-      slot.headers     = build_header_list(auth.headers, &range);
-      auto* handle     = slot.easy.get();
+      auto const tag   = conditional_tag(slot.req->op->obj.get());
+      std::string const if_match = tag.empty() ? std::string{} : "If-Match: " + std::string(tag);
+      slot.headers = build_header_list(auth.headers, &range, tag.empty() ? nullptr : &if_match);
+      auto* handle = slot.easy.get();
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_URL, slot.url.c_str()));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HTTPHEADER, slot.headers.get()));
@@ -1514,6 +1540,21 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
 
       bool const complete_body =
         slot.sink.written == io_rng.size && slot.sink.total_received == io_rng.size;
+      if (auto const expected = conditional_tag(op.obj.get()); !expected.empty()) {
+        bool const accepted = curl_status == CURLE_OK && range_status && complete_body;
+        // The status line is enough: however the refusal's error body ended,
+        // the precondition failed and no retry can change that.
+        if (http_status == 412) {
+          op.finish_error(std::make_exception_ptr(
+            object_changed_error(op.obj->object_path(), std::string(expected), {})));
+          return false;
+        }
+        if (accepted && slot.hc.etag != expected) {
+          op.finish_error(std::make_exception_ptr(
+            object_changed_error(op.obj->object_path(), std::string(expected), slot.hc.etag)));
+          return false;
+        }
+      }
       if (curl_status == CURLE_OK && range_status && complete_body) {
         if (!request.is_device()) {
           op.finish_success();

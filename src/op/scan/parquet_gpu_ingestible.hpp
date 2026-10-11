@@ -22,6 +22,7 @@
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
+#include <op/scan/table_scan/parquet_physical_profile.hpp>
 #include <sirius_config.hpp>
 
 // duckdb
@@ -72,6 +73,10 @@ namespace sirius::op::scan {
  */
 class parquet_ingestible_table_info : public ingestible_table_info {
  public:
+  duckdb::vector<duckdb::LogicalType> bound_types;      // Full nested bind schema, in P-space.
+  std::optional<iceberg_table_schema> physical_schema;  // Populated by the S3 Iceberg lowering.
+  bound_table_scan physical_contract;
+  leaf_set semantic_columns;
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
@@ -259,6 +264,8 @@ class parquet_file_scan_info : public scan_info {
 
   /// Parsed footer metadata for this file.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::vector<uint8_t> original_schema;
+  std::string arrow_schema;
   /// File path (also the datasource cache key).
   std::string file_path;
   /// Stable position in DuckDB's bound file list.
@@ -446,6 +453,15 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // partially filtered, so the scan must NOT be reported ROW_FILTERED or the
   // dropped conjuncts would never be applied.
   bool _static_pushdown_is_complete = true;
+
+  // The part of _static_pushdown_expression pushed into the per-task reader:
+  // minus any top-level AND conjunct with an equality on a column whose bloom
+  // filter probe cuDF before 26.12 gets wrong (has_unreliable_bloom_filter_probe).
+  // The reader probes bloom filters, the row-group stats filter does not.
+  std::shared_ptr<duckdb::Expression> _reader_pushdown_expression;
+  // False when the reader filter is a strict subset of _duckdb_filter_expression,
+  // like _static_pushdown_is_complete.
+  bool _reader_pushdown_is_complete = true;
 
   // Only the simple `IS [NOT] NULL` over a bare column reference shape is
   // recorded; anything compound is left to the post-decode filter. Empty when

@@ -76,7 +76,8 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
                                                      _gate,
                                                      stream,
                                                      _mode,
-                                                     ro.get_memory_space()->get_device_id());
+                                                     ro.get_memory_space()->get_device_id(),
+                                                     ro.get_data()->get_size_in_bytes());
     if (filtered) {
       output_batches.push_back(sirius::make_data_batch(
         std::move(filtered), *ro.get_memory_space(), stream, batch_telemetry()));

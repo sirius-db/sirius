@@ -60,6 +60,15 @@ if sql == 'SELECT version() AS version; PRAGMA platform;':
     print(json.dumps([{'platform':spec['extension']['platform']}]))
     sys.exit(0)
 
+sirius_path = os.environ.get('PAIMON_TEST_SIRIUS', '')
+if sirius_path:
+    load = "LOAD '" + sirius_path.replace("'", "''") + "';"
+    if load not in sql or sql.index(load) > sql.index('SET gpu_execution='):
+        print('Sirius must load before its settings are used', file=sys.stderr)
+        sys.exit(1)
+    if fault == 'sirius_load_failure':
+        print('Sirius extension failed to load', file=sys.stderr)
+        sys.exit(1)
 if os.environ.get('PAIMON_TEST_REQUIRE_UNSIGNED') == '1' and '-unsigned' not in sys.argv:
     print('Unsigned local extension requires -unsigned', file=sys.stderr)
     sys.exit(1)
@@ -115,7 +124,13 @@ for result in results: print(json.dumps(result))
         self.cli.chmod(0o755)
 
     def run_suite(
-        self, selected=(), fault="", target="disabled/empty_rows", source=False
+        self,
+        selected=(),
+        fault="",
+        target="disabled/empty_rows",
+        source=False,
+        sirius=None,
+        default_sirius=False,
     ):
         (self.corpus / "expectations.json").write_text(canonical_json(self.spec))
         args = [
@@ -129,6 +144,15 @@ for result in results: print(json.dumps(result))
             "--output",
             str(self.root / "reports"),
         ]
+        if default_sirius:
+            sirius = (
+                self.root
+                / "sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension"
+            )
+        elif sirius is None:
+            args.append("--builtin-sirius")
+        else:
+            args.extend(["--sirius-extension", str(sirius)])
         if source:
             index = args.index("--registry")
             del args[index : index + 2]
@@ -139,7 +163,8 @@ for result in results: print(json.dumps(result))
             os.environ,
             PAIMON_TEST_FAULT=fault,
             PAIMON_TEST_TARGET=target,
-            PAIMON_TEST_REQUIRE_UNSIGNED="1" if source else "0",
+            PAIMON_TEST_REQUIRE_UNSIGNED="1" if source or sirius else "0",
+            PAIMON_TEST_SIRIUS=str(sirius) if sirius else "",
         ), contextlib.redirect_stdout(io.StringIO()):
             try:
                 main(args)
@@ -343,6 +368,66 @@ for result in results: print(json.dumps(result))
         self.assertEqual(report["state"], "failed")
         self.assertEqual(report["executed_cases"], 5)
         self.assertTrue(all(c["passed"] for c in report["cases"]))
+
+    def test_loadable_sirius_all_modes_and_smoke_paths(self):
+        sirius = self.root / "Sirius reader's local.duckdb_extension"
+        sirius.write_bytes(b"fake Sirius wrapper")
+        report, error = self.run_suite(["append_b"], sirius=sirius)
+        self.assertIsNone(error)
+        self.assertEqual(report["state"], "passed")
+        self.assertEqual(report["executed_cases"], 5)
+        self.assertEqual(
+            report["sirius"],
+            {"mode": "loadable", "path": str(sirius), "sha256": digest(sirius)},
+        )
+        calls = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertNotIn("-unsigned", calls[0]["argv"])
+        self.assertEqual(len(calls), 6)
+        for call in calls[1:]:
+            self.assertIn("-unsigned", call["argv"])
+            self.assertIn("LOAD '" + str(sirius).replace("'", "''") + "';", call["sql"])
+
+    def test_default_sirius_uses_wrapper_build(self):
+        sirius = (
+            self.root
+            / "sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension"
+        )
+        sirius.parent.mkdir(parents=True)
+        sirius.write_bytes(b"default local wrapper")
+        with patch("run_conformance.ROOT", self.root):
+            report, error = self.run_suite(["append_b"], default_sirius=True)
+        self.assertIsNone(error)
+        self.assertEqual(report["state"], "passed")
+        self.assertEqual(report["sirius"]["path"], str(sirius))
+
+    def test_missing_sirius_fails_setup_without_running_cases(self):
+        report, error = self.run_suite(
+            ["append_b"], sirius=self.root / "missing-sirius"
+        )
+        self.assertIsInstance(error, FileNotFoundError)
+        self.assertEqual(report["state"], "failed")
+        self.assertEqual((report["executed_cases"], report["not_run_cases"]), (0, 5))
+        self.assertFalse(self.trace.exists())
+
+    def test_sirius_load_failure_cannot_pass_any_case(self):
+        sirius = self.root / "sirius.duckdb_extension"
+        sirius.write_bytes(b"unloadable wrapper")
+        report, error = self.run_suite(
+            ["append_b"], "sirius_load_failure", sirius=sirius
+        )
+        self.assertIsNotNone(error)
+        self.assertEqual(report["state"], "failed")
+        self.assertEqual(report["failed_cases"], 5)
+        self.assertTrue(all(case["state"] == "FAIL" for case in report["cases"]))
+
+    def test_loadable_sirius_does_not_bypass_paimon_qualification(self):
+        sirius = self.root / "sirius.duckdb_extension"
+        sirius.write_bytes(b"fake wrapper")
+        self.extension.write_bytes(b"tampered reader")
+        report, error = self.run_suite(["append_b"], sirius=sirius)
+        self.assertIn("Unqualified Paimon artifact", str(error))
+        self.assertEqual((report["executed_cases"], report["not_run_cases"]), (0, 5))
+        self.assertEqual(len(self.trace.read_text().splitlines()), 1)
 
     def test_output_cannot_be_inside_corpus(self):
         (self.corpus / "expectations.json").write_text(canonical_json(self.spec))

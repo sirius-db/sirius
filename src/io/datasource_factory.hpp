@@ -17,13 +17,21 @@
 #pragma once
 
 #include "io/io_context.hpp"
+#include "io/object_store_config.hpp"
 #include "sirius_config.hpp"
 
+#include <absl/functional/any_invocable.h>
+
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
+#include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius {
 struct sirius_config;
@@ -34,6 +42,41 @@ class memory_reservation_manager;
 }
 
 namespace sirius::io {
+
+/// Per-connection registry of immutable S3 configs resolved while binding a
+/// path. Replacing a scope publishes a new ID so already-created ioctxs remain
+/// bound to the previous snapshot for in-flight work.
+class scoped_object_store_configs {
+ public:
+  struct snapshot {
+    std::uint64_t id;
+    std::shared_ptr<const object_store_config> config;
+  };
+
+  [[nodiscard]] std::optional<std::uint64_t> install(std::string_view path,
+                                                     object_store_config config);
+  [[nodiscard]] std::optional<snapshot> resolve(std::string_view path) const;
+
+ private:
+  struct transparent_string_hash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view value) const noexcept
+    {
+      return std::hash<std::string_view>{}(value);
+    }
+  };
+  struct stored_snapshot {
+    snapshot value;
+    std::size_t scope_refs{0};
+    std::size_t config_hash{0};
+  };
+  mutable std::mutex _mtx;
+  std::unordered_map<std::string, std::uint64_t, transparent_string_hash, std::equal_to<>>
+    _scope_ids;
+  std::unordered_map<std::uint64_t, stored_snapshot> _snapshots;
+  std::unordered_map<std::size_t, std::vector<std::uint64_t>> _config_ids_by_hash;
+  std::uint64_t _next_id{1};
+};
 
 // ---------------------------------------------------------------------------
 // datasource_registry
@@ -92,6 +135,10 @@ class io_context_registry {
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
+
+  /// Build an ioctx using a query-resolved scan configuration. The registry
+  /// factory remains immutable; this overload is used for per-path S3 secrets.
+  std::shared_ptr<ioctx> make_ioctx(io_context_type type, const config_type& config) const noexcept;
 
   /**
    * @brief Drop all registered ioctxs. Callers are responsible for shutting

@@ -412,16 +412,17 @@ TEST_CASE("sigv4_presigned_authorizer signs sorted ListObjectsV2 query params", 
 TEST_CASE("sigv4_header_authorizer signs ListObjectsV2 canonical queries", "[s3][sigv4]")
 {
   sigv4_header_authorizer provider(
-    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+    example_static_credentials(), "us-east-1", "http://s3.example.test:9000");
 
   auto request =
     provider.authorize_list("bucket",
                             "continuation-token=page%2F1%2B%3D&list-type=2&max-keys=1&prefix=p%2F",
                             k_presign_timeout);
 
-  CHECK(request.url ==
-        "http://minio.local:9000/bucket?continuation-token=page%2F1%2B%3D&list-type=2&max-keys=1&"
-        "prefix=p%2F");
+  CHECK(
+    request.url ==
+    "http://s3.example.test:9000/bucket?continuation-token=page%2F1%2B%3D&list-type=2&max-keys=1&"
+    "prefix=p%2F");
   CHECK_FALSE(contains(request.url, "X-Amz-Signature"));
   CHECK(starts_with(header_value(request.headers, "Authorization"), "AWS4-HMAC-SHA256 "));
   CHECK_FALSE(header_value(request.headers, "x-amz-date").empty());
@@ -460,14 +461,14 @@ TEST_CASE("sigv4_presigned_authorizer normalizes HTTPS endpoint", "[s3][sigv4]")
 TEST_CASE("sigv4_presigned_authorizer preserves HTTP endpoint ports", "[s3][sigv4]")
 {
   sigv4_presigned_authorizer provider(
-    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+    example_static_credentials(), "us-east-1", "http://s3.example.test:9000");
 
   auto request =
     provider.authorize({"bucket", "object.parquet"}, request_method::GET, k_presign_timeout);
   CHECK(request.headers.empty());
   auto const& url = request.url;
 
-  CHECK(starts_with(url, "http://minio.local:9000/bucket/object.parquet?"));
+  CHECK(starts_with(url, "http://s3.example.test:9000/bucket/object.parquet?"));
   CHECK(is_lower_hex_64(query_value(url, "X-Amz-Signature")));
 }
 
@@ -532,12 +533,12 @@ TEST_CASE("sigv4_header_authorizer signs with headers and plain path-style URLs"
 TEST_CASE("sigv4_header_authorizer omits session-token header for long-lived keys", "[s3][sigv4]")
 {
   sigv4_header_authorizer provider(
-    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+    example_static_credentials(), "us-east-1", "http://s3.example.test:9000");
 
   auto request = provider.authorize(
     {"bucket", "nested/object.parquet"}, request_method::GET, std::chrono::seconds{10});
 
-  CHECK(request.url == "http://minio.local:9000/bucket/nested/object.parquet");
+  CHECK(request.url == "http://s3.example.test:9000/bucket/nested/object.parquet");
   CHECK_FALSE(contains(request.url, "X-Amz-"));
   CHECK(starts_with(header_value(request.headers, "Authorization"), "AWS4-HMAC-SHA256 "));
   CHECK(header_value(request.headers, "x-amz-security-token").empty());

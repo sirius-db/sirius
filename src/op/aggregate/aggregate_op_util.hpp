@@ -21,9 +21,17 @@
 #include "expression/ast/node.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
 
+#include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
+
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius {
@@ -41,6 +49,56 @@ namespace op {
  * (decomposes into SUM + COUNT_VALID) and `first` (NTH_ELEMENT, handled by the caller).
  */
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
+
+/// The type a SUM over a column of type @p type is computed in when it must not overflow the
+/// input width: the next wider decimal type for DECIMAL32 and DECIMAL64, nullopt otherwise.
+std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type);
+
+/// The columns among @p candidates (indices into @p table; DECIMAL32 or DECIMAL64) whose SUM over
+/// this batch could overflow the column's own storage width and so must be summed over a wider
+/// decimal type.
+///
+/// A sum of n values of magnitude at most m is at most n * m, so rows * max|value| within the
+/// storage width (2^31-1 or 2^63-1) rules out wrap-around in every group. The bound is exact. It
+/// lets columns with small values, such as TPC-H's DECIMAL(15,2), skip the widening copy and the
+/// 128-bit accumulation. Nulls are skipped, and a column with no valid value cannot overflow.
+/// All cudf::minmax passes are launched first and their results come back in one device-to-host
+/// copy, so a batch costs a single stream synchronization. Throws sirius::internal_exception if a
+/// candidate is not DECIMAL32 or DECIMAL64.
+std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& table,
+                                                      std::vector<int> const& candidates,
+                                                      ::cuda::stream_ref stream,
+                                                      rmm::device_async_resource_ref mr);
+
+/// |v| as an unsigned 64-bit magnitude; the most negative value's 2^63 fits.
+constexpr std::uint64_t decimal_magnitude(std::int64_t v)
+{
+  auto const bits = static_cast<std::uint64_t>(v);
+  return v < 0 ? std::uint64_t{0} - bits : bits;
+}
+
+/// Whether a SUM of @p num_rows values of magnitude at most @p max_abs can exceed the storage
+/// width of @p type (2^31-1 for DECIMAL32, 2^63-1 for DECIMAL64). Throws
+/// sirius::internal_exception for any other type.
+bool decimal_sum_may_overflow(cudf::data_type type,
+                              cudf::size_type num_rows,
+                              std::uint64_t max_abs);
+
+/// A decimal SUM input of one batch: its column and, when the planner proved one from base-table
+/// statistics (planner::resolve_decimal_sum_input_bounds), the largest |unscaled value| it holds.
+struct decimal_sum_candidate {
+  int column;
+  std::optional<std::uint64_t> max_abs;
+};
+
+/// The columns among @p candidates (DECIMAL32 or DECIMAL64) whose SUM over this batch could
+/// overflow their storage width. A column whose every candidate carries a bound is decided on the
+/// host from the batch row count; the others are measured with decimal_sums_needing_widening. A
+/// batch without unproven columns therefore costs no device work and no synchronization.
+std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
+                                              std::vector<decimal_sum_candidate> const& candidates,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr);
 
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded

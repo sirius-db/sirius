@@ -569,3 +569,49 @@ TEST_CASE("hybrid scan bulk materialize applies the reader filter like read_parq
             .tbl->num_rows() == 200764);
   }
 }
+
+TEST_CASE("column_chunk_range_cache matches column_chunk_ranges",
+          "[scan][parquet][column_chunk_ranges]")
+{
+  auto const dir       = fresh_tmp_dir("chunk_range_cache");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  // Two files with different string lengths, so their column chunk offsets differ.
+  std::vector<std::shared_ptr<cudf::io::parquet::FileMetaData const>> metadata;
+  for (int const scale : {1, 1000}) {
+    auto const table = "ranges_" + std::to_string(scale);
+    require_ok(con.Query("CREATE TABLE " + table + " AS SELECT i AS x, i * 2 AS y, (i * " +
+                         std::to_string(scale) + ")::VARCHAR AS z FROM range(10240) t(i)"));
+    auto const path = dir / (table + ".parquet");
+    require_ok(con.Query("COPY " + table + " TO '" + path.string() +
+                         "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"));
+    metadata.push_back(
+      std::make_shared<cudf::io::parquet::FileMetaData const>(read_metadata(path)));
+    REQUIRE(metadata.back()->row_groups.size() == 5);
+  }
+  auto const all_columns = std::make_shared<cudf::io::parquet_reader_options const>(
+    cudf::io::parquet_reader_options::builder().build());
+  auto const two_columns = std::make_shared<cudf::io::parquet_reader_options const>(
+    cudf::io::parquet_reader_options::builder().column_names({"z", "x"}).build());
+  std::vector<std::vector<cudf::size_type>> const subsets{{0, 1}, {2}, {3, 4}, {}, {0, 2, 4}};
+
+  sirius::op::scan::column_chunk_range_cache cache;
+  auto const check = [&](auto const& file, auto const& options, auto const& row_groups) {
+    auto const expected = sirius::op::scan::column_chunk_ranges(*file, *options, row_groups);
+    auto const actual   = cache.ranges(file, options, row_groups);
+    REQUIRE(actual.size() == expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      CHECK(actual[i].offset() == expected[i].offset());
+      CHECK(actual[i].size() == expected[i].size());
+    }
+  };
+  // Options outermost, so the cache also sees a change of file alone.
+  for (auto const& options : {all_columns, two_columns}) {
+    for (auto const& file : metadata) {
+      for (auto const& row_groups : subsets) {
+        check(file, options, row_groups);
+      }
+    }
+  }
+  cache.clear();
+  check(metadata.front(), all_columns, subsets.front());
+}

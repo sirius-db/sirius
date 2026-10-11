@@ -16,8 +16,8 @@
 
 // Hidden microbenchmark for the duckdb-native metadata prepare walk on a real
 // unpinned table. GPU-free. Run:
-//   SIRIUS_WALK_BENCH_DB=$HOME/tpch_sf1000.duckdb \
-//     build/release/extension/sirius/test/cpp/sirius_unittest '[walk_bench]'
+//   export SIRIUS_WALK_BENCH_DB=$HOME/tpch_sf1000.duckdb
+//   build/release/test/cpp/sirius_unittest '[walk_bench]'
 // Scenarios: uncached/serial, uncached/parallel, first cached query (rebuild),
 // repeat (product hit), varied predicate (snapshot hit + assemble).
 

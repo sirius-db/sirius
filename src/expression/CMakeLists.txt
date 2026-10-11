@@ -7,5 +7,4 @@ target_sources(
           from_duckdb.cpp
           function_id.cpp
           join_condition.cpp
-          to_duckdb.cpp
           value.cpp)

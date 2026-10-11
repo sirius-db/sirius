@@ -144,14 +144,20 @@ __global__ void chunk_offsets_tail_kernel(uint32_t const* __restrict__ counts,
 // mask -> ascending survivor row ids. One warp per chunk: lane l owns word l,
 // warp-exclusive shfl_up prefix of popcounts gives each word's output base
 // inside the chunk; bits are drained in ascending order so the global output
-// is fully ordered (cudf gather map contract). Ported from the microbench's
-// load_mask_scan/k2a idiom, flattened to warp shuffles (no smem, no block sync).
+// is fully ordered (cudf gather map contract).
+//
+// The chunk's ids are staged in a per-warp shared buffer and written out as one contiguous run:
+// draining straight to global makes every store instruction hit 32 different cache lines (each
+// lane writes its own slice), while the staged copy is one coalesced 128-byte store per 32 ids.
 __global__ void mask_to_indices_kernel(uint32_t const* __restrict__ words,
                                        uint32_t const* __restrict__ chunk_offsets,
                                        int64_t num_chunks,
                                        int32_t* __restrict__ out)
 {
+  extern __shared__ int32_t staged_all[];
   int const lane               = threadIdx.x & 31;
+  int const warp_in_block      = threadIdx.x >> 5;
+  int32_t* const staged        = staged_all + warp_in_block * SELECTION_CHUNK_ROWS;
   int64_t const warps_per_grid = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 5;
   int64_t warp                 = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
   for (; warp < num_chunks; warp += warps_per_grid) {
@@ -162,31 +168,32 @@ __global__ void mask_to_indices_kernel(uint32_t const* __restrict__ words,
       int const y = __shfl_up_sync(kFullWarp, x, o);
       if (lane >= o) x += y;
     }
-    int64_t base       = chunk_offsets[warp] + static_cast<int64_t>(x - pc);
+    int const total    = __shfl_sync(kFullWarp, x, 31);
+    int local          = x - pc;
     int32_t const row0 = static_cast<int32_t>(warp * SELECTION_CHUNK_ROWS) + lane * 32;
     while (wv) {
       int const b = __ffs(wv) - 1;
       wv &= wv - 1u;
-      out[base++] = row0 + b;
+      staged[local++] = row0 + b;
     }
+    __syncwarp();
+    int32_t* const dst = out + chunk_offsets[warp];
+    for (int i = lane; i < total; i += 32)
+      dst[i] = staged[i];
+    __syncwarp();
   }
 }
 
-// Bit k of the result is set iff byte k of the 16 flag bytes in `v` is non-zero. Each byte's bits
-// are folded down into its bit 0, then the four bit-0 positions of each 32-bit lane are gathered.
+// Bit k of the result is set iff byte k of the 16 flag bytes in `v` is non-zero. Per 32-bit lane,
+// bit 7 of each byte is set iff that byte is non-zero (the add cannot carry across bytes because
+// the operand is masked to 7 bits), and one multiply gathers the four bit-7s into bits 28..31.
 __device__ __forceinline__ uint32_t pack16_nonzero(uint4 v)
 {
-  auto const nonzero_bit0 = [](uint32_t x) {
-    uint32_t y = x | (x >> 4);
-    y |= y >> 2;
-    y |= y >> 1;
-    return y & 0x01010101u;
+  auto const nibble = [](uint32_t x) {
+    uint32_t const m = ((x & 0x7f7f7f7fu) + 0x7f7f7f7fu) | x;
+    return ((m & 0x80808080u) * 0x00204081u) >> 28;
   };
-  auto const gather4 = [](uint32_t x) {
-    return (x & 1u) | ((x >> 7) & 2u) | ((x >> 14) & 4u) | ((x >> 21) & 8u);
-  };
-  return gather4(nonzero_bit0(v.x)) | (gather4(nonzero_bit0(v.y)) << 4) |
-         (gather4(nonzero_bit0(v.z)) << 8) | (gather4(nonzero_bit0(v.w)) << 12);
+  return nibble(v.x) | (nibble(v.y) << 4) | (nibble(v.z) << 8) | (nibble(v.w) << 12);
 }
 
 // Bit i of the result is set iff p[i] is non-zero, for i in [0, count).
@@ -352,7 +359,8 @@ void mask_to_row_indices(selection_mask const& mask,
   if (mask.survivor_count == 0) return;
   int64_t const nc          = selection_mask::ChunksFor(mask.num_rows);
   int const warps_per_block = kBlock / 32;
-  mask_to_indices_kernel<<<grid_for(nc, warps_per_block), kBlock, 0, stream.get()>>>(
+  size_t const smem = static_cast<size_t>(warps_per_block) * SELECTION_CHUNK_ROWS * sizeof(int32_t);
+  mask_to_indices_kernel<<<grid_for(nc, warps_per_block), kBlock, smem, stream.get()>>>(
     mask.words, mask.chunk_offsets, nc, out_indices);
   throw_on_cuda(cudaPeekAtLastError(), "mask_to_indices launch");
 }

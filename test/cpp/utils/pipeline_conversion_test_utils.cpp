@@ -85,15 +85,8 @@ class optimizer_disable_guard {
   std::set<duckdb::OptimizerType> original_disabled_optimizers_;
 };
 
-struct extracted_plan {
-  duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
-  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
-};
+}  // namespace
 
-//! Parse + plan + optimize + resolve a SQL query, mirroring the sirius-specific order of
-//! `SiriusTableFunctionData::ExtractPlan`: `ResolveOperatorTypes` BEFORE `ColumnBindingResolver`.
-//! DuckDB's `Connection::ExtractPlan` uses the reverse order, which trips sirius plan
-//! generation with an "inequal types" binder error on some queries.
 extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
                                                  const std::string& query)
 {
@@ -121,6 +114,8 @@ extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
   resolver.VisitOperator(*plan);
   return {std::move(plan), std::move(prepared)};
 }
+
+namespace {
 
 //! Starts far above any window id a test process will reach, so a synthetic query can never
 //! collide with a genuine execution window's registration (the registry rejects duplicates).

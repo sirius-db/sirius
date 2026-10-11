@@ -27,11 +27,12 @@ concurrency:
 jobs:
   cuda-13:
     if: github.event_name != 'pull_request'
-    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
+    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@5dc87c16f52ea4ae7b6248eb6ea39b7a56278e84
     with:
       extension_name: sirius
       duckdb_version: v1.5.6
-      ci_tools_version: sirius
+      ci_tools_version: 5dc87c16f52ea4ae7b6248eb6ea39b7a56278e84
+      extension_directory: sirius-duckdb
       exclude_archs: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
       extra_toolchains: "cuda;rust;protobuf;libclang;lld"
       vcpkg_url: "https://github.com/microsoft/vcpkg.git"
@@ -41,10 +42,9 @@ jobs:
       save_cache: ${{ github.ref == 'refs/heads/main' }}
       reduced_ci_mode: "disabled"
       override_ci_tools_repository: "sirius-db/extension-ci-tools"
-      build_type: ci-release
       build_duckdb_shell: false
-      vcpkg_overlay_ports: "vcpkg_ports"
-      vcpkg_overlay_triplets: "vcpkg_triplets"
+      vcpkg_overlay_ports: "sirius-duckdb/vcpkg_ports"
+      vcpkg_overlay_triplets: "sirius-duckdb/vcpkg_triplets"
       cuda_archs: "75-real;80-real;86-real;89-real;90a-real;100f-real;120a-real;120"
       cuda_version: "13"
       artifact_postfix: "-cuda13"
@@ -52,11 +52,12 @@ jobs:
 
   cuda-12:
     if: github.event_name != 'pull_request'
-    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
+    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@5dc87c16f52ea4ae7b6248eb6ea39b7a56278e84
     with:
       extension_name: sirius
       duckdb_version: v1.5.6
-      ci_tools_version: sirius
+      ci_tools_version: 5dc87c16f52ea4ae7b6248eb6ea39b7a56278e84
+      extension_directory: sirius-duckdb
       exclude_archs: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
       extra_toolchains: "cuda;rust;protobuf;libclang;lld"
       vcpkg_url: "https://github.com/microsoft/vcpkg.git"
@@ -66,10 +67,9 @@ jobs:
       save_cache: ${{ github.ref == 'refs/heads/main' }}
       reduced_ci_mode: "disabled"
       override_ci_tools_repository: "sirius-db/extension-ci-tools"
-      build_type: ci-release
       build_duckdb_shell: false
-      vcpkg_overlay_ports: "vcpkg_ports"
-      vcpkg_overlay_triplets: "vcpkg_triplets"
+      vcpkg_overlay_ports: "sirius-duckdb/vcpkg_ports"
+      vcpkg_overlay_triplets: "sirius-duckdb/vcpkg_triplets"
       cuda_archs: "75-real;80-real;86-real;89-real;90a-real"
       cuda_version: "12"
       artifact_postfix: "-cuda12"

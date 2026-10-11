@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use starrocks_thrift::exprs::TExpr;
+use starrocks_thrift::exprs::{TExpr, TExprNodeType};
 use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNode, TPlanNodeType, TSortInfo};
 use starrocks_thrift::types::TSlotId;
@@ -15,32 +15,28 @@ use substrait::proto::{
     rel, rel_common, sort_field,
 };
 
-use crate::descriptor_table::DescriptorTable;
+use crate::descriptor_table::{DescriptorTable, SlotKey};
 use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
+use crate::row_layout::RowLayout;
 use crate::scan_paths::ScanFilePaths;
 use crate::type_mapper;
 use crate::{ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON};
 
 /// Partially translated relation plus the StarRocks row layout it emits.
 pub(crate) struct TranslatedRel {
-    /// Substrait relation built for the StarRocks subtree.
-    pub rel: Rel,
-    /// Tuple ids visible in the relation output row.
-    ///
-    /// For multi-input relations (joins, set ops) this is the left-to-right
-    /// concatenation of the child layouts, so `DescriptorTable::slot_global_index`
-    /// resolves a right-side slot to `left_width + right_index`. New multi-input
-    /// translators MUST follow this ordering.
-    pub row_tuples: Vec<i32>,
-    /// Number of columns this relation emits.
-    ///
-    /// Carried as an invariant (rather than recomputed by walking `rel`) so a
-    /// parent projection can compute its `output_mapping` base offset without
-    /// teaching a column-counting helper about every relation type — a pattern
-    /// that silently produced a wrong offset the moment an unknown relation
-    /// appeared mid-tree. Every relation built here MUST set its true width.
-    pub output_width: usize,
+    rel: Rel,
+    layout: RowLayout,
+}
+
+impl TranslatedRel {
+    pub(crate) fn into_rel(self) -> Rel {
+        self.rel
+    }
+
+    pub(crate) fn output_names(&self, desc: &DescriptorTable) -> Result<Vec<String>> {
+        self.layout.output_names(desc)
+    }
 }
 
 /// Mutable state shared by plan-node translators.
@@ -69,18 +65,8 @@ impl<'a> PlanContext<'a> {
         }
     }
 
-    /// Creates an expression context for an expression over `row_tuples`.
-    fn expr_context<'b>(&'b mut self, row_tuples: &'b [i32]) -> ExprContext<'b> {
-        ExprContext::new(self.desc, self.registry, row_tuples)
-    }
-
-    /// Creates an expression context with synthetic slot-to-column mappings.
-    fn expr_context_with_slots<'b>(
-        &'b mut self,
-        row_tuples: &'b [i32],
-        slot_overrides: &'b std::collections::HashMap<(i32, i32), usize>,
-    ) -> ExprContext<'b> {
-        ExprContext::with_slot_overrides(self.desc, self.registry, row_tuples, slot_overrides)
+    fn expr_context<'b>(&'b mut self, layout: &'b RowLayout) -> ExprContext<'b> {
+        ExprContext::new(self.registry, layout)
     }
 }
 
@@ -189,11 +175,7 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
     if node.limit < 0 && offset == 0 {
         return input;
     }
-    let TranslatedRel {
-        rel,
-        row_tuples,
-        output_width,
-    } = input;
+    let TranslatedRel { rel, layout } = input;
     TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Fetch(Box::new(FetchRel {
@@ -203,8 +185,7 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
                 ..Default::default()
             }))),
         },
-        row_tuples,
-        output_width,
+        layout,
     }
 }
 
@@ -260,8 +241,7 @@ fn translate_scan(
     let file_paths = ctx.scan_paths.for_node(node.node_id);
     let input = TranslatedRel {
         rel: scan_rel(ctx.desc, tuple_id, file_paths)?,
-        row_tuples: vec![tuple_id],
-        output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
+        layout: RowLayout::from_tuples(ctx.desc, &[tuple_id])?,
     };
     apply_conjuncts(input, node, ctx)
 }
@@ -270,7 +250,7 @@ fn translate_scan(
 ///
 /// Only `PROJECT_NODE` appends its common slots. On every other node carrying the field the
 /// shared sub-expressions would be read past: a conjunct or key that references one of them then
-/// fails later with an opaque descriptor error (`slot N (tuple T) is not part of row_tuples`),
+/// fails later with an opaque descriptor error (`slot N (tuple T) is not part of the row layout`),
 /// and a map nothing references is silently ignored. Report the unsupported shape up front.
 fn reject_common_slots(
     node: &TPlanNode,
@@ -360,20 +340,19 @@ fn translate_aggregation(
     let grouping_exprs = agg.grouping_exprs.as_deref().unwrap_or_default();
     let mut grouping_expressions = Vec::with_capacity(grouping_exprs.len());
     for expr in grouping_exprs {
-        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+        let mut expr_ctx = ctx.expr_context(&child.layout);
         grouping_expressions.push(expr.translate(&mut expr_ctx)?);
     }
 
     // Aggregate output types come from the output tuple's slots, which carry the grouping keys
     // first and then one slot per aggregate function.
     let output_slots = ctx.desc.materialized_slot_ids(output_tuple)?;
-    let output_width = output_slots.len();
-    if output_width != grouping_expressions.len() + agg.aggregate_functions.len() {
+    if output_slots.len() != grouping_expressions.len() + agg.aggregate_functions.len() {
         return Err(TranslateError::descriptor(format!(
             "AGGREGATION_NODE {} output tuple {} has {} slots for {} keys + {} aggregates",
             node.node_id,
             output_tuple,
-            output_width,
+            output_slots.len(),
             grouping_expressions.len(),
             agg.aggregate_functions.len()
         )));
@@ -410,7 +389,7 @@ fn translate_aggregation(
         .iter()
         .zip(&output_slots[grouping_expressions.len()..])
     {
-        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+        let mut expr_ctx = ctx.expr_context(&child.layout);
         let call = expr_translator::aggregate_call(expr, &mut expr_ctx)?;
         // The GPU ungrouped-aggregate operator rejects every distinct aggregate, so a
         // grouping-free DISTINCT measure would translate fine and then fail at execution.
@@ -480,8 +459,11 @@ fn translate_aggregation(
                 ..Default::default()
             }))),
         },
-        row_tuples: vec![output_tuple],
-        output_width,
+        layout: RowLayout::new(
+            output_slots
+                .into_iter()
+                .map(|slot_id| Some(SlotKey::new(output_tuple, slot_id))),
+        ),
     };
     // Node conjuncts evaluate over the aggregation output (HAVING predicates).
     apply_conjuncts(aggregated, node, ctx)
@@ -590,17 +572,20 @@ fn translate_sort(
         }
         let mut expressions = Vec::with_capacity(slot_exprs.len());
         for expr in slot_exprs {
-            let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+            let mut expr_ctx = ctx.expr_context(&child.layout);
             expressions.push(expr.translate(&mut expr_ctx)?);
         }
-        project_rel(child, expressions, vec![sort_tuple])
+        project_bound_rel(
+            child,
+            expressions,
+            RowLayout::from_tuples(ctx.desc, &[sort_tuple])?,
+        )?
     } else {
         child
     };
 
     let sorts = sort_fields(&sort.sort_info, &input, ctx)?;
-    let row_tuples = input.row_tuples.clone();
-    let output_width = input.output_width;
+    let layout = input.layout;
     let sorted = TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
@@ -609,8 +594,7 @@ fn translate_sort(
                 ..Default::default()
             }))),
         },
-        row_tuples,
-        output_width,
+        layout,
     };
     apply_conjuncts(sorted, node, ctx)
 }
@@ -633,7 +617,7 @@ fn sort_fields(
         .iter()
         .zip(sort_info.is_asc_order.iter().zip(&sort_info.nulls_first))
         .map(|(expr, (asc, nulls_first))| {
-            let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+            let mut expr_ctx = ctx.expr_context(&input.layout);
             let expr = expr.translate(&mut expr_ctx)?;
             let direction = match (asc, nulls_first) {
                 (true, true) => sort_field::SortDirection::AscNullsFirst,
@@ -653,7 +637,7 @@ fn sort_fields(
 ///
 /// StarRocks children are `[probe (left), build (right)]`; the Substrait join condition is
 /// evaluated over the concatenated left-then-right row, which is exactly how
-/// `slot_global_index` resolves slots against the combined layout.
+/// the combined layout resolves slot references.
 fn translate_hash_join(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
@@ -731,7 +715,7 @@ fn translate_hash_join(
     let left = children.next().unwrap();
     let right = children.next().unwrap();
 
-    let combined_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
+    let combined_layout = left.layout.concat(&right.layout);
     let mut conditions = Vec::new();
     let mut first_equality = None;
     for eq in &join.eq_join_conjuncts {
@@ -744,9 +728,9 @@ fn translate_hash_join(
                 reason: "only plain equality join conjuncts are supported",
             });
         }
-        let mut expr_ctx = ctx.expr_context(&combined_tuples);
+        let mut expr_ctx = ctx.expr_context(&combined_layout);
         let left_expr = eq.left.translate(&mut expr_ctx)?;
-        let mut expr_ctx = ctx.expr_context(&combined_tuples);
+        let mut expr_ctx = ctx.expr_context(&combined_layout);
         let right_expr = eq.right.translate(&mut expr_ctx)?;
         if first_equality.is_none() {
             first_equality = Some((left_expr.clone(), right_expr.clone()));
@@ -759,7 +743,7 @@ fn translate_hash_join(
         ));
     }
     for expr in join.other_join_conjuncts.as_deref().unwrap_or_default() {
-        let mut expr_ctx = ctx.expr_context(&combined_tuples);
+        let mut expr_ctx = ctx.expr_context(&combined_layout);
         conditions.push(expr.translate(&mut expr_ctx)?);
     }
     let condition = and_conditions(conditions, ctx).ok_or(TranslateError::UnsupportedPlanNode {
@@ -768,51 +752,28 @@ fn translate_hash_join(
         reason: "hash join without join conjuncts",
     })?;
 
-    let (row_tuples, output_width) = match output {
-        JoinOutput::Left => (left.row_tuples.clone(), left.output_width),
-        JoinOutput::NullAwareLeftAnti => (left.row_tuples.clone(), left.output_width + 1),
-        _ => (
-            combined_tuples.clone(),
-            left.output_width + right.output_width,
-        ),
-    };
-
-    let joined = TranslatedRel {
-        rel: Rel {
-            rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
-                left: Some(Box::new(left.rel)),
-                right: Some(Box::new(right.rel)),
-                expression: Some(Box::new(condition)),
-                r#type: join_type as i32,
-                ..Default::default()
-            }))),
-        },
-        row_tuples,
-        output_width,
-    };
+    let left_width = left.layout.len();
+    let right_width = right.layout.len();
+    let joined = join_rel(left, right, condition, join_type)?;
     let joined = match output {
         JoinOutput::LeftAnti => {
             let (_, right_key) = first_equality
                 .ok_or_else(|| TranslateError::malformed("left anti join has no equality key"))?;
             require_column_key(node, &right_key)?;
             let filtered = filter_is_null(joined, right_key, ctx);
-            emit_columns(
-                filtered.rel,
-                (0..left.output_width as i32).collect(),
-                left.row_tuples,
-            )
+            emit_columns(filtered, (0..left_width as i32).collect())?
         }
         JoinOutput::RightAnti => {
             let (left_key, _) = first_equality
                 .ok_or_else(|| TranslateError::malformed("right anti join has no equality key"))?;
             require_column_key(node, &left_key)?;
             let filtered = filter_is_null(joined, left_key, ctx);
-            let start = left.output_width as i32;
-            let end = start + right.output_width as i32;
-            emit_columns(filtered.rel, (start..end).collect(), right.row_tuples)
+            let start = left_width as i32;
+            let end = start + right_width as i32;
+            emit_columns(filtered, (start..end).collect())?
         }
         JoinOutput::NullAwareLeftAnti => {
-            let marker = field_selection(left.output_width as i32);
+            let marker = field_selection(left_width as i32);
             let not_anchor = ctx.registry.register_function(URN_BOOLEAN, "not");
             let condition = expr_translator::scalar_function(
                 not_anchor,
@@ -820,11 +781,7 @@ fn translate_hash_join(
                 crate::type_mapper::bool_type(),
             );
             let filtered = filter_rel(joined, condition);
-            emit_columns(
-                filtered.rel,
-                (0..left.output_width as i32).collect(),
-                left.row_tuples,
-            )
+            emit_columns(filtered, (0..left_width as i32).collect())?
         }
         _ => joined,
     };
@@ -878,36 +835,24 @@ fn translate_nestloop_join(
     let mut children = children.into_iter();
     let left = children.next().unwrap();
     let right = children.next().unwrap();
-    let left_width = left.output_width;
-    let right_width = right.output_width;
-    let row_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
-    let left = append_project(left, i32_literal(1));
-    let right = append_project(right, i32_literal(1));
+    let left_width = left.layout.len();
+    let right_width = right.layout.len();
+    let left = append_project(left, i32_literal(1), None)?;
+    let right = append_project(right, i32_literal(1), None)?;
     let equal_anchor = ctx.registry.register_function(URN_COMPARISON, "equal");
     let condition = expr_translator::scalar_function(
         equal_anchor,
         vec![
             field_selection(left_width as i32),
-            field_selection((left.output_width + right_width) as i32),
+            field_selection((left.layout.len() + right_width) as i32),
         ],
         crate::type_mapper::bool_type(),
     );
-    // Kept as a bare `Rel`, not a `TranslatedRel`: the join row carries both synthetic keys, so
-    // it is two columns wider than `row_tuples` describes, and a `TranslatedRel` claiming that
-    // layout would resolve every right-side slot to the wrong index. The projection below drops
-    // the keys and restores the invariant.
-    let joined = Rel {
-        rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
-            left: Some(Box::new(left.rel)),
-            right: Some(Box::new(right.rel)),
-            expression: Some(Box::new(condition)),
-            r#type: join_rel::JoinType::Inner as i32,
-            ..Default::default()
-        }))),
-    };
+    let right_start = left.layout.len() as i32;
+    let joined = join_rel(left, right, condition, join_rel::JoinType::Inner)?;
     let mut mapping = (0..left_width as i32).collect::<Vec<_>>();
-    mapping.extend(left.output_width as i32..left.output_width as i32 + right_width as i32);
-    let cross = emit_columns(joined, mapping, row_tuples);
+    mapping.extend(right_start..right_start + right_width as i32);
+    let cross = emit_columns(joined, mapping)?;
     let filtered = if let Some(conjuncts) = join
         .join_conjuncts
         .as_ref()
@@ -915,28 +860,11 @@ fn translate_nestloop_join(
     {
         let mut conditions = Vec::with_capacity(conjuncts.len());
         for expr in conjuncts {
-            let mut expr_ctx = ctx.expr_context(&cross.row_tuples);
+            let mut expr_ctx = ctx.expr_context(&cross.layout);
             conditions.push(expr.translate(&mut expr_ctx)?);
         }
         match and_conditions(conditions, ctx) {
-            Some(condition) => {
-                let TranslatedRel {
-                    rel,
-                    row_tuples,
-                    output_width,
-                } = cross;
-                TranslatedRel {
-                    rel: Rel {
-                        rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
-                            input: Some(Box::new(rel)),
-                            condition: Some(Box::new(condition)),
-                            ..Default::default()
-                        }))),
-                    },
-                    row_tuples,
-                    output_width,
-                }
-            }
+            Some(condition) => filter_rel(cross, condition),
             None => cross,
         }
     } else {
@@ -1035,15 +963,12 @@ fn translate_project_node(
 
     let output_tuple = output_tuples[0];
     let mut input = child;
-    let mut common_slots = std::collections::HashMap::new();
     for (&slot_id, expr) in project_node.common_slot_map.as_ref().into_iter().flatten() {
         let expression = {
-            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
+            let mut expr_ctx = ctx.expr_context(&input.layout);
             expr.translate(&mut expr_ctx)?
         };
-        let field = input.output_width;
-        input = append_project(input, expression);
-        common_slots.insert((output_tuple, slot_id), field);
+        input = append_project(input, expression, Some(SlotKey::new(output_tuple, slot_id)))?;
     }
 
     let mut expressions = Vec::new();
@@ -1055,12 +980,16 @@ fn translate_project_node(
                     node.node_id, slot_id
                 ))
             })?;
-            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
+            let mut expr_ctx = ctx.expr_context(&input.layout);
             expressions.push(expr.translate(&mut expr_ctx)?);
         }
     }
 
-    Ok(project_rel(input, expressions, output_tuples))
+    project_bound_rel(
+        input,
+        expressions,
+        RowLayout::from_tuples(ctx.desc, &output_tuples)?,
+    )
 }
 
 /// Adds a root projection over explicit fragment output expressions.
@@ -1085,28 +1014,46 @@ fn project_exprs_with_context(
 ) -> Result<TranslatedRel> {
     let mut expressions = Vec::with_capacity(exprs.len());
     for expr in exprs {
-        let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+        let mut expr_ctx = ctx.expr_context(&input.layout);
         expressions.push(expr.translate(&mut expr_ctx)?);
     }
-    // A root projection over fragment output expressions keeps the input layout.
-    let row_tuples = input.row_tuples.clone();
-    Ok(project_rel(input, expressions, row_tuples))
+    let bindings = exprs.iter().map(|expr| match expr.nodes.as_slice() {
+        [node] if node.node_type == TExprNodeType::SLOT_REF => node
+            .slot_ref
+            .as_ref()
+            .map(|slot| SlotKey::new(slot.tuple_id, slot.slot_id)),
+        _ => None,
+    });
+    Ok(project_rel(
+        input,
+        expressions.into_iter().zip(bindings).collect(),
+    ))
 }
 
-/// Builds a Substrait project that emits exactly `expressions`.
-///
-/// The emit `output_mapping` selects the projected expressions, which sit after
-/// the input columns, so the base offset is the input's carried `output_width`.
-/// `row_tuples` is the output row layout (the project's own tuples, which may
-/// reorder or differ from the input's).
-fn project_rel(
+/// Pairs descriptor-ordered bindings with the expressions producing them.
+fn project_bound_rel(
     input: TranslatedRel,
     expressions: Vec<Expression>,
-    row_tuples: Vec<i32>,
-) -> TranslatedRel {
-    let base = input.output_width as i32;
-    let output_mapping = (base..base + expressions.len() as i32).collect();
-    let output_width = expressions.len();
+    layout: RowLayout,
+) -> Result<TranslatedRel> {
+    if expressions.len() != layout.len() {
+        return Err(TranslateError::descriptor(format!(
+            "projection has {} expressions for {} output slots",
+            expressions.len(),
+            layout.len()
+        )));
+    }
+    Ok(project_rel(
+        input,
+        expressions.into_iter().zip(layout.columns()).collect(),
+    ))
+}
+
+/// Builds the project and its layout from the same ordered output list.
+fn project_rel(input: TranslatedRel, outputs: Vec<(Expression, Option<SlotKey>)>) -> TranslatedRel {
+    let base = input.layout.len() as i32;
+    let output_mapping = (base..base + outputs.len() as i32).collect();
+    let (expressions, bindings): (Vec<_>, Vec<_>) = outputs.into_iter().unzip();
     TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
@@ -1121,20 +1068,31 @@ fn project_rel(
                 ..Default::default()
             }))),
         },
-        row_tuples,
-        output_width,
+        layout: RowLayout::new(bindings),
     }
 }
 
-/// Appends one expression to a relation while retaining all existing columns.
-fn append_project(input: TranslatedRel, expression: Expression) -> TranslatedRel {
-    let output_width = input.output_width + 1;
-    TranslatedRel {
+/// Appends a temporary expression, optionally binding a common projection slot.
+fn append_project(
+    mut input: TranslatedRel,
+    expression: Expression,
+    binding: Option<SlotKey>,
+) -> Result<TranslatedRel> {
+    if let Some(key) = binding
+        && input.layout.columns().any(|column| column == Some(key))
+    {
+        return Err(TranslateError::descriptor(format!(
+            "common slot {} (tuple {}) already exists in the row layout",
+            key.slot_id, key.tuple_id
+        )));
+    }
+    input.layout.append(binding);
+    Ok(TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
                 common: Some(RelCommon {
                     emit_kind: Some(rel_common::EmitKind::Emit(rel_common::Emit {
-                        output_mapping: (0..output_width as i32).collect(),
+                        output_mapping: (0..input.layout.len() as i32).collect(),
                     })),
                     ..Default::default()
                 }),
@@ -1143,15 +1101,14 @@ fn append_project(input: TranslatedRel, expression: Expression) -> TranslatedRel
                 ..Default::default()
             }))),
         },
-        row_tuples: input.row_tuples,
-        output_width,
-    }
+        layout: input.layout,
+    })
 }
 
-/// Emits selected input columns without evaluating new expressions.
-fn emit_columns(input: Rel, output_mapping: Vec<i32>, row_tuples: Vec<i32>) -> TranslatedRel {
-    let output_width = output_mapping.len();
-    TranslatedRel {
+/// Applies the same selection to the relation and its bindings.
+fn emit_columns(input: TranslatedRel, output_mapping: Vec<i32>) -> Result<TranslatedRel> {
+    let layout = input.layout.select(&output_mapping)?;
+    Ok(TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
                 common: Some(RelCommon {
@@ -1160,13 +1117,50 @@ fn emit_columns(input: Rel, output_mapping: Vec<i32>, row_tuples: Vec<i32>) -> T
                     })),
                     ..Default::default()
                 }),
-                input: Some(Box::new(input)),
+                input: Some(Box::new(input.rel)),
                 ..Default::default()
             }))),
         },
-        row_tuples,
-        output_width,
-    }
+        layout,
+    })
+}
+
+/// Derives output bindings from the join's actual output shape.
+fn join_rel(
+    left: TranslatedRel,
+    right: TranslatedRel,
+    condition: Expression,
+    kind: join_rel::JoinType,
+) -> Result<TranslatedRel> {
+    let layout = match kind {
+        join_rel::JoinType::LeftSemi => left.layout,
+        join_rel::JoinType::LeftMark => {
+            let mut layout = left.layout;
+            layout.append(None);
+            layout
+        }
+        join_rel::JoinType::Inner
+        | join_rel::JoinType::Left
+        | join_rel::JoinType::Right
+        | join_rel::JoinType::Outer => left.layout.concat(&right.layout),
+        _ => {
+            return Err(TranslateError::malformed(format!(
+                "unsupported translated join kind {kind:?}"
+            )));
+        }
+    };
+    Ok(TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
+                left: Some(Box::new(left.rel)),
+                right: Some(Box::new(right.rel)),
+                expression: Some(Box::new(condition)),
+                r#type: kind as i32,
+                ..Default::default()
+            }))),
+        },
+        layout,
+    })
 }
 
 /// Builds a direct field selection against the current relation output.
@@ -1223,7 +1217,6 @@ fn i64_literal(value: i64) -> Expression {
 
 /// Wraps a relation in a filter without changing its row layout.
 fn filter_rel(input: TranslatedRel, condition: Expression) -> TranslatedRel {
-    let output_width = input.output_width;
     TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
@@ -1232,8 +1225,7 @@ fn filter_rel(input: TranslatedRel, condition: Expression) -> TranslatedRel {
                 ..Default::default()
             }))),
         },
-        row_tuples: input.row_tuples,
-        output_width,
+        layout: input.layout,
     }
 }
 
@@ -1285,26 +1277,14 @@ fn apply_conjuncts(
     let conjuncts = node.conjuncts.as_deref().unwrap_or_default();
     let mut conditions = Vec::with_capacity(conjuncts.len());
     for expr in conjuncts {
-        let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+        let mut expr_ctx = ctx.expr_context(&input.layout);
         conditions.push(expr.translate(&mut expr_ctx)?);
     }
     let Some(condition) = and_conditions(conditions, ctx) else {
         return Ok(input);
     };
 
-    // A filter does not change the column layout, so the width passes through.
-    let output_width = input.output_width;
-    Ok(TranslatedRel {
-        rel: Rel {
-            rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
-                input: Some(Box::new(input.rel)),
-                condition: Some(Box::new(condition)),
-                ..Default::default()
-            }))),
-        },
-        row_tuples: input.row_tuples,
-        output_width,
-    })
+    Ok(filter_rel(input, condition))
 }
 
 /// Returns whether a StarRocks plan node carries filter conjuncts.
@@ -1327,4 +1307,70 @@ fn expect_children(node: &TPlanNode, children: &[TranslatedRel], expected: usize
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unhandled_join_kind_cannot_claim_a_concatenated_layout() {
+        let input = || TranslatedRel {
+            rel: Rel::default(),
+            layout: RowLayout::new([None]),
+        };
+        assert!(
+            join_rel(
+                input(),
+                input(),
+                i32_literal(1),
+                join_rel::JoinType::RightSemi
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn projected_layout_is_used_by_subsequent_joins_and_selections() {
+        let first = SlotKey::new(0, 1);
+        let second = SlotKey::new(0, 2);
+        let right_key = SlotKey::new(1, 1);
+        let input = TranslatedRel {
+            rel: Rel::default(),
+            layout: RowLayout::new([Some(first), Some(second)]),
+        };
+        let projected = project_rel(
+            input,
+            vec![
+                (field_selection(1), Some(second)),
+                (field_selection(1), Some(second)),
+                (i32_literal(7), None),
+            ],
+        );
+        assert_eq!(
+            projected.layout.columns().collect::<Vec<_>>(),
+            [Some(second), Some(second), None]
+        );
+        assert!(projected.layout.resolve(first).is_err());
+        assert!(
+            projected
+                .layout
+                .resolve(second)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        let right = TranslatedRel {
+            rel: Rel::default(),
+            layout: RowLayout::new([Some(right_key)]),
+        };
+        let joined = join_rel(projected, right, i32_literal(1), join_rel::JoinType::Inner).unwrap();
+        assert_eq!(joined.layout.resolve(right_key).unwrap(), 3);
+        let selected = emit_columns(joined, vec![3, 0, 2]).unwrap();
+        assert_eq!(
+            selected.layout.columns().collect::<Vec<_>>(),
+            [Some(right_key), Some(second), None]
+        );
+        assert_eq!(selected.layout.resolve(second).unwrap(), 1);
+    }
 }

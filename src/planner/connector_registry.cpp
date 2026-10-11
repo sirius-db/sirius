@@ -17,13 +17,18 @@
 #include "planner/connector_registry.hpp"
 
 #include "exec/stream_plan_bindings.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_reference_cache.hpp"
+#include "planner/duckdb_host.hpp"
 #include "sirius_registration.hpp"
 
 #include <dlfcn.h>
 #include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
@@ -35,6 +40,8 @@
 #include <duckdb/main/extension_manager.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/storage/single_file_block_manager.hpp>
+#include <duckdb/storage/storage_manager.hpp>
 #include <link.h>
 #include <parquet_extension.hpp>
 #include <parquet_multi_file_info.hpp>
@@ -42,7 +49,7 @@
 #include <array>
 #include <mutex>
 #include <tuple>
-#include <typeinfo>
+#include <unordered_set>
 
 namespace sirius::planner {
 namespace {
@@ -56,6 +63,157 @@ bool matches_bind(duckdb::FunctionData const* bind)
   return dynamic_cast<T const*>(bind) != nullptr;
 }
 
+bool collect_iceberg_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns)
+{
+  if (columns.empty()) return false;
+  for (auto const& column : columns) {
+    if (column.identifier.IsNull() ||
+        column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER)
+      return false;
+    if (!column.children.empty() && !collect_iceberg_field_ids(column.children)) return false;
+  }
+  return true;
+}
+
+op::scan::certification_result supported_parquet(op::scan::bound_table_scan const&,
+                                                 op::sirius_physical_table_scan const&,
+                                                 duckdb::ClientContext&,
+                                                 scan_contract_provenance&)
+{
+  op::scan::certification_result result;
+  result.verdict      = op::scan::eligibility_verdict::supported;
+  result.later_checks = op::scan::check_bit(op::scan::later_check::footer_per_file) |
+                        op::scan::check_bit(op::scan::later_check::profile_per_file);
+  return result;
+}
+
+op::scan::certification_result supported_iceberg(op::scan::bound_table_scan const& contract,
+                                                 op::sirius_physical_table_scan const& scan,
+                                                 duckdb::ClientContext& context,
+                                                 scan_contract_provenance& provenance)
+{
+  auto result = supported_parquet(contract, scan, context, provenance);
+  if (!iceberg_table_schema_has_field_ids(scan.bind_data.get())) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::iceberg_table_schema_no_field_ids;
+    result.reason_text =
+      "iceberg_scan table schema has no complete field-id mapping; the GPU path requires "
+      "field IDs to prove per-file schema correspondence";
+    result.later_checks = {};
+    return result;
+  }
+  result.later_checks |= op::scan::check_bit(op::scan::later_check::schema_per_file);
+  return result;
+}
+
+op::scan::certification_result supported_native(op::scan::bound_table_scan const&,
+                                                op::sirius_physical_table_scan const& scan,
+                                                duckdb::ClientContext&,
+                                                scan_contract_provenance&)
+{
+  op::scan::certification_result result;
+  result.verdict      = op::scan::eligibility_verdict::supported;
+  result.later_checks = op::scan::check_bit(op::scan::later_check::segments_per_range) |
+                        op::scan::check_bit(op::scan::later_check::matrix_per_range);
+
+  duckdb::vector<duckdb::idx_t> fallback_ids;
+  if (scan.projection_ids.empty()) {
+    for (duckdb::idx_t index = 0; index < scan.column_ids.size(); ++index) {
+      fallback_ids.push_back(index);
+    }
+  }
+  auto const& source_ids = scan.projection_ids.empty() ? fallback_ids : scan.projection_ids;
+  std::vector<op::scan::projected_column> projected_cols;
+  std::vector<sirius::logical_type> projected_types;
+  projected_cols.reserve(source_ids.size());
+  projected_types.reserve(source_ids.size());
+  for (std::size_t index = 0; index < source_ids.size(); ++index) {
+    auto const& column = scan.column_ids.at(source_ids[index]);
+    op::scan::projected_column projected;
+    projected.is_rowid = column.IsRowIdColumn();
+    if (!projected.is_rowid) {
+      projected.storage_idx = duckdb::StorageIndex(column.GetPrimaryIndex());
+    }
+    projected_cols.push_back(projected);
+    projected_types.push_back(index < scan.types.size()
+                                ? scan.types[index]
+                                : scan.returned_types.at(column.GetPrimaryIndex()));
+  }
+  if (auto text = op::scan::unsupported_projected_type_reason(projected_cols, projected_types)) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_type_unenumerated;
+    for (std::size_t index = 0; index < projected_types.size(); ++index) {
+      if (projected_cols[index].is_rowid) continue;
+      if (!op::scan::unsupported_projected_type_reason({projected_cols[index]},
+                                                       {projected_types[index]})) {
+        continue;
+      }
+      auto const& type = projected_types[index];
+      switch (type.id()) {
+        case sirius::type_id::HUGEINT:
+        case sirius::type_id::UHUGEINT:
+          result.reason = op::scan::verdict_reason::native_type_128bit;
+          break;
+        case sirius::type_id::STRUCT:
+        case sirius::type_id::LIST:
+          result.reason = op::scan::verdict_reason::native_type_nested;
+          break;
+        case sirius::type_id::DECIMAL:
+          result.reason = op::scan::verdict_reason::native_type_decimal128;
+          break;
+        case sirius::type_id::ARRAY:
+          result.reason = type.has_child() ? op::scan::verdict_reason::native_array_element
+                                           : op::scan::verdict_reason::native_array_child;
+          break;
+        case sirius::type_id::INVALID:
+        case sirius::type_id::SQLNULL:
+          result.reason = op::scan::verdict_reason::native_type_sentinel;
+          break;
+        default: break;
+      }
+      break;
+    }
+    result.reason_text = "duckdb-native scan rejected query: " + *text;
+    return result;
+  }
+
+  auto const* bind = dynamic_cast<duckdb::TableScanBindData const*>(scan.bind_data.get());
+  if (!bind || !bind->table.IsDuckTable()) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_block_manager;
+    result.reason_text =
+      "[prepare_duckdb_native_walk] duckdb-native scan rejected query: "
+      "requires a single-file block manager";
+    return result;
+  }
+  auto& storage = bind->table.Cast<duckdb::DuckTableEntry>().GetStorage();
+  auto& manager = storage.GetAttached().GetStorageManager();
+  if (!dynamic_cast<duckdb::SingleFileBlockManager const*>(&manager.GetBlockManager())) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_block_manager;
+    result.reason_text =
+      "[prepare_duckdb_native_walk] duckdb-native scan rejected query: "
+      "requires a single-file block manager";
+    return result;
+  }
+  if (manager.IsEncrypted()) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_encrypted;
+    result.reason_text =
+      "duckdb-native scan rejected query: encrypted storage is not GPU-decodable";
+    return result;
+  }
+  if (!manager.HasStorageVersion() || manager.GetStorageVersion() < 1 ||
+      manager.GetStorageVersion() > 7) {
+    result.verdict     = op::scan::eligibility_verdict::unsupported;
+    result.reason      = op::scan::verdict_reason::native_storage_version_unqualified;
+    result.reason_text = "duckdb-native scan rejected query: storage version is not qualified";
+    return result;
+  }
+  result.storage_version = manager.GetStorageVersion();
+  return result;
+}
+
 connector make_seq_scan_connector()
 {
   return {.function_name              = "seq_scan",
@@ -63,12 +221,13 @@ connector make_seq_scan_connector()
           .registry_profile           = "duckdb.seq_scan.v1",
           .bind_data_matches          = matches_bind<duckdb::TableScanBindData>,
           .lower                      = lower_native_scan,
-          .filter_mode                = mode::include_ast_row_masks,
+          .filter_mode                = mode::INCLUDE_AST_ROW_MASKS,
           .byte_source                = bytes::duckdb_native,
           .permits_cpu_replay         = true,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_native};
 }
 
 connector make_parquet_scan_connector()
@@ -78,12 +237,13 @@ connector make_parquet_scan_connector()
           .registry_profile           = "duckdb.parquet_scan.v1",
           .bind_data_matches          = matches_bind<duckdb::MultiFileBindData>,
           .lower                      = lower_parquet_scan,
-          .filter_mode                = mode::membership_masks_only,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
           .byte_source                = bytes::local_file,
           .permits_cpu_replay         = true,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_parquet};
 }
 
 connector make_read_parquet_connector()
@@ -93,12 +253,13 @@ connector make_read_parquet_connector()
           .registry_profile           = "duckdb.read_parquet.v1",
           .bind_data_matches          = matches_bind<duckdb::MultiFileBindData>,
           .lower                      = lower_parquet_scan,
-          .filter_mode                = mode::membership_masks_only,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
           .byte_source                = bytes::local_file,
           .permits_cpu_replay         = true,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_parquet};
 }
 
 connector make_sirius_read_parquet_connector()
@@ -108,12 +269,13 @@ connector make_sirius_read_parquet_connector()
           .registry_profile           = "sirius.read_parquet.v1",
           .bind_data_matches          = matches_bind<duckdb::SiriusReadParquetBindData>,
           .lower                      = lower_parquet_scan,
-          .filter_mode                = mode::membership_masks_only,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
           .byte_source                = bytes::sirius_owned_s3,
           .permits_cpu_replay         = false,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_parquet};
 }
 
 connector make_iceberg_scan_connector()
@@ -123,12 +285,13 @@ connector make_iceberg_scan_connector()
           .registry_profile           = "duckdb.iceberg_scan.v1",
           .bind_data_matches          = matches_bind<duckdb::MultiFileBindData>,
           .lower                      = lower_iceberg_scan,
-          .filter_mode                = mode::membership_masks_only,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
           .byte_source                = bytes::local_file,
           .permits_cpu_replay         = true,
           .selector_outside_bind_data = true,
           .decline_reason             = registered_iceberg_decline_reason,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_iceberg};
 }
 
 connector make_sirius_stream_source_connector()
@@ -138,12 +301,13 @@ connector make_sirius_stream_source_connector()
           .registry_profile           = "sirius.stream_source.v1",
           .bind_data_matches          = matches_bind<exec::stream_source_bind_data>,
           .lower                      = nullptr,
-          .filter_mode                = mode::membership_masks_only,
+          .filter_mode                = mode::MEMBERSHIP_MASKS_ONLY,
           .byte_source                = bytes::stream,
           .permits_cpu_replay         = false,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = nullptr};
 }
 
 std::array<connector, 6> const entries{make_seq_scan_connector(),
@@ -152,10 +316,6 @@ std::array<connector, 6> const entries{make_seq_scan_connector(),
                                        make_sirius_read_parquet_connector(),
                                        make_iceberg_scan_connector(),
                                        make_sirius_stream_source_connector()};
-
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
-void* host_factory(duckdb::DatabaseInstance& db, char const* symbol);
-#endif
 
 duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::DatabaseInstance& db)
 {
@@ -187,12 +347,10 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Databa
     config.options.maximum_threads = 1;
     duckdb::DuckDB reference(nullptr, &config);
     reference.LoadStaticExtension<duckdb::ParquetExtension>();
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
-    // Iceberg derives part of its scan callbacks from Parquet. The reference must
-    // use the host factory, not the loadable Sirius module's hidden DuckDB copy.
-    using parquet_factory = duckdb::TableFunctionSet (*)();
-    auto get_parquet      = reinterpret_cast<parquet_factory>(
-      host_factory(db, "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv"));
+    // Iceberg derives scan callbacks from Parquet; use the caller's DuckDB factory.
+    auto get_parquet = detail::host_factory(db,
+                                            &duckdb::ParquetScanFunction::GetFunctionSet,
+                                            "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv");
     if (!get_parquet) return {};
     duckdb::ExtensionLoader parquet_loader(*reference.instance, "parquet");
     auto functions = get_parquet();
@@ -202,7 +360,6 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Databa
       info.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
       parquet_loader.RegisterFunction(std::move(info));
     }
-#endif
     duckdb::ExtensionLoader loader(*reference.instance, "iceberg");
     init(loader);
     auto entry = loader.TryGetTableFunction("iceberg_scan");
@@ -211,63 +368,22 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Databa
   return {};
 }
 
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
-void* host_factory(duckdb::DatabaseInstance& db, char const* symbol)
-{
-  // The system catalog object is created by the host, independently of mutable function
-  // registrations. Its dynamic type locates that DuckDB module even for Python's RTLD_LOCAL
-  // import. Do not locate the host through a candidate callback or promote it to RTLD_GLOBAL.
-  auto& catalog = duckdb::Catalog::GetSystemCatalog(db);
-  Dl_info owner{};
-  void* owner_map{};
-  if (!::dladdr1(&typeid(catalog), &owner, &owner_map, RTLD_DL_LINKMAP) || !owner_map)
-    return nullptr;
-  auto const* module = static_cast<link_map const*>(owner_map);
-  // Use the loader's own name so NOLOAD finds its existing record without probing a file.
-  // The main executable has an empty name: use its main handle, never reopen its disk path.
-  auto const* name = module->l_name && module->l_name[0] ? module->l_name : nullptr;
-  auto* handle     = ::dlopen(name, RTLD_NOW | RTLD_NOLOAD);
-  if (!handle) return nullptr;
-  auto close = [](void* value) { ::dlclose(value); };
-  std::unique_ptr<void, decltype(close)> guard(handle, close);
-  auto* factory = ::dlsym(handle, symbol);
-  Dl_info implementation{};
-  // A handle can also resolve symbols from dependencies. Only this host may grant trust.
-  if (!factory || !::dladdr(factory, &implementation) ||
-      implementation.dli_fbase != owner.dli_fbase) {
-    return nullptr;
-  }
-  return factory;
-}
-#endif
-
 duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& name,
                                                           duckdb::ClientContext& context)
 {
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
-  // The loadable extension links a hidden DuckDB copy. Its factory addresses are not the
-  // host's. Resolve the host's exported factories (pinned DuckDB C++ ABI), never an entry in
-  // the caller's mutable catalog. Missing host symbols leave the source unverified.
+  auto& db = duckdb::DatabaseInstance::GetDatabase(context);
   if (name == "seq_scan") {
-    using factory = duckdb::TableFunction (*)();
-    auto get =
-      reinterpret_cast<factory>(host_factory(duckdb::DatabaseInstance::GetDatabase(context),
-                                             "_ZN6duckdb17TableScanFunction11GetFunctionEv"));
+    auto get = detail::host_factory(
+      db, &duckdb::TableScanFunction::GetFunction, "_ZN6duckdb17TableScanFunction11GetFunctionEv");
     return get ? duckdb::vector<duckdb::TableFunction>{get()}
                : duckdb::vector<duckdb::TableFunction>{};
   }
   if (name == "parquet_scan" || name == "read_parquet") {
-    using factory = duckdb::TableFunctionSet (*)();
-    auto get =
-      reinterpret_cast<factory>(host_factory(duckdb::DatabaseInstance::GetDatabase(context),
-                                             "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv"));
+    auto get = detail::host_factory(db,
+                                    &duckdb::ParquetScanFunction::GetFunctionSet,
+                                    "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv");
     return get ? get().functions : duckdb::vector<duckdb::TableFunction>{};
   }
-#else
-  if (name == "seq_scan") return {duckdb::TableScanFunction::GetFunction()};
-  if (name == "parquet_scan" || name == "read_parquet")
-    return duckdb::ParquetScanFunction::GetFunctionSet().functions;
-#endif
   if (name == "sirius_read_parquet") return {duckdb::GetSiriusReadParquetFunction()};
   if (name == "sirius_stream_source") return {exec::get_stream_source_function()};
   // Iceberg is initialized at extension load, never during a planning lookup.
@@ -367,21 +483,22 @@ struct accepted_callbacks {
   /// Caches trusted definitions, including an unavailable resolution result.
   detail::connector_reference_cache reference;
   /// Prevents repeated warnings when a connector has no trusted definition.
-  bool missing_reference_reported = false;
+  std::unordered_set<void const*> missing_reference_reported;
 };
 std::array<accepted_callbacks, entries.size()> accepted;
 
 void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
 {
   if (!duckdb::ExtensionManager::Get(db).ExtensionIsLoaded("iceberg")) return;
+  auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
   for (std::size_t i = 0; i < entries.size(); ++i) {
     if (entries[i].function_name != "iceberg_scan") continue;
     auto& cache = accepted[i];
     std::lock_guard lock(cache.mutex);
-    if (cache.reference.has_verified_functions()) return;
+    if (cache.reference.has_verified_functions(host)) return;
     try {
       // Publish the complete independent reference only after registration succeeds.
-      cache.reference.publish(iceberg_reference_functions(db));
+      cache.reference.publish(host, iceberg_reference_functions(db));
     } catch (std::exception const& error) {
       // Optional GPU admission must not break LOAD or fall back to trusting the caller's
       // catalog. An empty cache makes lookup decline without retrying initialization there.
@@ -404,6 +521,14 @@ class scan_source_extension_callback final : public duckdb::ExtensionCallback {
 
 std::span<connector const> registered_connectors() { return entries; }
 
+bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data)
+{
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
+  if (bind == nullptr) return false;
+  auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
+  return collect_iceberg_field_ids(columns);
+}
+
 void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
 {
   // Register first so a subsequent Iceberg load is observed. The explicit initialization
@@ -413,53 +538,69 @@ void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
   initialize_iceberg_callbacks(db);
 }
 
-connector const* lookup_connector(duckdb::TableFunction const& function,
-                                  duckdb::FunctionData const* bind,
-                                  duckdb::ClientContext& context)
+lookup_outcome lookup_connector_classified(duckdb::TableFunction const& function,
+                                           duckdb::FunctionData const* bind,
+                                           duckdb::ClientContext& context)
 {
+  bool function_known = false;
   for (size_t i = 0; i < entries.size(); ++i) {
     auto const& entry = entries[i];
-    if (entry.function_name != function.name || !entry.bind_data_matches(bind)) continue;
-    auto& cache = accepted[i];
+    if (entry.function_name != function.name) continue;
+    function_known = true;
+    if (!entry.bind_data_matches(bind)) continue;
+    // The catalog's destructor identifies its host without a loader lookup per scan.
+    auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(context));
+    auto& cache      = accepted[i];
     std::lock_guard lock(cache.mutex);
     auto catalog_entry =
       duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::TableFunctionCatalogEntry>(
         context, DEFAULT_SCHEMA, entry.function_name, duckdb::OnEntryNotFound::RETURN_NULL);
-    if (!catalog_entry) return nullptr;
+    if (!catalog_entry) return {nullptr, lookup_decline::catalog_entry_missing};
     // A mutable catalog can confirm registration, but must never grant trust.
     auto const& references = cache.reference.get_or_resolve(
-      [&] { return reference_functions(entry.function_name, context); });
+      host, [&] { return reference_functions(entry.function_name, context); });
     if (references.empty()) {
-      if (!cache.missing_reference_reported) {
+      if (cache.missing_reference_reported.insert(host).second) {
         auto const* requirement =
           "The source extension must provide a verifiable function definition.";
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
         if (entry.function_name == "seq_scan" || entry.function_name == "parquet_scan" ||
             entry.function_name == "read_parquet") {
           requirement =
-            "Loadable Sirius requires the matching host DuckDB build to export "
+            "An external DuckDB host must export "
             "TableScanFunction::GetFunction and ParquetScanFunction::GetFunctionSet.";
         }
-#endif
         SIRIUS_LOG_WARN(
           "GPU scan source '{}' has no trusted reference definition; GPU lowering "
           "is disabled for this source. {}",
           entry.function_name,
           requirement);
-        cache.missing_reference_reported = true;
       }
-      return nullptr;
+      return {nullptr, lookup_decline::no_trusted_reference};
     }
     for (auto const& reference : references) {
       verified_callbacks const callbacks(reference);
       if (!callbacks.matches(function)) continue;
       for (auto const& registered : catalog_entry->functions.functions) {
-        if (callbacks.matches(registered)) return &entry;
+        if (callbacks.matches(registered)) return {&entry, lookup_decline::none};
       }
     }
-    return nullptr;
+    return {nullptr, lookup_decline::callback_mismatch};
   }
-  return nullptr;
+  return {nullptr,
+          function_known ? lookup_decline::bind_data_mismatch : lookup_decline::unknown_function};
+}
+
+lookup_outcome lookup_connector_classified(duckdb::LogicalGet const& get,
+                                           duckdb::ClientContext& context)
+{
+  return lookup_connector_classified(get.function, get.bind_data.get(), context);
+}
+
+connector const* lookup_connector(duckdb::TableFunction const& function,
+                                  duckdb::FunctionData const* bind,
+                                  duckdb::ClientContext& context)
+{
+  return lookup_connector_classified(function, bind, context).entry;
 }
 
 connector const* lookup_connector(duckdb::LogicalGet const& get, duckdb::ClientContext& context)

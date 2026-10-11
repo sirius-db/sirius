@@ -44,7 +44,7 @@
 //!
 //! | Expression node   | Substrait expression |
 //! |-------------------|----------------------|
-//! | `SLOT_REF`        | field reference (resolved by `DescriptorTable::slot_global_index`) |
+//! | `SLOT_REF`        | field reference (resolved against the input `RowLayout`) |
 //! | `*_LITERAL`       | width-matched typed literal (incl. `DATE_LITERAL` as epoch days) |
 //! | `BINARY_PRED`     | comparison function (`equal`, `not_equal`, `lt`, `lte`, `gt`, `gte`) |
 //! | `COMPOUND_PRED`   | boolean function (`and`, `or`, `not`) |
@@ -75,11 +75,8 @@
 //!
 //! 1. Add a match arm in `PlanNodeRel`/`NodeExpr` routing to a translator.
 //! 2. Build the Substrait relation/expression, translating children first.
-//! 3. For relations, set `TranslatedRel::row_tuples` (the visible row layout) and
-//!    `TranslatedRel::output_width` (emitted column count) so parent projections
-//!    compute correct field offsets. Multi-input relations concatenate child
-//!    layouts left-to-right; `DescriptorTable::slot_global_index` then resolves a
-//!    right-side slot to `left_width + right_index`.
+//! 3. Build the relation and its `RowLayout` together. Each emitted column has
+//!    a slot binding or an anonymous entry; expressions resolve against child layouts.
 //! 4. Register any extension function through [`ExtensionRegistry`], which
 //!    de-duplicates anchors by `(urn, name)`.
 
@@ -101,6 +98,7 @@ pub(crate) mod descriptor_table;
 pub mod error;
 mod expr_translator;
 mod node_translator;
+mod row_layout;
 mod scan_paths;
 pub(crate) mod type_mapper;
 
@@ -212,7 +210,7 @@ impl PlanTranslator {
                 node_translator::project_exprs(translated, output_exprs, &desc, &mut registry)?;
             names
         } else {
-            desc.output_names_for_tuples(&translated.row_tuples)?
+            translated.output_names(&desc)?
         };
 
         let output_names = unique_names(output_names).collect::<Vec<_>>();
@@ -228,7 +226,7 @@ impl PlanTranslator {
             extensions,
             relations: vec![PlanRel {
                 rel_type: Some(plan_rel::RelType::Root(RelRoot {
-                    input: Some(translated.rel),
+                    input: Some(translated.into_rel()),
                     names: output_names.clone(),
                 })),
             }],

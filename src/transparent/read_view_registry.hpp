@@ -27,6 +27,15 @@
 namespace sirius::transparent {
 
 class read_view_registry;
+}
+namespace sirius::planner {
+struct connector;
+enum class lookup_decline : uint8_t;
+}  // namespace sirius::planner
+namespace sirius::op {
+class sirius_physical_table_scan;
+}
+namespace sirius::transparent {
 
 enum class candidate_origin : uint8_t { copy, replan };
 
@@ -79,10 +88,19 @@ struct read_view_registry_entry {
   uint64_t finalize_generation = 0;
 };
 
+struct declined_lookup_record {
+  op::scan::eligibility_verdict verdict = op::scan::eligibility_verdict::unsupported;
+  op::scan::verdict_reason reason       = op::scan::verdict_reason::none;
+};
+
 // Planning and finalize, including execution rebuilds, complete mutations before dispatch.
 // Dispatcher threads only read published entries; mutation must not overlap those reads.
 class read_view_registry {
  public:
+  op::scan::test_injections injections;
+  std::shared_ptr<op::scan::physical_profile_table> profiles =
+    std::make_shared<op::scan::physical_profile_table>();
+
   [[nodiscard]] read_view_registry_entry const& entry(op::scan::scan_contract_id id) const;
   [[nodiscard]] read_view_registry_entry const& entry_for_scan_node(uint64_t scan_node_id) const;
   [[nodiscard]] std::vector<read_view_registry_entry> const& entries() const noexcept
@@ -90,10 +108,17 @@ class read_view_registry {
     return entries_;
   }
   [[nodiscard]] std::vector<candidate_binding> candidate_bindings() const;
-  void publish_supported(op::scan::certificate_evidence_scope scope,
-                         std::string correspondence,
-                         std::span<op::scan::bound_read_view const> physical_original);
+  void record_verdict(op::scan::scan_contract_id id, op::scan::certification_result const& result);
+  // Returns true only for the first refusal of this LogicalGet in this query.
+  bool record_declined_lookup(duckdb::LogicalGet const&, planner::lookup_decline);
+  [[nodiscard]] auto const& declined_lookups() const noexcept { return declined_lookups_; }
+  op::scan::scan_contract_id allocate_declined_scan(op::sirius_physical_table_scan const& scan,
+                                                    planner::connector const& connector);
+  void publish_correspondence(op::scan::certificate_evidence_scope scope,
+                              std::string correspondence,
+                              std::span<op::scan::bound_read_view const> physical_original);
   void inject_mismatch_for_testing(bool swap);
+  void record_delete_preparation(op::scan::scan_contract_id id, uint64_t elapsed_us);
 
  private:
   friend op::scan::scan_contract_id op::scan::allocate_scan_contract(
@@ -109,6 +134,7 @@ class read_view_registry {
     duckdb::idx_t);
 
   std::vector<read_view_registry_entry> entries_;
+  std::unordered_map<duckdb::idx_t, declined_lookup_record> declined_lookups_;
   std::unordered_map<op::scan::scan_contract_id, std::size_t> by_contract_id_;
   std::unordered_map<uint64_t, std::size_t> by_scan_node_id_;
 };

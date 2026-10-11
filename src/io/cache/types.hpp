@@ -116,6 +116,11 @@ class buffer_pool {
 
   void deallocate_bulk(std::vector<std::byte*>&& out, int numa) noexcept;
 
+  /// Same hand-back from a caller-owned list the caller keeps.  The pool copies
+  /// the pointers into the list the allocator's RAII wrapper takes; that copy
+  /// and the wrapper are the only allocations on this path.
+  void deallocate_bulk(std::span<std::byte* const> blocks, int numa) noexcept;
+
   [[nodiscard]] size_t chunk_size() const noexcept { return _chunk_bytes; }
 
   [[nodiscard]] size_t total_allocated_bytes() const noexcept

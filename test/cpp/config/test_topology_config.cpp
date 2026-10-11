@@ -57,25 +57,25 @@ TEST_CASE("parsed hardware configuration resolves independently after copying",
                    "    host: { capacity_bytes: 2Gi }\n"
                    "  operator_params: { concat_batch_bytes: 123456789 }\n"
                    "  telemetry: { exporter: msgpack, output_directory: deferred_telemetry }\n");
-  sirius::sirius_config parsed;
-  parsed.parse_from_file(yaml.path);
-  CHECK(parsed.get_hw_topology().gpus.empty());
-  CHECK(parsed.get_memory_space_configs().empty());
+  auto parsed = sirius::parsed_sirius_config::from_file(yaml.path);
   CHECK(parsed.get_telemetry_config().exporter == "msgpack");
   CHECK(parsed.get_operator_params().concat_batch_bytes == 123456789);
 
-  auto resolved = parsed;
-  resolved.resolve_hardware();
+  auto copy = parsed;
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                             /*with_runtime_attributes=*/true));
+  auto resolved = copy.resolve(discovery.get_topology());
   REQUIRE_FALSE(resolved.get_memory_space_configs().empty());
   CHECK(resolved.get_operator_params().scan_task_batch_size == (1ULL << 30) / 40);
   CHECK(resolved.get_operator_params().concat_batch_bytes == 123456789);
-  CHECK(parsed.get_hw_topology().gpus.empty());
-  CHECK(parsed.get_memory_space_configs().empty());
+  CHECK(parsed.get_operator_params().concat_batch_bytes == 123456789);
 
-  // Resolving again must preserve runtime overrides instead of reapplying YAML.
+  // A new resolution leaves existing runtime overrides and the specification unchanged.
   resolved.get_operator_params().concat_batch_bytes = 987654321;
-  resolved.resolve_hardware();
+  auto another                                      = parsed.resolve(discovery.get_topology());
   CHECK(resolved.get_operator_params().concat_batch_bytes == 987654321);
+  CHECK(another.get_operator_params().concat_batch_bytes == 123456789);
 }
 
 TEST_CASE("sirius_config parses topology.gpus_per_query", "[topology_config][config]")

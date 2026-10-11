@@ -32,6 +32,9 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -301,17 +304,21 @@ TEST_CASE("prepare does not publish a request the retry's eviction left short of
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
-  // Buffered, then disposed: the only chunks in the tier the evictor may take.
-  // Its last 4 MiB are named by nothing else below, so the request stays an
-  // eviction candidate instead of being retired the moment it is released.
-  {
-    std::vector<cudf::io::text::byte_range_info> ranges;
-    ranges.emplace_back(0, static_cast<std::int64_t>(36 * mib));
-    auto victim = manager.create_datasource(file.path.string());
-    REQUIRE(victim != nullptr);
-    victim->fadvise(ranges, 0);
-    REQUIRE(victim->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
-  }
+  REQUIRE(cache->chunk_size() == mib);
+  auto host_spaces = memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(host_spaces.size() == 1);
+  REQUIRE(host_spaces.front()->get_max_memory() == 256 * mib);
+  auto* host_mr = host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host_mr != nullptr);
+  REQUIRE(host_mr->get_block_size() == mib);
+  REQUIRE(host_mr->get_total_reserved_bytes() == 64 * mib);
+
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  ranges.emplace_back(0, static_cast<std::int64_t>(36 * mib));
+  auto victim = manager.create_datasource(file.path.string());
+  REQUIRE(victim != nullptr);
+  victim->fadvise(ranges, 0);
+  REQUIRE(victim->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
 
   // The target names 32 MiB of the victim's chunks -- still buffered, so the
   // shortfall count skips them -- plus 32 MiB of empty ones past the gap.
@@ -323,25 +330,23 @@ TEST_CASE("prepare does not publish a request the retry's eviction left short of
   REQUIRE(target != nullptr);
   target->fadvise(target_ranges, 0);
 
-  // Fill the rest of the tier with requests that stay alive, so the victim's
-  // chunks remain the only reclaimable ones.
-  std::vector<std::shared_ptr<sirius::io::sirius_datasource>> fillers;
-  std::size_t offset = 68 * mib;
-  bool exhausted     = false;
-  for (std::size_t attempt = 0; attempt < 32; ++attempt) {
-    std::vector<cudf::io::text::byte_range_info> ranges;
-    ranges.emplace_back(static_cast<std::int64_t>(offset), static_cast<std::int64_t>(32 * mib));
-    auto filler = manager.create_datasource(file.path.string());
-    REQUIRE(filler != nullptr);
-    filler->fadvise(ranges, 0);
-    if (filler->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed) {
-      exhausted = true;
-      break;
-    }
-    fillers.push_back(std::move(filler));
-    offset += 32 * mib;
-  }
-  REQUIRE(exhausted);
+  // Fill the rest of the tier without a failed cache preparation that could
+  // enqueue an eviction before the target counts its missing buffers.
+  auto const pressure_bytes = host_mr->get_available_memory();
+  REQUIRE(pressure_bytes > 0);
+  REQUIRE(pressure_bytes % mib == 0);
+  auto pressure = host_mr->allocate_multiple_blocks(pressure_bytes);
+  REQUIRE(pressure != nullptr);
+  REQUIRE(pressure->size_bytes() == pressure_bytes);
+  REQUIRE(host_mr->get_available_memory() == 0);
+
+  cache->evict_sync(mib);
+  REQUIRE(cache->claimed_bytes() == 36 * mib);
+
+  // Buffered, then disposed: the only chunks in the tier the evictor may take.
+  // Its last 4 MiB are named by nothing else below, so the request stays an
+  // eviction candidate instead of being retired the moment it is released.
+  victim.reset();
 
   // The synchronous eviction the shortfall triggers cannot meet its target from
   // the victim's unsubscribed tail alone, so the subscriber-ignoring pass takes

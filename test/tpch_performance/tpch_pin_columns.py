@@ -258,7 +258,13 @@ def detect_pin_glob(parquet_dir: str, table: str) -> str:
     raise RuntimeError(f"no parquet files for table '{table}' under {abs_dir}")
 
 
-def _pin_call(table: str, cols: list[str], source: str, data_source: str) -> str:
+def _pin_call(
+    table: str,
+    cols: list[str],
+    source: str,
+    data_source: str,
+    pin_globs: dict[str, str] | None = None,
+) -> str:
     """Emit a single `CALL pin_table(...)` for `table` in the given data source.
 
     Tier defaults to 'gpu'; SIRIUS_PIN_TIER selects 'host' or 'parquet' instead
@@ -280,14 +286,20 @@ def _pin_call(table: str, cols: list[str], source: str, data_source: str) -> str
             f"CALL pin_table(format='duckdb', tier='{tier}', "
             f"name='{table}', cols=[{col_literals}]);"
         )
-    path = detect_pin_glob(source, table)
-    return f"CALL pin_table('{path}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
+    path = pin_globs[table] if pin_globs is not None else detect_pin_glob(source, table)
+    path_literal = path.replace("'", "''")
+    return f"CALL pin_table('{path_literal}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
 
 
-def emit_pin(query_num: int, source: str, data_source: str = "parquet") -> str:
+def emit_pin(
+    query_num: int,
+    source: str,
+    data_source: str = "parquet",
+    pin_globs: dict[str, str] | None = None,
+) -> str:
     cols_by_table = QUERY_COLUMNS[query_num]
     lines = [
-        _pin_call(table, cols, source, data_source)
+        _pin_call(table, cols, source, data_source, pin_globs)
         for table, cols in cols_by_table.items()
     ]
     return "\n".join(lines) + "\n"
@@ -307,14 +319,18 @@ def union_columns_by_table() -> dict[str, list[str]]:
     return {table: sorted(cols) for table, cols in by_table.items()}
 
 
-def emit_pin_all(source: str, data_source: str = "parquet") -> str:
+def emit_pin_all(
+    source: str,
+    data_source: str = "parquet",
+    pin_globs: dict[str, str] | None = None,
+) -> str:
     """Emit one CALL pin_table per table with the union of columns across all queries.
 
     Used by sequential-mode benchmarks where re-pinning between queries would
     erase the cache; pin everything once up front instead.
     """
     lines = [
-        _pin_call(table, cols, source, data_source)
+        _pin_call(table, cols, source, data_source, pin_globs)
         for table, cols in union_columns_by_table().items()
     ]
     return "\n".join(lines) + "\n"

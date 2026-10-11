@@ -305,7 +305,10 @@ work is exposed by task hints and completion-driven downstream scheduling — pl
 
 The scheduler is filter-agnostic: it does not inspect hash joins or reorder queued work to advance
 dynamic-filter publication. Immediate probes remain strictly ordered by synchronous build-CONCAT
-publication in the join pipeline. A scan reached transitively through an intervening join has no
+publication in the join pipeline. An accumulated multi-partition filter is published inside the
+elected build PARTITION task, before its deposit. Work requiring that deposit or build completion
+observes the publication outcome; already-runnable CONCAT/probe work may see an earlier snapshot.
+A scan reached transitively through an intervening join has no
 such edge and samples whatever complete filters are visible at its reader and post-decode
 checkpoints.
 

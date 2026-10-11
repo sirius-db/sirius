@@ -6,7 +6,7 @@
 """Prepare local fixtures for the [s3][integration] tests.
 
 Writes files under ``<out_dir>`` which the test harness
-(``test/cpp/utils/s3_container.*``) then uploads to the MinIO containers from
+(``test/cpp/utils/s3_backend.*``) then uploads to the SeaweedFS server from
 the host via Sirius's SigV4 signer. Text/binary fixtures are regenerated
 deterministically each run, and the standard integration Parquet fixtures are
 copied from ``test/cpp/integration/data/parquet`` so S3 tests exercise the same
@@ -22,7 +22,7 @@ known TPCH data as the regular GPU integration suite.
 
 The binary blobs are opaque bytes, not parquet. REST byte-equality tests
 read them through scan_manager create_datasource. Unless --manifest is set,
-MANIFEST.sha256 is written inside out_dir; the container harness overrides
+MANIFEST.sha256 is written inside out_dir; the S3 harness overrides
 that path to keep it outside the uploaded directory.
 """
 

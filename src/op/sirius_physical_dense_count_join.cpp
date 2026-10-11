@@ -330,11 +330,14 @@ partition_strategy sirius_physical_dense_count_join::get_partition_strategy(
       }
     }
   }
-  return partition_strategy{
-    num_partitions,
-    /*broadcast=*/false,
-    /*build_probe=*/false,
-    partition_placement::round_robin(static_cast<std::size_t>(num_partitions), active_gpu_ids())};
+  // The histogram/hash state is task-local; a lone partition needs no fixed GPU.
+  return partition_strategy{num_partitions,
+                            /*broadcast=*/false,
+                            /*build_probe=*/false,
+                            num_partitions == 1
+                              ? partition_placement::unpinned(1)
+                              : partition_placement::round_robin(
+                                  static_cast<std::size_t>(num_partitions), active_gpu_ids())};
 }
 
 std::optional<task_creation_hint> sirius_physical_dense_count_join::get_next_task_hint()

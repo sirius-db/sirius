@@ -114,8 +114,8 @@ bool collect_equality_values(duckdb::TableFilter const& filter, std::vector<std:
 
 /// Wide intermediate for bound arithmetic: rescaling a decimal constant and the
 /// ±1 of strict inequalities can step just past the int64 edge, so bounds are
-/// intersected as __int128 and clamped once at the end.
-using int128 = __int128;
+/// intersected as __int128_t and clamped once at the end.
+using int128 = __int128_t;
 
 /// 10^e as int128 (e ≤ 38 fits; callers never exceed decimal precision bounds).
 int128 pow10_128(int e)
@@ -414,9 +414,8 @@ bool fold_expression_conjunct(duckdb::Expression const& expr,
 /// under-filters), usable to drop rows during decode but never as grounds to
 /// skip the scan's own filter.
 ///
-/// IS_NOT_NULL child conjuncts are absorbed without affecting coverage:
-/// today's post-decode filter (convert_table_filters_to_expression) drops them,
-/// so ignoring them changes nothing. Unconvertible AND children are skipped
+/// IS_NOT_NULL has no numeric bound and must retain the residual predicate.
+/// Unconvertible AND children are skipped
 /// (coverage lost, bounds kept). OR/IN and other shapes contribute no bounds at
 /// all — decomposing them soundly needs a hull, not an intersection.
 bool fold_numeric_conjunct(duckdb::TableFilter const& filter,
@@ -446,7 +445,6 @@ bool fold_numeric_conjunct(duckdb::TableFilter const& filter,
       auto const& conjunction = filter.Cast<duckdb::ConjunctionAndFilter>();
       bool any_bound          = false;
       for (auto const& child : conjunction.child_filters) {
-        if (child->filter_type == duckdb::TableFilterType::IS_NOT_NULL) { continue; }
         any_bound |= fold_numeric_conjunct(*child, col_type, acc, fully_covered);
       }
       return any_bound;
@@ -498,13 +496,9 @@ scan_filter_analysis analyze_scan_filters(
 
   for (auto const& [column_index, filter] : filters.filters) {
     if (!filter) { continue; }
-    // Non-restricting forms, exactly as convert_table_filters_to_expression
-    // skips them: dynamic/optional filters run downstream, IS_NOT_NULL is
-    // dropped from the post-decode conjunction today.
-    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
-        filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
-      continue;
-    }
+    // Advisory filters do not affect coverage. Required IS_NOT_NULL predicates
+    // are not numeric ranges and clear coverage below, retaining the residual.
+    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER) { continue; }
     if (column_index >= column_ids.size()) {
       not_covered(column_index, "references no scan column");
       continue;

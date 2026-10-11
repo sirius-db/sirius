@@ -29,6 +29,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/error.hpp>
 
+#include <algorithm>
 #include <optional>
 
 namespace sirius {
@@ -37,6 +38,20 @@ namespace op {
 //===--------------------------------------------------------------------===//
 // operator_data
 //===--------------------------------------------------------------------===//
+
+std::vector<std::uint64_t> pipelineable_operator_data::original_batch_ids() const
+{
+  std::vector<std::uint64_t> ids;
+  ids.reserve(_data_batches.size());
+  for (std::size_t position = 0; position < _data_batches.size(); ++position) {
+    if (!_data_batches[position]) { continue; }
+    auto const replaced = std::ranges::find(
+      _replaced_batch_ids, position, &std::pair<std::size_t, std::uint64_t>::first);
+    ids.push_back(replaced != _replaced_batch_ids.end() ? replaced->second
+                                                        : _data_batches[position]->get_batch_id());
+  }
+  return ids;
+}
 
 const std::vector<std::shared_ptr<::cucascade::data_batch>>&
 pipelineable_operator_data::get_data_batches() const
@@ -69,7 +84,8 @@ void pipelineable_operator_data::prepare_for_processing(
   std::vector<cucascade::read_only_data_batch> ro_batches;
   ro_batches.reserve(_data_batches.size());
 
-  for (std::shared_ptr<cucascade::data_batch>& batch : _data_batches) {
+  for (std::size_t position = 0; position < _data_batches.size(); ++position) {
+    auto& batch = _data_batches[position];
     if (not batch) {
       throw sirius::internal_exception(
         "pipelineable_operator_data: null batch encountered during prepare_for_processing");
@@ -79,22 +95,28 @@ void pipelineable_operator_data::prepare_for_processing(
             pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream)) {
         pipeline::lock_and_prepare_batch_result result = *maybe_result;
 
-        std::visit(cucascade::utils::overloaded{
-                     [&ro_batches](pipeline::lock_to_existing_batch& result) {
-                       ro_batches.push_back(std::move(result.ro_lock));
-                     },
-                     [&batch, &ro_batches](pipeline::lock_to_new_batch& result) {
-                       // result has returned a read_only accessor to a clone (for the case of
-                       // cross-GPU input/target_mem_space), so the ro_lock accessor here references
-                       // a different batch than `batch` from `_data_batches`. Update the vector so
-                       // _data_batches now holds the new updated batch, upholding the invariant
-                       // that _data_batches[i] is the batch underlying accessor
-                       // _read_only_data_batches[i].
-                       batch = std::move(result.new_batch);
-                       ro_batches.push_back(std::move(result.ro_lock));
-                     },
-                   },
-                   result);
+        std::visit(
+          cucascade::utils::overloaded{
+            [&ro_batches](pipeline::lock_to_existing_batch& result) {
+              ro_batches.push_back(std::move(result.ro_lock));
+            },
+            [this, position, &batch, &ro_batches](pipeline::lock_to_new_batch& result) {
+              // result has returned a read_only accessor to a clone (for the case of
+              // cross-GPU input/target_mem_space), so the ro_lock accessor here references
+              // a different batch than `batch` from `_data_batches`. Update the vector so
+              // _data_batches now holds the new updated batch, upholding the invariant
+              // that _data_batches[i] is the batch underlying accessor
+              // _read_only_data_batches[i]. The first replacement keeps the original ID.
+              if (std::ranges::find(
+                    _replaced_batch_ids, position, &std::pair<std::size_t, std::uint64_t>::first) ==
+                  _replaced_batch_ids.end()) {
+                _replaced_batch_ids.emplace_back(position, batch->get_batch_id());
+              }
+              batch = std::move(result.new_batch);
+              ro_batches.push_back(std::move(result.ro_lock));
+            },
+          },
+          result);
       } else {
         throw sirius::internal_exception(
           "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
@@ -275,11 +297,17 @@ std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_
     std::vector<std::shared_ptr<::cucascade::data_batch>>{});
 }
 
+void sirius_physical_operator::on_input_batch_pushed(std::string_view /*port_id*/,
+                                                     ::cucascade::data_batch& /*batch*/)
+{
+}
+
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
                                                std::shared_ptr<::cucascade::data_batch> batch)
 {
   auto* p = get_port(port_id);
   if (p && p->repo) {
+    if (batch) { on_input_batch_pushed(port_id, *batch); }
     // Emit before the batch becomes poppable so `queued` precedes `packaged`.
     telemetry::batch_telemetry_registry::instance().on_published(
       batch, p->repo, telemetry::batch_origin::operator_output);

@@ -24,6 +24,8 @@
 
 #include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -51,70 +53,115 @@ inline int grid_for(std::int64_t items, int per_block)
   return static_cast<int>(g);
 }
 
-// Pass 1: in-chunk positions, chunk-boundary flags, and the input's own
-// validity — all from the same load of row_ids, since each is a function of a
-// row id and its predecessor.
+// Pass 1: in-chunk positions and the input's own validity — both from the same
+// load of row_ids, since each is a function of a row id and its predecessor.
+// The chunk-boundary flags are not materialised: the scan reads them through
+// boundary_at, and the scatter recovers them from rank steps.
 //
 // `bad` is set (never cleared) by any thread that sees an id out of range or
 // out of order. Checking here rather than trusting the caller is the same
 // argument the uint16 positions make: a post-join caller is exactly the one
 // whose ordering we cannot verify by construction.
+__device__ __forceinline__ std::uint16_t scan_one(
+  std::int32_t id, std::int32_t prev, bool has_prev, std::int64_t num_rows, std::uint32_t* bad)
+{
+  if (id < 0 || id >= num_rows) {
+    // Every derived value below would be out of bounds. Use the neutral one
+    // anyway: the scan runs before the host learns of this.
+    *bad = 1u;
+    return 0u;
+  }
+  if (has_prev && prev >= id) { *bad = 1u; }  // a repeat would decode the row twice
+  return static_cast<std::uint16_t>(id & (::codegen::kChunkSize - 1));
+}
+
+// Four ids per thread when row_ids and in_chunk_rows are vector-aligned (16 B / 8 B): one 16-byte
+// load, one 8-byte store. Otherwise, and for the sub-quad tail, one id per iteration.
 __global__ void row_ids_scan_kernel(std::int32_t const* __restrict__ row_ids,
                                     std::int64_t num_ids,
                                     std::int64_t num_rows,
                                     std::uint16_t* __restrict__ in_chunk_rows,
-                                    std::uint32_t* __restrict__ boundary,
                                     std::uint32_t* __restrict__ bad)
 {
-  auto const chunk_rows = static_cast<std::int64_t>(::codegen::kChunkSize);
-  auto const stride     = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
-  for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       i < num_ids;
-       i += stride) {
-    std::int64_t const id = row_ids[i];
-    if (id < 0 || id >= num_rows) {
-      // Every derived value below would be out of bounds. Write the neutral one
-      // anyway: the scan runs before the host learns of this, and it must not
-      // read a flag that was never stored.
-      *bad             = 1u;
-      in_chunk_rows[i] = 0u;
-      boundary[i]      = 0u;
-      continue;
+  auto const stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+  auto const tid    = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  bool const vec    = ((reinterpret_cast<std::uintptr_t>(row_ids) & 15u) == 0) &&
+                   ((reinterpret_cast<std::uintptr_t>(in_chunk_rows) & 7u) == 0);
+  std::int64_t const scalar_from = vec ? (num_ids & ~std::int64_t{3}) : 0;
+  if (vec) {
+    for (std::int64_t i = tid * 4; i < scalar_from; i += stride * 4) {
+      int4 const v            = *reinterpret_cast<int4 const*>(row_ids + i);
+      std::int32_t const prev = i != 0 ? row_ids[i - 1] : 0;
+      ushort4 out;
+      out.x                                          = scan_one(v.x, prev, i != 0, num_rows, bad);
+      out.y                                          = scan_one(v.y, v.x, true, num_rows, bad);
+      out.z                                          = scan_one(v.z, v.y, true, num_rows, bad);
+      out.w                                          = scan_one(v.w, v.z, true, num_rows, bad);
+      *reinterpret_cast<ushort4*>(in_chunk_rows + i) = out;
     }
-    std::int64_t const chunk = id / chunk_rows;
-    in_chunk_rows[i]         = static_cast<std::uint16_t>(id - chunk * chunk_rows);
-    if (i == 0) {
-      boundary[i] = 1u;
-    } else {
-      std::int64_t const prev = row_ids[i - 1];
-      if (prev >= id) { *bad = 1u; }  // a repeat would decode the row twice
-      boundary[i] = (prev / chunk_rows != chunk) ? 1u : 0u;
-    }
+  }
+  for (std::int64_t i = scalar_from + tid; i < num_ids; i += stride) {
+    in_chunk_rows[i] = scan_one(row_ids[i], i != 0 ? row_ids[i - 1] : 0, i != 0, num_rows, bad);
   }
 }
 
+// 1 where row_ids[i] opens a new chunk (always at i == 0), else 0. Fed to the boundary scan as a
+// transform iterator, so the flags never exist in memory. Out-of-range ids give a meaningless but
+// harmless value: pass 1 has flagged them and the build throws before the result is used.
+struct boundary_at {
+  std::int32_t const* row_ids;
+  __host__ __device__ std::uint32_t operator()(std::int64_t i) const
+  {
+    constexpr int kShift = 10;
+    static_assert((1 << kShift) == ::codegen::kChunkSize, "chunk size must be 2^10");
+    if (i == 0) return 1u;
+    return (row_ids[i - 1] >> kShift) != (row_ids[i] >> kShift) ? 1u : 0u;
+  }
+};
+
 // Pass 3: one entry per boundary. `rank` is the inclusive scan of the flags, so
-// a boundary at i is block rank[i]-1, and its slice starts at i. The last id
-// closes the CSR: block_offsets[T] = S.
+// a boundary at i is where rank steps up (or i == 0): block rank[i]-1, whose slice starts at i. The
+// last id closes the CSR: block_offsets[T] = S.
+__device__ __forceinline__ void scatter_one(std::int64_t i,
+                                            std::uint32_t r,
+                                            std::uint32_t prev_r,
+                                            std::int32_t const* row_ids,
+                                            std::uint32_t* chunk_ids,
+                                            std::uint32_t* block_offsets)
+{
+  if (i == 0 || r != prev_r) {
+    std::uint32_t const b = r - 1u;
+    chunk_ids[b]          = static_cast<std::uint32_t>(row_ids[i] >> 10);
+    block_offsets[b]      = static_cast<std::uint32_t>(i);
+  }
+}
+
+// Four ranks per thread when rank is 16-byte aligned; scalar otherwise and for the tail.
 __global__ void scatter_blocks_kernel(std::int32_t const* __restrict__ row_ids,
                                       std::int64_t num_ids,
-                                      std::uint32_t const* __restrict__ boundary,
                                       std::uint32_t const* __restrict__ rank,
                                       std::uint32_t* __restrict__ chunk_ids,
                                       std::uint32_t* __restrict__ block_offsets)
 {
-  auto const chunk_rows = static_cast<std::int64_t>(::codegen::kChunkSize);
-  auto const stride     = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
-  for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       i < num_ids;
-       i += stride) {
-    if (boundary[i] != 0u) {
-      std::uint32_t const b = rank[i] - 1u;
-      chunk_ids[b]          = static_cast<std::uint32_t>(row_ids[i] / chunk_rows);
-      block_offsets[b]      = static_cast<std::uint32_t>(i);
+  static_assert((1 << 10) == ::codegen::kChunkSize, "chunk size must be 2^10");
+  auto const stride              = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+  auto const tid                 = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  bool const vec                 = (reinterpret_cast<std::uintptr_t>(rank) & 15u) == 0;
+  std::int64_t const scalar_from = vec ? (num_ids & ~std::int64_t{3}) : 0;
+  if (vec) {
+    for (std::int64_t i = tid * 4; i < scalar_from; i += stride * 4) {
+      uint4 const r            = *reinterpret_cast<uint4 const*>(rank + i);
+      std::uint32_t const prev = i != 0 ? rank[i - 1] : 0u;
+      scatter_one(i, r.x, prev, row_ids, chunk_ids, block_offsets);
+      scatter_one(i + 1, r.y, r.x, row_ids, chunk_ids, block_offsets);
+      scatter_one(i + 2, r.z, r.y, row_ids, chunk_ids, block_offsets);
+      scatter_one(i + 3, r.w, r.z, row_ids, chunk_ids, block_offsets);
     }
-    if (i == num_ids - 1) { block_offsets[rank[i]] = static_cast<std::uint32_t>(num_ids); }
   }
+  for (std::int64_t i = scalar_from + tid; i < num_ids; i += stride) {
+    scatter_one(i, rank[i], i != 0 ? rank[i - 1] : 0u, row_ids, chunk_ids, block_offsets);
+  }
+  if (tid == 0) { block_offsets[rank[num_ids - 1]] = static_cast<std::uint32_t>(num_ids); }
 }
 
 }  // namespace
@@ -144,28 +191,22 @@ chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
   out.in_chunk_rows =
     rmm::device_buffer(static_cast<std::size_t>(num_ids) * sizeof(std::uint16_t), stream, mr);
 
-  // Boundary flags and their inclusive scan. Both are transient, and the
-  // scatter still reads them AFTER the D2H sync below, so what makes freeing
-  // them on return safe is the stream-ordered deallocation — not that sync.
-  rmm::device_buffer boundary_buf(
-    static_cast<std::size_t>(num_ids) * sizeof(std::uint32_t), stream, mr);
+  // Inclusive scan of the boundary flags. Transient, and the scatter still
+  // reads it AFTER the D2H sync below, so what makes freeing it on return safe
+  // is the stream-ordered deallocation — not that sync.
   rmm::device_buffer rank_buf(
     static_cast<std::size_t>(num_ids) * sizeof(std::uint32_t), stream, mr);
   rmm::device_buffer bad_buf(sizeof(std::uint32_t), stream, mr);
-  auto* boundary = static_cast<std::uint32_t*>(boundary_buf.data());
-  auto* rank     = static_cast<std::uint32_t*>(rank_buf.data());
-  auto* bad      = static_cast<std::uint32_t*>(bad_buf.data());
+  auto* rank = static_cast<std::uint32_t*>(rank_buf.data());
+  auto* bad  = static_cast<std::uint32_t*>(bad_buf.data());
   throw_on_cuda(cudaMemsetAsync(bad, 0, sizeof(std::uint32_t), stream.get()), "bad flag clear");
 
-  row_ids_scan_kernel<<<grid_for(num_ids, kBlock), kBlock, 0, stream.get()>>>(
-    row_ids,
-    num_ids,
-    num_rows,
-    static_cast<std::uint16_t*>(out.in_chunk_rows.data()),
-    boundary,
-    bad);
+  row_ids_scan_kernel<<<grid_for((num_ids + 3) / 4, kBlock), kBlock, 0, stream.get()>>>(
+    row_ids, num_ids, num_rows, static_cast<std::uint16_t*>(out.in_chunk_rows.data()), bad);
   throw_on_cuda(cudaPeekAtLastError(), "row_ids_scan launch");
 
+  auto const boundary = thrust::make_transform_iterator(
+    thrust::make_counting_iterator<std::int64_t>(0), boundary_at{row_ids});
   std::size_t tmp_bytes = 0;
   throw_on_cuda(cub::DeviceScan::InclusiveSum(
                   nullptr, tmp_bytes, boundary, rank, static_cast<int>(num_ids), stream.get()),
@@ -199,10 +240,9 @@ chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
   out.block_offsets =
     rmm::device_buffer((static_cast<std::size_t>(touched) + 1) * sizeof(std::uint32_t), stream, mr);
 
-  scatter_blocks_kernel<<<grid_for(num_ids, kBlock), kBlock, 0, stream.get()>>>(
+  scatter_blocks_kernel<<<grid_for((num_ids + 3) / 4, kBlock), kBlock, 0, stream.get()>>>(
     row_ids,
     num_ids,
-    boundary,
     rank,
     static_cast<std::uint32_t*>(out.chunk_ids.data()),
     static_cast<std::uint32_t*>(out.block_offsets.data()));

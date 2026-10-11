@@ -19,7 +19,6 @@
 
 #include "config.hpp"                                      // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
-#include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
 #include "duckdb/common/enums/optimizer_type.hpp"          // duckdb::OptimizerType
 #include "duckdb/execution/column_binding_resolver.hpp"    // duckdb::ColumnBindingResolver
@@ -159,10 +158,9 @@ struct Context::Impl {
   // Serializes transactions on `conn`; see in_transaction().
   std::mutex conn_mutex;
 
-  void bring_up(sirius::sirius_config& config)
+  void bring_up(const sirius::parsed_sirius_config& config)
   {
     install_log_sink_from_env();
-    sirius::converter_registry::initialize(config.get_downgrade_executor_config().copy_chunk_bytes);
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
 
@@ -210,15 +208,13 @@ struct Context::Impl {
 
 Context::Context() : impl_(std::make_unique<Impl>())
 {
-  sirius::sirius_config config;
-  // Resolve the default memory spaces only after initialize() creates Quent.
+  sirius::parsed_sirius_config config;
   impl_->bring_up(config);
 }
 
 Context::Context(const std::string& config_path) : impl_(std::make_unique<Impl>())
 {
-  sirius::sirius_config config;
-  config.parse_from_file(config_path);  // throws on a missing/invalid config file
+  auto config = sirius::parsed_sirius_config::from_file(config_path);
   impl_->bring_up(config);
 }
 

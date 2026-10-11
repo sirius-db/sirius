@@ -57,11 +57,12 @@ the Linux CUDA environment, the same unittest command can run through an isolate
 CPU-only Pixi environment containing Python 3.12. The fake CLI tests check harness
 decisions; they do not qualify native Paimon behavior.
 
-Build the test dependency into a **new** directory (Python 3.12 is recommended):
+Build Sirius and its wrapper first with `pixi run make`, then build the test
+dependency into a **new** directory (Python 3.12 is recommended):
 
 ```bash
 pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_extension.py \
-  --duckdb build/release/duckdb --output build/paimon-conformance/source-build --jobs 4
+  --duckdb sirius-duckdb/build/release/duckdb --output build/paimon-conformance/source-build --jobs 4
 ```
 
 The builder refuses an existing output directory, including a failed build. Use
@@ -74,11 +75,15 @@ whose hashes appear in the pinned native `third_party/versions.txt` are reused.
 A missing cache entry downloads normally; a corrupt entry fails. The default
 needs no cache. This cache contains source archives, never prebuilt libraries.
 
-Then read the committed corpus using the same Sirius executable:
+Build Sirius and its DuckDB wrapper with `pixi run make` first (see the
+[wrapper instructions](../../../../../sirius-duckdb/README.md)). The CLI and the
+loadable Sirius extension are separate artifacts. Then read the committed corpus
+using the same DuckDB executable:
 
 ```bash
 pixi run --locked python3 test/cpp/integration/data/paimon_conformance/run_conformance.py \
-  --duckdb build/release/duckdb \
+  --duckdb sirius-duckdb/build/release/duckdb \
+  --sirius-extension sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension \
   --paimon-extension build/paimon-conformance/source-build/paimon.duckdb_extension
 ```
 
@@ -95,9 +100,28 @@ Each ordinary/smoke query uses one process for DESCRIBE, rows, and liveness.
 SQL JSON is written to a separate per-case results file, so Sirius fallback
 banners remain in the retained stdout log. Missing, empty, or incomplete SQL
 results still fail, and process failure is checked before result parsing.
-Source-built extensions are unsigned: after receipt validation, their case
-processes use DuckDB's `-unsigned` option. The identity probe and historical
-registry mode keep signature enforcement enabled.
+Source-built Paimon extensions and the local Sirius wrapper are unsigned. Case
+processes use `-unsigned` after validating Paimon provenance and resolving the
+local wrapper. Reports record the wrapper path and SHA256. Loading Sirius is
+required before its settings are used in every mode and smoke case; missing or
+unloadable wrappers fail rather than silently testing vanilla DuckDB. The identity
+probe does not load either extension and retains signature enforcement.
+
+Historical executables with Sirius built in require explicit `--builtin-sirius`
+instead of `--sirius-extension`. In that mode, a historical Paimon `--registry`
+does not enable unsigned loading. Registry metadata cannot select a local wrapper
+or bypass Paimon hash validation. This compatibility mode does not qualify the
+current shared build.
+
+For build artifacts copied from another runner, expose the relocated libraries
+before invoking the builder or runner, from the activated Pixi environment:
+
+```bash
+export LD_LIBRARY_PATH="$PWD/build/release/install/lib:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+The optional workflow sets this automatically. A local `pixi run make` build also
+records its local library paths in the binaries.
 
 Runtime-disabled and explicit-CPU modes use the same Sirius executable. Normal
 initialization, transparent fallback, and rejection checks require a working GPU
@@ -112,9 +136,9 @@ leaves cases NOT RUN and the command fails. Case-local failure does not suppress
 later independent cases. Interrupts still terminate the run.
 
 The optional `Paimon conformance` workflow accepts a completed `Test` run whose
-source head matches the dispatched revision. The CUDA 13 artifact must contain
-`build/release/sirius-build-sha.txt`, written from the build checkout before
-packaging. Old artifacts without this marker are rejected.
+source head matches the dispatched revision. The CUDA 13 artifact must contain both `build/release/` (including the installed
+Sirius libraries) and `sirius-duckdb/build/release/` (CLI and extension).
+`build/release/sirius-build-sha.txt` records the build checkout before packaging. Old artifacts without this marker are rejected.
 
 For PR runs, that checkout is the synthetic PR-plus-base merge at build time,
 not the PR head alone. `build-provenance.json`, the setup log, and the workflow

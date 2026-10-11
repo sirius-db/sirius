@@ -25,7 +25,8 @@
 #include <utility>
 
 namespace sirius {
-struct sirius_config;
+struct operator_params;
+struct compression_config;
 }  // namespace sirius
 
 namespace duckdb {
@@ -77,10 +78,12 @@ TableFunction GetSiriusReadParquetFunction();
 
 class SiriusRegistration {
  public:
-  /// Register Sirius's extension options. @p defaults supplies the registered default for every
-  /// option DuckDB stores per connection, so a sirius.yaml value reaches those connections as
+  /// Register Sirius's extension options using the supplied operator and compression defaults.
+  /// Defaults for options DuckDB stores per connection carry sirius.yaml values as
   /// their inherited starting point instead of being shadowed by the compiled default.
-  static void InitialGPUConfigs(DBConfig& db, const sirius::sirius_config& defaults);
+  static void InitialGPUConfigs(DBConfig& db,
+                                const sirius::operator_params& operator_defaults,
+                                const sirius::compression_config& compression_defaults);
   static void RegisterGPUFunctions(DatabaseInstance& catalog);
   static void GPUExecutionFunction(ClientContext& context,
                                    TableFunctionInput& data_p,

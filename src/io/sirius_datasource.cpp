@@ -291,6 +291,11 @@ prefetch_refusal sirius_datasource::prefetch_async(exec::invocable<void(bool) no
                                              : prefetch_refusal::other;
 }
 
+std::exception_ptr sirius_datasource::prefetch_failure() const noexcept
+{
+  return _cache_handle ? _cache_handle.failure() : nullptr;
+}
+
 bool sirius_datasource::uses_prefetching_cache() const noexcept
 {
   return _io_ctx->uses_prefetching_cache();

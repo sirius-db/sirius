@@ -21,6 +21,10 @@
 
 #include "operator/operator_test_utils.hpp"
 
+#include <cudf/table/table.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
 #include <catch.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <duckdb.hpp>
@@ -28,16 +32,20 @@
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/storage/data_table.hpp>
+#include <duckdb/storage/storage_manager.hpp>
+#include <duckdb/transaction/duck_transaction_manager.hpp>
 #include <exec/scoped_dispatcher.hpp>
 #include <exec/thread_pool.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <memory/topology_index.hpp>
+#include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <op/scan/table_scan/scan_contract.hpp>
 #include <scan_manager/insert_delta_job.hpp>
 #include <unistd.h>
+#include <utils/parquet_fixture_utils.hpp>
 
 #include <cstdint>
 #include <cstdio>
@@ -131,12 +139,13 @@ insert_delta_job_request make_request(duckdb::Connection& con,
                                       std::vector<sirius::logical_type> types)
 {
   insert_delta_job_request request;
-  request.storage     = &storage;
-  request.context     = con.context.get();
-  request.n_cache     = n_cache;
-  request.union_cols  = std::move(cols);
-  request.union_types = std::move(types);
-  request.entry_name  = "t";
+  request.storage         = &storage;
+  request.context         = con.context.get();
+  request.n_cache         = n_cache;
+  request.union_cols      = std::move(cols);
+  request.union_types     = std::move(types);
+  request.entry_name      = "t";
+  request.storage_version = storage.GetAttached().GetStorageManager().GetStorageVersion();
   return request;
 }
 
@@ -440,6 +449,13 @@ TEST_CASE("insert-delta job: blockless-only splits carry no datasource",
     saw_blockless_only = true;
     REQUIRE(split.info->host_backed_only);
     REQUIRE(split.info->datasource == nullptr);
+    REQUIRE(split.info->certificates().size() == split.info->row_groups.size());
+    auto const& certificate = split.info->certificates().front();
+    CHECK(certificate.validation.test(
+      static_cast<unsigned>(sirius::op::scan::later_check::segments_per_range)));
+    CHECK(certificate.validation.test(
+      static_cast<unsigned>(sirius::op::scan::later_check::matrix_per_range)));
+    CHECK(request.profiles->get(certificate.profile).storage_version == request.storage_version);
   }
   REQUIRE(saw_blockless_only);
   exec_ok(*tdb.con, "ROLLBACK");
@@ -513,5 +529,125 @@ TEST_CASE("insert-delta job: no delta is a no-op", "[insert_delta_job][scan_mana
   run(requests);
   REQUIRE(requests[0].plan.empty());
   REQUIRE(requests[0].bundles.empty());
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+TEST_CASE("insert-delta physical evidence is the union inside a mixed row group",
+          "[insert_delta_job][scan_manager][native][matrix]")
+{
+  using namespace sirius::op::scan;
+  job_test_db tdb;
+  exec_ok(*tdb.con, "SET force_compression='auto'");
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT 7::INTEGER k FROM range(8192) t(i)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  exec_ok(*tdb.con, "ALTER TABLE t ADD COLUMN v INTEGER DEFAULT 42");
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  std::vector<insert_delta_job_request> requests;
+  requests.push_back(make_request(*tdb.con,
+                                  storage,
+                                  0,
+                                  {0, 1},
+                                  {sirius::logical_type::make(sirius::type_id::INTEGER),
+                                   sirius::logical_type::make(sirius::type_id::INTEGER)}));
+  // The cutter receives an already-held witness from its caller. The production
+  // manager's checkpoint-lock entry supplies this, never host_backed_only.
+  auto key = duckdb::DuckTransactionManager::Get(storage.GetAttached()).SharedCheckpointLock();
+  requests[0].checkpoint_witness = key_held_witness{&storage.GetAttached(), tdb.path, 91};
+  run(requests);
+  bool mixed = false;
+  for (auto const& group : requests[0].plan.row_groups) {
+    bool persistent = false, transient = false;
+    for (auto const& column : group.columns) {
+      for (auto const& segment : column.data_segments) {
+        persistent |= !segment.is_transient;
+        transient |= segment.is_transient;
+      }
+    }
+    mixed |= persistent && transient;
+  }
+  REQUIRE(mixed);
+  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
+  std::shared_ptr<sirius::io::sirius_datasource> datasource = ioctx->open_datasource(tdb.path);
+  std::vector<projected_column> columns{real_col(0), real_col(1)};
+  auto splits = cut_delta_splits_for_op(requests[0], columns, datasource, nullptr, 81);
+  REQUIRE(splits.size() == 1);
+  auto const& certificate = splits[0].info->certificates().front();
+  CHECK(certificate.validation ==
+        (check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range) |
+         check_bit(later_check::host_staged) | check_bit(later_check::key_held)));
+  REQUIRE(certificate.key_held);
+  CHECK(certificate.key_held->database == &storage.GetAttached());
+  CHECK(certificate.key_held->query_token == 91);
+  CHECK(certificate.key_held->db_path == tdb.path);
+  CHECK(certificate.profile != 0);
+  CHECK(splits[0].info->dependencies()[0].profiles == requests[0].profiles);
+  CHECK(requests[0].profiles->get(certificate.profile).storage_version ==
+        requests[0].storage_version);
+  duckdb_native_ingestible_table_info info;
+  info.storage         = &storage;
+  info.context         = tdb.con->context.get();
+  info.projected_cols  = columns;
+  info.projected_types = requests[0].union_types;
+  auto* gpu_space      = env().mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(gpu_space);
+  rmm::cuda_stream stream;
+  auto decoded = decode_duckdb_native_split(
+    splits[0].info->row_groups, info, splits[0].info->datasource.get(), *gpu_space, stream);
+  auto cpu = tdb.con->Query("SELECT k,v FROM t");
+  REQUIRE_FALSE(cpu->HasError());
+  REQUIRE(decoded->num_rows() == cpu->RowCount());
+  REQUIRE(decoded->num_columns() == 2);
+  for (int c = 0; c < 2; ++c) {
+    std::vector<int32_t> values(decoded->num_rows());
+    REQUIRE(cudaMemcpyAsync(values.data(),
+                            decoded->view().column(c).data<int32_t>(),
+                            values.size() * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost,
+                            stream.value()) == cudaSuccess);
+    stream.synchronize();
+    for (std::size_t row = 0; row < values.size(); ++row)
+      CHECK(values[row] == cpu->GetValue(c, row).GetValue<int32_t>());
+  }
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+TEST_CASE("insert-delta physical refusal preserves the first contract through fanout",
+          "[insert_delta_job][scan_manager][native][matrix]")
+{
+  using namespace sirius::op::scan;
+  sirius::test::scratch_dir directory("delta_refusal_v15");
+  job_test_db tdb;
+  exec_ok(*tdb.con,
+          "ATTACH " + directory.file_literal("v15.duckdb") + " AS v15 (STORAGE_VERSION 'v1.5.0')");
+  exec_ok(*tdb.con, "USE v15");
+  exec_ok(*tdb.con, "SET force_compression='zstd'");
+  exec_ok(*tdb.con,
+          "CREATE TABLE t AS SELECT ('prefix-' || (i%997)::VARCHAR) v FROM range(16384) t(i)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  auto codecs =
+    tdb.con->Query("SELECT count(*) FROM pragma_storage_info('t') WHERE compression='ZSTD'");
+  REQUIRE_FALSE(codecs->HasError());
+  REQUIRE(codecs->GetValue(0, 0).GetValue<int64_t>() > 0);
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  std::vector<insert_delta_job_request> requests;
+  requests.push_back(make_request(
+    *tdb.con, storage, 0, {0}, {sirius::logical_type::make(sirius::type_id::VARCHAR)}));
+  requests[0].first_consuming_contract = 81;
+  auto counters                        = std::make_shared<physical_check_counters>();
+  requests[0].profiles->counters       = counters;
+  try {
+    run(requests);
+    FAIL("ZSTD capture accepted");
+  } catch (unsupported_physical_input const& error) {
+    CHECK(error.contract == 81);
+    CHECK(error.reason == verdict_reason::native_segment_codec);
+    CHECK(error.input_identity.find("t|") == 0);
+  }
+  CHECK(
+    counters->rejections[static_cast<std::size_t>(verdict_reason::native_segment_codec)].load() ==
+    1);
+  CHECK(requests[0].bundles.empty());
   exec_ok(*tdb.con, "ROLLBACK");
 }

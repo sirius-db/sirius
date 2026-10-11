@@ -88,16 +88,12 @@ std::vector<table_filter_conjunct> decompose_table_filters(
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
   const std::unordered_set<std::size_t>& skip_primary_indices,
-  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types,
-  bool include_is_not_null)
+  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types)
 {
   std::vector<table_filter_conjunct> conjuncts;
 
   for (auto& [column_index, filter] : filters.filters) {
-    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
-        (!include_is_not_null && filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL)) {
-      continue;
-    }
+    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER) { continue; }
 
     auto const column = resolve_filtered_column(
       column_index, column_ids, batch_position_by_column_id, skip_primary_indices);
@@ -148,16 +144,14 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
   const std::unordered_set<std::size_t>& skip_primary_indices,
-  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types,
-  bool include_is_not_null)
+  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types)
 {
   auto conjuncts = decompose_table_filters(filters,
                                            column_ids,
                                            returned_types,
                                            batch_position_by_column_id,
                                            skip_primary_indices,
-                                           virtual_types,
-                                           include_is_not_null);
+                                           virtual_types);
 
   if (conjuncts.empty()) { return nullptr; }
   if (conjuncts.size() == 1) { return std::move(conjuncts[0].expr); }

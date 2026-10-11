@@ -1,6 +1,8 @@
 target_sources(
   sirius_objects
-  PRIVATE late_mat_plan_pass.cpp
+  PRIVATE connector_registry.cpp
+          decimal_sum_input_bounds.cpp
+          late_mat_plan_pass.cpp
           dynamic_filter/build_filter_evidence.cpp
           dynamic_filter/build_key_domain.cpp
           dynamic_filter/dynamic_filter_key_admission.cpp
@@ -8,11 +10,13 @@ target_sources(
           gpu_admission.cpp
           query.cpp
           query_index.cpp
+          scan_column_origin.cpp
           sirius_physical_plan_generator.cpp
           sirius_plan_aggregate.cpp
           sirius_plan_column_data_get.cpp
           sirius_plan_comparison_join.cpp
           sirius_plan_compressed_schema.cpp
+          sirius_plan_cross_product.cpp
           sirius_plan_cte.cpp
           sirius_plan_delim_get.cpp
           sirius_plan_delim_join.cpp

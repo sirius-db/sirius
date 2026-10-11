@@ -38,7 +38,7 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
     std::size_t estimated_cardinality,
     std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
     double gate_keep_threshold     = dynamic_filter_gate::k_default_keep_threshold,
-    dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::membership_masks_only);
+    dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;

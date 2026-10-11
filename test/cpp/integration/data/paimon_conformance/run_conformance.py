@@ -261,9 +261,15 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
         env.update(SIRIUS_CONFIG_FILE=str(config), TZ="UTC", SIRIUS_LOG_LEVEL="warn")
         env["SIRIUS_DISABLE"] = "1" if mode == "disabled" else "0"
         enabled = "true" if mode == "transparent" else "false"
+        sirius_load = (
+            f"LOAD {sql_literal(args.sirius_extension)};"
+            if args.sirius_extension
+            else ""
+        )
         setup = (
             "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false;"
-            f"LOAD {sql_literal(extension)}; SET gpu_execution={enabled};"
+            + sirius_load
+            + f"LOAD {sql_literal(extension)}; SET gpu_execution={enabled};"
             "SELECT extension_version FROM duckdb_extensions() WHERE extension_name='paimon';"
             "SELECT version() AS version;"
             "SELECT current_setting('gpu_execution') AS gpu;"
@@ -280,7 +286,11 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
             execute(
                 [
                     cli,
-                    *(["-unsigned"] if args.registry is None else []),
+                    *(
+                        ["-unsigned"]
+                        if args.registry is None or args.sirius_extension
+                        else []
+                    ),
                     "-init",
                     "/dev/null",
                     "-json",
@@ -386,7 +396,20 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", type=Path, nargs="?", default=HERE)
-    parser.add_argument("--duckdb", type=Path, default=ROOT / "build/release/duckdb")
+    parser.add_argument(
+        "--duckdb", type=Path, default=ROOT / "sirius-duckdb/build/release/duckdb"
+    )
+    sirius_host = parser.add_mutually_exclusive_group()
+    sirius_host.add_argument(
+        "--sirius-extension",
+        type=Path,
+        help="Local Sirius extension (default: the wrapper's release build)",
+    )
+    sirius_host.add_argument(
+        "--builtin-sirius",
+        action="store_true",
+        help="Explicitly use a historical CLI with Sirius built in",
+    )
     parser.add_argument("--paimon-extension", type=Path, required=True)
     provenance = parser.add_mutually_exclusive_group()
     provenance.add_argument(
@@ -453,6 +476,19 @@ def main(argv=None):
         validate_oracle(spec, manifest, compare_rows)
         extension = args.paimon_extension.resolve(strict=True)
         cli = args.duckdb.resolve(strict=True)
+        if args.builtin_sirius:
+            report["sirius"] = {"mode": "builtin"}
+        else:
+            args.sirius_extension = (
+                args.sirius_extension
+                or ROOT
+                / "sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension"
+            ).resolve(strict=True)
+            report["sirius"] = {
+                "mode": "loadable",
+                "path": str(args.sirius_extension),
+                "sha256": digest(args.sirius_extension),
+            }
         identity = probe_identity(cli, run_dir, args.timeout)
         if args.registry:
             spec["extension"] = select_qualification(args.registry, identity)

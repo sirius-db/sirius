@@ -53,10 +53,11 @@ jobs:
               --run build/paimon-conformance/build-run.json --expected-sha "$GITHUB_SHA"
           } 2>&1 | tee -a build/paimon-conformance/setup.log
 
-      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
         with:
           cache: false
-          pixi-version: v0.71.1
+          locked: true
+          pixi-version: v0.81.0
           environments: default
           activate-environment: default
 
@@ -79,18 +80,23 @@ jobs:
               | tee build/paimon-conformance/build-provenance.json
           } 2>&1 | tee -a build/paimon-conformance/setup.log
 
+      - name: Configure shared library lookup
+        # Build artifacts can originate on a different runner.
+        run: echo "LD_LIBRARY_PATH=$PWD/build/release/install/lib:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
       - name: Build pinned Paimon test dependency
         run: |
           set -euo pipefail
           pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_extension.py \
-            --duckdb build/release/duckdb --output build/paimon-conformance/source-build --jobs 4 \
+            --duckdb sirius-duckdb/build/release/duckdb --output build/paimon-conformance/source-build --jobs 4 \
             2>&1 | tee -a build/paimon-conformance/setup.log
 
       - name: Run Paimon cases
         run: |
           set -euo pipefail
           pixi run --locked python3 test/cpp/integration/data/paimon_conformance/run_conformance.py \
-            --duckdb build/release/duckdb \
+            --duckdb sirius-duckdb/build/release/duckdb \
+            --sirius-extension sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension \
             --paimon-extension build/paimon-conformance/source-build/paimon.duckdb_extension \
             2>&1 | tee build/paimon-conformance/conformance.log
 
