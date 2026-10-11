@@ -35,7 +35,7 @@ A source rejected before its scan node exists still gets a classified lookup ver
 
 Sirius verifies supported scan functions against trusted definitions and the current catalog. A matching function name is insufficient.
 
-Loadable builds require ABI-compatible exports of `duckdb::TableScanFunction::GetFunction()` and `duckdb_extension_parquet_describe` from the host DuckDB module. Sirius checks that each resolved entry point belongs to that module. Both `RTLD_LOCAL` and `RTLD_GLOBAL` loading are supported.
+Loadable builds obtain ABI-compatible `duckdb::TableScanFunction::GetFunction()` and `duckdb_extension_parquet_describe` from the host DuckDB module: from its dynamic exports (`dlsym`), or, when the host exports nothing (the official DuckDB CLI releases are executables with an empty dynamic export table), from its static symbol table (`.symtab`), read from the image file after confirming its program header table matches what the loader mapped. Sirius checks that each resolved entry point belongs to that module. Both `RTLD_LOCAL` and `RTLD_GLOBAL` loading are supported. A host that is also stripped of its static symbol table has no trusted reference.
 
 If a trusted definition is unavailable, Sirius warns once per source and declines its GPU scans. CPU fallback still depends on fallback settings and source policy. Iceberg definitions are established when its extension loads and also require the host Parquet descriptor.
 
