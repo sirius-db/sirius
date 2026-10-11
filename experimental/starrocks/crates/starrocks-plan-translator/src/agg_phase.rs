@@ -22,11 +22,13 @@
 //! | `sum`       | BIGINT, DOUBLE or DECIMAL(38,s) | `sum`                          |
 //! | `count`     | BIGINT                          | `sum` of the counts            |
 //! | `min`/`max` | the input type                  | the same function              |
-//! | `avg`       | DOUBLE sum, then a BIGINT count | `sum` of each, then sum / count |
+//! | `avg`       | sum, then a BIGINT count        | `sum` of each, then sum / count |
 //!
 //! The FE gives a measure one slot of its tuple, whatever it ships: a partial `avg` slot is
 //! typed VARBINARY. AVG's count is an extra column right after the slot's, so every later
-//! column of the exchange row shifts by one.
+//! column of the exchange row shifts by one. A decimal AVG's sum is `DECIMAL(38,s)` at its
+//! input's scale and its merge divides exactly with `sirius_decimal_divide`; any other AVG's sum
+//! is DOUBLE and its merge divides in FP64.
 //!
 //! Anything else (the DISTINCT forms) is refused in a two-phase plan.
 
@@ -103,9 +105,12 @@ pub(crate) enum PartialState {
         /// Aggregate function the merge step applies to that column.
         merge_function: &'static str,
     },
-    /// AVG: the DOUBLE sum of the inputs, then the BIGINT count of the non-null inputs in the
-    /// next column. The merge step sums each and divides the sum by the count.
-    Average,
+    /// AVG: the sum of the inputs, of type `sum`, then the BIGINT count of the non-null inputs
+    /// in the next column. The merge step sums each and divides the sum by the count.
+    Average {
+        /// `DECIMAL(38,s)` for a decimal input, DOUBLE otherwise.
+        sum: Type,
+    },
 }
 
 impl PartialState {
@@ -113,7 +118,7 @@ impl PartialState {
     pub(crate) fn columns(&self) -> Vec<Type> {
         match self {
             Self::Column { ty, .. } => vec![ty.clone()],
-            Self::Average => vec![type_mapper::fp64_type(true), type_mapper::i64_type(true)],
+            Self::Average { sum } => vec![sum.clone(), type_mapper::i64_type(true)],
         }
     }
 }
@@ -130,9 +135,10 @@ impl PartialState {
 /// - `count` is BIGINT. Merging counts has to add them up; a `count` on the merge side would
 ///   count the partial rows instead;
 /// - `min`/`max` keep their input type, which StarRocks also uses as their return type;
-/// - `avg` ships an FP64 sum (decimal and integer inputs are summed as FP64, as a one-phase
-///   `avg` computes them) and a BIGINT count. Its return type is DOUBLE, or DECIMAL for decimal
-///   inputs; `expr_translator::aggregate_call` refuses the others.
+/// - `avg` ships a sum and a BIGINT count. Over decimals (return type DECIMAL) the sum is the
+///   exact `DECIMAL(38,s)` sum at the input's scale, from the function's argument type; over
+///   integers and doubles (return type DOUBLE) it is an FP64 sum. `expr_translator::aggregate_call`
+///   refuses the other return types.
 pub(crate) fn partial_state(
     node_id: i32,
     node_type: TPlanNodeType,
@@ -176,20 +182,57 @@ pub(crate) fn partial_state(
             merge_function: "max",
         }),
         "avg" => {
-            if !is_decimal(&function.ret_type)?
-                && type_mapper::scalar_primitive(&function.ret_type)? != TPrimitiveType::DOUBLE
-            {
+            if is_decimal(&function.ret_type)? {
+                return Ok(PartialState::Average {
+                    sum: average_sum_type(node_id, node_type, function)?,
+                });
+            }
+            if type_mapper::scalar_primitive(&function.ret_type)? != TPrimitiveType::DOUBLE {
                 return Err(unsupported(
                     "two-phase AVG supports DOUBLE and DECIMAL results only",
                 ));
             }
-            Ok(PartialState::Average)
+            Ok(PartialState::Average {
+                sum: type_mapper::fp64_type(true),
+            })
         }
         name if name.starts_with("multi_distinct_") => Err(unsupported(
             "DISTINCT aggregates are not supported in two-phase aggregation",
         )),
         _ => Err(unsupported(
             "two-phase aggregation supports SUM, COUNT, MIN, MAX and AVG only",
+        )),
+    }
+}
+
+/// The type of a decimal AVG's sum: `DECIMAL(38,s)` at the scale of the function's argument,
+/// which the FE records in `arg_types` on both the partial and the merge node. DuckDB's decimal
+/// sum returns that type.
+pub(crate) fn average_sum_type(
+    node_id: i32,
+    node_type: TPlanNodeType,
+    function: &TFunction,
+) -> Result<Type> {
+    let argument = function
+        .arg_types
+        .first()
+        .filter(|argument| is_decimal(argument).unwrap_or(false))
+        .ok_or(TranslateError::UnsupportedPlanNode {
+            node_id,
+            node_type,
+            reason: "a decimal AVG must name its decimal argument type",
+        })?;
+    match type_mapper::map_type_desc(argument, true)?.kind {
+        Some(substrait::proto::r#type::Kind::Decimal(decimal)) => Ok(Type {
+            kind: Some(substrait::proto::r#type::Kind::Decimal(
+                substrait::proto::r#type::Decimal {
+                    precision: 38,
+                    ..decimal
+                },
+            )),
+        }),
+        _ => Err(TranslateError::malformed(
+            "expected a decimal argument type",
         )),
     }
 }

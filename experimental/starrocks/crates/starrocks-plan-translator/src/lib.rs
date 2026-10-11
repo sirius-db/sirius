@@ -51,7 +51,7 @@
 //! | `COMPOUND_PRED`   | boolean function (`and`, `or`, `not`) |
 //! | `CAST_EXPR`       | cast (throwing failure behavior) |
 //! | `IS_NULL_PRED`    | `is_null` / `is_not_null` |
-//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply` (decimal: exact, cast to the FE type), `divide`/`modulus` (decimal: FP64, zero divisor gives NULL) |
+//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply` (decimal: exact, cast to the FE type), `divide` (decimal: exact `sirius_decimal_divide`), `modulus` (decimal: FP64, zero divisor gives NULL) |
 //! | `IN_PRED`         | singular-or-list (wrapped in `not` for `NOT IN`) |
 //! | `CASE_EXPR`       | if-then chain (no leading case operand) |
 //! | `FUNCTION_CALL`   | allowlisted scalar functions (`like`, `if`, `substring`, `year`, ...) |
@@ -60,8 +60,8 @@
 //! `multi_distinct_*` distinct forms) are decomposed by `expr_translator::aggregate_call` for
 //! `AggregateRel` measures. Two-phase plans accept SUM, COUNT, MIN, MAX and AVG: the partial
 //! step emits each measure's partial-state columns and the merge step combines them (`sum`,
-//! `sum` of the counts, `min`, `max`, and for AVG an FP64 sum and a BIGINT count that the merge
-//! sums and divides); `agg_phase::partial_state` types those columns for both fragments.
+//! `sum` of the counts, `min`, `max`, and for AVG a sum and a BIGINT count that the merge sums
+//! and divides); `agg_phase::partial_state` types those columns for both fragments.
 //! Distinct in a partial/merge node is rejected.
 //!
 //! Type mapping lives in `type_mapper`. Intentional v1 omissions return
@@ -75,10 +75,11 @@
 //! frontend declared, which DuckDB's binder would otherwise narrow. A product the frontend types
 //! wider than 18 digits is computed in DECIMAL128, as StarRocks does. The decimal outputs of a
 //! result fragment are cast to the frontend's types too, so they print as StarRocks' decimals.
-//! Decimal AVG and `/` are the exception: DuckDB computes them only in DOUBLE, so they run in
-//! FP64 and their results are cast to the declared decimal type. That cast must round, which
-//! needs sirius-db/sirius#2124; without it the GPU truncates, and a result can be one unit low in
-//! its last digit.
+//! Decimal AVG and `/` are exact too, although DuckDB computes them only in DOUBLE: a decimal
+//! AVG is its exact sum and count, and both divide with Sirius' `sirius_decimal_divide` at the
+//! frontend's result scale, rounded half away from zero, as StarRocks computes them. Decimal MOD
+//! runs in FP64, cast to the declared decimal type; that cast must round, which needs
+//! sirius-db/sirius#2124.
 //!
 //! # Adding a node
 //!
@@ -452,6 +453,13 @@ impl ExtensionRegistry {
         });
         self.function_map.insert(function_key, function_anchor);
         function_anchor
+    }
+
+    /// The anchor of a function already registered, if any.
+    pub(crate) fn function_anchor(&self, urn: &str, name: &str) -> Option<u32> {
+        self.function_map
+            .get(&(urn.to_string(), name.to_string()))
+            .copied()
     }
 
     /// Registers or reuses a URN anchor for an extension URN.
