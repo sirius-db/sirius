@@ -18,6 +18,7 @@
 
 #include "compression/compressed_representation.hpp"
 #include "late_mat/multi_source_gather.hpp"
+#include "log/logging.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
@@ -487,10 +488,22 @@ std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
   // In pin order, so the assembled column is in pinned-table order.
   std::vector<std::unique_ptr<cudf::column>> pieces;
   pieces.reserve(column.batches.size());
+  std::size_t remote_batches = 0;
+  std::int64_t remote_rows   = 0;
   for (std::size_t b = 0; b < column.batches.size(); ++b) {
     if (canonical.batches[b].survivors == 0) { continue; }
+    if (is_remote(column.batches[b], consumer_device)) {
+      ++remote_batches;
+      remote_rows += canonical.batches[b].survivors;
+    }
     pieces.push_back(
       materialize_batch(column.batches[b], canonical.batches[b], consumer_device, stream, mr));
+  }
+  if (remote_batches > 0) {
+    SIRIUS_LOG_INFO("[late-mat] GPU {}: gathered {} row(s) from {} batch(es) pinned on other GPUs",
+                    consumer_device,
+                    remote_rows,
+                    remote_batches);
   }
 
   std::unique_ptr<cudf::column> assembled;
