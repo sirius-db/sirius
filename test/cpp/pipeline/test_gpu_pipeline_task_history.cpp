@@ -208,7 +208,7 @@ struct pipeline_task_history_fixture {
   cucascade::memory::memory_space* gpu_space  = nullptr;
   cucascade::memory::memory_space* host_space = nullptr;
 
-  bool setup()
+  bool setup(bool per_stream = false)
   {
     try {
       cucascade::memory::reservation_manager_configurator builder;
@@ -217,7 +217,7 @@ struct pipeline_task_history_fixture {
         .set_reservation_fraction_per_gpu(0.95)
         .set_per_numa_region_capacity(1ULL * 1024 * 1024 * 1024)
         .use_gpu_id_as_host_id()
-        .track_reservation_per_stream(false)
+        .track_reservation_per_stream(per_stream)
         .set_reservation_fraction_per_numa_region(0.75);
       auto space_configs = builder.build();
       manager            = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
@@ -1048,8 +1048,10 @@ TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline
   constexpr std::size_t kInputNumRows           = kInputDataSize / sizeof(int64_t);
   constexpr std::size_t kExecuteConsumptionSize = kInputDataSize;
 
+  auto const per_stream = GENERATE(false, true);
+  CAPTURE(per_stream);
   pipeline_task_history_fixture f;
-  if (!f.setup()) {
+  if (!f.setup(per_stream)) {
     WARN("Skipping test — no GPU available");
     return;
   }

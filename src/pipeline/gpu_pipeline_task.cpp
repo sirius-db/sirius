@@ -656,6 +656,8 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
   absl::Cleanup source_closer = [allocator, stream]() {
     allocator->reset_stream_reservation(stream);
   };
+  // Attribute allocations to this task even when converters or operators use auxiliary streams.
+  auto allocation_context = allocator->allocation_context_for(stream);
 
   if (!local_state._input_data) {
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
