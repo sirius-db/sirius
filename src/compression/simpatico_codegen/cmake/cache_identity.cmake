@@ -8,5 +8,5 @@ set_target_properties(simpatico_cache_identity
 target_compile_features(simpatico_cache_identity PUBLIC cxx_std_20)
 target_include_directories(
   simpatico_cache_identity
-  PUBLIC "${_simpatico_root}/src"
+  PUBLIC "$<BUILD_INTERFACE:${_simpatico_root}/src>"
   PRIVATE "${SIMPATICO_XXHASH_INCLUDE_DIR}")
