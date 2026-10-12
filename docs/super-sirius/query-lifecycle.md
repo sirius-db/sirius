@@ -31,8 +31,10 @@ lookup occurs only for an unknown ID, avoiding extra creator-state locking on ac
 
 Creator requests keep their lease through hint traversal and the creation worker. Execution
 tasks keep theirs through scheduler routing, executor dispatch, retries and destruction. The
-GPU worker transfers the lease to its completion epilogue when it destroys the task before
-scheduling consumers. A rejected handoff leaves the caller's existing claim intact through
+GPU and creator workers transfer their existing lease into an ordered callable owner before
+dispatch. That owner releases the lease after the callable and all captures are destroyed, including
+when a GPU worker destroys its task before scheduling consumers. Logical completion only signals
+the query owner; workers never join creator work or wait for their own query to retire. A rejected handoff leaves the caller's existing claim intact through
 disposal. Queue drains detach under their mutex and destroy outside it.
 
 Tier-1 spilling acquires a borrow for the actual victim query before inspecting its repositories.

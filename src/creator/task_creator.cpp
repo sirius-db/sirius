@@ -16,6 +16,7 @@
 
 #include "creator/task_creator.hpp"
 
+#include "exec/leased_callable.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
@@ -686,9 +687,12 @@ void task_creator::manager_loop()
           dynamic_cast<op::scan::sirius_gpu_scan_operator*>(node) == nullptr) {
         continue;
       }
-      // Dispatch the task creation work to the pool
-      _bounded_pool->dispatch(
+      // Keep the request claim through destruction of every worker capture.
+      auto work = std::move(request->work);
+      exec::dispatch_with_work(
+        *_bounded_pool,
         std::move(slot),
+        std::move(work),
         [this,
          request = std::move(request),
          node,

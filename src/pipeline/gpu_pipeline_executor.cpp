@@ -20,6 +20,7 @@
 #include "cucascade/memory/stream_pool.hpp"
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
+#include "exec/leased_callable.hpp"
 #include "log/logging.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -400,8 +401,11 @@ void gpu_pipeline_executor::process_task(
     // before query cleanup drains the queues. Copied (not moved) into the lambda so the catch
     // blocks below still have it if dispatch itself throws.
     auto completion = iteration_completion;
-    _bounded_pool->dispatch(
+    auto work       = pipeline_task->take_work_lease();
+    exec::dispatch_with_work(
+      *_bounded_pool,
       std::move(slot),
+      std::move(work),
       [this,
        task       = std::move(pipeline_task),
        exc_stream = std::move(exc_stream),
@@ -491,8 +495,8 @@ void gpu_pipeline_executor::process_task(
           auto intermediate_data = ex.release_intermediate_data();
           if (auto pipelineable_data =
                 dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
-            // We want to release the read-only lock on the data so that when its added back to the
-            // task queue it could be downgraded if needed.
+            // We want to release the read-only lock on the data so that when its added back to
+            // the task queue it could be downgraded if needed.
             pipelineable_data->remove_read_only_lock();
           }
 
@@ -555,9 +559,8 @@ void gpu_pipeline_executor::process_task(
           pipeline_task->telemetry_fsm().finalizing({.success = true});
           pipeline_task->set_telemetry_finalized();
         }
-        // Destruction updates pipeline completion. Keep its lifetime claim through the
-        // epilogue, which still dereferences the pipeline and schedules its consumers.
-        auto completed_work = task->take_work_lease();
+        // Destruction updates pipeline completion. The enclosing leased callable protects
+        // the epilogue and all captures even after the task is destroyed.
         task.reset();
 
         // Check if query is complete BEFORE scheduling downstream tasks.
@@ -594,10 +597,8 @@ void gpu_pipeline_executor::process_task(
         }
 
         if (query_complete && completion) {
-          // Scoped to the finishing query: its pending creation requests point at operators
-          // that mark_completed() may let the engine destroy. Any other query's requests are
-          // left alone.
-          _task_creator->drain_pending_tasks(pipeline->get_query_id());
+          // The query owner retires creators and other borrowers after observing completion.
+          // A worker must never wait for retirement while holding its own query's lease.
           completion->mark_completed();
         }
       });
