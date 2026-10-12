@@ -498,7 +498,7 @@ void prefetching_cache::reclaim_idle_chunks(cache_generation& generation) noexce
 std::size_t prefetching_cache::generation_count(std::string_view object_path) const noexcept
 {
   std::shared_lock lk(_map_mtx);
-  auto const it = _generations_by_path.find(object_path);
+  auto const it = _generations_by_path.find(std::string(object_path));
   if (it == _generations_by_path.end()) { return 0; }
   return static_cast<std::size_t>(
     std::ranges::count_if(it->second, [](auto const& weak) { return !weak.expired(); }));

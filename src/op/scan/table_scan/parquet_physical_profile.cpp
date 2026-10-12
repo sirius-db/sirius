@@ -172,28 +172,40 @@ std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
   // Profile all schema-affecting reader options. Custom nested column schemas
   // are not yet serialised; bypass cache instead of conflating their results.
   bool const cacheable = !options.get_column_schema().has_value();
-  std::string profile  = "parquet-v1:";
-  auto append          = [&](auto v) { profile += std::to_string(v) + ":"; };
-  append(options.is_enabled_convert_strings_to_categories());
-  append(options.is_enabled_use_pandas_metadata());
-  append(options.is_enabled_use_arrow_schema());
-  append(options.is_enabled_allow_mismatched_pq_schemas());
-  append(options.is_enabled_ignore_missing_columns());
-  append(options.is_enabled_case_sensitive_names());
-  append(static_cast<int>(options.get_timestamp_type().id()));
-  append(static_cast<int>(options.get_decimal_width()));
-  if (options.get_column_names()) {
+  auto schema_profile  = [](auto const& o) {
+    std::string key = "parquet-v1:";
+    auto append     = [&](auto v) { key += std::to_string(v) + ":"; };
+    append(o.is_enabled_convert_strings_to_categories());
+    append(o.is_enabled_use_pandas_metadata());
+    append(o.is_enabled_use_arrow_schema());
+    append(o.is_enabled_allow_mismatched_pq_schemas());
+    append(o.is_enabled_ignore_missing_columns());
+    append(o.is_enabled_case_sensitive_names());
+    append(static_cast<int>(o.get_timestamp_type().id()));
+    append(static_cast<int>(o.get_decimal_width()));
+    return key;
+  };
+  auto default_options = cudf::io::parquet_reader_options::builder().build();
+  auto profile         = schema_profile(options);
+  bool const canonical = cacheable && profile == schema_profile(default_options);
+  // Normal bind/pin/scan callers differ only in projection. Parse the complete
+  // footer with canonical options; the consumer applies its own projection to
+  // the resulting FileMetaData. This makes reuse independent of query columns
+  // without assuming that cuDF's projected parser is option-independent.
+  if (canonical) profile = "parquet-v1";
+  auto append = [&](auto v) { profile += std::to_string(v) + ":"; };
+  if (!canonical && options.get_column_names()) {
     profile += "names:";
     for (auto const& name : *options.get_column_names()) {
       profile += std::to_string(name.size()) + ":" + name;
     }
   }
-  if (options.get_column_indices()) {
+  if (!canonical && options.get_column_indices()) {
     profile += "indices:";
     for (auto index : *options.get_column_indices())
       append(index);
   }
-  if (options.get_column_field_ids()) {
+  if (!canonical && options.get_column_field_ids()) {
     profile += "fields:";
     for (auto id : *options.get_column_field_ids())
       append(id);
@@ -204,6 +216,14 @@ std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
     if (cache_hit) *cache_hit = true;
     return cached;
   }
+  auto miss_gate = cacheable ? source.lock_metadata_miss(profile) : std::unique_lock<std::mutex>{};
+  if (cacheable) {
+    cached = std::dynamic_pointer_cast<parquet_metadata>(source.metadata(profile));
+    if (cached) {
+      if (cache_hit) *cache_hit = true;
+      return cached;
+    }
+  }
   if (cache_hit) *cache_hit = false;
   auto footer = fetch_plaintext_parquet_footer(source, contract, identity);
   crypto_reader probe({footer->data(), footer->size()});
@@ -212,7 +232,8 @@ std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
     throw std::runtime_error("incomplete Parquet footer evidence: " + identity);
   }
   cudf::io::parquet::experimental::hybrid_scan_reader reader(
-    cudf::host_span<uint8_t const>(footer->data(), footer->size()), options);
+    cudf::host_span<uint8_t const>(footer->data(), footer->size()),
+    canonical ? default_options : options);
   auto parsed = std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
   std::string arrow_schema;
   // Stable cuDF returns a string here; nightly cuDF wraps the value in an optional.

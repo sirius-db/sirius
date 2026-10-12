@@ -573,7 +573,10 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
       errno, std::generic_category(), "uring_reactor::create_io_object: buffered open");
   }
 
-  file_descriptor direct{::open(path.c_str(), O_RDONLY | O_DIRECT)};
+  // Reopen the owned descriptor, not the pathname: a concurrent rename must
+  // not pair the old buffered footer with a different O_DIRECT data file.
+  auto const direct_path = "/proc/self/fd/" + std::to_string(buffered.get());
+  file_descriptor direct{::open(direct_path.c_str(), O_RDONLY | O_DIRECT)};
   if (!direct) {
     SIRIUS_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
                     path,

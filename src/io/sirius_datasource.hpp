@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <mutex>
 #include <span>
 
 namespace sirius::io {
@@ -121,6 +122,8 @@ class sirius_datasource : public cudf::io::datasource {
 
   [[nodiscard]] bool store_metadata(std::shared_ptr<io_object_metadata> metadata,
                                     std::string const& profile = "parquet-v1");
+  [[nodiscard]] std::unique_lock<std::mutex> lock_metadata_miss(
+    std::string const& profile = "parquet-v1") const;
 
   // ---- cudf::io::datasource overrides ---------------------------------------
 

@@ -1184,6 +1184,31 @@ TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
     certificates[0].input_identity = parquet->rg_slices[0].file_path + "|footer=0";
   }
   SECTION("missing file approval") { dependencies[0].parquet_approval.reset(); }
+  SECTION("missing metadata owner")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->metadata_owner.reset();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("foreign metadata owner")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->metadata_owner         = std::make_shared<sirius::io::io_object_metadata>();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("missing object identity")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->object_identity.clear();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("foreign object identity")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->object_identity += "different-version";
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+
   SECTION("row group outside approved set")
   {
     auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);

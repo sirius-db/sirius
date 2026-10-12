@@ -848,3 +848,31 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(after.parquet_reader_calls[directory.file("two_groups.parquet")] ==
         before.parquet_reader_calls[directory.file("two_groups.parquet")] + 1);
 }
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet canonical footer cache is shared across query projections",
+                 "[scan][parquet][profile][integration][metadata_retention]")
+{
+  sirius::test::scratch_dir directory("parquet_r3_projection");
+  run_ok("SET gpu_execution=false");
+  auto path = directory.file("columns.parquet");
+  run_ok("COPY (SELECT 1::INTEGER x, 2::BIGINT y) TO " + sirius::test::sql_literal(path) +
+         " (FORMAT PARQUET)");
+  auto& manager = sirius::test::get_registered_sirius_context(*con)->get_scan_manager();
+  auto source   = manager.create_datasource(path);
+  REQUIRE(source);
+  auto options = cudf::io::parquet_reader_options::builder().build();
+  bool hit     = true;
+  auto all     = resolve_parquet_metadata(*source, 0, path, options, &hit);
+  CHECK_FALSE(hit);
+  options.set_column_names({"y"});
+  auto projected = resolve_parquet_metadata(*source, 0, path, options, &hit);
+  CHECK(hit);
+  CHECK(projected == all);
+  CHECK(projected->file_metadata()->schema.size() == 3);
+  CHECK(source->metadata() == all);
+  options.enable_use_arrow_schema(!options.is_enabled_use_arrow_schema());
+  auto different_profile = resolve_parquet_metadata(*source, 0, path, options, &hit);
+  CHECK_FALSE(hit);
+  CHECK(different_profile != all);
+}

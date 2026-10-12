@@ -733,9 +733,10 @@ void validate_split_for_gpu(scan_contract_id expected,
       if (!dependency.parquet_approval || !dependency.parquet_approval->footer_bytes)
         fail("Parquet file approval missing");
       auto const& approval = *dependency.parquet_approval;
-      if (!approval.object_identity.empty() &&
-          (!approval.metadata_owner || !dependency.datasource ||
-           approval.object_identity != dependency.datasource->get_io_object().identity_cache_key()))
+      if (approval.object_identity.empty() || !approval.metadata_owner || !dependency.datasource ||
+          approval.object_identity != dependency.datasource->get_io_object().identity_cache_key() ||
+          dependency.footer.owner_before(approval.metadata_owner) ||
+          approval.metadata_owner.owner_before(dependency.footer))
         fail("Parquet evidence belongs to another object identity");
       auto const prefix =
         slice.file_path + "|footer=" + std::to_string(dependency.parquet_approval->footer_bytes);
