@@ -22,11 +22,11 @@
 //===----------------------------------------------------------------------===//
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 
 #include <cuda/scan/gpu_native_decode.cuh>
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
@@ -38,7 +38,7 @@
 namespace sirius::test::decode {
 
 template <typename T>
-inline rmm::device_buffer upload(std::vector<T> const& host, rmm::cuda_stream_view stream)
+inline rmm::device_buffer upload(std::vector<T> const& host, ::cuda::stream_ref stream)
 {
   return rmm::device_buffer(host.data(), host.size() * sizeof(T), stream);
 }
@@ -97,7 +97,7 @@ struct decode_env {
   std::unique_ptr<cudf::table> decode(
     std::vector<::sirius::cuda::scan::gpu_column_decode_input> const& cols)
   {
-    return ::sirius::cuda::scan::gpu_decode_table(cols, stream.view(), mr);
+    return ::sirius::cuda::scan::gpu_decode_table(cols, stream, mr);
   }
 };
 
@@ -110,7 +110,7 @@ inline void require_uncompressed_roundtrip(decode_env& env,
                                            cudf::data_type type,
                                            std::vector<T> const& values)
 {
-  auto d   = upload(values, env.stream.view());
+  auto d   = upload(values, env.stream);
   auto col = one_codec_column(type,
                               static_cast<uint32_t>(values.size()),
                               duckdb::CompressionType::COMPRESSION_UNCOMPRESSED,
@@ -132,7 +132,7 @@ inline void require_constant_broadcast(decode_env& env,
                                        uint32_t rows)
 {
   std::vector<T> v = {value};
-  auto d           = upload(v, env.stream.view());
+  auto d           = upload(v, env.stream);
   auto col         = one_codec_column(
     type, rows, duckdb::CompressionType::COMPRESSION_CONSTANT, {segment(d, 0, rows)});
   auto t   = env.decode({col});
@@ -149,14 +149,13 @@ inline void require_constant_broadcast(decode_env& env,
 ///
 /// `expected_row` may be any callable taking `uint32_t row -> T`.
 template <typename T, typename ExpectedRow>
-inline void verify_decoded_column(rmm::cuda_stream_view stream,
+inline void verify_decoded_column(::cuda::stream_ref stream,
                                   rmm::device_async_resource_ref mr,
                                   ::sirius::cuda::scan::gpu_column_decode_input const& col,
                                   ExpectedRow expected_row)
 {
-  auto t = ::sirius::cuda::scan::gpu_decode_table({col}, stream, mr);
-  auto out =
-    download<T>(t->get_column(0).view().template data<T>(), col.total_rows, stream.value());
+  auto t   = ::sirius::cuda::scan::gpu_decode_table({col}, stream, mr);
+  auto out = download<T>(t->get_column(0).view().template data<T>(), col.total_rows, stream.get());
   for (uint32_t i = 0; i < col.total_rows; ++i) {
     T const want = expected_row(i);
     if (out[i] != want) {

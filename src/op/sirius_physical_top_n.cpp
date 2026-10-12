@@ -25,6 +25,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
@@ -32,8 +33,6 @@
 #include <cudf/sorting.hpp>
 
 #include <rmm/resource_ref.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
@@ -57,7 +56,7 @@ std::unique_ptr<cudf::table> sorted_order_top_k(cudf::table_view input,
                                                 std::vector<cudf::order> const& key_orders,
                                                 std::vector<cudf::null_order> const& null_orders,
                                                 cudf::size_type keep_rows,
-                                                rmm::cuda_stream_view stream,
+                                                ::cuda::stream_ref stream,
                                                 rmm::device_async_resource_ref memory_resource)
 {
   auto indices = cudf::sorted_order(keys, key_orders, null_orders, stream, memory_resource);
@@ -77,7 +76,7 @@ std::unique_ptr<cudf::table> compute_top_n_table(
   duckdb::vector<duckdb::BoundOrderByNode> const& orders,
   std::size_t limit,
   std::size_t offset,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref memory_resource)
 {
   if (limit == 0 || input.num_rows() == 0) { return duckdb::make_empty_like(input); }
@@ -181,9 +180,9 @@ sirius_physical_top_n::sirius_physical_top_n(
 sirius_physical_top_n::~sirius_physical_top_n() {}
 
 std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_data& input_data,
-                                                              rmm::cuda_stream_view stream)
+                                                              ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_top_n::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_top_n::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (limit == 0) {
@@ -267,9 +266,9 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(
 }
 
 std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operator_data& input_data,
-                                                                    rmm::cuda_stream_view stream)
+                                                                    ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (limit == 0) {

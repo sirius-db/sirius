@@ -29,7 +29,6 @@ public:
 **Description**: Per-thread execution state, primarily for profiling and thread-local storage.
 
 **Our usage**:
-- `src/operator/gpu_physical_table_scan.cpp` — Create thread contexts for DuckDB scan threads
 - `src/op/scan/duckdb_scan_task.cpp` — Thread context for scan task execution
 - `test/cpp/scan/test_scan_executor.cpp` — Test thread context
 
@@ -49,7 +48,6 @@ public:
 **Description**: DuckDB's global task scheduler for parallel execution.
 
 **Our usage**:
-- `src/operator/gpu_physical_table_scan.cpp` — Access scheduler for parallel scan coordination
 
 ### TaskExecutor
 
@@ -65,7 +63,6 @@ public:
 ```
 
 **Our usage**:
-- `src/operator/gpu_physical_table_scan.cpp` — Execute DuckDB tasks for parallel scanning
 
 ## APIs Available but Not Used
 

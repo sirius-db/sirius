@@ -7,10 +7,11 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/std/functional>
+#include <cuda/stream>
 #include <thrust/copy.h>
 #include <thrust/device_ptr.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -42,7 +43,7 @@ alp_exception_columns compact_exceptions(const uint8_t* d_flags,
                                          cudf::size_type n,
                                          const ValueT* values_source,
                                          cudf::type_id value_type_id,
-                                         rmm::cuda_stream_view stream,
+                                         ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr)
 {
   auto exec         = rmm::exec_policy_nosync(stream, mr);
@@ -50,7 +51,7 @@ alp_exception_columns compact_exceptions(const uint8_t* d_flags,
                                      thrust::device_pointer_cast(d_flags),
                                      thrust::device_pointer_cast(d_flags + n),
                                      int64_t{0},
-                                     thrust::plus<int64_t>{});
+                                     cuda::std::plus<int64_t>{});
 
   alp_exception_columns out;
   out.count  = static_cast<cudf::size_type>(exc_count);

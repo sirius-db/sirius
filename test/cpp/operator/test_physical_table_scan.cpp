@@ -512,5 +512,5 @@ TEST_CASE("sirius_physical_table_scan fails closed for an untranslatable pushed-
 
   CHECK_THROWS_WITH(
     table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream()),
-    Catch::Contains("cannot evaluate pushed-down predicate"));
+    Catch::Matchers::ContainsSubstring("cannot evaluate pushed-down predicate"));
 }

@@ -1,0 +1,105 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "op/sirius_physical_operator.hpp"
+
+#include <string>
+#include <vector>
+
+namespace sirius {
+namespace op {
+
+//! Physical `UNION ALL`: an N-ary, non-materializing fan-in. Bag union computes nothing, so this
+//! operator only routes batches and `execute` is the identity. Distinct `UNION`, `EXCEPT` and
+//! `INTERSECT` never reach it: the plan builder accepts only `setop_all == true`.
+//!
+//! `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, and each sink feeds a distinct
+//! `port_label(i)` port.
+class sirius_physical_union : public sirius_physical_operator {
+ public:
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::UNION;
+
+  //! @param types  Output schema. The binder has already cast every arm to the common super-type,
+  //!               so Sirius does no type reconciliation itself.
+  explicit sirius_physical_union(duckdb::vector<sirius::logical_type> types,
+                                 std::size_t estimated_cardinality);
+
+  //! Port name for arm `i`. Returns by value, so it cannot back `input_port_for`'s `string_view`,
+  //! which is retained by the wiring descriptor — that view points at the sink's own member.
+  [[nodiscard]] static std::string port_label(std::size_t arm_index)
+  {
+    return "union_" + std::to_string(arm_index);
+  }
+
+  std::string get_name() const override;
+
+  bool is_source() const override;
+
+  //! `order_preservation_recursive` stops at the first `is_source()` operator, so this answer
+  //! decides the whole plan's.
+  sirius::OrderPreservationType source_order() const override;
+
+  //! The base throws for a non-sink operator with more than one child.
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
+  //! The base recurses into `children[0]` only; collect every arm's sources instead.
+  duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_sources() const override;
+
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         ::cuda::stream_ref stream) override;
+
+  //! Distinct per arm, not cosmetic: `add_port` is last-writer-wins and repositories key by
+  //! `(operator_id, port_id)`, so a shared name orphans an arm's repository. The returned view is
+  //! backed by the producer's own member.
+  [[nodiscard]] std::string_view input_port_for(
+    sirius_physical_operator const& producer) const override;
+
+  //! `PARTIAL`: a UNION arm streams, so it never needs a complete side. The base default `FULL`
+  //! would buffer every arm before emitting.
+  [[nodiscard]] MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const override;
+
+  //! Drains one arm at a time, nominating each arm's producer at most once.
+  std::optional<task_creation_hint> get_next_task_hint() override;
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  //! Pure forwarder: no device allocation beyond the batches already resident.
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const op::input_stats& /*stats*/) const override
+  {
+    return 0;
+  }
+
+ private:
+  //! Arm ports in arm order, resolved once on first use. Callers must hold `lock`.
+  const std::vector<port*>& arm_ports();
+
+  //! The only arm eligible to produce or drain. `children.size()` means every arm is exhausted.
+  //! Guarded by `lock`.
+  std::size_t _active_arm = 0;
+
+  //! Whether UNION has issued a normal, draining nomination for the active arm's producer.
+  //! Guarded by `lock`.
+  bool _active_arm_nominated = false;
+
+  std::vector<port*> _arm_ports;
+};
+
+}  // namespace op
+}  // namespace sirius

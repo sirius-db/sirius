@@ -47,8 +47,6 @@ public:
 
 **Our usage**:
 - `src/op/sirius_physical_top_n.cpp:175` — Creates null mask buffers: `std::make_unique<rmm::device_buffer>(std::move(new_mask))`
-- `src/cuda/operator/empty_str_check.cu:69` — Empty buffer for null mask: `rmm::device_buffer(0, stream, mr)`
-- `src/cuda/operator/strlen_from_offsets.cu:69` — Same pattern for column construction
 - `test/cpp/utils/data_utils.hpp:95` — Creates char buffers for string column construction
 - `test/cpp/operator/operator_test_utils.hpp:249` — Allocates char data for test string columns
 - `test/cpp/memory/test_host_table_utils.cpp:280` — Copies host mask to device
@@ -97,9 +95,6 @@ public:
 **Description**: Typed, uninitialized device vector. Only supports trivially copyable types. Unlike `thrust::device_vector`, does not default-initialize elements (better performance). All allocation/copy ops take a stream parameter.
 
 **Our usage**:
-- `src/cuda/operator/empty_str_check.cu:56` — `rmm::device_uvector<bool> output(num_rows, stream, mr)` for kernel output
-- `src/cuda/operator/strlen_from_offsets.cu:56` — `rmm::device_uvector<int32_t> output(num_rows, stream, mr)` for string length calculation
-- `src/expression_executor/specializations/gpu_execute_operator.cpp:28` — Used in expression evaluation
 - `src/cuda/expression_executor/gpu_dispatch_materialize.cu:21` — Used in materialization kernels
 
 ## APIs Available but Not Used

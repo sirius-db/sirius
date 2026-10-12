@@ -1,7 +1,7 @@
 //! Safe, idiomatic Rust bindings for [Sirius](https://github.com/sirius-db/sirius),
 //! the GPU-native SQL engine.
 //!
-//! This crate wraps the low-level [`sirius-sys`] cxx bindings in safe Rust types
+//! This crate wraps the low-level [`sirius-sys`][sirius_sys] cxx bindings in safe Rust types
 //! — the entry point for driving Sirius from Rust.
 //!
 //! Today it binds just enough to prove the toolchain links against the real

@@ -73,7 +73,6 @@ public:
 **Description**: Base class for all logical operators in the query plan tree. Sirius walks this tree to decide which operators can run on GPU.
 
 **Our usage**:
-- `src/gpu_physical_plan_generator.cpp` — Walk logical plan to create GPU physical operators
 - `src/planner/sirius_physical_plan_generator.cpp` — Same for new code path
 - `src/fallback.cpp` — Inspect logical operators for fallback decisions
 
@@ -95,8 +94,6 @@ public:
 **Our usage**:
 - Used in virtually every operator translation file to map column references to GPU column indices
 - `src/expression_executor/gpu_expression_translator.cpp` — Map to GPU column references
-- `src/operator/gpu_physical_hash_join.cpp` — Join key column indices
-- `src/plan/gpu_plan_get.cpp` — Table scan column indices
 
 ### BoundComparisonExpression
 
@@ -132,7 +129,6 @@ public:
 **Description**: AND/OR combination of boolean expressions.
 
 **Our usage**:
-- `src/operator/gpu_physical_filter.cpp` — Decompose conjunction into individual filter conditions
 - `src/expression_executor/gpu_expression_translator.cpp` — Translate AND/OR to GPU
 
 ### BoundConstantExpression
@@ -205,8 +201,6 @@ public:
 ```
 
 **Our usage**:
-- `src/plan/gpu_plan_aggregate.cpp` — Extract aggregate functions for GPU grouped/ungrouped aggregation
-- `src/operator/gpu_physical_grouped_aggregate.cpp` — Map aggregate functions to cuDF aggregation ops
 
 ### BoundCaseExpression / BoundBetweenExpression / BoundOperatorExpression
 
@@ -235,7 +229,6 @@ public:
 **Description**: Pushed-down filters for table scans. Sirius translates these to GPU filter operations that run during data loading.
 
 **Our usage**:
-- `src/operator/gpu_physical_table_scan.cpp` — Apply pushed-down filters during scan
 - `test/cpp/operator/test_physical_table_scan.cpp` — Test filter pushdown
 
 ### Logical Operators (LogicalGet, LogicalAggregate, LogicalOrder, LogicalComparisonJoin, LogicalCTERef)
@@ -245,10 +238,6 @@ public:
 **Description**: Specific logical operator types in the plan tree. Sirius accesses their properties (e.g., `LogicalGet::table_filters`, `LogicalAggregate::groups`, `LogicalComparisonJoin::conditions`).
 
 **Our usage**:
-- `src/plan/gpu_plan_get.cpp` — Access `LogicalGet` for table scan configuration
-- `src/plan/gpu_plan_aggregate.cpp` — Access `LogicalAggregate` for grouping/aggregate info
-- `src/plan/gpu_plan_join.cpp` — Access `LogicalComparisonJoin` for join conditions
-- `src/plan/gpu_plan_recursive_cte.cpp` — Access `LogicalCTERef` for CTE handling
 
 ### BoundResultModifier (BoundOrderModifier)
 
@@ -256,7 +245,6 @@ public:
 
 **Our usage**:
 - `test/cpp/operator/test_physical_top_n.cpp` — Build ORDER BY specifications for tests
-- `src/plan/gpu_plan_order.cpp` — Access sort specifications
 
 ## APIs Available but Not Used
 

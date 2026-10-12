@@ -32,11 +32,11 @@ This is the complete workflow: profile for GPU analysis, then run without profil
 
 **Step 1: Profiled run** (for GPU analysis data)
 ```bash
-# Profile TPC-H queries via nsys_report.sh (delegates to performance_test.py --mode nsys-profile)
+# Profile TPC-H queries via nsys_report.sh (delegates to performance_test.py --precmd nsys)
 bash test/tpch_performance/nsys_report.sh --sf <scale_factor> [query_numbers...]
 ```
 
-`nsys_report.sh` orchestrates the profiling under the hood: it calls `performance_test.py --mode nsys-profile` (the same runner the `benchmark` skill uses) to produce one `.nsys-rep` + `.sqlite` per query, then runs `nsys_analyze.sh` to emit `report.md` and `summary.json`.
+`nsys_report.sh` orchestrates the profiling under the hood: it calls `performance_test.py --precmd nsys` (the same runner the `benchmark` skill uses) to produce one `.nsys-rep` + `.sqlite` per query, then runs `nsys_analyze.sh` to emit `report.md` and `summary.json`.
 
 **Step 2: Non-profiled timing run** (for accurate cold/hot times)
 ```bash
@@ -44,11 +44,11 @@ export SIRIUS_CONFIG_FILE=<path_to_config>
 
 # Sirius-only timing
 pixi run python test/tpch_performance/performance_test.py \
-    --input <parquet_dir> --engine gpu --iterations <N> [--queries 1,3,6-10]
+    --input <parquet_dir> --scale-factor <SF> --engine gpu --iterations <N> [--queries 1,3,6-10]
 
 # DuckDB vs Sirius timing + result validation in one shot
 pixi run python test/tpch_performance/performance_test.py \
-    --input <parquet_dir> --engine both --iterations <N> --validation
+    --input <parquet_dir> --scale-factor <SF> --engine both --iterations <N> --validation
 ```
 
 The non-profiled run produces a long-format `<bench>/csv/runtimes.csv` (`engine,query,iteration,runtime_s`) and per-query `result.txt`. `--validation` additionally byte-compares the saved Sirius vs DuckDB results (with a small `abs_tol` on floats).
@@ -85,13 +85,13 @@ reports/<label>_<YYYYMMDD_HHMMSS>/
   metadata.json    - Hardware, git commit, config, driver version
   comparison.md    - (if --compare used) Regression/improvement analysis
   profiles/        - Flat raw artifacts (one set per query, flattened from the
-                     per-query subdirs produced by performance_test.py --mode nsys-profile)
+                     per-query subdirs produced by performance_test.py --precmd nsys)
     q1.sqlite, q1.nsys-rep, q1_timings.csv, q1_result.txt, ...
   profiles_tree/   - Original per-query layout from performance_test.py:
     sirius/q<N>/{nsys.nsys-rep, nsys.sqlite, nsys.sql, timings.csv, log_dir/}
 ```
 
-**Output from non-profiled run** (`performance_test.py` benchmark layout): a timestamped `<benchmark_dir>/` with `metadata.json`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
+**Output from non-profiled run** (`performance_test.py` benchmark layout): a timestamped `<benchmark_dir>/` with `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
 
 ### Workflow B: Generate Report from Existing Profiles
 

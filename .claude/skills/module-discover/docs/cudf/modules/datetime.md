@@ -20,7 +20,6 @@ std::unique_ptr<column> extract_day(column_view const& timestamps, ...);
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_function.cpp:32` — SQL EXTRACT and date_part functions
 
 ## APIs Available but Not Used
 

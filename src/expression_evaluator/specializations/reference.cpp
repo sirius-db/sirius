@@ -16,7 +16,6 @@
 
 // sirius
 #include <cudf/cudf_utils.hpp>
-#include <cudf/unary.hpp>
 
 #include <expression/ast/node.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
@@ -44,7 +43,7 @@ evaluate_result expression_evaluator::get_or_create_restored_reference(std::uint
   if (cached == _restored_reference_cache.end()) {
     temp_column_index = _temp_columns.size();
     _temp_columns.push_back(
-      cudf::cast(_input_table.column(column_index), target_type, _stream, _mr));
+      cast_through_rep(_input_table.column(column_index), target_type, _stream, _mr));
     _restored_reference_cache.push_back(
       restored_reference_cache_entry{column_index, target_type, temp_column_index});
     ++_restored_reference_cast_count;

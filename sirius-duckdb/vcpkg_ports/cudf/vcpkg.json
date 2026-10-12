@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "dependencies": [
+    {
+      "host": true,
+      "name": "vcpkg-cmake"
+    },
+    {
+      "host": true,
+      "name": "vcpkg-cmake-config"
+    },
+    "cccl",
+    "dlpack",
+    "flatbuffers",
+    "fmt",
+    "kvikio",
+    "nanoarrow",
+    "nvcomp",
+    "nvjitlink",
+    "nvrtc",
+    "nvtx3",
+    "rmm",
+    "roaring",
+    "spdlog",
+    "zlib",
+    "zstd"
+  ],
+  "license": "Apache-2.0",
+  "name": "cudf",
+  "supports": "linux",
+  "version-string": "26.08.01"
+}

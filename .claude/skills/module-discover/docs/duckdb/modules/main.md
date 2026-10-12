@@ -44,7 +44,6 @@ public:
 **Our usage**:
 - `src/sirius_extension.cpp` — Accessed in table function callbacks to get database config, run queries, access catalog
 - `src/op/scan/duckdb_scan_task.cpp` — Used to create execution contexts for DuckDB table scans
-- `src/plan/gpu_plan_aggregate.cpp` — Accessed for client config settings (e.g., optimizer flags)
 
 ### Connection
 
@@ -66,7 +65,6 @@ public:
 
 **Our usage**:
 - `src/sirius_extension.cpp` — Creates internal connections for query execution
-- `test/cpp/pipeline/test_modified_pipeline.cpp` — Used in tests for setting up test database connections
 
 ### DBConfig
 
@@ -87,7 +85,6 @@ public:
 
 **Our usage**:
 - `src/sirius_extension.cpp` — `DBConfig::GetConfig()` to register extension callbacks and read settings
-- `src/plan/gpu_plan_aggregate.cpp` — `DBConfig::GetSetting<>()` to check optimizer-related settings
 
 ### PreparedStatementData
 
@@ -107,7 +104,6 @@ public:
 
 **Our usage**:
 - `src/sirius_extension.cpp` — Extracts logical plan from prepared statements for GPU physical plan generation
-- `src/operator/gpu_physical_result_collector.cpp` — Accesses statement types/names for result collection
 
 ### QueryResult / MaterializedQueryResult
 
@@ -158,8 +154,6 @@ struct MergeJoinThresholdSetting { static constexpr const char *Name = "merge_jo
 **Description**: Type-safe settings accessors used with `DBConfig::GetSetting<T>()`.
 
 **Our usage**:
-- `src/plan/gpu_plan_join.cpp` — Checks join threshold settings to match DuckDB's join selection behavior
-- `src/plan/gpu_plan_aggregate.cpp` — Checks `PreserveInsertionOrderSetting`
 
 ## APIs Available but Not Used
 

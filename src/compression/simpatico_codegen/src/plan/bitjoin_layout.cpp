@@ -128,7 +128,7 @@ void bitjoin_warn_on_truncation(
   rmm::device_buffer flag_buf;
   try {
     flag_buf = rmm::device_buffer(
-      sizeof(uint32_t), rmm::cuda_stream_view{stream}, rmm::mr::get_current_device_resource_ref());
+      sizeof(uint32_t), ::cuda::stream_ref{stream}, rmm::mr::get_current_device_resource_ref());
   } catch (...) {
     return;  // best-effort: skip the check if allocation fails
   }
@@ -157,7 +157,7 @@ void bitjoin_warn_on_truncation(
 namespace {
 
 std::unique_ptr<cudf::column> copy_column_view_impl(cudf::column_view const& view,
-                                                    rmm::cuda_stream_view stream,
+                                                    ::cuda::stream_ref stream,
                                                     rmm::device_async_resource_ref mr)
 {
   cudf::data_type const dt = view.type();
@@ -176,8 +176,8 @@ std::unique_ptr<cudf::column> copy_column_view_impl(cudf::column_view const& vie
       const void* src = static_cast<const uint8_t*>(view.head<void>()) +
                         static_cast<size_t>(view.offset()) * elem_bytes;
       cudaMemcpyAsync(
-        col->mutable_view().head<void>(), src, bytes, cudaMemcpyDeviceToDevice, stream.value());
-      cudaStreamSynchronize(stream.value());
+        col->mutable_view().head<void>(), src, bytes, cudaMemcpyDeviceToDevice, stream.get());
+      cudaStreamSynchronize(stream.get());
     }
     return col;
   }
@@ -195,8 +195,8 @@ std::unique_ptr<cudf::column> copy_column_view_impl(cudf::column_view const& vie
                   h_indices.data(),
                   static_cast<size_t>(n) * sizeof(int32_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
-  cudaStreamSynchronize(stream.value());
+                  stream.get());
+  cudaStreamSynchronize(stream.get());
   cudf::table_view single(std::vector<cudf::column_view>{view});
   auto gathered =
     cudf::gather(single, indices_col->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
@@ -207,7 +207,7 @@ std::unique_ptr<cudf::column> copy_column_view_impl(cudf::column_view const& vie
 }  // namespace
 
 std::unique_ptr<cudf::column> copy_column_view(cudf::column_view const& view,
-                                               rmm::cuda_stream_view stream,
+                                               ::cuda::stream_ref stream,
                                                rmm::device_async_resource_ref mr)
 {
   if (view.type().id() == cudf::type_id::LIST && view.num_children() >= 2) {
@@ -217,7 +217,7 @@ std::unique_ptr<cudf::column> copy_column_view(cudf::column_view const& view,
 }
 
 std::unique_ptr<cudf::column> copy_column_view_as_uint8(cudf::column_view const& view,
-                                                        rmm::cuda_stream_view stream,
+                                                        ::cuda::stream_ref stream,
                                                         rmm::device_async_resource_ref mr)
 {
   cudf::column_view data_view = view;
@@ -235,8 +235,8 @@ std::unique_ptr<cudf::column> copy_column_view_as_uint8(cudf::column_view const&
     const void* src = static_cast<const uint8_t*>(data_view.head<void>()) +
                       static_cast<size_t>(data_view.offset()) * elem_size;
     cudaMemcpyAsync(
-      col->mutable_view().head<void>(), src, total_bytes, cudaMemcpyDeviceToDevice, stream.value());
-    cudaStreamSynchronize(stream.value());
+      col->mutable_view().head<void>(), src, total_bytes, cudaMemcpyDeviceToDevice, stream.get());
+    cudaStreamSynchronize(stream.get());
   }
   return col;
 }

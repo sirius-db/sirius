@@ -27,7 +27,9 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DUCKDB="$PROJECT_DIR/build/release/duckdb"
+DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
+SIRIUS_EXTENSION="${SIRIUS_EXTENSION_PATH:-$PROJECT_DIR/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension}"
+DUCKDB_ARGS=(-unsigned -bail -cmd "LOAD '${SIRIUS_EXTENSION//\'/\'\'}';")
 QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 DEFAULT_SIRIUS_TELEMETRY_CONFIG="$SCRIPT_DIR/tpch_telemetry_sirius.yaml"
 SIRIUS_CONFIG="$DEFAULT_SIRIUS_TELEMETRY_CONFIG"
@@ -130,7 +132,7 @@ fi
 [ -n "$RUN_NOTE" ] && echo "  Note:         $RUN_NOTE"
 echo "=========================================="
 
-SIRIUS_DISABLE=0 SIRIUS_CONFIG_FILE="$SIRIUS_CONFIG" "$DUCKDB" -f "$TEMP_SQL"
+SIRIUS_DISABLE=0 SIRIUS_CONFIG_FILE="$SIRIUS_CONFIG" "$DUCKDB" "${DUCKDB_ARGS[@]}" -f "$TEMP_SQL"
 EXIT=$?
 rm -f "$TEMP_SQL"
 

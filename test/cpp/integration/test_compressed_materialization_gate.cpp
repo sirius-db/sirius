@@ -29,6 +29,12 @@
 // retract to native at plan time (scan_narrow_targets_retracted) and widen
 // during scan normalization instead — while HOST-tier pins are structurally
 // invisible to that pass, so their serves stay cast-free.
+//
+// The last two tests cover DATE, whose carrier conversions cannot use
+// cudf::cast directly (cuDF refuses timestamp<->numeric outright) and instead
+// tunnel through the int32 representation the TIMESTAMP_DAYS carrier already
+// stores. They own a separate fixture rather than extending the one above,
+// whose per-chunk carrier equality is reasoned about column by column.
 
 #include "compressed_materialization_test_common.hpp"
 #include "sirius_config.hpp"
@@ -102,6 +108,29 @@ void generate_dim_parquet(fs::path const& path)
 {
   generate_parquet(
     path, "SELECT (range * 7) % 301 AS k FROM range(" + std::to_string(kDimRows) + ")", 400);
+}
+
+// 8192 rows x (d1 DATE, d2 DATE, d3 DATE, k BIGINT) in 2048-row row groups, read with the same
+// 16 KiB scan batches, so each row group becomes its own pin chunk (>= 3, asserted).
+constexpr std::int64_t kDateRows = 8192;
+
+// d1 walks 1992-01-01 to 1998-12-31 (epoch days 8035 to 10591, the TPC-H lineitem span), d2 is d1
+// plus 0..29 days, d3 is d1 with every seventh row NULL, and k is range % 251. No DATE value is
+// below 8035 or above 10621 epoch days, so INT8 never fits and INT16 always does: ANY contiguous
+// slice of the recipe — in particular every pin chunk of every DATE column — picks INT16, and k
+// (0..250) picks INT16 too. Chunk carrier therefore equals the plan target for every column, so a
+// pinned-narrow serve issues no cast and the narrowed/restored counters can be asserted flat.
+void generate_date_parquet(fs::path const& path)
+{
+  generate_parquet(
+    path,
+    "SELECT DATE '1992-01-01' + CAST(range % 2557 AS INTEGER) AS d1, "
+    "DATE '1992-01-01' + CAST(range % 2557 AS INTEGER) + CAST(range % 30 AS INTEGER) AS d2, "
+    "CASE WHEN range % 7 = 0 THEN NULL "
+    "ELSE DATE '1992-01-01' + CAST(range % 2557 AS INTEGER) END AS d3, "
+    "range % 251 AS k FROM range(" +
+      std::to_string(kDateRows) + ")",
+    2048);
 }
 
 sirius::scan_manager::pinned_entry const* find_entry(duckdb::SiriusContext& sirius_ctx,
@@ -569,6 +598,203 @@ TEST_CASE("gpu_execution - zero-benefit pruning stays discriminating on pinned-b
 
       require_ok(con.Query("CALL unpin_table('o');"), "unpin dim");
       require_ok(con.Query("CALL unpin_table('t');"), "unpin fact");
+    }
+  }
+
+  fs::remove_all(tmp, ec);
+}
+
+// DATE is the one narrowable logical type whose native cuDF carrier is not itself numeric, so this
+// test answers "did the DATE column narrow at all" before the round-trip test below asks what
+// happens to it afterwards. Pinning d1 alone makes the counter unambiguous: nothing but the DATE
+// column can answer it.
+TEST_CASE("gpu_execution - a pinned DATE column narrows only with the flag on",
+          "[gpu_execution][parquet][compressed_materialization_gate]")
+{
+  pause_shared_envs();
+
+  auto tmp = fs::temp_directory_path() / ("sirius-compmat-datepin-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  auto parquet_path = tmp / "date.parquet";
+  generate_date_parquet(parquet_path);
+
+  auto yaml_path = tmp / "compmat_datepin.yaml";
+  write_config(yaml_path, kConfigValues);
+  REQUIRE(fs::exists(yaml_path));
+
+  {
+    sirius::test::shared_test_env local_env(yaml_path);
+    auto con = local_env.make_connection();
+
+    require_ok(con.Query("SET enable_duckdb_fallback = false;"), "disable fallback");
+    require_ok(
+      con.Query("CREATE VIEW t AS SELECT * FROM read_parquet('" + parquet_path.string() + "');"),
+      "create view");
+
+    auto const pin_date = [&con, &parquet_path]() {
+      require_ok(con.Query("CALL pin_table('" + parquet_path.string() +
+                           "', tier='gpu', name='t', cols=['d1']);"),
+                 "pin d1");
+    };
+
+    require_ok(con.Query("SET enable_compressed_materialization = true;"), "enable flag");
+    auto const on_before = sirius::test::get_compressed_materialization_stats(con);
+    pin_date();
+    auto const on_after = sirius::test::get_compressed_materialization_stats(con);
+    REQUIRE(on_after.pin_columns_narrowed > on_before.pin_columns_narrowed);
+    require_ok(con.Query("CALL unpin_table('t');"), "unpin");
+
+    // The contrast that makes the count above attributable to the feature rather than to some
+    // unconditional pin-time conversion.
+    require_ok(con.Query("SET enable_compressed_materialization = false;"), "disable flag");
+    auto const off_before = sirius::test::get_compressed_materialization_stats(con);
+    pin_date();
+    auto const off_after = sirius::test::get_compressed_materialization_stats(con);
+    REQUIRE(off_after.pin_columns_narrowed == off_before.pin_columns_narrowed);
+    require_ok(con.Query("CALL unpin_table('t');"), "unpin");
+  }
+
+  fs::remove_all(tmp, ec);
+}
+
+// Every shape below is a DATE carrier conversion that cudf::cast alone cannot perform. They are run
+// against one pin per tier because the tier decides WHERE the restore happens, not whether it
+// happens: a GPU-tier pin lets the narrowing policy retract restore-only targets so their resident
+// chunks widen during scan normalization, while a HOST-tier pin keeps every target and the same
+// restores land downstream in the boundary projections instead.
+TEST_CASE("gpu_execution - a pinned narrow DATE column round-trips through its restore boundaries",
+          "[gpu_execution][parquet][compressed_materialization_gate]")
+{
+  pause_shared_envs();
+
+  auto tmp = fs::temp_directory_path() / ("sirius-compmat-date-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  auto parquet_path = tmp / "date.parquet";
+  generate_date_parquet(parquet_path);
+
+  auto yaml_path = tmp / "compmat_date.yaml";
+  write_config(yaml_path, kConfigValues);
+  REQUIRE(fs::exists(yaml_path));
+
+  {
+    sirius::test::shared_test_env local_env(yaml_path);
+    auto con = local_env.make_connection();
+
+    require_ok(con.Query("SET enable_duckdb_fallback = false;"), "disable fallback");
+    require_ok(
+      con.Query("CREATE VIEW t AS SELECT * FROM read_parquet('" + parquet_path.string() + "');"),
+      "create view");
+    require_ok(con.Query("SET enable_compressed_materialization = true;"), "enable flag");
+
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx);
+
+    for (auto const* tier : {"gpu", "host"}) {
+      DYNAMIC_SECTION("tier = " << tier)
+      {
+        bool const gpu_tier = std::string_view(tier) == "gpu";
+
+        auto const pin_before = sirius::test::get_compressed_materialization_stats(con);
+        require_ok(con.Query("CALL pin_table('" + parquet_path.string() + "', tier='" +
+                             std::string(tier) + "', name='t');"),
+                   "pin_table");
+        auto const pin_after = sirius::test::get_compressed_materialization_stats(con);
+        REQUIRE(pin_after.pin_columns_narrowed > pin_before.pin_columns_narrowed);
+
+        auto const* entry_ptr = find_entry(*sirius_ctx, "t");
+        REQUIRE(entry_ptr != nullptr);
+        REQUIRE(entry_chunk_count(*entry_ptr) >= 3);
+
+        // THE REGRESSION. A bare-reference group key of an eligible grouped aggregate earns
+        // transport, so the tier policy keeps it narrow on GPU tier and is inert on HOST tier:
+        // on both, the scan hands d1 downstream as INT16 (no retraction, no serve-time cast —
+        // asserted) and the only conversion in the whole plan is the restore projection that
+        // propagation inserts above the aggregate for the ORDER BY boundary. cuDF refuses
+        // INT16 -> TIMESTAMP_DAYS outright, so this shape threw "Timestamps cannot be converted
+        // to numeric without converting it to a duration" out of that projection until the
+        // carrier conversions learned to tunnel through the int32 representation.
+        auto const group_before = sirius::test::get_compressed_materialization_stats(con);
+        compare_gpu_vs_cpu(con, "SELECT d1, count(*) AS n FROM t GROUP BY d1 ORDER BY d1;");
+        auto const group_after = sirius::test::get_compressed_materialization_stats(con);
+        REQUIRE(group_after.scan_sidecars_installed > group_before.scan_sidecars_installed);
+        REQUIRE(group_after.scan_columns_narrowed == group_before.scan_columns_narrowed);
+        REQUIRE(group_after.scan_narrow_targets_retracted ==
+                group_before.scan_narrow_targets_retracted);
+        REQUIRE(group_after.scan_columns_restored == group_before.scan_columns_restored);
+
+        // The same restore boundary reached through a narrow-domain DATE filter: the literal
+        // folds to its epoch-day range and the predicate runs at the carrier width, so d1 is
+        // still INT16 when the group key crosses the aggregate. k is a value-sensitive aggregate
+        // input and restores at its own boundary.
+        auto const filter_before = sirius::test::get_compressed_materialization_stats(con);
+        compare_gpu_vs_cpu(con,
+                           "SELECT d1, sum(k) AS sk FROM t WHERE d1 >= DATE '1994-01-01' "
+                           "GROUP BY d1 ORDER BY d1 LIMIT 20;");
+        auto const filter_after = sirius::test::get_compressed_materialization_stats(con);
+        REQUIRE(filter_after.scan_sidecars_installed > filter_before.scan_sidecars_installed);
+        REQUIRE(filter_after.scan_columns_narrowed == filter_before.scan_columns_narrowed);
+
+        // Column versus column at one shared carrier — the q4/q12/q21 shape. Both operands are
+        // carried DATE at INT16, so the comparison evaluates at the narrow width with no restore
+        // on either side. Engagement itself has no context counter (the evaluator counts it per
+        // instance), so the assertion is the result: a pair evaluated at the wrong width, or one
+        // side reinterpreted against the other, changes which rows survive.
+        auto const pair_before = sirius::test::get_compressed_materialization_stats(con);
+        compare_gpu_vs_cpu(con, "SELECT count(*) AS c FROM t WHERE d1 < d2;");
+        compare_gpu_vs_cpu(con, "SELECT d1, d2 FROM t WHERE d1 < d2 ORDER BY d1, d2 LIMIT 50;");
+        auto const pair_after = sirius::test::get_compressed_materialization_stats(con);
+        REQUIRE(pair_after.scan_sidecars_installed > pair_before.scan_sidecars_installed);
+        REQUIRE(pair_after.scan_columns_narrowed == pair_before.scan_columns_narrowed);
+
+        // Nulls survive the carrier round trip: the predicate keeps the NULL rows, so the answer
+        // depends on the validity mask arriving intact through narrowing, the narrow-width
+        // comparison, and the restore.
+        compare_gpu_vs_cpu(
+          con,
+          "SELECT count(*) AS c, count(d3) AS cd FROM t WHERE d3 < DATE '1995-01-01' "
+          "OR d3 IS NULL;");
+        compare_gpu_vs_cpu(con, "SELECT d3 FROM t ORDER BY d3 NULLS FIRST LIMIT 10;");
+
+        // A restore-only DATE column: its single use is an ordering boundary, so the scan emits
+        // TIMESTAMP_DAYS and the resident INT16 chunks widen inside normalize_physical_schema —
+        // the only observable for that conversion site, and the assertion that the tunnel runs
+        // there too. Both tiers reach it, by different passes: on GPU tier the tier policy
+        // retracts the target (counted), while on HOST tier the policy is inert and
+        // `prune_immediate_scan_restores` folds the boundary projection's cast back into the
+        // scan (not counted as a retraction). The retraction counter is what separates them.
+        auto const order_before = sirius::test::get_compressed_materialization_stats(con);
+        compare_gpu_vs_cpu(con, "SELECT d1 FROM t ORDER BY d1 LIMIT 100;");
+        auto const order_after = sirius::test::get_compressed_materialization_stats(con);
+        REQUIRE(order_after.scan_sidecars_installed > order_before.scan_sidecars_installed);
+        REQUIRE(order_after.scan_columns_narrowed == order_before.scan_columns_narrowed);
+        REQUIRE(order_after.scan_columns_restored > order_before.scan_columns_restored);
+        if (gpu_tier) {
+          REQUIRE(order_after.scan_narrow_targets_retracted >
+                  order_before.scan_narrow_targets_retracted);
+        } else {
+          REQUIRE(order_after.scan_narrow_targets_retracted ==
+                  order_before.scan_narrow_targets_retracted);
+        }
+
+        // A DATE equality join. Join keys are native before partitioning and joining, so both
+        // sides restore INT16 back to TIMESTAMP_DAYS below the join; a self-join puts both
+        // restores on scans served by the same pinned entry.
+        auto const join_before = sirius::test::get_compressed_materialization_stats(con);
+        compare_gpu_vs_cpu(con,
+                           "SELECT a.k AS ak, count(*) AS n FROM t a JOIN t b ON a.d1 = b.d2 "
+                           "WHERE a.k < 5 GROUP BY a.k ORDER BY a.k;");
+        auto const join_after = sirius::test::get_compressed_materialization_stats(con);
+        REQUIRE(join_after.scan_sidecars_installed >= join_before.scan_sidecars_installed + 2);
+        REQUIRE(join_after.scan_columns_narrowed == join_before.scan_columns_narrowed);
+
+        require_ok(con.Query("CALL unpin_table('t');"), "unpin");
+      }
     }
   }
 

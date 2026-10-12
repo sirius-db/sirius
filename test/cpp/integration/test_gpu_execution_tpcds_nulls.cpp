@@ -333,3 +333,74 @@ TEST_CASE_METHOD(TpcdsNullFixture,
     "FROM store_returns GROUP BY sr_store_sk");
   compare_gpu_vs_cpu("SELECT count(*) FROM store_returns WHERE sr_customer_sk IS NULL");
 }
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution string case in join predicates and grouped projections",
+                 "[integration][gpu_execution][string_case]")
+{
+  run_ok("CREATE TABLE customers (id INTEGER, birth_country VARCHAR)");
+  run_ok(
+    "INSERT INTO customers VALUES (1, 'GERMANY'), (2, 'CANADA'), (3, 'USA'), "
+    "(4, NULL), (5, 'FRANCE')");
+  run_ok("CREATE TABLE locations (customer_id INTEGER, country VARCHAR)");
+  run_ok(
+    "INSERT INTO locations VALUES (1, 'Germany'), (2, 'France'), (3, NULL), "
+    "(4, 'Canada'), (5, 'Germany')");
+  run_ok(
+    "CREATE TABLE orders (customer_id INTEGER, center_id INTEGER, delay INTEGER, "
+    "amount INTEGER)");
+  run_ok(
+    "INSERT INTO orders VALUES (1, 1, 10, 100), (2, 1, 20, 200), (2, 1, 40, 300), "
+    "(3, 2, 50, 400), (4, 2, NULL, 500), (5, 3, 80, 600), (5, 4, 5, 700)");
+  run_ok("CREATE TABLE centers (id INTEGER, name VARCHAR)");
+  // Distinct group keys can have the same lowercase projection.
+  run_ok("INSERT INTO centers VALUES (1, 'North'), (2, 'NORTH'), (3, 'South'), (4, NULL)");
+  run_ok("CHECKPOINT");
+
+  SECTION("uppercase inequality join followed by aggregation")
+  {
+    // Q24's relevant shape: an equijoin plus an inequality whose operand must
+    // be materialized by case conversion, followed by joins and aggregation.
+    // Customer 1 matches after conversion; 2 and 5 differ; NULLs exclude 3 and 4.
+    compare_gpu_vs_cpu_ordered(
+      "SELECT c.id, sum(o.amount) AS total "
+      "FROM customers c JOIN locations l "
+      "ON c.id = l.customer_id AND c.birth_country <> upper(l.country) "
+      "JOIN orders o ON o.customer_id = c.id GROUP BY c.id ORDER BY c.id");
+  }
+
+  SECTION("lowercase projection after grouping by the original string")
+  {
+    // Q99's relevant shape: join, conditional aggregates, group by the original
+    // name, then lowercase the group key in the projection and sort by it.
+    compare_gpu_vs_cpu_ordered(
+      "SELECT lower(c.name) AS center_name, "
+      "sum(CASE WHEN o.delay <= 30 THEN 1 ELSE 0 END) AS fast, "
+      "sum(CASE WHEN o.delay > 30 THEN 1 ELSE 0 END) AS slow "
+      "FROM orders o JOIN centers c ON o.center_id = c.id "
+      "GROUP BY c.name ORDER BY center_name NULLS FIRST, fast, slow LIMIT 10");
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution string case projection and inequality join",
+                 "[integration][gpu_execution][string_case]")
+{
+  run_ok("CREATE TABLE people (id INTEGER, birth_country VARCHAR)");
+  run_ok("INSERT INTO people VALUES (1, 'GERMANY'), (2, 'CANADA'), (3, 'USA'), (4, NULL)");
+  run_ok("CREATE TABLE addresses (id INTEGER, country VARCHAR)");
+  run_ok("INSERT INTO addresses VALUES (1, 'Germany'), (2, 'France'), (3, NULL), (4, 'Canada')");
+  run_ok("CHECKPOINT");
+  compare_gpu_vs_cpu("SELECT id, lower(country), upper(country) FROM addresses");
+  // DuckDB folds scalar calls before they reach the column-only GPU handlers.
+  compare_gpu_vs_cpu(
+    "SELECT id, upper('Hello'), lower('Hello'), upper(NULL::VARCHAR), lower(NULL::VARCHAR), "
+    "length('Hello'), strlen('é') FROM addresses");
+  // A nonempty Q24-style join verifies the materialized operand at runtime.
+  compare_gpu_vs_cpu(
+    "SELECT p.id FROM people p JOIN addresses a ON p.id = a.id "
+    "AND p.birth_country <> upper(a.country)");
+  compare_gpu_vs_cpu(
+    "SELECT p.id FROM people p JOIN addresses a ON p.id = a.id "
+    "AND lower(p.birth_country) <> lower(a.country)");
+}

@@ -1,0 +1,228 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * @file test_gpu_execution_cross_product.cpp
+ * @brief Verifies that DuckDB cross products run on the GPU and match the CPU.
+ *
+ * A LOGICAL_CROSS_PRODUCT is planned as a nested loop join without conditions. A pair of input
+ * batches whose cross join exceeds the task budget or the row limit of a cuDF column is split into
+ * tasks over row ranges of the left batch. A slice whose cross join exceeds the GPU memory limit
+ * fails at runtime before allocating its output.
+ */
+
+#include <catch.hpp>
+#include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
+
+#include <string>
+
+using CrossProductFixture = sirius::test::GpuExecutionFixture;
+
+namespace {
+
+void create_cross_tables(CrossProductFixture& fx)
+{
+  fx.run_ok("CREATE TABLE cp_a AS SELECT i::INTEGER x FROM range(4) r(i);");
+  fx.run_ok(
+    "CREATE TABLE cp_b AS SELECT i::BIGINT y, (i * 1.5)::DOUBLE z, 'b' || i::VARCHAR s "
+    "FROM range(3) r(i);");
+  fx.run_ok("CHECKPOINT;");
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - two tables run on the GPU",
+                 "[integration][gpu_execution][cross_product]")
+{
+  create_cross_tables(*this);
+  SECTION("CROSS JOIN") { compare_gpu_vs_cpu("SELECT * FROM cp_a CROSS JOIN cp_b;"); }
+  SECTION("comma join") { compare_gpu_vs_cpu("SELECT x, s FROM cp_a, cp_b;"); }
+  SECTION("JOIN ON true") { compare_gpu_vs_cpu("SELECT y, x FROM cp_a JOIN cp_b ON true;"); }
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - scalar aggregate subqueries run on the GPU",
+                 "[integration][gpu_execution][cross_product]")
+{
+  // The shape of TPC-DS Q88 and Q90: single-row aggregates combined by a cross product.
+  create_cross_tables(*this);
+  compare_gpu_vs_cpu(
+    "SELECT * FROM (SELECT count(*) c1 FROM cp_a WHERE x < 2) s1, "
+    "(SELECT sum(y) c2 FROM cp_b WHERE y >= 1) s2, "
+    "(SELECT max(z) c3 FROM cp_b) s3;");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - count(*) without projected columns runs on the GPU",
+                 "[integration][gpu_execution][cross_product]")
+{
+  create_cross_tables(*this);
+  compare_gpu_vs_cpu("SELECT count(*) FROM cp_a, cp_b;");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - an empty side yields no rows",
+                 "[integration][gpu_execution][cross_product]")
+{
+  create_cross_tables(*this);
+  compare_gpu_vs_cpu("SELECT * FROM cp_a, (SELECT * FROM cp_b WHERE y > 100) e;");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - uncorrelated EXISTS runs on the GPU",
+                 "[integration][gpu_execution][cross_product]")
+{
+  // DuckDB plans an uncorrelated EXISTS as a cross product with a count over LIMIT 1.
+  create_cross_tables(*this);
+  SECTION("EXISTS, rows")
+  {
+    compare_gpu_vs_cpu("SELECT * FROM cp_a WHERE EXISTS (SELECT 1 FROM cp_b);");
+  }
+  SECTION("EXISTS, no rows")
+  {
+    compare_gpu_vs_cpu("SELECT * FROM cp_a WHERE EXISTS (SELECT 1 FROM cp_b WHERE y > 100);");
+  }
+  SECTION("NOT EXISTS, rows")
+  {
+    compare_gpu_vs_cpu("SELECT * FROM cp_a WHERE NOT EXISTS (SELECT 1 FROM cp_b);");
+  }
+  SECTION("NOT EXISTS, no rows")
+  {
+    compare_gpu_vs_cpu("SELECT * FROM cp_a WHERE NOT EXISTS (SELECT 1 FROM cp_b WHERE y > 100);");
+  }
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - feeds a grouped aggregate",
+                 "[integration][gpu_execution][cross_product]")
+{
+  create_cross_tables(*this);
+  compare_gpu_vs_cpu("SELECT x, sum(y) s, count(*) c FROM cp_a, cp_b GROUP BY x;");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - sides split into several batches",
+                 "[integration][gpu_execution][cross_product]")
+{
+  run_ok("CREATE TABLE cp_big AS SELECT i::INTEGER x FROM range(200000) r(i);");
+  run_ok("CREATE TABLE cp_small AS SELECT i::INTEGER y FROM range(50) r(i);");
+  run_ok("CHECKPOINT;");
+  sirius::test::scoped_setting const scan_batch{*con, "scan_task_batch_size", 65536};
+  sirius::test::scoped_setting const concat_batch{*con, "concat_batch_bytes", 65536};
+  compare_gpu_vs_cpu("SELECT count(*) c, sum(x + y) s, min(x - y) m FROM cp_big, cp_small;");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - a large batch pair is split over the left rows",
+                 "[integration][gpu_execution][cross_product]")
+{
+  // Each side is one batch. With a 64 KiB task budget, their cross join of about 20 MB runs as
+  // hundreds of tasks over row ranges of the left batch.
+  run_ok(
+    "CREATE TABLE cp_left AS SELECT i::INTEGER x, "
+    "CASE WHEN i % 7 = 0 THEN NULL ELSE 'l' || i::VARCHAR END s FROM range(3000) r(i);");
+  run_ok("CREATE TABLE cp_right AS SELECT i::BIGINT y FROM range(500) r(i);");
+  run_ok("CHECKPOINT;");
+  sirius::test::scoped_setting const task_bytes{*con, "cross_join_task_bytes", 65536};
+  compare_gpu_vs_cpu(
+    "SELECT count(*) c, count(s) cs, sum(x * y) xy, min(s) mn, max(s) mx FROM cp_left, cp_right;");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - pairs of several batches on both sides are split",
+                 "[integration][gpu_execution][cross_product]")
+{
+  // Both sides span several batches, and each batch pair runs as several tasks over row ranges of
+  // its left batch. Every pair must contribute exactly once, after which its batches are released.
+  sirius::test::scratch_dir const dir{"cross_product_batches"};
+  run_ok("COPY (SELECT i::INTEGER x FROM range(20000) r(i)) TO " + dir.file_literal("l.parquet") +
+         " (FORMAT PARQUET, ROW_GROUP_SIZE 4096);");
+  run_ok("COPY (SELECT i::INTEGER y FROM range(17000) r(i)) TO " + dir.file_literal("r.parquet") +
+         " (FORMAT PARQUET, ROW_GROUP_SIZE 4096);");
+  sirius::test::scoped_setting const scan_batch{*con, "scan_task_batch_size", 16384};
+  sirius::test::scoped_setting const concat_batch{*con, "concat_batch_bytes", 16384};
+  sirius::test::scoped_setting const task_bytes{*con, "cross_join_task_bytes", 64ULL << 20};
+  compare_gpu_vs_cpu(
+    "SELECT count(*) c, sum(x) sx, sum(y) sy, sum(x::BIGINT * y) xy FROM "
+    "read_parquet(" +
+    dir.file_literal("l.parquet") + "), read_parquet(" + dir.file_literal("r.parquet") + ");");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - an output beyond the cuDF row limit runs as several tasks",
+                 "[integration][gpu_execution][cross_product]")
+{
+  // 50000 x 50000 output rows exceed cudf::size_type, so the pair is split over the left rows. The
+  // expected values are computed here, since the CPU would take long to produce 2.5e9 rows.
+  run_ok("CREATE TABLE cp_l AS SELECT i::INTEGER x FROM range(50000) r(i);");
+  run_ok("CREATE TABLE cp_r AS SELECT i::INTEGER y FROM range(50000) r(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SET gpu_execution = true;");
+  run_ok("SET enable_duckdb_fallback = false;");
+  auto result = con->Query("SELECT count(*), sum(x), sum(y) FROM cp_l, cp_r;");
+  run_ok("SET enable_duckdb_fallback = true;");
+  REQUIRE(result);
+  INFO(result->ToString());
+  REQUIRE_FALSE(result->HasError());
+  // Each value of 0..49999 appears 50000 times.
+  CHECK(result->GetValue(0, 0).ToString() == "2500000000");
+  CHECK(result->GetValue(1, 0).ToString() == "62498750000000");
+  CHECK(result->GetValue(2, 0).ToString() == "62498750000000");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - grouped aggregates with a large estimate run on the GPU",
+                 "[integration][gpu_execution][cross_product]")
+{
+  // The shape of TPC-DS Q77. DuckDB estimates a grouped aggregate near its input size, so this
+  // cross product of 10 x 7 rows is estimated at about 1e10 rows.
+  run_ok("CREATE TABLE cp_l AS SELECT i::INTEGER x FROM range(100000) r(i);");
+  run_ok("CREATE TABLE cp_r AS SELECT i::INTEGER y FROM range(100000) r(i);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu(
+    "SELECT * FROM (SELECT x % 10 g, count(*) c FROM cp_l GROUP BY g) l, "
+    "(SELECT y % 7 h, sum(y) s FROM cp_r GROUP BY h) r;");
+}
+
+TEST_CASE_METHOD(CrossProductFixture,
+                 "cross product - an output beyond GPU memory fails without retrying",
+                 "[integration][gpu_execution][cross_product]")
+{
+  // A task budget this large leaves the pair split only by the cuDF row limit, into 5 tasks of
+  // 20000 x 100000 rows. With eight BIGINT columns each task needs far more than any GPU memory
+  // space holds.
+  run_ok(
+    "CREATE TABLE cp_wide_l AS SELECT i::BIGINT a1, i::BIGINT a2, i::BIGINT a3, i::BIGINT a4 "
+    "FROM range(100000) r(i);");
+  run_ok(
+    "CREATE TABLE cp_wide_r AS SELECT i::BIGINT b1, i::BIGINT b2, i::BIGINT b3, i::BIGINT b4 "
+    "FROM range(100000) r(i);");
+  run_ok("CHECKPOINT;");
+  sirius::test::scoped_setting const task_bytes{*con, "cross_join_task_bytes", 1ULL << 50};
+  run_ok("SET gpu_execution = true;");
+  run_ok("SET enable_duckdb_fallback = false;");
+  auto result =
+    con->Query("SELECT max(a1 + a2 + a3 + a4 + b1 + b2 + b3 + b4) FROM cp_wide_l, cp_wide_r;");
+  run_ok("SET enable_duckdb_fallback = true;");
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  INFO(result->GetError());
+  REQUIRE(result->GetError().find("Cross join of 20000 x 100000 rows needs") != std::string::npos);
+}

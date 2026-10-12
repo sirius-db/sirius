@@ -12,8 +12,6 @@ use crate::type_mapper;
 pub struct SlotInfo {
     /// StarRocks slot identifier from `TSlotDescriptor.id`.
     pub slot_id: i32,
-    /// Descriptor-table column position, used to preserve StarRocks output order.
-    pub column_pos: i32,
     /// Stable output name for the slot, falling back to `col_<slot_id>`.
     pub col_name: String,
     /// Substrait type mapped from the StarRocks slot type and nullability.
@@ -41,7 +39,7 @@ impl SlotInfo {
 pub struct TupleInfo {
     /// Optional table id referenced by this tuple.
     pub table_id: Option<i64>,
-    /// Slot ids sorted in descriptor/output order.
+    /// Slot ids in descriptor/output order.
     pub slot_ids: Vec<i32>,
 }
 
@@ -60,16 +58,16 @@ struct TableInfo {
 /// (e.g. a FILES scan's src and dest tuples), so the tuple id is part of the key; keying by slot
 /// id alone would let one tuple's slots clobber another's.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct SlotKey {
+pub(crate) struct SlotKey {
     /// Owning tuple id (`TSlotDescriptor.parent`).
-    tuple_id: i32,
+    pub(crate) tuple_id: i32,
     /// StarRocks slot id, unique only within `tuple_id`.
-    slot_id: i32,
+    pub(crate) slot_id: i32,
 }
 
 impl SlotKey {
     /// Builds a slot key from its owning tuple and slot id.
-    fn new(tuple_id: i32, slot_id: i32) -> Self {
+    pub(crate) fn new(tuple_id: i32, slot_id: i32) -> Self {
         Self { tuple_id, slot_id }
     }
 }
@@ -157,7 +155,6 @@ impl TryFrom<&TDescriptorTable> for DescriptorTable {
                 SlotKey::new(parent_tuple_id, slot_id),
                 SlotInfo {
                     slot_id,
-                    column_pos: slot.column_pos.unwrap_or(slot_id),
                     col_name: slot
                         .col_name
                         .clone()
@@ -167,6 +164,11 @@ impl TryFrom<&TDescriptorTable> for DescriptorTable {
                 },
             );
 
+            // Wire order is the column order: the FE appends materialized slots in the same
+            // order as the positional expression lists that reference them (grouping keys in
+            // GROUP BY order, sort tuples ordering-slots-first). It is not sorted by slot id,
+            // and `TSlotDescriptor.column_pos` cannot be used instead -- the FE always sends
+            // -1 and the field is deprecated in the IDL.
             tuples
                 .get_mut(&parent_tuple_id)
                 .ok_or_else(|| {
@@ -176,15 +178,6 @@ impl TryFrom<&TDescriptorTable> for DescriptorTable {
                 })?
                 .slot_ids
                 .push(slot_id);
-        }
-
-        for (tuple_id, tuple) in tuples.iter_mut() {
-            tuple.slot_ids.sort_by_key(|slot_id| {
-                let slot = slots
-                    .get(&SlotKey::new(*tuple_id, *slot_id))
-                    .expect("slot id stored in tuple exists");
-                (slot.column_pos < 0, slot.column_pos, slot.slot_id)
-            });
         }
 
         Ok(Self {
@@ -228,21 +221,6 @@ impl DescriptorTable {
             .collect())
     }
 
-    /// Builds output names for a row layout described by tuple ids.
-    pub fn output_names_for_tuples(&self, row_tuples: &[i32]) -> Result<Vec<String>> {
-        row_tuples
-            .iter()
-            .copied()
-            .map(|tuple_id| {
-                self.materialized_slot_ids(tuple_id)?
-                    .into_iter()
-                    .map(|slot_id| self.slot(tuple_id, slot_id).map(SlotInfo::output_name))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()
-            .map(|names_by_tuple| names_by_tuple.into_iter().flatten().collect())
-    }
-
     /// Builds the Substrait schema for a StarRocks tuple.
     pub fn named_struct(&self, tuple_id: i32) -> Result<NamedStruct> {
         let (names, types): (Vec<_>, Vec<_>) = self
@@ -273,34 +251,6 @@ impl DescriptorTable {
         })
     }
 
-    /// Resolves a StarRocks `(tuple id, slot id)` to its zero-based field index in `row_tuples`.
-    ///
-    /// The tuple id comes from the `TSlotRef` and disambiguates slots: ids are unique only within
-    /// a tuple, so the same slot id can name different columns in different tuples.
-    pub fn slot_global_index(
-        &self,
-        tuple_id: i32,
-        slot_id: i32,
-        row_tuples: &[i32],
-    ) -> Result<usize> {
-        let mut offset = 0;
-        for &candidate_tuple in row_tuples {
-            let materialized = self.materialized_slot_ids(candidate_tuple)?;
-            if candidate_tuple == tuple_id
-                && let Some(index) = materialized
-                    .iter()
-                    .position(|candidate| *candidate == slot_id)
-            {
-                return Ok(offset + index);
-            }
-            offset += materialized.len();
-        }
-
-        Err(TranslateError::descriptor(format!(
-            "slot {slot_id} (tuple {tuple_id}) is not part of row_tuples {row_tuples:?}"
-        )))
-    }
-
     /// Returns the Substrait named-table path for a tuple's backing table.
     pub fn table_names_for_tuple(&self, tuple_id: i32) -> Result<Vec<String>> {
         let tuple = self.tuple(tuple_id)?;
@@ -323,6 +273,7 @@ impl DescriptorTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::row_layout::RowLayout;
     use starrocks_thrift::descriptors::{TSlotDescriptor, TTupleDescriptor};
     use starrocks_thrift::types::{
         TPrimitiveType, TScalarType, TTypeDesc, TTypeNode, TTypeNodeType,
@@ -379,40 +330,48 @@ mod tests {
 
     /// Verifies field indices accumulate each preceding tuple's materialized width.
     #[test]
-    fn slot_global_index_accumulates_offset_across_tuples() {
+    fn layout_accumulates_offset_across_tuples() {
         let desc = two_tuple_desc();
+        let layout = RowLayout::from_tuples(&desc, &[0, 1]).unwrap();
         // Tuple 0 contributes two columns, so tuple 1's slots start at index 2.
-        assert_eq!(desc.slot_global_index(0, 1, &[0, 1]).unwrap(), 0);
-        assert_eq!(desc.slot_global_index(0, 2, &[0, 1]).unwrap(), 1);
-        assert_eq!(desc.slot_global_index(1, 3, &[0, 1]).unwrap(), 2);
-        assert_eq!(desc.slot_global_index(1, 4, &[0, 1]).unwrap(), 3);
+        assert_eq!(layout.resolve(SlotKey::new(0, 1)).unwrap(), 0);
+        assert_eq!(layout.resolve(SlotKey::new(0, 2)).unwrap(), 1);
+        assert_eq!(layout.resolve(SlotKey::new(1, 3)).unwrap(), 2);
+        assert_eq!(layout.resolve(SlotKey::new(1, 4)).unwrap(), 3);
     }
 
     /// Verifies field indices follow the order tuples appear in `row_tuples`.
     #[test]
-    fn slot_global_index_follows_row_tuple_order() {
+    fn layout_follows_row_tuple_order() {
         let desc = two_tuple_desc();
+        let layout = RowLayout::from_tuples(&desc, &[1, 0]).unwrap();
         // Reversed layout: tuple 1's slots now come before tuple 0's.
-        assert_eq!(desc.slot_global_index(1, 3, &[1, 0]).unwrap(), 0);
-        assert_eq!(desc.slot_global_index(1, 4, &[1, 0]).unwrap(), 1);
-        assert_eq!(desc.slot_global_index(0, 1, &[1, 0]).unwrap(), 2);
-        assert_eq!(desc.slot_global_index(0, 2, &[1, 0]).unwrap(), 3);
+        assert_eq!(layout.resolve(SlotKey::new(1, 3)).unwrap(), 0);
+        assert_eq!(layout.resolve(SlotKey::new(1, 4)).unwrap(), 1);
+        assert_eq!(layout.resolve(SlotKey::new(0, 1)).unwrap(), 2);
+        assert_eq!(layout.resolve(SlotKey::new(0, 2)).unwrap(), 3);
     }
 
     /// Verifies a slot whose tuple is absent from the row layout is rejected.
     #[test]
-    fn slot_global_index_rejects_slot_outside_row_tuples() {
+    fn layout_rejects_slot_outside_row_tuples() {
         let desc = two_tuple_desc();
         // Slot 3 lives in tuple 1, which is absent from this row layout.
-        let err = desc.slot_global_index(1, 3, &[0]).unwrap_err();
+        let err = RowLayout::from_tuples(&desc, &[0])
+            .unwrap()
+            .resolve(SlotKey::new(1, 3))
+            .unwrap_err();
         assert!(matches!(err, TranslateError::Descriptor(_)));
     }
 
     /// Verifies an unknown slot id surfaces a descriptor error.
     #[test]
-    fn slot_global_index_reports_unknown_slot() {
+    fn layout_reports_unknown_slot() {
         let desc = two_tuple_desc();
-        let err = desc.slot_global_index(0, 99, &[0, 1]).unwrap_err();
+        let err = RowLayout::from_tuples(&desc, &[0, 1])
+            .unwrap()
+            .resolve(SlotKey::new(0, 99))
+            .unwrap_err();
         assert!(matches!(err, TranslateError::Descriptor(_)));
     }
 
@@ -438,12 +397,27 @@ mod tests {
         let desc = DescriptorTable::try_from(&desc_tbl).unwrap();
 
         // Resolving slot 1 in tuple 0 must not pick up tuple 1's slot 1.
-        assert_eq!(desc.slot_global_index(0, 1, &[0]).unwrap(), 0);
-        assert_eq!(desc.slot_global_index(0, 2, &[0]).unwrap(), 1);
+        assert_eq!(
+            RowLayout::from_tuples(&desc, &[0])
+                .unwrap()
+                .resolve(SlotKey::new(0, 1))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            RowLayout::from_tuples(&desc, &[0])
+                .unwrap()
+                .resolve(SlotKey::new(0, 2))
+                .unwrap(),
+            1
+        );
         assert_eq!(desc.slot(0, 1).unwrap().output_name(), "a");
         assert_eq!(desc.slot(1, 1).unwrap().output_name(), "x");
         assert_eq!(
-            desc.output_names_for_tuples(&[0]).unwrap(),
+            RowLayout::from_tuples(&desc, &[0])
+                .unwrap()
+                .output_names(&desc)
+                .unwrap(),
             vec!["a".to_string(), "b".to_string()]
         );
     }

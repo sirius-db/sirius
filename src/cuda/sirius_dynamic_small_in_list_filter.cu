@@ -16,22 +16,22 @@
 
 // sirius
 #include <log/logging.hpp>
-#include <op/dynamic_filter_device.hpp>
-#include <op/dynamic_filter_replica_reservation.hpp>
-#include <op/dynamic_filter_replica_space.hpp>
-#include <op/dynamic_filter_replica_transfer.hpp>
-#include <op/sirius_dynamic_filter.hpp>
+#include <op/dynamic_filter/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_space.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>
-#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
-#include <cudf/null_mask.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
 // cccl
-#include <cub/device/device_for.cuh>
+#include <cuda/dynamic_filter_probe.cuh>
+#include <thrust/copy.h>
 
 // cucascade
 #include <cucascade/error.hpp>
@@ -39,9 +39,11 @@
 
 // rmm
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/exec_policy.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 // cuda
 #include <cuda_runtime_api.h>
@@ -58,24 +60,22 @@
 
 namespace {
 
-/// @brief Per-row brute-force membership scan: out[idx] == true iff probe[idx] equals any of the m
-/// needles. For the small m this filter gates on (<= k_max_keys), a compare-all linear scan beats a
-/// hash probe and reserves no sentinel value.
+/// @brief Brute-force needle scan, the filter-specific half of detail::membership_probe_functor:
+/// a converted key is a member iff it equals any of the m needles. For the small m this filter
+/// gates on (<= k_max_keys), a compare-all linear scan beats a hash probe and reserves no sentinel
+/// value. String needles are 64-bit fingerprints compared as such (one code path, no byte
+/// compare), so the scan is exact for integers and no-false-negatives for strings.
 template <class KeyT>
-struct small_in_list_scan {
-  KeyT const* __restrict__ probe;
+struct needle_lookup {
   KeyT const* __restrict__ needles;
   int m;
-  bool* __restrict__ out;
-
-  __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
+  __device__ __forceinline__ bool operator()(KeyT x) const noexcept
   {
-    auto const x = probe[idx];
-    bool hit     = false;
+    bool hit = false;
     for (int j = 0; j < m; ++j) {
       hit |= (x == needles[j]);
     }
-    out[idx] = hit;
+    return hit;
   }
 };
 
@@ -87,9 +87,9 @@ namespace sirius::op {
 // Per-device needle storage (PIMPL)
 //===----------------------------------------------------------------------===//
 
-/// @brief Per-device raw snapshots of the build keys. Mirrors sirius_dynamic_in_list_filter's
-/// replica store, but a device_buffer of raw bytes needs no cuco set / typed variant: the outer
-/// class's _key_type / _num_keys decode the bytes in compute_mask.
+/// @brief Per-device raw snapshots of the build keys at the key rep. Mirrors
+/// sirius_dynamic_in_list_filter's replica store, but a device_buffer of raw bytes needs no cuco
+/// set / typed variant: the outer class's _domain.rep / _num_keys decode the bytes in compute_mask.
 struct sirius_dynamic_small_in_list_filter::needle_store {
   /// @brief One device-local needle buffer. Frees on its owning device (an rmm::device_buffer
   /// frees on the current device, so teardown must restore that device first — mirrors
@@ -135,79 +135,70 @@ struct sirius_dynamic_small_in_list_filter::needle_store {
 
 bool sirius_dynamic_small_in_list_filter::supports(cudf::column_view const& keys) noexcept
 {
-  auto const num_keys = static_cast<std::size_t>(keys.size());
-  auto const id       = keys.type().id();
-  return num_keys >= 1 && num_keys <= k_max_keys &&
-         (id == cudf::type_id::INT32 || id == cudf::type_id::INT64) && keys.null_count() == 0;
+  // The size gate counts the keys that will actually be stored: null build slots are compacted
+  // out at construction, so a nullable column qualifies on its valid rows.
+  auto const num_keys = static_cast<std::size_t>(keys.size() - keys.null_count());
+  return num_keys >= 1 && num_keys <= k_max_keys && membership_key_supported(keys.type());
 }
 
 sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
-  cudf::column_view const& keys, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
-  : _key_type(keys.type()), _num_keys(static_cast<std::size_t>(keys.size()))
+  cudf::column_view const& keys, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   if (!supports(keys)) {
     throw std::invalid_argument(
-      "[sirius_dynamic_small_in_list_filter] unsupported key column (1..k_max_keys INT32/INT64 "
-      "keys with no nulls required).");
+      "[sirius_dynamic_small_in_list_filter] unsupported key column (1..k_max_keys valid keys of "
+      "a membership_key_supported type required).");
   }
+  // Classifies, checks the DECIMAL128 fit, compacts null build keys out, and names the source
+  // device; `build.compacted` stays alive until the needle copy is queued on `stream`.
+  auto const build =
+    prepare_membership_build("[sirius_dynamic_small_in_list_filter]", keys, stream, mr);
+  _domain   = build.domain;
+  _num_keys = static_cast<std::size_t>(build.keys.size());
 
-  _store = std::make_unique<needle_store>();
-  if (cudaGetDevice(&_store->source_device) != cudaSuccess) {
-    throw std::runtime_error(
-      "[sirius_dynamic_small_in_list_filter] failed to identify source device.");
+  _store                = std::make_unique<needle_store>();
+  _store->source_device = build.source_device;
+
+  // Needles are stored at the rep so one kernel per (adapter, rep) serves every build carrier;
+  // a build carrier other than the rep converts per element on the way in.
+  auto const bytes = _num_keys * membership_rep_bytes(_domain.rep);
+  rmm::device_buffer needles{bytes, stream, mr};
+  bool const copied = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
+    using key_type = decltype(key_tag);
+    return detail::with_build_key_iterator<key_type>(
+      _domain, build.keys, stream, mr, [&](auto first, auto last) {
+        thrust::copy(
+          rmm::exec_policy_nosync(stream, mr), first, last, static_cast<key_type*>(needles.data()));
+      });
+  });
+  if (!copied) {
+    throw std::logic_error(
+      "[sirius_dynamic_small_in_list_filter] build carrier does not fit its rep.");
   }
-
-  auto const bytes = _num_keys * static_cast<std::size_t>(cudf::size_of(_key_type));
-  void const* src =
-    (_key_type.id() == cudf::type_id::INT32 ? static_cast<void const*>(keys.data<std::int32_t>())
-                                            : static_cast<void const*>(keys.data<std::int64_t>()));
-  _store->replicas.push_back(std::make_unique<needle_store::needle_replica>(
-    _store->source_device, rmm::device_buffer{src, bytes, stream, mr}));
+  _store->replicas.push_back(
+    std::make_unique<needle_store::needle_replica>(_store->source_device, std::move(needles)));
 }
 
 sirius_dynamic_small_in_list_filter::~sirius_dynamic_small_in_list_filter() = default;
 
 std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
   cudf::column_view const& probe,
+  std::uint32_t const* prior_mask_words,
   int device_id,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
-  if (probe.type() != _key_type) { return nullptr; }
   auto const* replica =
     _store ? _store->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica) { return nullptr; }
 
-  auto const n = probe.size();
-  auto out     = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto* const outp = out->mutable_view().data<bool>();
-  auto const m     = static_cast<int>(_num_keys);
-
-  switch (_key_type.id()) {
-    case cudf::type_id::INT32: {
-      auto const* needles = static_cast<std::int32_t const*>(replica->needles.data());
-      CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
-        n,
-        small_in_list_scan<std::int32_t>{probe.data<std::int32_t>(), needles, m, outp},
-        stream.value()));
-      break;
-    }
-    case cudf::type_id::INT64: {
-      auto const* needles = static_cast<std::int64_t const*>(replica->needles.data());
-      CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
-        n,
-        small_in_list_scan<std::int64_t>{probe.data<std::int64_t>(), needles, m, outp},
-        stream.value()));
-      break;
-    }
-    default: return nullptr;
-  }
-
-  if (probe.nullable() && probe.null_count() > 0) {
-    out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
-  }
-  return out;
+  auto const m = static_cast<int>(_num_keys);
+  return detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
+    using key_type      = decltype(key_tag);
+    auto const* needles = static_cast<key_type const*>(replica->needles.data());
+    return detail::run_membership_probe<key_type>(
+      _domain, probe, prior_mask_words, stream, mr, needle_lookup<key_type>{needles, m});
+  });
 }
 
 void sirius_dynamic_small_in_list_filter::replicate_to_devices(
@@ -233,8 +224,7 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
 
   // Retain every destination and pooled stream while direct peer copies are submitted. Waiting
   // only after this loop lets different destination GPUs transfer concurrently.
-  std::vector<std::pair<std::unique_ptr<needle_store::needle_replica>, rmm::cuda_stream_view>>
-    pending;
+  std::vector<std::pair<std::unique_ptr<needle_store::needle_replica>, ::cuda::stream_ref>> pending;
   pending.reserve(spaces.size());
   _store->replicas.reserve(_store->replicas.size() + spaces.size());
   for (auto const& target : spaces) {
@@ -257,16 +247,16 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
         continue;
       }
 
-      rmm::device_buffer destination{bytes, stream, reservation->allocator()};
-      detail::enqueue_replica_copy(destination.data(),
+      auto replica = std::make_unique<needle_store::needle_replica>(
+        device_id, rmm::device_buffer{bytes, stream, reservation->allocator()});
+      detail::enqueue_replica_copy(replica->needles.data(),
                                    rmm::cuda_device_id{device_id},
                                    source->needles.data(),
                                    source_space,
                                    bytes,
                                    stream,
                                    target.get_host_staging_space());
-      pending.emplace_back(
-        std::make_unique<needle_store::needle_replica>(device_id, std::move(destination)), stream);
+      pending.emplace_back(std::move(replica), stream);
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
         "[sirius_dynamic_small_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. That GPU "
@@ -287,7 +277,7 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.synchronize();
+      stream.sync();
       _store->replicas.push_back(std::move(replica));
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(

@@ -72,7 +72,7 @@ std::vector<T> decode_one_alp(std::vector<uint8_t> const& bytes,
 {
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_column_decode_input col;
   col.out_type   = type;
@@ -83,7 +83,7 @@ std::vector<T> decode_one_alp(std::vector<uint8_t> const& bytes,
                                         static_cast<uint32_t>(d_seg.size()),
                                         0,
                                         row_count}}});
-  auto t = gpu_decode_table({col}, stream.view(), mr);
+  auto t = gpu_decode_table({col}, stream, mr);
   REQUIRE(t->num_rows() == static_cast<cudf::size_type>(row_count));
   return download<T>(t->get_column(0).view().data<T>(), row_count, stream.value());
 }
@@ -95,7 +95,7 @@ std::vector<T> decode_one_alprd(std::vector<uint8_t> const& bytes,
 {
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_column_decode_input col;
   col.out_type   = type;
@@ -106,7 +106,7 @@ std::vector<T> decode_one_alprd(std::vector<uint8_t> const& bytes,
                                         static_cast<uint32_t>(d_seg.size()),
                                         0,
                                         row_count}}});
-  auto t = gpu_decode_table({col}, stream.view(), mr);
+  auto t = gpu_decode_table({col}, stream, mr);
   REQUIRE(t->num_rows() == static_cast<cudf::size_type>(row_count));
   return download<T>(t->get_column(0).view().data<T>(), row_count, stream.value());
 }
@@ -383,8 +383,8 @@ std::vector<T> decode_alp_invalid_with_canary(rmm::cuda_stream& stream,
                                               uint32_t total_rows)
 {
   std::vector<uint8_t> canary(size_t{total_rows} * sizeof(T), 0xCC);
-  rmm::device_buffer d_out(canary.data(), canary.size(), stream.view());
-  decode_alp_data(run, static_cast<uint8_t*>(d_out.data()), type, sizeof(T), stream.view(), mr);
+  rmm::device_buffer d_out(canary.data(), canary.size(), stream);
+  decode_alp_data(run, static_cast<uint8_t*>(d_out.data()), type, sizeof(T), stream, mr);
   return download<T>(d_out.data(), total_rows, stream.value());
 }
 
@@ -396,8 +396,8 @@ std::vector<T> decode_alprd_invalid_with_canary(rmm::cuda_stream& stream,
                                                 uint32_t total_rows)
 {
   std::vector<uint8_t> canary(size_t{total_rows} * sizeof(T), 0xCC);
-  rmm::device_buffer d_out(canary.data(), canary.size(), stream.view());
-  decode_alprd_data(run, static_cast<uint8_t*>(d_out.data()), type, sizeof(T), stream.view(), mr);
+  rmm::device_buffer d_out(canary.data(), canary.size(), stream);
+  decode_alprd_data(run, static_cast<uint8_t*>(d_out.data()), type, sizeof(T), stream, mr);
   return download<T>(d_out.data(), total_rows, stream.value());
 }
 
@@ -413,7 +413,7 @@ TEST_CASE("gpu_decode_table ALP - metadata_end past segment zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 32;
   gpu_codec_run run{CompressionType::COMPRESSION_ALP,
@@ -439,7 +439,7 @@ TEST_CASE("gpu_decode_table ALP - vector pointer below segment header zero-fills
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 16;
   gpu_codec_run run{CompressionType::COMPRESSION_ALP,
@@ -476,7 +476,7 @@ TEST_CASE("gpu_decode_table ALP - bit_width > sizeof(T)*8 zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_codec_run run{
     CompressionType::COMPRESSION_ALP,
@@ -511,7 +511,7 @@ TEST_CASE("gpu_decode_table ALP - exception payload past metadata_end zero-fills
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_codec_run run{
     CompressionType::COMPRESSION_ALP,
@@ -538,7 +538,7 @@ TEST_CASE("gpu_decode_table ALPRD - dict_size > MAX_DICTIONARY_SIZE zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const N = 8;
   gpu_codec_run run{
@@ -570,7 +570,7 @@ TEST_CASE("gpu_decode_table ALP - factor > 18 zero-fills", "[scan][decode][alp][
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_codec_run run{
     CompressionType::COMPRESSION_ALP,
@@ -601,7 +601,7 @@ TEST_CASE("gpu_decode_table ALP - exponent > MAX_EXPONENT zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_codec_run run{
     CompressionType::COMPRESSION_ALP,
@@ -638,7 +638,7 @@ TEST_CASE("gpu_decode_table ALP - vector pointer way past metadata_end zero-fill
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_codec_run run{
     CompressionType::COMPRESSION_ALP,
@@ -664,7 +664,7 @@ TEST_CASE("gpu_decode_table ALPRD - right_bw > sizeof(T)*8 zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const N = 4;
   gpu_codec_run run{
@@ -692,11 +692,11 @@ TEST_CASE("gpu_decode_table ALP bench-scale - f64 bw=11 verify", "[scan][decode]
   uint64_t const mask         = (uint64_t{1} << BIT_WIDTH) - 1u;
 
   auto seg_bytes = synth_alp_segment<double>(N_VECS, BIT_WIDTH);
-  auto d_seg     = upload(seg_bytes, stream.view());
+  auto d_seg     = upload(seg_bytes, stream);
   auto col =
     one_codec_column(F64, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
 
-  verify_decoded_column<double>(stream.view(), mr, col, [](uint32_t row) {
+  verify_decoded_column<double>(stream, mr, col, [](uint32_t row) {
     uint32_t const v = row >> 10;
     uint32_t const i = row & 1023u;
     return static_cast<double>(static_cast<int64_t>((uint64_t{i} ^ uint64_t{v}) & mask));
@@ -713,11 +713,11 @@ TEST_CASE("gpu_decode_table ALP bench-scale - f32 bw=20 verify", "[scan][decode]
   uint64_t const mask         = (uint64_t{1} << BIT_WIDTH) - 1u;
 
   auto seg_bytes = synth_alp_segment<float>(N_VECS, BIT_WIDTH);
-  auto d_seg     = upload(seg_bytes, stream.view());
+  auto d_seg     = upload(seg_bytes, stream);
   auto col =
     one_codec_column(F32, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
 
-  verify_decoded_column<float>(stream.view(), mr, col, [](uint32_t row) {
+  verify_decoded_column<float>(stream, mr, col, [](uint32_t row) {
     uint32_t const v = row >> 10;
     uint32_t const i = row & 1023u;
     return static_cast<float>(static_cast<int64_t>((uint64_t{i} ^ uint64_t{v}) & mask));
@@ -735,13 +735,13 @@ TEST_CASE("gpu_decode_table ALPRD bench-scale - f64 r48/l3 verify", "[scan][deco
   std::vector<uint16_t> dict = {0xAAAA, 0x5555, 0x1234, 0xABCD, 0xDEAD, 0xBEEF, 0xCAFE, 0xF00D};
 
   auto seg_bytes = synth_alprd_segment<double>(N_VECS, RIGHT_BW, LEFT_BW, dict);
-  auto d_seg     = upload(seg_bytes, stream.view());
+  auto d_seg     = upload(seg_bytes, stream);
   auto col =
     one_codec_column(F64, ROWS, CompressionType::COMPRESSION_ALPRD, {segment(d_seg, 0, ROWS)});
 
   uint64_t const r_mask = (uint64_t{1} << RIGHT_BW) - 1u;
   uint16_t const l_mask = static_cast<uint16_t>((uint16_t{1} << LEFT_BW) - 1u);
-  verify_decoded_column<double>(stream.view(), mr, col, [&dict](uint32_t row) {
+  verify_decoded_column<double>(stream, mr, col, [&dict](uint32_t row) {
     uint32_t const v          = row >> 10;
     uint32_t const i          = row & 1023u;
     uint32_t const left_idx   = (i ^ v) & l_mask;
@@ -767,11 +767,11 @@ TEST_CASE("gpu_decode_table ALP bench-scale - f64 bw=8 verify", "[scan][decode][
   uint64_t const mask         = (uint64_t{1} << BIT_WIDTH) - 1u;
 
   auto seg_bytes = synth_alp_segment<double>(N_VECS, BIT_WIDTH);
-  auto d_seg     = upload(seg_bytes, stream.view());
+  auto d_seg     = upload(seg_bytes, stream);
   auto col =
     one_codec_column(F64, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
 
-  verify_decoded_column<double>(stream.view(), mr, col, [](uint32_t row) {
+  verify_decoded_column<double>(stream, mr, col, [](uint32_t row) {
     uint32_t const v = row >> 10;
     uint32_t const i = row & 1023u;
     return static_cast<double>(static_cast<int64_t>((uint64_t{i} ^ uint64_t{v}) & mask));
@@ -788,11 +788,11 @@ TEST_CASE("gpu_decode_table ALP bench-scale - f64 bw=16 verify", "[scan][decode]
   uint64_t const mask         = (uint64_t{1} << BIT_WIDTH) - 1u;
 
   auto seg_bytes = synth_alp_segment<double>(N_VECS, BIT_WIDTH);
-  auto d_seg     = upload(seg_bytes, stream.view());
+  auto d_seg     = upload(seg_bytes, stream);
   auto col =
     one_codec_column(F64, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
 
-  verify_decoded_column<double>(stream.view(), mr, col, [](uint32_t row) {
+  verify_decoded_column<double>(stream, mr, col, [](uint32_t row) {
     uint32_t const v = row >> 10;
     uint32_t const i = row & 1023u;
     return static_cast<double>(static_cast<int64_t>((uint64_t{i} ^ uint64_t{v}) & mask));
@@ -808,12 +808,12 @@ TEST_CASE("gpu_decode_table ALP bench-scale - f32 bw=32 verify", "[scan][decode]
   constexpr uint8_t BIT_WIDTH = 32u;
 
   auto seg_bytes = synth_alp_segment<float>(N_VECS, BIT_WIDTH);
-  auto d_seg     = upload(seg_bytes, stream.view());
+  auto d_seg     = upload(seg_bytes, stream);
   auto col =
     one_codec_column(F32, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
 
   // bw=32 covers the full f32 mantissa width; no mask needed.
-  verify_decoded_column<float>(stream.view(), mr, col, [](uint32_t row) {
+  verify_decoded_column<float>(stream, mr, col, [](uint32_t row) {
     uint32_t const v = row >> 10;
     uint32_t const i = row & 1023u;
     return static_cast<float>(static_cast<int64_t>(uint64_t{i} ^ uint64_t{v}));
@@ -831,13 +831,13 @@ TEST_CASE("gpu_decode_table ALPRD bench-scale - f64 r56/l2 verify", "[scan][deco
   std::vector<uint16_t> dict = {0xAAAA, 0x5555, 0x1234, 0xABCD};
 
   auto seg_bytes = synth_alprd_segment<double>(N_VECS, RIGHT_BW, LEFT_BW, dict);
-  auto d_seg     = upload(seg_bytes, stream.view());
+  auto d_seg     = upload(seg_bytes, stream);
   auto col =
     one_codec_column(F64, ROWS, CompressionType::COMPRESSION_ALPRD, {segment(d_seg, 0, ROWS)});
 
   uint64_t const r_mask = (uint64_t{1} << RIGHT_BW) - 1u;
   uint16_t const l_mask = static_cast<uint16_t>((uint16_t{1} << LEFT_BW) - 1u);
-  verify_decoded_column<double>(stream.view(), mr, col, [&dict](uint32_t row) {
+  verify_decoded_column<double>(stream, mr, col, [&dict](uint32_t row) {
     uint32_t const v          = row >> 10;
     uint32_t const i          = row & 1023u;
     uint32_t const left_idx   = (i ^ v) & l_mask;

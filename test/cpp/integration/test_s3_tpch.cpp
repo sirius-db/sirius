@@ -6,8 +6,10 @@
  */
 
 #include "catch.hpp"
+#include "sirius_context.hpp"
 #include "sirius_extension.hpp"
-#include "utils/s3_container.hpp"
+#include "utils/s3_backend.hpp"
+#include "utils/s3_test_env.hpp"
 #include "utils/tpch_queries.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
@@ -31,33 +33,13 @@
 
 namespace {
 
+using sirius::test::s3::env_or;
+using sirius::test::s3::sql_quote;
+
 namespace fs = std::filesystem;
 
 constexpr std::array<std::string_view, 8> kS3TpchTables = {
   "nation", "region", "customer", "orders", "part", "partsupp", "supplier", "lineitem"};
-
-std::string tpch_env_or(std::string_view name, std::string fallback = {})
-{
-  auto const* value = std::getenv(std::string{name}.c_str());
-  return value != nullptr ? std::string{value} : std::move(fallback);
-}
-
-bool tpch_truthy_env(std::string_view name)
-{
-  auto const value = tpch_env_or(name);
-  return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES";
-}
-
-std::string tpch_sql_quote(std::string_view value)
-{
-  std::string out{"'"};
-  for (auto const c : value) {
-    if (c == '\'') out.push_back('\'');
-    out.push_back(c);
-  }
-  out.push_back('\'');
-  return out;
-}
 
 struct s3_tpch_env {
   std::string endpoint;
@@ -72,41 +54,37 @@ struct s3_tpch_env {
 
 std::optional<s3_tpch_env> load_s3_tpch_env()
 {
-  if (!sirius::test::ensure_s3_container_env()) return std::nullopt;
+  if (!sirius::test::ensure_s3_test_env()) return std::nullopt;
 
-  auto endpoint   = tpch_env_or("SIRIUS_TEST_S3_ENDPOINT");
-  auto access_key = tpch_env_or("SIRIUS_TEST_S3_ACCESS_KEY");
-  auto secret_key = tpch_env_or("SIRIUS_TEST_S3_SECRET_KEY");
-  auto bucket     = tpch_env_or("SIRIUS_TEST_S3_BUCKET");
-  auto local_dir  = tpch_env_or("SIRIUS_TEST_S3_LOCAL_DIR");
+  auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
+  auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  auto secret_key = env_or("SIRIUS_TEST_S3_SECRET_KEY");
+  auto bucket     = env_or("SIRIUS_TEST_S3_BUCKET");
+  auto local_dir  = env_or("SIRIUS_TEST_S3_LOCAL_DIR");
   if (endpoint.empty() || access_key.empty() || secret_key.empty() || bucket.empty() ||
       local_dir.empty()) {
     return std::nullopt;
   }
 
   return s3_tpch_env{std::move(endpoint),
-                     tpch_env_or("SIRIUS_TEST_S3_REGION", "us-east-1"),
+                     env_or("SIRIUS_TEST_S3_REGION", "us-east-1"),
                      std::move(access_key),
                      std::move(secret_key),
                      std::move(bucket),
-                     tpch_env_or("SIRIUS_TEST_S3_SESSION_TOKEN"),
+                     env_or("SIRIUS_TEST_S3_SESSION_TOKEN"),
                      fs::path{std::move(local_dir)} / "parquet",
-                     fs::path{tpch_env_or("SIRIUS_TEST_S3_TPCH_LOCAL_DIR")}};
+                     fs::path{env_or("SIRIUS_TEST_S3_TPCH_LOCAL_DIR")}};
 }
 
 bool should_skip_s3_tpch_env(std::optional<s3_tpch_env> const& env)
 {
-  if (env.has_value()) return false;
-  if (tpch_truthy_env("SIRIUS_TEST_S3_STRICT")) {
-    FAIL("SIRIUS_TEST_S3_* environment is required in strict mode");
-  }
-  SUCCEED("SIRIUS_TEST_S3_* not set; skipping S3 TPC-H test");
-  return true;
+  return sirius::test::s3::skip_or_fail_unless(env.has_value(),
+                                               "SIRIUS_TEST_S3_* environment is not configured");
 }
 
 class s3_tpch_config_guard {
  public:
-  s3_tpch_config_guard(s3_tpch_env const& env, bool sf1)
+  s3_tpch_config_guard(s3_tpch_env const& /*env*/, bool sf1)
   {
     if (auto const* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       original_config_ = current;
@@ -147,31 +125,14 @@ class s3_tpch_config_guard {
            "    disk:\n"
            "      - disk_id: 0\n"
            "        mount_path: "
-        << tpch_sql_quote((dir_ / "disk_memory").string())
+        << sql_quote((dir_ / "disk_memory").string())
         << "\n"
            "        memory_capacity: "
         << disk_capacity
         << "\n"
            "  executor:\n"
            "    scan_manager:\n"
-           "      object_store:\n"
-           "        endpoint: "
-        << tpch_sql_quote(env.endpoint)
-        << "\n"
-           "        region: "
-        << tpch_sql_quote(env.region)
-        << "\n"
-           "        access_key: "
-        << tpch_sql_quote(env.access_key)
-        << "\n"
-           "        secret_key: "
-        << tpch_sql_quote(env.secret_key) << "\n";
-    if (!env.session_token.empty()) {
-      out << "        session_token: " << tpch_sql_quote(env.session_token) << "\n";
-    }
-    out << "        tls_verify: false\n"
            "      rest:\n"
-           "        max_connections: 8\n"
            "        request_timeout_s: 30\n";
     out.close();
     REQUIRE(out);
@@ -299,7 +260,7 @@ class s3_tpch_suite {
                            : (fs::path{root} / (std::string{table} + ".parquet")).string();
       tpch_require_query_ok(connection,
                             "CREATE OR REPLACE VIEW " + std::string{table} +
-                              " AS SELECT * FROM read_parquet(" + tpch_sql_quote(path) + ");");
+                              " AS SELECT * FROM read_parquet(" + sql_quote(path) + ");");
     }
   }
 
@@ -319,6 +280,18 @@ class s3_tpch_suite {
     gpu_db_ = std::make_unique<duckdb::DuckDB>(nullptr);
     tpch_load_sirius_extension(*gpu_db_);
     gpu_connection_ = std::make_unique<duckdb::Connection>(*gpu_db_);
+    auto context =
+      gpu_connection_->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(context);
+    sirius::io::object_store_config object_store;
+    object_store.endpoint      = env_.endpoint;
+    object_store.region        = env_.region;
+    object_store.access_key    = env_.access_key;
+    object_store.secret_key    = env_.secret_key;
+    object_store.session_token = env_.session_token;
+    object_store.tls_verify    = false;
+    context->get_config().set_object_store_config(object_store);
+    context->get_scan_manager().install_s3_config("s3://" + env_.bucket, object_store);
     auto const root = "s3://" + env_.bucket + "/" + object_prefix_;
     create_views(*gpu_connection_, root, true);
     tpch_require_query_ok(*gpu_connection_, "SET gpu_execution = true;");
@@ -372,10 +345,12 @@ class s3_tpch_suite {
   std::string object_prefix_;
   fs::path local_dir_;
   s3_tpch_config_guard config_guard_;
-  std::unique_ptr<duckdb::DuckDB> gpu_db_;
-  std::unique_ptr<duckdb::Connection> gpu_connection_;
+  // Outlive the GPU database: each Sirius context restores the device memory
+  // resource that was current when it was created.
   duckdb::DuckDB cpu_db_;
   duckdb::Connection cpu_connection_;
+  std::unique_ptr<duckdb::DuckDB> gpu_db_;
+  std::unique_ptr<duckdb::Connection> gpu_connection_;
 };
 
 }  // namespace
@@ -394,8 +369,8 @@ TEST_CASE("transparent S3 TPC-H Q1-Q22 match the tiny local CPU oracle",
 TEST_CASE("transparent S3 TPC-H Q1-Q22 match the SF1 local CPU oracle",
           "[.][s3][integration][sql][tpch][large]")
 {
-  if (!tpch_truthy_env("SIRIUS_TEST_S3_TPCH")) {
-    SUCCEED("SIRIUS_TEST_S3_TPCH is not enabled");
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::s3::truthy_env("SIRIUS_TEST_S3_TPCH"),
+                                            "SIRIUS_TEST_S3_TPCH is not enabled")) {
     return;
   }
 

@@ -134,6 +134,12 @@ void buffer_pool::deallocate_bulk(std::vector<std::byte*>&& out, int numa) noexc
   _n_allocated_chunks.fetch_sub(count, std::memory_order_relaxed);
 }
 
+void buffer_pool::deallocate_bulk(std::span<std::byte* const> blocks, int numa) noexcept
+{
+  if (blocks.empty()) return;
+  deallocate_bulk(std::vector<std::byte*>(blocks.begin(), blocks.end()), numa);
+}
+
 size_t buffer_pool::reservation_size_for_prefetching() const noexcept { return _reserved_size; }
 
 size_t buffer_pool::max_allowed_budget_for_prefetching() const noexcept

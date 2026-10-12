@@ -46,6 +46,7 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
@@ -229,8 +230,12 @@ std::unique_ptr<cudf::table> make_string_table(std::vector<std::string> const& v
                cudaMemcpyHostToDevice);
   }
 
-  auto col = cudf::make_strings_column(
-    n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{0, stream, mr});
+  auto col =
+    cudf::make_strings_column(n,
+                              std::move(offsets_col),
+                              std::move(chars_buf),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
   return std::make_unique<cudf::table>(std::move(cols));

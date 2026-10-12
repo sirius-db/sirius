@@ -60,12 +60,12 @@ fn tier_usage(resource_id: Uuid, bytes: u64) -> Option<Usage<MemoryTier>> {
     })
 }
 
-fn batch_event(id: Uuid, ts: u64, seq: u64, state: BatchPlacementTransition) -> Event<SiriusEvent> {
+fn batch_event(id: Uuid, ts: u64, seq: u16, state: BatchPlacementTransition) -> Event<SiriusEvent> {
     Event::new(id, ts, SiriusEvent::BatchPlacement(FsmEvent { seq, state }))
 }
 
 fn memory_tier_events(id: Uuid, parent: Uuid, name: &str, bytes: u64) -> Vec<Event<SiriusEvent>> {
-    let event = |ts: u64, seq: u64, state: MemoryTierTransition| {
+    let event = |ts: u64, seq: u16, state: MemoryTierTransition| {
         Event::new(id, ts, SiriusEvent::MemoryTier(FsmEvent { seq, state }))
     };
     vec![
@@ -145,7 +145,7 @@ fn fixture(with_batches: bool) -> Fixture {
     events.extend(memory_tier_events(disk_id, engine_id, "DISK", 16 << 30));
 
     // The query FSM: its first transition is the query epoch.
-    let query_event = |ts: u64, seq: u64, state: query::QueryTransition| {
+    let query_event = |ts: u64, seq: u16, state: query::QueryTransition| {
         Event::new(query_id, ts, SiriusEvent::Query(FsmEvent { seq, state }))
     };
     events.extend([
@@ -335,7 +335,7 @@ fn fixture(with_batches: bool) -> Fixture {
 /// - t=1000 exit
 fn add_working_space_task(fixture: &mut Fixture) {
     let task_id = fixture.task_1_id;
-    let task_event = |ts: u64, seq: u64, state: TaskTransition| {
+    let task_event = |ts: u64, seq: u16, state: TaskTransition| {
         Event::new(task_id, ts, SiriusEvent::Task(FsmEvent { seq, state }))
     };
     fixture.events.extend([
