@@ -991,6 +991,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("AVG records its two-column local accumulator schema below MERGE_AGGREGATE")
   {
+    // AVG(INTEGER) accumulates in 128 bits (a wide integer sum), so its local sum is
+    // DECIMAL(38, 0) and its count BIGINT.
     auto plan = generate_sirius_plan(*con, "SELECT avg(val) FROM big_left");
     INFO(tree_to_string(plan.get()));
 
@@ -1002,7 +1004,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* local = merge->children[0].get();
     REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
     duckdb::vector<sirius::logical_type> const expected_local_types{
-      sirius::logical_type::make(sirius::type_id::BIGINT),
+      sirius::logical_type::make_decimal(38, 0),
       sirius::logical_type::make(sirius::type_id::BIGINT)};
     CHECK(local->get_types() == expected_local_types);
   }
