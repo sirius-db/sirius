@@ -8,9 +8,7 @@ collector = ["quent-instrumentation/io-collector"]
 
 [dependencies]
 quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b", features = [
-    "io-msgpack",
     "io-ndjson",
-    "io-postcard",
 ] }
 serde = { version = "1", features = ["derive"] }
 

@@ -11,8 +11,8 @@ crate-type = ["staticlib"]
 cxx = "1"
 instrumentation-model = { path = "../model" }
 quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
-quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b", features = ["io-ndjson", "io-msgpack", "io-postcard"] }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b", default-features = false, features = ["ndjson", "msgpack", "postcard"] }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b", features = ["io-ndjson"] }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b", default-features = false, features = ["ndjson"] }
 nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b", features = ["static-injection"] }
 quent-nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
 quent-nvtx-events = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }

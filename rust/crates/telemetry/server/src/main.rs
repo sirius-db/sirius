@@ -41,7 +41,7 @@ struct Args {
     #[arg(long, default_value = defaults::QUENT_COLLECTOR_ADDRESS, env = env::QUENT_COLLECTOR_ADDRESS)]
     collector_address: String,
 
-    #[arg(long, default_value = "ndjson", env = env::QUENT_COLLECTOR_EXPORTER)]
+    #[arg(long, default_value = "ndjson", value_parser = ["ndjson"], env = env::QUENT_COLLECTOR_EXPORTER)]
     exporter: String,
 
     #[arg(long, default_value = "data", env = env::QUENT_COLLECTOR_OUTPUT_DIR)]
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_level,
         cors_address,
         collector_address,
-        exporter,
+        exporter: _,
         output_dir,
         analyzer_address,
     } = Args::parse();
@@ -80,16 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lister_output_dir = output_dir.clone();
     let nvtx_output_dir = output_dir.clone();
 
-    let format = match exporter.as_str() {
-        "ndjson" => Format::Ndjson,
-        "msgpack" => Format::Msgpack,
-        "postcard" => Format::Postcard,
-        other => return Err(format!("unknown exporter: {other}").into()),
-    };
     // Each context exports under `output_dir/<context-id>/<entity>/`, so the
     // collector writes per-entity streams beneath output_dir.
-    let exporter_kind =
-        ExporterOptions::FileSystem(filesystem::exporter::Options::new(format, output_dir));
+    let exporter_kind = ExporterOptions::FileSystem(filesystem::exporter::Options::new(
+        Format::Ndjson,
+        output_dir,
+    ));
 
     // The collector builds a fresh sink per incoming context, replaying each
     // remote source's events under that source's own context id.

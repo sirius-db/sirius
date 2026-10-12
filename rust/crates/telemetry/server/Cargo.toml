@@ -15,10 +15,10 @@ sirius-telemetry-analyzer = { path = "../analyzer" }
 sirius-telemetry-store = { path = "../store" }
 nvtx-server = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
 quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b", default-features = false, features = ["ndjson"] }
 quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
 quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b" }
-quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
+quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "bcfe076a8fcb05b8a1fae4efb9e1e2bfee9cca2b", default-features = false, features = ["io-ndjson"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 

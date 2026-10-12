@@ -52,8 +52,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         instrumentation_path: "instrumentation_model".to_owned(),
         exporters: quent_schema_codegen_cpp::Exporters {
             ndjson: true,
-            msgpack: true,
-            postcard: true,
             ..Default::default()
         },
         nvtx: quent_schema_codegen_cpp::NvtxSupport::Enabled,

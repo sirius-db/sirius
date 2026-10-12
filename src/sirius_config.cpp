@@ -392,8 +392,8 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   r.optional("enable_quent", opt.enable_quent);
   r.optional("enable_nvtx", opt.enable_nvtx);
   r.optional("exporter", opt.exporter, [](std::string const& value) {
-    if (value == "ndjson" || value == "msgpack" || value == "postcard") return true;
-    throw std::runtime_error("must be one of ndjson, msgpack, postcard");
+    if (value == QUENT_NDJSON_EXPORTER) { return true; }
+    throw std::runtime_error("must be ndjson");
   });
   r.optional("output_directory", opt.output_directory, [](std::string const& value) {
     if (!value.empty()) return true;
