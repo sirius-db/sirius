@@ -642,9 +642,9 @@ void task_creator::manager_loop()
     // creation lambda returns. Entered once, left once, with no separate bookkeeping to keep in
     // sync. (Attribution cannot happen at reserve() time: the manager reserves before it knows
     // which query it will serve, and an idle manager must not be counted against anyone.)
-    slot.attach(query_id);
-
     try {
+      // Attribution can allocate; contain failures in this query's error handler.
+      slot.attach(query_id);
       std::vector<std::shared_ptr<pipeline::sirius_pipeline>> visited_pipelines;
       auto* requested_node = node;
       auto const next      = get_operator_for_next_task(node, visited_pipelines);
