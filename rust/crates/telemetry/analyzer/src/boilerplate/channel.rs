@@ -17,19 +17,18 @@ impl EntityEventAccumulator for ChannelAccumulator {
     type Payload = schema::ChannelEvent;
 
     fn push(&mut self, event: Self::Payload) {
-        if let schema::ChannelEvent::Declaration {
+        let schema::ChannelEvent::Declaration {
             source_tier,
             destination_tier,
             worker_id,
             gpu_id,
             label,
-        } = event
-        {
-            self.instance_name = Some(label);
-            self.parent_group_id = Some(gpu_id.map_or(worker_id.target, |gpu| gpu.target));
-            self.source_id = Some(source_tier.target);
-            self.target_id = Some(destination_tier.target);
-        }
+        } = event;
+
+        self.instance_name = Some(label);
+        self.parent_group_id = Some(gpu_id.map_or(worker_id.target, |gpu| gpu.target));
+        self.source_id = Some(source_tier.target);
+        self.target_id = Some(destination_tier.target);
     }
 }
 

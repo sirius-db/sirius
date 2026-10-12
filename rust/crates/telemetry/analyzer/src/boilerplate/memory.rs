@@ -16,17 +16,16 @@ impl EntityEventAccumulator for MemoryAccumulator {
     type Payload = schema::MemorySpaceEvent;
 
     fn push(&mut self, event: Self::Payload) {
-        if let schema::MemorySpaceEvent::Declaration {
+        let schema::MemorySpaceEvent::Declaration {
             label,
             bounds,
             worker_id,
             gpu_id,
-        } = event
-        {
-            self.instance_name = Some(label);
-            self.parent_group_id = Some(gpu_id.map_or(worker_id.target, |gpu| gpu.target));
-            self.bounds = Some(bounds);
-        }
+        } = event;
+
+        self.instance_name = Some(label);
+        self.parent_group_id = Some(gpu_id.map_or(worker_id.target, |gpu| gpu.target));
+        self.bounds = Some(bounds);
     }
 }
 

@@ -17,10 +17,8 @@ impl EntityEventAccumulator for ThreadGroupAccumulator {
             label,
             worker_id,
             gpu_device_id,
-        } = event
-        else {
-            return;
-        };
+        } = event;
+
         self.instance_name = Some(label);
         self.parent_group_id = Some(gpu_device_id.map_or(worker_id.target, |gpu| gpu.target));
     }

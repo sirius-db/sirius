@@ -16,10 +16,10 @@ impl EntityEventAccumulator for ExecutorThreadAccumulator {
     type Payload = ExecutorThreadEvent;
 
     fn push(&mut self, event: Self::Payload) {
-        if let ExecutorThreadEvent::Spawned { label, group_id } = event {
-            self.instance_name = Some(label);
-            self.parent_group_id = Some(group_id.target);
-        }
+        let ExecutorThreadEvent::Spawned { label, group_id } = event;
+
+        self.instance_name = Some(label);
+        self.parent_group_id = Some(group_id.target);
     }
 }
 

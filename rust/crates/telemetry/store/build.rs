@@ -14,16 +14,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:warning={warning}");
     }
 
-    let generated = generate(
+    // YAML validation already checks metadata that code generation does not validate.
+    generate(
         &parsed.schema,
         &Options {
             combined_event: true,
             ..Options::default()
         },
     )?;
-    for warning in generated.warnings {
-        println!("cargo:warning={warning}");
-    }
 
     Ok(())
 }

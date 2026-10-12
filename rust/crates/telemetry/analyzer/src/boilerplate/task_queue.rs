@@ -15,15 +15,14 @@ impl EntityEventAccumulator for TaskQueueAccumulator {
     type Payload = schema::TaskQueueEvent;
 
     fn push(&mut self, event: Self::Payload) {
-        if let schema::TaskQueueEvent::Created {
+        let schema::TaskQueueEvent::Created {
             worker_id,
             gpu_device_id,
             label,
-        } = event
-        {
-            self.instance_name = Some(label);
-            self.parent_group_id = Some(gpu_device_id.map_or(worker_id.target, |gpu| gpu.target));
-        }
+        } = event;
+
+        self.instance_name = Some(label);
+        self.parent_group_id = Some(gpu_device_id.map_or(worker_id.target, |gpu| gpu.target));
     }
 }
 

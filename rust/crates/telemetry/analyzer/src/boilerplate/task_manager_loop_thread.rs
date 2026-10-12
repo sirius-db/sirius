@@ -15,10 +15,10 @@ impl EntityEventAccumulator for TaskManagerLoopThreadAccumulator {
     type Payload = schema::TaskManagerLoopThreadEvent;
 
     fn push(&mut self, event: Self::Payload) {
-        if let schema::TaskManagerLoopThreadEvent::Spawned { label, group_id } = event {
-            self.instance_name = Some(label);
-            self.parent_group_id = Some(group_id.target);
-        }
+        let schema::TaskManagerLoopThreadEvent::Spawned { label, group_id } = event;
+
+        self.instance_name = Some(label);
+        self.parent_group_id = Some(group_id.target);
     }
 }
 

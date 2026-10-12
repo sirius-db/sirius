@@ -377,16 +377,13 @@ impl QuentViewer for Viewer {
             .map_err(quent_io::ImporterError::other)?;
         let worker_analysis_target_ids = EventLoader::<schema::Worker>::events(&loader)
             .map_err(quent_io::ImporterError::other)?
-            .filter_map(|event| match event {
-                Ok(Event {
-                    data:
-                        schema::WorkerEvent::Init {
-                            parent_engine_id, ..
-                        },
-                    ..
-                }) => Some(Ok(parent_engine_id.target)),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
+            .map(|event| {
+                event.map(|event| {
+                    let schema::WorkerEvent::Init {
+                        parent_engine_id, ..
+                    } = event.data;
+                    parent_engine_id.target
+                })
             })
             .collect::<Result<HashSet<_>, _>>()
             .map_err(quent_io::ImporterError::other)?;
