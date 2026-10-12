@@ -42,7 +42,7 @@ When a query never returns or the process appears stuck. Hangs are typically cau
    export SIRIUS_LOG_LEVEL=trace
    export SIRIUS_LOG_DIR=build/release/log/run_$(date +%s)
    mkdir -p $SIRIUS_LOG_DIR
-   timeout <TIMEOUT> build/release/duckdb <db_path> <<'EOF'
+   timeout <TIMEOUT> sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF'
    CALL gpu_execution('<QUERY>');
    EOF
    ```
@@ -85,7 +85,7 @@ For deadlocks and thread-level hangs where log analysis is insufficient:
 
 1. Run the query **without** timeout (let it hang). Use `relwithdebinfo` or `clang-debug`:
    ```bash
-   build/<preset>/duckdb <db_path> <<'EOF' &
+   sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF' &
    CALL gpu_execution('<QUERY>');
    EOF
    HANG_PID=$\!
@@ -132,7 +132,7 @@ Sirius installs a signal handler (via `install_segfault_backtrace_handler()`) th
    export SIRIUS_LOG_LEVEL=trace
    export SIRIUS_LOG_DIR=build/release/log/run_$(date +%s)
    mkdir -p $SIRIUS_LOG_DIR
-   build/release/duckdb <db_path> <<'EOF' 2>&1 | tee /tmp/segfault_output.txt
+   sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF' 2>&1 | tee /tmp/segfault_output.txt
    CALL gpu_execution('<QUERY>');
    EOF
    ```
@@ -193,7 +193,7 @@ Summarize Phase 1 findings. Offer ASan when the crash appears to be a CPU-side m
   export SIRIUS_LOG_LEVEL=trace
   export SIRIUS_LOG_DIR=build/clang-debug/log/run_$(date +%s)
   mkdir -p $SIRIUS_LOG_DIR
-  ASAN_OPTIONS="detect_leaks=1:halt_on_error=1" build/clang-debug/duckdb <db_path> <<'EOF'
+  ASAN_OPTIONS="detect_leaks=1:halt_on_error=1" sirius-duckdb/build/debug/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/debug/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF'
   CALL gpu_execution('<QUERY>');
   EOF
   ```
@@ -212,7 +212,7 @@ Use when Phase 1 points to a GPU memory error (crash during/after a CUDA kernel 
 
 Build with debug symbols (`clang-debug` or `relwithdebinfo`):
 ```bash
-compute-sanitizer --tool memcheck build/<preset>/duckdb <<'EOF'
+compute-sanitizer --tool memcheck sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';" <<'EOF'
 CALL gpu_execution('<QUERY>');
 EOF
 ```
@@ -232,7 +232,7 @@ Fallback when ASan and Compute Sanitizer don't find the issue, or when you need 
   ```
 - Run with cuda-gdb (replace `<preset>` with chosen preset):
   ```bash
-  cuda-gdb --batch -ex run -ex bt -ex quit --args build/<preset>/duckdb
+  cuda-gdb --batch -ex run -ex bt -ex quit --args sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';"
   ```
 - Parse the backtrace to identify the exact file, line, and call stack
 - For GPU-side crashes, cuda-gdb can inspect device threads and shared memory
@@ -265,7 +265,7 @@ When the query produces an exception, error message, unexpected fallback to CPU,
    export SIRIUS_LOG_LEVEL=trace
    export SIRIUS_LOG_DIR=build/release/log/run_$(date +%s)
    mkdir -p $SIRIUS_LOG_DIR
-   build/release/duckdb <db_path> <<'EOF'
+   sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';" <db_path> <<'EOF'
    CALL gpu_execution('<QUERY>');
    EOF
    ```
@@ -324,7 +324,7 @@ For errors that are hard to reproduce or where the exception obscures the true o
     -ex run \
     -ex bt \
     -ex quit \
-    --args build/<preset>/duckdb
+    --args sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';"
   ```
   This catches C++ exceptions at the throw site, before unwinding obscures the call stack.
 - For CUDA errors, set a breakpoint on the CUDA error handler:
@@ -334,7 +334,7 @@ For errors that are hard to reproduce or where the exception obscures the true o
     -ex run \
     -ex bt \
     -ex quit \
-    --args build/<preset>/duckdb
+    --args sirius-duckdb/build/<preset>/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/<preset>/extension/sirius/sirius.duckdb_extension';"
   ```
 
 ### Runtime error analysis checklist

@@ -25,6 +25,7 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/regex/regex_playground.hpp>
+#include <expression_evaluator/round_floating_point.hpp>
 #include <helper/logical_type.hpp>
 #include <helper/timestamp_semantics.hpp>
 #include <sirius/exception.hpp>
@@ -421,6 +422,21 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
                            ? cudf::strings::to_upper(strings, _stream, _mr)
                            : cudf::strings::to_lower(strings, _stream, _mr);
     return evaluate_result(std::move(result_column));
+  }
+  if (resolved_id == function_id::round) {
+    // Planning admits FLOAT and DOUBLE inputs with an optional constant INTEGER precision.
+    D_ASSERT(args.size() == 1 || args.size() == 2);
+    int32_t precision = 0;
+    if (args.size() == 2) {
+      D_ASSERT(args[1]->holds<sirius::ast::constant>());
+      precision = std::get<int32_t>(args[1]->get<sirius::ast::constant>().payload);
+    }
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    return evaluate_result(round_floating_point(input.get_column_view(), precision, _stream, _mr));
   }
   if (resolved_id == function_id::strlen) {
     D_ASSERT(args.size() == 1);
