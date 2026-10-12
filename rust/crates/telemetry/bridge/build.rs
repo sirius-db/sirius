@@ -18,10 +18,24 @@ fn copy_headers(source: &Path, destination: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let target = destination.join(entry.file_name());
+        let source = entry.path();
+
+        // Recurse before reading contents; directories are not files.
         if entry.file_type()?.is_dir() {
-            copy_headers(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), target)?;
+            copy_headers(&source, &target)?;
+            continue;
+        }
+
+        let contents = std::fs::read(&source)?;
+        let changed = match std::fs::read(&target) {
+            Ok(existing) => existing != contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error),
+        };
+
+        // Preserve timestamps so unchanged headers do not rebuild C++ consumers.
+        if changed {
+            std::fs::copy(source, target)?;
         }
     }
     Ok(())
@@ -61,7 +75,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for subtree in ["rust", "telemetry-bridge/gen"] {
             copy_headers(&include_dir.join(subtree), &public_include.join(subtree))?;
         }
-        println!("cargo:rerun-if-changed={}", public_include.display());
     }
     Ok(())
 }
