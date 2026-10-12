@@ -233,6 +233,8 @@ void sirius_engine::execute()
   try {
     future.get();
     sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
+    // Metadata workers borrow scan operators; drain them before releasing the plan.
+    sirius_ctx->get_scan_manager().drain_query(query_id_);
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     cancel_dynamic_filter_publications();
@@ -241,11 +243,13 @@ void sirius_engine::execute()
     // this drain, tasks still running in the thread pool hold raw pointers to
     // those repositories and cause a use-after-free / heap corruption.
     sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
+    sirius_ctx->get_scan_manager().drain_query(query_id_);
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
     cancel_dynamic_filter_publications();
     sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
+    sirius_ctx->get_scan_manager().drain_query(query_id_);
     throw;
   }
 
