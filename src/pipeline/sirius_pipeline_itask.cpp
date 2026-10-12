@@ -50,7 +50,6 @@ sirius_pipeline_itask::~sirius_pipeline_itask()
     _telemetry_fsm.finalizing({
       .success = false,
     });
-    _telemetry_fsm.exit();
   } catch (std::exception const& e) {
     SIRIUS_LOG_WARN("sirius_pipeline_itask destructor failed: {}", e.what());
   } catch (...) {

@@ -32,7 +32,6 @@
 
 #include <rmm/cuda_device.hpp>
 
-#include <absl/cleanup/cleanup.h>
 #include <util/stream_check_wrapper.hpp>
 
 #include <algorithm>
@@ -113,9 +112,6 @@ void gpu_pipeline_executor::manager_loop()
     .group_id = _telemetry_context->gpu_device_telemetry_handles(_memory_space->get_device_id())
                   .manager_threads.id(),
   });
-  absl::Cleanup exit_manager_thread = [&manager_thread_handle] {
-    telemetry::exit_from_destructor(manager_thread_handle, "executor manager thread");
-  };
 
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   sirius::util::enable_log_on_default_stream();
@@ -492,7 +488,6 @@ void gpu_pipeline_executor::manager_loop()
             pipeline_task->telemetry_fsm().finalizing({
               .success = false,
             });
-            pipeline_task->telemetry_fsm().exit();
           }
           this->schedule(std::move(new_task));
           return;
@@ -515,7 +510,6 @@ void gpu_pipeline_executor::manager_loop()
         }
         if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
           pipeline_task->telemetry_fsm().finalizing({.success = true});
-          pipeline_task->telemetry_fsm().exit();
           pipeline_task->set_telemetry_finalized();
         }
         task.reset();

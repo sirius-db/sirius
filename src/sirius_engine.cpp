@@ -131,9 +131,9 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context,
 sirius_engine::~sirius_engine()
 {
   try {
-    query_handle_.exit();
+    query_handle_.finished();
   } catch (std::exception const& e) {
-    SIRIUS_LOG_ERROR("query telemetry exit failed: {}", e.what());
+    SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what());
   }
 }
 

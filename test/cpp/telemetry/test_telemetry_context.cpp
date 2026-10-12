@@ -296,10 +296,7 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups",
                         .gpu_device_id = gpu0.device.id(),
                         .label         = "gpu_pipeline-task-queue"});
 
-    task_queue.exit();
-    manager_thread.exit();
-    exec_thread.exit();
-  }  // Handles exit, then the context flushes the ndjson files.
+  }  // The context flushes the ndjson files.
 
   const auto lines = read_all_telemetry_lines(out_dir);
   REQUIRE(!lines.empty());

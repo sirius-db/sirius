@@ -16,7 +16,6 @@ entities:
       init:
         attributes:
           label: { option: string }
-      exit: {}
 
   QueryGroup:
     doc: Group of queries submitted to an engine.
@@ -34,7 +33,6 @@ entities:
           parent_engine_id: { scope-ref: Engine }
           process_id: string
           tag: string
-      exit: {}
 
   Plan:
     doc: A directed acyclic graph of query operators.
@@ -96,7 +94,6 @@ entities:
           worker_id: { scope-ref: Worker }
           gpu_device_id: { option: { ref: GpuDevice } }
           label: string
-      exit: {}
 
   ThreadGroup:
     doc: A bucket of threads
@@ -110,7 +107,6 @@ entities:
           # empty for case like scheduler thread-group that used by multiple
           # GPUs and sits underneath the engine.
           gpu_device_id: { option: { ref: GpuDevice } }
-      exit: {}
 
   TaskManagerLoopThread:
     doc: A thread coordinating task execution.
@@ -120,7 +116,6 @@ entities:
         attributes:
           label: string
           group_id: { scope-ref: ThreadGroup }
-      exit: {}
 
   ExecutorThread:
     doc: A thread executing tasks.
@@ -130,7 +125,6 @@ entities:
         attributes:
           label: string
           group_id: { scope-ref: ThreadGroup }
-      exit: {}
 
   MemorySpace:
     doc: A logical memory space data can reside in, like device memory, host memory or storage.
@@ -145,7 +139,6 @@ entities:
           bounds: { sets-resource-bounds: true }
           worker_id: { scope-ref: Worker }
           gpu_id: { option: { ref: GpuDevice } }
-      exit: {}
 
   Channel:
     doc: A logical channel over which data is transferred between two memory tiers.
@@ -159,7 +152,6 @@ entities:
           worker_id: { scope-ref: Worker }
           gpu_id: { option: { ref: GpuDevice } }
           label: string
-      exit: {}
 
 fsms:
   Query:
@@ -170,12 +162,12 @@ fsms:
         attributes:
           instance_name: string
           query_group_id: { scope-ref: QueryGroup }
-        to: [ planning, exit ]
+        to: [ planning, finished ]
       planning:
-        to: [ executing, exit ]
+        to: [ executing, finished ]
       executing:
-        to: [exit]
-      exit: {}
+        to: [finished]
+      finished: {}
 
   Task:
     doc: Scheduling and execution of one pipeline task.
@@ -231,8 +223,6 @@ fsms:
       finalizing:
         attributes:
           success: bool
-        to: [ exit ]
-      exit: {}
 
   DataBatch:
     doc: Physical batch residency and transfer
@@ -253,6 +243,4 @@ fsms:
           dest_memory: { uses: MemorySpace }
           channel: { uses: Channel }
         to: [ stationary, destructed ]
-      destructed:
-        to: [ exit ]
-      exit: { }
+      destructed: {}

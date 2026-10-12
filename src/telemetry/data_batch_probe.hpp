@@ -81,7 +81,6 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
   {
     try {
       handle_.destructed();
-      handle_.exit();
     } catch (...) {
       log_current_exception("destructor");
     }

@@ -31,7 +31,6 @@
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
 
-#include <absl/cleanup/cleanup.h>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -107,11 +106,7 @@ task_scheduler::task_scheduler(
   }
 }
 
-task_scheduler::~task_scheduler()
-{
-  stop();
-  telemetry::exit_from_destructor(_task_queue_telemetry, "scheduler task queue");
-}
+task_scheduler::~task_scheduler() { stop(); }
 
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
@@ -298,9 +293,6 @@ void task_scheduler::management_eventloop()
     .label    = "task-scheduler-thread",
     .group_id = _telemetry_context->shared_group_id(),
   });
-  absl::Cleanup exit_scheduler_thread = [&scheduler_thread_telemetry_handle] {
-    telemetry::exit_from_destructor(scheduler_thread_telemetry_handle, "scheduler thread");
-  };
 
   // Each pass tops up the two things the matcher needs — known ready devices
   // and a non-empty queue — sleeping only for whichever is missing. The queue

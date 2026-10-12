@@ -87,15 +87,7 @@ memory_context::memory_context(
   }
 }
 
-memory_context::~memory_context()
-{
-  for (auto& [key, handle] : channel_handles_) {
-    exit_from_destructor(handle, "channel");
-  }
-  for (auto& [id, handle] : memory_space_handles_) {
-    exit_from_destructor(handle, "memory space");
-  }
-}
+memory_context::~memory_context() = default;
 
 std::optional<std::reference_wrapper<const quent::Handle<quent::MemorySpace>>>
 memory_context::get_memory_handle(cucascade::memory::memory_space_id mem_space) const noexcept

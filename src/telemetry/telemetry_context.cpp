@@ -175,21 +175,7 @@ telemetry_context::gpu_device_telemetry_handles(int device_id) const
   return fallback_gpu_device_telemtry_handles();
 }
 
-telemetry_context::~telemetry_context()
-{
-  memory_context_.reset();
-  for (auto& [device_id, handles] : gpu_group_ids_) {
-    exit_from_destructor(handles.executor_threads, "gpu executor thread group");
-    exit_from_destructor(handles.manager_threads, "gpu manager thread group");
-  }
-  if (fallback_gpu_device_handles_) {
-    exit_from_destructor(fallback_gpu_device_handles_->executor_threads, "fallback executor group");
-    exit_from_destructor(fallback_gpu_device_handles_->manager_threads, "fallback manager group");
-  }
-  exit_from_destructor(shared_thread_group_handle_, "shared thread group");
-  exit_from_destructor(worker_handle_, "worker");
-  exit_from_destructor(engine_handle_, "engine");
-}
+telemetry_context::~telemetry_context() { memory_context_.reset(); }
 
 void emit_plan_telemetry(const quent::Context& context,
                          const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& pipelines,

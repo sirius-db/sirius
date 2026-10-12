@@ -169,28 +169,9 @@ void emit_plan_telemetry(const quent::Context& context,
                          quent::Uuid plan_id,
                          query_telemetry_info telemetry_info);
 
-/// Emits `exit` from a destructor or scope guard. Those are noexcept, so a failure is logged
-/// rather than propagated. Skips handles whose exit was already emitted.
-template <typename Handle>
-void exit_from_destructor(Handle& handle, std::string_view what) noexcept
-{
-  if (handle.exit_emitted()) { return; }
-  try {
-    handle.exit();
-  } catch (std::exception const& e) {
-    SIRIUS_LOG_ERROR("telemetry: {} exit failed: {}", what, e.what());
-  } catch (...) {
-    SIRIUS_LOG_ERROR("telemetry: {} exit failed", what);
-  }
-}
-
-/// Per pool-thread ExecutorThread handle; emits `exit` when the thread ends.
+/// Per pool-thread ExecutorThread handle.
 struct executor_thread_telemetry {
   std::optional<quent::Handle<quent::ExecutorThread>> handle;
-  ~executor_thread_telemetry()
-  {
-    if (handle) { exit_from_destructor(*handle, "executor thread"); }
-  }
 };
 inline thread_local executor_thread_telemetry executor_thread_telemetry_state;
 

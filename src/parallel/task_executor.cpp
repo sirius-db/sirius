@@ -51,11 +51,7 @@ itask_executor::itask_executor(
   });
 }
 
-itask_executor::~itask_executor()
-{
-  stop();
-  telemetry::exit_from_destructor(_task_queue_telemetry, "executor task queue");
-}
+itask_executor::~itask_executor() { stop(); }
 
 void itask_executor::schedule(std::unique_ptr<itask> task)
 {
