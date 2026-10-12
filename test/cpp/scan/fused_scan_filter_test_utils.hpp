@@ -102,7 +102,7 @@ inline std::unique_ptr<cudf::column> upload_strings(std::vector<std::string> con
   std::string chars;
   std::vector<std::size_t> offsets;
   offsets.reserve(host.size());
-  std::vector<cuda::std::pair<char const*, cudf::size_type>> strings;
+  std::vector<::cuda::std::pair<char const*, cudf::size_type>> strings;
   strings.reserve(host.size());
   for (std::size_t i = 0; i < host.size(); ++i) {
     offsets.push_back(chars.size());
@@ -124,8 +124,8 @@ inline std::unique_ptr<cudf::column> upload_strings(std::vector<std::string> con
     strings.data(), strings.size() * sizeof(decltype(strings)::value_type), stream, mr};
   stream.sync();
   auto const device_strings =
-    cudf::device_span<cuda::std::pair<char const*, cudf::size_type> const>{
-      static_cast<cuda::std::pair<char const*, cudf::size_type> const*>(strings_buf.data()),
+    cudf::device_span<::cuda::std::pair<char const*, cudf::size_type> const>{
+      static_cast<::cuda::std::pair<char const*, cudf::size_type> const*>(strings_buf.data()),
       static_cast<std::size_t>(n)};
   return cudf::make_strings_column(device_strings, stream, mr);
 }
