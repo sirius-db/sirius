@@ -27,7 +27,7 @@ concurrency:
 jobs:
   cuda-13:
     if: github.event_name != 'pull_request'
-    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@5dc87c16f52ea4ae7b6248eb6ea39b7a56278e84
+    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
     with:
       extension_name: sirius
       duckdb_version: v1.5.6
@@ -52,7 +52,7 @@ jobs:
 
   cuda-12:
     if: github.event_name != 'pull_request'
-    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@5dc87c16f52ea4ae7b6248eb6ea39b7a56278e84
+    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
     with:
       extension_name: sirius
       duckdb_version: v1.5.6
