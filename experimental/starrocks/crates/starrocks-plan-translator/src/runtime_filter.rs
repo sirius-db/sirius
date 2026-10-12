@@ -139,6 +139,9 @@ pub struct BuiltFilter {
     pub distribution: BuildDistribution,
     /// For a partitioned join: the FE's merge node, which knows the filter's probers.
     pub merge_node: Option<TNetworkAddress>,
+    /// The filter whose build exchange serves this filter's keys, when this filter's own build
+    /// side isn't an exchange ([`built_filters`]).
+    pub served_by: Option<i32>,
 }
 
 /// Column name of a share holding its exact keys.
@@ -235,14 +238,23 @@ pub fn built_filters(params: &TExecPlanFragmentParams) -> Result<Vec<BuiltFilter
         })?;
     let desc = DescriptorTable::try_from(desc_tbl)?;
     let children = child_indices(nodes)?;
+    let builds: Vec<JoinBuild> = join_builds(nodes, &children).collect();
+    let parents = parent_indices(&children);
     let mut built = Vec::new();
-    for build in join_builds(nodes, &children) {
-        if build.skip_reason().is_some() {
+    for build in &builds {
+        // A filter built from its own exchange, or served by another filter's.
+        let (source, served_by) = if build.skip_reason().is_none() {
+            (*build, None)
+        } else if let Some(server) = served_by(build, &builds, nodes, &parents) {
+            (server, server.filter.filter_id)
+        } else {
             continue;
-        }
-        let (Some(exchange), Some((filter_id, tuple_id, slot_id))) =
-            (build.exchange, slot_key(build.filter))
-        else {
+        };
+        let (Some(exchange), Some((_, tuple_id, slot_id)), Some(filter_id)) = (
+            source.exchange,
+            slot_key(source.filter),
+            build.filter.filter_id,
+        ) else {
             continue;
         };
         let Some(input_row_tuples) = exchange
@@ -252,30 +264,29 @@ pub fn built_filters(params: &TExecPlanFragmentParams) -> Result<Vec<BuiltFilter
         else {
             continue;
         };
-        {
-            let column = RowLayout::from_tuples(&desc, input_row_tuples)?
-                .resolve(SlotKey::new(tuple_id, slot_id))?;
-            let schema = desc.named_struct_for_tuples(input_row_tuples)?;
-            let ty = schema
-                .r#struct
-                .as_ref()
-                .and_then(|structure| structure.types.get(column))
-                .ok_or_else(|| {
-                    TranslateError::descriptor(format!(
-                        "runtime filter {filter_id} key column {column} is outside exchange {}",
-                        exchange.node_id
-                    ))
-                })?;
-            built.push(BuiltFilter {
-                filter_id,
-                join_node_id: build.join_node_id,
-                exchange_node_id: exchange.node_id,
-                column,
-                column_type: type_mapper::duckdb_type_name(ty)?,
-                distribution: BuildDistribution::of(build.filter),
-                merge_node: merge_node(build.filter),
-            });
-        }
+        let column = RowLayout::from_tuples(&desc, input_row_tuples)?
+            .resolve(SlotKey::new(tuple_id, slot_id))?;
+        let schema = desc.named_struct_for_tuples(input_row_tuples)?;
+        let ty = schema
+            .r#struct
+            .as_ref()
+            .and_then(|structure| structure.types.get(column))
+            .ok_or_else(|| {
+                TranslateError::descriptor(format!(
+                    "runtime filter {filter_id} key column {column} is outside exchange {}",
+                    exchange.node_id
+                ))
+            })?;
+        built.push(BuiltFilter {
+            filter_id,
+            join_node_id: build.join_node_id,
+            exchange_node_id: exchange.node_id,
+            column,
+            column_type: type_mapper::duckdb_type_name(ty)?,
+            distribution: BuildDistribution::of(build.filter),
+            merge_node: merge_node(build.filter),
+            served_by,
+        });
     }
     Ok(built)
 }
@@ -287,7 +298,11 @@ pub fn skipped_builds(params: &TExecPlanFragmentParams) -> Result<Vec<SkippedFil
         return Ok(Vec::new());
     }
     let children = child_indices(nodes)?;
-    Ok(join_builds(nodes, &children)
+    let builds: Vec<JoinBuild> = join_builds(nodes, &children).collect();
+    let parents = parent_indices(&children);
+    Ok(builds
+        .iter()
+        .filter(|build| served_by(build, &builds, nodes, &parents).is_none())
         .filter_map(|build| {
             Some(SkippedFilter {
                 filter_id: build.filter.filter_id?,
@@ -320,8 +335,12 @@ pub fn unbuilt_shares(params: &TExecPlanFragmentParams) -> Result<Vec<UnbuiltSha
         return Ok(Vec::new());
     }
     let children = child_indices(nodes)?;
-    Ok(join_builds(nodes, &children)
+    let builds: Vec<JoinBuild> = join_builds(nodes, &children).collect();
+    let parents = parent_indices(&children);
+    Ok(builds
+        .iter()
         .filter(|build| BuildDistribution::of(build.filter) == BuildDistribution::Partitioned)
+        .filter(|build| served_by(build, &builds, nodes, &parents).is_none())
         .filter_map(|build| {
             Some(UnbuiltShare {
                 filter_id: build.filter.filter_id?,
@@ -363,9 +382,12 @@ pub fn skipped_probes(params: &TExecPlanFragmentParams) -> Vec<SkippedFilter> {
 }
 
 /// One join filter a hash join of the fragment builds.
+#[derive(Clone, Copy)]
 struct JoinBuild<'a> {
     join_node_id: i32,
     join: &'a THashJoinNode,
+    /// Index of the join's build child among the fragment's nodes.
+    build_child: Option<usize>,
     /// The join's build child, when it's an exchange.
     exchange: Option<&'a TPlanNode>,
     filter: &'a TRuntimeFilterDescription,
@@ -405,9 +427,9 @@ fn join_builds<'a>(
         .enumerate()
         .filter_map(|(index, node)| Some((index, node, node.hash_join_node.as_ref()?)))
         .flat_map(move |(index, node, join)| {
-            let exchange = children[index]
-                .get(1)
-                .map(|&child| &nodes[child])
+            let build_child = children[index].get(1).copied();
+            let exchange = build_child
+                .map(|child| &nodes[child])
                 .filter(|child| child.node_type == TPlanNodeType::EXCHANGE_NODE);
             join.build_runtime_filters
                 .iter()
@@ -416,10 +438,115 @@ fn join_builds<'a>(
                 .map(move |filter| JoinBuild {
                     join_node_id: node.node_id,
                     join,
+                    build_child,
                     exchange,
                     filter,
                 })
         })
+}
+
+/// The filter of the same fragment whose build exchange can serve the keys of `build`, a
+/// partitioned join's filter whose build side is another join's output
+/// ([`SkipReason::BuildNotExchange`]).
+///
+/// q17's filter 1 is built on `p_partkey` from the output of the join that builds filter 0 on
+/// `p_partkey` from the `part` exchange. Every key filter 1 would hold passed through that
+/// exchange: a slot id names one column in a query, and joins, filters and projections that pass
+/// the slot on unchanged only drop its values (an outer join adds NULLs, which `=` never
+/// matches). So the exchange holds a superset of filter 1's keys, and a scan keeping the rows
+/// whose key is among them keeps every row the join can match.
+///
+/// The serving filter is one this fragment builds from an exchange, on the same slot, and its
+/// exchange is under `build`'s build side with only such nodes in between.
+fn served_by<'a>(
+    build: &JoinBuild<'a>,
+    builds: &[JoinBuild<'a>],
+    nodes: &[TPlanNode],
+    parents: &[Option<usize>],
+) -> Option<JoinBuild<'a>> {
+    if BuildDistribution::of(build.filter) != BuildDistribution::Partitioned
+        || build.exchange.is_some()
+        || merge_node(build.filter).is_none()
+        || build.filter.is_broad_cast_join_in_skew == Some(true)
+        || null_safe_key(build.join, build.filter)
+    {
+        return None;
+    }
+    let (_, _, slot) = slot_key(build.filter)?;
+    let top = build.build_child?;
+    builds
+        .iter()
+        .find(|server| {
+            server.skip_reason().is_none()
+                && slot_key(server.filter).is_some_and(|(_, _, server_slot)| server_slot == slot)
+                && server
+                    .build_child
+                    .is_some_and(|exchange| passes_slot_on(nodes, parents, exchange, top, slot))
+        })
+        .copied()
+}
+
+/// Whether every node from `from`'s parent up to `to` passes slot `slot` on unchanged: a join, a
+/// filter, or a projection mapping the slot to itself. `to` must be above `from`.
+fn passes_slot_on(
+    nodes: &[TPlanNode],
+    parents: &[Option<usize>],
+    from: usize,
+    to: usize,
+    slot: i32,
+) -> bool {
+    let mut at = from;
+    while at != to {
+        let Some(parent) = parents[at] else {
+            return false;
+        };
+        at = parent;
+        let node = &nodes[at];
+        let keeps_values = matches!(
+            node.node_type,
+            TPlanNodeType::HASH_JOIN_NODE
+                | TPlanNodeType::NESTLOOP_JOIN_NODE
+                | TPlanNodeType::SELECT_NODE
+                | TPlanNodeType::PROJECT_NODE
+        );
+        if !keeps_values || !projects_slot_to_itself(node, slot) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `node`'s projection, if it has one, outputs slot `slot` as the slot itself.
+fn projects_slot_to_itself(node: &TPlanNode, slot: i32) -> bool {
+    let Some(project) = &node.project_node else {
+        return node.node_type != TPlanNodeType::PROJECT_NODE;
+    };
+    let is_slot = |expr: &starrocks_thrift::exprs::TExpr| {
+        matches!(expr.nodes.as_slice(), [node]
+            if node.node_type == TExprNodeType::SLOT_REF
+                && node.slot_ref.as_ref().is_some_and(|slot_ref| slot_ref.slot_id == slot))
+    };
+    let common = project
+        .common_slot_map
+        .as_ref()
+        .is_some_and(|map| map.contains_key(&slot));
+    !common
+        && project
+            .slot_map
+            .as_ref()
+            .and_then(|map| map.get(&slot))
+            .is_some_and(is_slot)
+}
+
+/// The parent index of every node, from [`child_indices`].
+fn parent_indices(children: &[Vec<usize>]) -> Vec<Option<usize>> {
+    let mut parents = vec![None; children.len()];
+    for (parent, kids) in children.iter().enumerate() {
+        for &child in kids {
+            parents[child] = Some(parent);
+        }
+    }
+    parents
 }
 
 /// The probe filters a scan node carries.
