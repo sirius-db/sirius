@@ -23,11 +23,6 @@
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
-#include <cudf/version_config.hpp>
-
-#if CUDF_VERSION_MAJOR < 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR < 10)
-#include <rmm/cuda_stream_view.hpp>
-#endif
 
 #include <cuda/stream>
 
@@ -37,13 +32,7 @@
 
 namespace sirius::io {
 
-// cudf >= 26.10 (rapidsai/cudf#23669) takes cuda::stream_ref in the
-// device_read virtuals; overrides must match the base signature exactly.
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 10)
 using cudf_datasource_stream_t = ::cuda::stream_ref;
-#else
-using cudf_datasource_stream_t = rmm::cuda_stream_view;
-#endif
 
 // ---------------------------------------------------------------------------
 // sirius_datasource

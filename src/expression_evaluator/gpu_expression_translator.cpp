@@ -16,6 +16,7 @@
 
 // sirius
 #include <expression/ast/aggregate.hpp>
+#include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <log/logging.hpp>
 #include <sirius/exception.hpp>
@@ -325,38 +326,6 @@ gpu_expression_translator::translate_join_conditions(
   result.owned_literals = std::move(_literal_scalars);
   return result;
 }
-
-namespace {
-
-/// @brief Recover the SQL type identifier of an AST node, where it is carried.
-///
-/// Used by the function arm's decimal-propagation guard. Node kinds that carry
-/// a logical type (reference, constant, cast, function_call) return its id;
-/// alternatives without one return INVALID, treated as a non-DECIMAL sentinel
-/// by the caller. References must be included so that direct decimal-column
-/// arithmetic (e.g. col + col) trips the guard, matching the pre-AST translator
-/// which checked every function child's return_type.
-sirius::type_id node_logical_type_id(sirius::ast::node const& expr)
-{
-  return std::visit(
-    [](auto const& alt) -> sirius::type_id {
-      using T = std::decay_t<decltype(alt)>;
-      if constexpr (std::is_same_v<T, sirius::ast::reference>) {
-        return alt.return_type().id();
-      } else if constexpr (std::is_same_v<T, sirius::ast::constant>) {
-        return alt.return_type().id();
-      } else if constexpr (std::is_same_v<T, sirius::ast::cast>) {
-        return alt.target_type.id();
-      } else if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
-        return alt.return_type().id();
-      } else {
-        return sirius::type_id::INVALID;
-      }
-    },
-    expr.v);
-}
-
-}  // namespace
 
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::node const& expr, cudf::ast::table_reference const table_src)
@@ -748,16 +717,14 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
 {
-  // cuDF AST only supports numeric binary functions. We must also disable any
-  // operation that propagates decimal types up the expression tree, pending the
-  // cuDF fix: https://github.com/rapidsai/cudf/pull/21996. Unsupported functions
-  // fall through to the default arm below, so checking decimal propagation once
-  // up front (rather than per supported case) is equivalent.
-  if (std::ranges::any_of(alt.arguments(), [](auto const& arg) {
-        return node_logical_type_id(*arg) == sirius::type_id::DECIMAL;
-      })) {
-    SIRIUS_LOG_DEBUG(
-      "[expression_translator] Blocking function because it propagates decimal types");
+  // cuDF AST supports DECIMAL32/64 arithmetic, but DECIMAL128 binary operations
+  // exceed its intermediate storage width. Unsupported functions fall through
+  // to the default arm below, so checking decimal widths once up front is enough.
+  if (std::ranges::any_of(
+        alt.arguments(),
+        [](auto const& arg) { return sirius::is_cudf_ast_decimal128(arg->return_type()); }) ||
+      sirius::is_cudf_ast_decimal128(alt.return_type())) {
+    SIRIUS_LOG_DEBUG("[expression_translator] Blocking DECIMAL128 function from AST");
     return std::nullopt;
   }
 

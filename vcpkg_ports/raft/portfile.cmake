@@ -11,9 +11,9 @@ vcpkg_from_github(
   REPO
   rapidsai/raft
   REF
-  v26.08.00
+  v26.10.00
   SHA512
-  cbfe6c618bac35b16f5b9313f1f0315c8c9e331dcb1bdc5038be772951e45798d644f4c602a4370552cd22778676f860b54ed489662d8ac2ac775ba5efe52cf5
+  337e03c28fe351bb6108cf0409b661781db6db44b40b957f86e50cdc92b2dd33ed92379ed4d3e1789bc7230b2c7112623312b90d5fdd18562fc06f279384a106
   PATCHES
   static-cuda-math.patch
   HEAD_REF
@@ -25,9 +25,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.08.00
+  v26.10.00
   SHA512
-  472e3bbc0aeedce6632c339f5a383a25524df8462a58891474523cd558b7d8d8bc09b24e8f75da6f2fbfcb83b302caa911fb5a38bc6c04871a570390e7b4a5b8
+  c5c2be8672faae3990713a990b8e0d4e1082307c9dfd5857805bd543243daf0ec2c1fe41bbdb1736d5ea4e4e9fa261de44b2e8b885d812ce822814251d9f65d2
   HEAD_REF
   main)
 
@@ -37,9 +37,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-logger
   REF
-  v0.2.3
+  v0.3.0
   SHA512
-  eb7b5ebf6289d10307b8a34d9d1469ffcb63e9371e9dd5ccbda0351923b920ebae8220ceaa8d1d52c9bed57200f35921a6365a5f9a25a209a98314f75195310c
+  0952bcd7c6579b0cc613e848c1d695466942d3a09d3f98af4c8fed97d23f5e7ad86d73603bfc58b55a4f33461b4e567716d0a70957935fefb896907bdf1074d1
   HEAD_REF
   main)
 

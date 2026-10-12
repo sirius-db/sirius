@@ -1483,11 +1483,8 @@ TEST_CASE("translator: 100-row table with complex expression", "[expression_tran
 //===----------------------------------------------------------------------===//
 // Test: Decimal column vs. decimal literal comparisons
 //
-// NOTE: decimal column-vs-literal comparisons work once rapidsai/cudf#21447 is
-// included. Decimal arithmetic (function_call children returning DECIMAL) is
-// currently blocked by the translator pending rapidsai/cudf#21996, so the
-// positive tests here stay inside the comparison pattern and a negative test
-// below pins the blocking behavior.
+// Decimal column comparisons and DECIMAL32/64 arithmetic are supported by cuDF AST.
+// DECIMAL128 arithmetic remains materialized because it exceeds AST intermediate storage.
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("translator: decimal32 column EQUAL decimal literal", "[expression_translator]")
@@ -1567,12 +1564,9 @@ TEST_CASE("translator: nested decimal comparison col(0) >= 2.00 AND col(0) <= 4.
   REQUIRE(host_vals == std::vector<uint8_t>{0, 1, 1, 1, 0});
 }
 
-TEST_CASE("translator: nested decimal arithmetic returns nullopt", "[expression_translator]")
+TEST_CASE("translator: nested decimal32 arithmetic produces AST", "[expression_translator]")
 {
-  // Any function_call whose children have DECIMAL return_type must be blocked by
-  // the translator (pending rapidsai/cudf#21996). Build a nested expression
-  // (col(0) + col(0)) * 2.00 over a DECIMAL(5,2) column and confirm the
-  // translator refuses both the inner and outer functions.
+  // Build (col(0) + col(0)) * 2.00 over a DECIMAL(5,2) column.
   auto const dec52 = logical_type::make_decimal(5, 2);
 
   // col(0) + col(0)
@@ -1589,22 +1583,18 @@ TEST_CASE("translator: nested decimal arithmetic returns nullopt", "[expression_
 
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *mul);
-  REQUIRE_FALSE(ast_tree.has_value());
+  REQUIRE(ast_tree.has_value());
 }
 
-TEST_CASE("translator: direct decimal column arithmetic returns nullopt", "[expression_translator]")
+TEST_CASE("translator: direct decimal128 column arithmetic returns nullopt",
+          "[expression_translator]")
 {
-  // Direct column-vs-column decimal arithmetic (col(0) + col(0)) must also be
-  // blocked (pending rapidsai/cudf#21996), not just arithmetic whose children
-  // are decimal constants or nested functions. The function's arguments are
-  // bare references here, so the guard depends on reference nodes carrying their
-  // DECIMAL return_type.
-  auto const dec52 = logical_type::make_decimal(5, 2);
+  auto const dec38 = logical_type::make_decimal(38, 2);
 
   std::vector<std::unique_ptr<ast_node>> add_args;
-  add_args.push_back(make_ref_typed(0, dec52));
-  add_args.push_back(make_ref_typed(0, dec52));
-  auto add = make_func(sirius::function_id::add, std::move(add_args), dec52);
+  add_args.push_back(make_ref_typed(0, dec38));
+  add_args.push_back(make_ref_typed(0, dec38));
+  auto add = make_func(sirius::function_id::add, std::move(add_args), dec38);
 
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *add);

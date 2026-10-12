@@ -107,10 +107,15 @@ libcuvs = "==26.10.00"
 CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real"
 VCPKG_CUDA_VERSION = "12"
 
+[feature.vcpkg]
+platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
+
 [feature.vcpkg.dependencies]
 # Enable S3 use for vcpkg cache
 awscli = "*"
 bison = "*"
+cutile-python = "1.5.*"
+cuda-tileiras = "13.4.*"
 libnvjitlink-dev = "*"
 cuda-nvrtc-dev = "*"
 libcurand-dev = "*"

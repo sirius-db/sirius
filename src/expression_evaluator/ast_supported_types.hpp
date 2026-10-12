@@ -18,7 +18,7 @@
 
 // sirius
 #include "expression/function_id.hpp"
-#include "helper/logical_type.hpp"  // sirius::type_id
+#include "helper/logical_type.hpp"
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -47,5 +47,11 @@ inline constexpr std::array<function_id, 6> supported_ast_functions{function_id:
                                                                     function_id::div,
                                                                     function_id::int_div,
                                                                     function_id::mod};
+
+/// Whether a type maps to DECIMAL128, whose binary arithmetic cuDF AST cannot represent.
+inline bool is_cudf_ast_decimal128(logical_type const& type)
+{
+  return type.is_decimal() && type.decimal_precision() > logical_type::decimal_max_precision_int64;
+}
 
 }  // namespace sirius

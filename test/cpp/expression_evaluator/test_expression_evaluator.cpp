@@ -1326,9 +1326,7 @@ TEMPLATE_TEST_CASE("evaluate arithmetic functions",
 }
 
 // ---------------------------------------------------------------------------
-// Decimal arithmetic (MATERIALIZE path — AST is disabled for decimal return
-// types pending cudf#21996, so all decimal function evaluation flows through
-// cudf::binary_operation on fixed_point columns/scalars).
+// Decimal arithmetic exercises both cuDF AST and materialized paths.
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("evaluate decimal arithmetic (DECIMAL64)",
@@ -1466,11 +1464,7 @@ TEMPLATE_TEST_CASE("evaluate nested decimal arithmetic (col + 1.00) * 2",
                    ast_interpret_strategy,
                    ast_jit_strategy)
 {
-  // Regression coverage: before disabling AST for decimal-returning functions,
-  // nested decimal arithmetic would feed intermediate fixed_point results into
-  // the cudf AST kernel and trip cudf#21996. With AST disabled for decimal
-  // return types, the inner `+` materializes via cudf::binary_operation and the
-  // outer `*` consumes the materialized column via another cudf::binary_operation.
+  // Nested DECIMAL64 arithmetic exercises intermediate fixed_point AST results.
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
   REQUIRE(space != nullptr);
