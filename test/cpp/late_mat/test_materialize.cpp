@@ -306,19 +306,21 @@ struct spread_pin {
 /// one it sees -- and passes everything else upstream. Negative never fails.
 /// Written against the cuda::mr interface rmm 26 resources use (see
 /// cucascade::memory::null_device_memory_resource for the minimal shape).
+/// The counter is shared state: a resource_ref may hold a COPY of the
+/// resource, so counting in a member would count in the copy.
 class failing_resource {
  public:
   explicit failing_resource(rmm::device_async_resource_ref upstream, long fail_at = -1)
-    : _upstream{upstream}, _fail_at{fail_at}
+    : _upstream{upstream}, _state{std::make_shared<state>(fail_at)}
   {
   }
-  [[nodiscard]] long allocations() const noexcept { return _seen; }
+  [[nodiscard]] long allocations() const noexcept { return _state->seen; }
 
   void* allocate(::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t))
   {
-    if (_seen++ == _fail_at) { throw rmm::out_of_memory("injected allocation failure"); }
+    maybe_fail();
     return _upstream.allocate(stream, bytes, alignment);
   }
   void deallocate(::cuda::stream_ref stream,
@@ -330,7 +332,7 @@ class failing_resource {
   }
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    if (_seen++ == _fail_at) { throw rmm::out_of_memory("injected allocation failure"); }
+    maybe_fail();
     return _upstream.allocate_sync(bytes, alignment);
   }
   void deallocate_sync(void* p,
@@ -339,13 +341,24 @@ class failing_resource {
   {
     _upstream.deallocate_sync(p, bytes, alignment);
   }
-  bool operator==(failing_resource const& other) const noexcept { return this == &other; }
+  bool operator==(failing_resource const& other) const noexcept { return _state == other._state; }
   friend void get_property(failing_resource const&, ::cuda::mr::device_accessible) noexcept {}
 
  private:
+  struct state {
+    explicit state(long fail_at) : fail_at{fail_at} {}
+    long fail_at;
+    long seen = 0;
+  };
+  void maybe_fail()
+  {
+    if (_state->seen++ == _state->fail_at) {
+      throw rmm::out_of_memory("injected allocation failure");
+    }
+  }
+
   rmm::device_async_resource_ref _upstream;
-  long _fail_at;
-  long _seen = 0;
+  std::shared_ptr<state> _state;
 };
 
 }  // namespace
