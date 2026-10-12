@@ -7,7 +7,6 @@ use super::*;
 pub(crate) struct WorkerAccumulator {
     pub(crate) parent_engine_id: Option<Uuid>,
     pub(crate) instance_name: Option<String>,
-    pub(crate) exited: bool,
 }
 
 impl EntityEventAccumulator for WorkerAccumulator {
@@ -23,7 +22,6 @@ impl EntityEventAccumulator for WorkerAccumulator {
                 self.parent_engine_id = Some(parent_engine_id.target);
                 self.instance_name = Some(format!("{tag}-{process_id}"));
             }
-            schema::WorkerEvent::Exit => self.exited = true,
         }
     }
 }
@@ -77,7 +75,7 @@ impl WorkerEntity for Worker {
             parent_engine_id: data.parent_engine_id,
             instance_name: data.instance_name.clone(),
             start_unix_ns: Some(self.earliest_timestamp()),
-            end_unix_ns: data.exited.then(|| self.latest_timestamp()),
+            end_unix_ns: None,
         }
     }
 }

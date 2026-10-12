@@ -32,7 +32,6 @@ use crate::{
 };
 
 pub(crate) const MEMORY_SPACE_BYTES_CAPACITY_NAME: &str = "bytes";
-const SHARED_THREAD_GROUP_LABEL: &str = "shared-thread-group";
 
 /// Removes entities whose ref-tree parent is in `dropped_parents`; returns the removed ids so
 /// the caller can cascade to the next level.
@@ -849,31 +848,6 @@ impl SiriusModelBuilder {
             batch_by_number: HashMap::default(),
             resource_group_types: HashMap::default(),
         };
-
-        // Old scheduler events used a nil GPU reference for the shared thread.
-        if model
-            .task_manager_loop_threads
-            .values()
-            .any(|thread| thread.parent_id() == Some(Uuid::nil()))
-        {
-            let mut groups = model
-                .thread_groups
-                .values()
-                .filter(|group| group.instance_name() == SHARED_THREAD_GROUP_LABEL);
-            let group_id = groups.next().map(Entity::id).ok_or_else(|| {
-                AnalyzerError::Validation("legacy scheduler thread has no shared group".into())
-            })?;
-            if groups.next().is_some() {
-                return Err(AnalyzerError::Validation(
-                    "legacy scheduler thread has ambiguous shared groups".into(),
-                ));
-            }
-            for thread in model.task_manager_loop_threads.values_mut() {
-                if thread.parent_id() == Some(Uuid::nil()) {
-                    thread.set_legacy_parent(group_id);
-                }
-            }
-        }
 
         for (task_id, task_builder) in self.tasks {
             let task = match Task::from_builder(task_builder) {

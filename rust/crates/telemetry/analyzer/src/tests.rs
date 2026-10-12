@@ -59,7 +59,7 @@ fn fixture() -> Vec<Event<E>> {
         ),
         ev(4, 1, E::Query(s::QueryEvent::Planning { seq: 1 })),
         ev(4, 2, E::Query(s::QueryEvent::Executing { seq: 2 })),
-        ev(4, 10, E::Query(s::QueryEvent::Exit { seq: 3 })),
+        ev(4, 10, E::Query(s::QueryEvent::Finished { seq: 3 })),
         ev(
             5,
             0,
@@ -155,7 +155,6 @@ fn fixture() -> Vec<Event<E>> {
             8,
             E::DataBatch(s::DataBatchEvent::Destructed { seq: 2 }),
         ),
-        ev(13, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 3 })),
         ev(
             14,
             2,
@@ -217,43 +216,9 @@ fn fixture() -> Vec<Event<E>> {
                 success: true,
             }),
         ),
-        ev(14, 8, E::Task(s::TaskEvent::Exit { seq: 6 })),
     ];
     events.sort_by_key(|e| e.timestamp);
     events
-}
-
-#[test]
-fn legacy_shared_manager_uses_group() {
-    let mut events = fixture();
-    events.push(ev(
-        15,
-        0,
-        E::ThreadGroup(s::ThreadGroupEvent::Declaration {
-            label: "shared-thread-group".into(),
-            worker_id: EntityRef::new(id(2), ()),
-            gpu_device_id: None,
-        }),
-    ));
-    events.push(ev(
-        16,
-        0,
-        E::TaskManagerLoopThread(s::TaskManagerLoopThreadEvent::Spawned {
-            label: "task-scheduler-thread".into(),
-            group_id: EntityRef::new(Uuid::nil(), ()),
-        }),
-    ));
-
-    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
-    let thread = analyzer
-        .model
-        .task_manager_loop_threads
-        .get(&id(16))
-        .unwrap();
-    assert_eq!(
-        quent_analyzer::RefTreeEntity::parent_id(thread),
-        Some(id(15))
-    );
 }
 
 #[test]
@@ -390,7 +355,7 @@ fn transit_does_not_double_count_batch_bytes() {
         event.id != id(13)
             || !matches!(
                 event.data,
-                E::DataBatch(s::DataBatchEvent::Destructed { .. } | s::DataBatchEvent::Exit { .. })
+                E::DataBatch(s::DataBatchEvent::Destructed { .. })
             )
     });
     events.extend([
@@ -438,7 +403,6 @@ fn transit_does_not_double_count_batch_bytes() {
             8,
             E::DataBatch(s::DataBatchEvent::Destructed { seq: 4 }),
         ),
-        ev(13, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 5 })),
     ]);
     let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
     let response = analyzer
@@ -579,7 +543,6 @@ fn duplicate_numeric_batch_id_on_one_worker_is_left_unresolved() {
             8,
             E::DataBatch(s::DataBatchEvent::Destructed { seq: 2 }),
         ),
-        ev(15, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 3 })),
     ]);
     let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
     // Both batches survive; only the ambiguous number lookup is withheld.
@@ -644,7 +607,6 @@ fn same_numeric_batch_id_on_two_workers_resolves_per_worker() {
             8,
             E::DataBatch(s::DataBatchEvent::Destructed { seq: 2 }),
         ),
-        ev(43, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 3 })),
     ]);
     let model = SiriusUiAnalyzer::try_new(id(1), events.into_iter())
         .unwrap()
@@ -723,16 +685,6 @@ fn invalid_data_batch_is_skipped() {
 }
 
 #[test]
-fn exit_before_declaration_is_not_a_duplicate() {
-    let mut events = fixture();
-    events.insert(
-        0,
-        ev(12, 9, E::ExecutorThread(s::ExecutorThreadEvent::Exit)),
-    );
-    assert!(SiriusUiAnalyzer::try_new(id(1), events.into_iter()).is_ok());
-}
-
-#[test]
 fn duplicate_resource_group_declaration_is_rejected() {
     let mut events = fixture();
     events.push(ev(
@@ -745,16 +697,6 @@ fn duplicate_resource_group_declaration_is_rejected() {
         }),
     ));
     assert!(SiriusUiAnalyzer::try_new(id(1), events.into_iter()).is_err());
-}
-
-#[test]
-fn resource_group_types_are_snake_case() {
-    let model = SiriusUiAnalyzer::try_new(id(1), fixture().into_iter())
-        .unwrap()
-        .model;
-    assert!(model.resource_group_types.contains_key("gpu_device"));
-    assert!(model.resource_group_types.contains_key("thread_group"));
-    assert!(!model.resource_group_types.contains_key("GpuDevice"));
 }
 
 #[test]
@@ -804,7 +746,7 @@ fn consumer_view_resolves_foreign_producer_batch() {
         ),
         ev(20, 1, E::Query(s::QueryEvent::Planning { seq: 1 })),
         ev(20, 2, E::Query(s::QueryEvent::Executing { seq: 2 })),
-        ev(20, 10, E::Query(s::QueryEvent::Exit { seq: 3 })),
+        ev(20, 10, E::Query(s::QueryEvent::Finished { seq: 3 })),
         ev(
             21,
             0,
@@ -847,7 +789,6 @@ fn consumer_view_resolves_foreign_producer_batch() {
             8,
             E::DataBatch(s::DataBatchEvent::Destructed { seq: 2 }),
         ),
-        ev(23, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 3 })),
     ]);
     let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
     let view = analyzer.model.query_view(id(4)).unwrap();
@@ -916,7 +857,7 @@ fn generated_ndjson_imports_into_analyzer() {
             .init("select".into(), group.as_entity_ref())
             .planning()
             .executing()
-            .exit();
+            .finished();
         let query_id = query.id();
         let mut worker = context.observer::<instrumentation::Worker>().handle();
         worker
@@ -930,7 +871,7 @@ fn generated_ndjson_imports_into_analyzer() {
             Some(worker.as_entity_ref()),
         )
         .unwrap();
-        engine.exit().unwrap();
+
         (context_id, engine_id, query_id)
     };
 
@@ -939,7 +880,7 @@ fn generated_ndjson_imports_into_analyzer() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(stored.len(), 9);
+    assert_eq!(stored.len(), 8);
 
     let context_dir = output.path().join(context_id.to_string());
     let inventory = crate::Viewer::context_inventory(&context_dir).unwrap();
@@ -977,7 +918,7 @@ fn generated_ndjson_imports_into_analyzer() {
     );
     assert_eq!(
         crate::Viewer::import_events(&context_dir).unwrap().count(),
-        9
+        8
     );
 
     let engine_events = crate::Viewer::import_events(&context_dir).unwrap();
@@ -985,4 +926,25 @@ fn generated_ndjson_imports_into_analyzer() {
     let combined =
         SiriusUiAnalyzer::try_new(engine_id, engine_events.chain(worker_events)).unwrap();
     assert_eq!(combined.model.workers.len(), 2);
+}
+
+#[test]
+fn fsm_diagrams_use_final_states() {
+    use quent_ui::fsm::{FsmTransitionDecl, FsmTypeDeclaration};
+
+    use crate::boilerplate::{DataBatch, Task};
+
+    // UI diagrams must end at the same states as recorded events.
+    for (declaration, terminal) in [
+        (Task::fsm_type_declaration(), "finalizing"),
+        (DataBatch::fsm_type_declaration(), "destructed"),
+    ] {
+        assert!(declaration.states.iter().all(|state| state.name != "exit"));
+        assert!(declaration.transitions.iter().any(
+            |transition| matches!(transition, FsmTransitionDecl::Exit(state) if state == terminal)
+        ));
+        assert!(declaration.transitions.iter().all(
+            |transition| !matches!(transition, FsmTransitionDecl::Transition(source, _) if source == terminal)
+        ));
+    }
 }

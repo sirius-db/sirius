@@ -9,8 +9,7 @@ impl TransitionEvent for DataBatchEvent {
             Self::Constructed { seq, .. }
             | Self::Stationary { seq, .. }
             | Self::InTransit { seq, .. }
-            | Self::Destructed { seq }
-            | Self::Exit { seq } => *seq,
+            | Self::Destructed { seq } => *seq,
         }
     }
 
@@ -19,7 +18,7 @@ impl TransitionEvent for DataBatchEvent {
     }
 
     fn is_final(&self) -> bool {
-        matches!(self, Self::Exit { .. })
+        matches!(self, Self::Destructed { .. })
     }
 
     fn is_valid_next(&self, next: &Self) -> bool {
@@ -34,8 +33,7 @@ impl TransitionEvent for DataBatchEvent {
             Self::InTransit { .. } => {
                 matches!(next, Self::Stationary { .. } | Self::Destructed { .. })
             }
-            Self::Destructed { .. } => matches!(next, Self::Exit { .. }),
-            Self::Exit { .. } => false,
+            Self::Destructed { .. } => false,
         }
     }
 
@@ -45,7 +43,6 @@ impl TransitionEvent for DataBatchEvent {
             Self::Stationary { .. } => "stationary",
             Self::InTransit { .. } => "in_transit",
             Self::Destructed { .. } => "destructed",
-            Self::Exit { .. } => "exit",
         }
     }
 
@@ -68,9 +65,7 @@ impl TransitionEvent for DataBatchEvent {
                 usages.push(bytes(channel.target, channel.data.bytes));
                 usages
             }
-            Self::Constructed { .. } | Self::Destructed { .. } | Self::Exit { .. } => {
-                SmallVec::new()
-            }
+            Self::Constructed { .. } | Self::Destructed { .. } => SmallVec::new(),
         }
     }
 }

@@ -13,8 +13,7 @@ impl TransitionEvent for TaskEvent {
             | Self::Downgrading { seq, .. }
             | Self::Preparing { seq, .. }
             | Self::Computing { seq, .. }
-            | Self::Finalizing { seq, .. }
-            | Self::Exit { seq } => *seq,
+            | Self::Finalizing { seq, .. } => *seq,
         }
     }
 
@@ -23,7 +22,7 @@ impl TransitionEvent for TaskEvent {
     }
 
     fn is_final(&self) -> bool {
-        matches!(self, Self::Exit { .. })
+        matches!(self, Self::Finalizing { .. })
     }
 
     fn is_valid_next(&self, next: &Self) -> bool {
@@ -52,8 +51,7 @@ impl TransitionEvent for TaskEvent {
             Self::Computing { .. } => {
                 matches!(next, Self::Computing { .. } | Self::Finalizing { .. })
             }
-            Self::Finalizing { .. } => matches!(next, Self::Exit { .. }),
-            Self::Exit { .. } => false,
+            Self::Finalizing { .. } => false,
         }
     }
 
@@ -67,7 +65,6 @@ impl TransitionEvent for TaskEvent {
             Self::Preparing { .. } => "preparing",
             Self::Computing { .. } => "computing",
             Self::Finalizing { .. } => "finalizing",
-            Self::Exit { .. } => "exit",
         }
     }
 
@@ -107,7 +104,7 @@ impl TransitionEvent for TaskEvent {
                 ));
                 usages
             }
-            Self::Created { .. } | Self::Finalizing { .. } | Self::Exit { .. } => SmallVec::new(),
+            Self::Created { .. } | Self::Finalizing { .. } => SmallVec::new(),
         }
     }
 }

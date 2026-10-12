@@ -79,7 +79,7 @@ fn transition_attributes(event: &schema::TaskEvent) -> Vec<DynamicAttribute> {
         schema::TaskEvent::Finalizing { success, .. } => {
             vec![DynamicAttribute::u8("success", u8::from(*success))]
         }
-        schema::TaskEvent::Queued { .. } | schema::TaskEvent::Exit { .. } => Vec::new(),
+        schema::TaskEvent::Queued { .. } => Vec::new(),
     }
 }
 
@@ -99,7 +99,6 @@ fn declaration() -> FsmTypeDecl {
             state("preparing", &["executor_thread", "reservation"]),
             state("computing", &["executor_thread", "reservation"]),
             state("finalizing", &[]),
-            state("exit", &[]),
         ],
         transitions: vec![
             FsmTransitionDecl::Entry("created".to_owned()),
@@ -120,8 +119,7 @@ fn declaration() -> FsmTypeDecl {
             FsmTransitionDecl::Transition("preparing".to_owned(), "finalizing".to_owned()),
             FsmTransitionDecl::Transition("computing".to_owned(), "computing".to_owned()),
             FsmTransitionDecl::Transition("computing".to_owned(), "finalizing".to_owned()),
-            FsmTransitionDecl::Transition("finalizing".to_owned(), "exit".to_owned()),
-            FsmTransitionDecl::Exit("exit".to_owned()),
+            FsmTransitionDecl::Exit("finalizing".to_owned()),
         ],
     }
 }

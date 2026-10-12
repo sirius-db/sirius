@@ -51,7 +51,6 @@ fn declaration() -> FsmTypeDecl {
             state("stationary", &["memory"]),
             state("in_transit", &["source_memory", "dest_memory", "channel"]),
             state("destructed", &[]),
-            state("exit", &[]),
         ],
         transitions: vec![
             FsmTransitionDecl::Entry("constructed".to_owned()),
@@ -60,8 +59,7 @@ fn declaration() -> FsmTypeDecl {
             FsmTransitionDecl::Transition("in_transit".to_owned(), "stationary".to_owned()),
             FsmTransitionDecl::Transition("stationary".to_owned(), "stationary".to_owned()),
             FsmTransitionDecl::Transition("stationary".to_owned(), "destructed".to_owned()),
-            FsmTransitionDecl::Transition("destructed".to_owned(), "exit".to_owned()),
-            FsmTransitionDecl::Exit("exit".to_owned()),
+            FsmTransitionDecl::Exit("destructed".to_owned()),
         ],
     }
 }

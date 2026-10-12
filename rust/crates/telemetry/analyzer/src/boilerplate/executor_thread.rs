@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use quent_analyzer::resource::{Resource, ResourceTypeDecl};
+use schema::ExecutorThreadEvent;
 
 use super::*;
 
@@ -12,10 +13,10 @@ pub(crate) struct ExecutorThreadAccumulator {
 }
 
 impl EntityEventAccumulator for ExecutorThreadAccumulator {
-    type Payload = schema::ExecutorThreadEvent;
+    type Payload = ExecutorThreadEvent;
 
     fn push(&mut self, event: Self::Payload) {
-        if let schema::ExecutorThreadEvent::Spawned { label, group_id } = event {
+        if let ExecutorThreadEvent::Spawned { label, group_id } = event {
             self.instance_name = Some(label);
             self.parent_group_id = Some(group_id.target);
         }
@@ -26,13 +27,11 @@ impl EntityEventAccumulator for ExecutorThreadAccumulator {
 pub(crate) struct ExecutorThread(AnalyzedEntity<ExecutorThreadAccumulator>);
 
 impl ExecutorThread {
-    pub(crate) fn try_from_event(
-        event: Event<schema::ExecutorThreadEvent>,
-    ) -> AnalyzerResult<Self> {
+    pub(crate) fn try_from_event(event: Event<ExecutorThreadEvent>) -> AnalyzerResult<Self> {
         Ok(Self(AnalyzedEntity::try_from_event(event)?))
     }
 
-    pub(crate) fn push(&mut self, event: Event<schema::ExecutorThreadEvent>) -> AnalyzerResult<()> {
+    pub(crate) fn push(&mut self, event: Event<ExecutorThreadEvent>) -> AnalyzerResult<()> {
         self.0.push(event)
     }
 

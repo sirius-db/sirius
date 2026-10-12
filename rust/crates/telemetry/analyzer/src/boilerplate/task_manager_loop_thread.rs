@@ -25,7 +25,6 @@ impl EntityEventAccumulator for TaskManagerLoopThreadAccumulator {
 #[derive(Debug)]
 pub(crate) struct TaskManagerLoopThread {
     entity: AnalyzedEntity<TaskManagerLoopThreadAccumulator>,
-    legacy_parent_id: Option<Uuid>,
 }
 
 impl TaskManagerLoopThread {
@@ -34,7 +33,6 @@ impl TaskManagerLoopThread {
     ) -> AnalyzerResult<Self> {
         Ok(Self {
             entity: AnalyzedEntity::try_from_event(event)?,
-            legacy_parent_id: None,
         })
     }
 
@@ -43,10 +41,6 @@ impl TaskManagerLoopThread {
         event: Event<schema::TaskManagerLoopThreadEvent>,
     ) -> AnalyzerResult<()> {
         self.entity.push(event)
-    }
-
-    pub(crate) fn set_legacy_parent(&mut self, group_id: Uuid) {
-        self.legacy_parent_id = Some(group_id);
     }
 
     pub(crate) fn instance_name(&self) -> &str {
@@ -84,7 +78,6 @@ impl Resource for TaskManagerLoopThread {}
 
 impl RefTreeEntity for TaskManagerLoopThread {
     fn parent_id(&self) -> Option<Uuid> {
-        self.legacy_parent_id
-            .or(self.entity.accumulator().parent_group_id)
+        self.entity.accumulator().parent_group_id
     }
 }

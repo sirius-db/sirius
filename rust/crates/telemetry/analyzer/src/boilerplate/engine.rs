@@ -6,7 +6,6 @@ use super::*;
 #[derive(Default)]
 pub(crate) struct EngineAccumulator {
     pub(crate) instance_name: Option<String>,
-    pub(crate) exited: bool,
 }
 
 impl EntityEventAccumulator for EngineAccumulator {
@@ -15,7 +14,6 @@ impl EntityEventAccumulator for EngineAccumulator {
     fn push(&mut self, event: Self::Payload) {
         match event {
             schema::EngineEvent::Init { label } => self.instance_name = label,
-            schema::EngineEvent::Exit => self.exited = true,
         }
     }
 }
@@ -65,14 +63,11 @@ impl EngineEntity for Engine {
     fn to_ui(&self) -> AnalyzerResult<query_engine_ui::Engine> {
         let data = self.data();
         let start = self.earliest_timestamp();
-        let duration_s = data
-            .exited
-            .then(|| try_to_secs_relative(self.latest_timestamp(), start))
-            .transpose()?;
+
         Ok(query_engine_ui::Engine {
             id: self.id(),
             start_time_unix_ns: Some(start),
-            duration_s,
+            duration_s: None,
             instance_name: data.instance_name.clone(),
             implementation: None,
         })

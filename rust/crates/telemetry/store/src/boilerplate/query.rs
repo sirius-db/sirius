@@ -9,7 +9,7 @@ impl TransitionEvent for QueryEvent {
             Self::Init { seq, .. }
             | Self::Planning { seq }
             | Self::Executing { seq }
-            | Self::Exit { seq } => *seq,
+            | Self::Finished { seq } => *seq,
         }
     }
 
@@ -18,15 +18,15 @@ impl TransitionEvent for QueryEvent {
     }
 
     fn is_final(&self) -> bool {
-        matches!(self, Self::Exit { .. })
+        matches!(self, Self::Finished { .. })
     }
 
     fn is_valid_next(&self, next: &Self) -> bool {
         match self {
-            Self::Init { .. } => matches!(next, Self::Planning { .. } | Self::Exit { .. }),
-            Self::Planning { .. } => matches!(next, Self::Executing { .. } | Self::Exit { .. }),
-            Self::Executing { .. } => matches!(next, Self::Exit { .. }),
-            Self::Exit { .. } => false,
+            Self::Init { .. } => matches!(next, Self::Planning { .. } | Self::Finished { .. }),
+            Self::Planning { .. } => matches!(next, Self::Executing { .. } | Self::Finished { .. }),
+            Self::Executing { .. } => matches!(next, Self::Finished { .. }),
+            Self::Finished { .. } => false,
         }
     }
 
@@ -35,7 +35,21 @@ impl TransitionEvent for QueryEvent {
             Self::Init { .. } => "init",
             Self::Planning { .. } => "planning",
             Self::Executing { .. } => "executing",
-            Self::Exit { .. } => "exit",
+            Self::Finished { .. } => "finished",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executing_accepts_finished() {
+        // Completed queries must survive FSM validation to appear in the UI.
+        let executing = QueryEvent::Executing { seq: 2 };
+        let finished = QueryEvent::Finished { seq: 3 };
+
+        assert!(executing.is_valid_next(&finished));
     }
 }
