@@ -3909,6 +3909,86 @@ mod tests {
         );
     }
 
+    /// Instance 10 of `query`, q17's shape on one CN: join 5 builds partitioned filter 1 on the
+    /// output of join 6, which builds partitioned filter 0 on the same key from build exchange 2.
+    /// One share makes each filter. It never runs: its probe exchanges wait for second senders.
+    fn served_filter_holder(query: i64) -> TExecPlanFragmentParams {
+        let mut params = share_holder(query, 0, 1);
+        let plan = params.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        let below = plan.nodes[0].clone();
+        let mut top = below.clone();
+        let mut served = share_filter(1);
+        served.filter_id = Some(1);
+        top.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![served]);
+        let mut below = below;
+        below.node_id = 6;
+        plan.nodes = vec![
+            top,
+            exchange_plan_node(1, 0),
+            below,
+            exchange_plan_node(3, 0),
+            exchange_plan_node(2, 0),
+        ];
+        expect_senders(&mut params, 3, 2);
+        // The merge node's topology: filter 1 has one share, probed by instance 3.
+        params.params.as_mut().unwrap().runtime_filter_params =
+            Some(starrocks_thrift::runtime_filter::TRuntimeFilterParams {
+                id_to_prober_params: Some(BTreeMap::from([(
+                    1,
+                    vec![
+                        starrocks_thrift::runtime_filter::TRuntimeFilterProberParams::new(
+                            TUniqueId::new(query, 3),
+                            local_brpc(),
+                        ),
+                    ],
+                )])),
+                runtime_filter_builder_number: Some(BTreeMap::from([(1, 1)])),
+                runtime_filter_max_size: None,
+                skew_join_runtime_filters: None,
+            });
+        params
+    }
+
+    #[test]
+    fn a_filter_built_on_a_joins_output_is_applied_with_the_keys_of_the_exchange_serving_it() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        exec_ok(&service, &served_filter_holder(57));
+        let mut scan = share_probing_scan(57, 1);
+        let plan = scan.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0].probe_runtime_filters.as_mut().unwrap()[0].filter_id = Some(1);
+        exec_ok(&service, &scan);
+        assert_eq!(service.filters.deferred(), 1, "the scan waits for filter 1");
+
+        // Exchange 2 completes: filter 1's share is filter 0's keys, read from exchange 2.
+        exec_ok(&service, &share_build_sender(57, 0));
+        let runs = executor.wait_for(3);
+        let stream = FILTER_STREAM_BASE + 1;
+        let share = runs
+            .iter()
+            .find(|(_, filters, _)| filters.first().map(|f| f.stream_id) == Some(stream as u64))
+            .expect("filter 1's share ran");
+        assert_eq!(
+            share.1[0].keys.sources,
+            vec![KeySource::Parked(SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from_halves(57, 10),
+                node_id: 2,
+                sender_id: 0,
+            })]
+        );
+        let (streams, filters, _) = filtered_scan_run(&runs).expect("the scan ran filtered");
+        assert_eq!(streams, &vec![stream]);
+        assert_eq!(
+            filters[0].keys.sources,
+            vec![KeySource::Parked(SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from_halves(57, 3),
+                node_id: stream,
+                sender_id: 0,
+            })]
+        );
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
     #[test]
     fn a_share_is_sent_when_its_build_exchange_completes_the_receiver() {
         let executor = Arc::new(FilterRecorder::new(sparse_keys()));

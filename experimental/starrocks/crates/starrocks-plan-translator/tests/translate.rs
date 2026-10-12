@@ -5893,6 +5893,7 @@ fn a_broadcast_join_reports_the_filters_it_builds_from_its_exchange() {
             column_type: "BIGINT".to_string(),
             distribution: starrocks_plan_translator::runtime_filter::BuildDistribution::Broadcast,
             merge_node: None,
+            served_by: None,
         }]
     );
 }
@@ -6092,6 +6093,145 @@ fn partitioned_filters_a_join_cant_build_name_their_merge_node() {
     );
 }
 
+/// q17's shape: join 2 builds partitioned filter 1 on `b` from the output of join 11, which
+/// builds partitioned filter 0 on `b` from exchange 12. `between` sits between the two joins.
+fn served_filter_plan(
+    between: Option<TPlanNode>,
+    top_filter: impl FnOnce(&mut TPlanNode),
+) -> TExecPlanFragmentParams {
+    let filter = |id| {
+        let mut filter = partitioned_filter(
+            id,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            4,
+        );
+        filter.expr_order = Some(0);
+        filter
+    };
+    let mut top = hash_join_node(TJoinOp::INNER_JOIN);
+    top.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![filter(1)]);
+    top_filter(&mut top);
+    let mut below = hash_join_node(TJoinOp::INNER_JOIN);
+    below.node_id = 11;
+    below.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![filter(0)]);
+    let mut nodes = vec![top, exchange_node(10, vec![0])];
+    nodes.extend(between);
+    nodes.extend([
+        below,
+        exchange_node(13, vec![0]),
+        exchange_node(12, vec![1]),
+    ]);
+    params(Some(TPlan::new(nodes)), Some(join_desc()), None)
+}
+
+/// A projection of slot 1 (`b`) to `expr`.
+fn projection_of_b(expr: TExpr) -> TPlanNode {
+    let mut project = base_plan_node(20, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(starrocks_thrift::plan_nodes::TProjectNode {
+        slot_map: Some(BTreeMap::from([(1, expr)])),
+        common_slot_map: None,
+    });
+    project
+}
+
+#[test]
+fn a_filter_built_on_a_joins_output_is_served_by_the_exchange_its_keys_came_through() {
+    use starrocks_plan_translator::runtime_filter::{
+        BuildDistribution, BuiltFilter, SkipReason, built_filters, skipped_builds, unbuilt_shares,
+    };
+    let served = |plan: &TExecPlanFragmentParams| {
+        built_filters(plan)
+            .unwrap()
+            .into_iter()
+            .find(|built| built.filter_id == 1)
+    };
+    let b = || slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT));
+
+    // Filter 1 reads filter 0's exchange, column and key type.
+    let plan = served_filter_plan(None, |_| {});
+    let filter_0 = BuiltFilter {
+        filter_id: 0,
+        join_node_id: 11,
+        exchange_node_id: 12,
+        column: 0,
+        column_type: "BIGINT".to_string(),
+        distribution: BuildDistribution::Partitioned,
+        merge_node: Some(merge_node()),
+        served_by: None,
+    };
+    assert_eq!(
+        built_filters(&plan).unwrap(),
+        vec![
+            BuiltFilter {
+                filter_id: 1,
+                join_node_id: 2,
+                served_by: Some(0),
+                ..filter_0.clone()
+            },
+            filter_0,
+        ]
+    );
+    // It is neither reported skipped nor released.
+    assert_eq!(skipped_builds(&plan).unwrap(), Vec::new());
+    assert_eq!(unbuilt_shares(&plan).unwrap(), Vec::new());
+
+    // A filter or a projection passing `b` on unchanged keeps it served.
+    let filter_node = base_plan_node(20, TPlanNodeType::SELECT_NODE, 1, vec![1]);
+    assert!(served(&served_filter_plan(Some(filter_node), |_| {})).is_some());
+    assert!(served(&served_filter_plan(Some(projection_of_b(b())), |_| {})).is_some());
+
+    // Anything that may make new values of `b` in between, a different key, a null-safe or
+    // broadcast join: not served, and released as before.
+    let computed = arithmetic(TExprOpcode::ADD, b(), b());
+    let aggregation = base_plan_node(20, TPlanNodeType::AGGREGATION_NODE, 1, vec![1]);
+    let other_key = |top: &mut TPlanNode| {
+        top.hash_join_node
+            .as_mut()
+            .unwrap()
+            .build_runtime_filters
+            .as_mut()
+            .unwrap()[0]
+            .build_expr = Some(slot_ref(7, 1, scalar_type(TPrimitiveType::BIGINT)));
+    };
+    let null_safe = |top: &mut TPlanNode| {
+        top.hash_join_node.as_mut().unwrap().eq_join_conjuncts[0].opcode =
+            Some(TExprOpcode::EQ_FOR_NULL);
+    };
+    let broadcast = |top: &mut TPlanNode| {
+        top.hash_join_node
+            .as_mut()
+            .unwrap()
+            .build_runtime_filters
+            .as_mut()
+            .unwrap()[0]
+            .build_join_mode =
+            Some(starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::BROADCAST);
+    };
+    // A projection that also lists `b` among its common slots may compute it.
+    let mut common = projection_of_b(b());
+    common.project_node.as_mut().unwrap().common_slot_map = Some(BTreeMap::from([(1, b())]));
+    let not_served = [
+        served_filter_plan(Some(projection_of_b(computed)), |_| {}),
+        served_filter_plan(Some(common), |_| {}),
+        served_filter_plan(Some(aggregation), |_| {}),
+        served_filter_plan(None, other_key),
+        served_filter_plan(None, null_safe),
+        served_filter_plan(None, broadcast),
+    ];
+    for (case, plan) in not_served.iter().enumerate() {
+        assert_eq!(served(plan), None, "case {case}");
+        assert!(
+            skipped_builds(plan)
+                .unwrap()
+                .iter()
+                .any(|skip| skip.filter_id == 1 && skip.reason == SkipReason::BuildNotExchange),
+        );
+    }
+    assert_eq!(unbuilt_shares(&not_served[2]).unwrap()[0].filter_id, 1);
+}
+
 #[test]
 fn probes_no_compute_node_filters_are_reported_and_the_rest_are_probed() {
     use starrocks_plan_translator::runtime_filter::{SkipReason, SkippedFilter, skipped_probes};
@@ -6184,6 +6324,7 @@ fn a_partitioned_join_reports_the_share_each_instance_builds() {
         column_type: "BIGINT".to_string(),
         distribution: BuildDistribution::Partitioned,
         merge_node: Some(merge_node()),
+        served_by: None,
     };
     assert_eq!(built, vec![share(7), share(8)]);
 }
