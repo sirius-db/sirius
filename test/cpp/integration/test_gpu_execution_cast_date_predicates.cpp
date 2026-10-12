@@ -241,11 +241,8 @@ const std::vector<std::string> kFiniteConstantsOnInfinityRows = {
   "d <= TIMESTAMP_NS '1998-09-20 00:00:00'",
 };
 
-// ±infinity constants lower to the infinite dates' stored days (`< 'infinity'`
-// keeps everything but +infinity, `>= 'infinity'` only it, ...). Run on the
-// fold path only: the residual cudf::cast that the other paths evaluate
-// multiplies ±INT32_MAX days into int64 micros, which wraps, so those paths
-// mis-answer these predicates today (pre-existing, independent of the fold).
+// Keep expression rewriting enabled: infinite timestamp comparisons must preserve
+// DuckDB's cast semantics on both residual and compressed scan paths.
 const std::vector<std::string> kInfinityConstants = {
   // +infinity constants
   "d <  TIMESTAMP 'infinity'",
@@ -262,7 +259,7 @@ const std::vector<std::string> kInfinityConstants = {
   "d =  TIMESTAMP '-infinity'",
   // (Not `d > '-infinity' AND d < 'infinity'`: DuckDB merges two cast
   // comparisons on one column into a single BETWEEN expression, a shape the
-  // fold does not recognize, so it takes the residual path.)
+  // scan-bound fold does not recognize, so it takes the residual path.)
   // other flavors (every finite row of t_inf fits TIMESTAMP_NS's range)
   "d <  TIMESTAMP_NS 'infinity'",
   "d >= TIMESTAMP_NS '-infinity'",
@@ -307,22 +304,23 @@ TEST_CASE_METHOD(CastDatePredicateFixture,
                  "gpu_execution cast-shaped DATE predicates match CPU on ±infinity dates",
                  "[integration][gpu_execution][filter][fused_scan_filter][cast_date]")
 {
-  SECTION("plain scan") { compare_all(kFiniteConstantsOnInfinityRows, "t_inf"); }
+  SECTION("plain scan")
+  {
+    compare_all(kFiniteConstantsOnInfinityRows, "t_inf");
+    compare_all(kInfinityConstants, "t_inf");
+  }
   SECTION("gpu-pinned duckdb table")
   {
     run_ok("CALL pin_table(format='duckdb', name='t_inf', tier='gpu');");
     compare_all(kFiniteConstantsOnInfinityRows, "t_inf");
+    compare_all(kInfinityConstants, "t_inf");
     run_ok("CALL unpin_table('t_inf');");
   }
   SECTION("compressed parquet pin")
   {
     pin_compressed_parquet("t_inf");
     compare_all(kFiniteConstantsOnInfinityRows, "p_t_inf");
-    {
-      // Retain the casts to exercise residual infinity conversion.
-      sirius::test::disabled_optimizers_guard guard(*con, "expression_rewriter");
-      compare_all(kInfinityConstants, "p_t_inf");
-    }
+    compare_all(kInfinityConstants, "p_t_inf");
     unpin_parquet("t_inf");
   }
 }
@@ -337,8 +335,9 @@ TEST_CASE_METHOD(CastDatePredicateFixture,
     sirius::test::disabled_optimizers_guard guard(*con, "expression_rewriter");
     expect_cast_overflow("SELECT id FROM p_t_far WHERE d <= TIMESTAMP '2000-06-01'");
     expect_cast_overflow("SELECT id FROM p_t_far WHERE d >  TIMESTAMP '2000-06-01'");
-    expect_cast_overflow("SELECT id FROM p_t_far WHERE d <  TIMESTAMP 'infinity'");
   }
+  // Infinite bounds retain the cast with the normal optimizer.
+  expect_cast_overflow("SELECT id FROM p_t_far WHERE d <  TIMESTAMP 'infinity'");
   unpin_parquet("t_far");
 }
 
