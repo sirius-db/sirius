@@ -3597,8 +3597,8 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
   // compressed shapes — neither is executable by the rebind path.
   updated.insert(OptimizerType::IN_CLAUSE);
   updated.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-  updated.insert(sirius::planner::unsupported_aggregate_optimizers.begin(),
-                 sirius::planner::unsupported_aggregate_optimizers.end());
+  updated.insert(sirius::planner::unsupported_optimizers.begin(),
+                 sirius::planner::unsupported_optimizers.end());
   // LATE_MATERIALIZATION rewrites `ORDER BY ... LIMIT N` over a scan into a
   // self-RIGHT_SEMI_JOIN keyed on parquet virtual columns the Sirius scan path
   // drops (src/op/scan/scan_plan.cpp), so the join's key columns would not

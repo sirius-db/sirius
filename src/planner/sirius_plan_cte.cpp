@@ -41,7 +41,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
   // Initialize an empty vector to collect the scan operators.
   auto right = create_plan(*op.children[1]);
 
-  // Parents consume the CTE's result; its materialization sink has a separate schema.
+  // V2 uses materialized CTEs for correlated joins: parents need the consumer schema,
+  // while the producer-forwarding stage opts out of the runtime output-schema check.
   auto result_types = right->types;
   duckdb::unique_ptr<sirius::op::sirius_physical_cte> cte;
   cte = duckdb::make_uniq<sirius::op::sirius_physical_cte>(op.ctename.GetIdentifierName(),

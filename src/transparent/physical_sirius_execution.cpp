@@ -65,7 +65,7 @@ struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
 // snapshot, including this transaction's uncommitted writes. Returns a materialized
 // result; throws if the CPU plan itself fails.
 // DuckDB v2 shares cancellation state between executors, but not their errors:
-// the outer query can report Interrupted before receiving the nested error.
+// the outer query can report Interrupted before receiving the nested error (#2145).
 duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
   duckdb::ClientContext& client,
   duckdb::PreparedStatementData& cpu_prepared,

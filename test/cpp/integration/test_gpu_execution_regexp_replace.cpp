@@ -123,7 +123,7 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
                  "regexp_replace backreferences replace only the first match on GPU",
                  "[integration][gpu_execution][regexp_replace]")
 {
-  // Exercise regexp_replace before DuckDB v2 rewrites it to regexp_extract.
+  // Exercise regexp_replace before the unsupported v2 rewrite to regexp_extract (#2146).
   sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
   create_regexp_replace_table(*this);
   for (auto const* expression : {
@@ -152,7 +152,7 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
                  "regexp_replace dollar anchors match only the end of text on GPU",
                  "[integration][gpu_execution][regexp_replace][regexp_replace_anchors]")
 {
-  // Exercise regexp_replace before DuckDB v2 rewrites it to regexp_extract.
+  // Exercise regexp_replace before the unsupported v2 rewrite to regexp_extract (#2146).
   sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
   create_regexp_replace_table(*this);
   // cuDF's $ also matches before a trailing newline; the evaluator rewrites it to \Z.
@@ -185,7 +185,7 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
                  "regexp_replace Q28 implementation stays on GPU before rewrites",
                  "[integration][gpu_execution][aggregate][regexp_replace][regexp_replace_anchors]")
 {
-  // Exercise regexp_replace before DuckDB v2 rewrites it to regexp_extract.
+  // Exercise regexp_replace before the unsupported v2 rewrite to regexp_extract (#2146).
   sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
   create_regexp_replace_table(*this);
   // Q28's shape, with and without the dedicated JIT transform for its pattern.

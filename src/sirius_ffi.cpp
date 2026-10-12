@@ -200,8 +200,8 @@ struct Context::Impl {
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
-    disabled.insert(sirius::planner::unsupported_aggregate_optimizers.begin(),
-                    sirius::planner::unsupported_aggregate_optimizers.end());
+    disabled.insert(sirius::planner::unsupported_optimizers.begin(),
+                    sirius::planner::unsupported_optimizers.end());
     // Keep this FFI-only restriction until its no-fallback execution path has
     // dedicated GPU_VALUES coverage.
     disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);

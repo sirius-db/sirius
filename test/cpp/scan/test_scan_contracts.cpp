@@ -582,11 +582,27 @@ TEST_CASE("Parquet plan copies preserve the pruned bound file inventory",
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet byte-length expressions stay on GPU",
+                 "[scan][contracts][integration][scalar_pushdown]")
+{
+  auto const parquet =
+    std::string(SIRIUS_PROJECT_ROOT) + "/test/cpp/integration/data/parquet/nation.parquet";
+  compare_gpu_vs_cpu("SELECT sum(strlen(n_name)) FROM read_parquet('" + parquet + "')");
+}
+
 TEST_CASE("Parquet byte-length pushdown declines during planning",
           "[scan][contracts][shared_context]")
 {
   REQUIRE(sirius::test::g_shared_env);
-  auto con = sirius::test::g_shared_env->make_connection();
+  auto con       = sirius::test::g_shared_env->make_connection();
+  auto& disabled = duckdb::DBConfig::GetConfig(*con.context).options.disabled_optimizers;
+  struct restore_optimizers {
+    std::set<duckdb::OptimizerType>& target;
+    std::set<duckdb::OptimizerType> saved;
+    ~restore_optimizers() { target.swap(saved); }
+  } restore{disabled, disabled};
+  disabled.erase(duckdb::OptimizerType::SCALAR_FN_PUSHDOWN);
   REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
   auto const parquet =

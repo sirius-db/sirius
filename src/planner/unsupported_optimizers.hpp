@@ -22,11 +22,13 @@
 
 namespace sirius::planner {
 
-// Rewrites whose aggregate states or nested keys are not supported by GPU execution.
-inline constexpr std::array unsupported_aggregate_optimizers{
+// Rewrites that produce aggregate or scan shapes unsupported by GPU execution.
+inline constexpr std::array unsupported_optimizers{
   duckdb::OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN,
   duckdb::OptimizerType::GROUPING_SETS,
   duckdb::OptimizerType::AGGREGATE_REUSE,
-  duckdb::OptimizerType::DISTINCT_AGGREGATE_REWRITE};
+  duckdb::OptimizerType::DISTINCT_AGGREGATE_REWRITE,
+  // Evaluate scalar expressions above scans instead of inside DuckDB readers.
+  duckdb::OptimizerType::SCALAR_FN_PUSHDOWN};
 
 }  // namespace sirius::planner

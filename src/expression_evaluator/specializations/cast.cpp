@@ -104,6 +104,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
               input.type().id() == cudf::type_id::TIMESTAMP_MILLISECONDS ||
               input.type().id() == cudf::type_id::TIMESTAMP_SECONDS) &&
              return_type.id() == cudf::type_id::TIMESTAMP_MICROSECONDS) {
+    // Carrier restores were handled above; only semantic casts reach this branch.
     result_column = temporal::cast_to_microseconds_checked(input, _stream, _mr);
   } else {
     result_column = cudf::cast(input, return_type, _stream, _mr);

@@ -25,18 +25,17 @@
 
 // duckdb
 #include <duckdb/common/types/decimal.hpp>
-#include <duckdb/common/vector_operations/vector_operations.hpp>
-#include <duckdb/common/vector_size.hpp>
-#include <duckdb/main/client_context.hpp>
-
-// standard library
 #include <duckdb/common/vector/array_vector.hpp>
 #include <duckdb/common/vector/flat_vector.hpp>
 #include <duckdb/common/vector/list_vector.hpp>
 #include <duckdb/common/vector/string_vector.hpp>
 #include <duckdb/common/vector/struct_vector.hpp>
+#include <duckdb/common/vector_operations/vector_operations.hpp>
+#include <duckdb/common/vector_size.hpp>
+#include <duckdb/main/client_context.hpp>
 #include <duckdb/storage/arena_allocator.hpp>
 
+// standard library
 #include <algorithm>
 
 namespace sirius::op::result {

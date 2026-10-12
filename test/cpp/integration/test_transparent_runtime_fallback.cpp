@@ -197,7 +197,7 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
     ~regex_jit_restore_guard() { duckdb::Config::ENABLE_REGEX_JIT_IMPL = original; }
   } restore_regex_jit{duckdb::Config::ENABLE_REGEX_JIT_IMPL};
 
-  // Keep regexp_replace visible instead of DuckDB v2's regexp_extract rewrite.
+  // Keep regexp_replace visible instead of the unsupported v2 rewrite (#2146).
   sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
 
   create_table(R"SQL(
@@ -293,6 +293,7 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
   REQUIRE(specialized_final_newline == std::vector<std::string>{"http://a/x\n"});
 }
 
+// Track restoration of default-optimizer GPU execution in #2146.
 TEST_CASE_METHOD(RuntimeFallbackFixture,
                  "transparent execution: rewritten regex uses CPU fallback",
                  "[transparent][fallback][integration][regex-rewrite]")
@@ -660,7 +661,7 @@ void run_s3mix_scenario(std::string const& scenario)
     auto failed  = fixture.con->Query(query);
     REQUIRE(failed->HasError());
     // DuckDB v2 can report Interrupted before the nested CPU reader error reaches
-    // the outer executor. Keep connection recovery covered independently.
+    // the outer executor (#2145). Keep connection recovery covered independently.
     CHECK((failed->GetError() == cpu->GetError() ||
            failed->GetErrorType() == duckdb::ExceptionType::INTERRUPT));
     auto after = sirius::test::get_transparent_execution_stats(*fixture.con);
