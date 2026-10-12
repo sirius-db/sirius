@@ -187,7 +187,8 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
 //! `build_parquet_table_info` so the iceberg path can populate the same fields into its own
 //! subclass — an iceberg table's data files are parquet, so every field here applies unchanged.
 void populate_parquet_schema(sirius::op::scan::parquet_ingestible_table_info& out,
-                             sirius::op::sirius_physical_table_scan const& scan_op)
+                             sirius::op::sirius_physical_table_scan const& scan_op,
+                             duckdb::ClientContext& context)
 {
   auto* info           = &out;
   info->returned_types = scan_op.returned_types;
@@ -235,7 +236,8 @@ void populate_parquet_schema(sirius::op::scan::parquet_ingestible_table_info& ou
     // explicit schema= binds.
     bool legacy_file_row_number = false;
     if (scan_op.function.get_bind_info) {
-      auto bind_info         = scan_op.function.get_bind_info(scan_op.bind_data.get());
+      duckdb::TableFunctionGetBindInfoInput input(context, scan_op.bind_data.get());
+      auto bind_info         = scan_op.function.get_bind_info(input);
       auto const option      = bind_info.options.find("file_row_number");
       legacy_file_row_number = option != bind_info.options.end() && option->second.GetValue<bool>();
     }
@@ -252,9 +254,10 @@ void populate_parquet_schema(sirius::op::scan::parquet_ingestible_table_info& ou
 
 void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info& out,
                                  sirius::op::sirius_physical_table_scan& scan_op,
-                                 const sirius::operator_params& op_params)
+                                 const sirius::operator_params& op_params,
+                                 duckdb::ClientContext& context)
 {
-  populate_parquet_schema(out, scan_op);
+  populate_parquet_schema(out, scan_op, context);
   auto* info          = &out;
   info->table_filters = std::move(scan_op.table_filters);
   auto resolved_file_paths =
@@ -286,10 +289,12 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
 }
 
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
-  sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
+  sirius::op::sirius_physical_table_scan& scan_op,
+  const sirius::operator_params& op_params,
+  duckdb::ClientContext& context)
 {
   auto info = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
-  populate_parquet_table_info(*info, scan_op, op_params);
+  populate_parquet_table_info(*info, scan_op, op_params, context);
   return info;
 }
 
@@ -320,7 +325,7 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   duckdb::ClientContext& context)
 {
   auto info = std::make_unique<sirius::op::scan::iceberg_ingestible_table_info>();
-  populate_parquet_table_info(*info, scan_op, op_params);
+  populate_parquet_table_info(*info, scan_op, op_params, context);
   if (iceberg_table_schema_has_field_ids(scan_op.bind_data.get())) {
     auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(scan_op.bind_data.get());
     D_ASSERT(bind != nullptr);
@@ -561,7 +566,8 @@ void append_lineage(plan_lineage& output, plan_lineage const& input, Indices con
 plan_lineage collect_semantic_lineage(
   op::sirius_physical_operator& node,
   bool force_all,
-  std::unordered_map<op::sirius_physical_operator*, plan_lineage>& aliases)
+  std::unordered_map<op::sirius_physical_operator*, plan_lineage>& aliases,
+  duckdb::ClientContext& context)
 {
   if (auto it = aliases.find(&node); it != aliases.end()) return it->second;
   using type = op::SiriusPhysicalOperatorType;
@@ -572,7 +578,7 @@ plan_lineage collect_semantic_lineage(
     if (scan.function.GetName().GetIdentifierName() != "seq_scan" && scan.children.empty() &&
         !scan.pre_declined) {
       op::scan::parquet_ingestible_table_info info;
-      populate_parquet_schema(info, scan);
+      populate_parquet_schema(info, scan, context);
       auto layout = op::scan::build_scan_plan(info.column_ids,
                                               info.projection_ids,
                                               info.names,
@@ -632,7 +638,7 @@ plan_lineage collect_semantic_lineage(
   std::vector<plan_lineage> children;
   plan_lineage result;
   for (auto& child : node.children) {
-    children.push_back(collect_semantic_lineage(*child, force_all, aliases));
+    children.push_back(collect_semantic_lineage(*child, force_all, aliases, context));
     auto const& inputs = children.back().inputs;
     result.inputs.insert(result.inputs.end(), inputs.begin(), inputs.end());
   }
@@ -649,7 +655,7 @@ plan_lineage collect_semantic_lineage(
       if (delim.distinct)
         for (auto index : delim.distinct->group_idx)
           if (index >= 0) mark_semantic(lineage_at(children[0], index));
-      auto joined = collect_semantic_lineage(*delim.join, force_all, aliases);
+      auto joined = collect_semantic_lineage(*delim.join, force_all, aliases, context);
       result      = std::move(joined);
     } else
       all();
@@ -1475,7 +1481,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  auto table_info = build_parquet_table_info(scan, op_params);
+  auto table_info = build_parquet_table_info(scan, op_params, context);
   // DuckDB may bind an explicit file list after opening only its first file. Sirius opens every
   // resolved file later, so install the matching secret snapshot for each path before the bind
   // data moves into the GPU ingestible.
@@ -1748,7 +1754,7 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   std::unordered_map<op::sirius_physical_operator*, plan_lineage> lineage_aliases;
   auto lineage_started = std::chrono::steady_clock::now();
   collect_semantic_lineage(
-    *plan, contract_provenance.injections.lineage_unmodelled, lineage_aliases);
+    *plan, contract_provenance.injections.lineage_unmodelled, lineage_aliases, context);
   contract_provenance.lineage_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                           std::chrono::steady_clock::now() - lineage_started)
                                           .count();

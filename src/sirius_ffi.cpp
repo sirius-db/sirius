@@ -20,7 +20,6 @@
 #include "config.hpp"                                    // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                  // duckdb::CoreFunctionsExtension
 #include "data/sirius_converter_registry.hpp"            // sirius::converter_registry
-#include "duckdb/common/arrow/result_arrow_wrapper.hpp"  // duckdb::ResultArrowArrayStreamWrapper
 #include "duckdb/common/enums/optimizer_type.hpp"        // duckdb::OptimizerType
 #include "duckdb/execution/column_binding_resolver.hpp"  // duckdb::ColumnBindingResolver
 #include "duckdb/main/client_context.hpp"                // duckdb::ClientContext
@@ -34,7 +33,8 @@
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
-#include "exec/stream_bind_catalog.hpp"                    // sirius::exec::stream_bind_catalog
+#include "exec/arrow_result_stream.hpp"
+#include "exec/stream_bind_catalog.hpp"   // sirius::exec::stream_bind_catalog
 #include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
@@ -265,9 +265,8 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     plan_ms,
     execute_ms);
 
-  // The stream's release callback deletes the ResultArrowArrayStreamWrapper.
-  auto* wrapper = new duckdb::ResultArrowArrayStreamWrapper(std::move(result), kArrowBatchSize);
-  *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
+  sirius::exec::export_arrow_result(
+    std::move(result), *reinterpret_cast<ArrowArrayStream*>(out_stream_addr), kArrowBatchSize);
 }
 
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
@@ -470,9 +469,9 @@ void Fragment::run()
 void Fragment::result_to_arrow(std::uintptr_t out_stream_addr)
 {
   impl_->require_built("result_to_arrow()");
-  auto result   = impl_->fragment->take_result();
-  auto* wrapper = new duckdb::ResultArrowArrayStreamWrapper(std::move(result), kArrowBatchSize);
-  *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
+  auto result = impl_->fragment->take_result();
+  sirius::exec::export_arrow_result(
+    std::move(result), *reinterpret_cast<ArrowArrayStream*>(out_stream_addr), kArrowBatchSize);
 }
 
 std::size_t Fragment::output_batch_count(std::uint64_t stream_id) const

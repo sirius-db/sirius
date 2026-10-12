@@ -1,9 +1,16 @@
 # DuckDB v2 migration
 
 The engine and wrapper use unmodified DuckDB revision
-`561522aea03e400bd20adc64fcc63e78b8721f3f`. They use DuckDB's C++ APIs and must
+`88ecd0a49d7d3d838e002b2fbc0ce91ccf74110e`. They use DuckDB's C++ APIs and must
 agree on that revision and a compatible toolchain. This is not a stable C ABI
 boundary.
+
+## API replacements
+
+- Parsers take `ClientContext&` directly; parser options are private.
+- Table-function bind-info callbacks take `TableFunctionGetBindInfoInput`, including the context.
+- Sirius exports its materialized FFI results through a small Arrow stream adapter because
+  DuckDB removed `ResultArrowArrayStreamWrapper`. The FFI interface is unchanged.
 
 ## Branch order
 

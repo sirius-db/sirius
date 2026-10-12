@@ -94,7 +94,7 @@ class optimizer_disable_guard {
 extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
                                                  const std::string& query)
 {
-  duckdb::Parser parser(context.GetParserOptions());
+  duckdb::Parser parser(context);
   parser.ParseQuery(query);
   auto statement_type = parser.statements[0]->type;
 

@@ -543,12 +543,13 @@ TEST_CASE_METHOD(isolation_fixture,
   REQUIRE(state(b)->provenance() == connection_provenance::user);
 }
 
-TEST_CASE("hidden catalog inspection fails closed when get_bind_info throws",
+TEST_CASE("hidden catalog inspection fails closed when get_table_entry throws",
           "[transparent][provenance]")
 {
   duckdb::TableFunction function;
-  function.get_bind_info = [](duckdb::optional_ptr<duckdb::FunctionData>) -> duckdb::BindInfo {
-    throw std::runtime_error("injected get_bind_info failure");
+  function.get_table_entry = [](duckdb::optional_ptr<const duckdb::FunctionData>)
+    -> duckdb::optional_ptr<duckdb::TableCatalogEntry> {
+    throw std::runtime_error("injected get_table_entry failure");
   };
   duckdb::LogicalGet get(duckdb::TableIndex(0),
                          duckdb::BoundTableFunction(function),

@@ -428,7 +428,7 @@ struct SiriusContext::internal_connection::implementation {
         !MetaTransaction::Get(context).IsReadOnly()) {
       throw InvalidInputException("Sirius internal connection lost its read-only transaction");
     }
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(sql);
     if (parser.statements.size() != 1 ||
         (parser.statements[0]->type != StatementType::SELECT_STATEMENT &&
@@ -1779,7 +1779,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
         }
         std::filesystem::copy_file(*source, destination);
       }
-      Parser parser(context.GetParserOptions());
+      Parser parser(context);
       parser.ParseQuery(current_query_sql);
       if (parser.statements.size() != 1) { return RebindQueryInfo::DO_NOT_REBIND; }
       Planner planner(context);

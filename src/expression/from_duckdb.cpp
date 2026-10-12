@@ -300,8 +300,8 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
       auto const& value = expr.GetChildren()[i]->Cast<duckdb::BoundConstantExpression>().GetValue();
       if (value.IsNull() || value.type() != duckdb::LogicalType::VARCHAR) { return nullptr; }
     }
-    auto const& pattern =
-      duckdb::StringValue::Get(expr.GetChildren()[1]->Cast<duckdb::BoundConstantExpression>().GetValue());
+    auto const& pattern = duckdb::StringValue::Get(
+      expr.GetChildren()[1]->Cast<duckdb::BoundConstantExpression>().GetValue());
     // RE2's shorthand classes and word boundaries are ASCII-only; cuDF's are Unicode-aware.
     // cuDF also does not implement POSIX classes. Skip escaped characters so a literal \\w
     // remains supported, but reject these constructs wherever they occur in the pattern.
@@ -338,8 +338,8 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
         max_match.empty()) {
       return nullptr;
     }
-    auto const& replacement =
-      duckdb::StringValue::Get(expr.GetChildren()[2]->Cast<duckdb::BoundConstantExpression>().GetValue());
+    auto const& replacement = duckdb::StringValue::Get(
+      expr.GetChildren()[2]->Cast<duckdb::BoundConstantExpression>().GetValue());
     // cuDF's template syntax differs from RE2's. Only translate single-digit backreferences;
     // leave escaped backslashes and invalid rewrite escapes to DuckDB. Braced references are
     // reserved for the translated cuDF template below, but are literal text in DuckDB.
@@ -354,7 +354,6 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
     if (has_backrefs && replacement.find("${") != std::string::npos) { return nullptr; }
     if (has_backrefs) {
       std::string error;
-      // RE2 leaves the input unchanged for an out-of-range reference; cuDF throws.
       // Validate against the original captures before adding the GPU wrapper groups.
       if (!regex.CheckRewriteString(replacement, &error)) { return nullptr; }
     }

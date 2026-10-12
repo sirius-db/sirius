@@ -186,7 +186,7 @@ duckdb::unique_ptr<sirius_physical_operator> build_sirius_plan(duckdb::Connectio
 
   duckdb::unique_ptr<sirius_physical_operator> result;
   try {
-    duckdb::Parser parser(context.GetParserOptions());
+    duckdb::Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 

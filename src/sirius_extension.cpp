@@ -409,7 +409,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
     PrepareConnection(context);
     unique_ptr<LogicalOperator> plan;
     try {
-      Parser parser(context.GetParserOptions());
+      Parser parser(context);
       parser.ParseQuery(query);
 
       Planner planner(context);
@@ -500,7 +500,7 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
   // execution's window (GPUExecutionFunction) so every execution observes the
   // pin registry and configuration current at execute time — a plan built at
   // bind would carry pin-registry pointers a later unpin invalidates.
-  Parser parser(context.GetParserOptions());
+  Parser parser(context);
   parser.ParseQuery(result->query);
   Planner planner(context);
   planner.CreatePlan(std::move(parser.statements[0]));

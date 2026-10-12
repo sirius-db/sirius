@@ -310,7 +310,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           // Suppress the optimizer hooks for this nested replan (the guard is a
           // no-op when Sirius has no per-connection state registered).
           duckdb::SiriusContext::InternalQueryGuard guard(context.client);
-          duckdb::Parser parser(context.client.GetParserOptions());
+          duckdb::Parser parser(context.client);
           parser.ParseQuery(query_sql_);
           if (parser.statements.size() != 1) {
             throw duckdb::ExecutorException(

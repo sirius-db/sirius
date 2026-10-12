@@ -169,7 +169,7 @@ duckdb::unique_ptr<duckdb::LogicalOperator> optimize_query(
   con.Query("BEGIN TRANSACTION");
   duckdb::unique_ptr<duckdb::LogicalOperator> plan;
   try {
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
