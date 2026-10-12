@@ -182,8 +182,7 @@ struct Context::Impl {
       .SetOptionByName("parquet_metadata_cache", duckdb::Value::BOOLEAN(true));
     conn = duckdb::make_uniq<duckdb::Connection>(*db);
     // Register the engine on the connection and disable DuckDB optimizer rewrites this
-    // no-fallback FFI path cannot safely execute. The transparent path only disables
-    // IN_CLAUSE and COMPRESSED_MATERIALIZATION here; this path remains more conservative.
+    // no-fallback FFI path cannot safely execute.
     auto& client = *conn->context;
     client.registered_state->Insert(kSiriusStateKey, context);
     // Per-connection Sirius state (guard depths, capture bookkeeping) for the
@@ -200,6 +199,10 @@ struct Context::Impl {
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+    disabled.insert(duckdb::OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN);
+    disabled.insert(duckdb::OptimizerType::GROUPING_SETS);
+    disabled.insert(duckdb::OptimizerType::AGGREGATE_REUSE);
+    disabled.insert(duckdb::OptimizerType::DISTINCT_AGGREGATE_REWRITE);
     // Keep this FFI-only restriction until its no-fallback execution path has
     // dedicated GPU_VALUES coverage.
     disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);

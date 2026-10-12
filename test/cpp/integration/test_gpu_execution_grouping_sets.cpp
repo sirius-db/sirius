@@ -134,11 +134,11 @@ TEST_CASE_METHOD(GroupingSetsFixture,
 }
 
 TEST_CASE_METHOD(GroupingSetsFixture,
-                 "grouping sets - grouping sets without keys fall back",
+                 "grouping sets - empty grouping sets preserve duplicate grand totals",
                  "[integration][gpu_execution][grouping_sets]")
 {
   create_grouping_table(*this);
-  expect_plan_fallback_matches_cpu("SELECT count(*) n FROM gs_t GROUP BY GROUPING SETS ((), ());");
+  compare_gpu_vs_cpu("SELECT count(*) n FROM gs_t GROUP BY GROUPING SETS ((), ());");
 }
 
 TEST_CASE_METHOD(GroupingSetsFixture,

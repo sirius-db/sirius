@@ -36,8 +36,11 @@ CI transfers those binaries from the CPU build job to the GPU test job; it does
 not download providers for this development revision. Test databases allow these
 locally built, unsigned providers.
 
-Sirius disables partial-aggregate pushdown alongside its existing unsupported
-optimizers because the new `combine_aggr` expressions cannot execute on the GPU.
+Sirius disables partial-aggregate pushdown, aggregate reuse and the grouping-sets rewrite alongside
+its existing unsupported optimizers because their DuckDB aggregate-state expressions
+cannot execute on the GPU. Sirius executes grouping sets directly on the GPU.
+The distinct-aggregate rewrite is also disabled: it turns supported
+`COUNT(DISTINCT row(...))` aggregates into unsupported nested grouping keys.
 This setting also applies to CPU queries after loading Sirius. Correlated joins
 retain v2's default CTE representation.
 

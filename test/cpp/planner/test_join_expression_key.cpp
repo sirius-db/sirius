@@ -34,7 +34,10 @@
 #include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <duckdb/planner/operator/logical_dummy_scan.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
@@ -354,4 +357,26 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   REQUIRE(!con->Query("INSERT INTO names VALUES ('Call Center'), (NULL)")->HasError());
   auto plan = generate_sirius_plan(*con, "SELECT lower(name), upper(name) FROM names");
   REQUIRE(plan);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "DELIM join with an arbitrary condition declines before wrapping the join",
+                 "[join_expression_key][isolated_context]")
+{
+  auto join =
+    make_uniq<LogicalComparisonJoin>(JoinType::INNER, LogicalOperatorType::LOGICAL_DELIM_JOIN);
+  join->delim_flipped = GENERATE(false, true);
+  join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(0)));
+  join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(1)));
+  join->conditions.emplace_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+                                make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+                                ExpressionType::COMPARE_EQUAL);
+  join->conditions.emplace_back(BoundComparisonExpression::Create(
+    ExpressionType::COMPARE_GREATERTHAN,
+    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1)));
+  join->ResolveOperatorTypes();
+  sirius::planner::sirius_physical_plan_generator planner(*con->context);
+  CHECK_THROWS_WITH(planner.create_plan(std::move(join)),
+                    Catch::Matchers::ContainsSubstring("arbitrary join conditions"));
 }

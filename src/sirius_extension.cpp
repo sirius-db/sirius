@@ -3596,8 +3596,12 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
   // compressed shapes — neither is executable by the rebind path.
   updated.insert(OptimizerType::IN_CLAUSE);
   updated.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-  // Partial aggregation introduces combine_aggr expressions the GPU planner cannot execute.
+  // These rewrites export DuckDB aggregate states instead of GPU aggregate values.
   updated.insert(OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN);
+  updated.insert(OptimizerType::GROUPING_SETS);
+  updated.insert(OptimizerType::AGGREGATE_REUSE);
+  // Keep COUNT(DISTINCT row(...)) as an aggregate, not a nested GROUP BY key.
+  updated.insert(OptimizerType::DISTINCT_AGGREGATE_REWRITE);
   // LATE_MATERIALIZATION rewrites `ORDER BY ... LIMIT N` over a scan into a
   // self-RIGHT_SEMI_JOIN keyed on parquet virtual columns the Sirius scan path
   // drops (src/op/scan/scan_plan.cpp), so the join's key columns would not

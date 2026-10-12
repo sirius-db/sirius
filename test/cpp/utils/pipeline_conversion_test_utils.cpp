@@ -63,6 +63,10 @@ class optimizer_disable_guard {
     auto disabled  = dbconfig.options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+    disabled.insert(duckdb::OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN);
+    disabled.insert(duckdb::OptimizerType::GROUPING_SETS);
+    disabled.insert(duckdb::OptimizerType::AGGREGATE_REUSE);
+    disabled.insert(duckdb::OptimizerType::DISTINCT_AGGREGATE_REWRITE);
 #ifdef DEBUG
     disabled.insert(duckdb::OptimizerType::COLUMN_LIFETIME);
 #endif

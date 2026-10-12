@@ -141,7 +141,7 @@ uint64_t reserve_standalone_plan_generation()
 bool is_nested_logical_type(duckdb::LogicalType const& type)
 {
   auto const id = type.id();
-  return id == duckdb::LogicalTypeId::STRUCT || id == duckdb::LogicalTypeId::LIST ||
+  return duckdb::StructType::IsStruct(id) || id == duckdb::LogicalTypeId::LIST ||
          id == duckdb::LogicalTypeId::MAP;
 }
 
