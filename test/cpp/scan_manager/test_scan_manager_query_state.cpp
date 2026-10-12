@@ -83,7 +83,7 @@ std::unique_ptr<scan::parquet_ingestible_table_info> make_table_info(std::string
   info->names = {"c0"};
   info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
   info->column_ids.push_back(duckdb::ColumnIndex(0));
-  info->scan_output_arity = 1;
+  info->projected_output_count = 1;
   return info;
 }
 
