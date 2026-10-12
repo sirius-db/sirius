@@ -1532,9 +1532,41 @@ impl SiriusComputeNodeService {
                 .push_share_frame(key, sender_id, seq, eos, names, batch)?;
             return Ok(kept.then_some(None));
         }
-        self.exchanges
-            .push_remote_frame(key, sender_id, seq, eos, names, batch)
-            .map(|frame| Some(frame.into_ready()))
+        let ready = self
+            .exchanges
+            .push_remote_frame(key, sender_id, seq, eos, names, batch)?;
+        self.release_oversized_shares(key);
+        Ok(Some(ready.into_ready()))
+    }
+
+    /// Releases the probers of the shares held at build exchange `key` once it has received more
+    /// rows than a share sends as exact keys ([`runtime_filters::max_share_keys`]). Such a share
+    /// could only go out as bounds, which rarely drop anything, and its probers would wait for the
+    /// whole build first: q21's l2 and l3 scans waited about 1.2 s for bounds over every order
+    /// key. Rows aren't distinct keys, so a build with many duplicate keys loses a filter it
+    /// could have sent exactly.
+    fn release_oversized_shares(&self, key: ExchangeKey) {
+        if !runtime_filters::enabled() || !self.filters.holds_share_at(key) {
+            return;
+        }
+        let (rows, limit) = (
+            self.exchanges.received_rows(key),
+            runtime_filters::max_share_keys(),
+        );
+        if rows <= limit {
+            return;
+        }
+        for share in self.filters.take_ready_shares(|site| site.key == key) {
+            runtime_filters::log_skipped(
+                Some(share.query),
+                Some(key.fragment_instance_id),
+                share.filter_id,
+                Some(share.join_node_id),
+                "too_many_keys",
+                &format!("{rows} build rows, more than {limit}"),
+            );
+            self.release_probers(share.query, share.filter_id, share.merge_node);
+        }
     }
 
     /// Runs a receiver a remote frame completed on its own thread, so `transmit_chunk` answers
@@ -3696,6 +3728,73 @@ mod tests {
         // The scan keeps the keys between them: a predicate, with no key stream to read.
         let scan = filtered_scan_run(&runs).expect("the scan ran filtered");
         assert_eq!(scan, &(Vec::new(), Vec::new(), true));
+    }
+
+    /// A batch of `rows` rows from remote sender 0 into holder 10's build exchange 2; with no
+    /// rows, its end of stream.
+    fn build_rows(service: &SiriusComputeNodeService, query: i64, seq: i64, rows: u64) {
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(query, 10),
+            node_id: 2,
+            sender_id: 0,
+        };
+        let envelope = NixlEnvelope::Packed {
+            token: if rows == 0 { 0 } else { 7 + seq as u64 },
+            rows,
+            names: vec!["id".to_string(), "name".to_string()],
+        };
+        let (status, _) = transmit(
+            service,
+            nixl_chunk::packed_params(Some(slot), seq, rows == 0),
+            envelope,
+        );
+        assert_eq!(status.status_code, TStatusCode::OK.0, "{status:?}");
+    }
+
+    #[test]
+    fn a_holder_whose_build_outgrows_exact_keys_releases_its_probers_at_once() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let (mut service, _) = nixl_service(executor.clone());
+        service.filter_wait = Duration::from_secs(5);
+        let exchange = share_query(&service, 58);
+        let limit = runtime_filters::max_share_keys();
+
+        // As many rows as a share sends exactly: the scan still waits for the build.
+        build_rows(&service, 58, 0, limit);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(service.filters.deferred(), 1);
+
+        // One more row: the share can only be bounds, so the scan runs unfiltered at once,
+        // before the build exchange completes.
+        build_rows(&service, 58, 1, 1);
+        assert_eq!(
+            runs_within_3s(&executor, 1),
+            vec![(Vec::new(), Vec::new(), false)]
+        );
+        assert_eq!(service.filters.deferred(), 0);
+        assert_eq!(
+            service.filters.held_shares(),
+            1,
+            "holder 11's share is still held"
+        );
+
+        // Both builds complete: holder 10's share never ships, and holder 11's, which the scan
+        // no longer waits for, is dropped where it lands.
+        build_rows(&service, 58, 2, 0);
+        exec_ok(&service, &share_build_sender(58, 1));
+        let runs = executor.wait_for(3);
+        let share_runs: Vec<_> = executor
+            .outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, slots)| slots.iter().all(|slot| slot.node_id == FILTER_STREAM_BASE))
+            .map(|(_, slots)| slots[0].sender_id)
+            .collect();
+        assert_eq!(share_runs, vec![1], "{runs:?}");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(service.exchanges.shares(exchange).is_empty());
+        assert_eq!(service.filters.held_shares(), 0);
     }
 
     #[test]

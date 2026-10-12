@@ -442,6 +442,23 @@ impl LocalExchange {
         Ok(true)
     }
 
+    /// Rows the remote senders of exchange `key` delivered so far. Local senders aren't counted:
+    /// their output stays parked, and its size isn't known here.
+    pub(crate) fn received_rows(&self, key: ExchangeKey) -> u64 {
+        self.lock()
+            .sources
+            .get(&key)
+            .into_iter()
+            .flat_map(|senders| senders.values())
+            .map(|source| match source {
+                SenderSource::Remote { batches, .. } => {
+                    batches.iter().map(|batch| batch.rows).sum::<u64>()
+                }
+                SenderSource::LocalParked { .. } => 0,
+            })
+            .sum()
+    }
+
     /// Where exchange `key`'s batches sit, once every expected sender completed it, left in place
     /// for its receiver. `None` while a sender is still producing, and once the receiver took
     /// them (or was never registered here).

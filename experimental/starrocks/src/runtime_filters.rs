@@ -254,6 +254,11 @@ impl RuntimeFilters {
         self.take_ready_shares(|site| site.key.fragment_instance_id == receiver)
     }
 
+    /// Whether a share not sent yet is held at build exchange `key`.
+    pub(crate) fn holds_share_at(&self, key: ExchangeKey) -> bool {
+        self.lock().shares.iter().any(|share| share.site.key == key)
+    }
+
     /// Shares held but not sent yet.
     pub(crate) fn held_shares(&self) -> usize {
         self.lock().shares.len()
@@ -607,7 +612,8 @@ pub(crate) fn wait_limit() -> Duration {
 ///
 /// TPC-H keys are spread evenly over their range, so bounds rarely drop anything. At SF1000,
 /// q12's `orders` filter is about 7.3M keys per share: sent exactly, it cuts the `orders` rows
-/// shipped from 1.5B to 29M; as bounds, by 96 rows.
+/// shipped from 1.5B to 29M; as bounds, by 96 rows. So a holder whose build exchange receives
+/// more rows than this releases its probers at once instead of making them wait for bounds.
 pub(crate) fn max_share_keys() -> u64 {
     std::env::var("SIRIUS_CN_RUNTIME_FILTER_MAX_SHARE_KEYS")
         .ok()
