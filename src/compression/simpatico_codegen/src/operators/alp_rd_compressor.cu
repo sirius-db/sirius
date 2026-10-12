@@ -329,7 +329,7 @@ __global__ void alp_rd_scatter_exceptions_kernel(
 
 template <typename T>
 std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
-  cudf::column_view const& col, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  cudf::column_view const& col, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   using traits = alp_rd_traits<T>;
   using uint_t = typename traits::uint_t;
@@ -348,7 +348,7 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
     cudaMemsetAsync(dict_col->mutable_view().data<uint16_t>(),
                     0,
                     sizeof(uint16_t) * kAlpRdMaxDictSize,
-                    stream.value());
+                    stream.get());
     auto md_col = cudf::make_fixed_width_column(
       cudf::data_type(cudf::type_id::UINT8), 1, cudf::mask_state::UNALLOCATED, stream, mr);
     uint8_t default_right_bw =
@@ -357,8 +357,8 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
                     &default_right_bw,
                     sizeof(uint8_t),
                     cudaMemcpyHostToDevice,
-                    stream.value());
-    cudaStreamSynchronize(stream.value());
+                    stream.get());
+    cudaStreamSynchronize(stream.get());
     return std::make_unique<alp_rd_compressed_representation>(col.type(),
                                                               0,
                                                               default_right_bw,
@@ -397,9 +397,9 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
                                           sizeof(T),
                                           safe_sample_n,
                                           cudaMemcpyDeviceToHost,
-                                          stream.value()),
+                                          stream.get()),
                         "alp_rd sample copy (2D)");
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
     if (safe_sample_n < sample_n) {
       uint_t pad = safe_sample_n > 0 ? h_sample[safe_sample_n - 1] : uint_t{0};
       for (size_t i = safe_sample_n; i < sample_n; ++i)
@@ -426,12 +426,12 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
                   choice.dict,
                   sizeof(uint16_t) * kAlpRdMaxDictSize,
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
   cudaMemcpyAsync(metadata_col->mutable_view().data<uint8_t>(),
                   &choice.right_bw,
                   sizeof(uint8_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
 
   // Step 3: encode kernel → (right_parts, dict_indices, exception_left, flag).
   rmm::device_uvector<uint8_t> d_flags(n, stream, mr);
@@ -440,21 +440,21 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
   const int block = 256;
   int grid        = (n + block - 1) / block;
   alp_rd_encode_kernel<T>
-    <<<grid, block, 0, stream.value()>>>(reinterpret_cast<const uint_t*>(col.data<T>()),
-                                         n,
-                                         choice.right_bw,
-                                         choice.actual_dict_size,
-                                         dict_col->view().data<uint16_t>(),
-                                         right_parts_col->mutable_view().data<uint_t>(),
-                                         dict_indices_col->mutable_view().data<uint8_t>(),
-                                         d_exception_left.data(),
-                                         d_flags.data());
+    <<<grid, block, 0, stream.get()>>>(reinterpret_cast<const uint_t*>(col.data<T>()),
+                                       n,
+                                       choice.right_bw,
+                                       choice.actual_dict_size,
+                                       dict_col->view().data<uint16_t>(),
+                                       right_parts_col->mutable_view().data<uint_t>(),
+                                       dict_indices_col->mutable_view().data<uint8_t>(),
+                                       d_exception_left.data(),
+                                       d_flags.data());
 
   // Step 4: compact exceptions into (positions, rejected left parts).
   auto exc = compact_exceptions<uint16_t>(
     d_flags.data(), n, d_exception_left.data(), cudf::type_id::UINT16, stream, mr);
 
-  throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "alp_rd_compress_impl sync");
+  throw_if_cuda_error(cudaStreamSynchronize(stream.get()), "alp_rd_compress_impl sync");
 
   return std::make_unique<alp_rd_compressed_representation>(col.type(),
                                                             n,
@@ -469,7 +469,7 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
 
 template <typename T>
 std::unique_ptr<cudf::column> alp_rd_decompress_impl(alp_rd_compressed_representation const& repr,
-                                                     rmm::cuda_stream_view stream,
+                                                     ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr)
 {
   using traits = alp_rd_traits<T>;
@@ -486,26 +486,26 @@ std::unique_ptr<cudf::column> alp_rd_decompress_impl(alp_rd_compressed_represent
   const int block = 256;
   int grid        = (repr.num_rows + block - 1) / block;
   alp_rd_decode_kernel<T>
-    <<<grid, block, 0, stream.value()>>>(repr.right_parts()->view().data<uint_t>(),
-                                         repr.dict_indices()->view().data<uint8_t>(),
-                                         repr.dict()->view().data<uint16_t>(),
-                                         repr.right_bw,
-                                         repr.num_rows,
-                                         out->mutable_view().data<T>());
+    <<<grid, block, 0, stream.get()>>>(repr.right_parts()->view().data<uint_t>(),
+                                       repr.dict_indices()->view().data<uint8_t>(),
+                                       repr.dict()->view().data<uint16_t>(),
+                                       repr.right_bw,
+                                       repr.num_rows,
+                                       out->mutable_view().data<T>());
 
   cudf::size_type exc_n = repr.exceptions() ? repr.exceptions()->size() : 0;
   if (exc_n > 0) {
     int egrid = (exc_n + block - 1) / block;
     alp_rd_scatter_exceptions_kernel<T>
-      <<<egrid, block, 0, stream.value()>>>(repr.exceptions()->view().data<uint16_t>(),
-                                            repr.exception_positions()->view().data<int32_t>(),
-                                            repr.right_parts()->view().data<uint_t>(),
-                                            exc_n,
-                                            repr.right_bw,
-                                            out->mutable_view().data<T>());
+      <<<egrid, block, 0, stream.get()>>>(repr.exceptions()->view().data<uint16_t>(),
+                                          repr.exception_positions()->view().data<int32_t>(),
+                                          repr.right_parts()->view().data<uint_t>(),
+                                          exc_n,
+                                          repr.right_bw,
+                                          out->mutable_view().data<T>());
   }
 
-  throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "alp_rd_decompress sync");
+  throw_if_cuda_error(cudaStreamSynchronize(stream.get()), "alp_rd_decompress sync");
   return out;
 }
 
@@ -536,7 +536,7 @@ alp_rd_compressed_representation::alp_rd_compressed_representation(
 }
 
 std::unique_ptr<cudf::column> alp_rd_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
 {
   switch (original_type.id()) {
     case cudf::type_id::FLOAT32: return alp_rd_decompress_impl<float>(*this, stream, mr);
@@ -553,7 +553,7 @@ std::unique_ptr<cudf::column> alp_rd_compressed_representation::decompress(
 
 std::unique_ptr<compressed_representation> alp_rd_compressor::compress(
   cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto const dt = column_to_compress.type();

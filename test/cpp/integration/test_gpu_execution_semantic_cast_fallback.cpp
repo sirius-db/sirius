@@ -34,34 +34,6 @@ using SemanticCastFixture = sirius::test::GpuExecutionFixture;
 
 namespace {
 
-/// Run @p query with gpu_execution on and CPU fallback enabled: the query must succeed via a
-/// plan-time fallback (never a GPU execution) and produce exactly the CPU results.
-void expect_plan_fallback_matches_cpu(SemanticCastFixture& fx, std::string const& query)
-{
-  fx.run_ok("SET gpu_execution = true;");
-  auto const before = sirius::test::get_transparent_execution_stats(*fx.con);
-  auto result       = fx.con->Query(query);
-  auto const after  = sirius::test::get_transparent_execution_stats(*fx.con);
-  REQUIRE(result);
-  if (result->HasError()) { UNSCOPED_INFO("query error: " << result->GetError()); }
-  REQUIRE_FALSE(result->HasError());
-  // Plan-time CPU fallback, not a GPU run: the unsupported cast is rejected during plan
-  // generation, so the fallback counter moves and the execution counter does not.
-  REQUIRE(after.fallbacks == before.fallbacks + 1);
-  REQUIRE(after.executions == before.executions);
-
-  fx.run_ok("SET gpu_execution = false;");
-  auto cpu_result = fx.con->Query(query);
-  fx.run_ok("SET gpu_execution = true;");
-  REQUIRE(cpu_result);
-  REQUIRE_FALSE(cpu_result->HasError());
-
-  auto rows = SemanticCastFixture::collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows =
-    SemanticCastFixture::collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
-  REQUIRE(rows == cpu_rows);
-}
-
 /// Rejection wording of the projection translation site (sirius_plan_projection.cpp).
 constexpr char kProjectionRejection[] = "Unsupported expression in projection";
 /// Shared prefix of both filter rejection sites: LogicalFilter translation (sirius_plan_filter.cpp,
@@ -120,7 +92,7 @@ TEST_CASE_METHOD(SemanticCastFixture,
 {
   create_cast_table(*this);
   // DuckDB null-cast semantics: every row is NULL -- never the int16 epoch-day value 1.
-  expect_plan_fallback_matches_cpu(*this, "SELECT TRY_CAST(d AS SMALLINT) FROM cast_t;");
+  expect_plan_fallback_matches_cpu("SELECT TRY_CAST(d AS SMALLINT) FROM cast_t;");
 }
 
 TEST_CASE_METHOD(SemanticCastFixture,
@@ -129,7 +101,7 @@ TEST_CASE_METHOD(SemanticCastFixture,
 {
   create_cast_table(*this);
   // Every row NULL -- never DATE '1970-01-02' retagged from s = 1.
-  expect_plan_fallback_matches_cpu(*this, "SELECT TRY_CAST(s AS DATE) FROM cast_t;");
+  expect_plan_fallback_matches_cpu("SELECT TRY_CAST(s AS DATE) FROM cast_t;");
 }
 
 TEST_CASE_METHOD(SemanticCastFixture,
@@ -187,7 +159,7 @@ TEST_CASE_METHOD(SemanticCastFixture,
   // translation declines it from reject_untranslatable_table_filter (sirius_plan_get.cpp) rather
   // than the LogicalFilter site. On the CPU the null-cast makes the predicate true for every row.
   expect_plan_fallback_matches_cpu(
-    *this, "SELECT count(*) FROM cast_t WHERE TRY_CAST(d AS SMALLINT) IS NULL;");
+    "SELECT count(*) FROM cast_t WHERE TRY_CAST(d AS SMALLINT) IS NULL;");
 }
 
 TEST_CASE_METHOD(SemanticCastFixture,
@@ -260,4 +232,24 @@ TEST_CASE_METHOD(SemanticCastFixture,
       SemanticCastFixture::collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
     REQUIRE(rows == cpu_rows);
   }
+}
+
+TEST_CASE_METHOD(SemanticCastFixture,
+                 "scalar cast - sum_rewriter arithmetic runs without CPU fallback",
+                 "[integration][gpu_execution][scalar_cast]")
+{
+  run_ok("CREATE TABLE hits(ResolutionWidth INTEGER, grp INTEGER);");
+  run_ok("INSERT INTO hits VALUES (1920, 1), (1280, 1), (NULL, 1), (-1, 2), (0, 2), (NULL, 3);");
+  run_ok("CHECKPOINT;");
+  // Keep Sirius's optimizer exclusions; sum_rewriter is enabled by default.
+  auto disabled = con->Query("SELECT current_setting('disabled_optimizers');");
+  REQUIRE(disabled);
+  REQUIRE_FALSE(disabled->HasError());
+  REQUIRE(disabled->GetValue(0, 0).ToString().find("sum_rewriter") == std::string::npos);
+  run_ok("SET enable_duckdb_fallback = false;");
+
+  compare_gpu_vs_cpu("SELECT SUM(ResolutionWidth + 1) FROM hits;");
+  compare_gpu_vs_cpu("SELECT grp, SUM(ResolutionWidth + 1) FROM hits GROUP BY grp;");
+  compare_gpu_vs_cpu("SELECT SUM(ResolutionWidth + 1) FROM hits WHERE grp = 3;");
+  compare_gpu_vs_cpu("SELECT SUM(ResolutionWidth + 1) FROM hits WHERE grp = 99;");
 }

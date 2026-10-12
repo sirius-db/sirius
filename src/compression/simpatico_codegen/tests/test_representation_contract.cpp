@@ -14,9 +14,10 @@
 
 #include <cudf/column/column.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdio>
 #include <stdexcept>
@@ -95,7 +96,7 @@ void test_fused_rep_rejected_by_helper()
 
   std::string err;
   auto result = simpatico::decompress_standalone_representation(
-    &fused, rmm::cuda_stream_view{}, rmm::mr::get_current_device_resource_ref(), &err);
+    &fused, ::cuda::stream_ref{cudaStream_t{}}, rmm::mr::get_current_device_resource_ref(), &err);
 
   expect(result == nullptr, "helper must return nullptr for a fused rep");
   expect(!err.empty(), "helper must set a non-empty error message for a fused rep");
@@ -107,7 +108,7 @@ void test_null_rep_rejected_by_helper()
 {
   std::string err;
   auto result = simpatico::decompress_standalone_representation(
-    nullptr, rmm::cuda_stream_view{}, rmm::mr::get_current_device_resource_ref(), &err);
+    nullptr, ::cuda::stream_ref{cudaStream_t{}}, rmm::mr::get_current_device_resource_ref(), &err);
 
   expect(result == nullptr, "helper must return nullptr for null rep");
   expect(!err.empty(), "helper must set a non-empty error message for null rep");
@@ -119,8 +120,11 @@ void test_fused_rep_rejected_without_error_out()
     simpatico::OpId::Delta, cudf::data_type{cudf::type_id::INT64}, 0};
 
   // Passing nullptr for error_out must not crash.
-  auto result = simpatico::decompress_standalone_representation(
-    &fused, rmm::cuda_stream_view{}, rmm::mr::get_current_device_resource_ref(), nullptr);
+  auto result =
+    simpatico::decompress_standalone_representation(&fused,
+                                                    ::cuda::stream_ref{cudaStream_t{}},
+                                                    rmm::mr::get_current_device_resource_ref(),
+                                                    nullptr);
 
   expect(result == nullptr, "helper must return nullptr for a fused rep (no error_out)");
 }

@@ -38,9 +38,11 @@ void require_pinned_update_error(duckdb::QueryResult& result,
                                  const std::string& pinned_name)
 {
   REQUIRE(result.HasError());
-  REQUIRE_THAT(result.GetError(), Catch::Contains("does not support UPDATE"));
-  REQUIRE_THAT(result.GetError(), Catch::Contains("pinned DuckDB table '" + table_name + "'"));
-  REQUIRE_THAT(result.GetError(), Catch::Contains("CALL unpin_table('" + pinned_name + "')"));
+  REQUIRE_THAT(result.GetError(), Catch::Matchers::ContainsSubstring("does not support UPDATE"));
+  REQUIRE_THAT(result.GetError(),
+               Catch::Matchers::ContainsSubstring("pinned DuckDB table '" + table_name + "'"));
+  REQUIRE_THAT(result.GetError(),
+               Catch::Matchers::ContainsSubstring("CALL unpin_table('" + pinned_name + "')"));
 }
 
 }  // namespace
@@ -200,8 +202,9 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   auto pin = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   REQUIRE(pin);
   REQUIRE(pin->HasError());
-  REQUIRE_THAT(pin->GetError(), Catch::Contains("has in-memory update chains"));
-  REQUIRE_THAT(pin->GetError(), Catch::Contains("run CHECKPOINT before pinning"));
+  REQUIRE_THAT(pin->GetError(), Catch::Matchers::ContainsSubstring("has in-memory update chains"));
+  REQUIRE_THAT(pin->GetError(),
+               Catch::Matchers::ContainsSubstring("run CHECKPOINT before pinning"));
 
   run_ok("CHECKPOINT;");
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
@@ -224,8 +227,9 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   auto result = con->Query("SELECT sum(v) FROM t;");
   REQUIRE(result);
   REQUIRE(result->HasError());
-  REQUIRE_THAT(result->GetError(), Catch::Contains("checkpointed after pin_table"));
-  REQUIRE_THAT(result->GetError(), Catch::Contains("CALL unpin_table('t')"));
+  REQUIRE_THAT(result->GetError(),
+               Catch::Matchers::ContainsSubstring("checkpointed after pin_table"));
+  REQUIRE_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("CALL unpin_table('t')"));
 
   run_ok("SET enable_duckdb_fallback = true;");
   run_ok("CALL unpin_table('t');");

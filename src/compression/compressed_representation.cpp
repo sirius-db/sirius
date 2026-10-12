@@ -17,6 +17,7 @@
 #include "compressed_representation.hpp"
 
 #include "device_compressed_blob.hpp"
+#include "memory/size_arithmetic.hpp"
 
 #include <cuda_runtime.h>
 
@@ -24,7 +25,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace sirius {
@@ -36,7 +39,7 @@ void copy_device_to_pinned_blocks(
   cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& dst,
   std::uint64_t dst_offset,
   std::size_t size,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (size == 0) return;
   const std::size_t bs = dst.block_size();
@@ -47,7 +50,7 @@ void copy_device_to_pinned_blocks(
   while (copied < size) {
     const std::size_t chunk = std::min(size - copied, bs - d_off);
     CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-      dst.at(d_idx).data() + d_off, src + copied, chunk, cudaMemcpyDeviceToHost, stream.value()));
+      dst.at(d_idx).data() + d_off, src + copied, chunk, cudaMemcpyDeviceToHost, stream.get()));
     copied += chunk;
     d_off += chunk;
     if (d_off == bs) {
@@ -62,7 +65,7 @@ void copy_pinned_blocks_to_device(
   std::uint64_t src_offset,
   void* dst_device,
   std::size_t size,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (size == 0) return;
   const std::size_t bs = src.block_size();
@@ -73,7 +76,7 @@ void copy_pinned_blocks_to_device(
   while (copied < size) {
     const std::size_t chunk = std::min(size - copied, bs - s_off);
     CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-      dst + copied, src.at(s_idx).data() + s_off, chunk, cudaMemcpyHostToDevice, stream.value()));
+      dst + copied, src.at(s_idx).data() + s_off, chunk, cudaMemcpyHostToDevice, stream.get()));
     copied += chunk;
     s_off += chunk;
     if (s_off == bs) {
@@ -93,7 +96,7 @@ compressed_host_representation::compressed_host_representation(
   std::size_t uncompressed_bytes,
   std::int64_t num_rows,
   std::shared_ptr<const per_column_byte_sizes> column_sizes)
-  : cucascade::idata_representation(memory_space),
+  : simpatico_compressed_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
@@ -114,7 +117,7 @@ compressed_host_representation::compressed_host_representation(
   std::int64_t num_rows,
   std::optional<std::vector<std::size_t>> selected_indices,
   std::shared_ptr<const per_column_byte_sizes> column_sizes)
-  : cucascade::idata_representation(memory_space),
+  : simpatico_compressed_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
@@ -128,7 +131,7 @@ compressed_host_representation::compressed_host_representation(
 // ── idata_representation interface ───────────────────────────────────────────
 
 std::unique_ptr<cucascade::idata_representation> compressed_host_representation::clone(
-  rmm::cuda_stream_view /*stream*/)
+  ::cuda::stream_ref /*stream*/)
 {
   // Share the same backing blob — no byte copy needed.
   auto copy = std::unique_ptr<compressed_host_representation>(
@@ -140,8 +143,8 @@ std::unique_ptr<cucascade::idata_representation> compressed_host_representation:
                                        _num_rows,
                                        _selected_indices,
                                        _column_sizes));
-  // The pushdown is indexed by the selected column list, which the clone shares.
-  copy->set_equality_pushdown(_equality_pushdown);
+  // The request is indexed by the selected column list, which the clone shares.
+  copy->set_pushdown_scan(_pushdown_scan);
   return copy;
 }
 
@@ -163,8 +166,8 @@ std::pair<std::size_t, std::size_t> projected_bytes(
     std::size_t compressed   = 0;
     std::size_t uncompressed = 0;
     for (auto idx : absolute) {
-      compressed += sizes->compressed[idx];
-      uncompressed += sizes->uncompressed[idx];
+      compressed   = memory::saturating_add(compressed, sizes->compressed[idx]);
+      uncompressed = memory::saturating_add(uncompressed, sizes->uncompressed[idx]);
     }
     return {compressed, uncompressed};
   }
@@ -257,7 +260,7 @@ compressed_device_representation::compressed_device_representation(
   std::size_t uncompressed_bytes,
   std::int64_t num_rows,
   std::shared_ptr<const per_column_byte_sizes> column_sizes)
-  : cucascade::idata_representation(memory_space),
+  : simpatico_compressed_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
@@ -276,7 +279,7 @@ compressed_device_representation::compressed_device_representation(
   std::int64_t num_rows,
   std::optional<std::vector<std::size_t>> selected_indices,
   std::shared_ptr<const per_column_byte_sizes> column_sizes)
-  : cucascade::idata_representation(memory_space),
+  : simpatico_compressed_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
@@ -287,13 +290,15 @@ compressed_device_representation::compressed_device_representation(
 {
 }
 
+bool compressed_device_representation::has_table() const noexcept { return _blob != nullptr; }
+
 const simpatico::compressed_table& compressed_device_representation::table() const noexcept
 {
   return _blob->table;
 }
 
 std::unique_ptr<cucascade::idata_representation> compressed_device_representation::clone(
-  rmm::cuda_stream_view /*stream*/)
+  ::cuda::stream_ref /*stream*/)
 {
   // Share the same cached blob — no byte copy needed.
   auto copy = std::unique_ptr<compressed_device_representation>(
@@ -305,8 +310,8 @@ std::unique_ptr<cucascade::idata_representation> compressed_device_representatio
                                          _num_rows,
                                          _selected_indices,
                                          _column_sizes));
-  // The pushdown is indexed by the selected column list, which the clone shares.
-  copy->set_equality_pushdown(_equality_pushdown);
+  // The request is indexed by the selected column list, which the clone shares.
+  copy->set_pushdown_scan(_pushdown_scan);
   return copy;
 }
 

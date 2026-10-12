@@ -2,7 +2,7 @@ sirius:
   space:
     gpu:
       - device_id: 0
-        per_stream_reservation: false
+        per_stream_reservation: true
         reservation_limit_fraction: 0.9
         downgrade_trigger_fraction: 0.8
         downgrade_stop_fraction: 0.7
@@ -24,8 +24,6 @@ sirius:
   executor:
     pipeline:
       num_threads: 4
-      thread_name_prefix: "sirius_pipeline_executor"
     downgrade:
       num_threads: 1
-      thread_name_prefix: "sirius_downgrade_executor"
       monitor_period: 10ms

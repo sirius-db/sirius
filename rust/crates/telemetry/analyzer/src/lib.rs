@@ -171,7 +171,9 @@ impl QuentViewer for Viewer {
     fn import_events(
         dir: &std::path::Path,
     ) -> quent_model::io::ImporterResult<ViewerEventStream<Self::Analyzer>> {
-        Sirius::import_events(dir)
+        let events =
+            Sirius::import_events(dir)?.collect::<quent_model::io::ImporterResult<Vec<_>>>()?;
+        Ok(Box::new(events.into_iter()))
     }
 }
 

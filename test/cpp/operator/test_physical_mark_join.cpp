@@ -18,13 +18,22 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator_test_utils.hpp"
 
+#include <cudf/transform.hpp>
+
 #include <catch.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/exception.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_hash_join.hpp>
 #include <op/sirius_physical_nested_loop_join.hpp>
+#include <pipeline/sirius_pipeline.hpp>
+#include <utils/gpu_execution_fixture.hpp>
+
+#include <algorithm>
+#include <limits>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -48,6 +57,17 @@ struct mark_join_fixture {
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 };
 
+struct finishable_mark_pipeline : sirius::pipeline::sirius_pipeline {
+  explicit finishable_mark_pipeline(const sirius::pipeline::pipeline_build_context& ctx)
+    : sirius_pipeline(ctx)
+  {
+  }
+
+  [[nodiscard]] bool is_pipeline_finished() const override { return finished; }
+
+  bool finished = false;
+};
+
 //! Depth-first, root-first numbering of a bare operator tree, standing in for
 //! pipeline::assign_operator_ids in fixtures that never build pipelines.
 void number_operator_tree(sirius::op::sirius_physical_operator& op, size_t& next_id)
@@ -69,10 +89,12 @@ struct projected_nlj_result {
 };
 
 /**
- * @brief Create a mark join operator with two INT32 key columns (left col[0] = right col[0]).
+ * @brief Create a mark join operator with two INT32 key columns joined by @p comparison
+ * (left col[0] <comparison> right col[0]).
  * Left child has types {INTEGER, INTEGER} (key + payload), right child has {INTEGER} (key only).
  */
-mark_join_fixture create_mark_join()
+mark_join_fixture create_mark_join(
+  duckdb::ExpressionType comparison = duckdb::ExpressionType::COMPARE_EQUAL)
 {
   mark_join_fixture f;
 
@@ -94,7 +116,7 @@ mark_join_fixture create_mark_join()
   duckdb::JoinCondition cond;
   cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
   cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  cond.comparison = comparison;
   conditions.push_back(std::move(cond));
 
   f.hash_join = duckdb::make_uniq<sirius_physical_hash_join>(
@@ -106,8 +128,7 @@ mark_join_fixture create_mark_join()
     duckdb::vector<duckdb::idx_t>{},  // left_projection_map (empty = all)
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (not used by MARK)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
-    1000,
-    nullptr);
+    1000);
 
   // No pipelines exist in this fixture, so the converter's assign_operator_ids never runs.
   // Number the tree here — operator code reads get_operator_id(), which rejects the sentinel.
@@ -142,6 +163,8 @@ nlj_projection_fixture create_projected_nlj(duckdb::JoinType join_type,
   f.logical_join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
   if (join_type == duckdb::JoinType::MARK) {
     f.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
+  } else if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::INNER) {
+    f.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
   } else {
     f.logical_join->types = {duckdb::LogicalType::INTEGER};
   }
@@ -336,10 +359,13 @@ TEST_CASE("sirius_physical_hash_join mark join - empty right side", "[physical_m
   auto* space = get_shared_mem_space();
   REQUIRE(space);
 
+  const bool null_probe             = GENERATE(false, true);
   std::vector<int32_t> left_ids     = {10, 20, 30};
   std::vector<int32_t> left_payload = {1, 2, 3};
-  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
-    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+  auto left_keys                    = make_numeric_batch_with_nulls<int32_t>(
+    *space, left_ids, {true, !null_probe, true}, cudf::type_id::INT32);
+  auto payload    = make_numeric_batch<int32_t>(*space, left_payload, cudf::type_id::INT32);
+  auto left_batch = concatenate_batches_horizontal({left_keys, payload}, *space);
 
   // Empty right table — semi_indices will be empty, all marks should be false
   std::vector<int32_t> right_ids = {};
@@ -355,39 +381,98 @@ TEST_CASE("sirius_physical_hash_join mark join - empty right side", "[physical_m
     *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
 
-  REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
+  REQUIRE(copy_validity_to_host(out_view.column(0)) == std::vector<bool>{true, !null_probe, true});
+  if (!null_probe) { REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids); }
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
+  // Even NULL IN (empty) is a definite FALSE; NOT IN must therefore be TRUE.
+  REQUIRE(out_view.column(2).null_count() == 0);
   REQUIRE(copy_column_to_host<bool>(out_view.column(2)) == std::vector<bool>{false, false, false});
 }
 
-// `x IN (S)` is FALSE for every probe row when S is empty — including a NULL probe key, which
-// yields NULL only against a NON-empty set. The mark must be all-false with no null mask.
-TEST_CASE("sirius_physical_hash_join mark join - empty right side with NULL probe key",
-          "[physical_mark_join]")
+TEST_CASE("MARK join drains probe batches when its build pipeline emits no batches",
+          "[physical_mark_join][build_probe]")
 {
   auto* space = get_shared_mem_space();
   REQUIRE(space);
 
-  // Left key column carries a NULL at row 1; payload is a plain column.
-  auto left_key = make_numeric_batch_with_nulls<int32_t>(
+  auto f          = create_mark_join();
+  auto build_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*build_pipeline, *f.hash_join->children[1]);
+  build_state.add_pipeline_operator(*probe_pipeline, *f.hash_join->children[0]);
+
+  auto attach_port = [&](std::string_view name,
+                         cucascade::shared_data_repository& repo,
+                         std::shared_ptr<finishable_mark_pipeline> source) {
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = MemoryBarrierType::PARTIAL;
+    port->repo         = &repo;
+    port->src_pipeline = std::move(source);
+    f.hash_join->add_port(name, std::move(port));
+  };
+  attach_port("build", *build_repo, build_pipeline);
+  attach_port("default", *probe_repo, probe_pipeline);
+
+  // Before either side is sized, the build producer is the next source of work.
+  auto hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(hint->producer == f.hash_join->children[1].get());
+
+  // The upstream PARTITION normally installs this for an empty build side.
+  f.hash_join->set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+
+  // The build finishes without ever publishing a batch. The join must switch to the probe
+  // producer, then process each probe batch without trying to build a hash table.
+  build_pipeline->finished = true;
+  hint                     = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(hint->producer == f.hash_join->children[0].get());
+
+  auto probe_key = make_numeric_batch_with_nulls<int32_t>(
     *space, {1, 0, 2}, {true, false, true}, cudf::type_id::INT32);
-  auto left_payload = make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32);
-  auto left_batch   = concatenate_batches_horizontal({left_key, left_payload}, *space);
+  auto payload = make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32);
+  probe_repo->add_data_batch(concatenate_batches_horizontal({probe_key, payload}, *space));
 
-  auto right_batch = make_numeric_batch<int32_t>(*space, {}, cudf::type_id::INT32);
+  hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  auto input = f.hash_join->get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  auto output         = f.hash_join->execute(*input, cudf::get_default_stream());
+  auto const& batches = dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches();
+  REQUIRE(batches.size() == 1);
+  auto view = sirius::get_cudf_table_view(*batches[0]);
+  REQUIRE(copy_column_to_host<int32_t>(view.column(1)) == std::vector<int32_t>{10, 20, 30});
+  REQUIRE(view.column(2).null_count() == 0);
+  REQUIRE(copy_column_to_host<bool>(view.column(2)) == std::vector<bool>{false, false, false});
 
-  auto f = create_mark_join();
-  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
-  auto outputs =
-    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  // A second poll must wait for more probe work, and both finished inputs end the join.
+  hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(hint->producer == f.hash_join->children[0].get());
 
-  auto out_view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
-  REQUIRE(out_view.num_rows() == 3);
+  probe_repo->add_data_batch(make_two_column_batch<int32_t, int32_t>(
+    *space, {7}, {70}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32));
+  hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  auto second_input = f.hash_join->get_next_task_input_data();
+  REQUIRE(second_input != nullptr);
+  auto second_output = f.hash_join->execute(*second_input, cudf::get_default_stream());
+  auto second_view   = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*second_output).get_data_batches()[0]);
+  REQUIRE(copy_column_to_host<bool>(second_view.column(2)) == std::vector<bool>{false});
 
-  auto mark = out_view.column(2);
-  REQUIRE(mark.null_count() == 0);
-  REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{false, false, false});
+  probe_pipeline->finished = true;
+  REQUIRE_FALSE(f.hash_join->get_next_task_hint().has_value());
 }
 
 TEST_CASE("sirius_physical_hash_join mark join - duplicate keys on right side",
@@ -599,8 +684,7 @@ TEST_CASE("sirius_physical_hash_join mark join - mixed conditions are unsupporte
                       duckdb::vector<duckdb::idx_t>{},
                       duckdb::vector<duckdb::idx_t>{},
                       sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
-                      1000,
-                      nullptr),
+                      1000),
                     std::runtime_error);
 }
 
@@ -919,6 +1003,123 @@ TEST_CASE("sirius_physical_nested_loop_join MARK mixed null-safe + null-propagat
   }
 }
 
+// DuckDB's PhysicalNestedLoopJoin::IsSupported admits RIGHT_SEMI, RIGHT_ANTI and SINGLE, which
+// used to survive planning and then hit the execute switch's `default:` throw mid-query.
+TEST_CASE("sirius_physical_nested_loop_join rejects join types it cannot execute",
+          "[physical_nested_loop_join][join_type]")
+{
+  using JT = duckdb::JoinType;
+
+  for (auto join_type : {JT::INNER, JT::LEFT, JT::RIGHT, JT::SEMI, JT::ANTI, JT::MARK, JT::OUTER}) {
+    INFO("join type " << duckdb::JoinTypeToString(join_type));
+    REQUIRE(sirius_physical_nested_loop_join::is_join_type_supported(join_type));
+  }
+
+  for (auto join_type : {JT::RIGHT_SEMI, JT::RIGHT_ANTI, JT::SINGLE}) {
+    INFO("join type " << duckdb::JoinTypeToString(join_type));
+    REQUIRE_FALSE(sirius_physical_nested_loop_join::is_join_type_supported(join_type));
+    // The DuckDB-mirroring condition check must agree, so neither entry point can admit them.
+    REQUIRE_FALSE(sirius_physical_nested_loop_join::is_supported(
+      duckdb::vector<sirius::join_condition>{}, join_type));
+    // Backstop: constructing one anyway throws inside plan generation (which falls back to CPU)
+    // rather than aborting the query from execute().
+    REQUIRE_THROWS_AS(create_projected_nlj(join_type, duckdb::ExpressionType::COMPARE_EQUAL),
+                      duckdb::NotImplementedException);
+  }
+}
+
+// SINGLE reaches neither GPU join: both dispatches fall through to a mid-query throw.
+// are_conditions_supported now folds in the join-type screen so the planner rejects it.
+TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
+          "[physical_hash_join][join_type]")
+{
+  using JT = duckdb::JoinType;
+
+  for (auto join_type : {JT::INNER,
+                         JT::LEFT,
+                         JT::RIGHT,
+                         JT::SEMI,
+                         JT::ANTI,
+                         JT::RIGHT_SEMI,
+                         JT::RIGHT_ANTI,
+                         JT::MARK,
+                         JT::OUTER}) {
+    INFO("join type " << duckdb::JoinTypeToString(join_type));
+    REQUIRE(sirius_physical_hash_join::is_join_type_supported(join_type));
+  }
+  REQUIRE_FALSE(sirius_physical_hash_join::is_join_type_supported(JT::SINGLE));
+
+  // A plain equality condition the hash join would otherwise accept.
+  auto make_conditions = [](duckdb::ExpressionType comparison) {
+    duckdb::vector<duckdb::JoinCondition> conditions;
+    duckdb::JoinCondition cond;
+    cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+    cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+    cond.comparison = comparison;
+    conditions.push_back(std::move(cond));
+    return sirius::wrap_join_conditions(std::move(conditions));
+  };
+
+  auto equal_conditions = make_conditions(duckdb::ExpressionType::COMPARE_EQUAL);
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::INNER));
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::MARK));
+  // Rejected on the join type alone, not the conditions.
+  REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::SINGLE));
+
+  // An all-null-safe MARK is supported: one EQUAL covers every key and the marks are definite.
+  auto null_safe_conditions = make_conditions(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(null_safe_conditions, JT::INNER));
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(null_safe_conditions, JT::MARK));
+
+  // Mixing the two is not, since one null_equality cannot express both policies.
+  duckdb::vector<duckdb::JoinCondition> mixed;
+  for (auto comparison :
+       {duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM}) {
+    duckdb::JoinCondition cond;
+    auto const idx = static_cast<duckdb::idx_t>(mixed.size());
+    cond.left      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx);
+    cond.right     = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx);
+    cond.comparison = comparison;
+    mixed.push_back(std::move(cond));
+  }
+  auto mixed_conditions = sirius::wrap_join_conditions(std::move(mixed));
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(mixed_conditions, JT::INNER));
+  REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(mixed_conditions, JT::MARK));
+}
+
+// An all-null-safe MARK runs under EQUAL: NULL matches NULL and no comparison is UNKNOWN, so the
+// mark column carries no nulls. Under the previous UNEQUAL pin a NULL probe key produced NULL.
+TEST_CASE("sirius_physical_hash_join MARK with all null-safe keys emits definite marks",
+          "[physical_hash_join][mark][nulls]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  // compare_nulls()/mark_is_null_safe() are internal, so assert the semantics instead: NULL
+  // matching NULL proves EQUAL, a null-free mark column proves definiteness.
+  auto f = create_mark_join(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+
+  // Left keys {NULL, 5, 7} with payload; right (build) keys {NULL, 5}.
+  auto left_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {0, 5, 7}, {false, true, true}, cudf::type_id::INT32);
+  auto left_payload = make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32);
+  auto left         = concatenate_batches_horizontal({left_key, left_payload}, *space);
+  auto right =
+    make_numeric_batch_with_nulls<int32_t>(*space, {0, 5}, {false, true}, cudf::type_id::INT32);
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left, right};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  auto const& output_data = dynamic_cast<const pipelineable_operator_data&>(*outputs);
+  REQUIRE(output_data.get_data_batches().size() == 1);
+  auto view = sirius::get_cudf_table_view(*output_data.get_data_batches()[0]);
+
+  // NULL matches NULL, 5 matches 5, 7 matches nothing -- and the miss is FALSE, never NULL.
+  auto mark = view.column(view.num_columns() - 1);
+  REQUIRE(mark.null_count() == 0);
+  REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{true, true, false});
+}
+
 TEST_CASE("sirius_physical_nested_loop_join SEMI and ANTI honor the left projection map",
           "[physical_nested_loop_join][projection][semi][anti]")
 {
@@ -979,4 +1180,195 @@ TEST_CASE("sirius_physical_nested_loop_join SEMI and ANTI honor the left project
     REQUIRE(out_view.num_rows() == 3);
     REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == std::vector<int32_t>{10, 20, 30});
   }
+}
+
+TEST_CASE("sirius_physical_nested_loop_join RIGHT keeps asymmetric predicate sides",
+          "[physical_nested_loop_join][projection][right]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  auto left  = make_three_int32_batch(*space, {1, 1, 5}, {10, 11, 50}, {100, 101, 500});
+  auto right = make_numeric_batch_with_nulls<int32_t>(
+    *space, {0, 3, 0}, {true, true, false}, cudf::type_id::INT32);
+  auto f = create_projected_nlj(duckdb::JoinType::RIGHT, duckdb::ExpressionType::COMPARE_LESSTHAN);
+  // Preserve the asymmetric comparison through nested semantic conversion.
+  auto const native_operands = GENERATE(false, true);
+  if (native_operands) {
+    auto const integer = sirius::logical_type::make(sirius::type_id::INTEGER);
+    auto const bigint  = sirius::logical_type::make(sirius::type_id::BIGINT);
+    auto const real    = sirius::logical_type::make(sirius::type_id::DOUBLE);
+    auto operand       = [&] {
+      return std::make_unique<sirius::ast::node>(sirius::ast::cast{
+        std::make_unique<sirius::ast::node>(sirius::ast::cast{
+          std::make_unique<sirius::ast::node>(sirius::ast::reference{0, integer}), bigint}),
+        real});
+    };
+    f.nlj->conditions[0].left  = operand();
+    f.nlj->conditions[0].right = operand();
+  }
+  auto result = execute_projected_nlj(*f.nlj, left, right);
+  REQUIRE(result.view.num_columns() == 2);
+  REQUIRE(result.view.num_rows() == 4);
+  auto payload       = copy_column_to_host<int32_t>(result.view.column(0));
+  auto keys          = copy_column_to_host<int32_t>(result.view.column(1));
+  auto payload_valid = copy_validity_to_host(result.view.column(0));
+  auto keys_valid    = copy_validity_to_host(result.view.column(1));
+  std::vector<int32_t> matched_payload;
+  size_t unmatched_zero = 0;
+  size_t unmatched_null = 0;
+  for (size_t i = 0; i < payload.size(); ++i) {
+    if (payload_valid[i]) {
+      REQUIRE(keys_valid[i]);
+      REQUIRE(keys[i] == 3);
+      matched_payload.push_back(payload[i]);
+    } else if (keys_valid[i]) {
+      REQUIRE(keys[i] == 0);
+      ++unmatched_zero;
+    } else {
+      ++unmatched_null;
+    }
+  }
+  std::sort(matched_payload.begin(), matched_payload.end());
+  REQUIRE(matched_payload == std::vector<int32_t>{10, 11});
+  REQUIRE(unmatched_zero == 1);
+  REQUIRE(unmatched_null == 1);
+}
+
+TEST_CASE("native mixed join admission keeps reference overlap local to each side",
+          "[physical_hash_join][native_join_analysis]")
+{
+  auto const type = sirius::logical_type::make(sirius::type_id::INTEGER);
+  auto ref        = [&](uint32_t index) {
+    return std::make_unique<sirius::ast::node>(sirius::ast::reference{index, type});
+  };
+  auto const left_overlap  = GENERATE(false, true);
+  auto const right_overlap = GENERATE(false, true);
+  duckdb::vector<sirius::join_condition> conditions;
+  conditions.push_back({ref(0), ref(1), sirius::comparison_type::equal});
+  // Wrap the residual references in casts: collection must reach their children and must
+  // retain each side's original index space, even when the opposite side uses that index.
+  conditions.push_back(
+    {std::make_unique<sirius::ast::node>(sirius::ast::cast{ref(left_overlap ? 0 : 1), type}),
+     std::make_unique<sirius::ast::node>(sirius::ast::cast{ref(right_overlap ? 1 : 0), type}),
+     sirius::comparison_type::lt});
+  CHECK(sirius_physical_hash_join::are_conditions_supported(conditions, JoinType::INNER) ==
+        !(left_overlap || right_overlap));
+}
+
+TEST_CASE("native nested-loop support retains nested type and join type gates",
+          "[native_join_analysis]")
+{
+  auto const id   = GENERATE(sirius::type_id::INTEGER,
+                           sirius::type_id::STRUCT,
+                           sirius::type_id::LIST,
+                           sirius::type_id::ARRAY);
+  auto const type = sirius::logical_type::make(id);
+  duckdb::vector<sirius::join_condition> conditions;
+  conditions.push_back({std::make_unique<sirius::ast::node>(sirius::ast::reference{0, type}),
+                        std::make_unique<sirius::ast::node>(sirius::ast::reference{0, type}),
+                        sirius::comparison_type::lt});
+  CHECK(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::INNER) ==
+        (id == sirius::type_id::INTEGER));
+  CHECK(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::MARK));
+  if (id == sirius::type_id::INTEGER) {
+    CHECK(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::SEMI));
+    CHECK(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::ANTI));
+    conditions.push_back({std::make_unique<sirius::ast::node>(sirius::ast::reference{1, type}),
+                          std::make_unique<sirius::ast::node>(sirius::ast::reference{1, type}),
+                          sirius::comparison_type::gt});
+    CHECK_FALSE(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::SEMI));
+    CHECK_FALSE(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::ANTI));
+  }
+}
+
+TEST_CASE("native nested-loop operands restore carriers and retain distinct conversions",
+          "[physical_nested_loop_join][native_join_operands]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  auto left = make_numeric_batch_with_nulls<int16_t>(
+    *space, {1, 5, 0}, {true, true, false}, cudf::type_id::INT16);
+  auto right =
+    make_numeric_batch_with_nulls<int32_t>(*space, {3, 0}, {true, false}, cudf::type_id::INT32);
+  auto f = create_projected_nlj(JoinType::INNER, ExpressionType::COMPARE_LESSTHAN);
+  // Output just the key; the physical input remains a narrowed INT16 carrier.
+  f.nlj->left_output_col_idxs = {0};
+  auto const integer          = sirius::logical_type::make(sirius::type_id::INTEGER);
+  auto const bigint           = sirius::logical_type::make(sirius::type_id::BIGINT);
+  auto const real             = sirius::logical_type::make(sirius::type_id::DOUBLE);
+  auto ref                    = [&] {
+    return std::make_unique<sirius::ast::node>(sirius::ast::reference{0, integer});
+  };
+  auto const restore        = GENERATE(false, true);
+  f.nlj->conditions[0].left = restore
+                                ? std::make_unique<sirius::ast::node>(sirius::ast::cast{
+                                    ref(), integer, false, sirius::ast::cast_kind::carrier_restore})
+                                : ref();
+  // Repeated equivalent operands and a different nested conversion have separate slots.
+  f.nlj->conditions.push_back({ref(), ref(), sirius::comparison_type::lt});
+  f.nlj->conditions.push_back(
+    {std::make_unique<sirius::ast::node>(sirius::ast::cast{
+       std::make_unique<sirius::ast::node>(sirius::ast::cast{ref(), bigint}), real}),
+     std::make_unique<sirius::ast::node>(sirius::ast::cast{ref(), real}),
+     sirius::comparison_type::lt});
+  auto result = execute_projected_nlj(*f.nlj, left, right);
+  REQUIRE(result.view.num_columns() == 2);
+  REQUIRE(result.view.num_rows() == 1);
+  CHECK(copy_column_to_host<int16_t>(result.view.column(0)) == std::vector<int16_t>{1});
+  CHECK(copy_column_to_host<int32_t>(result.view.column(1)) == std::vector<int32_t>{3});
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "native nested-loop converted operands match CPU execution",
+                 "[integration][gpu_execution][native_join_operands]")
+{
+  run_ok("SET gpu_execution = false");
+  run_ok("CREATE TABLE nlj_left (k INTEGER, v INTEGER)");
+  run_ok("CREATE TABLE nlj_right (k INTEGER)");
+  run_ok("INSERT INTO nlj_left VALUES (1, 10), (1, 11), (5, 50), (NULL, 99)");
+  run_ok("INSERT INTO nlj_right VALUES (0), (3), (NULL)");
+  run_ok("CHECKPOINT");
+  compare_gpu_vs_cpu(
+    "SELECT l.v, r.k FROM nlj_left l RIGHT JOIN nlj_right r "
+    "ON CAST(CAST(l.k AS BIGINT) AS DOUBLE) < CAST(r.k AS DOUBLE)");
+  compare_gpu_vs_cpu(
+    "SELECT l.v, r.k FROM nlj_left l JOIN nlj_right r "
+    "ON CAST(l.k AS DOUBLE) < CAST(r.k AS DOUBLE) "
+    "AND CAST(l.k AS DOUBLE) < CAST(r.k AS DOUBLE) "
+    "AND COALESCE(CAST(l.v AS BIGINT), 100) > COALESCE(CAST(r.k AS BIGINT), -100)");
+}
+
+TEST_CASE("native nested-loop semantic timestamp casts retain checked overflow",
+          "[physical_nested_loop_join][native_join_operands][timestamp_bounds]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  auto make_timestamps = [&](int64_t tick, cudf::type_id type) {
+    auto mr     = get_resource_ref(*space);
+    auto stream = default_stream();
+    auto col    = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT64}, 1, cudf::mask_state::UNALLOCATED, stream, mr);
+    REQUIRE(cudaMemcpy(
+              col->mutable_view().data<int64_t>(), &tick, sizeof(tick), cudaMemcpyHostToDevice) ==
+            cudaSuccess);
+    auto view = cudf::bit_cast(col->view(), cudf::data_type{type});
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::make_unique<cudf::column>(view, stream, mr));
+    return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                   *space,
+                                   stream,
+                                   sirius::telemetry::batch_telemetry_info{});
+  };
+  auto left          = make_timestamps(std::numeric_limits<int64_t>::max() / 1000000 + 1,
+                              cudf::type_id::TIMESTAMP_SECONDS);
+  auto right         = make_timestamps(0, cudf::type_id::TIMESTAMP_MICROSECONDS);
+  auto f             = create_projected_nlj(JoinType::INNER, ExpressionType::COMPARE_LESSTHAN);
+  auto const seconds = sirius::logical_type::make(sirius::type_id::TIMESTAMP_SEC);
+  auto const micros  = sirius::logical_type::make(sirius::type_id::TIMESTAMP);
+  f.nlj->conditions[0].left = std::make_unique<sirius::ast::node>(sirius::ast::cast{
+    std::make_unique<sirius::ast::node>(sirius::ast::reference{0, seconds}), micros});
+  f.nlj->conditions[0].right =
+    std::make_unique<sirius::ast::node>(sirius::ast::reference{0, micros});
+  REQUIRE_THROWS_AS(execute_projected_nlj(*f.nlj, left, right), sirius::invalid_input_exception);
 }

@@ -46,7 +46,6 @@
 #include <data/sirius_converter_registry.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
-#include <expression/ast/to_duckdb.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
@@ -412,26 +411,16 @@ TEST_CASE("ast_equivalence - unary_op IS_NOT_NULL (MATERIALIZE)", "[expression_e
     *duck_expr, *hand_ast, int32_col(), range(0, 50), MAT, copy_bool_column_to_host);
 }
 
-TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)", "[expression_evaluator_ast]")
+TEST_CASE("ast_equivalence - unary_op TRY is rejected before execution",
+          "[expression_evaluator_ast]")
 {
-  // OPERATOR_TRY is recognized by the AST surface but not executable by the
-  // current expression_evaluator (it throws on dispatch through
-  // operator.cpp). Verify only the translation half of the contract
-  // for this kind: the translated node has the expected unary_op kind and round-
-  // trips back to OPERATOR_TRY. Execution coverage is intentionally omitted until
-  // the underlying OPERATOR_TRY specialization lands.
+  // The evaluator cannot suppress per-row errors for TRY, so translation must
+  // decline it before a GPU execution plan can be built.
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_TRY,
                                                               LogicalType{LogicalTypeId::INTEGER});
   duck_expr->children.push_back(duck_int_ref(0));
 
-  auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
-  REQUIRE(translated_ast);
-  REQUIRE(translated_ast->holds<sirius::ast::unary_op>());
-  REQUIRE(translated_ast->get<sirius::ast::unary_op>().op == sirius::ast::unary_op::kind::op_try);
-
-  auto round_trip = sirius::ast::to_duckdb(*translated_ast);
-  REQUIRE(round_trip);
-  REQUIRE(round_trip->GetExpressionType() == ExpressionType::OPERATOR_TRY);
+  REQUIRE(sirius::ast::from_duckdb(*duck_expr) == nullptr);
 }
 
 // ============================================================================

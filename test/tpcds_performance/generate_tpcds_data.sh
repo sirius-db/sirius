@@ -16,7 +16,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DUCKDB="$PROJECT_DIR/build/release/duckdb"
+DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
 
 # --- Parse arguments ---
 if [ $# -lt 1 ]; then
@@ -90,7 +90,7 @@ else
 
     # Convert double-quoted identifiers to single quotes in all queries
     # e.g. "order count" -> 'order count'
-    # This allows uniform gpu_processing("...") wrapping without escaping conflicts
+    # This avoids escaping conflicts when each query is embedded in a SQL string.
     echo "Converting double-quoted identifiers to single quotes..."
     for f in "$QUERY_DIR"/q*.sql; do
         sed -i 's/"/'"'"'/g' "$f"

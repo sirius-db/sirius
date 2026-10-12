@@ -16,6 +16,8 @@
 
 #include "op/scan/duckdb_insert_delta.hpp"
 
+#include "helper/type_conversions.hpp"
+
 #include <cudf/utilities/bit.hpp>
 
 #include <duckdb/common/enums/scan_options.hpp>
@@ -38,6 +40,7 @@
 #include <duckdb/storage/table/row_group_segment_tree.hpp>
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
+#include <duckdb/storage/table/validity_column_data.hpp>
 #include <duckdb/transaction/duck_transaction.hpp>
 
 #include <algorithm>
@@ -69,6 +72,19 @@ bool is_constant_or_empty_validity(duckdb::CompressionType c)
   return c == duckdb::CompressionType::COMPRESSION_CONSTANT ||
          c == duckdb::CompressionType::COMPRESSION_EMPTY;
 }
+
+// Grants access to ArrayColumnData's protected child/validity members.
+// (similar to that defined in duckdb_native_metadata.cpp)
+struct array_column_access : duckdb::ArrayColumnData {
+  static duckdb::ColumnData* get_child(duckdb::ArrayColumnData& a)
+  {
+    return static_cast<array_column_access&>(a).child_column.get();
+  }
+  static duckdb::ValidityColumnData* get_validity(duckdb::ArrayColumnData& a)
+  {
+    return static_cast<array_column_access&>(a).validity.get();
+  }
+};
 
 /// Walk one column tree over the delta slice [k, k + row_count), in
 /// row-group-relative rows. Validity trees get their own codec rules and
@@ -112,6 +128,7 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
     out_seg.segment_start = lo - k;
     out_seg.segment_count = hi - lo;
     out_seg.compression   = compression;
+    out_seg.is_transient  = segment.segment_type == duckdb::ColumnSegmentType::TRANSIENT;
 
     if (all_null_validity) {
       // Nothing to stage or read; the marker alone drives the decode.
@@ -162,13 +179,21 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
                       std::to_string(rg_index) +
                       " straddles the delta boundary — positional drift");
       }
-      bool const supported = is_validity ? is_supported_validity_compression(compression)
-                                         : is_supported_data_compression(compression);
+      bool const supported =
+        is_validity ? is_supported_validity_compression(compression)
+                    : native_matrix_supports(sirius::to_duckdb(type).id(),
+                                             compression,
+                                             duckdb::CompressionType::COMPRESSION_CONSTANT);
       if (!supported ||
           (is_varchar && compression == duckdb::CompressionType::COMPRESSION_CONSTANT)) {
-        throw_capture("persistent delta segment on column " + std::to_string(column_id) +
-                      " row group " + std::to_string(rg_index) + ": unsupported compression " +
-                      duckdb::CompressionTypeToString(compression));
+        throw unsupported_physical_input(
+          0,
+          "row_group=" + std::to_string(rg_index),
+          is_validity ? verdict_reason::native_validity_codec
+                      : verdict_reason::native_segment_codec,
+          std::string(kTag) + " persistent delta segment on column " + std::to_string(column_id) +
+            " row group " + std::to_string(rg_index) + ": unsupported compression " +
+            duckdb::CompressionTypeToString(compression));
       }
       if (compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
         // CONSTANT segments have no backing block (GetBlockSize() would
@@ -196,14 +221,22 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
       // plan-time table-stat probe normally declines first; this catches
       // stats drift.
       if (!duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
-        throw_capture("varchar delta segment on column " + std::to_string(column_id) +
-                      " row group " + std::to_string(rg_index) + ": Max String Length stat absent");
+        throw unsupported_physical_input(
+          0,
+          "row_group=" + std::to_string(rg_index),
+          verdict_reason::native_varchar_overflow,
+          std::string(kTag) + " varchar delta segment on column " + std::to_string(column_id) +
+            " row group " + std::to_string(rg_index) + ": Max String Length stat absent");
       }
       auto const max_len = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
       if (max_len >= duckdb::StringUncompressed::GetStringBlockLimit(segment.GetBlockSize())) {
-        throw_capture("varchar delta segment on column " + std::to_string(column_id) +
-                      " row group " + std::to_string(rg_index) +
-                      ": max string length reaches the overflow-block limit");
+        throw unsupported_physical_input(0,
+                                         "row_group=" + std::to_string(rg_index),
+                                         verdict_reason::native_varchar_overflow,
+                                         std::string(kTag) + " varchar delta segment on column " +
+                                           std::to_string(column_id) + " row group " +
+                                           std::to_string(rg_index) +
+                                           ": max string length reaches the overflow-block limit");
       }
       out_seg.max_string_length = static_cast<std::uint32_t>(max_len);
     }
@@ -233,10 +266,108 @@ insert_delta_row_group complete_delta_row_group(
     auto const& type = column_types[ci];
 
     if (type.is_array() || dynamic_cast<duckdb::ArrayColumnData*>(&col_data) != nullptr) {
-      // ARRAY deltas are declined at plan time; hitting this means the
-      // delta appeared between plan and prepare.
-      throw_capture("ARRAY column " + std::to_string(col) +
-                    " in the insert delta is not supported");
+      // Fixed-size ARRAY: DuckDB stores it as array-level validity plus a child column
+      // of row_count * array_size contiguous elements.
+      auto* array_col = dynamic_cast<duckdb::ArrayColumnData*>(&col_data);
+      if (array_col == nullptr) {
+        throw_capture("ARRAY column " + std::to_string(col) + " row group " +
+                      std::to_string(rg_index) + ": expected ArrayColumnData");
+      }
+      auto const array_size  = static_cast<std::size_t>(type.array_size());
+      auto const& child_type = type.array_child();
+
+      // Only a fixed-width scalar child has a staging and decode path.
+      if (!child_type.is_fixed_width()) {
+        throw_capture(
+          "ARRAY column " + std::to_string(col) + " row group " + std::to_string(rg_index) +
+          ": child type " + child_type.to_string() +
+          " is not a fixed-width scalar (only fixed-width ARRAY children are supported)");
+      }
+
+      insert_delta_column col_plan;
+      col_plan.column_id = col;
+      col_plan.is_array  = true;
+
+      // Array-level validity -> data_segments (one bit per array row).
+      auto* array_validity = array_column_access::get_validity(*array_col);
+      if (array_validity == nullptr) {
+        throw_capture("ARRAY column " + std::to_string(col) + " row group " +
+                      std::to_string(rg_index) + ": no array validity column");
+      }
+      walk_delta_tree(array_validity->GetSegmentTree(),
+                      /*is_validity=*/true,
+                      /*is_varchar=*/false,
+                      type,
+                      col,
+                      rg_index,
+                      rg_plan.k_offset,
+                      rg_plan.row_count,
+                      col_plan.data_segments);
+
+      // The array's elements live in a fixed-width child column (StandardColumnData).
+      // Elements are stored flat so here we use offset and row count to index into
+      // the delta slice.
+      auto* child = array_column_access::get_child(*array_col);
+      auto* child_std =
+        child != nullptr ? dynamic_cast<duckdb::StandardColumnData*>(child) : nullptr;
+      if (child_std == nullptr) {
+        throw_capture("ARRAY child on column " + std::to_string(col) + " row group " +
+                      std::to_string(rg_index) + ": child storage is not StandardColumnData");
+      }
+      auto const k_child  = rg_plan.k_offset * array_size;
+      auto const rc_child = rg_plan.row_count * array_size;
+      walk_delta_tree(child_std->GetSegmentTree(),
+                      /*is_validity=*/false,
+                      /*is_varchar=*/false,
+                      child_type,
+                      col,
+                      rg_index,
+                      k_child,
+                      rc_child,
+                      col_plan.array_child_data_segments);
+      walk_delta_tree(child_std->GetValidityData().GetSegmentTree(),
+                      /*is_validity=*/true,
+                      /*is_varchar=*/false,
+                      child_type,
+                      col,
+                      rg_index,
+                      k_child,
+                      rc_child,
+                      col_plan.array_child_validity_segments);
+
+      // The child data segments must fully cover the child slice with no gaps.
+      // Array-level validity can have gaps (all-valid runs are dropped), so it
+      // can't be used to check coverage.
+      std::size_t child_rows = 0;
+      for (auto const& s : col_plan.array_child_data_segments) {
+        child_rows += s.segment_count;
+      }
+      if (child_rows != rc_child) {
+        throw_capture("ARRAY column " + std::to_string(col) + " row group " +
+                      std::to_string(rg_index) + ": child data segments cover " +
+                      std::to_string(child_rows) + " of " + std::to_string(rc_child) + " elements");
+      }
+
+      // Stage every transient segment across the three buckets.
+      for (auto* segs : {&col_plan.data_segments,
+                         &col_plan.array_child_data_segments,
+                         &col_plan.array_child_validity_segments}) {
+        for (auto& s : *segs) {
+          if (!s.is_transient) { continue; }
+          // 8-byte aligned
+          slab          = (slab + 7) / 8 * 8;
+          s.slab_offset = slab;
+          slab += s.bytes_size;
+        }
+      }
+
+      // Decoded bytes: the child element payload plus the LIST offsets buffer.
+      // Array-level validity is one bit per row and not counted, matching the fixed-width path.
+      budget +=
+        rc_child * child_type.fixed_width_byte_size() + rg_plan.row_count * sizeof(std::int32_t);
+
+      rg_plan.columns.push_back(std::move(col_plan));
+      continue;
     }
     auto* std_col = dynamic_cast<duckdb::StandardColumnData*>(&col_data);
     if (std_col == nullptr) {
@@ -446,7 +577,10 @@ void copy_delta_row_group(insert_delta_row_group const& rg,
                           std::uint8_t* slab_base)
 {
   for (auto const& col : rg.columns) {
-    for (auto const* segs : {&col.data_segments, &col.validity_segments}) {
+    for (auto const* segs : {&col.data_segments,
+                             &col.validity_segments,
+                             &col.array_child_data_segments,
+                             &col.array_child_validity_segments}) {
       for (auto const& s : *segs) {
         if (!s.is_transient) { continue; }
         // Pin just long enough to memcpy; no DuckDB handle outlives the call.

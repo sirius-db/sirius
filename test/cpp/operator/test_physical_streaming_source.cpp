@@ -87,11 +87,11 @@ static auto make_source(std::set<sender_id_t> expected = {SOLE_SENDER})
 /// is_pipeline_finished()) instead of only inspecting the operator in isolation.
 /// Mirrors the minimal wiring pattern used by
 /// test/cpp/pipeline/test_gpu_pipeline_task_history.cpp's create_pipeline_context().
-static duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipeline(
+static std::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipeline(
   sirius_physical_streaming_source& op)
 {
   sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+  auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*pipeline, op);
   build_state.set_pipeline_sink(*pipeline, &op, 1);

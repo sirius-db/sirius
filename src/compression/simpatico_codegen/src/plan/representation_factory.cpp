@@ -38,10 +38,10 @@ namespace {
 // a kernel/copy on a non-blocking pool stream: the default stream does not order
 // against pool streams, so a plain sync copy can race and read uninitialised RMM
 // memory. Issuing the D2H on the same `stream` orders it after the producer.
-inline void d2h_sync(void* dst, const void* src, size_t bytes, rmm::cuda_stream_view stream)
+inline void d2h_sync(void* dst, const void* src, size_t bytes, ::cuda::stream_ref stream)
 {
-  cudaError_t e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream.value());
-  if (e == cudaSuccess) e = cudaStreamSynchronize(stream.value());
+  cudaError_t e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream.get());
+  if (e == cudaSuccess) e = cudaStreamSynchronize(stream.get());
   if (e != cudaSuccess)
     throw std::runtime_error(std::string("d2h_sync failed: ") + cudaGetErrorString(e));
 }
@@ -93,7 +93,7 @@ std::unique_ptr<rmm::device_buffer> copy_output_payload(
   const char* codec,
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>>& outputs,
-  rmm::cuda_stream_view,
+  ::cuda::stream_ref,
   rmm::device_async_resource_ref,
   std::string* error_out,
   std::size_t* out_size)
@@ -116,7 +116,7 @@ std::unique_ptr<rmm::device_buffer> copy_output_payload(
 std::unique_ptr<compressed_representation> identity_compressed_representation::from_outputs(
   std::vector<std::string> const& /*output_names*/,
   std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view,
+  ::cuda::stream_ref,
   rmm::device_async_resource_ref,
   std::string* error_out)
 {
@@ -132,12 +132,14 @@ namespace {
 // Reads a "null_mask" channel column (UINT8 bitmask bytes, as emitted by
 // dictionary/str_split named_channels) into a device_buffer + null count over
 // `num_rows` rows. Returns false and sets *error_out on a malformed channel.
-bool take_null_mask_channel(std::unique_ptr<cudf::column> mask_col,
-                            cudf::size_type num_rows,
-                            rmm::device_buffer* mask_out,
-                            cudf::size_type* null_count_out,
-                            rmm::cuda_stream_view stream,
-                            std::string* error_out)
+bool take_null_mask_channel(
+  std::unique_ptr<cudf::column> mask_col,
+  cudf::size_type num_rows,
+  decltype(cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED))* mask_out,
+  cudf::size_type* null_count_out,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
 {
   if (mask_col->type().id() != cudf::type_id::UINT8) {
     if (error_out) *error_out = "dictionary null_mask must be UINT8";
@@ -151,7 +153,13 @@ bool take_null_mask_channel(std::unique_ptr<cudf::column> mask_col,
     reinterpret_cast<cudf::bitmask_type const*>(mask_col->view().data<std::uint8_t>());
   *null_count_out = num_rows > 0 ? cudf::null_count(bits, 0, num_rows, stream) : 0;
   auto contents   = mask_col->release();
-  *mask_out       = std::move(*contents.data);
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+  // Keep the source alive until the asynchronous mask copy completes.
+  contents.data->set_stream(stream);
+  *mask_out = cudf::copy_bitmask(bits, 0, num_rows, stream, mr);
+#else
+  *mask_out = std::move(*contents.data);
+#endif
   return true;
 }
 
@@ -160,7 +168,7 @@ bool take_null_mask_channel(std::unique_ptr<cudf::column> mask_col,
 std::unique_ptr<compressed_representation> dictionary_compressed_representation::from_outputs(
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out)
 {
@@ -193,11 +201,11 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
     return nullptr;
   }
 
-  rmm::device_buffer mask(0, stream, mr);
+  auto mask                  = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   cudf::size_type null_count = 0;
   if (has_mask &&
       !take_null_mask_channel(
-        std::move(outputs[3]), indices->size(), &mask, &null_count, stream, error_out)) {
+        std::move(outputs[3]), indices->size(), &mask, &null_count, stream, mr, error_out)) {
     return nullptr;
   }
 
@@ -207,11 +215,12 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
   rmm::device_buffer chars_buffer =
     chars_contents.data ? std::move(*chars_contents.data) : rmm::device_buffer(0, stream, mr);
 
-  auto keys_strings = cudf::make_strings_column(num_keys,
-                                                std::move(keys_offsets),
-                                                std::move(chars_buffer),
-                                                0,
-                                                rmm::device_buffer(0, stream, mr));
+  auto keys_strings =
+    cudf::make_strings_column(num_keys,
+                              std::move(keys_offsets),
+                              std::move(chars_buffer),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 
   auto dict_col =
     null_count > 0
@@ -228,7 +237,7 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
 std::unique_ptr<compressed_representation> alp_compressed_representation::from_outputs(
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view,
+  ::cuda::stream_ref,
   rmm::device_async_resource_ref,
   std::string* error_out)
 {
@@ -291,7 +300,7 @@ std::unique_ptr<compressed_representation> alp_compressed_representation::from_o
 std::unique_ptr<compressed_representation> alp_rd_compressed_representation::from_outputs(
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref,
   std::string* error_out)
 {
@@ -376,7 +385,7 @@ std::unique_ptr<compressed_representation> alp_rd_compressed_representation::fro
 std::unique_ptr<compressed_representation> str_split_compressed_representation::from_outputs(
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view,
+  ::cuda::stream_ref,
   rmm::device_async_resource_ref,
   std::string* error_out)
 {
@@ -442,7 +451,7 @@ std::unique_ptr<compressed_representation> bitextract_compressed_representation:
 std::unique_ptr<compressed_representation> bitcomp_compressed_representation::from_outputs(
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out,
   leaf_meta_v const& meta)
@@ -474,7 +483,7 @@ std::unique_ptr<compressed_representation> bitcomp_compressed_representation::fr
 std::unique_ptr<compressed_representation> cascaded_compressed_representation::from_outputs(
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out,
   leaf_meta_v const& meta)
@@ -517,7 +526,7 @@ std::unique_ptr<compressed_representation> nvcomp_simple_from_outputs(
   std::string_view codec_name,
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out,
   leaf_meta_v const& meta)
@@ -554,7 +563,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string const& compressor_name,
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out,
   leaf_meta_v const& meta)
@@ -570,6 +579,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   if (!id) return unsupported();
 
   switch (*id) {
+    case OpId::Unknown: return unsupported();
     case OpId::Identity:
       return identity_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out);
@@ -626,7 +636,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
 
 std::unique_ptr<cudf::column> decompress_standalone_representation(
   compressed_representation const* rep,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out)
 {

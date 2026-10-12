@@ -12,7 +12,7 @@ duckdb there is no path: the table is resolved from the attached catalog by name
 and the source is selected with format='duckdb'.
 
 Pin tier: defaults to 'gpu'; both 'gpu' and 'host' are supported. Set
-SIRIUS_PIN_TIER=host to select the host tier, which converts the pinned
+SIRIUS_PIN_TIER=host|parquet to select another tier; host converts the pinned
 table into NUMA-local pinned host memory. Any other tier raises
 NotImplementedException at bind time (src/sirius_extension.cpp).
 """
@@ -258,12 +258,19 @@ def detect_pin_glob(parquet_dir: str, table: str) -> str:
     raise RuntimeError(f"no parquet files for table '{table}' under {abs_dir}")
 
 
-def _pin_call(table: str, cols: list[str], source: str, data_source: str) -> str:
+def _pin_call(
+    table: str,
+    cols: list[str],
+    source: str,
+    data_source: str,
+    pin_globs: dict[str, str] | None = None,
+) -> str:
     """Emit a single `CALL pin_table(...)` for `table` in the given data source.
 
-    Tier defaults to 'gpu'; SIRIUS_PIN_TIER=host selects the host tier (both are
-    supported — see src/sirius_extension.cpp). Any other tier throws
-    NotImplementedException at bind time.
+    Tier defaults to 'gpu'; SIRIUS_PIN_TIER selects 'host' or 'parquet' instead
+    (see src/sirius_extension.cpp). Any other tier throws NotImplementedException
+    at bind time. 'parquet' is parquet-only — it pins undecoded column chunks
+    into the prefetching cache, which a duckdb-native table does not have.
 
     parquet: a positional glob path whose FileSystem::GlobFiles expansion must
              match the corresponding CREATE VIEW read_parquet([...]) file list.
@@ -279,14 +286,20 @@ def _pin_call(table: str, cols: list[str], source: str, data_source: str) -> str
             f"CALL pin_table(format='duckdb', tier='{tier}', "
             f"name='{table}', cols=[{col_literals}]);"
         )
-    path = detect_pin_glob(source, table)
-    return f"CALL pin_table('{path}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
+    path = pin_globs[table] if pin_globs is not None else detect_pin_glob(source, table)
+    path_literal = path.replace("'", "''")
+    return f"CALL pin_table('{path_literal}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
 
 
-def emit_pin(query_num: int, source: str, data_source: str = "parquet") -> str:
+def emit_pin(
+    query_num: int,
+    source: str,
+    data_source: str = "parquet",
+    pin_globs: dict[str, str] | None = None,
+) -> str:
     cols_by_table = QUERY_COLUMNS[query_num]
     lines = [
-        _pin_call(table, cols, source, data_source)
+        _pin_call(table, cols, source, data_source, pin_globs)
         for table, cols in cols_by_table.items()
     ]
     return "\n".join(lines) + "\n"
@@ -306,14 +319,18 @@ def union_columns_by_table() -> dict[str, list[str]]:
     return {table: sorted(cols) for table, cols in by_table.items()}
 
 
-def emit_pin_all(source: str, data_source: str = "parquet") -> str:
+def emit_pin_all(
+    source: str,
+    data_source: str = "parquet",
+    pin_globs: dict[str, str] | None = None,
+) -> str:
     """Emit one CALL pin_table per table with the union of columns across all queries.
 
     Used by sequential-mode benchmarks where re-pinning between queries would
     erase the cache; pin everything once up front instead.
     """
     lines = [
-        _pin_call(table, cols, source, data_source)
+        _pin_call(table, cols, source, data_source, pin_globs)
         for table, cols in union_columns_by_table().items()
     ]
     return "\n".join(lines) + "\n"
@@ -352,7 +369,7 @@ def main(argv: list[str]) -> int:
             "\n"
             "Source: --format parquet (default) needs <parquet_dir>; --format duckdb\n"
             "pins native catalog tables by name (no path).\n"
-            "Tier: defaults to 'gpu'; set SIRIUS_PIN_TIER=host for the host tier\n"
+            "Tier: defaults to 'gpu'; set SIRIUS_PIN_TIER=host|parquet for the others\n"
             "(both 'gpu' and 'host' are supported).",
             file=sys.stderr,
         )

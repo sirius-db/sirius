@@ -8,13 +8,12 @@
 # Teams follow the pattern: @sirius-db/sirius-<component|language>
 
 # ── Core (Planner, Executors & Operators/Expressions) ─────────────────────────
+include/                            @sirius-db/sirius-core
 src/*.cpp                           @sirius-db/sirius-core
-src/include/*.hpp                   @sirius-db/sirius-core
+src/*.hpp                           @sirius-db/sirius-core
 src/creator/                        @sirius-db/sirius-core
-src/include/common/                 @sirius-db/sirius-core
-src/include/cudf/                   @sirius-db/sirius-core
-src/include/pipeline/               @sirius-db/sirius-core
-src/include/planner/                @sirius-db/sirius-core
+src/common/                         @sirius-db/sirius-core
+src/cudf/                           @sirius-db/sirius-core
 src/pipeline/                       @sirius-db/sirius-core
 src/planner/                        @sirius-db/sirius-core
 src/**/cuda/                        @sirius-db/sirius-core
@@ -31,7 +30,7 @@ test/**/utils/                      @sirius-db/sirius-core
 
 # ── I/O (Scan, Compression & Memory) ──────────────────────────────────────────
 src/compression/                    @sirius-db/sirius-io
-src/include/data/                   @sirius-db/sirius-io
+src/data/                           @sirius-db/sirius-io
 src/**/downgrade/                   @sirius-db/sirius-io
 src/**/helper/                      @sirius-db/sirius-io
 src/**/io/                          @sirius-db/sirius-io

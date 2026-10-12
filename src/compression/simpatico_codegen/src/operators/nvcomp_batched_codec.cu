@@ -54,10 +54,10 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
   batched_codec_ops const& ops,
   void const* src,
   std::size_t n_bytes,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
-  cudaStream_t const s = stream.value();
+  cudaStream_t const s = stream.get();
   if (n_bytes == 0) { return {std::make_unique<rmm::device_buffer>(0, stream, mr), 0}; }
 
   std::size_t const chunk      = ops.chunk_size;
@@ -190,10 +190,10 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
                               std::size_t /*frame_size*/,
                               void* dst,
                               std::size_t out_bytes,
-                              rmm::cuda_stream_view stream,
+                              ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref mr)
 {
-  cudaStream_t const s = stream.value();
+  cudaStream_t const s = stream.get();
   if (out_bytes == 0) return;
 
   auto const* fbase = static_cast<std::uint8_t const*>(frame);

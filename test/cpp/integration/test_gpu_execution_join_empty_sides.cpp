@@ -14,28 +14,9 @@
  * limitations under the License.
  */
 
-// GPU-vs-CPU correctness for hash joins whose build side is empty or emptied
-// at runtime, and for MARK (IN / NOT IN) three-valued semantics driven by the
-// mark_build_kind classification: `x IN (S)` is FALSE for every x — including
-// NULL x — when S is empty, while NULL semantics apply only to non-empty sets.
-// Also pins the stacked-MARK scheduling shape, where the outer join's probe
-// chain forwards a task-creation hint into the inner MARK join before that
-// join has been sized (refresh_cross_schedule's MARK tripwire tolerates this
-// pre-sizing state, so the hint reports wait-for-build).
-//
-// All cases run over file-backed native tables, whose scans always deliver at
-// least one (possibly 0-row) batch. The zero-BATCH side shapes (a
-// zero-row-group parquet scan feeding a BUILD_PROBE join, served by
-// plan_build_probe_reclaim's orphan build task) are exercised by the
-// [build_probe] and [build_probe_orphan] unit tests instead: a
-// zero-row-group parquet scan can nondeterministically fail task creation
-// (a scan-side defect, tracked separately), and its runtime fallback leaves
-// the shared SiriusContext unable to run later GPU queries — so that trigger
-// cannot be used in a shared-context test suite.
-//
-// Every query goes through the shared file-backed GpuExecutionFixture, which
-// runs it once on the GPU (asserting a real GPU execution with no fallback)
-// and once on DuckDB CPU, then compares the results (order-insensitive).
+// Empty-side SQL regressions preserve the existing MARK semantics and pre-sizing behavior.
+// A deterministic gpu_pipeline_task regression covers zero-batch probes; zero-row-group Parquet
+// currently fails upstream column discovery before reaching the join.
 
 #include <catch.hpp>
 #include <duckdb.hpp>

@@ -16,16 +16,15 @@
 
 /**
  * @file test_duckdb_join_filter_candidate_adapter.cpp
- * @brief Contract tests for the version-pinned adapter's extraction/classification surface
- *        (sirius::planner::duckdb_join_filter_candidate_adapter::extract / scan_channel_identity)
- *        and the join-to-GET channel-identity topology the preservation walk must keep intact.
+ * @brief Contract tests for the test-only parity oracle's extraction/classification surface
+ *        (sirius::planner::duckdb_join_filter_candidate_adapter::extract / scan_channel_identity).
  *
  * These are the pin-bump sentinels. Every `malformed` case below is unreachable under the pinned
  * DuckDB: it exists to fail loudly if a future submodule bump breaks a structural invariant that
- * the positional key-to-column pairing depends on.
+ * the positional key-to-column pairing and discovery parity suite depend on.
  */
 
-#include "planner/duckdb_join_filter_candidate_adapter.hpp"
+#include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
 
 #include <catch.hpp>
 #include <duckdb/common/typedefs.hpp>
@@ -44,7 +43,6 @@
 using sirius::planner::duckdb_candidate_kind;
 using sirius::planner::duckdb_join_filter_candidate;
 using sirius::planner::duckdb_join_filter_candidate_adapter::extract;
-using sirius::planner::duckdb_join_filter_candidate_adapter::preserve_dynamic_filter_metadata;
 using sirius::planner::duckdb_join_filter_candidate_adapter::scan_channel_identity;
 
 namespace {
@@ -437,118 +435,4 @@ TEST_CASE("scan_channel_identity returns the gets channel or null", "[dynamic_fi
   auto dyn             = duckdb::make_shared_ptr<duckdb::DynamicTableFilterSet>();
   get->dynamic_filters = dyn;
   REQUIRE(scan_channel_identity(*get).get() == dyn.get());
-}
-
-TEST_CASE("preservation keeps a producing join and its GET paired to one channel",
-          "[dynamic_filter][adapter]")
-{
-  auto dyn = duckdb::make_shared_ptr<duckdb::DynamicTableFilterSet>();
-
-  // Original: join → [get(with channel), get(plain)]; the join's target names the same channel.
-  duckdb::LogicalComparisonJoin original(duckdb::JoinType::INNER);
-  {
-    auto probe_get             = make_get();
-    probe_get->dynamic_filters = dyn;
-    original.children.push_back(std::move(probe_get));
-    original.children.push_back(make_get());
-    original.conditions.push_back(make_condition(duckdb::ExpressionType::COMPARE_EQUAL));
-    original.filter_pushdown = make_pushdown_info({0});
-    original.filter_pushdown->probe_info.push_back(make_target(dyn, 1));
-  }
-
-  // Structurally aligned copy, metadata stripped (the post-Copy state).
-  duckdb::LogicalComparisonJoin copy(duckdb::JoinType::INNER);
-  copy.children.push_back(make_get());
-  copy.children.push_back(make_get());
-  copy.conditions.push_back(make_condition(duckdb::ExpressionType::COMPARE_EQUAL));
-
-  preserve_dynamic_filter_metadata(original, copy);
-
-  // The pairing invariant: the copied join's target and the copied GET reference the SAME set —
-  // and extraction on the copy surfaces that same identity.
-  auto& copy_get = copy.children[0]->Cast<duckdb::LogicalGet>();
-  REQUIRE(copy.filter_pushdown);
-  REQUIRE(copy.filter_pushdown->probe_info[0].dynamic_filters.get() == dyn.get());
-  REQUIRE(copy_get.dynamic_filters.get() == dyn.get());
-  auto reextracted = extract(copy);
-  REQUIRE(reextracted.kind() == duckdb_candidate_kind::admitted);
-  REQUIRE(reextracted.targets()[0].channel_identity().get() ==
-          scan_channel_identity(copy_get).get());
-}
-
-TEST_CASE("preservation is all-or-nothing on a descendant structural mismatch",
-          "[dynamic_filter][adapter]")
-{
-  auto dyn = duckdb::make_shared_ptr<duckdb::DynamicTableFilterSet>();
-
-  // Original: join(pushdown) → [get(with channel), get].
-  duckdb::LogicalComparisonJoin original(duckdb::JoinType::INNER);
-  {
-    auto probe_get             = make_get();
-    probe_get->dynamic_filters = dyn;
-    original.children.push_back(std::move(probe_get));
-    original.children.push_back(make_get());
-    original.conditions.push_back(make_condition(duckdb::ExpressionType::COMPARE_EQUAL));
-    original.filter_pushdown = make_pushdown_info({0});
-    original.filter_pushdown->probe_info.push_back(make_target(dyn, 1));
-  }
-
-  // Copy: aligned AT the join, but child 0 is a join instead of a get — descendant mismatch.
-  duckdb::LogicalComparisonJoin copy(duckdb::JoinType::INNER);
-  copy.children.push_back(
-    duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER));
-  copy.children.push_back(make_get());
-  copy.conditions.push_back(make_condition(duckdb::ExpressionType::COMPARE_EQUAL));
-
-  preserve_dynamic_filter_metadata(original, copy);
-
-  // The locally-aligned ancestor must receive NOTHING: attaching its metadata while the scan
-  // below cannot be restored would half-build the join-to-GET pairing.
-  REQUIRE_FALSE(copy.filter_pushdown);
-}
-
-TEST_CASE("preservation keeps two producing joins sharing one GET channel",
-          "[dynamic_filter][adapter]")
-{
-  auto dyn = duckdb::make_shared_ptr<duckdb::DynamicTableFilterSet>();
-
-  // Original: P2 → [P1 → [get(with channel), get], get]; both joins target the same channel.
-  duckdb::LogicalComparisonJoin original_p2(duckdb::JoinType::INNER);
-  {
-    auto p1        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
-    auto probe_get = make_get();
-    probe_get->dynamic_filters = dyn;
-    p1->children.push_back(std::move(probe_get));
-    p1->children.push_back(make_get());
-    p1->conditions.push_back(make_condition(duckdb::ExpressionType::COMPARE_EQUAL));
-    p1->filter_pushdown = make_pushdown_info({0});
-    p1->filter_pushdown->probe_info.push_back(make_target(dyn, 1));
-
-    original_p2.children.push_back(std::move(p1));
-    original_p2.children.push_back(make_get());
-    original_p2.conditions.push_back(make_condition(duckdb::ExpressionType::COMPARE_EQUAL));
-    original_p2.filter_pushdown = make_pushdown_info({0});
-    original_p2.filter_pushdown->probe_info.push_back(make_target(dyn, 1));
-  }
-
-  // Structurally aligned copy.
-  duckdb::LogicalComparisonJoin copy_p2(duckdb::JoinType::INNER);
-  {
-    auto p1 = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
-    p1->children.push_back(make_get());
-    p1->children.push_back(make_get());
-    copy_p2.children.push_back(std::move(p1));
-    copy_p2.children.push_back(make_get());
-  }
-
-  preserve_dynamic_filter_metadata(original_p2, copy_p2);
-
-  // N-producer/one-consumer: both copied joins and the copied GET share ONE set.
-  auto& copy_p1  = copy_p2.children[0]->Cast<duckdb::LogicalComparisonJoin>();
-  auto& copy_get = copy_p1.children[0]->Cast<duckdb::LogicalGet>();
-  REQUIRE(copy_p2.filter_pushdown);
-  REQUIRE(copy_p1.filter_pushdown);
-  REQUIRE(copy_p2.filter_pushdown->probe_info[0].dynamic_filters.get() == dyn.get());
-  REQUIRE(copy_p1.filter_pushdown->probe_info[0].dynamic_filters.get() == dyn.get());
-  REQUIRE(copy_get.dynamic_filters.get() == dyn.get());
 }

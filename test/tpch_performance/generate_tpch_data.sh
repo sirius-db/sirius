@@ -46,7 +46,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DUCKDB="$PROJECT_DIR/build/release/duckdb"
+DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <scale_factor> [--format duckdb|parquet] [--output <path>] [--jobs N] [--cluster] [--cluster-keys <spec>]"

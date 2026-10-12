@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 
+#include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <duckdb.hpp>
@@ -38,15 +39,19 @@
 #include <exec/thread_pool.hpp>
 #include <memory/topology_index.hpp>
 #include <op/scan/duckdb_mvcc_visibility.hpp>
+#include <scan_manager/mvcc_mask_cache.hpp>
 #include <scan_manager/mvcc_mask_job.hpp>
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using sirius::scan_manager::fan_out_and_join;
@@ -157,7 +162,7 @@ TEST_CASE("fan_out_and_join assembles concurrent disjoint writes exactly once",
   constexpr std::size_t kSlice  = 4096;
   std::vector<std::uint8_t> buffer(kSlices * kSlice, 0);
 
-  std::vector<absl::AnyInvocable<void()>> tasks;
+  std::vector<sirius::exec::invocable<void()>> tasks;
   for (std::size_t s = 0; s < kSlices; ++s) {
     tasks.push_back([&buffer, s] {
       std::fill_n(buffer.data() + s * kSlice, kSlice, static_cast<std::uint8_t>(s + 1));
@@ -181,14 +186,86 @@ TEST_CASE("fan_out_and_join rethrows the first task error after the join",
   sirius::exec::scoped_dispatcher dispatcher(pool, 4);
 
   std::atomic<int> ran{0};
-  std::vector<absl::AnyInvocable<void()>> tasks;
+  std::vector<sirius::exec::invocable<void()>> tasks;
   tasks.push_back([&ran] { ran.fetch_add(1); });
   tasks.push_back([] { throw std::runtime_error("mask task blew up"); });
   tasks.push_back([&ran] { ran.fetch_add(1); });
 
   REQUIRE_THROWS_WITH(fan_out_and_join(dispatcher, std::move(tasks), "error test"),
-                      Catch::Contains("mask task blew up"));
+                      Catch::Matchers::ContainsSubstring("mask task blew up"));
   REQUIRE(ran.load() == 2);  // the join waited for the healthy tasks too
+}
+
+TEST_CASE("fan_out_and_join joins accepted work before rethrowing a submission error",
+          "[mvcc_mask_job][scan_manager]")
+{
+  bool const task_fails = GENERATE(false, true);
+  sirius::exec::static_thread_pool pool(2);
+  sirius::exec::scoped_dispatcher dispatcher(pool, 2);
+  std::promise<void> started, release, stopped;
+  auto started_future = started.get_future();
+  auto released       = release.get_future();
+  auto stopped_future = stopped.get_future();
+  std::atomic<bool> finished{false};
+  std::atomic<bool> later_ran{false};
+  bool joined_before_throw = false;
+
+  struct stop_control {
+    sirius::exec::static_thread_pool& pool;
+    std::future<void>& started;
+    std::promise<void>& stopped;
+    bool armed = false;
+  } control{pool, started_future, stopped};
+  // A small move-only callable stays inline in AnyInvocable. Its move into the
+  // fan-out wrapper stops the real pool after the first task has started, so the
+  // second submission fails deterministically without an allocation-failure hook.
+  struct stop_on_move {
+    stop_control* control;
+    explicit stop_on_move(stop_control* value) : control(value) {}
+    stop_on_move(stop_on_move&& other) noexcept : control(std::exchange(other.control, nullptr))
+    {
+      if (control && std::exchange(control->armed, false)) {
+        control->started.wait();
+        control->pool.stop();
+        control->stopped.set_value();
+      }
+    }
+    void operator()() const {}
+  };
+
+  std::vector<sirius::exec::invocable<void()>> tasks;
+  tasks.emplace_back([&] {
+    started.set_value();
+    released.wait();
+    finished = true;
+    if (task_fails) { throw std::runtime_error("earlier task failed"); }
+  });
+  tasks.emplace_back(stop_on_move{&control});
+  tasks.emplace_back([&] { later_ran = true; });
+  control.armed = true;
+  auto result   = std::async(std::launch::async, [&] {
+    try {
+      fan_out_and_join(dispatcher, std::move(tasks), "partial submission test");
+    } catch (...) {
+      joined_before_throw = finished.load();
+      throw;
+    }
+  });
+  // Unblock the worker before the async future is destroyed if a check fails.
+  bool worker_released  = false;
+  absl::Cleanup cleanup = [&] {
+    if (!worker_released) release.set_value();
+    dispatcher.wait_for_all();
+  };
+  REQUIRE(stopped_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  CHECK(result.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+  release.set_value();
+  worker_released = true;
+  CHECK_THROWS_WITH(result.get(), "thread pool is stopped");
+  dispatcher.wait_for_all();
+  CHECK(joined_before_throw);
+  CHECK(finished.load());
+  CHECK_FALSE(later_ran.load());
 }
 
 TEST_CASE("fan_out_and_join turns dropped tasks into a loud error, not a deadlock",
@@ -199,7 +276,7 @@ TEST_CASE("fan_out_and_join turns dropped tasks into a loud error, not a deadloc
   dispatcher.request_stop();  // enqueue is a silent no-op from here on
 
   std::atomic<int> ran{0};
-  std::vector<absl::AnyInvocable<void()>> tasks;
+  std::vector<sirius::exec::invocable<void()>> tasks;
   for (int i = 0; i < 3; ++i) {
     tasks.push_back([&ran] { ran.fetch_add(1); });
   }
@@ -528,4 +605,72 @@ TEST_CASE("run_mvcc_mask_jobs handles two requests over the same table",
     }
   }
   exec_ok(*tdb.con, "ROLLBACK");
+}
+
+// A masks_ready request must skip staging entirely and leave the masks as installed.
+TEST_CASE("prepare_mvcc_mask_tasks skips requests served from the version cache",
+          "[mvcc_mask_job][scan_manager]")
+{
+  auto& e = env();
+  job_test_db tdb;
+  // Without the skip, this request would stage a carve + fill for chunk 0.
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  exec_ok(*tdb.con, "DELETE FROM t WHERE k < 10");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  auto metadata = make_metadata(*tdb.con, storage);
+
+  auto* host_space = e.mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  mvcc_mask_job_request request;
+  request.masks        = mvcc_chunk_mask_set(1);
+  request.metadata     = metadata;
+  request.storage      = &storage;
+  request.context      = tdb.con->context.get();
+  request.chunk_spaces = {host_space};
+  request.entry_name   = "t";
+  auto const rows      = metadata.base_row_count_per_chunk[0];
+  auto const n_words   = (rows + 31) / 32;
+  auto canned          = std::make_shared<std::vector<std::uint32_t>>(n_words, 0xA5A5A5A5u);
+  request.masks[0]     = sirius::scan_manager::mvcc_chunk_mask{{canned, canned->data()}, rows};
+  request.masks_ready  = true;
+  std::vector<mvcc_mask_job_request> requests;
+  requests.push_back(std::move(request));
+
+  auto workset = prepare_mvcc_mask_tasks(requests, *e.mgr, e.topology);
+  REQUIRE(workset.works.empty());
+  REQUIRE(workset.fill_tasks.empty());
+  // Words untouched: the job never re-carved the slot.
+  REQUIRE(requests[0].masks[0].words.get() == canned->data());
+  REQUIRE(requests[0].masks[0].view()[0] == 0xA5A5A5A5u);
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+// Publish requires a writer-free build whose snapshot covers every existing commit;
+// reuse also requires an unchanged last_commit and a covering query snapshot.
+// (transaction_t values are arbitrary; the rules only compare them.)
+TEST_CASE("mvcc mask version cache reuse rules", "[mvcc_mask_job][scan_manager]")
+{
+  using sirius::scan_manager::mvcc_mask_cache_publishable;
+  using sirius::scan_manager::mvcc_mask_cache_reusable;
+  using sirius::scan_manager::mvcc_mask_snapshot_key;
+
+  mvcc_mask_snapshot_key const built{/*last_commit=*/100, /*start_time=*/105, false};
+  REQUIRE(mvcc_mask_cache_publishable(built));
+  // A writer's set embeds its own uncommitted deletes: never publishable.
+  REQUIRE_FALSE(mvcc_mask_cache_publishable({100, 105, true}));
+  // A snapshot older than the newest commit misses what it never saw.
+  REQUIRE_FALSE(mvcc_mask_cache_publishable({100, 99, false}));
+
+  // Same committed state, covering snapshot, read-only query: reuse.
+  REQUIRE(mvcc_mask_cache_reusable(built, {100, 200, false}));
+  // The builder's own snapshot qualifies trivially.
+  REQUIRE(mvcc_mask_cache_reusable(built, built));
+  // A commit landed since the build: the cached set is a stale version.
+  REQUIRE_FALSE(mvcc_mask_cache_reusable(built, {150, 200, false}));
+  // The querying transaction wrote: its visibility is private.
+  REQUIRE_FALSE(mvcc_mask_cache_reusable(built, {100, 200, true}));
+  // Query snapshot below the cached version cannot see all of it.
+  REQUIRE_FALSE(mvcc_mask_cache_reusable(built, {100, 99, false}));
 }

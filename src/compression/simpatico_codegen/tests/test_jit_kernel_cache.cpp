@@ -52,8 +52,7 @@ int main()
   }
 
   jit::CompileOptions opts;
-  opts.arch_cc        = jit::arch_cc_for_current_device();
-  opts.default_device = true;
+  opts.arch_cc = jit::arch_cc_for_current_device();
 
   auto tree_bp = jit::FusedTree::make(OpKind::Bitpack);
   // Decode is Compact-only (drop-overalloc).

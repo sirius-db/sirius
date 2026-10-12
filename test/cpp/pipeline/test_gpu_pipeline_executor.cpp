@@ -83,7 +83,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
   {
   }
 
-  void execute(rmm::cuda_stream_view stream) override
+  void execute(::cuda::stream_ref stream) override
   {
     auto& global = _global_state->cast<test_gpu_pipeline_task_global_state>();
     auto& local  = _local_state->cast<test_gpu_pipeline_task_local_state>();

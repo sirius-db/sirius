@@ -120,7 +120,8 @@ void generate_4file_surface(fs::path const& dir)
 // Distribution gate: assert pinned_entry.chunk_memory_spaces lands chunks
 // on at least 2 distinct GPU device_ids.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution", "[pin_mgpu][scan_manager]")
+TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution",
+          "[pin_mgpu][scan_manager][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -198,7 +199,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution", "[pin_mgpu][sc
 // and GPU 1.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
-          "[pin_mgpu][scan_manager][mgpu-audit]")
+          "[pin_mgpu][scan_manager][mgpu-audit][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -295,7 +296,8 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
 // On single-NUMA hosts, the host space is shared but the test passes
 // trivially via the >=1 chunk assertion.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin", "[pin_mgpu][scan_manager][host_tier]")
+TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
+          "[pin_mgpu][scan_manager][host_tier][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -447,7 +449,7 @@ TEST_CASE("pin_table - host-tier cached path serves column read after overwrite 
 // fall-through to the mutated parquet would return 199999.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - host-tier cached path serves MAX(k) after overwrite (multi-GPU)",
-          "[pin_mgpu][scan_manager][host_tier]")
+          "[pin_mgpu][scan_manager][host_tier][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -565,7 +567,7 @@ TEST_CASE("pin_table - host-tier cached path serves MAX(k) after overwrite (mult
 // gate but with tier='host'.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)",
-          "[pin_mgpu][scan_manager][host_tier][mgpu-audit]")
+          "[pin_mgpu][scan_manager][host_tier][mgpu-audit][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -638,7 +640,7 @@ TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)
 // the new files' total.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - host-tier cached path serves SUM(v) after overwrite (multi-GPU)",
-          "[pin_mgpu][scan_manager][host_tier]")
+          "[pin_mgpu][scan_manager][host_tier][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -720,7 +722,7 @@ TEST_CASE("pin_table - host-tier cached path serves SUM(v) after overwrite (mult
 // number of chunks as `chunk_memory_spaces`.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns",
-          "[pin_mgpu][scan_manager][merge]")
+          "[pin_mgpu][scan_manager][merge][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 

@@ -79,7 +79,10 @@ struct oom_test_fixture {
   cucascade::memory::memory_space* mem_space = nullptr;
   sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> request_channel;
   std::unique_ptr<sirius::pipeline::gpu_pipeline_executor> executor;
-  sirius::pipeline::completion_handler completion;
+  // The query's completion signal now travels on the task's global state rather than on
+  // the executor, so it is shared with whatever global state the test builds.
+  std::shared_ptr<sirius::pipeline::completion_handler> completion =
+    std::make_shared<sirius::pipeline::completion_handler>();
 
   // Returns false if setup failed (no GPU available) — caller should WARN and return.
   bool setup(int num_threads, const std::string& thread_name_prefix)
@@ -115,7 +118,6 @@ struct oom_test_fixture {
       std::move(request_publisher),
       nullptr,
       sirius::test::make_test_telemetry_context());
-    executor->set_completion_handler(&completion);
     return true;
   }
 };
@@ -136,12 +138,12 @@ class oom_test_task_base : public sirius::pipeline::gpu_pipeline_task {
   {
   }
 
-  std::unique_ptr<sirius::op::operator_data> compute_task(rmm::cuda_stream_view) override
+  std::unique_ptr<sirius::op::operator_data> compute_task(::cuda::stream_ref) override
   {
     return nullptr;
   }
 
-  void publish_output(sirius::op::operator_data&, rmm::cuda_stream_view) override {}
+  void publish_output(sirius::op::operator_data&, ::cuda::stream_ref) override {}
 
   sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
     const cucascade::memory::memory_space* /*target_space*/) const override
@@ -157,10 +159,9 @@ class oom_test_task_base : public sirius::pipeline::gpu_pipeline_task {
   // RAII guard that resets the stream reservation on destruction.
   struct allocator_guard {
     cucascade::memory::reservation_aware_resource_adaptor* allocator;
-    rmm::cuda_stream_view stream;
+    ::cuda::stream_ref stream{cudaStream_t{}};
 
-    allocator_guard(cucascade::memory::reservation_aware_resource_adaptor* a,
-                    rmm::cuda_stream_view s)
+    allocator_guard(cucascade::memory::reservation_aware_resource_adaptor* a, ::cuda::stream_ref s)
       : allocator(a), stream(s)
     {
     }
@@ -175,7 +176,7 @@ class oom_test_task_base : public sirius::pipeline::gpu_pipeline_task {
   // Performs the common reservation → allocator → attach → cleanup setup.
   // Returns the allocator guard on success, or nullptr on failure (after
   // recording an error on global_state).
-  std::unique_ptr<allocator_guard> setup_allocator(rmm::cuda_stream_view stream,
+  std::unique_ptr<allocator_guard> setup_allocator(::cuda::stream_ref stream,
                                                    const std::string& task_label)
   {
     auto& global = _global_state->cast<oom_test_global_state>();
@@ -218,7 +219,7 @@ class oom_test_task : public oom_test_task_base {
  public:
   using oom_test_task_base::oom_test_task_base;
 
-  void execute(rmm::cuda_stream_view stream) override
+  void execute(::cuda::stream_ref stream) override
   {
     auto& global = _global_state->cast<oom_test_global_state>();
     auto& local  = _local_state->cast<sirius::pipeline::gpu_pipeline_task_local_state>();
@@ -268,7 +269,7 @@ class small_task : public oom_test_task_base {
  public:
   using oom_test_task_base::oom_test_task_base;
 
-  void execute(rmm::cuda_stream_view stream) override
+  void execute(::cuda::stream_ref stream) override
   {
     auto& global = _global_state->cast<oom_test_global_state>();
 
@@ -305,7 +306,7 @@ class xl_task : public oom_test_task_base {
  public:
   using oom_test_task_base::oom_test_task_base;
 
-  void execute(rmm::cuda_stream_view stream) override
+  void execute(::cuda::stream_ref stream) override
   {
     auto& global = _global_state->cast<oom_test_global_state>();
     auto& local  = _local_state->cast<sirius::pipeline::gpu_pipeline_task_local_state>();
@@ -364,6 +365,7 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
   }
 
   auto global_state = std::make_shared<oom_test_global_state>();
+  global_state->set_completion_handler(f.completion);
 
   const int num_tasks = 3;
   std::atomic<int> dispatched{0};
@@ -453,6 +455,7 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   }
 
   auto global_state = std::make_shared<oom_test_global_state>();
+  global_state->set_completion_handler(f.completion);
 
   const int num_small = 5;
   const int num_xl    = 3;
@@ -487,7 +490,7 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   //--------------------------------------------------------------------------
   auto start_time = std::chrono::steady_clock::now();
   auto timeout    = std::chrono::seconds(60);
-  while (!f.completion.has_error()) {
+  while (!f.completion->has_error()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if (std::chrono::steady_clock::now() - start_time > timeout) {
       f.executor->stop();
@@ -522,7 +525,7 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   REQUIRE(global_state->completed_count.load(std::memory_order_relaxed) == num_small);
 
   // The completion handler should be in an error state from exceeding max retries.
-  REQUIRE(f.completion.has_error());
+  REQUIRE(f.completion->has_error());
 
   // XL tasks should have OOM'd many times (at least 10 for the one that hit the limit).
   REQUIRE(global_state->oom_count.load(std::memory_order_relaxed) >= 10);

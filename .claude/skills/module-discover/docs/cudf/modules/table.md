@@ -63,7 +63,6 @@ class column {
 
 **Our usage**:
 - `src/expression_executor/specializations/*.cpp` — Expression results as columns
-- `src/cuda/operator/empty_str_check.cu` — Column construction from device data
 
 ### `cudf::column_view`
 
@@ -86,8 +85,6 @@ class column_view {
 ```
 
 **Our usage**:
-- `src/gpu_columns.cpp` — Constructing column_views from GPU buffer data
-- `src/expression_executor/specializations/gpu_execute_operator.cpp` — Accessing column data for operations
 
 ### `cudf::make_empty_column(data_type)`
 
@@ -99,7 +96,6 @@ std::unique_ptr<column> make_fixed_width_column(data_type type, size_type size, 
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_function.cpp:31` — Creating empty result columns
 - `src/op/sirius_physical_ungrouped_aggregate.cpp:27` — Empty columns for empty aggregation results
 
 ## APIs Available but Not Used

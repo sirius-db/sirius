@@ -190,7 +190,7 @@ inline void validate_scanned_batches(
   const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
   size_t expected_rows,
   cucascade::memory::memory_reservation_manager& mem_mgr,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto* gpu_space = get_space(mem_mgr, cucascade::memory::Tier::GPU);
   REQUIRE(gpu_space != nullptr);
@@ -279,7 +279,7 @@ inline void validate_projected_id_price_batches(
   const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
   size_t expected_rows,
   cucascade::memory::memory_reservation_manager& mem_mgr,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto* gpu_space = get_space(mem_mgr, cucascade::memory::Tier::GPU);
   REQUIRE(gpu_space != nullptr);

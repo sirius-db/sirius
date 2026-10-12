@@ -18,8 +18,6 @@ The `storage` module implements DuckDB's persistent storage engine. Sirius only 
 **Description**: Represents a table's physical storage. Referenced by GPU physical operators that need access to table metadata.
 
 **Our usage**:
-- `src/include/operator/gpu_physical_table_scan.hpp` — Table scan references DataTable
-- `src/include/operator/gpu_physical_grouped_aggregate.hpp` — Grouped aggregate references DataTable
 - `src/include/op/sirius_physical_duckdb_scan.hpp` — New code path scan operator
 - `src/include/op/sirius_physical_grouped_aggregate.hpp` — New code path aggregate
 

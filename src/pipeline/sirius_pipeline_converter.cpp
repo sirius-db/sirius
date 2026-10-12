@@ -16,21 +16,27 @@
 
 #include "pipeline/sirius_pipeline_converter.hpp"
 
-#include "duckdb/common/shared_ptr_ipp.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_streaming_source.hpp"
 #include "pipeline/repository_wiring.hpp"
+#include "sirius/exception.hpp"
+#include "transparent/read_view_registry.hpp"
+
+#include <duckdb/common/types/blob.hpp>
 
 #include <algorithm>
 #include <functional>
@@ -42,9 +48,8 @@
 
 namespace sirius::pipeline {
 
-sirius_pipeline_converter::sirius_pipeline_converter(const pipeline_build_context& ctx,
-                                                     const sirius::operator_params& op_params)
-  : build_ctx_(ctx), op_params_(op_params)
+sirius_pipeline_converter::sirius_pipeline_converter(const pipeline_build_context& ctx)
+  : build_ctx_(ctx)
 {
 }
 
@@ -58,7 +63,7 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   setup_pipeline_parents();
   finalize_pipeline_structure();
   link_join_partition_siblings();
-  configure_partition_min_partitions();
+  configure_partition_consumers();
   restrict_dynamic_filter_replicas();
   // Must run after finalize_pipeline_structure (populates `dependencies`) and after
   // link_join_partition_siblings (reads dependencies[0]/[1] positionally pre-reorder).
@@ -72,14 +77,14 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   return {std::move(scheduled_), std::move(repository_wirings_), meta_pipeline_count_};
 }
 
-void reorder_pipelines_topologically(duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+void reorder_pipelines_topologically(std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
 {
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> ordered;
+  std::vector<std::shared_ptr<sirius_pipeline>> ordered;
   ordered.reserve(pipelines.size());
   std::unordered_set<const sirius_pipeline*> emitted;
   std::unordered_set<const sirius_pipeline*> in_progress;
 
-  auto emit = [&](auto&& self, const duckdb::shared_ptr<sirius_pipeline>& pipeline) -> void {
+  auto emit = [&](auto&& self, const std::shared_ptr<sirius_pipeline>& pipeline) -> void {
     // `in_progress` breaks dependency cycles (delim-join distribution edges); the
     // pipeline is still emitted when its own frame completes.
     if (emitted.contains(pipeline.get()) || in_progress.contains(pipeline.get())) { return; }
@@ -106,12 +111,12 @@ void reorder_pipelines_topologically(duckdb::vector<duckdb::shared_ptr<sirius_pi
     pipelines[i]->set_pipeline_id(i);
   }
   for (const auto& pipeline : pipelines) {
-    std::sort(pipeline->dependencies.begin(),
-              pipeline->dependencies.end(),
-              [](const duckdb::shared_ptr<sirius_pipeline>& a,
-                 const duckdb::shared_ptr<sirius_pipeline>& b) {
-                return a->get_pipeline_id() < b->get_pipeline_id();
-              });
+    std::sort(
+      pipeline->dependencies.begin(),
+      pipeline->dependencies.end(),
+      [](const std::shared_ptr<sirius_pipeline>& a, const std::shared_ptr<sirius_pipeline>& b) {
+        return a->get_pipeline_id() < b->get_pipeline_id();
+      });
   }
 #ifdef DEBUG
   // Join dependencies are build-first (finalize_pipeline_structure) and the walk above
@@ -131,11 +136,11 @@ void reorder_pipelines_topologically(duckdb::vector<duckdb::shared_ptr<sirius_pi
 #endif
 }
 
-duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::schedule_pipelines(
+std::vector<std::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::schedule_pipelines(
   sirius_meta_pipeline& root_pipeline)
 {
-  duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>> to_schedule;
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_scheduled;
+  std::vector<std::shared_ptr<sirius_meta_pipeline>> to_schedule;
+  std::vector<std::shared_ptr<sirius_pipeline>> sirius_scheduled;
   scheduled_.clear();
   root_pipeline.get_meta_pipelines(to_schedule, true, true);
 
@@ -144,10 +149,10 @@ duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::s
   meta_pipeline_count_ = to_schedule.size();
 
   SIRIUS_LOG_DEBUG("Total meta pipelines {}", to_schedule.size());
-  int schedule_count = 0;
-  int meta           = 0;
+  std::size_t schedule_count = 0;
+  std::size_t meta           = 0;
   while (schedule_count < to_schedule.size()) {
-    duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>> children;
+    std::vector<std::shared_ptr<sirius_meta_pipeline>> children;
     to_schedule[to_schedule.size() - 1 - meta]->get_meta_pipelines(children, false, true);
     auto base_pipeline   = to_schedule[to_schedule.size() - 1 - meta]->get_base_pipeline();
     bool should_schedule = true;
@@ -173,7 +178,7 @@ duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::s
       }
     }
     if (should_schedule) {
-      duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipeline_inside;
+      std::vector<std::shared_ptr<sirius_pipeline>> pipeline_inside;
       to_schedule[to_schedule.size() - 1 - meta]->get_pipelines(pipeline_inside, false);
       for (auto& pipeline : pipeline_inside) {
         sirius_scheduled.push_back(pipeline);
@@ -188,76 +193,11 @@ duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::s
   return sirius_scheduled;
 }
 
-std::string_view sirius_pipeline_converter::resolve_port_id(
-  const op::sirius_physical_operator& sink, const op::sirius_physical_operator& /*parent*/)
-{
-  using T = op::SiriusPhysicalOperatorType;
-  // Build-side CONCATs feed the join's "build" port; everything else feeds "default".
-  if (sink.type == T::CONCAT) {
-    return sink.Cast<op::sirius_physical_concat>().is_build_concat() ? "build" : "default";
-  }
-  return "default";
-}
-
-op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
-  const op::sirius_physical_operator& sink, const sirius_pipeline& dest)
-{
-  using T = op::SiriusPhysicalOperatorType;
-  // Sort sinks process batches as they arrive. GPU_SCAN is intentionally excluded
-  // (legacy gives it FULL/PARTIAL, not PIPELINE); SORT_SAMPLE is never a pipeline
-  // sink (it runs as an intermediate in the SORT_PARTITION pipeline).
-  if (sink.type == T::ORDER_BY) { return op::MemoryBarrierType::PIPELINE; }
-  // Producers that feed CONCAT can drain incrementally (PARTIAL); otherwise wait
-  // for the upstream pipeline to finish (FULL).
-  if (sink.type == T::PARTITION || sink.type == T::UNGROUPED_AGGREGATE || sink.type == T::TOP_N ||
-      sink.type == T::SORT_PARTITION) {
-    const auto ops                  = dest.get_operators();
-    const bool downstream_is_concat = (!ops.empty() && ops[0].get().type == T::CONCAT) ||
-                                      (dest.get_sink() && dest.get_sink()->type == T::CONCAT);
-    return downstream_is_concat ? op::MemoryBarrierType::PARTIAL : op::MemoryBarrierType::FULL;
-  }
-  // Probe-side PARTITION under a join streams batches → PARTIAL; build-side PARTITION is
-  // FULL (build must accumulate every partition before the probe can join). Aggregate-
-  // fanout PARTITIONs are also FULL — the merge operator needs every per-thread bucket.
-  // Join-feeders sit under a CONCAT (wrap_join_child's wrap chain); aggregate-fanouts sit
-  // under MERGE_GROUP_BY / GROUPED_AGGREGATE_MERGE. Exception: a RIGHT-family join sizes
-  // from the complete probe input (CONCAT retains the whole probe partition), so its probe
-  // PARTITION stays FULL — unless it is a RIGHT_DELIM_JOIN's internal join, which
-  // bootstraps its probe subtree from build-side distinct data.
-  if (dest.get_sink() && dest.get_sink()->type == T::PARTITION) {
-    auto& partition        = dest.get_sink()->Cast<op::sirius_physical_partition>();
-    auto* partition_parent = partition.get_parent_op();
-    const bool join_feeder = partition_parent != nullptr && partition_parent->type == T::CONCAT;
-    // Tree-parent walk: PARTITION -> CONCAT -> owning join (stamped at plan-gen).
-    auto* join = join_feeder ? partition_parent->get_parent_op() : nullptr;
-    const bool right_family_full =
-      join && join->type == T::HASH_JOIN &&
-      join->Cast<op::sirius_physical_hash_join>().is_right_family() &&
-      !(join->get_parent_op() && join->get_parent_op()->type == T::RIGHT_DELIM_JOIN);
-    if (!partition.is_build_partition() && join_feeder && !right_family_full) {
-      return op::MemoryBarrierType::PARTIAL;
-    }
-  }
-  // A CONCAT feeding a HASH_JOIN drives the join's own "build"/"default" input ports. Make those
-  // ports PARTIAL so the join consumes build and probe batches progressively (partial barrier)
-  // rather than waiting (via the base FULL-barrier hint) for both upstream pipelines to finish. The
-  // hash join's overridden get_next_task_hint / get_next_task_input_data schedule per-partition
-  // build x probe pairs as batches arrive; the concat still folds whichever side must be seen whole
-  // (LEFT/SEMI/ANTI -> build, RIGHT-family -> probe, OUTER -> both) to a single batch, so results
-  // stay correct for every join type. BUILD_PROBE mode is unaffected (it overrides its hint
-  // regardless of the port barrier). See docs/super-sirius/operators.md.
-  if (sink.type == T::CONCAT && sink.get_parent_op() &&
-      sink.get_parent_op()->type == T::HASH_JOIN) {
-    return op::MemoryBarrierType::PARTIAL;
-  }
-  return op::MemoryBarrierType::FULL;
-}
-
 void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_state& state)
 {
   // Lookup: operator -> the pipeline that starts at it, i.e. its operators[0]
   // (entry-point post-reverse) or its sink for sink-only pipelines.
-  std::unordered_map<const op::sirius_physical_operator*, duckdb::shared_ptr<sirius_pipeline>>
+  std::unordered_map<const op::sirius_physical_operator*, std::shared_ptr<sirius_pipeline>>
     dest_for_op;
   for (const auto& pipeline : scheduled_) {
     const auto ops = pipeline->get_operators();
@@ -271,11 +211,12 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
     scheduled_[i]->set_pipeline_id(i);
   }
 
-  auto emit = [&](std::string_view port_id,
-                  op::MemoryBarrierType barrier,
+  auto emit = [&](op::sirius_physical_operator const& consumer,
                   op::sirius_physical_operator* source_op,
-                  const duckdb::shared_ptr<sirius_pipeline>& src,
-                  const duckdb::shared_ptr<sirius_pipeline>& dst) {
+                  const std::shared_ptr<sirius_pipeline>& src,
+                  const std::shared_ptr<sirius_pipeline>& dst) {
+    auto const port_id = consumer.input_port_for(*source_op);
+    auto const barrier = consumer.input_barrier_for(*source_op);
     repository_wirings_.push_back({port_id, barrier, source_op, src, dst});
   };
 
@@ -297,10 +238,11 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
         auto it = state.cte_scan_consumers.find(cte_scan);
         if (it == state.cte_scan_consumers.end()) { continue; }
         auto dest_pipeline = it->second.get().shared_from_this();
-        // Per-consumer barrier: probe-side CTE_SCAN consumers resolve to PARTIAL via the
-        // join-feeder rule; build-side consumers resolve to FULL.
-        emit(
-          "default", resolve_barrier(*sink_op, *dest_pipeline), sink_op, pipeline, dest_pipeline);
+        auto* consumer     = cte_scan.get().get_parent_op();
+        if (consumer == nullptr) {
+          throw sirius::internal_exception("CTE_SCAN repository wiring has no logical consumer");
+        }
+        emit(*consumer, sink_op, pipeline, dest_pipeline);
       }
       continue;
     }
@@ -325,11 +267,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
         if (!branch) { continue; }
         auto it = dest_for_op.find(branch);
         if (it == dest_for_op.end()) { continue; }
-        emit(resolve_port_id(*sink_op, *branch),
-             resolve_barrier(*sink_op, *it->second),
-             sink_op,
-             pipeline,
-             it->second);
+        emit(*branch, sink_op, pipeline, it->second);
       }
       continue;
     }
@@ -345,11 +283,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
         if (!scan_parent) { continue; }
         auto cit = dest_for_op.find(scan_parent);
         if (cit == dest_for_op.end()) { continue; }
-        emit(resolve_port_id(*sink_op, *scan_parent),
-             resolve_barrier(*sink_op, *cit->second),
-             sink_op,
-             pipeline,
-             cit->second);
+        emit(*scan_parent, sink_op, pipeline, cit->second);
       }
       continue;
     }
@@ -368,11 +302,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
       if (grand) {
         auto it_gp = dest_for_op.find(grand);
         if (it_gp != dest_for_op.end()) {
-          emit(resolve_port_id(*sink_op, *grand),
-               resolve_barrier(*sink_op, *it_gp->second),
-               sink_op,
-               pipeline,
-               it_gp->second);
+          emit(*grand, sink_op, pipeline, it_gp->second);
           continue;
         }
       }
@@ -382,11 +312,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
     if (it == dest_for_op.end()) { continue; }
 
     const auto& dest = it->second;
-    emit(resolve_port_id(*sink_op, *parent_op),
-         resolve_barrier(*sink_op, *dest),
-         sink_op,
-         pipeline,
-         dest);
+    emit(*parent_op, sink_op, pipeline, dest);
   }
 }
 
@@ -401,8 +327,7 @@ void sirius_pipeline_converter::setup_pipeline_parents()
     pipeline->dependencies.clear();
   }
   for (const auto& wiring : repository_wirings_) {
-    wiring.source_pipeline->parents.push_back(
-      duckdb::weak_ptr<sirius_pipeline>(wiring.dest_pipeline));
+    wiring.source_pipeline->parents.push_back(std::weak_ptr<sirius_pipeline>(wiring.dest_pipeline));
   }
 }
 
@@ -437,8 +362,30 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
 void sirius_pipeline_converter::link_join_partition_siblings()
 {
   for (const auto& pipeline : scheduled_) {
-    // Both join types get the same CONCAT/PARTITION build+probe wrap from `wrap_join`, and
-    // both can stream the probe, so the upstream→probe-partition edge is PARTIAL for both.
+    // DENSE_COUNT_JOIN feeds from bare PARTITIONs with no CONCAT between, so its dependencies are
+    // the partition pipelines directly. Sides are identified by is_build_partition() rather than
+    // by dependency position: dependency order follows build_pipelines' child order, which is not
+    // the same for this operator as for the joins below.
+    if (pipeline->source->type == op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN) {
+      if (pipeline->dependencies.size() != 2) { continue; }
+      auto* first  = pipeline->dependencies[0]->get_sink().get();
+      auto* second = pipeline->dependencies[1]->get_sink().get();
+      if (first == nullptr || second == nullptr ||
+          first->type != op::SiriusPhysicalOperatorType::PARTITION ||
+          second->type != op::SiriusPhysicalOperatorType::PARTITION) {
+        continue;
+      }
+      auto& first_partition  = first->Cast<op::sirius_physical_partition>();
+      auto& second_partition = second->Cast<op::sirius_physical_partition>();
+      // Exactly one side is the build (preserved) side; it drives the partition count.
+      D_ASSERT(first_partition.is_build_partition() != second_partition.is_build_partition());
+      first_partition.set_sibling_partition_op(&second_partition);
+      second_partition.set_sibling_partition_op(&first_partition);
+      continue;
+    }
+    // Both join types use the same CONCAT/PARTITION wrap. Probe input is PARTIAL except for
+    // right-family hash joins whose complete probe drives partition sizing; RIGHT_DELIM_JOIN
+    // inner joins use their build side instead.
     if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
         pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
       auto build_concat_pipeline    = pipeline->dependencies[0];
@@ -451,10 +398,6 @@ void sirius_pipeline_converter::link_join_partition_siblings()
       D_ASSERT(
         build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
         build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>().is_build_concat());
-      // A RIGHT_DELIM_JOIN's inner join bootstraps its probe subtree from build-side (distinct)
-      // data, so the build side drives the partition count. Detect it off the join's tree parent
-      // (the same predicate resolve_barrier uses), since the build partition is a plain PARTITION
-      // that the sink type alone does not distinguish.
       bool const inner_join_of_rdj =
         pipeline->source->get_parent_op() != nullptr &&
         pipeline->source->get_parent_op()->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
@@ -482,12 +425,10 @@ void sirius_pipeline_converter::link_join_partition_siblings()
 void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
 {
   auto const& admitted = build_ctx_.active_gpu_ids();
-  if (admitted.empty()) return;
+  std::unordered_set<op::sirius_physical_hash_join*> joins;
 
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
-    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(op)) {
-      join->restrict_dynamic_filter_replicas(admitted);
-    }
+    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(op)) { joins.insert(join); }
   };
   for (auto& pipe : scheduled_) {
     if (!pipe) continue;
@@ -495,45 +436,59 @@ void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
     auto source = pipe->get_source();
     if (sink) apply_to_op(sink.get());
     if (source) apply_to_op(source.get());
-    // A join is not always a pipeline boundary — fusion can leave one among the intermediate
-    // operators, where source/sink alone would miss it. Restriction is idempotent, so an
-    // operator reached twice is harmless.
+    // Fusion can leave a join among intermediate operators rather than at a pipeline boundary.
     for (auto op_ref : pipe->get_operators()) {
       apply_to_op(&op_ref.get());
     }
   }
+  for (auto* join : joins) {
+    join->restrict_dynamic_filter_replicas(admitted);
+  }
+  for (auto* join : joins) {
+    join->seal_dynamic_filter_plan();
+  }
 }
 
-void sirius_pipeline_converter::configure_partition_min_partitions()
+void sirius_pipeline_converter::configure_partition_consumers()
 {
-  // Pull num_gpus from the build context (derived from sirius_engine's configured GPU set at
-  // convert time). Single-GPU runs keep the consumer default of 1 (no-op). For multi-GPU we hand
-  // num_gpus to each partition's downstream sizing consumer, which derives the partition floor and
-  // small-table threshold internally (see natural_num_partitions / partition_small_table_bytes) and
-  // lets joins keep one hash table per partition so BUILD_PROBE is admitted for up to num_gpus
-  // partitions rather than only one.
-  const int num_gpus = build_ctx_.num_gpus();
-  if (num_gpus <= 1) return;
+  // The engine-backed context always carries the admitted ids; only the engine-free test
+  // constructor leaves them empty, and it cannot say which GPUs a multi-GPU count refers to.
+  auto const& active_gpu_ids = build_ctx_.active_gpu_ids();
+  if (active_gpu_ids.empty() && build_ctx_.num_gpus() > 1) {
+    throw sirius::internal_exception(
+      "configure_partition_consumers: a {}-GPU plan needs the admitted GPU ids to place partitions",
+      build_ctx_.num_gpus());
+  }
 
-  auto apply_to_op = [&](op::sirius_physical_operator* op) {
-    if (!op) return;
-    if (op->type != op::SiriusPhysicalOperatorType::PARTITION) return;
-    auto* partition_op = static_cast<op::sirius_physical_partition*>(op);
-    // The active GPU id list lets broadcast partitioning map a probe batch's residence GPU to its
-    // partition slot (inverse of task_creator's partition_idx -> GPU routing).
-    partition_op->set_active_gpu_ids(build_ctx_.active_gpu_ids());
-    // Inform the downstream sizing consumer (hash join / NLJ / merge) of the GPU count.
-    if (auto* consumer = dynamic_cast<op::sirius_physical_partition_consumer_operator*>(
-          partition_op->get_downstream_consumer_op())) {
-      consumer->set_num_gpus(num_gpus);
+  // Every partition consumer gets the list: sizing consumers choose each exchange's placement
+  // from it, and every emitter then treats a missing placement as a bug instead of silently
+  // leaving its partitions unpinned.
+  auto set_ids = [&](op::sirius_physical_operator* op) {
+    if (auto* consumer = dynamic_cast<op::sirius_physical_partition_consumer_operator*>(op)) {
+      consumer->set_active_gpu_ids(active_gpu_ids);
     }
   };
   for (auto& pipe : scheduled_) {
     if (!pipe) continue;
+    for (auto op_ref : pipe->get_operators()) {
+      set_ids(&op_ref.get());
+    }
     auto sink   = pipe->get_sink();
     auto source = pipe->get_source();
-    if (sink) apply_to_op(sink.get());
-    if (source) apply_to_op(source.get());
+    if (sink) set_ids(sink.get());
+    if (source) set_ids(source.get());
+    if (sink && sink->type == op::SiriusPhysicalOperatorType::PARTITION) {
+      set_ids(sink->Cast<op::sirius_physical_partition>().get_downstream_consumer_op());
+    }
+  }
+  // Sub-operators that emit or receive through a wiring without being a pipeline boundary (build
+  // CONCATs, delim-join internals), resolved the way materialize_repository_wiring resolves them.
+  for (auto const& wiring : repository_wirings_) {
+    set_ids(wiring.source_op);
+    auto const& dest = wiring.dest_pipeline;
+    if (!dest) continue;
+    set_ids(dest->get_operators().empty() ? dest->get_sink().get()
+                                          : &dest->get_operators()[0].get());
   }
 }
 
@@ -554,6 +509,66 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
   return "?";
 }
 
+char const* dump_source_kind(op::scan::source_kind kind)
+{
+  switch (kind) {
+    case op::scan::source_kind::duckdb_native: return "duckdb_native";
+    case op::scan::source_kind::parquet_local: return "parquet_local";
+    case op::scan::source_kind::parquet_s3: return "parquet_s3";
+    case op::scan::source_kind::stream_source: return "stream_source";
+  }
+  return "unknown";
+}
+
+char const* dump_evidence_depth(op::scan::evidence_depth depth)
+{
+  switch (depth) {
+    case op::scan::evidence_depth::path: return "path";
+    case op::scan::evidence_depth::path_and_size: return "path_and_size";
+    case op::scan::evidence_depth::path_size_and_tag: return "path_size_and_tag";
+  }
+  return "unknown";
+}
+
+std::string dump_later_checks(op::scan::later_check_set const& checks)
+{
+  static constexpr char const* names[] = {"footer_per_file",
+                                          "profile_per_file",
+                                          "schema_per_file",
+                                          "segments_per_range",
+                                          "matrix_per_range",
+                                          "host_staged",
+                                          "key_held"};
+  std::string result;
+  for (std::size_t index = 0; index < std::size(names); ++index) {
+    if (!checks.test(index)) continue;
+    if (!result.empty()) result += ",";
+    result += names[index];
+  }
+  return result.empty() ? "none" : result;
+}
+
+char const* dump_verdict(op::scan::eligibility_verdict verdict)
+{
+  switch (verdict) {
+    case op::scan::eligibility_verdict::not_evaluated: return "not_evaluated";
+    case op::scan::eligibility_verdict::supported: return "supported";
+    case op::scan::eligibility_verdict::unsupported: return "unsupported";
+    case op::scan::eligibility_verdict::incomplete: return "incomplete";
+  }
+  return "unknown";
+}
+
+char const* dump_evidence_scope(op::scan::certificate_evidence_scope scope)
+{
+  switch (scope) {
+    case op::scan::certificate_evidence_scope::none: return "none";
+    case op::scan::certificate_evidence_scope::binding_correspondence:
+      return "binding_correspondence";
+  }
+  return "unknown";
+}
+
 //! Scan identity: serialize what the ingestible will scan, so a conversion that drops
 //! identity fields (e.g. the duckdb-native pin-cache qualified name, or a parquet file
 //! list) fails the dump byte-diff instead of passing on an identical operator-type chain.
@@ -561,9 +576,65 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
 //! the scan manager later matches against pinned entries.
 void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
 {
+  if (op.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
+    auto const& stream = op.Cast<op::sirius_physical_streaming_source>();
+    if (stream.contract_id() != 0 && stream.read_views()) {
+      auto const& entry    = stream.read_views()->entry(stream.contract_id());
+      auto const& contract = entry.contract;
+      auto const* identity =
+        contract.view && contract.view->identity ? contract.view->identity.get() : nullptr;
+      out << "      contract: handle=" << contract.contract_id << " node=" << contract.scan_node_id
+          << " window="
+          << (entry.window_id ? std::to_string(*entry.window_id) : std::string{"none"})
+          << " finalize_generation=" << entry.finalize_generation
+          << " source=" << (identity ? identity->source.function_name : "unknown")
+          << " kind=" << (identity ? dump_source_kind(identity->source.kind) : "unknown")
+          << " hash=" << (identity ? identity->fingerprint.hash : 0)
+          << " depth=" << dump_evidence_depth(entry.eligibility.depth)
+          << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
+          << (contract.predicates.pushdown_mode.empty() ? "none"
+                                                        : contract.predicates.pushdown_mode)
+          << " scan_cpu_replay="
+          << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
+                                                                               : "forbidden")
+          << " scan_replay_veto="
+          << (contract.view ? (contract.view->replay_policy.reason.empty()
+                                 ? "none"
+                                 : contract.view->replay_policy.reason)
+                            : "incomplete")
+          << " correspondence="
+          << (entry.eligibility.correspondence.empty() ? "none" : entry.eligibility.correspondence)
+          << " verdict=" << dump_verdict(entry.eligibility.verdict)
+          << " reason=" << static_cast<unsigned>(entry.eligibility.reason)
+          << " later_checks=" << dump_later_checks(entry.eligibility.later_checks)
+          << " added_time_us=" << entry.eligibility.cost.added_time_us
+          << " added_bytes=" << entry.eligibility.cost.added_bytes
+          << " inherited_capture_bytes=" << entry.eligibility.cost.inherited_capture_bytes
+          << " borrowed_files=" << entry.eligibility.cost.borrowed_files
+          << " delete_preparation_time_us=" << entry.eligibility.cost.delete_preparation_time_us
+          << " storage_version="
+          << (entry.eligibility.storage_version ? std::to_string(*entry.eligibility.storage_version)
+                                                : "none")
+          << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
+          << " outputs=" << contract.output_types.size() << "\n";
+    }
+    return;
+  }
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
-  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible().table_info();
-  if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
+  auto const& scan = op.Cast<op::scan::sirius_gpu_scan_operator>();
+  auto const& info = scan.get_ingestible().table_info();
+  // Iceberg first: its table info derives from parquet's, so the parquet branch would match it
+  // and describe an iceberg scan as a plain parquet one. The delete-file count belongs in the
+  // identity — two scans of the same files that apply different deletes are not the same scan.
+  if (auto const* ice = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&info)) {
+    out << "      scan: iceberg table=" << ice->table_path
+        << " deleted_files=" << (ice->delete_data ? ice->delete_data->positional_deletes.size() : 0)
+        << " files=[";
+    for (std::size_t f = 0; f < ice->resolved_file_paths.size(); ++f) {
+      out << (f == 0 ? "" : ",") << ice->resolved_file_paths[f];
+    }
+    out << "]\n";
+  } else if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
     out << "      scan: parquet files=[";
     for (std::size_t f = 0; f < pq->resolved_file_paths.size(); ++f) {
       out << (f == 0 ? "" : ",") << pq->resolved_file_paths[f];
@@ -572,8 +643,97 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
   } else if (auto const* nat =
                dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
     out << "      scan: duckdb table=" << nat->catalog_name << "." << nat->schema_name << "."
-        << nat->table_name << "\n";
+        << nat->table_name << " oid=" << nat->table_identity.oid << "\n";
   }
+
+  if (scan.contract_id() != 0 && scan.read_views()) {
+    auto const& entry    = scan.read_views()->entry(scan.contract_id());
+    auto const& contract = entry.contract;
+    auto const* identity =
+      contract.view && contract.view->identity ? contract.view->identity.get() : nullptr;
+    out << "      contract: handle=" << contract.contract_id << " node=" << contract.scan_node_id
+        << " window=" << (entry.window_id ? std::to_string(*entry.window_id) : std::string{"none"})
+        << " finalize_generation=" << entry.finalize_generation
+        << " source=" << (identity ? identity->source.function_name : "unknown")
+        << " kind=" << (identity ? dump_source_kind(identity->source.kind) : "unknown")
+        << " hash=" << (identity ? identity->fingerprint.hash : 0)
+        << " depth=" << dump_evidence_depth(entry.eligibility.depth)
+        << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
+        << (contract.predicates.pushdown_mode.empty() ? "none" : contract.predicates.pushdown_mode)
+        << " scan_cpu_replay="
+        << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
+                                                                             : "forbidden")
+        << " scan_replay_veto="
+        << (contract.view
+              ? (contract.view->replay_policy.reason.empty() ? "none"
+                                                             : contract.view->replay_policy.reason)
+              : "incomplete")
+        << " correspondence="
+        << (entry.eligibility.correspondence.empty() ? "none" : entry.eligibility.correspondence)
+        << " verdict=" << dump_verdict(entry.eligibility.verdict)
+        << " reason=" << static_cast<unsigned>(entry.eligibility.reason)
+        << " later_checks=" << dump_later_checks(entry.eligibility.later_checks)
+        << " added_time_us=" << entry.eligibility.cost.added_time_us
+        << " added_bytes=" << entry.eligibility.cost.added_bytes
+        << " inherited_capture_bytes=" << entry.eligibility.cost.inherited_capture_bytes
+        << " borrowed_files=" << entry.eligibility.cost.borrowed_files
+        << " delete_preparation_time_us=" << entry.eligibility.cost.delete_preparation_time_us
+        << " storage_version="
+        << (entry.eligibility.storage_version ? std::to_string(*entry.eligibility.storage_version)
+                                              : "none")
+        << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
+        << " outputs=" << contract.output_types.size()
+        << " columns=" << contract.columns.column_ids.size()
+        << " projections=" << contract.columns.projection_ids.size()
+        << " rowid=" << contract.columns.requires_row_id;
+    if (contract.view && contract.view->selector_evidence_required) {
+      auto const& evidence = contract.view->logical_selector_evidence;
+      out << " selector_evidence=\""
+          << (evidence ? duckdb::Blob::ToString(duckdb::string_t(*evidence)) : "missing") << "\"";
+    }
+    out << "\n";
+  }
+}
+
+// Aggregate every GPU-plan scan, independently of whichever pipeline is printed first.
+void dump_plan_replay_policy(std::ostringstream& out, pipeline_conversion_result const& result)
+{
+  bool s3 = false, stream = false, incomplete = false;
+  auto visit = [&](op::sirius_physical_operator const& node) {
+    std::shared_ptr<transparent::read_view_registry> registry;
+    op::scan::scan_contract_id id = 0;
+    if (node.type == op::SiriusPhysicalOperatorType::GPU_SCAN) {
+      auto const& scan = node.Cast<op::scan::sirius_gpu_scan_operator>();
+      registry         = scan.read_views();
+      id               = scan.contract_id();
+    } else if (node.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
+      auto const& scan = node.Cast<op::sirius_physical_streaming_source>();
+      registry         = scan.read_views();
+      id               = scan.contract_id();
+    } else
+      return;
+    if (!registry || !id || !registry->entry(id).contract.view) {
+      incomplete = true;
+      return;
+    }
+    auto const& policy = registry->entry(id).contract.view->replay_policy;
+    if (policy.permits_cpu_replay) return;
+    s3 |= policy.source == transparent::byte_source_class::sirius_owned_s3;
+    stream |= policy.source == transparent::byte_source_class::stream;
+    incomplete |= policy.source != transparent::byte_source_class::sirius_owned_s3 &&
+                  policy.source != transparent::byte_source_class::stream;
+  };
+  for (auto const& pipeline : result.scheduled_pipelines) {
+    if (pipeline->get_source()) visit(*pipeline->get_source());
+    for (auto const& node : pipeline->get_operators())
+      visit(node.get());
+  }
+  out << "plan_cpu_replay=" << (s3 || stream || incomplete ? "forbidden" : "permitted") << " veto=";
+  if (!s3 && !stream && !incomplete) out << "none";
+  if (s3) out << "s3";
+  if (stream) out << (s3 ? ",stream" : "stream");
+  if (incomplete) out << (s3 || stream ? ",incomplete" : "incomplete");
+  out << " scope=gpu_plan\n";
 }
 
 //! One `[pipeline N]` block: source/sink/operators with per-scan identity, shared by the
@@ -582,6 +742,7 @@ void dump_pipeline_block(std::ostringstream& out, std::size_t index, const siriu
 {
   out << "[pipeline " << index << "]\n";
   out << "  source: " << dump_op_name(p.get_source().get()) << "\n";
+  if (p.get_source()) { dump_scan_identity(out, *p.get_source()); }
   out << "  sink: " << dump_op_name(p.get_sink().get()) << "\n";
   const auto ops = p.get_operators();
   out << "  operators (" << ops.size() << "):\n";
@@ -597,9 +758,9 @@ void dump_pipeline_block(std::ostringstream& out, std::size_t index, const siriu
 void dump_wirings(
   std::ostringstream& out,
   const std::vector<repository_wiring>& wirings,
-  const std::function<std::size_t(const duckdb::shared_ptr<sirius_pipeline>&)>& index_of)
+  const std::function<std::size_t(const std::shared_ptr<sirius_pipeline>&)>& index_of)
 {
-  auto pipeline_index = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::string {
+  auto pipeline_index = [&](const std::shared_ptr<sirius_pipeline>& p) -> std::string {
     auto idx = index_of(p);
     return idx == std::numeric_limits<std::size_t>::max() ? std::string{"?"} : std::to_string(idx);
   };
@@ -672,7 +833,7 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
 
   // Canonical order: sort by signature so the dump is independent of emission order —
   // equivalent graphs print byte-identical output.
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> ordered = result.scheduled_pipelines;
+  std::vector<std::shared_ptr<sirius_pipeline>> ordered = result.scheduled_pipelines;
   std::sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) -> bool {
     return compute_sig(a.get()) < compute_sig(b.get());
   });
@@ -681,12 +842,13 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
   for (std::size_t i = 0; i < ordered.size(); ++i) {
     pipeline_to_index[ordered[i].get()] = i;
   }
-  auto idx_of = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::size_t {
+  auto idx_of = [&](const std::shared_ptr<sirius_pipeline>& p) -> std::size_t {
     auto it = pipeline_to_index.find(p.get());
     return it == pipeline_to_index.end() ? std::numeric_limits<std::size_t>::max() : it->second;
   };
 
   std::ostringstream out;
+  dump_plan_replay_policy(out, result);
   out << "=== pipelines (" << ordered.size() << ") ===\n";
   for (std::size_t i = 0; i < ordered.size(); ++i) {
     dump_pipeline_block(out, i, *ordered[i]);
@@ -704,16 +866,17 @@ std::string dump_pipeline_schedule_raw(const pipeline_conversion_result& result)
   for (std::size_t i = 0; i < scheduled.size(); ++i) {
     position[scheduled[i].get()] = i;
   }
-  auto idx_of = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::size_t {
+  auto idx_of = [&](const std::shared_ptr<sirius_pipeline>& p) -> std::size_t {
     auto it = position.find(p.get());
     return it == position.end() ? std::numeric_limits<std::size_t>::max() : it->second;
   };
-  auto idx_str = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::string {
+  auto idx_str = [&](const std::shared_ptr<sirius_pipeline>& p) -> std::string {
     auto idx = idx_of(p);
     return idx == std::numeric_limits<std::size_t>::max() ? std::string{"?"} : std::to_string(idx);
   };
 
   std::ostringstream out;
+  dump_plan_replay_policy(out, result);
   out << "=== scheduled pipelines (" << scheduled.size() << ") ===\n";
   for (std::size_t i = 0; i < scheduled.size(); ++i) {
     dump_pipeline_block(out, i, *scheduled[i]);

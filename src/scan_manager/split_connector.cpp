@@ -31,9 +31,15 @@ split_connector::~split_connector() = default;
 void split_connector::push_split(std::unique_ptr<op::operator_data> split)
 {
   assert(split != nullptr && "push_split requires a non-null split");
+  // Sized before the lock: a cached-batch split reads its size through the blocking
+  // to_read_only(), which waits on a downgrade — under _mutex that stalls every consumer pop.
+  auto const split_bytes = split->get_estimated_size_in_bytes();
   {
     std::lock_guard<std::mutex> lock(_mutex);
     assert(!_closed && "push_split after close() is forbidden");
+    // A zero estimate means unknown, not empty; latch it so the total remains conservative.
+    _discovered_bytes += split_bytes;
+    _has_unsized_splits = _has_unsized_splits || split_bytes == 0;
     _splits.push_back(std::move(split));
   }
   _cv.notify_one();
@@ -83,7 +89,10 @@ bool split_connector::is_draining(std::size_t quiet_ms) const
 bool split_connector::is_closed() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
-  return _closed && _splits.empty();
+  // A failed source still has terminal work: the scheduler must call
+  // get_next_split() so the original exception reaches the query window.
+  // Otherwise a metadata failure before the first pop looks like empty input.
+  return _closed && _splits.empty() && !_exception;
 }
 
 [[nodiscard]] bool split_connector::has_more_splits() const
@@ -104,6 +113,24 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> split_connector::peek_resi
     }
   }
   return batches;
+}
+
+bool split_connector::is_discovery_complete() const
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _closed;
+}
+
+std::size_t split_connector::discovered_bytes() const
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _discovered_bytes;
+}
+
+bool split_connector::has_unsized_splits() const
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _has_unsized_splits;
 }
 
 }  // namespace sirius::scan_manager

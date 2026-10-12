@@ -39,12 +39,12 @@ using namespace sirius::test::operator_utils;
 namespace {
 inline uint64_t int128_low64(__int128_t value)
 {
-  return static_cast<uint64_t>(static_cast<unsigned __int128>(value));
+  return static_cast<uint64_t>(static_cast<__uint128_t>(value));
 }
 
 inline int64_t int128_high64(__int128_t value)
 {
-  return static_cast<int64_t>(static_cast<unsigned __int128>(value) >> 64);
+  return static_cast<int64_t>(static_cast<__uint128_t>(value) >> 64);
 }
 
 // Translate a vector of DuckDB expressions into Sirius AST nodes (size/order

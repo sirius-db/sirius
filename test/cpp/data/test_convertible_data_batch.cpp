@@ -49,7 +49,7 @@ struct test_env {
   {
   }
 
-  rmm::cuda_stream_view stream() { return conv_stream.view(); }
+  ::cuda::stream_ref stream() { return conv_stream; }
 };
 
 test_env& env()
