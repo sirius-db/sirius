@@ -33,6 +33,8 @@
 
 namespace duckdb {
 class SiriusContext;
+class LogicalOperator;
+class PreparedStatementData;
 }  // namespace duckdb
 
 namespace sirius::pipeline {
@@ -77,6 +79,18 @@ class scoped_test_query {
 //! after `converter.convert()` — no GPU execution. Returns a string rather than the raw
 //! result because the result references the function-local plan tree. Throws on
 //! parse / bind / optimize errors.
+struct extracted_plan {
+  duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
+  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
+};
+
+//! Parse + plan + optimize + resolve a SQL query, mirroring the sirius-specific order of
+//! `SiriusTableFunctionData::ExtractPlan`: `ResolveOperatorTypes` BEFORE `ColumnBindingResolver`.
+//! DuckDB's `Connection::ExtractPlan` uses the reverse order, which trips sirius plan
+//! generation with an "inequal types" binder error on some queries. Needs an active transaction.
+extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
+                                                 const std::string& query);
+
 std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query);
 
 //! Like `convert_query_to_dump`, but returns the raw scheduled order

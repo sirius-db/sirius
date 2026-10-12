@@ -1217,7 +1217,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libgomp-15.2.0-he0feb66_19.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libstdcxx-15.2.0-h934c35e_19.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.3-h35e630c_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/pixi-0.71.1-ha759004_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/pixi-0.78.0-hf01adef_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.6.17-hbd8a1cb_0.conda
       linux-aarch64-cuda13:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
@@ -1225,7 +1225,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libgomp-15.2.0-h8acb6b2_19.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libstdcxx-15.2.0-hef695bb_19.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/openssl-3.6.3-h546c87b_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pixi-0.71.1-h1d7f6d8_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pixi-0.78.0-hc342849_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.6.17-hbd8a1cb_0.conda
   vcpkg:
     channels:
@@ -6216,20 +6216,21 @@ packages:
     - pcre2 >=10.47,<10.48.0a0
   size: 1218833
   timestamp: 1787294571916
-- conda: https://conda.anaconda.org/conda-forge/linux-64/pixi-0.71.1-ha759004_0.conda
-  sha256: 4a659805b7f9eb5d820beeec69ef2da01d0d8806f6660c2115b39fd97989a8ac
-  md5: 7e4b6377533e22fb603cebea5e26a6e6
+- conda: https://conda.anaconda.org/conda-forge/linux-64/pixi-0.78.0-hf01adef_0.conda
+  sha256: 2a1ba8d670331ae4dcf75355fc1142439c4ececfe472b6a028250b0038188ae6
+  md5: a93ac9cadeaea5022271ccdca2565e90
   depends:
+  - libgcc >=15
   - __glibc >=2.17,<3.0.a0
-  - libgcc >=14
-  - libstdcxx >=14
-  - openssl >=3.5.7,<4.0a0
+  - libstdcxx >=15
+  - openssl >=3.5.8,<4.0a0
   constrains:
   - __glibc >=2.17
   license: BSD-3-Clause
+  license_family: BSD
   run_exports: {}
-  size: 32748782
-  timestamp: 1782453816168
+  size: 33878666
+  timestamp: 1787927495904
 - conda: https://conda.anaconda.org/conda-forge/linux-64/pkg-config-0.29.2-h1114479_1013.conda
   sha256: 8f27ee1b6166c5be505dba4b0dd0f3b3b81ddec811f6118cc337b90cbd3937a4
   md5: 0aab2923309084c5f89ef32cd39a19b2
@@ -10821,19 +10822,20 @@ packages:
     - pcre2 >=10.47,<10.48.0a0
   size: 1199286
   timestamp: 1787294520352
-- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pixi-0.71.1-h1d7f6d8_0.conda
-  sha256: 762174250f3a415c3b2e23c13458775d6a38dacd7dc4b233fa7e95b5a4d9a963
-  md5: ae6adb212c6c03d17c05b1c55d9b4fa4
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pixi-0.78.0-hc342849_0.conda
+  sha256: e6799f165d7334b19562293382b450ff6cd3384be9fe21106ec5707c5a1618dc
+  md5: 8171440a58282c76c3a0ada7cbe4a093
   depends:
-  - libgcc >=14
-  - libstdcxx >=14
-  - openssl >=3.5.7,<4.0a0
+  - libstdcxx >=15
+  - libgcc >=15
+  - openssl >=3.5.8,<4.0a0
   constrains:
   - __glibc >=2.17
   license: BSD-3-Clause
+  license_family: BSD
   run_exports: {}
-  size: 31329375
-  timestamp: 1782453828507
+  size: 32348810
+  timestamp: 1787927495313
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pkg-config-0.29.2-hfbd14cd_1013.conda
   sha256: 4e2d6ffb3bca0e5ece75636124655b3a779ed3e8ed946f26a69797f6f1f86878
   md5: 1eb00be535cfa0e928554a98dfcb52f7

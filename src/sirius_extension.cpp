@@ -2604,6 +2604,15 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
+static void SetCrossJoinTaskBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                     = lock_operator_params_slot(context);
+  params->cross_join_task_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config CROSS_JOIN_TASK_BYTES to {}", params->cross_join_task_bytes);
+}
+
 static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2928,6 +2937,16 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
+static void SetEnableDecimalSumStatsBound(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                              = lock_operator_params_slot(context);
+  params->enable_decimal_sum_stats_bound = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DECIMAL_SUM_STATS_BOUND to {}",
+                   params->enable_decimal_sum_stats_bound);
+}
+
 static void SetUseHwDecompression(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -3231,6 +3250,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     SetEnablePinnedZoneMapPruning);
   add_sirius_option(config,
                     option_visibility::internal,
+                    "enable_decimal_sum_stats_bound",
+                    "decide decimal SUM widening from base-table statistics at plan time; off "
+                    "measures every batch",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_decimal_sum_stats_bound),
+                    SetEnableDecimalSumStatsBound);
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "enable_dynamic_filter",
                     "disable runtime dynamic-filter discovery for eligible hash joins "
                     "(probe-side scan and join-edge targets)",
@@ -3293,6 +3320,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.concat_batch_bytes),
                     SetConcatBatchBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "cross_join_task_bytes",
+                    "override the internally derived output target of a cross product task",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.cross_join_task_bytes),
+                    SetCrossJoinTaskBytes);
 
   // Add in config options for special JIT implementation for regex
   add_sirius_option(config,

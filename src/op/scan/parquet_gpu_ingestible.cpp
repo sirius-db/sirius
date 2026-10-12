@@ -316,7 +316,9 @@ std::string strip_file_uri(std::string const& p)
 }
 
 std::vector<std::vector<cudf::io::text::byte_range_info>> slice_column_chunk_ranges(
-  std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options);
+  std::span<row_group_slice const> slices,
+  std::shared_ptr<cudf::io::parquet_reader_options const> const& reader_options,
+  column_chunk_range_cache& cache);
 std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
   std::span<row_group_slice const> slices,
   std::span<std::vector<cudf::io::text::byte_range_info> const> per_slice_ranges);
@@ -499,6 +501,7 @@ class parquet_batch_coalescer : public batch_coalescer {
       _produced_any = true;
       out.push_back(emit_current());
     }
+    _ranges_cache.clear();
     return out;
   }
 
@@ -506,7 +509,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::unique_ptr<scan_info> emit_current()
   {
     auto reader_options   = _run_reader_options ? _run_reader_options : _reader_options;
-    auto per_slice_ranges = slice_column_chunk_ranges(_slices, *reader_options);
+    auto per_slice_ranges = slice_column_chunk_ranges(_slices, reader_options, _ranges_cache);
     auto hints            = parquet_fadvise_entries(_slices, per_slice_ranges);
     auto split            = std::make_unique<parquet_split_info>(std::move(hints));
     split->rg_slices      = std::move(_slices);
@@ -547,6 +550,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   /// Reader options of the current run. Projected and natural reads cannot share
   /// a split.
   std::shared_ptr<cudf::io::parquet_reader_options> _run_reader_options;
+  column_chunk_range_cache _ranges_cache;
 
   /// First fully-pruned file, kept as the source for flush()'s empty-split
   /// fallback when the whole scan produced no slice.
@@ -572,13 +576,15 @@ class parquet_batch_coalescer : public batch_coalescer {
 /// scan hands cuDF one chunk-data span per range, in exactly the order the
 /// reader enumerated them.
 std::vector<std::vector<cudf::io::text::byte_range_info>> slice_column_chunk_ranges(
-  std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options)
+  std::span<row_group_slice const> slices,
+  std::shared_ptr<cudf::io::parquet_reader_options const> const& reader_options,
+  column_chunk_range_cache& cache)
 {
   std::vector<std::vector<cudf::io::text::byte_range_info>> per_slice(slices.size());
   for (std::size_t i = 0; i < slices.size(); ++i) {
     if (!slices[i].file_metadata) { continue; }
     per_slice[i] =
-      column_chunk_ranges(*slices[i].file_metadata, reader_options, slices[i].row_group_indices);
+      cache.ranges(slices[i].file_metadata, reader_options, slices[i].row_group_indices);
   }
   return per_slice;
 }
@@ -1903,11 +1909,16 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
 
 bool parquet_gpu_ingestible::output_assembly_is_leading_identity() const noexcept
 {
-  // !needs_output_assembly means assemble_scan_output is a pass-through: no
-  // partition columns to synthesize and output_layout reads data columns
-  // 0..N-1 in order. (Its other false case, the empty count(*) layout, can
-  // never reach the transactional steal: such scans have no carrier targets.)
-  return !needs_output_assembly(*_plan);
+  // output_is_leading_prefix means assemble_scan_output only keeps a leading prefix: no partition
+  // columns to synthesize and output_layout reads data columns 0..N-1 in order, with any
+  // pure-filter columns trailing. (Its other false case, the empty count(*) layout, can never reach
+  // the transactional steal: such scans have no carrier targets.)
+  return output_is_leading_prefix(*_plan);
+}
+
+std::optional<std::size_t> parquet_gpu_ingestible::output_prefix_width() const noexcept
+{
+  return scan::output_prefix_width(*_plan);
 }
 
 //===----------------------------------------------------------------------===//

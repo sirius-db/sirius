@@ -113,6 +113,7 @@ sirius:
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     enable_runtime_size_estimation: false  # project total port input from upstream ratios
+    enable_decimal_sum_stats_bound: true  # decide decimal SUM widening from statistics at plan time
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -506,8 +507,8 @@ S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` 
 
 **File:** `src/include/sirius_config.hpp` — `operator_params` struct
 
-The four batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
-`concat_batch_bytes`, `sort_sample_bytes`) share one built-in default. Without an
+The five batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
+`concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`) share one built-in default. Without an
 explicit GPU capacity in YAML, it is computed at startup as
 `clamp(smallest visible physical GPU memory / 40, 512 MiB, 5 GiB)` (800 MiB when no
 GPU is visible). When the active YAML memory path explicitly caps GPU capacity, the
@@ -524,6 +525,7 @@ individually.
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
+| `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
@@ -541,6 +543,7 @@ individually.
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
+| `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input must be widened before aggregation. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 

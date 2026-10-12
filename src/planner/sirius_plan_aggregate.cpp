@@ -38,6 +38,7 @@
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "planner/decimal_sum_input_bounds.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius/exception.hpp"
@@ -686,7 +687,8 @@ static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_grouping_sets_aggregate(
   duckdb::LogicalAggregate& op,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
-  duckdb::TupleDataValidityType group_validity)
+  duckdb::TupleDataValidityType group_validity,
+  const std::vector<std::optional<std::uint64_t>>& decimal_sum_bounds)
 {
   auto const num_groups     = op.groups.size();
   auto const num_aggregates = op.expressions.size();
@@ -709,7 +711,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_grouping_sets_aggr
     std::move(op.grouping_functions),
     op.estimated_cardinality,
     group_validity,
-    op.distinct_validity);
+    op.distinct_validity,
+    decimal_sum_bounds);
   group_by->children.push_back(std::move(child));
 
   duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
@@ -730,6 +733,17 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_grouping_sets_aggr
                          sirius::from_duckdb_vec(op.types),
                          std::move(select_list),
                          op.estimated_cardinality);
+}
+
+/// Whether plan-time statistics may decide decimal SUM widening
+/// (sirius.operator_params.enable_decimal_sum_stats_bound); on without a Sirius context.
+bool decimal_sum_stats_bound_enabled(duckdb::ClientContext& context)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  return !sirius_ctx ||
+         sirius_ctx->get_config().get_operator_params().enable_decimal_sum_stats_bound;
 }
 
 }  // namespace
@@ -778,6 +792,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
 
+  // Resolved before the child is planned: planning moves expressions out of the logical subtree.
+  auto const decimal_sum_bounds = decimal_sum_stats_bound_enabled(context)
+                                    ? resolve_decimal_sum_input_bounds(context, op)
+                                    : std::vector<std::optional<std::uint64_t>>{};
+
   auto plan = create_plan(*op.children[0]);
 
   plan = extract_aggregate_expressions(
@@ -810,7 +829,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
         sirius::from_duckdb_vec(op.types),
         translate_expressions(std::move(op.expressions)),
         op.estimated_cardinality,
-        op.distinct_validity);
+        op.distinct_validity,
+        decimal_sum_bounds);
       group_by->children.push_back(std::move(plan));
       return group_by;
     }
@@ -818,7 +838,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   }
 
   if (has_grouping_sets) {
-    return plan_grouping_sets_aggregate(op, std::move(plan), group_validity);
+    return plan_grouping_sets_aggregate(op, std::move(plan), group_validity, decimal_sum_bounds);
   }
 
   // groups! create a GROUP BY aggregator
@@ -836,7 +856,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       std::move(op.grouping_functions),
       op.estimated_cardinality,
       group_validity,
-      op.distinct_validity);
+      op.distinct_validity,
+      decimal_sum_bounds);
     group_by->children.push_back(std::move(plan));
     return group_by;
   }
@@ -851,7 +872,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       std::move(op.grouping_functions),
       op.estimated_cardinality,
       group_validity,
-      op.distinct_validity);
+      op.distinct_validity,
+      decimal_sum_bounds);
     group_by->children.push_back(std::move(plan));
     return group_by;
   }
@@ -865,7 +887,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     std::move(op.grouping_functions),
     op.estimated_cardinality,
     group_validity,
-    op.distinct_validity);
+    op.distinct_validity,
+    decimal_sum_bounds);
   group_by->children.push_back(std::move(plan));
   return group_by;
 }

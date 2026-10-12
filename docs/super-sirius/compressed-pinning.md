@@ -88,6 +88,13 @@ a column's plan allows it the filter is answered from the compressed form, and t
 rows come back already compacted — so rows the filter rejects are never fully decoded, and the
 scan skips its own filter pass when the decode carried the whole predicate.
 
+When the decode carries the scan's whole filter it returns only the projected columns: a column
+the scan reads only for its filter is tested while the selection is built and is never decoded or
+gathered. When the projected columns are also the scan's output in order (no reordering, duplicate
+or synthesized column), the scan then takes ownership of the batch without copying it. With any
+conjunct left to the scan (a join filter, an unsupported shape) or on any decline, every column
+comes back as before.
+
 It is off by default and inert when off (byte-identical to an ordinary decompress):
 
 ```bash

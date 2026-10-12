@@ -5,7 +5,7 @@ This directory contains benchmarking, profiling, and performance testing tools f
 ## Prerequisites
 
 - Sirius must be built: `pixi run make -j12` (from project root)
-- Binary: `build/release/duckdb` with Sirius extension at `build/release/extension/sirius/sirius.duckdb_extension`
+- Binary: `sirius-duckdb/build/release/duckdb` with Sirius extension at `sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension`
 - Sirius config: `test/cpp/integration/integration.yaml` (set `SIRIUS_CONFIG_FILE` env var)
 - Parquet data must exist in `test_datasets/tpch_parquet_sf<N>/` (auto-generated if missing)
 
@@ -90,7 +90,7 @@ equivalent — which is sound precisely because the base data is byte-identical 
 
 ```bash
 # From project root - generates parquet files with DuckDB's default row groups (122K rows)
-./build/release/duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=100); EXPORT DATABASE 'test_datasets/tpch_parquet_sf100' (FORMAT PARQUET);"
+./sirius-duckdb/build/release/duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=100); EXPORT DATABASE 'test_datasets/tpch_parquet_sf100' (FORMAT PARQUET);"
 ```
 
 ### Rewriting parquet with GPU-optimized settings

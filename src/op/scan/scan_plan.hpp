@@ -182,6 +182,18 @@ struct bound_virtual_column {
 ///      covers @c data_columns 1:1 in order.
 [[nodiscard]] bool needs_output_assembly(scan_plan const& plan);
 
+/// How many leading materialized (M-space) columns the output reads: one past the largest @c DATA
+/// index in @c output_layout, whatever the entries' order, duplicates, or virtual columns. Nullopt
+/// when @c output_layout has no @c DATA entry (SELECT count(*), a partition-only output, or a
+/// row-count carrier scan).
+[[nodiscard]] std::optional<std::size_t> output_prefix_width(scan_plan const& plan) noexcept;
+
+/// True when the output is exactly the leading reader data columns in order: no partitions, a
+/// non-empty @c output_layout no longer than @c data_columns (so no synthesized virtual column),
+/// and output column k is @c DATA(k) for every k. Unlike @ref needs_output_assembly, materialized
+/// columns past that prefix (pure-filter columns) may follow.
+[[nodiscard]] bool output_is_leading_prefix(scan_plan const& plan) noexcept;
+
 /// Reshape the materialized M-order batch to the plan's output layout.
 ///
 /// Input DATA indexes are materialized M-space positions: reader columns followed by synthesized

@@ -149,6 +149,10 @@ struct operator_params {
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
+  /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
+  /// join is larger is split into tasks over row ranges of the left batch.
+  uint64_t cross_join_task_bytes = config::derived_default_batch_size();
+
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
@@ -205,6 +209,11 @@ struct operator_params {
 
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
+
+  /// Decide decimal SUM widening from base-table statistics at plan time: an aggregate input with
+  /// a proven magnitude bound skips the per-batch min/max scan and its stream synchronization
+  /// (planner::resolve_decimal_sum_input_bounds). Off: every batch is measured.
+  bool enable_decimal_sum_stats_bound = true;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
