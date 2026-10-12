@@ -620,10 +620,8 @@ void task_creator::manager_loop()
     }
 
     // The request's lease already protects manager-side hint traversal and will move into
-    // the worker owner. Pool attribution is retained temporarily for legacy pool callers.
+    // the worker owner. Pool slots account only for execution capacity.
     try {
-      // Attribution can allocate; contain failures in this query's error handler.
-      slot.attach(query_id);
       std::vector<std::shared_ptr<pipeline::sirius_pipeline>> visited_pipelines;
       auto* requested_node = node;
       auto const next      = get_operator_for_next_task(node, visited_pipelines);
@@ -670,6 +668,7 @@ void task_creator::manager_loop()
       exec::dispatch_with_work(
         *_bounded_pool,
         std::move(slot),
+        query_id,
         std::move(work),
         [this,
          request = std::move(request),

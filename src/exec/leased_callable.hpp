@@ -50,15 +50,16 @@ class leased_callable {
   F fn_;
 };
 
-/// Submit query work without depending on the pool's per-query lifetime accounting.
+/// Submit work with a queue-disposal tag; the lease owns its query resource lifetime.
 /// The caller's claim remains intact if constructing the callable argument throws.
 template <typename F>
 void dispatch_with_work(bounded_thread_pool& pool,
                         bounded_thread_pool::slot&& slot,
+                        query_id_t query,
                         query_lifecycle_registry::work_lease&& work,
                         F&& fn)
 {
-  pool.dispatch(std::move(slot), leased_callable{std::move(work), std::forward<F>(fn)});
+  pool.dispatch(std::move(slot), leased_callable{std::move(work), std::forward<F>(fn)}, query);
 }
 
 }  // namespace sirius::exec

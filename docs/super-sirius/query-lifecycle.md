@@ -73,8 +73,18 @@ be silently discarded or cause a wait on work that cannot progress. A validation
 the owner's cancellation path. Repeated retirement calls from the engine/destructor/window
 backstops remain safe; they use the same ordering without a separate retired flag.
 
-An existing lease does not authorize publication after closure. Every queue handoff, including
-retry and spill return, still needs a submission guard. No worker waits for its own lease.
+An existing lease does not authorize new task publication after closure. Handoffs to the creator,
+scheduler and GPU staging queues, including retry and spill return, need a submission guard.
+Internal dispatch from a manager into its bounded worker pool transfers an already-held claim;
+it may finish after the pool cancellation sweep. The final lease barrier covers that work.
+No worker waits for its own lease.
+
+Bounded pool slots count execution capacity only. Query IDs on queued callables identify work
+for `discard_queued(query_id)`; they do not count running work. There is no pool `slot.attach()`,
+per-query counter, or per-query wait. Idle manager reservations cannot delay query retirement,
+and a queue sweep makes no claim that manager-held/running work has finished. Global pool joins
+remain necessary for shutdown and operations whose workers borrow local stack state.
+Scan dispatcher joins retain their separate producer-cancellation role.
 
 The engine retires asynchronous users before member destruction. The registry retains the plan
 as a backstop if cleanup cannot prove quiescence. Such a cleanup failure marks the runtime
