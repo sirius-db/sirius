@@ -374,11 +374,14 @@ std::unique_ptr<rmm::device_buffer> peer_copy(std::unique_ptr<rmm::device_buffer
 {
   auto const bytes = source ? source->size() : std::size_t{0};
   auto copy        = std::make_unique<rmm::device_buffer>(bytes, stream, mr);
+  // Hand the source to the scratch BEFORE queueing a read of it, so a throw
+  // here leaves nothing queued against a buffer about to be freed.
+  rmm::device_buffer const* retained = nullptr;
+  if (source) { retained = retire.emplace_back(std::move(source)).get(); }
   if (bytes > 0) {
     CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
-      copy->data(), destination_device, source->data(), source_device, bytes, stream.get()));
+      copy->data(), destination_device, retained->data(), source_device, bytes, stream.get()));
   }
-  if (source) { retire.push_back(std::move(source)); }
   return copy;
 }
 
