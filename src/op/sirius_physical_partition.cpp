@@ -33,6 +33,7 @@
 #include "telemetry/nvtx.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -357,24 +358,51 @@ void sirius_physical_partition::sink(const operator_data& input_data, ::cuda::st
   }
 }
 
-uint64_t sirius_physical_partition::compute_total_bytes()
+namespace {
+
+/// `rows * (to_bytes / from_bytes)`, saturating; zero when `from_bytes` is zero.
+uint64_t scale_rows(uint64_t rows, uint64_t to_bytes, uint64_t from_bytes)
+{
+  if (from_bytes == 0 || rows == 0) { return 0; }
+  double const scaled =
+    static_cast<double>(rows) * (static_cast<double>(to_bytes) / static_cast<double>(from_bytes));
+  constexpr double kMaxRows = 9.0e18;  // Within uint64_t.
+  if (!(scaled < kMaxRows)) { return static_cast<uint64_t>(kMaxRows); }
+  return static_cast<uint64_t>(std::llround(scaled));
+}
+
+}  // namespace
+
+sirius_physical_partition::input_totals sirius_physical_partition::compute_input_totals()
 {
   if (ports.find("default") == ports.end()) {
     throw std::runtime_error(
-      "sirius_physical_partition::compute_total_bytes() did not find default repo for id " +
+      "sirius_physical_partition::compute_input_totals() did not find default repo for id " +
       std::to_string(this->get_operator_id()));
   }
-  auto& repo           = ports.at("default")->repo;
-  auto batch_ids       = repo->get_batch_ids(0);
-  uint64_t total_bytes = 0;
+  auto& repo               = ports.at("default")->repo;
+  auto batch_ids           = repo->get_batch_ids(0);
+  input_totals totals      = {};
+  uint64_t counted_bytes   = 0;
+  uint64_t uncounted_bytes = 0;
   for (auto batch_id : batch_ids) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
     if (batch) {
       auto ro = batch->to_read_only();
-      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
+      if (ro.get_data()) {
+        auto const bytes = ro.get_data()->get_size_in_bytes();
+        totals.bytes += bytes;
+        if (auto const rows = representation_num_rows(ro.get_data())) {
+          totals.rows += *rows;
+          counted_bytes += bytes;
+        } else {
+          uncounted_bytes += bytes;
+        }
+      }
     }
   }
-  return total_bytes;
+  totals.rows += scale_rows(totals.rows, uncounted_bytes, counted_bytes);
+  return totals;
 }
 
 std::optional<uint64_t> sirius_physical_partition::estimated_total_input_bytes()
@@ -607,10 +635,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       // size from the combined input.
       auto const this_bytes    = compute_total_bytes();
       auto const sibling_bytes = sibling.compute_total_bytes();
-      partition_sizing_input const in{sizing_partition.compute_total_bytes(),
+      auto const sizing_totals = sizing_partition.compute_input_totals();
+      partition_sizing_input const in{sizing_totals.bytes,
                                       sizing_partition._is_build,
                                       has_build_concat(*this) || has_build_concat(sibling),
-                                      sirius::memory::saturating_add(this_bytes, sibling_bytes)};
+                                      sirius::memory::saturating_add(this_bytes, sibling_bytes),
+                                      sizing_totals.rows};
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy      = consumer->get_partition_strategy(in);
@@ -660,11 +690,17 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     if (!_num_partitions.has_value()) {
       // Without an estimate, the task hint waits until the received input is complete.
       auto const estimated   = estimated_total_input_bytes();
-      auto const total_bytes = estimated.value_or(compute_total_bytes());
+      auto const received    = compute_input_totals();
+      auto const total_bytes = estimated.value_or(received.bytes);
+      // A projection covers input not yet received; project its rows at the received row width.
+      auto const total_rows = estimated.has_value()
+                                ? scale_rows(received.rows, total_bytes, received.bytes)
+                                : received.rows;
       partition_sizing_input const in{total_bytes,
                                       _is_build,
                                       /*build_foldable=*/false,
-                                      /*combined_total_bytes=*/total_bytes};
+                                      /*combined_total_bytes=*/total_bytes,
+                                      total_rows};
       auto const strategy = consumer->get_partition_strategy(in);
       apply_partition_strategy(strategy, *consumer);
       _sizing_bytes = in.total_bytes;
@@ -675,10 +711,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         _sizing_basis = sizing_basis::measured;
       }
       SIRIUS_LOG_DEBUG(
-        "sirius_physical_partition id {} sized {} partitions from {} bytes ({}), placement {}",
+        "sirius_physical_partition id {} sized {} partitions from {} bytes, {} rows ({}), "
+        "placement {}",
         this->get_operator_id(),
         strategy.num_partitions,
         in.total_bytes,
+        in.total_rows,
         sizing_basis_name(_sizing_basis),
         strategy.placement.to_string());
     }

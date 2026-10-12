@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 
+#include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <duckdb.hpp>
@@ -43,11 +44,14 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using sirius::scan_manager::fan_out_and_join;
@@ -190,6 +194,78 @@ TEST_CASE("fan_out_and_join rethrows the first task error after the join",
   REQUIRE_THROWS_WITH(fan_out_and_join(dispatcher, std::move(tasks), "error test"),
                       Catch::Matchers::ContainsSubstring("mask task blew up"));
   REQUIRE(ran.load() == 2);  // the join waited for the healthy tasks too
+}
+
+TEST_CASE("fan_out_and_join joins accepted work before rethrowing a submission error",
+          "[mvcc_mask_job][scan_manager]")
+{
+  bool const task_fails = GENERATE(false, true);
+  sirius::exec::static_thread_pool pool(2);
+  sirius::exec::scoped_dispatcher dispatcher(pool, 2);
+  std::promise<void> started, release, stopped;
+  auto started_future = started.get_future();
+  auto released       = release.get_future();
+  auto stopped_future = stopped.get_future();
+  std::atomic<bool> finished{false};
+  std::atomic<bool> later_ran{false};
+  bool joined_before_throw = false;
+
+  struct stop_control {
+    sirius::exec::static_thread_pool& pool;
+    std::future<void>& started;
+    std::promise<void>& stopped;
+    bool armed = false;
+  } control{pool, started_future, stopped};
+  // A small move-only callable stays inline in AnyInvocable. Its move into the
+  // fan-out wrapper stops the real pool after the first task has started, so the
+  // second submission fails deterministically without an allocation-failure hook.
+  struct stop_on_move {
+    stop_control* control;
+    explicit stop_on_move(stop_control* value) : control(value) {}
+    stop_on_move(stop_on_move&& other) noexcept : control(std::exchange(other.control, nullptr))
+    {
+      if (control && std::exchange(control->armed, false)) {
+        control->started.wait();
+        control->pool.stop();
+        control->stopped.set_value();
+      }
+    }
+    void operator()() const {}
+  };
+
+  std::vector<sirius::exec::invocable<void()>> tasks;
+  tasks.emplace_back([&] {
+    started.set_value();
+    released.wait();
+    finished = true;
+    if (task_fails) { throw std::runtime_error("earlier task failed"); }
+  });
+  tasks.emplace_back(stop_on_move{&control});
+  tasks.emplace_back([&] { later_ran = true; });
+  control.armed = true;
+  auto result   = std::async(std::launch::async, [&] {
+    try {
+      fan_out_and_join(dispatcher, std::move(tasks), "partial submission test");
+    } catch (...) {
+      joined_before_throw = finished.load();
+      throw;
+    }
+  });
+  // Unblock the worker before the async future is destroyed if a check fails.
+  bool worker_released  = false;
+  absl::Cleanup cleanup = [&] {
+    if (!worker_released) release.set_value();
+    dispatcher.wait_for_all();
+  };
+  REQUIRE(stopped_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  CHECK(result.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+  release.set_value();
+  worker_released = true;
+  CHECK_THROWS_WITH(result.get(), "thread pool is stopped");
+  dispatcher.wait_for_all();
+  CHECK(joined_before_throw);
+  CHECK(finished.load());
+  CHECK_FALSE(later_ran.load());
 }
 
 TEST_CASE("fan_out_and_join turns dropped tasks into a loud error, not a deadlock",

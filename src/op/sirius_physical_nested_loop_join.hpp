@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
@@ -42,6 +43,27 @@ class sirius_meta_pipeline;
 }  // namespace pipeline
 
 namespace op {
+
+//! Task input of a cross product: a left and a right batch, and which of `num_slices` equal row
+//! ranges of the left batch to join with the right batch.
+class cross_join_slice_data : public pipelineable_operator_data {
+ public:
+  cross_join_slice_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+                        std::size_t slice,
+                        std::size_t num_slices)
+    : pipelineable_operator_data(std::move(data_batches)), slice(slice), num_slices(num_slices)
+  {
+  }
+
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_data_batches(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches) const override
+  {
+    return std::make_unique<cross_join_slice_data>(std::move(data_batches), slice, num_slices);
+  }
+
+  std::size_t slice;
+  std::size_t num_slices;
+};
 
 //! sirius_physical_nested_loop_join represents a nested loop join between two tables
 class sirius_physical_nested_loop_join : public sirius_physical_partition_consumer_operator {
@@ -136,6 +158,10 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
+  //! Output bytes a cross product task aims for. A pair of input batches whose cross join is
+  //! larger is split into tasks over row ranges of the left batch.
+  void set_cross_join_task_bytes(uint64_t bytes) noexcept { cross_join_task_bytes = bytes; }
+
   //! A nested-loop join always runs on a single partition (its build side is not hash-partitioned),
   //! so it never broadcasts or enters build-probe.
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
@@ -160,10 +186,24 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
  protected:
   std::mutex batches_to_processed_mutex;
-  std::size_t current_partition_index = 0;
-  std::size_t num_batches_to_process  = 0;
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
+  //! Sizes of the batches in left_batch_ids and right_batch_ids. Read for a cross product only.
+  std::vector<std::vector<batch_rows_and_bytes>> left_batch_sizes;
+  std::vector<std::vector<batch_rows_and_bytes>> right_batch_sizes;
+
+  //! One task: a pair of input batches and, for a cross product, a slice of the left batch.
+  struct pair_task {
+    std::size_t partition  = 0;
+    std::size_t left       = 0;  //!< index into left_batch_ids[partition]
+    std::size_t right      = 0;  //!< index into right_batch_ids[partition]
+    std::size_t slice      = 0;
+    std::size_t num_slices = 0;  //!< 0 until the task's pair is reached
+  };
+  //! The next task to hand out. Tasks run over partitions, then left batches, then right batches,
+  //! then slices.
+  pair_task next_task;
+  uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
 };
 
 }  // namespace op

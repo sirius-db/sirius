@@ -153,6 +153,7 @@ TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order
 #include <cuda_runtime.h>
 
 #include <compression/compressed_representation.hpp>
+#include <compression/decompression_pushdown_policy.hpp>
 #include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <unistd.h>
@@ -668,6 +669,84 @@ TEST_CASE("pin_table compression - predicate pushdown declines a non-dictionary 
   REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(6245000LL));
 
   run_ok(con, "CALL unpin_table('t_dictpred_fb');", "unpin fallback");
+
+  fs::remove_all(tmp);
+}
+
+// The TPC-H q1/q6 shape: a pure-filter column whose range is the scan's whole filter. A GPU-tier
+// pin whose decode carries that filter returns only the projected columns, and the scan takes the
+// batch over without copying it; every other shape -- a decode that falls back, a count(*) with no
+// projected column, a filtered column that is also projected, an equality the scan still has to
+// evaluate -- must come back with every column. The observable contract is that no answer moves.
+TEST_CASE("pin_table compression - decode-time pure-filter column omission preserves results",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+  if (!sirius::decompression_pushdown_enabled()) {
+    WARN("filtered-decode env gate off in this process; only the plain decode is exercised");
+  }
+
+  auto [tmp, yaml_path] = make_comp_env("dropfilter");
+
+  // k is the filter column (range % 1000); d is a DECIMAL whose values narrow to DECIMAL32 at pin
+  // time, so serving it restores a carrier; v is a plain payload; s is a dictionary string column;
+  // n is a dictionary string column with nulls, which a filtered decode cannot compact.
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp,
+    "SELECT (range % 1000)::INTEGER AS k, ((range % 997) * 1.25)::DECIMAL(15,2) AS d, "
+    "range::BIGINT AS v, CASE range % 4 WHEN 0 THEN 'DELIVER IN PERSON' WHEN 1 THEN 'COLLECT COD' "
+    "WHEN 2 THEN 'NONE' ELSE 'TAKE BACK RETURN' END AS s, CASE WHEN range % 7 = 0 THEN NULL ELSE "
+    "'n_' || (range % 30)::VARCHAR END AS n FROM range(20000)",
+    1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir,
+                  "t_dropfilter",
+                  bitpack_plan(3) +
+                    "---\ninput -> dictionary -> keys_offsets, keys_chars, indices\n"
+                    "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+                    "---\ninput -> dictionary -> keys_offsets, keys_chars, indices, null_mask\n"
+                    "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+                    "dictionary.null_mask -> identity\n");
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_dropfilter');");
+  require_ok(pin, "pin dropfilter");
+  auto const census = sirius::test::census_entry(con, "t_dropfilter");
+  REQUIRE(census.chunks > 0);
+  REQUIRE(census.compressed_chunks == census.chunks);
+
+  auto const from = "FROM read_parquet('" + glob + "')";
+  for (auto const& query : std::vector<std::string>{
+         // Selective range on the pure-filter column: the decode drops k.
+         "SELECT SUM(d), SUM(v) " + from + " WHERE k < 5",
+         "SELECT d, v " + from + " WHERE k < 5 ORDER BY v",
+         // Unselective range: whether the decode compacts 90% of the rows or gives up depends on
+         // the selectivity ceilings; neither may move the answer.
+         "SELECT SUM(d), SUM(v) " + from + " WHERE k < 900",
+         // A projected null-masked column fails the decode after its filter ran, so the scan gets
+         // every column back and filters them itself.
+         "SELECT n, v " + from + " WHERE k < 5 ORDER BY v",
+         // No projected column: the row count rides on the filter column, which stays.
+         "SELECT count(*) " + from + " WHERE k < 5",
+         // The filter column is also projected, so it is no pure-filter column.
+         "SELECT SUM(k), SUM(v) " + from + " WHERE k < 5",
+         // An equality the decode answers alongside the range.
+         "SELECT SUM(d), SUM(v) " + from + " WHERE s = 'DELIVER IN PERSON' AND k < 5"}) {
+    CAPTURE(query);
+    sirius::test::mgpu::require_gpu_matches_cpu(con, query, /*force_cpu_reference=*/true);
+  }
+
+  run_ok(con, "CALL unpin_table('t_dropfilter');", "unpin dropfilter");
 
   fs::remove_all(tmp);
 }

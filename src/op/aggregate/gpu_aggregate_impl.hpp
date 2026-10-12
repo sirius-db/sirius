@@ -24,7 +24,9 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -80,6 +82,10 @@ class gpu_aggregate_impl {
    *        indices. Empty entries (or an empty outer vector) use `aggregate_idx` directly.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param telemetry_info Per-batch telemetry sink.
+   * @param aggregate_input_max_abs Parallel to `aggregates`: plan-time |unscaled value| bound of
+   *        a decimal SUM input (see sirius_physical_grouped_aggregate); absent entries are
+   *        measured.
    *
    * @return The output data batch.
    */
@@ -91,7 +97,8 @@ class gpu_aggregate_impl {
     const std::vector<std::vector<int>>& aggregate_struct_col_indices,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info                    = {},
+    const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {});
 
   /**
    * @brief Perform local grouped aggregate over several grouping sets on the input data batch.
@@ -141,7 +148,8 @@ class gpu_aggregate_impl {
     const std::vector<std::vector<std::size_t>>& grouping_functions,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info                    = {},
+    const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {});
 };
 
 }  // namespace op

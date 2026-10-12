@@ -1909,11 +1909,16 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
 
 bool parquet_gpu_ingestible::output_assembly_is_leading_identity() const noexcept
 {
-  // !needs_output_assembly means assemble_scan_output is a pass-through: no
-  // partition columns to synthesize and output_layout reads data columns
-  // 0..N-1 in order. (Its other false case, the empty count(*) layout, can
-  // never reach the transactional steal: such scans have no carrier targets.)
-  return !needs_output_assembly(*_plan);
+  // output_is_leading_prefix means assemble_scan_output only keeps a leading prefix: no partition
+  // columns to synthesize and output_layout reads data columns 0..N-1 in order, with any
+  // pure-filter columns trailing. (Its other false case, the empty count(*) layout, can never reach
+  // the transactional steal: such scans have no carrier targets.)
+  return output_is_leading_prefix(*_plan);
+}
+
+std::optional<std::size_t> parquet_gpu_ingestible::output_prefix_width() const noexcept
+{
+  return scan::output_prefix_width(*_plan);
 }
 
 //===----------------------------------------------------------------------===//

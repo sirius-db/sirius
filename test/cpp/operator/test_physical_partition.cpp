@@ -528,6 +528,7 @@ struct sizing_consumer : sirius_physical_partition_consumer_operator {
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override
   {
     inputs.push_back(in.total_bytes);
+    rows.push_back(in.total_rows);
     count = natural_num_partitions(in.total_bytes, target_bytes, 1);
     return partition_strategy{
       count, false, false, partition_placement::unpinned(static_cast<std::size_t>(count))};
@@ -536,7 +537,20 @@ struct sizing_consumer : sirius_physical_partition_consumer_operator {
   uint64_t target_bytes = 1;
   int count             = 0;
   std::vector<uint64_t> inputs;
+  std::vector<uint64_t> rows;
 };
+
+/// A one-column INT32 GPU batch of `num_rows` rows on `space`.
+std::shared_ptr<data_batch> make_int_batch(memory_space& space, std::size_t num_rows)
+{
+  auto stream = default_stream();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(
+    std::vector<int32_t>(num_rows, 1), stream, get_resource_ref(space)));
+  auto representation = std::make_unique<gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(columns)), space, stream);
+  return data_batch::make(sirius::get_next_batch_id(), std::move(representation));
+}
 
 struct partition_sizing_fixture {
   explicit partition_sizing_fixture(bool enabled = true)
@@ -1179,4 +1193,50 @@ TEST_CASE("native join preparation aligns evaluated and compressed keys across f
   std::sort(joined.begin(), joined.end());
   CHECK(joined ==
         (null_safe ? std::vector<int32_t>{0, 1, 2, 3, 4, 5} : std::vector<int32_t>{0, 1, 2, 3, 4}));
+}
+
+TEST_CASE("partition sizing reports the measured input rows",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f(false);
+  f.finish(f.received_bytes);
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.rows == std::vector<uint64_t>{100});
+}
+
+TEST_CASE("partition sizing projects rows with a projected byte total",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  f.source.projected_bytes = 4 * f.received_bytes;
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{4 * f.received_bytes});
+  REQUIRE(f.consumer.rows == std::vector<uint64_t>{400});
+}
+
+TEST_CASE("sibling partition sizing reports the sizing side's rows", "[physical_partition]")
+{
+  bool const drives = GENERATE(true, false);
+  partition_sizing_fixture f(false);
+  f.finish(f.received_bytes);
+
+  // A sibling holding 30 rows; the pair sizes from whichever side drives the count.
+  shared_data_repository sibling_repo;
+  auto* space = f.memory_manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  sibling_repo.add_data_batch(make_int_batch(*space, 30));
+  sirius_physical_partition sibling({}, 0, &f.consumer, true);
+  sibling.operator_id = 3;
+  auto port           = std::make_unique<sirius_physical_operator::port>();
+  port->type          = MemoryBarrierType::FULL;
+  port->repo          = &sibling_repo;
+  port->src_pipeline  = f.producer;
+  sibling.add_port("default", std::move(port));
+  f.partition.set_sibling_partition_op(&sibling);
+  sibling.set_sibling_partition_op(&f.partition);
+  f.partition.set_drives_partition_count(drives);
+  sibling.set_drives_partition_count(!drives);
+
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.rows == std::vector<uint64_t>{drives ? 100u : 30u});
 }

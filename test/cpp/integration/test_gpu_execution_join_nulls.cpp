@@ -104,6 +104,40 @@ TEST_CASE_METHOD(JoinNullFixture,
   compare_gpu_vs_cpu("SELECT l.id, l.k IN (SELECT k FROM r WHERE k IS NOT NULL) AS m FROM l");
 }
 
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution NULL NOT IN a constant empty subquery is true",
+                 "[integration][gpu_execution][join][nulls][empty_subquery]")
+{
+  compare_gpu_vs_cpu("SELECT NULL::INTEGER IN (SELECT 1 WHERE false)");
+  compare_gpu_vs_cpu("SELECT NULL::INTEGER NOT IN (SELECT 1 WHERE false)");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution IN and NOT IN with an empty subquery have definite marks",
+                 "[integration][gpu_execution][join][nulls][empty_subquery]")
+{
+  const std::string key_type = GENERATE("INTEGER", "VARCHAR");
+  const std::string empty_source =
+    GENERATE("WHERE CAST(NULL AS BOOLEAN)", "WHERE false", "WHERE k <> k", "empty_build");
+  INFO(key_type << ": " << empty_source);
+  run_ok("CREATE TABLE mark_probe (id INTEGER, k " + key_type + ");");
+  run_ok("CREATE TABLE mark_build (k " + key_type + ");");
+  run_ok("INSERT INTO mark_probe VALUES (1, '1'), (2, NULL), (3, '2');");
+  if (empty_source != "empty_build") { run_ok("INSERT INTO mark_build VALUES ('1'), (NULL);"); }
+  run_ok("CHECKPOINT;");
+
+  // Cover an optimizer-produced EMPTY_RESULT, a runtime-empty filter and a physical empty
+  // table. NULL probe keys must still yield FALSE for IN and TRUE for NOT IN in every case.
+  const auto subquery =
+    "(SELECT k FROM mark_build " + (empty_source == "empty_build" ? "" : empty_source) + ")";
+  compare_gpu_vs_cpu("SELECT id, k IN " + subquery + " AS m FROM mark_probe");
+  compare_gpu_vs_cpu("SELECT id, k NOT IN " + subquery + " AS m FROM mark_probe");
+  // Reduced from fuzz finding 041-mismatch-89bc93ce: an erroneous NULL mark takes ELSE.
+  compare_gpu_vs_cpu("SELECT id, CASE WHEN k NOT IN " + subquery +
+                     " THEN 1.0000::DECIMAL(18,4) ELSE 573493.3702::DECIMAL(18,4) END "
+                     "FROM mark_probe");
+}
+
 TEST_CASE_METHOD(JoinNullFixture,
                  "gpu_execution mixed SEMI and ANTI joins keep matches after NULL build rows",
                  "[integration][gpu_execution][join][nulls][mixed_join]")

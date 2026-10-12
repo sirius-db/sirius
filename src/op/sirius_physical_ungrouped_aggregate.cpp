@@ -49,7 +49,6 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 
-#include <algorithm>
 #include <limits>
 #include <optional>
 #include <unordered_set>
@@ -61,10 +60,12 @@ sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
   std::size_t estimated_cardinality,
-  duckdb::TupleDataValidityType /*distinct_validity*/)
+  duckdb::TupleDataValidityType /*distinct_validity*/,
+  std::vector<std::optional<std::uint64_t>> aggregate_input_max_abs_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
-    aggregates(std::move(expressions))
+    aggregates(std::move(expressions)),
+    aggregate_input_max_abs(std::move(aggregate_input_max_abs_p))
 {
   // COUNT(DISTINCT) uses COLLECT_SET. DistinctAggregateCollectionInfo and DistinctAggregateData
   // are not populated.
@@ -359,24 +360,25 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     cols.reserve(layout.local_types.size());
 
     // DECIMAL32/DECIMAL64 SUM and AVG inputs are summed over DECIMAL128 only if this batch could
-    // overflow the input width (see decimal_sums_needing_widening); otherwise they are reduced at
-    // the input width and the one-row result is widened.
+    // overflow the input width (see decimal_sums_to_widen); otherwise they are reduced at the
+    // input width and the one-row result is widened.
     std::unordered_set<int> widened_decimal_inputs;
     {
-      std::vector<int> candidates;
-      for (auto const& spec : layout.aggregates) {
+      std::vector<decimal_sum_candidate> candidates;
+      for (size_t k = 0; k < layout.aggregates.size(); ++k) {
+        auto const& spec = layout.aggregates[k];
         // Only SUM (and AVG's SUM) is gated: MIN, MAX and COUNT cannot overflow, and no other
         // overflow-prone kind (PRODUCT, SUM_OF_SQUARES) is reachable here.
         if (spec.kind != aggregate_kind::SUM && spec.kind != aggregate_kind::AVG) { continue; }
         auto const col_type = view.column(static_cast<cudf::size_type>(spec.input_idx)).type();
-        if (widened_decimal_sum_type(col_type) &&
-            std::find(candidates.begin(), candidates.end(), spec.input_idx) == candidates.end()) {
-          candidates.push_back(static_cast<int>(spec.input_idx));
-        }
+        if (!widened_decimal_sum_type(col_type)) { continue; }
+        candidates.push_back(
+          {spec.input_idx,
+           k < aggregate_input_max_abs.size() ? aggregate_input_max_abs[k] : std::nullopt});
       }
       if (!candidates.empty()) {
         widened_decimal_inputs =
-          decimal_sums_needing_widening(view, candidates, stream, space->get_default_allocator());
+          decimal_sums_to_widen(view, candidates, stream, space->get_default_allocator());
       }
     }
 
