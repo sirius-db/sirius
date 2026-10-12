@@ -29,6 +29,7 @@
 #include <sys/wait.h>
 #include <unistd.h>  // getpid
 #include <util/duckdb_error_message.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/log_test_utils.hpp>
 #include <utils/parquet_fixture_utils.hpp>
@@ -196,6 +197,9 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
     ~regex_jit_restore_guard() { duckdb::Config::ENABLE_REGEX_JIT_IMPL = original; }
   } restore_regex_jit{duckdb::Config::ENABLE_REGEX_JIT_IMPL};
 
+  // Keep regexp_replace visible instead of DuckDB v2's regexp_extract rewrite.
+  sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
+
   create_table(R"SQL(
     CREATE TABLE test_regex_jit_equivalence AS
     SELECT * FROM (VALUES
@@ -287,6 +291,30 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
     run_with_specialized_regex(true, "test_regex_jit_final_newline");
   REQUIRE(specialized_final_newline == generic_final_newline);
   REQUIRE(specialized_final_newline == std::vector<std::string>{"http://a/x\n"});
+}
+
+TEST_CASE_METHOD(RuntimeFallbackFixture,
+                 "transparent execution: rewritten regex uses CPU fallback",
+                 "[transparent][fallback][integration][regex-rewrite]")
+{
+  create_table(R"SQL(
+    CREATE TABLE test_regex_rewrite AS
+    SELECT * FROM (VALUES (1, 'https://www.example.com/path'), (2, 'no match'), (3, NULL))
+      AS cases(id, url)
+  )SQL");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto result       = con->Query(R"SQL(
+    SELECT regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1')
+    FROM test_regex_rewrite ORDER BY id
+  )SQL");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
+  REQUIRE(result->RowCount() == 3);
+  REQUIRE(result->Collection().GetValue(0, 0).ToString() == "example.com");
+  REQUIRE(result->Collection().GetValue(0, 1).ToString() == "no match");
+  REQUIRE(result->Collection().GetValue(0, 2).IsNull());
 }
 
 // A GPU failure at runtime completes the query on CPU and is counted as a runtime
@@ -905,10 +933,9 @@ TEST_CASE("an unsupported filter above a join falls back during planning",
   fixture.require_plan_fallback("SELECT count(*) FROM " + parquet + " a JOIN " + parquet +
                                   " b ON a.id = b.id WHERE round(a.a + b.b) > 1",
                                 "249");
-  // V2 absorbs this cross-table predicate into an arbitrary join condition.
-  fixture.require_plan_fallback("SELECT count(*) FROM " + parquet + " a JOIN " + parquet +
-                                  " b ON a.id = b.id WHERE a.a + b.b > 1",
-                                "249");
+  fixture.require_gpu("SELECT count(*) FROM " + parquet + " a JOIN " + parquet +
+                        " b ON a.id = b.id WHERE a.a + b.b > 1",
+                      "249");
 }
 
 TEST_CASE("supported IS NOT NULL filter stays on GPU for parquet",

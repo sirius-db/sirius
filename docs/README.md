@@ -262,6 +262,7 @@ Sirius is under active development. Notable current limitations include:
 - **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
 
 - **DuckDB v2 fallback errors:** If runtime CPU fallback also fails, the query can report `Interrupted` instead of the underlying error.
+- **DuckDB v2 regex rewrites:** Whole-input backreference replacements, including the ClickBench Q28 URL pattern, are rewritten to `regexp_extract(..., 'k')` and currently require CPU fallback instead of using the GPU regex implementation.
 
 For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). Unsupported types and operators fall back to DuckDB CPU execution when fallback is enabled.
 
