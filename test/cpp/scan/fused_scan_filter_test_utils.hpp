@@ -105,24 +105,22 @@ inline std::unique_ptr<cudf::column> upload_strings(std::vector<std::string> con
   }
   rmm::device_buffer chars_buf{chars.empty() ? 1 : chars.size(), stream, mr};
   if (!chars.empty()) {
-    REQUIRE(cudaMemcpyAsync(chars_buf.data(),
-                            chars.data(),
-                            chars.size(),
-                            cudaMemcpyHostToDevice,
-                            stream.get()) == cudaSuccess);
+    REQUIRE(cudaMemcpyAsync(
+              chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.get()) ==
+            cudaSuccess);
   }
   REQUIRE((valid.empty() || valid.size() == host.size()));
   for (std::size_t i = 0; i < host.size(); ++i) {
-    strings[i].first = valid.empty() || valid[i]
-                         ? static_cast<char const*>(chars_buf.data()) + offsets[i]
-                         : nullptr;
+    strings[i].first =
+      valid.empty() || valid[i] ? static_cast<char const*>(chars_buf.data()) + offsets[i] : nullptr;
   }
   rmm::device_buffer strings_buf{
     strings.data(), strings.size() * sizeof(decltype(strings)::value_type), stream, mr};
   stream.sync();
-  auto const device_strings = cudf::device_span<cuda::std::pair<char const*, cudf::size_type> const>{
-    static_cast<cuda::std::pair<char const*, cudf::size_type> const*>(strings_buf.data()),
-    static_cast<std::size_t>(n)};
+  auto const device_strings =
+    cudf::device_span<cuda::std::pair<char const*, cudf::size_type> const>{
+      static_cast<cuda::std::pair<char const*, cudf::size_type> const*>(strings_buf.data()),
+      static_cast<std::size_t>(n)};
   return cudf::make_strings_column(device_strings, stream, mr);
 }
 
