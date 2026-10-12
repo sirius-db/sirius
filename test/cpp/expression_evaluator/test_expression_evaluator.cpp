@@ -3019,6 +3019,43 @@ TEST_CASE("native_ast - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
   }
 }
 
+TEMPLATE_TEST_CASE("CASE accepts scalar WHEN conditions",
+                   "[expression_evaluator][case_expr]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto* space          = get_default_gpu_space();
+  auto input           = make_int32_input(*space);
+  auto const condition = GENERATE(-1, 0, 1);
+  auto const nested    = GENERATE(false, true);
+  auto const boolean   = logical_type::make(type_id::BOOLEAN);
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.push_back({std::make_unique<ast_node>(sirius::ast::constant{
+                     condition < 0 ? sirius::value{} : sirius::value{condition == 1}, boolean}),
+                   int_const_node_native(100)});
+  auto expr = std::make_unique<ast_node>(sirius::ast::case_expr{
+    std::move(cases), ref_node_native(0), logical_type::make(type_id::INTEGER)});
+  if (nested) {
+    expr = make_cmp(sirius::comparison_type::equal, std::move(expr), int_const_node_native(100));
+  }
+  auto output         = run_native_ast(*space, expr.get(), input.view, TestType::value);
+  auto const expected = copy_column_to_host<int32_t>(input.view.column(0));
+  REQUIRE(output->num_rows() == input.view.num_rows());
+  REQUIRE(output->view().column(0).null_count() == 0);
+  if (nested) {
+    auto actual = copy_column_to_host<int8_t>(output->view().column(0));
+    for (size_t i = 0; i < actual.size(); ++i) {
+      CHECK(actual[i] == (condition == 1 || expected[i] == 100));
+    }
+  } else {
+    auto actual = copy_column_to_host<int32_t>(output->view().column(0));
+    for (size_t i = 0; i < actual.size(); ++i) {
+      CHECK(actual[i] == (condition == 1 ? 100 : expected[i]));
+    }
+  }
+}
+
 // Native-AST executor coverage for the null-safe comparison kinds
 // (COMPARE_DISTINCT_FROM / COMPARE_NOT_DISTINCT_FROM) built directly as
 // sirius::ast::comparison nodes — the comparison-kind enum is preserved end to
