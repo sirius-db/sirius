@@ -24,6 +24,8 @@
 #include "operator_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
+#include <variant>
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>

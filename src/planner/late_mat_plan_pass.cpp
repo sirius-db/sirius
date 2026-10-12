@@ -178,12 +178,15 @@ struct group_by_shape {
 std::optional<group_by_shape> read_group_by(sirius_physical_operator const& node)
 {
   if (auto const* agg = dynamic_cast<op::sirius_physical_grouped_aggregate const*>(&node)) {
+    // Grouping sets NULL some keys and add columns after the keys.
+    if (agg->has_grouping_sets()) { return std::nullopt; }
     return group_by_shape{&agg->group_idx,
                           &agg->cudf_aggregate_idx,
                           &agg->cudf_aggregate_struct_col_indices,
                           &agg->cudf_aggregates};
   }
   if (auto const* merge = dynamic_cast<op::sirius_physical_grouped_aggregate_merge const*>(&node)) {
+    if (merge->num_grouping_set_columns > 0) { return std::nullopt; }
     return group_by_shape{&merge->group_idx,
                           &merge->cudf_aggregate_idx,
                           &merge->cudf_aggregate_struct_col_indices,

@@ -25,6 +25,8 @@
 #include <duckdb/common/exception.hpp>
 
 // cudf
+#include <variant>
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>

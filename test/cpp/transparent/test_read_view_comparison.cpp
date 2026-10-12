@@ -15,6 +15,8 @@
  */
 
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "op/sirius_physical_table_scan.hpp"
+#include "planner/connector_registry.hpp"
 #include "transparent/read_view_registry.hpp"
 
 #include <catch.hpp>
@@ -22,6 +24,7 @@
 #include <iomanip>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -207,7 +210,7 @@ TEST_CASE("Equal read-view sides share candidate identity storage", "[transparen
   CHECK(candidate.entry(contract).eligibility.verdict == eligibility_verdict::not_evaluated);
   CHECK(candidate.entry(contract).eligibility.evidence_scope == certificate_evidence_scope::none);
   share_equal_read_view_identities(&logical, physical, candidate);
-  candidate.publish_supported(
+  candidate.publish_correspondence(
     certificate_evidence_scope::binding_correspondence, comparison.correspondence, physical);
 
   auto const& shared = candidate.entry(contract).contract.view->identity;
@@ -223,4 +226,70 @@ TEST_CASE("Equal read-view sides share candidate identity storage", "[transparen
   expected_identity << std::hex << std::setw(16) << std::setfill('0') << shared->fingerprint.hash;
   CHECK(candidate.entry(contract).eligibility.cpu_gpu_view_identity == expected_identity.str());
   CHECK(candidate.entry(contract).eligibility.correspondence == "table_index");
+}
+
+TEST_CASE("Correspondence preserves a recorded scan refusal", "[transparent][read_view]")
+{
+  read_view_registry registry;
+  auto candidate_view = view("refused.parquet");
+  auto const contract =
+    allocate_scan_contract(registry, std::nullopt, 1, 102, candidate_view, {}, {}, {}, {}, 10);
+  certification_result result;
+  result.verdict          = eligibility_verdict::unsupported;
+  result.reason           = verdict_reason::iceberg_equality_deletes;
+  result.reason_text      = "equality deletes";
+  result.later_checks     = check_bit(later_check::footer_per_file);
+  result.semantic_columns = {true, false};
+  auto invalid            = result;
+  invalid.verdict         = eligibility_verdict::incomplete;
+  CHECK_THROWS_AS(registry.record_verdict(contract, invalid), std::logic_error);
+  registry.record_verdict(contract, result);
+  CHECK_THROWS_AS(registry.record_verdict(contract, result), std::logic_error);
+
+  std::vector<bound_read_view> physical{*candidate_view};
+  registry.publish_correspondence(
+    certificate_evidence_scope::binding_correspondence, "table_index", physical);
+  auto const& certificate = registry.entry(contract).eligibility;
+  CHECK(certificate.verdict == eligibility_verdict::unsupported);
+  CHECK(certificate.reason == verdict_reason::iceberg_equality_deletes);
+  CHECK(certificate.reason_text == "equality deletes");
+  CHECK(certificate.later_checks == result.later_checks);
+  CHECK(certificate.semantic_columns == result.semantic_columns);
+  CHECK(certificate.evidence_scope == certificate_evidence_scope::binding_correspondence);
+}
+
+TEST_CASE("Pre-declined scan receives a contract without a candidate view",
+          "[transparent][read_view]")
+{
+  auto registry = std::make_shared<read_view_registry>();
+  duckdb::TableFunction function("iceberg_scan", {}, nullptr, nullptr);
+  sirius::op::sirius_physical_table_scan scan({},
+                                              std::move(function),
+                                              nullptr,
+                                              {},
+                                              {},
+                                              {},
+                                              {},
+                                              duckdb::make_uniq<duckdb::TableFilterSet>(),
+                                              1,
+                                              duckdb::ExtraOperatorInfo(),
+                                              {},
+                                              duckdb::virtual_column_map_t{});
+  scan.read_views                   = registry;
+  scan.scan_node_id                 = 77;
+  scan.table_index                  = 12;
+  scan.contract_finalize_generation = 9;
+  sirius::planner::connector connector{};
+  connector.function_name    = "iceberg_scan";
+  connector.kind             = source_kind::parquet_local;
+  connector.registry_profile = "iceberg.v1";
+
+  auto id            = registry->allocate_declined_scan(scan, connector);
+  auto const& record = registry->entry(id);
+  CHECK(record.contract.view == nullptr);
+  CHECK(record.contract.scan_node_id == 77);
+  CHECK(record.contract.table_index == 12);
+  CHECK(record.finalize_generation == 9);
+  CHECK(record.eligibility.materializer.kind == materializer_kind::iceberg);
+  CHECK_THROWS_AS(registry->allocate_declined_scan(scan, connector), std::runtime_error);
 }

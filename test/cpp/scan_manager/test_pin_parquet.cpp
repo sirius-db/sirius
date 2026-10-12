@@ -27,9 +27,11 @@
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
 #include "memory/topology_index.hpp"
+#include "op/scan/parquet_metadata.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 
 #include <cstddef>
 #include <filesystem>
@@ -102,6 +104,32 @@ TEST_CASE("a pin that throws part way through pins nothing", "[scan_manager][cac
   // Nothing may be left pinned: with the partial entry retained, the first
   // file's request still has a live consumer and the evictor skips it forever.
   CHECK(bytes_after_full_eviction(*cache) == 0);
+}
+
+TEST_CASE("parquet tier pin caches complete footer evidence for every file",
+          "[scan_manager][cache][pin_parquet][r2a]")
+{
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_pin();
+  sirius_scan_manager manager{config_with_sirius_cache(), *memory, topology};
+  sirius::test::scratch_dir directory("pin_parquet_evidence");
+  std::vector<std::string> paths;
+  for (auto const* name : {"a.parquet", "b.parquet"}) {
+    auto path = directory.file(name);
+    std::filesystem::copy_file(good_parquet(), path);
+    paths.push_back(path);
+  }
+  REQUIRE(manager.pin_parquet_ranges("footer_evidence", paths, std::nullopt) > 0);
+  for (auto const& path : paths) {
+    auto datasource = manager.create_datasource(path);
+    REQUIRE(datasource);
+    auto stored =
+      std::dynamic_pointer_cast<sirius::op::scan::parquet_metadata>(datasource->metadata());
+    REQUIRE(stored);
+    CHECK(stored->encryption_evidence.complete);
+    CHECK_FALSE(stored->encryption_evidence.columns_encrypted);
+    CHECK_FALSE(stored->original_schema.empty());
+  }
 }
 
 TEST_CASE("a failed re-pin leaves the previous pin intact", "[scan_manager][cache][pin_parquet]")

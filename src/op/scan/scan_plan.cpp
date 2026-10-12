@@ -31,6 +31,7 @@
 #include <cudf/scalar/scalar.hpp>
 
 // standard library
+#include <algorithm>
 #include <unordered_map>
 
 namespace sirius::op::scan {
@@ -104,6 +105,32 @@ bool needs_output_assembly(scan_plan const& plan)
     }
   }
   return false;
+}
+
+std::optional<std::size_t> output_prefix_width(scan_plan const& plan) noexcept
+{
+  std::optional<std::size_t> width;
+  for (auto const& entry : plan.output_layout) {
+    if (entry.source == scan_plan::output_entry::DATA) {
+      width = std::max(width.value_or(0), entry.idx + 1);
+    }
+  }
+  return width;
+}
+
+bool output_is_leading_prefix(scan_plan const& plan) noexcept
+{
+  if (plan.has_partitions() || plan.output_layout.empty() ||
+      plan.output_layout.size() > plan.data_columns.size()) {
+    return false;
+  }
+  for (std::size_t k = 0; k < plan.output_layout.size(); ++k) {
+    if (plan.output_layout[k].source != scan_plan::output_entry::DATA ||
+        plan.output_layout[k].idx != k) {
+      return false;
+    }
+  }
+  return true;
 }
 
 std::vector<cudf::size_type> output_data_positions(scan_plan const& plan)

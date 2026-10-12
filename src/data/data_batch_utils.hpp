@@ -25,9 +25,12 @@
 #include <cuda/stream>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -47,6 +50,39 @@ inline std::atomic<uint64_t> g_next_batch_id{0};
  * @brief Generate a unique data batch ID.
  */
 inline uint64_t get_next_batch_id() { return g_next_batch_id++; }
+
+/**
+ * @brief Row count of a batch representation.
+ *
+ * Reads the count from the concrete representation: the table view of a GPU table, the column
+ * metadata of a host or disk table, or the row count of a compressed representation.
+ *
+ * @param data The representation to inspect.
+ * @return The number of rows, or `std::nullopt` when the representation records none, for example
+ *         a table without columns or a packed host table.
+ */
+[[nodiscard]] std::optional<std::size_t> representation_num_rows(
+  cucascade::idata_representation const& data);
+
+/**
+ * @brief Row count and decoded size of a batch.
+ */
+struct batch_rows_and_bytes {
+  std::optional<std::size_t> rows;  ///< Number of rows, empty when the representation records none
+  std::size_t bytes = 0;            ///< Decoded size in bytes
+};
+
+/**
+ * @brief Row count and decoded size of a batch, in whichever memory tier it is.
+ *
+ * Takes a read lock on @p batch while reading. The lock waits while another thread holds the batch
+ * exclusively, for example while it is spilled to another tier.
+ *
+ * @param batch The batch to inspect.
+ * @return The row count from representation_num_rows() and the size from
+ *         `get_uncompressed_data_size_in_bytes()`. Empty and zero when the batch holds no data.
+ */
+[[nodiscard]] batch_rows_and_bytes get_batch_rows_and_bytes(cucascade::data_batch const& batch);
 
 /**
  * @brief Get a cudf::table_view from a read-only data_batch accessor.
@@ -79,6 +115,33 @@ inline std::size_t peak_materialization_bytes(const cucascade::idata_representat
   auto const logical_bytes = data->get_uncompressed_data_size_in_bytes();
   if (!is_simpatico_compressed_representation(data)) { return logical_bytes; }
   return memory::saturating_add(data->get_size_in_bytes(), logical_bytes);
+}
+
+/**
+ * @brief Row count of @p data read from its metadata, without touching column data.
+ *
+ * Known for GPU tables and for unpacked host and disk tables; nullopt for other representations
+ * (packed host tables, Simpatico-compressed chunks) and for nullptr. A table with no columns has
+ * zero rows.
+ */
+inline std::optional<std::size_t> representation_num_rows(
+  const cucascade::idata_representation* data)
+{
+  if (data == nullptr) { return std::nullopt; }
+  if (auto const* gpu = dynamic_cast<const cucascade::gpu_table_representation*>(data)) {
+    return static_cast<std::size_t>(gpu->get_table_view().num_rows());
+  }
+  auto const rows_of = [](std::vector<cucascade::memory::column_metadata> const& columns) {
+    return columns.empty() ? std::size_t{0} : static_cast<std::size_t>(columns.front().num_rows);
+  };
+  if (auto const* host = dynamic_cast<const cucascade::host_data_representation*>(data)) {
+    if (host->get_host_table() == nullptr) { return std::nullopt; }
+    return rows_of(host->get_host_table()->columns);
+  }
+  if (auto const* disk = dynamic_cast<const cucascade::disk_data_representation*>(data)) {
+    return rows_of(disk->get_disk_table().columns);
+  }
+  return std::nullopt;
 }
 
 /**

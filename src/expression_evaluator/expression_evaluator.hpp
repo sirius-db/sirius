@@ -23,6 +23,8 @@
 #include <expression_evaluator/like_multiliteral.hpp>
 
 // cudf
+#include <variant>
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table_view.hpp>
@@ -43,7 +45,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <variant>
 #include <vector>
 
 namespace sirius {

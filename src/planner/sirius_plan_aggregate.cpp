@@ -38,6 +38,7 @@
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "planner/decimal_sum_input_bounds.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius/exception.hpp"
@@ -676,6 +677,75 @@ static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
   }
 }
 
+/// Plan an aggregate with several grouping sets or GROUPING() functions on top of @p child.
+///
+/// The plan is a grouped aggregate with a projection on top:
+/// - the grouped aggregate outputs the columns keys, set id, grouping functions, aggregates.
+///   See `gpu_aggregate_impl::local_grouping_sets_aggregate()`
+/// - the projection reorders them to DuckDB's output columns keys, aggregates, grouping
+///   functions, and drops the set id
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_grouping_sets_aggregate(
+  duckdb::LogicalAggregate& op,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+  duckdb::TupleDataValidityType group_validity,
+  const std::vector<std::optional<std::uint64_t>>& decimal_sum_bounds)
+{
+  auto const num_groups     = op.groups.size();
+  auto const num_aggregates = op.expressions.size();
+  auto const num_functions  = op.grouping_functions.size();
+  D_ASSERT(op.types.size() == num_groups + num_aggregates + num_functions);
+  auto const aggregates_begin = op.types.begin() + static_cast<std::ptrdiff_t>(num_groups);
+  auto const functions_begin  = aggregates_begin + static_cast<std::ptrdiff_t>(num_aggregates);
+
+  duckdb::vector<duckdb::LogicalType> aggregate_types(op.types.begin(), aggregates_begin);
+  aggregate_types.push_back(duckdb::LogicalType::INTEGER);
+  aggregate_types.insert(aggregate_types.end(), functions_begin, op.types.end());
+  aggregate_types.insert(aggregate_types.end(), aggregates_begin, functions_begin);
+
+  auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
+                                         sirius::op::sirius_physical_grouped_aggregate>(
+    sirius::from_duckdb_vec(aggregate_types),
+    translate_expressions(std::move(op.expressions)),
+    translate_expressions(std::move(op.groups)),
+    std::move(op.grouping_sets),
+    std::move(op.grouping_functions),
+    op.estimated_cardinality,
+    group_validity,
+    op.distinct_validity,
+    decimal_sum_bounds);
+  group_by->children.push_back(std::move(child));
+
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+  auto const select = [&](std::size_t column, std::size_t output) {
+    select_list.push_back(std::make_unique<sirius::ast::node>(sirius::ast::reference{
+      static_cast<uint32_t>(column), sirius::from_duckdb(op.types[output])}));
+  };
+  for (std::size_t i = 0; i < num_groups; ++i) {
+    select(i, i);
+  }
+  for (std::size_t i = 0; i < num_aggregates; ++i) {
+    select(num_groups + 1 + num_functions + i, num_groups + i);
+  }
+  for (std::size_t i = 0; i < num_functions; ++i) {
+    select(num_groups + 1 + i, num_groups + num_aggregates + i);
+  }
+  return push_projection(std::move(group_by),
+                         sirius::from_duckdb_vec(op.types),
+                         std::move(select_list),
+                         op.estimated_cardinality);
+}
+
+/// Whether plan-time statistics may decide decimal SUM widening
+/// (sirius.operator_params.enable_decimal_sum_stats_bound); on without a Sirius context.
+bool decimal_sum_stats_bound_enabled(duckdb::ClientContext& context)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  return !sirius_ctx ||
+         sirius_ctx->get_config().get_operator_params().enable_decimal_sum_stats_bound;
+}
+
 }  // namespace
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
@@ -692,21 +762,19 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     reject_nested_column_operation(*group, "GROUP BY");
   }
 
-  // The GPU aggregates compute a single grouping set and have no GROUPING() support.
-  // See https://github.com/sirius-db/sirius/pull/1928.
-  if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
+  bool const has_grouping_sets = op.grouping_sets.size() > 1 || !op.grouping_functions.empty();
+  if (has_grouping_sets && op.groups.empty()) {
     throw duckdb::NotImplementedException(
-      "ROLLUP, CUBE, GROUPING SETS and GROUPING() are not supported in GPU aggregates");
+      "Grouping sets without GROUP BY keys are not supported in GPU aggregates");
   }
 
-  // The GPU aggregates support DISTINCT only in COUNT, but not with FILTER.
+  // The GPU aggregates do not apply FILTER clauses, and support DISTINCT only in COUNT.
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (!aggregate.IsDistinct()) { continue; }
     if (aggregate.filter) {
-      throw duckdb::NotImplementedException(
-        "DISTINCT aggregates with a FILTER clause not supported in GPU");
+      throw duckdb::NotImplementedException("Aggregates with a FILTER clause not supported in GPU");
     }
+    if (!aggregate.IsDistinct()) { continue; }
     if (sirius::from_duckdb_aggregate_name(aggregate.function.name) !=
         sirius::aggregate_id::count) {
       throw duckdb::NotImplementedException(op.groups.empty()
@@ -723,6 +791,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   }
 
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
+
+  // Resolved before the child is planned: planning moves expressions out of the logical subtree.
+  auto const decimal_sum_bounds = decimal_sum_stats_bound_enabled(context)
+                                    ? resolve_decimal_sum_input_bounds(context, op)
+                                    : std::vector<std::optional<std::uint64_t>>{};
 
   auto plan = create_plan(*op.children[0]);
 
@@ -756,11 +829,16 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
         sirius::from_duckdb_vec(op.types),
         translate_expressions(std::move(op.expressions)),
         op.estimated_cardinality,
-        op.distinct_validity);
+        op.distinct_validity,
+        decimal_sum_bounds);
       group_by->children.push_back(std::move(plan));
       return group_by;
     }
     throw duckdb::NotImplementedException("Non simple aggregation is not supported");
+  }
+
+  if (has_grouping_sets) {
+    return plan_grouping_sets_aggregate(op, std::move(plan), group_validity, decimal_sum_bounds);
   }
 
   // groups! create a GROUP BY aggregator
@@ -778,7 +856,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       std::move(op.grouping_functions),
       op.estimated_cardinality,
       group_validity,
-      op.distinct_validity);
+      op.distinct_validity,
+      decimal_sum_bounds);
     group_by->children.push_back(std::move(plan));
     return group_by;
   }
@@ -793,7 +872,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       std::move(op.grouping_functions),
       op.estimated_cardinality,
       group_validity,
-      op.distinct_validity);
+      op.distinct_validity,
+      decimal_sum_bounds);
     group_by->children.push_back(std::move(plan));
     return group_by;
   }
@@ -807,7 +887,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     std::move(op.grouping_functions),
     op.estimated_cardinality,
     group_validity,
-    op.distinct_validity);
+    op.distinct_validity,
+    decimal_sum_bounds);
   group_by->children.push_back(std::move(plan));
   return group_by;
 }

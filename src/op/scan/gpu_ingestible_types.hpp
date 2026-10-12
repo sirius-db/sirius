@@ -47,6 +47,8 @@ namespace sirius::op::scan {
 class ingestible_table_info {
  public:
   scan_contract_id contract_id = 0;
+  test_injections injections;
+  std::shared_ptr<physical_profile_table> profiles = std::make_shared<physical_profile_table>();
 
   virtual ~ingestible_table_info() = default;
 

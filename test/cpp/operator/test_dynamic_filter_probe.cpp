@@ -29,6 +29,8 @@
  */
 
 #include <cudf/aggregation.hpp>
+#include <variant>
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>

@@ -19,7 +19,7 @@ The run has three steps:
 The run stops after a step that fails. Arguments after -- are Catch2 options
 passed to every process. Every process writes its console output (unittest.log)
 and the Sirius logs to its own subdirectory of
-<build-dir>/extension/sirius/test/cpp/log.
+<build-dir>/test/cpp/log.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-UNITTEST_DIR = Path("extension/sirius/test/cpp")
+UNITTEST_DIR = Path("test/cpp")
 SHARD_CONFIG = REPO_ROOT / "test/cpp/integration/integration-shard.yaml"
 STEPS = ("shards", "multi_gpu", "late_mat")
 STEP_SPECS = {

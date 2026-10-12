@@ -22,6 +22,7 @@
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
+#include <op/scan/table_scan/parquet_physical_profile.hpp>
 #include <sirius_config.hpp>
 
 // duckdb
@@ -43,6 +44,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -72,6 +74,10 @@ namespace sirius::op::scan {
  */
 class parquet_ingestible_table_info : public ingestible_table_info {
  public:
+  duckdb::vector<duckdb::LogicalType> bound_types;      // Full nested bind schema, in P-space.
+  std::optional<iceberg_table_schema> physical_schema;  // Populated by the S3 Iceberg lowering.
+  bound_table_scan physical_contract;
+  leaf_set semantic_columns;
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
@@ -259,6 +265,8 @@ class parquet_file_scan_info : public scan_info {
 
   /// Parsed footer metadata for this file.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::vector<uint8_t> original_schema;
+  std::string arrow_schema;
   /// File path (also the datasource cache key).
   std::string file_path;
   /// Stable position in DuckDB's bound file list.
@@ -365,6 +373,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
 
   [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override;
+
+  [[nodiscard]] std::optional<std::size_t> output_prefix_width() const noexcept override;
 
   [[nodiscard]] bool has_row_filter() const noexcept override
   {

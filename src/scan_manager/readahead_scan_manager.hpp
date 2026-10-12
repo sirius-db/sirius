@@ -42,6 +42,7 @@
 
 namespace sirius::op::scan {
 class scan_info;
+struct physical_check_counters;
 }  // namespace sirius::op::scan
 
 namespace sirius::planner {
@@ -156,14 +157,17 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// between the readahead and the executor.  Zero means the backend opts out,
   /// and @ref start is then a no-op: there is no point running a worker that may
   /// never issue anything.
-  readahead_scan_manager(event::query_event_publisher& publisher, std::size_t budget)
+  readahead_scan_manager(event::query_event_publisher& publisher,
+                         std::size_t budget,
+                         std::shared_ptr<op::scan::physical_check_counters> physical_counters = {})
     : event::query_event_subscriber(publisher,
                                     {event::event_type::task_deployed,
                                      event::event_type::task_queue_empty,
                                      event::event_type::memory_downgrade_for_task,
                                      event::event_type::wait_for_memory_for_task}),
       _budget(budget),
-      _gatekeeper(static_cast<int>(budget))
+      _gatekeeper(static_cast<int>(budget)),
+      _physical_counters(std::move(physical_counters))
   {
   }
   /// Stops and joins both workers -- the prefetch worker and the event subscriber.
@@ -295,6 +299,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   /// This query's readahead outcomes; see @ref readahead_counters.
   readahead_counters _counters;
+  std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
+  uint64_t _query_token = 0;
 
   std::stop_source _stop_source;
   std::jthread _prefetch_worker;

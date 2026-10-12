@@ -53,7 +53,7 @@ Left side = probe (streamed), right side = build (materialized).
 
 Before either is chosen, `materialize_expression_join_keys()` pushes a projection below the join that turns complex equality-key expressions into real columns, rewriting the condition side to a plain reference so `PARTITION` (which hashes by column index) can consume it. It also materializes the *cast* on a null-safe key that will be routed to the mixed join's cuDF AST predicate: a routed key skips the hash-key path's `cudf::cast`, and a cuDF AST can only cast to INT64 / UINT64 / FLOAT64, so e.g. the INTEGER cast DuckDB inserts for a SMALLINT/INTEGER `IS NOT DISTINCT FROM` has to become a column. `are_conditions_supported()` rejects any routed null-safe key still carrying an untranslatable expression, so the join lands on the nested loop join (or CPU) instead of throwing mid-query.
 
-A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, `JOIN ... ON true`) becomes a `NESTED_LOOP_JOIN` without conditions (`src/planner/sirius_plan_cross_product.cpp`). It is refused when its estimated output exceeds the row limit of a cuDF column.
+A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, `JOIN ... ON true`) becomes a `NESTED_LOOP_JOIN` without conditions (`src/planner/sirius_plan_cross_product.cpp`).
 
 ### Aggregate Planning
 
@@ -61,6 +61,7 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 
 - **Ungrouped aggregate** — when no GROUP BY columns exist
 - **Grouped aggregate** — hash-based GROUP BY using cuDF's `groupby()` API
+- **Decimal SUM bounds** — before the child is planned, `resolve_decimal_sum_input_bounds()` (`src/planner/decimal_sum_input_bounds.cpp`) traces each DECIMAL32/DECIMAL64 SUM or AVG input to its base scan with `resolve_scan_column_origin()` (`src/planner/scan_column_origin.cpp`, the tracer the dynamic-filter key-domain estimate also uses) under its value-preserving policy, which accepts bare-reference projections, filters, sorts, limits, DISTINCT, group keys and either side of any join or cross product, then reads the table function's column statistics. The resulting magnitude bound lets the aggregate operators decide widening from the batch row count instead of scanning the batch; unproven inputs keep the per-batch scan. Gated by `sirius.operator_params.enable_decimal_sum_stats_bound`.
 - **AVG decomposition** — AVG is split into SUM + COUNT_VALID (cuDF doesn't support AVG directly)
 - **COUNT(DISTINCT)** — implemented via `COLLECT_SET` aggregation, then counting unique rows
 - **HUGEINT downcast** — HUGEINT types are downcast to BIGINT (cuDF doesn't support int128)

@@ -416,6 +416,23 @@ struct SiriusContext::internal_connection::implementation {
     }
   }
 
+  unique_ptr<SQLStatement> parse(const string& sql)
+  {
+    auto& context = *connection.context;
+    if (!context.transaction.HasActiveTransaction() ||
+        !MetaTransaction::Get(context).IsReadOnly()) {
+      throw InvalidInputException("Sirius internal connection lost its read-only transaction");
+    }
+    Parser parser(context.GetParserOptions());
+    parser.ParseQuery(sql);
+    if (parser.statements.size() != 1 ||
+        (parser.statements[0]->type != StatementType::SELECT_STATEMENT &&
+         parser.statements[0]->type != StatementType::SET_STATEMENT)) {
+      throw InvalidInputException("Sirius internal connection accepts one SELECT or SET statement");
+    }
+    return std::move(parser.statements[0]);
+  }
+
   Connection connection;
   InternalQueryGuard guard;
   bool transaction_open = false;
@@ -433,20 +450,14 @@ SiriusContext::internal_connection::~internal_connection() noexcept = default;
 
 unique_ptr<MaterializedQueryResult> SiriusContext::internal_connection::Query(const string& sql)
 {
-  auto& context = *impl_->connection.context;
-  if (!context.transaction.HasActiveTransaction() || !MetaTransaction::Get(context).IsReadOnly()) {
-    throw InvalidInputException("Sirius internal connection lost its read-only transaction");
-  }
-  // Accept only the metadata queries and session settings used by the two callers. In
-  // particular, no transaction control, prepared EXECUTE or multi-statement escape is exposed.
-  Parser parser(context.GetParserOptions());
-  parser.ParseQuery(sql);
-  if (parser.statements.size() != 1 ||
-      (parser.statements[0]->type != StatementType::SELECT_STATEMENT &&
-       parser.statements[0]->type != StatementType::SET_STATEMENT)) {
-    throw InvalidInputException("Sirius internal connection accepts one SELECT or SET statement");
-  }
-  return impl_->connection.Query(std::move(parser.statements[0]));
+  return impl_->connection.Query(impl_->parse(sql));
+}
+
+unique_ptr<QueryResult> SiriusContext::internal_connection::SendQuery(const string& sql)
+{
+  // Keep the same read-only transaction and statement restrictions while the
+  // caller drains chunks under this connection's InternalQueryGuard.
+  return impl_->connection.SendQuery(impl_->parse(sql));
 }
 
 SiriusContext::internal_connection SiriusContext::open_internal_connection(ClientContext& outer)
@@ -563,6 +574,11 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
   // holds a raw data_repository* borrowed from this query's manager.
   {
     auto leaked = data_repository_registry_.erase(query_id);
+    if (auto completion = window_completion(query_id); completion && completion->has_error()) {
+      for (auto const& info : leaked) {
+        discarded_speculative_work_.fetch_add(info.count, std::memory_order_relaxed);
+      }
+    }
     try {
       for (auto const& info : leaked) {
         SIRIUS_LOG_WARN(
@@ -681,6 +697,11 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
                                                           std::string_view window_label)
   : ctx_(ctx), window_id_(sirius::make_query_id(0)), connection_id_(0), query_ordinal_(0)
 {
+  completion_ = std::make_shared<sirius::pipeline::completion_handler>(ctx.window_task_counter());
+  completion_->injections = sirius::transparent::latch_replay_injections(context);
+  if (completion_->injections) ctx.record_certification_budget(false, false, 10);
+  completion_->non_rollbackable_state =
+    completion_->injections && completion_->injections->non_rollbackable_state;
   Value inject;
   inject_cleanup_failure_ =
     context.TryGetCurrentSetting("sirius_test_inject_checkpoint_cleanup_failure", inject) &&
@@ -712,6 +733,10 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   ctx_.acquire_query_lifecycle_slot(&context);
   log_window_event("begin", "-");
   try {
+    {
+      std::lock_guard lock(ctx_.window_completions_mutex_);
+      ctx_.window_completions_.emplace(sirius::value_of(window_id_), completion_);
+    }
     ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
     lease_release_.state = lease_release_state::cleanup_failed;
   } catch (std::exception& e) {
@@ -720,6 +745,10 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     // CPU-fall-back on): latch unavailability, attempt the backstop cleanup,
     // release, and throw the distinguishable begin-failure error. Entry-point
     // catch blocks rethrow it as-is instead of falling back.
+    {
+      std::lock_guard lock(ctx_.window_completions_mutex_);
+      ctx_.window_completions_.erase(sirius::value_of(window_id_));
+    }
     state_ = scope_state::FAILED;
     ctx_.mark_runtime_unavailable();
     lease_release_.state = lease_release_state::begin_failed;
@@ -730,6 +759,10 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
       string("Sirius execution-window initialization failed (runtime marked unavailable): ") +
       e.what());
   } catch (...) {
+    {
+      std::lock_guard lock(ctx_.window_completions_mutex_);
+      ctx_.window_completions_.erase(sirius::value_of(window_id_));
+    }
     state_ = scope_state::FAILED;
     ctx_.mark_runtime_unavailable();
     lease_release_.state = lease_release_state::begin_failed;
@@ -777,15 +810,16 @@ void SiriusContext::StandaloneQueryScope::finish()
 
 SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
 {
-  if (state_ != scope_state::ACTIVE) { return; }
-  // Unwind path: finish() never ran (an exception escaped the window body).
-  // One backstop cleanup attempt; on failure the runtime is latched
-  // unavailable. The slot is released exactly once either way; logging is
-  // noexcept-wrapped so the destructor can never terminate.
-  ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
-  log_window_event("end", "unwind");
-  ctx_.release_query_lifecycle_slot();
-  state_ = scope_state::FAILED;
+  if (state_ == scope_state::ACTIVE) {
+    // Keep the completion registered through backstop cleanup so discarded batches
+    // are attributed just as they are on an explicit finish().
+    ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
+    log_window_event("end", "unwind");
+    ctx_.release_query_lifecycle_slot();
+    state_ = scope_state::FAILED;
+  }
+  std::lock_guard lock(ctx_.window_completions_mutex_);
+  ctx_.window_completions_.erase(sirius::value_of(window_id_));
 }
 
 void SiriusContext::restore_cudf_pinned_memory_resource() noexcept
@@ -1097,7 +1131,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   task_scheduler_->set_query_event_publisher(*query_event_publisher_);
 
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), *memory_manager_, topology_index_);
+    config_.get_scan_manager_config(), *memory_manager_, topology_index_, physical_counters_);
   scan_manager_->set_query_event_publisher(*query_event_publisher_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
@@ -1330,12 +1364,13 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   // Pushed down to the subsystems that need it; neither retains the query itself (they extract
   // pipelines and raw operator pointers, both owned by the caller's plan). Returned rather than
   // stored so ownership sits with the sirius_engine, whose plan the query indexes.
-  task_creator_->prepare_for_query(*query, std::move(handler));
+  task_creator_->prepare_for_query(*query, handler);
   // Reads this query's admitted subset back off task_creator, so this must run after
   // initialize_internal has set it — otherwise scan_manager gets an empty (unnarrowed) set.
   scan_manager_->prepare_for_query(*query,
                                    config_.get_operator_params().enable_pinned_zone_map_pruning,
-                                   task_creator_->get_active_gpu_ids(query_id));
+                                   task_creator_->get_active_gpu_ids(query_id),
+                                   handler);
   return query;
 }
 
@@ -1366,7 +1401,7 @@ shared_ptr<SiriusConnectionState> get_sirius_connection_state(ClientContext& con
 SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execution_stats()
   const noexcept
 {
-  return transparent_execution_stats{
+  auto snapshot = transparent_execution_stats{
     .successful_rebinds = transparent_rebind_success_count_.load(std::memory_order_relaxed),
     .fallbacks          = transparent_fallback_count_.load(std::memory_order_relaxed),
     .executions         = transparent_execution_count_.load(std::memory_order_relaxed),
@@ -1379,11 +1414,138 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .read_view_mismatches = transparent_read_view_mismatch_count_.load(std::memory_order_relaxed),
     .certificate_mismatches =
       transparent_certificate_mismatch_count_.load(std::memory_order_relaxed),
+    .certificate_incompletes =
+      transparent_certificate_incomplete_count_.load(std::memory_order_relaxed),
     .execution_rebuilds = transparent_execution_rebuild_count_.load(std::memory_order_relaxed),
     .checkpoint_revalidation_failures =
       checkpoint_revalidation_failure_count_.load(std::memory_order_relaxed),
     .lease_held_at_replay = lease_held_at_replay_count_.load(std::memory_order_relaxed),
   };
+  for (std::size_t i = 0; i < snapshot.semantic_declines.size(); ++i) {
+    snapshot.semantic_declines[i] = semantic_decline_counts_[i].load(std::memory_order_relaxed);
+  }
+  std::lock_guard<std::mutex> lock(certification_stats_mutex_);
+  snapshot.semantic_verdicts               = certification_stats_.semantic_verdicts;
+  snapshot.certification_added_time_us_sum = certification_stats_.certification_added_time_us_sum;
+  snapshot.certification_added_time_us_max = certification_stats_.certification_added_time_us_max;
+  snapshot.certification_added_bytes       = certification_stats_.certification_added_bytes;
+  snapshot.inherited_capture_bytes         = certification_stats_.inherited_capture_bytes;
+  snapshot.certification_borrowed_files    = certification_stats_.certification_borrowed_files;
+  snapshot.delete_preparation_time_us      = certification_stats_.delete_preparation_time_us;
+  snapshot.budget_exceeded                 = certification_stats_.budget_exceeded;
+  snapshot.setting_lookups_per_attempt     = certification_stats_.setting_lookups_per_attempt;
+  snapshot.scan_lowerings                  = certification_stats_.scan_lowerings;
+  for (size_t i = 0; i < snapshot.late_failures.size(); ++i) {
+    snapshot.late_failures[i] = late_failures_[i].load(std::memory_order_relaxed);
+    snapshot.late_replays[i]  = late_replays_[i].load(std::memory_order_relaxed);
+  }
+  for (size_t i = 0; i < snapshot.late_failure_no_replay.size(); ++i) {
+    snapshot.late_failure_no_replay[i] = late_failure_no_replay_[i].load(std::memory_order_relaxed);
+  }
+  snapshot.late_replay_not_read_only  = late_replay_not_read_only_.load(std::memory_order_relaxed);
+  snapshot.discarded_speculative_work = discarded_speculative_work_.load(std::memory_order_relaxed);
+  snapshot.window_tasks_started       = window_tasks_started_->load(std::memory_order_relaxed);
+  {
+    std::lock_guard lock(physical_counters_->units_mutex);
+    snapshot.parquet_reader_calls  = physical_counters_->parquet_reader_calls;
+    snapshot.native_decoder_calls  = physical_counters_->native_decoder_calls;
+    snapshot.publications_by_query = physical_counters_->publications_by_query;
+    for (auto const& [query, publication] : snapshot.publications_by_query) {
+      for (auto const& [file, count] : publication.readahead_registrations)
+        snapshot.readahead_registrations[file] += count;
+      snapshot.prefetcher_conversions += publication.prefetcher_conversions;
+    }
+  }
+  snapshot.iceberg_manifest_walks =
+    physical_counters_->iceberg_manifest_walks.load(std::memory_order_relaxed);
+  snapshot.iceberg_dv_manifest_reads =
+    physical_counters_->iceberg_dv_manifest_reads.load(std::memory_order_relaxed);
+  snapshot.iceberg_delete_payload_loads =
+    physical_counters_->iceberg_delete_payload_loads.load(std::memory_order_relaxed);
+  snapshot.iceberg_inventory_bytes_peak =
+    physical_counters_->iceberg_inventory_bytes_peak.load(std::memory_order_relaxed);
+  snapshot.split_physical_checks = physical_counters_->checks.load(std::memory_order_relaxed);
+  snapshot.split_flushed_for_schema =
+    physical_counters_->split_flushed_for_schema.load(std::memory_order_relaxed);
+  snapshot.parquet_type_mismatch_observed =
+    physical_counters_->type_mismatches.load(std::memory_order_relaxed);
+  snapshot.parquet_type_refusals =
+    physical_counters_->type_refusals.load(std::memory_order_relaxed);
+  for (std::size_t i = 0; i < snapshot.split_physical_rejections.size(); ++i)
+    snapshot.split_physical_rejections[i] =
+      physical_counters_->rejections[i].load(std::memory_order_relaxed);
+  return snapshot;
+}
+
+std::shared_ptr<sirius::pipeline::completion_handler> SiriusContext::window_completion(
+  sirius::query_id_t id) const
+{
+  std::lock_guard lock(window_completions_mutex_);
+  auto found = window_completions_.find(sirius::value_of(id));
+  return found == window_completions_.end() ? nullptr : found->second;
+}
+
+void SiriusContext::record_late_failure(sirius::transparent::late_failure_cause cause) noexcept
+{
+  late_failures_[static_cast<size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+}
+void SiriusContext::record_late_replay(sirius::transparent::late_failure_cause cause,
+                                       bool read_only) noexcept
+{
+  late_replays_[static_cast<size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+  if (!read_only) late_replay_not_read_only_.fetch_add(1, std::memory_order_relaxed);
+}
+void SiriusContext::record_late_refusal(
+  sirius::transparent::late_failure_condition condition) noexcept
+{
+  late_failure_no_replay_[static_cast<size_t>(condition)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_scan_certification(sirius::op::scan::eligibility_certificate const& cert)
+{
+  using sirius::op::scan::eligibility_verdict;
+  if (cert.verdict == eligibility_verdict::not_evaluated) return;
+  std::lock_guard<std::mutex> lock(certification_stats_mutex_);
+  auto& stats = certification_stats_;
+  ++stats.semantic_verdicts.at(static_cast<std::size_t>(cert.verdict) - 1);
+  stats.certification_added_time_us_sum += cert.cost.added_time_us;
+  stats.certification_added_time_us_max =
+    std::max(stats.certification_added_time_us_max, cert.cost.added_time_us);
+  stats.certification_added_bytes += cert.cost.added_bytes;
+  stats.inherited_capture_bytes += cert.cost.inherited_capture_bytes;
+  stats.certification_borrowed_files += cert.cost.borrowed_files;
+  stats.delete_preparation_time_us += cert.cost.delete_preparation_time_us;
+}
+
+void SiriusContext::record_certification_budget(bool time, bool bytes, uint64_t lookups)
+{
+  std::lock_guard<std::mutex> lock(certification_stats_mutex_);
+  certification_stats_.budget_exceeded[0] += time;
+  certification_stats_.budget_exceeded[1] += bytes;
+  certification_stats_.setting_lookups_per_attempt += lookups;
+  if (time || bytes)
+    SIRIUS_LOG_INFO("Scan certification budget exceeded: time={} bytes={}", time, bytes);
+}
+
+void SiriusContext::record_delete_preparation(uint64_t elapsed_us)
+{
+  std::lock_guard<std::mutex> lock(certification_stats_mutex_);
+  certification_stats_.delete_preparation_time_us += elapsed_us;
+}
+
+void SiriusContext::record_scan_lowering(uint64_t contract)
+{
+  auto const* enabled = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS");
+  if (!enabled || std::string_view(enabled) != "1") return;
+  std::lock_guard<std::mutex> lock(certification_stats_mutex_);
+  ++certification_stats_.scan_lowerings[contract];
+}
+
+void SiriusContext::record_semantic_decline(sirius::op::scan::verdict_reason reason) noexcept
+{
+  auto const index = static_cast<std::size_t>(reason);
+  if (index == 0 || index >= semantic_decline_counts_.size()) return;
+  semantic_decline_counts_[index].fetch_add(1, std::memory_order_relaxed);
 }
 
 void SiriusContext::record_transparent_decline(sirius::transparent::decline_reason reason) noexcept
@@ -1421,6 +1583,11 @@ void SiriusContext::record_transparent_execution() noexcept
 void SiriusContext::record_transparent_runtime_fallback() noexcept
 {
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_transparent_certificate_incomplete() noexcept
+{
+  transparent_certificate_incomplete_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void SiriusContext::record_transparent_certificate_mismatch() noexcept
@@ -1721,7 +1888,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       logical_original_views ? &*logical_original_views : nullptr,
       physical_original_views,
       *planner->read_views);
-    planner->read_views->publish_supported(
+    planner->read_views->publish_correspondence(
       sirius::op::scan::certificate_evidence_scope::binding_correspondence,
       comparison.correspondence,
       physical_original_views);
@@ -1752,7 +1919,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       source_policy,
       0,
       std::move(validated_sirius_plan),
-      validated_plan_pin_epoch);
+      validated_plan_pin_epoch,
+      context.transaction.ActiveTransaction().global_transaction_id);
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.

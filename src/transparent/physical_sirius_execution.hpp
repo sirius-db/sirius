@@ -58,7 +58,8 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
     plan_source_policy source_policy,
     duckdb::idx_t estimated_cardinality,
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan = nullptr,
-    std::uint64_t validated_plan_pin_epoch                                         = 0);
+    std::uint64_t validated_plan_pin_epoch                                         = 0,
+    std::optional<uint64_t> captured_transaction_id                                = std::nullopt);
 
   // Source operator interface
   bool IsSource() const override { return true; }
@@ -113,6 +114,7 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
 
   /// Derived from the retained CPU plan before any SQL replan.
   plan_source_policy source_policy_;
+  std::optional<uint64_t> captured_transaction_id_;
 
   /// The plan OnFinalizePrepare built while validating GPU support. The first GetData consumes
   /// it rather than rebuilding an identical one. Mutable: consumed from a `const` GetData.

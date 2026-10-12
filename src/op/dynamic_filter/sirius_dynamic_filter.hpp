@@ -19,6 +19,8 @@
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
+#include <variant>
+
 #include <cudf/ast/ast_operator.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>

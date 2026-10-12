@@ -16,9 +16,20 @@ Scan contracts validate GPU scan inputs, split ownership, checkpoint protection,
 
 1. Verify sources and capture the original logical bindings before copying the plan.
 2. Compare GPU inputs with the original logical and physical bindings.
-3. Acquire native checkpoint leases before preparing storage metadata.
-4. Validate fresh splits before materialization.
-5. Drain scan work and release leases before any CPU fallback.
+3. During physical tree construction, acquire native checkpoint leases before preparing storage metadata and retain any early scan refusal.
+4. Once the tree completes, record one verdict for each registered scan in the planning attempt before lowering any scan.
+5. Produce physical evidence for each input unit as its metadata becomes available, then validate it before GPU consumption.
+6. Drain scan work and release leases before any CPU replay.
+
+## Verdict at planning
+
+For a completed physical tree, each registered scan receives `supported`, `unsupported`, or `incomplete` at finalize and at an execution-time rebuild. A supported verdict declares the physical checks that must still pass. `unsupported` records a known incompatibility and its reason; `incomplete` records missing required evidence or an unavailable interface. An unread future Parquet footer is neither a refusal nor incomplete evidence. An established unsupported verdict takes precedence over a later incomplete result.
+
+The planner first records all registered scans in the completed tree, then decides whether to lower them. A refusal starts no dependent GPU work. An Iceberg or native refusal found while building the tree is retained so its original message wins if later planning also fails.
+
+The certification budget measures only added in-memory `certify` work. Its 50 ms and 8 MiB thresholds count exceedances in production; only a latched test option can turn an exceedance into a refusal. The scan record reports `added`, `inherited_capture`, `borrowed` file count, and Iceberg `delete_preparation` separately. Provider-retained bytes are unknown at this pin.
+
+A source rejected before its scan node exists still gets a classified lookup verdict. The reason distinguishes an unknown function, bind data or catalog mismatch, missing trusted reference, and callback mismatch. The existing planning error is returned unchanged.
 
 ## Source verification
 
@@ -52,7 +63,15 @@ Missing correspondence or changed inputs prevent GPU admission. Rebuilds and rep
 
 Each fresh split must belong to its consuming scan, even when another scan reads the same files. Parquet checks ownership before coalescing and validates each slice's certificate and footer before materialization.
 
-Cached batches use pin identity and visibility checks. Streaming inputs do not produce storage splits.
+Physical checks run per input unit. A Parquet file is checked from its retained footer for codec, encryption, and type compatibility before cuDF reads it. The codec table follows the pinned libcudf 26.08.01 support set: UNCOMPRESSED, SNAPPY, GZIP, ZSTD, LZ4_RAW, and BROTLI; level encodings and an empty encoding list do not cause a refusal. Iceberg checks its file schema in the metadata worker before the profile check; its former planning-time full-table footer sweep is gone. A pruned row group does not require a profile check. Type drift is allowed only for an export-only leaf when the actual export path performs the conversion; other semantic uses are refused before decode.
+
+Each Parquet footer producer stores the original schema record and encryption evidence before reader normalization. Coalescing ends a run when the next file's original schema differs, including its `ARROW:schema` entry. This keeps an admitted export-only type drift out of a mixed-schema multi-file reader.
+
+Native ranges carry their actual storage version and data and validity codec evidence. An insert delta combines the checks required by its persistent and transient segments and carries a checkpoint-key witness belonging to this query and database. A fresh or delta split with missing checks, a mismatched identity, or a non-empty payload without certificates is refused before materialization. An empty payload may have an empty certificate list.
+
+Cached batches use pin identity, layout, structure, and applicable iteration and visibility checks. The query token and all applicable results are validated before publication to the split connector, so the prefetcher cannot consume an unadmitted batch. Streaming inputs do not produce storage splits.
+
+In tests, the scan statistics retain each query's readahead registrations by file and its successful memory-prefetch conversions after the query state is drained. These observations do not change scan admission or publication.
 
 ## Native checkpoint lease
 
@@ -66,6 +85,8 @@ Failed cleanup retains checkpoint keys until the Sirius runtime is destroyed and
 
 CPU replay runs a failed GPU query on DuckDB. It requires `enable_duckdb_fallback`, source permission, and successful cleanup of any entered execution window. Cancellation is not replayable.
 
+A late GPU, physical-input, certificate, or exhausted-retry failure stops and drains the execution window before this decision. Transparent execution replays the retained CPU plan on its captured transaction only if that transaction remains valid, no result was emitted, and cleanup and query state permit replay. A non-read-only statement increments a counter but does not alone refuse replay. Explicit `gpu_execution()` re-executes on a fresh transaction. Failure causes and replay outcomes are counted separately; the returned terminal error determines the recorded cause.
+
 | Source or discovery result | CPU replay |
 |---|---|
 | Local files and DuckDB-native tables | Permitted. |
@@ -75,6 +96,8 @@ CPU replay runs a failed GPU query on DuckDB. It requires `enable_duckdb_fallbac
 | Other unclassified sources | Entry-point default. |
 
 The policy checks bound sources, including those hidden behind views. Transparent execution retains the original CPU plan. Explicit `gpu_execution()` checks its bind-time policy and validates the newly bound CPU plan before replay, so a replaced view cannot inherit stale permission. SQL-text and filesystem checks also block S3 replay.
+
+On the explicit path, the rebound validator returns a policy refusal separately from the CPU result. Such a refusal counts as no replay; an admitted CPU execution counts as replay even if it returns an ordinary error or no rows.
 
 Iceberg metadata queries use a separate read-only connection with recursive GPU execution disabled and complete planning before native leases are acquired.
 

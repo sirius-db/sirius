@@ -113,7 +113,7 @@ for ((i = 1; i <= PROBE_TRIES; i++)); do
   if SIRIUS_CONFIG_FILE="$PROBE_CFG" python3 - <<'PYEOF' >/dev/null 2>&1
 import duckdb
 con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-con.execute("LOAD 'build/release/extension/sirius/sirius.duckdb_extension'")
+con.execute("LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension'")
 con.close()
 PYEOF
   then

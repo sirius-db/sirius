@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <variant>
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/search.hpp>

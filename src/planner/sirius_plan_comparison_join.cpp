@@ -32,7 +32,6 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
-#include "expression/ast/to_duckdb.hpp"
 #include "expression/join_condition.hpp"
 #include "expression_evaluator/ast_supported_types.hpp"
 #include "helper/type_conversions.hpp"
@@ -298,124 +297,6 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
   }
 }
 
-/// Mirror the hash join's rule for routing mixed null-safe keys into the AST predicate.
-static bool routes_null_safe_keys_to_predicate(const duckdb::LogicalComparisonJoin& op)
-{
-  if (op.join_type == duckdb::JoinType::MARK) { return false; }
-  bool has_plain_equal = false;
-  bool has_null_safe   = false;
-  for (auto const& cond : op.conditions) {
-    if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL) {
-      has_plain_equal = true;
-    } else if (cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      has_null_safe = true;
-    }
-  }
-  return has_plain_equal && has_null_safe;
-}
-
-/// References and hash-key casts need no materialization. Routed predicate casts are trivial
-/// only when cuDF AST supports their target type.
-static bool is_trivial_key_side(const duckdb::Expression& expr, bool evaluated_as_ast_predicate)
-{
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) { return true; }
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-    if (expr.Cast<duckdb::BoundCastExpression>().child->GetExpressionClass() !=
-        duckdb::ExpressionClass::BOUND_REF) {
-      return false;
-    }
-    if (!evaluated_as_ast_predicate) { return true; }
-    return std::find(sirius::supported_ast_cast_types.begin(),
-                     sirius::supported_ast_cast_types.end(),
-                     expr.return_type.id()) != sirius::supported_ast_cast_types.end();
-  }
-  return false;
-}
-
-/// Materialize complex equality-key expressions into projected columns, then rewrite each
-/// condition to reference the appended column. This lets PARTITION and hash join consume a
-/// column index. Routed null-safe casts unsupported by cuDF AST use the same path, and so do the
-/// sides of inequality conditions: the mixed join evaluates those inline as a cuDF AST predicate,
-/// which can neither cast to nor compute with DECIMAL (e.g. TPC-H Q17's
-/// `l_quantity < 0.2 * avg(l_quantity)` when the planner hands the comparison over as a join
-/// condition), so anything beyond a reference or an AST-supported cast is computed as a column.
-static void materialize_expression_join_keys(
-  duckdb::LogicalComparisonJoin& op,
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& left,
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& right)
-{
-  const bool routes_null_safe = routes_null_safe_keys_to_predicate(op);
-
-  auto materialize_side = [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator>& child,
-                              duckdb::vector<duckdb::idx_t>& projection_map,
-                              bool is_left) {
-    const std::size_t old_width = child->types.size();
-
-    // Gather the complex, translatable sides on this child across all conditions.
-    std::vector<std::size_t> cond_indices;
-    duckdb::vector<std::unique_ptr<sirius::ast::node>> key_exprs;
-    duckdb::vector<sirius::logical_type> key_types;
-    for (std::size_t i = 0; i < op.conditions.size(); i++) {
-      auto& cond             = op.conditions[i];
-      const bool is_equality = cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-                               cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
-      auto& side_expr = is_left ? cond.left : cond.right;
-      // Equality keys become hash-table columns; inequality sides (and routed null-safe keys)
-      // are evaluated inline by the cuDF AST predicate, which only takes what it can cast.
-      const bool as_ast_predicate =
-        !is_equality ||
-        (routes_null_safe && cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
-      if (is_trivial_key_side(*side_expr, as_ast_predicate)) { continue; }
-      auto node = sirius::ast::from_duckdb(*side_expr);
-      if (!node) { continue; }  // untranslatable: leave for the existing downstream throw
-      cond_indices.push_back(i);
-      key_exprs.push_back(std::move(node));
-      key_types.push_back(sirius::from_duckdb(side_expr->return_type));
-    }
-
-    if (cond_indices.empty()) { return; }
-
-    // Build the projection: identity passthrough of all original columns + the key expressions.
-    duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
-    duckdb::vector<sirius::logical_type> out_types;
-    select_list.reserve(old_width + key_exprs.size());
-    out_types.reserve(old_width + key_exprs.size());
-    for (std::size_t c = 0; c < old_width; c++) {
-      select_list.push_back(std::make_unique<sirius::ast::node>(
-        sirius::ast::reference{static_cast<uint32_t>(c), child->types[c]}));
-      out_types.push_back(child->types[c]);
-    }
-    for (std::size_t k = 0; k < key_exprs.size(); k++) {
-      select_list.push_back(std::move(key_exprs[k]));
-      out_types.push_back(key_types[k]);
-    }
-
-    const std::size_t cardinality = child->estimated_cardinality;
-    child =
-      push_projection(std::move(child), std::move(out_types), std::move(select_list), cardinality);
-
-    // Rewrite each materialized condition side to reference its appended column.
-    for (std::size_t k = 0; k < cond_indices.size(); k++) {
-      const std::size_t new_index = old_width + k;
-      auto& side_expr =
-        is_left ? op.conditions[cond_indices[k]].left : op.conditions[cond_indices[k]].right;
-      side_expr =
-        duckdb::make_uniq<duckdb::BoundReferenceExpression>(side_expr->return_type, new_index);
-    }
-
-    // Convert "all columns" into the original range so synthetic keys do not leak.
-    if (projection_map.empty()) {
-      projection_map.reserve(old_width);
-      for (std::size_t c = 0; c < old_width; c++) {
-        projection_map.push_back(static_cast<duckdb::idx_t>(c));
-      }
-    }
-  };
-
-  materialize_side(left, op.left_projection_map, /*is_left=*/true);
-  materialize_side(right, op.right_projection_map, /*is_left=*/false);
-}
-
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJoin& op)
 {
@@ -481,9 +362,6 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // Preserve key shape before materialization makes computed keys look like direct references.
   auto condition_key_shapes = classify_join_key_shapes(op.conditions);
 
-  // Materialize computed equality keys before downstream admission and join planning.
-  materialize_expression_join_keys(op, left, right);
-
   std::size_t has_range              = 0;
   [[maybe_unused]] bool has_equality = op.HasEquality(has_range);
   bool can_merge                     = has_range > 0;
@@ -518,6 +396,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // Wrap once — subsequent checks and ctors consume from the wrapped vector.
   duckdb::vector<sirius::join_condition> conditions =
     sirius::wrap_join_conditions(std::move(op.conditions));
+  sirius::op::sirius_physical_hash_join::materialize_expression_join_keys(
+    conditions, left, right, op.left_projection_map, op.right_projection_map);
 
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
@@ -737,12 +617,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       bool keys_extractable = true;
       for (const auto& c : hj.conditions) {
         if (c.comparison != sirius::comparison_type::equal) { continue; }
-        auto right_expr = sirius::ast::to_duckdb(*c.right);
-        if (right_expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+        if (!c.right->holds<sirius::ast::reference>()) {
           keys_extractable = false;
           break;
         }
-        build_key_cols.insert(right_expr->Cast<duckdb::BoundReferenceExpression>().index);
+        build_key_cols.insert(c.right->get<sirius::ast::reference>().column_index);
       }
       if (keys_extractable && !build_key_cols.empty()) {
         // build_side_unique_cols was computed before create_plan (which moves logical node data).

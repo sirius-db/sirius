@@ -593,32 +593,45 @@ echo "=== Collecting run info and filesystem benchmark ==="
     echo ""
 
     echo "--- Build ---"
-    DUCKDB_BIN="$PROJECT_DIR/build/release/duckdb"
+    DUCKDB_BIN="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
     if [ -f "$DUCKDB_BIN" ]; then
         echo "duckdb binary: $DUCKDB_BIN"
         echo "duckdb mtime:  $(stat -c %y "$DUCKDB_BIN" 2>/dev/null || stat -f '%Sm' "$DUCKDB_BIN" 2>/dev/null)"
-        # Compare binary to the most recently modified source file (src/ and cucascade/)
+    else
+        echo "duckdb binary: not found ($DUCKDB_BIN)"
+    fi
+    SIRIUS_EXTENSION="${SIRIUS_EXTENSION_PATH:-$PROJECT_DIR/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension}"
+    echo "sirius extension: $SIRIUS_EXTENSION"
+    # Shared builds execute the installed library; static builds execute the extension.
+    SIRIUS_LIBRARY=$(ldd "$SIRIUS_EXTENSION" 2>/dev/null | awk '$1 ~ /^libsirius\.so/ && $2 == "=>" {print $3; exit}')
+    SIRIUS_ARTIFACT="${SIRIUS_LIBRARY:-$SIRIUS_EXTENSION}"
+    if [ "$SIRIUS_LIBRARY" = "not" ]; then
+        echo "sirius engine: shared library could not be resolved"
+    elif [ -f "$SIRIUS_ARTIFACT" ]; then
+        echo "sirius engine: $SIRIUS_ARTIFACT"
+        echo "sirius mtime: $(stat -L -c %y "$SIRIUS_ARTIFACT" 2>/dev/null || stat -L -f '%Sm' "$SIRIUS_ARTIFACT" 2>/dev/null)"
+        # Compare the loaded engine to its newest source file.
         SRC_REF=""
-        for dir in "$PROJECT_DIR/src" "$PROJECT_DIR/cucascade"; do
+        for dir in "$PROJECT_DIR/src" "$PROJECT_DIR/include" "$PROJECT_DIR/cucascade"; do
             [ ! -d "$dir" ] && continue
             while IFS= read -r -d '' f; do
                 [ -f "$f" ] || continue
                 if [ -z "$SRC_REF" ] || [ "$f" -nt "$SRC_REF" ]; then
                     SRC_REF="$f"
                 fi
-            done < <(find "$dir" -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.c' -o -name '*.h' \) -print0 2>/dev/null)
+            done < <(find "$dir" -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.c' -o -name '*.h' -o -name '*.cu' -o -name '*.cuh' \) -print0 2>/dev/null)
         done
         if [ -n "$SRC_REF" ]; then
             echo "newest_src: $SRC_REF"
             echo "newest_src_mtime: $(stat -c %y "$SRC_REF" 2>/dev/null || stat -f '%Sm' "$SRC_REF" 2>/dev/null)"
-            if [ "$DUCKDB_BIN" -nt "$SRC_REF" ]; then
-                echo "build: binary newer than newest source (likely compiled after last source change)"
+            if [ "$SIRIUS_ARTIFACT" -nt "$SRC_REF" ]; then
+                echo "build: Sirius engine newer than newest source (likely compiled after last source change)"
             else
-                echo "build: binary older than newest source (source may have changed since build)"
+                echo "build: Sirius engine older than newest source (source may have changed since build)"
             fi
         fi
     else
-        echo "duckdb binary: not found ($DUCKDB_BIN)"
+        echo "sirius engine: not found ($SIRIUS_ARTIFACT)"
     fi
     echo ""
 

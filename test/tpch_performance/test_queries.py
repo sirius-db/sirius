@@ -141,5 +141,55 @@ class TestScaleAwareQueries(unittest.TestCase):
         self.assertIn("* 0.0000001000", worker_args.query_texts["q11"])
 
 
+class _RecordingConnection:
+    def __init__(self):
+        self.statements = []
+
+    def execute(self, sql):
+        self.statements.append(sql.strip())
+        return self
+
+    def fetchall(self):
+        return []
+
+
+class TestOpenConnection(unittest.TestCase):
+    def test_gpu_connection_applies_pin_compression_and_pre_sql_after_load(self):
+        con = _RecordingConnection()
+        pre_sql = "SET expression_evaluator_strategy = 'ast_jit'; SET threads = 4"
+        with (
+            patch.object(performance_test.duckdb, "connect", return_value=con),
+            patch.object(performance_test, "PIN_COMPRESSION_PLAN_DIR", "/plans"),
+            patch.dict(os.environ, {"SIRIUS_PRE_SQL": pre_sql}),
+        ):
+            performance_test.open_connection(
+                "unused.duckdb", gpu_execution=True, data_source="duckdb"
+            )
+
+        load = next(i for i, s in enumerate(con.statements) if s.startswith("LOAD "))
+        self.assertEqual(
+            con.statements[load + 1 :],
+            [
+                "SET pin_table_compression = true;",
+                "SET pin_table_input_compression_plan_dir = '/plans';",
+                "SET expression_evaluator_strategy = 'ast_jit'",
+                "SET threads = 4",
+            ],
+        )
+
+    def test_cpu_connection_runs_no_sirius_setup(self):
+        con = _RecordingConnection()
+        with (
+            patch.object(performance_test.duckdb, "connect", return_value=con),
+            patch.object(performance_test, "PIN_COMPRESSION_PLAN_DIR", "/plans"),
+            patch.dict(os.environ, {"SIRIUS_PRE_SQL": "SET threads = 4"}),
+        ):
+            performance_test.open_connection(
+                "unused.duckdb", gpu_execution=False, data_source="duckdb"
+            )
+
+        self.assertEqual(con.statements, [])
+
+
 if __name__ == "__main__":
     unittest.main()

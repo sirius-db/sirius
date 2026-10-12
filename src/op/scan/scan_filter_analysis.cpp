@@ -114,8 +114,8 @@ bool collect_equality_values(duckdb::TableFilter const& filter, std::vector<std:
 
 /// Wide intermediate for bound arithmetic: rescaling a decimal constant and the
 /// ±1 of strict inequalities can step just past the int64 edge, so bounds are
-/// intersected as __int128 and clamped once at the end.
-using int128 = __int128;
+/// intersected as __int128_t and clamped once at the end.
+using int128 = __int128_t;
 
 /// 10^e as int128 (e ≤ 38 fits; callers never exceed decimal precision bounds).
 int128 pow10_128(int e)
@@ -563,7 +563,8 @@ scan_filter_analysis analyze_scan_filters(
 }
 
 sirius::pushdown_request build_pushdown_request(scan_filter_analysis const& analysis,
-                                                std::span<const std::size_t> primary_index_by_slot)
+                                                std::span<const std::size_t> primary_index_by_slot,
+                                                std::optional<std::size_t> output_prefix_width)
 {
   sirius::pushdown_request request;
   if (analysis.equality_sets.empty() && analysis.ranges.empty()) { return request; }
@@ -591,6 +592,10 @@ sirius::pushdown_request build_pushdown_request(scan_filter_analysis const& anal
       return std::find(primary_index_by_slot.begin(), primary_index_by_slot.end(), entry.first) !=
              primary_index_by_slot.end();
     });
+  if (output_prefix_width && *output_prefix_width >= 1 &&
+      *output_prefix_width < primary_index_by_slot.size()) {
+    request.output_prefix_width = output_prefix_width;
+  }
   return request;
 }
 

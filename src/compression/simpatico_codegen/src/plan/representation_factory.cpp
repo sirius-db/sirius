@@ -579,6 +579,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   if (!id) return unsupported();
 
   switch (*id) {
+    case OpId::Unknown: return unsupported();
     case OpId::Identity:
       return identity_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out);

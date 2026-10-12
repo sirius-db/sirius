@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <variant>
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/table/table.hpp>
 

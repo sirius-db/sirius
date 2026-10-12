@@ -24,6 +24,7 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "op/scan/table_scan/parquet_physical_profile.hpp"
 #include "planner/query.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -137,6 +138,16 @@ std::shared_ptr<cudf::io::parquet::FileMetaData const> read_local_parquet_metada
   cudf::io::parquet::experimental::hybrid_scan_reader reader{
     cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), opts};
   return std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
+}
+
+sirius::op::scan::parquet_encryption_evidence read_local_parquet_encryption(
+  std::filesystem::path const& path)
+{
+  auto source   = cudf::io::datasource::create(path.string());
+  auto footer   = read_local_parquet_footer(*source);
+  auto evidence = sirius::op::scan::inspect_parquet_encryption({footer->data(), footer->size()});
+  REQUIRE(evidence.complete);
+  return evidence;
 }
 
 std::string strip_file_scheme_for_registry(std::string const& path)
@@ -758,20 +769,21 @@ TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independentl
   std::string const s3_uri     = "s3://routing-bucket/nation.parquet";
   std::string const local_path = fixture_path.string();
   auto const metadata          = read_local_parquet_metadata(fixture_path);
+  auto const encryption        = read_local_parquet_encryption(fixture_path);
 
   auto s3_ds = manager.create_datasource(s3_uri);
   REQUIRE(s3_ds != nullptr);
   REQUIRE(s3_ds->io_ctx() != nullptr);
   REQUIRE(s3_ds->io_ctx()->type() == io_context_type::restful);
-  REQUIRE(s3_ds->store_metadata(
-    std::make_shared<sirius::op::scan::parquet_metadata>(metadata, /*footer_byte_len=*/0)));
+  REQUIRE(s3_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
+    metadata, /*footer_byte_len=*/0, encryption)));
 
   auto local_ds = manager.create_datasource(local_path);
   REQUIRE(local_ds != nullptr);
   REQUIRE(local_ds->io_ctx() != nullptr);
   REQUIRE(is_local_backend(local_ds->io_ctx()->type()));
-  REQUIRE(local_ds->store_metadata(
-    std::make_shared<sirius::op::scan::parquet_metadata>(metadata, /*footer_byte_len=*/0)));
+  REQUIRE(local_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
+    metadata, /*footer_byte_len=*/0, encryption)));
 
   auto ingestible = sirius::op::scan::make_ingestible(
     make_nation_table_info(std::vector<std::string>{s3_uri, local_path}));
@@ -798,16 +810,17 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
   std::string const s3_uri     = "s3://routing-bucket/nation.parquet";
   std::string const local_path = fixture_path.string();
   auto const metadata          = read_local_parquet_metadata(fixture_path);
+  auto const encryption        = read_local_parquet_encryption(fixture_path);
 
   auto s3_ds = manager.create_datasource(s3_uri);
   REQUIRE(s3_ds != nullptr);
-  REQUIRE(s3_ds->store_metadata(
-    std::make_shared<sirius::op::scan::parquet_metadata>(metadata, /*footer_byte_len=*/0)));
+  REQUIRE(s3_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
+    metadata, /*footer_byte_len=*/0, encryption)));
 
   auto local_ds = manager.create_datasource(local_path);
   REQUIRE(local_ds != nullptr);
-  REQUIRE(local_ds->store_metadata(
-    std::make_shared<sirius::op::scan::parquet_metadata>(metadata, /*footer_byte_len=*/0)));
+  REQUIRE(local_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
+    metadata, /*footer_byte_len=*/0, encryption)));
 
   auto provider_ingestible = sirius::op::scan::make_ingestible(
     make_nation_table_info(std::vector<std::string>{s3_uri, local_path}));

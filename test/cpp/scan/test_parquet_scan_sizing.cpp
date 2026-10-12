@@ -27,6 +27,7 @@
 #include <utils/parquet_fixture_utils.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -369,7 +370,8 @@ TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][s
   auto coalescer = ingestible.create_batch_coalescer();
 
   auto file = std::make_unique<scan::parquet_file_scan_info>();
-  file->set_contract_payload(1, {{1, 0, "sizing.parquet", "parquet", "footer"}}, {{}});
+  file->set_contract_payload(
+    1, {{.contract_id = 1, .split_id = 0, .input_identity = "sizing.parquet"}}, {{}});
   file->row_groups.push_back({0, 20, 60, 10, 1});
   file->row_groups.push_back({1, 20, 60, 10, 1});
 
@@ -415,7 +417,8 @@ TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
   };
   auto make_file = [] {
     auto file = std::make_unique<scan::parquet_file_scan_info>();
-    file->set_contract_payload(1, {{1, 0, "sizing.parquet", "parquet", "footer"}}, {{}});
+    file->set_contract_payload(
+      1, {{.contract_id = 1, .split_id = 0, .input_identity = "sizing.parquet"}}, {{}});
     file->row_groups.push_back({0, 20, 60, 10, 1});
     file->row_groups.push_back({1, 20, 60, 10, 1});
     return file;
@@ -498,6 +501,40 @@ TEST_CASE("parquet partition-only scans keep a nonzero history basis", "[scan][p
   REQUIRE(partition_only.pure_filter_columns == 1);
   CHECK(partition_only.output_bytes > 0);
   CHECK(partition_only.working_set_bytes == partition_only.output_bytes);
+}
+
+TEST_CASE("parquet scans report the output prefix their bound plan reads",
+          "[scan][parquet][assembly]")
+{
+  SECTION("a trailing pure-filter column lies past the prefix")
+  {
+    auto const ingestible = scan::make_ingestible(make_nation_info(true));
+    REQUIRE(ingestible->materialized_column_order().size() == 2);
+    CHECK(ingestible->output_prefix_width() == std::size_t{1});
+    CHECK(ingestible->output_assembly_is_leading_identity());
+  }
+
+  SECTION("an output-only scan is its own prefix")
+  {
+    auto const ingestible = scan::make_ingestible(make_nation_info(false));
+    REQUIRE(ingestible->materialized_column_order().size() == 1);
+    CHECK(ingestible->output_prefix_width() == std::size_t{1});
+    CHECK(ingestible->output_assembly_is_leading_identity());
+  }
+
+  SECTION("a zero-output scan reads no column")
+  {
+    auto const ingestible = scan::make_ingestible(make_nation_info(true, true));
+    CHECK_FALSE(ingestible->output_prefix_width().has_value());
+    CHECK_FALSE(ingestible->output_assembly_is_leading_identity());
+  }
+
+  SECTION("a partition-only scan reads no column")
+  {
+    auto const ingestible = scan::make_ingestible(make_partition_only_nation_info());
+    CHECK_FALSE(ingestible->output_prefix_width().has_value());
+    CHECK_FALSE(ingestible->output_assembly_is_leading_identity());
+  }
 }
 
 TEST_CASE("parquet scan plan avoids empty reader projection for hive count star",

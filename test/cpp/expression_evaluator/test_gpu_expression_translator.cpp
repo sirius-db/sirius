@@ -43,6 +43,8 @@
 #include <duckdb/common/enums/expression_type.hpp>
 
 // cudf
+#include <variant>
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>

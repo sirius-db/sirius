@@ -20,6 +20,7 @@
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/connector_registry.hpp"
@@ -27,9 +28,12 @@
 #include "sirius_extension.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "utils/child_process_environment.hpp"
+#include "utils/gpu_execution_fixture.hpp"
+#include "utils/loadable_extension.hpp"
 #include "utils/log_test_utils.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
+#include "utils/scan_callback_replacements.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
@@ -91,54 +95,9 @@ duckdb::LogicalGet& first_get(duckdb::LogicalOperator& node)
   throw std::out_of_range("No LogicalGet");
 }
 
-void fake_scan(duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&) {}
-
-duckdb::unique_ptr<duckdb::GlobalTableFunctionState> fake_global(duckdb::ClientContext&,
-                                                                 duckdb::TableFunctionInitInput&)
-{
-  throw duckdb::InvalidInputException("replacement global initializer");
-}
-duckdb::unique_ptr<duckdb::LocalTableFunctionState> fake_local(duckdb::ExecutionContext&,
-                                                               duckdb::TableFunctionInitInput&,
-                                                               duckdb::GlobalTableFunctionState*)
-{
-  throw duckdb::InvalidInputException("replacement local initializer");
-}
-void fake_serialize(duckdb::Serializer&,
-                    duckdb::optional_ptr<duckdb::FunctionData>,
-                    duckdb::TableFunction const&)
-{
-  throw duckdb::NotImplementedException("replacement serializer");
-}
-duckdb::unique_ptr<duckdb::FunctionData> fake_deserialize(duckdb::Deserializer&,
-                                                          duckdb::TableFunction&)
-{
-  throw duckdb::NotImplementedException("replacement deserializer");
-}
-
-void replace_callback(duckdb::TableFunction& function, std::string_view phase)
-{
-  if (phase.ends_with("init_global"))
-    function.init_global = fake_global;
-  else if (phase.ends_with("init_local"))
-    function.init_local = fake_local;
-  else if (phase.ends_with("_deserialize"))
-    function.deserialize = fake_deserialize;
-  else if (phase.ends_with("_serialize"))
-    function.serialize = fake_serialize;
-  else
-    function.function = fake_scan;
-}
-
-void require_registered_callbacks(duckdb::TableFunction const& actual,
-                                  duckdb::TableFunction const& expected)
-{
-  REQUIRE(actual.function == expected.function);
-  REQUIRE(actual.init_global == expected.init_global);
-  REQUIRE(actual.init_local == expected.init_local);
-  REQUIRE(actual.serialize == expected.serialize);
-  REQUIRE(actual.deserialize == expected.deserialize);
-}
+using sirius::test::fake_scan;
+using sirius::test::replace_callback;
+using sirius::test::require_registered_callbacks;
 
 duckdb::TableCatalogEntry* replacement_table = nullptr;
 
@@ -445,6 +404,46 @@ TEST_CASE("Native read-view identity includes catalog schema and table incarnati
   REQUIRE(make(1, "main", 2) != make(1, "main", 3));
 }
 
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Native connector certifies type before storage metadata",
+                 "[scan][certificate][integration]")
+{
+  run_ok("CREATE TABLE r2a_certified_native(i INTEGER)");
+  run_ok("CREATE TEMP TABLE r2a_unqualified_native(v DECIMAL(38,2))");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=false");
+  run_ok("BEGIN TRANSACTION READ ONLY");
+
+  auto certify = [&](std::string const& table) {
+    auto logical = con->ExtractPlan("SELECT * FROM " + table);
+    REQUIRE(logical);
+    registry_test_generator generator(*con->context);
+    auto physical = generator.create_plan(first_get(*logical));
+    REQUIRE(physical);
+    REQUIRE(physical->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN);
+    auto& scan = physical->Cast<sirius::op::sirius_physical_table_scan>();
+    auto const* connector =
+      sirius::planner::lookup_connector(scan.function, scan.bind_data.get(), *con->context);
+    REQUIRE(connector);
+    REQUIRE(connector->certify);
+    return connector->certify({}, scan, *con->context, generator.contract_provenance);
+  };
+
+  auto supported = certify("r2a_certified_native");
+  CHECK(supported.verdict == eligibility_verdict::supported);
+  REQUIRE(supported.storage_version);
+  CHECK(*supported.storage_version >= 1);
+  CHECK(*supported.storage_version <= 7);
+  CHECK(supported.later_checks.test(static_cast<std::size_t>(later_check::segments_per_range)));
+  CHECK(supported.later_checks.test(static_cast<std::size_t>(later_check::matrix_per_range)));
+
+  auto rejected = certify("r2a_unqualified_native");
+  CHECK(rejected.verdict == eligibility_verdict::unsupported);
+  CHECK(rejected.reason == verdict_reason::native_type_decimal128);
+  CHECK(rejected.reason_text.find("DECIMAL128") != std::string::npos);
+  run_ok("ROLLBACK");
+}
+
 TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts][shared_context]")
 {
   REQUIRE(sirius::test::g_shared_env);
@@ -458,8 +457,14 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
   REQUIRE(sirius::planner::lookup_connector(native_get, *con.context));
 
   std::set<std::string> names;
-  for (auto const& entry : sirius::planner::registered_connectors())
+  for (auto const& entry : sirius::planner::registered_connectors()) {
     names.insert(entry.function_name);
+    if (entry.function_name == "sirius_stream_source") {
+      CHECK(entry.certify == nullptr);
+    } else {
+      CHECK(entry.certify != nullptr);
+    }
+  }
   REQUIRE(names == std::set<std::string>{"seq_scan",
                                          "parquet_scan",
                                          "read_parquet",
@@ -643,7 +648,7 @@ TEST_CASE("Physical stream lowering records its window without file checks",
   auto const& contract_entry = source.read_views()->entry(source.contract_id());
   CHECK(contract_entry.window_id == 42);
   CHECK(contract_entry.finalize_generation == 0);
-  CHECK(contract_entry.eligibility.later_checks.empty());
+  CHECK(contract_entry.eligibility.later_checks.none());
   CHECK_FALSE(contract_entry.contract.view->replay_policy.permits_cpu_replay);
   CHECK(contract_entry.contract.view->replay_policy.reason == "stream");
   sirius::pipeline::pipeline_build_context build_context(nullptr);
@@ -699,7 +704,7 @@ TEST_CASE("Scan reference resolution remembers unavailable definitions",
           "[scan][contracts][reference_cache]")
 {
   sirius::planner::detail::connector_reference_cache cache;
-  int host;
+  int host{};
   unsigned calls = 0;
   auto resolve   = [&] {
     ++calls;
@@ -718,7 +723,7 @@ TEST_CASE("Extension bootstrap can publish after unavailable scan references",
           "[scan][contracts][reference_cache]")
 {
   sirius::planner::detail::connector_reference_cache cache;
-  int host;
+  int host{};
   unsigned calls   = 0;
   auto unavailable = [&] {
     ++calls;
@@ -742,7 +747,7 @@ TEST_CASE("Scan reference resolution publishes only complete results",
           "[scan][contracts][reference_cache]")
 {
   sirius::planner::detail::connector_reference_cache cache;
-  int host;
+  int host{};
   CHECK_THROWS_AS(cache.get_or_resolve(&host,
                                        []() -> duckdb::vector<duckdb::TableFunction> {
                                          throw std::runtime_error("factory unavailable");
@@ -802,6 +807,11 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
   auto const config = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" /
                       "data" / "configurator.yaml";
   REQUIRE(std::filesystem::is_regular_file(config));
+  auto const extension = sirius::test::loadable_extension_path();
+  if (extension.empty())
+    WARN("Set SIRIUS_EXTENSION_PATH to include dynamic scan-registration checks.");
+  else
+    REQUIRE(std::filesystem::is_regular_file(extension));
   for (auto const* phase : {"cold",
                             "warm",
                             "cold_same",
@@ -833,6 +843,8 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
                             "iceberg_unavailable",
                             "iceberg_disabled"}) {
     INFO(phase);
+    if (extension.empty() && std::string_view(phase).find("dynamic") != std::string_view::npos)
+      continue;
     bool const iceberg = std::string_view(phase).starts_with("iceberg_");
     bool const preload = iceberg || std::string_view(phase).starts_with("preload");
     // The parent test process may leave integration.yaml in the environment after pausing its
@@ -842,14 +854,18 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
       {{"SIRIUS_REGISTRY_TRUST_PHASE", phase},
        {"SIRIUS_TEST_SHARED_CONFIG_OVERRIDE", config.string()},
        {"SIRIUS_REGISTRY_PRELOAD_CHILD", preload ? "1" : "0"}}};
-    std::string executable = "sirius_unittest";
+    bool const dynamic   = std::string_view(phase).find("dynamic") != std::string_view::npos;
+    auto executable_path = std::filesystem::read_symlink("/proc/self/exe");
+    if (dynamic) executable_path = executable_path.parent_path() / "sirius_extension_host";
+    REQUIRE(std::filesystem::is_regular_file(executable_path));
+    std::string executable = executable_path.string();
     std::string filter     = iceberg ? "Iceberg trust bootstrap load order child"
                              : preload ? "Scan registry rejects replacement before Sirius load child"
                                        : "Scan registry first lookup child";
     char* arguments[]      = {executable.data(), filter.data(), nullptr};
     pid_t pid{};
-    REQUIRE(
-      ::posix_spawn(&pid, "/proc/self/exe", nullptr, nullptr, arguments, environment.data()) == 0);
+    REQUIRE(::posix_spawn(
+              &pid, executable.c_str(), nullptr, nullptr, arguments, environment.data()) == 0);
     int status{};
     auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
     pid_t waited{};
@@ -872,7 +888,6 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
   REQUIRE(sirius::test::g_shared_env == nullptr);
   auto const phase          = std::string(std::getenv("SIRIUS_REGISTRY_TRUST_PHASE"));
   bool const iceberg_first  = phase.find("last") == std::string::npos;
-  bool const dynamic        = phase.ends_with("_dynamic");
   bool const same_signature = phase.ends_with("_same");
   bool const unavailable    = phase.ends_with("_unavailable");
   bool const disabled       = phase.ends_with("_disabled");
@@ -905,16 +920,7 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
     else
       unsetenv("SIRIUS_DISABLE");
     marker("BEGIN sirius_load");
-    if (dynamic) {
-      auto const executable = std::filesystem::canonical("/proc/self/exe");
-      auto const extension =
-        executable.parent_path().parent_path().parent_path() / "sirius.duckdb_extension";
-      auto result = con.Query("LOAD " + sirius::test::sql_literal(extension.string()));
-      INFO((result->HasError() ? result->GetError() : "loaded"));
-      REQUIRE_FALSE(result->HasError());
-    } else {
-      database.LoadStaticExtension<duckdb::SiriusExtension>();
-    }
+    database.LoadStaticExtension<duckdb::SiriusExtension>();
     marker("END sirius_load");
     REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
   };
@@ -971,7 +977,7 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
   sirius::test::scoped_recording_log_sink logs;
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
   duckdb::MultiFileBindData bind;
-  if (!dynamic) {
+  {
     marker("BEGIN first_lookup");
     auto const* rejected = sirius::planner::lookup_connector(replacement, &bind, *con.context);
     marker("END first_lookup");
@@ -983,7 +989,7 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
     restore.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
     loader.RegisterFunction(std::move(restore));
   }
-  if (!dynamic) {
+  {
     for (auto const& function : loader.GetTableFunction("iceberg_scan").functions.functions) {
       if (function.function == fake_scan) continue;
       marker("BEGIN genuine_lookup");
@@ -993,7 +999,7 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
     }
   }
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
-  if (!dynamic) {
+  {
     auto const records  = logs.records();
     auto const warnings = std::count_if(records.begin(), records.end(), [](auto const& record) {
       return record.level == sirius::log::level::warn &&
@@ -1005,8 +1011,7 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
   }
   if (unavailable || disabled) return;
 
-  // Exercise the actual loaded Sirius module too: its private cache differs from the
-  // statically linked test executable's cache when LOAD uses the shared extension.
+  // Exercise admission through the registered Sirius extension as well.
   REQUIRE_FALSE(con.Query("SET gpu_execution=true")->HasError());
   REQUIRE_FALSE(con.Query("SET enable_duckdb_fallback=false")->HasError());
   if (!same_signature) {
@@ -1055,18 +1060,7 @@ TEST_CASE("Scan registry rejects replacement before Sirius load child", "[.][reg
   // Explicitly load Sirius only after the replacement is committed to the catalog.
   setenv("SIRIUS_CONFIG_FILE", std::getenv("SIRIUS_TEST_SHARED_CONFIG_OVERRIDE"), 1);
   unsetenv("SIRIUS_DISABLE");
-  bool const dynamic = phase.starts_with("preload_dynamic");
-  if (dynamic) {
-    auto const executable = std::filesystem::canonical("/proc/self/exe");
-    auto const extension =
-      executable.parent_path().parent_path().parent_path() / "sirius.duckdb_extension";
-    duckdb::Connection load(database);
-    auto result = load.Query("LOAD " + sirius::test::sql_literal(extension.string()));
-    INFO((result->HasError() ? result->GetError() : "loaded"));
-    REQUIRE_FALSE(result->HasError());
-  } else {
-    database.LoadStaticExtension<duckdb::SiriusExtension>();
-  }
+  database.LoadStaticExtension<duckdb::SiriusExtension>();
   duckdb::Connection con(database);
   REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
   if (phase.ends_with("init_global") || phase.ends_with("init_local")) {

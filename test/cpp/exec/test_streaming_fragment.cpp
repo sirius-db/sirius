@@ -28,6 +28,7 @@
 #include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/materialized_query_result.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
@@ -369,6 +370,55 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver.run();
     REQUIRE(drain_row_count(receiver, 1) == expected_rows);
 
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-4b: an export-only Parquet drift cannot publish a GPU stream",
+                 "[integration][streaming_fragment]")
+{
+  sirius::test::scratch_dir directory("fragment_export_drift");
+  auto write = [&](std::string const& sql) {
+    auto result = con->Query(sql);
+    if (result->HasError()) INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+  };
+  write("SET gpu_execution=false");
+  write("COPY (SELECT 0::INTEGER keep, 1::INTEGER x) TO " + directory.file_literal("a.parquet") +
+        " (FORMAT PARQUET)");
+  write("COPY (SELECT 1::INTEGER keep, 2.5::DOUBLE x) TO " + directory.file_literal("b.parquet") +
+        " (FORMAT PARQUET)");
+  write("SET gpu_execution=true");
+  auto query =
+    "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ") WHERE keep=1";
+  con->BeginTransaction();
+  try {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(query);
+    spec.outputs     = {0};
+    streaming_fragment sender(*con->context, std::move(spec));
+    sender.build();
+    REQUIRE(sender.sink_types().size() == 1);
+    REQUIRE(sender.sink_types()[0].id() == sirius::type_id::INTEGER);
+    REQUIRE_THROWS(sender.run());
+    // The only retained file carries DOUBLE. It must fail qualification before
+    // the reader or sink can publish a mismatched payload: a receiver relaying
+    // from the failed sender gets the failure, never a batch.
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source =
+      sirius::test::sql_plan_source("SELECT x FROM sirius_stream_source(0)");
+    receiver_spec.inputs[0] = stream_input_spec{
+      {"x"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      {0}};
+    receiver_spec.outputs = {1};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+    receiver.build();
+    REQUIRE_THROWS(receiver.relay_from(sender, 0, 0, 0));
     con->Rollback();
   } catch (...) {
     con->Rollback();

@@ -77,19 +77,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity);
 
-  //! The grouping sets
-  duckdb::GroupedAggregateData grouped_aggregate_data;
-
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
-  //! The radix partitioned hash tables (one per grouping set)
-  duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
-  duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
-  //! A recreation of the input chunk, with nulls for everything that isn't a group
-  duckdb::vector<sirius::logical_type> input_group_types;
-
-  // Filters given to sink and friends
-  duckdb::unsafe_vector<std::size_t> non_distinct_filter;
-  duckdb::unsafe_vector<std::size_t> distinct_filter;
 
   sirius_physical_operator* child_op;
   sirius_physical_operator* get_child_op() const { return child_op; }
@@ -105,12 +93,23 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   bool has_avg            = false;
   bool has_count_distinct = false;
 
+  /// Number of group columns after the `group_idx` keys: the set id and GROUPING() columns of
+  /// an aggregate over several grouping sets, see
+  /// `sirius_physical_grouped_aggregate::has_grouping_sets()`.
+  std::size_t num_grouping_set_columns = 0;
+
   std::size_t current_partition_index = 0;
 
  public:
+  /// Number of leading input and output columns that the merge groups by.
+  [[nodiscard]] std::size_t num_output_group_columns() const noexcept
+  {
+    return group_idx.size() + num_grouping_set_columns;
+  }
+
   std::vector<int> get_output_grouping_indices() const
   {
-    std::vector<int> indices(group_idx.size());
+    std::vector<int> indices(num_output_group_columns());
     std::iota(indices.begin(), indices.end(), 0);
     return indices;
   }

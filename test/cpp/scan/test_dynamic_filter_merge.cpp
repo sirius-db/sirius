@@ -635,8 +635,8 @@ TEST_CASE("sirius_dynamic_bloom_filter never drops a true match (no false negati
   stream.sync();
   REQUIRE(out != nullptr);
   auto const survivors = to_host_int64(out->view().column(0), stream);
-  REQUIRE(survivors.size() >= num_keys);
-  REQUIRE(survivors.size() <= 2 * num_keys);
+  REQUIRE(survivors.size() >= static_cast<std::size_t>(num_keys));
+  REQUIRE(survivors.size() <= static_cast<std::size_t>(2 * num_keys));
   // Build keys precede every possible false positive in the probe sequence.
   for (int64_t key = 0; key < num_keys; ++key) {
     REQUIRE(survivors[key] == key);
@@ -686,8 +686,8 @@ TEST_CASE("sirius_dynamic_bloom_filter supports INT32 keys with no false negativ
   stream.sync();
   REQUIRE(out != nullptr);
   auto const survivors = to_host_int32(out->view().column(0), stream);
-  REQUIRE(survivors.size() >= num_keys);
-  REQUIRE(survivors.size() <= 2 * num_keys);
+  REQUIRE(survivors.size() >= static_cast<std::size_t>(num_keys));
+  REQUIRE(survivors.size() <= static_cast<std::size_t>(2 * num_keys));
   for (int32_t key = 0; key < num_keys; ++key) {
     REQUIRE(survivors[key] == key);
   }

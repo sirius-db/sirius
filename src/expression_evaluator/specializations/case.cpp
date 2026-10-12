@@ -21,6 +21,8 @@
 #include <sirius/exception.hpp>
 
 // cudf
+#include <variant>
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>

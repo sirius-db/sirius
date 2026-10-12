@@ -183,7 +183,7 @@ inline std::vector<T> copy_column_to_host(const cudf::column_view& col)
         tmp.data(), col.data<int8_t>(), sizeof(int8_t) * col.size(), cudaMemcpyDeviceToHost);
     }
     std::vector<bool> host(col.size());
-    for (size_t i = 0; i < col.size(); ++i) {
+    for (cudf::size_type i = 0; i < col.size(); ++i) {
       host[i] = tmp[i] != 0;
     }
     return host;
