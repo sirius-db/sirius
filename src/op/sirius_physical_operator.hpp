@@ -282,6 +282,22 @@ class pipelineable_operator_data : public operator_data {
     const;
 
   /**
+   * @brief Task input of the same kind with @p data_batches in place of the batches.
+   *
+   * Late materialization calls it when it restores deferred columns just before an operator's
+   * execute(). Subclasses that carry state besides the batches, such as a cross product task's
+   * slice, override it to copy that state into the new task input.
+   *
+   * @param data_batches The batches of the new task input.
+   * @return A task input of the same type, holding @p data_batches.
+   */
+  [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_data_batches(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches) const
+  {
+    return std::make_unique<pipelineable_operator_data>(std::move(data_batches));
+  }
+
+  /**
    * @brief Get read-only accessors for the batches. Returns the pin locks acquired by
    * prepare_for_processing if present, otherwise transient read locks built from the idle batches.
    */
