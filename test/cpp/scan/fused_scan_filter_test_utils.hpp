@@ -19,10 +19,12 @@
 /**
  * @file fused_scan_filter_test_utils.hpp
  * @brief Fixtures shared by the filtered-decode tests: the env-gate armer, device upload and
- * readback of plain columns, the synthetic source tables, and exact membership sets with the probe
- * directives that consult them.
+ * readback of plain columns, the synthetic source tables, the range source with the engine request
+ * that carries its whole filter, and exact membership sets with the probe directives that consult
+ * them.
  */
 
+#include "api/simpatico_codegen.hpp"
 #include "codegen/selection/selection.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -38,8 +40,12 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <compression/compressed_scan.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
+#include <array>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -204,6 +210,70 @@ std::unique_ptr<cudf::table> make_source_table(
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+/// The range source: "v" = i % 100 and "k" = i % 50 are its output columns, and "f" = i % 1000 is a
+/// column only the scan's filter reads. All three are bitpacked, so the range on "f" is evaluated
+/// while decoding.
+inline constexpr char const* kRangeSourcePlans =
+  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+  "---\n"
+  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+  "---\n"
+  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+
+/// "f" = i % 1000 under [0, 49] keeps 250 of the 4096 rows, below every selectivity ceiling.
+inline constexpr std::int32_t kFilterModulus = 1000;
+inline constexpr std::int64_t kFilterLo      = 0;
+inline constexpr std::int64_t kFilterHi      = 49;
+
+inline constexpr std::size_t kOutputWidth = 2;
+inline constexpr std::array<std::size_t, 3> kSelected{0, 1, 2};
+
+inline bool in_filter_range(cudf::size_type i)
+{
+  auto const f = i % kFilterModulus;
+  return f >= kFilterLo && f <= kFilterHi;
+}
+
+inline simpatico::compressed_table compress_range_source(::cuda::stream_ref stream)
+{
+  auto table = make_source_table(
+    stream, cudf::data_type{cudf::type_id::INT32}, std::optional<std::int32_t>{kFilterModulus});
+  return simpatico::compress_with_plan(
+    table->view(), kRangeSourcePlans, stream, cudf::get_current_device_resource_ref());
+}
+
+/// The "v", "k" and "f" values of the rows @p keep selects, column by column.
+struct source_rows {
+  std::vector<std::int32_t> v;
+  std::vector<std::int32_t> k;
+  std::vector<std::int32_t> f;
+};
+
+inline source_rows rows_where(std::predicate<cudf::size_type> auto keep)
+{
+  source_rows rows;
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    if (keep(i)) {
+      rows.v.push_back(i % 100);
+      rows.k.push_back(i % 50);
+      rows.f.push_back(i % kFilterModulus);
+    }
+  }
+  return rows;
+}
+
+/// An engine request that carries the scan's whole filter -- the range on "f" -- and says the
+/// output reads only the leading @p output_prefix_width slots.
+inline sirius::pushdown_request covered_request(std::optional<std::size_t> output_prefix_width)
+{
+  sirius::pushdown_request request;
+  request.columns.resize(kSelected.size());
+  request.columns[2].range          = sirius::decode_range{kFilterLo, kFilterHi};
+  request.ranges_cover_whole_filter = true;
+  request.output_prefix_width       = output_prefix_width;
+  return request;
+}
+
 /// INT64-built exact membership set over the multiples of @p step in [0, 50) -- the probe column
 /// decodes as INT32, so the probe exercises the heterogeneous (cast-free) path.
 inline std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_key_set(
@@ -226,6 +296,13 @@ inline std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_key_set(
                           stream.get()) == cudaSuccess);
   stream.sync();
   return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
+}
+
+/// Whether @p value is in the set `make_key_set` builds with @p step: the multiples of @p step in
+/// [0, 50).
+inline bool in_key_set(std::int32_t value, std::int32_t step = 5)
+{
+  return value < 50 && value % step == 0;
 }
 
 inline sirius::codegen::membership_filter_directive make_probe_directive(
