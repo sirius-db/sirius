@@ -94,6 +94,10 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   bool has_avg            = false;
   bool has_count_distinct = false;
 
+  /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG
+  /// (AggregateSlot::is_wide_integer_sum). Derived from aggregate_slots (wide_integer_sum_mask).
+  std::vector<bool> cudf_aggregate_is_wide_integer_sum;
+
   /// Number of group columns after the `group_idx` keys: the set id and GROUPING() columns of
   /// an aggregate over several grouping sets, see
   /// `sirius_physical_grouped_aggregate::has_grouping_sets()`.

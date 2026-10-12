@@ -231,11 +231,11 @@ narrowed to DECIMAL64 at the same scale when rows * max|value| is at most 2^63 -
 cast back to DECIMAL128, so no value and no partial sum of any group can leave the 64-bit range, and
 the merge combines the per-batch partials at the original 128-bit width. The
 bound comes from base-table statistics when the SUM input is a scan column
-(`planner::resolve_decimal_sum_input_bounds`); otherwise the batch is measured with `cudf::minmax`,
+(`planner::resolve_sum_input_bounds`); otherwise the batch is measured with `cudf::minmax`,
 costing one stream synchronization per batch for all measured columns together.
 
 **Code path:**
-- `src/op/aggregate/aggregate_op_util.cpp` — `decimal_sums_to_widen`, `decimal_sums_to_narrow`
+- `src/op/aggregate/aggregate_op_util.cpp` — `sums_to_widen`, `decimal_sums_to_narrow`
 - `src/op/aggregate/gpu_aggregate_impl.cpp` — per-batch request rewriting in the grouped aggregation
 - `src/op/sirius_physical_ungrouped_aggregate.cpp` — per-batch input casts in the ungrouped reduction
 - `src/planner/decimal_sum_input_bounds.cpp` — plan-time bounds from scan statistics

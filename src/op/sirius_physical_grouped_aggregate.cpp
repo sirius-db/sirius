@@ -97,6 +97,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
       cudf_aggregate_input_max_abs[aggregate_slots[i].cudf_idx] = aggregate_input_max_abs[i];
     }
   }
+  cudf_aggregate_is_wide_integer_sum =
+    wide_integer_sum_mask(aggregate_slots, cudf_aggregates.size());
 }
 
 duckdb::vector<sirius::logical_type>
@@ -144,7 +146,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                           stream,
                                                           *space,
                                                           batch_telemetry(),
-                                                          cudf_aggregate_input_max_abs));
+                                                          cudf_aggregate_input_max_abs,
+                                                          cudf_aggregate_is_wide_integer_sum));
       continue;
     }
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
@@ -155,7 +158,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               stream,
                                                               *space,
                                                               batch_telemetry(),
-                                                              cudf_aggregate_input_max_abs);
+                                                              cudf_aggregate_input_max_abs,
+                                                              cudf_aggregate_is_wide_integer_sum);
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

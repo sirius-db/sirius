@@ -97,6 +97,12 @@ class gpu_merge_impl {
    * num input columns`.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param telemetry_info Per-batch telemetry sink.
+   * @param is_wide_integer_sum Parallel to `aggregates`: true for the SUM of a wide integer SUM
+   *        or AVG (see is_wide_integer_sum), whose partials are INT64 or DECIMAL128 with scale 0.
+   *        If any batch carries DECIMAL128, or the INT64 partials could overflow when summed
+   *        (partial_sums_may_overflow), the column is merged over DECIMAL128 and the output column
+   *        is DECIMAL128; otherwise it is merged and returned as INT64. An empty vector marks none.
    *
    * @return The output data batch.
    */
@@ -106,7 +112,8 @@ class gpu_merge_impl {
     const std::vector<cudf::aggregation::Kind>& aggregates,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info = {},
+    const std::vector<bool>& is_wide_integer_sum          = {});
 
   /**
    * @brief Perform merge order-by on multiple data batches.
