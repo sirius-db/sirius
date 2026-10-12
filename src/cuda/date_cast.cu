@@ -15,7 +15,7 @@
  */
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/detail/valid_if.cuh>
+#include <cudf/transform.hpp>
 #include <cudf/utilities/bit.hpp>
 
 #include <rmm/exec_policy.hpp>
@@ -61,33 +61,36 @@ std::unique_ptr<cudf::column> cast_date_to_timestamp(cudf::column_view const& in
   }
   auto const scale = ticks_per_day(target.id());
   // DuckDB converts DATE through microseconds even for second/millisecond targets.
-  auto const max_days     = timestamp_infinity / std::max(scale, micros_per_day);
-  auto const* days        = input.data<int32_t>();
-  auto const* input_mask  = input.null_mask();
-  auto const offset       = input.offset();
-  auto const begin        = thrust::make_counting_iterator<cudf::size_type>(0);
-  auto [mask, null_count] = cudf::detail::valid_if(
-    begin,
-    begin + input.size(),
-    [=] __device__(cudf::size_type i) {
-      if (input_mask && !cudf::bit_is_set(input_mask, offset + i)) { return false; }
-      auto const day = days[i];
-      return day == date_infinity || day == -date_infinity || (day >= -max_days && day <= max_days);
-    },
-    stream,
-    mr);
+  auto const max_days    = timestamp_infinity / std::max(scale, micros_per_day);
+  auto const* days       = input.data<int32_t>();
+  auto const* input_mask = input.null_mask();
+  auto const offset      = input.offset();
+  auto const begin       = thrust::make_counting_iterator<cudf::size_type>(0);
+  auto validity          = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::BOOL8}, input.size(), cudf::mask_state::UNALLOCATED, stream, mr);
+  thrust::transform(rmm::exec_policy(stream, mr),
+                    begin,
+                    begin + input.size(),
+                    validity->mutable_view().data<bool>(),
+                    [=] __device__(cudf::size_type i) {
+                      if (input_mask && !cudf::bit_is_set(input_mask, offset + i)) { return false; }
+                      auto const day = days[i];
+                      return day == date_infinity || day == -date_infinity ||
+                             (day >= -max_days && day <= max_days);
+                    });
+  auto [mask, null_count] = cudf::bools_to_mask(validity->view(), stream, mr);
   if (!try_cast && null_count > input.null_count()) {
     throw invalid_input_exception("DATE value is out of range for TIMESTAMP");
   }
   auto result =
-    cudf::make_timestamp_column(target, input.size(), std::move(mask), null_count, stream, mr);
+    cudf::make_timestamp_column(target, input.size(), std::move(*mask), null_count, stream, mr);
   auto const* output_mask = result->view().null_mask();
   thrust::transform(rmm::exec_policy(stream, mr),
                     begin,
                     begin + input.size(),
                     result->mutable_view().data<int64_t>(),
                     [=] __device__(cudf::size_type i) -> int64_t {
-                      if (!cudf::bit_is_set(output_mask, i)) { return 0; }
+                      if (output_mask && !cudf::bit_is_set(output_mask, i)) { return 0; }
                       auto const day = days[i];
                       if (day == date_infinity) { return timestamp_infinity; }
                       if (day == -date_infinity) { return -timestamp_infinity; }
