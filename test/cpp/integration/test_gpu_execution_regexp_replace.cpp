@@ -37,7 +37,10 @@ void create_regexp_replace_table(RegexpReplaceFixture& fx)
     " (16, 'éabaéaba'), (17, 'first' || chr(10) || 'aba aba'),"
     " (18, 'https://www.example.com/a/b'), (19, 'http://other.example/x'),"
     " (20, 'APPLE Orange APPLE'), (21, 'a' || chr(10) || 'a'),"
-    " (22, 'ab' || chr(10)), (23, 'a' || chr(10));");
+    " (22, 'ab' || chr(10)), (23, 'a' || chr(10)),"
+    " (24, 'https://www.example.com/a/b' || chr(10)), (25, 'https://www.example.com'),"
+    " (26, 'https://www./x'), (27, 'HTTPS://Example.com/x'),"
+    " (28, 'https://a.example/p' || chr(10) || 'q');");
   fx.run_ok("CHECKPOINT;");
 }
 
@@ -84,6 +87,7 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
          "regexp_replace(s, 'aba', 'X')",
          "regexp_replace(s, 'a', '')",
          "regexp_replace(s, '^a', 'X')",
+         "regexp_replace(s, 'a$', 'X')",
          "regexp_replace(s, '[0-9]+', '#')",
          "regexp_replace(s, 'a*', 'X')",
          "regexp_replace(s, 'a?', 'X')",
@@ -110,10 +114,12 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
          R"(regexp_replace(s, '[A-Z]', '\0\0'))",
          R"(regexp_replace(s, '[ \t\r\n\f]', '\0\0'))",
          R"(regexp_replace(s, '^(a)', '<\1>'))",
+         R"(regexp_replace(s, '(a)$', '<\1>'))",
          R"(regexp_replace(s, '([0-9]+)', '<\1>'))",
          R"(regexp_replace(s, '(a*)', '<\1>'))",
          R"(regexp_replace(s, '(a?)', '<\1>'))",
          R"(regexp_replace(s, '(a)|(b)', '<\1><\2>'))",
+         R"(regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1'))",
        }) {
     INFO(expression);
     compare_gpu_vs_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
@@ -121,22 +127,64 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
 }
 
 TEST_CASE_METHOD(RegexpReplaceFixture,
-                 "regexp_replace dollar anchors fall back during planning",
+                 "regexp_replace dollar anchors match only the end of text on GPU",
                  "[integration][gpu_execution][regexp_replace][regexp_replace_anchors]")
 {
   create_regexp_replace_table(*this);
-  run_ok(R"(INSERT INTO regex_t VALUES (24, 'ab\' || chr(10)), (25, 'ab\');)");
+  // cuDF's $ also matches before a trailing newline; the evaluator rewrites it to \Z.
+  // Rows ending in a newline must therefore stay unchanged, exactly as in DuckDB.
+  run_ok(R"(INSERT INTO regex_t VALUES (29, 'ab\' || chr(10)), (30, 'ab\'), (31, 'a$b$');)");
   run_ok("CHECKPOINT;");
   for (auto const* expression : {
          "regexp_replace(s, 'b$', 'X')",
          "regexp_replace(s, 'a$', 'X')",
+         "regexp_replace(s, '.$', 'X')",
+         "regexp_replace(s, '[^$]$', 'X')",
+         "regexp_replace(s, 'a|b$', 'X')",
+         "regexp_replace(s, '(?:b$)', 'X')",
+         "regexp_replace(s, '[$]', 'X')",
+         "regexp_replace(s, '[]$]', 'X')",
+         "regexp_replace(s, '[^]$]+$', 'X')",
          R"(regexp_replace(s, '(b)$', '<\1>'))",
          R"(regexp_replace(s, '(a)$', '<\1>'))",
+         R"(regexp_replace(s, '(a)(b)?$', '<\1\2>'))",
+         R"(regexp_replace(s, '([$])', '<\1>'))",
          R"(regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1'))",
          R"(regexp_replace(s, '\\$', 'X'))",
        }) {
     INFO(expression);
-    expect_plan_fallback_matches_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+    compare_gpu_vs_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "regexp_replace keeps ClickBench Q28 on GPU",
+                 "[integration][gpu_execution][aggregate][regexp_replace][regexp_replace_anchors]")
+{
+  create_regexp_replace_table(*this);
+  // Q28's shape, with and without the dedicated JIT transform for its pattern.
+  for (auto const* jit : {"true", "false"}) {
+    INFO("enable_regex_jit_impl = " << jit);
+    run_ok(std::string{"SET enable_regex_jit_impl = "} + jit + ";");
+    compare_gpu_vs_cpu_approx(
+      R"(SELECT regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k,)"
+      " avg(length(s)) AS l, count(*) AS c, min(s) FROM regex_t WHERE s <> '' GROUP BY k",
+      {1});
+  }
+  run_ok("SET enable_regex_jit_impl = true;");
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "regexp_replace inline flag groups fall back during planning",
+                 "[integration][gpu_execution][regexp_replace][regexp_replace_anchors]")
+{
+  create_regexp_replace_table(*this);
+  // cuDF rejects every (?...) form except (?:...). Multiline and dot-all flags would also
+  // change what the rewritten $ anchor and . match.
+  for (auto const* pattern : {"(?m)a$", "(?i)a$", "(?s)a.$", "(?i:a)", "(?P<x>a)$"}) {
+    INFO(pattern);
+    expect_plan_fallback_matches_cpu(std::string{"SELECT id, regexp_replace(s, '"} + pattern +
+                                     "', 'X') FROM regex_t");
   }
 }
 

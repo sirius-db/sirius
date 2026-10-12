@@ -24,6 +24,7 @@
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
+#include <expression_evaluator/regex/cudf_regex_pattern.hpp>
 #include <expression_evaluator/regex/regex_playground.hpp>
 #include <expression_evaluator/round_floating_point.hpp>
 #include <helper/logical_type.hpp>
@@ -463,6 +464,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
     auto const& pattern_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
     auto const& replace_str = std::get<std::string>(args[2]->get<sirius::ast::constant>().payload);
+    // The planner validated the RE2 pattern; give cuDF RE2's end-of-text anchor semantics.
+    auto const cudf_pattern = ::sirius::regex::to_cudf_regex_pattern(pattern_str);
     auto const has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
     if (has_backrefs) {
       if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
@@ -478,7 +481,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       // Group 1 is the prefix, group 2 is the whole original match (RE2's \0), and original
       // capture groups move by two. Braced references avoid treating e.g. \12 as group 12:
       // DuckDB interprets it as group 1 followed by the literal character '2'.
-      auto const first_pattern      = std::string{"^([\\s\\S]*?)("} + pattern_str + ")";
+      auto const first_pattern      = std::string{"^([\\s\\S]*?)("} + cudf_pattern + ")";
       auto regex_prog               = cudf::strings::regex_program::create(first_pattern);
       std::string first_replacement = "${1}";
       for (std::size_t i = 0; i < replace_str.size(); ++i) {
@@ -496,7 +499,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
         _stream,
         _mr);
     } else {
-      auto regex_prog = cudf::strings::regex_program::create(pattern_str);
+      auto regex_prog = cudf::strings::regex_program::create(cudf_pattern);
       return cudf::strings::replace_re(cudf::strings_column_view(input.get_column_view()),
                                        *regex_prog,
                                        cudf::string_scalar(replace_str, true, _stream, _mr),

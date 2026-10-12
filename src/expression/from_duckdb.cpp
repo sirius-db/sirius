@@ -307,9 +307,9 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
         }
       } else if (pattern.compare(i, 2, "[:") == 0) {
         return nullptr;
-      } else if (pattern[i] == '$') {
-        // cuDF also matches $ before a trailing newline; RE2's default is end-of-text only.
-        // Conservatively reject every unescaped $, including literals in character classes.
+      } else if (pattern.compare(i, 2, "(?") == 0 && pattern.compare(i, 3, "(?:") != 0) {
+        // cuDF only supports non-capturing groups among the (?...) forms. Inline flags such
+        // as (?m) would also change the anchor semantics the evaluator relies on.
         return nullptr;
       }
     }

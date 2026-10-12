@@ -188,7 +188,7 @@ class RuntimeFallbackFixture {
 }  // namespace
 
 TEST_CASE_METHOD(RuntimeFallbackFixture,
-                 "transparent execution: dollar anchors fall back regardless of regex JIT",
+                 "transparent execution: specialized regex matches generic implementation",
                  "[transparent][integration][regex-jit-differential][regexp_replace]")
 {
   struct regex_jit_restore_guard {
@@ -218,7 +218,7 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
   )SQL");
 
   create_table(R"SQL(
-    CREATE TABLE test_regex_jit_final_newline_fallback AS
+    CREATE TABLE test_regex_jit_final_newline AS
     SELECT * FROM (VALUES
       (1, 'http://a/x' || chr(10))
     ) AS cases(id, url)
@@ -245,9 +245,8 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
     }
     REQUIRE_FALSE(result->HasError());
     auto const after = sirius::test::get_transparent_execution_stats(*con);
-    // The pattern ends in an unescaped $, so planning must reject it before either
-    // GPU implementation runs. Both JIT settings must preserve DuckDB's semantics.
-    sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
+    // Both GPU implementations must run on the GPU and preserve DuckDB's semantics.
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
 
     std::vector<std::string> rows;
     rows.reserve(result->RowCount());
@@ -280,10 +279,12 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
   };
   REQUIRE(specialized == expected);
 
+  // RE2's $ never matches before a trailing newline; cuDF's $ would, so the pattern is
+  // rewritten to \Z. The input must remain unchanged under both implementations.
   auto const generic_final_newline =
-    run_with_specialized_regex(false, "test_regex_jit_final_newline_fallback");
+    run_with_specialized_regex(false, "test_regex_jit_final_newline");
   auto const specialized_final_newline =
-    run_with_specialized_regex(true, "test_regex_jit_final_newline_fallback");
+    run_with_specialized_regex(true, "test_regex_jit_final_newline");
   REQUIRE(specialized_final_newline == generic_final_newline);
   REQUIRE(specialized_final_newline == std::vector<std::string>{"http://a/x\n"});
 }
