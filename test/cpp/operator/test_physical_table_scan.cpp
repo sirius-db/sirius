@@ -144,7 +144,8 @@ TEMPLATE_TEST_CASE(
                                         filter_vals.size(),
                                         duckdb::ExtraOperatorInfo(),
                                         std::move(parameters),
-                                        std::move(virtual_columns));
+                                        std::move(virtual_columns),
+                                        /*projected_output_count=*/types.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -213,7 +214,8 @@ TEST_CASE("sirius_physical_table_scan with no filters passes through data", "[ph
                                         col0_vals.size(),
                                         duckdb::ExtraOperatorInfo(),
                                         std::move(parameters),
-                                        std::move(virtual_columns));
+                                        std::move(virtual_columns),
+                                        /*projected_output_count=*/types.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -265,7 +267,8 @@ TEST_CASE("sirius_physical_table_scan projection keeps its input batch valid",
                                         col0_vals.size(),
                                         duckdb::ExtraOperatorInfo(),
                                         std::move(parameters),
-                                        std::move(virtual_columns));
+                                        std::move(virtual_columns),
+                                        /*projected_output_count=*/types.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -339,7 +342,8 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
                                         col0_vals.size(),
                                         duckdb::ExtraOperatorInfo(),
                                         std::move(parameters),
-                                        std::move(virtual_columns));
+                                        std::move(virtual_columns),
+                                        /*projected_output_count=*/types.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -408,7 +412,8 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
                                         col0_vals.size(),
                                         duckdb::ExtraOperatorInfo(),
                                         std::move(parameters),
-                                        std::move(virtual_columns));
+                                        std::move(virtual_columns),
+                                        /*projected_output_count=*/types.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
@@ -515,7 +520,8 @@ TEST_CASE("sirius_physical_table_scan fails closed for an untranslatable pushed-
                                         filter_values.size(),
                                         duckdb::ExtraOperatorInfo(),
                                         std::move(parameters),
-                                        std::move(virtual_columns));
+                                        std::move(virtual_columns),
+                                        /*projected_output_count=*/types.size());
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
 
   CHECK_THROWS_WITH(

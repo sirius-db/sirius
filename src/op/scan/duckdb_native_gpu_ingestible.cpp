@@ -212,6 +212,25 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
       "[duckdb_native_gpu_ingestible] projected_cols and projected_types must be parallel");
   }
 
+  auto const& layout_ids  = bind.projection_ids;
+  auto const source_count = layout_ids.empty() ? bind.column_ids.size() : layout_ids.size();
+  _column_layout.data_roles.reserve(source_count);
+  _column_layout.materialized_primary_indices.reserve(source_count);
+  for (std::size_t slot = 0; slot < source_count; ++slot) {
+    auto const column_id = layout_ids.empty() ? slot : layout_ids[slot];
+    _column_layout.materialized_primary_indices.push_back(
+      bind.column_ids[column_id].GetPrimaryIndex());
+    if (slot < bind.projected_output_count) {
+      _column_layout.data_roles.push_back(scan_column_layout::data_role::OUTPUT);
+      _column_layout.output_data_positions.push_back(slot);
+    } else if (layout_ids.empty()) {
+      _column_layout.data_roles.push_back(scan_column_layout::data_role::ROW_COUNT_CARRIER);
+    } else {
+      _column_layout.data_roles.push_back(scan_column_layout::data_role::FILTER_ONLY);
+    }
+  }
+  _column_layout.output_is_identity = true;
+
   // Eager even when the walk is deferred, so an undecodable type still refuses at plan time.
   if (auto reason = unsupported_projected_type_reason(bind.projected_cols, bind.projected_types)) {
     SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}", *reason);
@@ -549,9 +568,8 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   std::unique_ptr<cudf::column>* /*survivors*/,
   std::span<std::size_t const> elided)
 {
-  auto const output_arity = _info->output_types.size();
-  auto const decoded_cols =
-    _info->projection_ids.empty() ? _info->column_ids.size() : _info->projection_ids.size();
+  auto const output_arity        = _column_layout.output_data_positions.size();
+  auto const decoded_cols        = _column_layout.data_roles.size();
   auto const projection_required = (output_arity > 0) && (decoded_cols > output_arity);
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
@@ -608,26 +626,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
 //===----------------------------------------------------------------------===//
 std::vector<std::size_t> duckdb_native_gpu_ingestible::materialized_column_order() const
 {
-  // The decoder emits columns in source_ids order (projection_ids, or column_ids order when
-  // projection is empty) — output columns first, pure-filter columns trailing — which is the
-  // layout post_filter_and_project's emission_order_map filter and [0..output_arity)
-  // projection assume. Return the corresponding column primary (storage) indices, matching
-  // how the pin cache keys columns (ColumnIndex::GetPrimaryIndex).
-  auto const& column_ids     = _info->column_ids;
-  auto const& projection_ids = _info->projection_ids;
-  std::vector<std::size_t> order;
-  if (projection_ids.empty()) {
-    order.reserve(column_ids.size());
-    for (auto const& c : column_ids) {
-      order.push_back(c.GetPrimaryIndex());
-    }
-  } else {
-    order.reserve(projection_ids.size());
-    for (auto const pid : projection_ids) {
-      order.push_back(column_ids[pid].GetPrimaryIndex());
-    }
-  }
-  return order;
+  return _column_layout.materialized_primary_indices;
 }
 
 std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(

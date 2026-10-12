@@ -137,7 +137,7 @@ class NullCountFixture {
     info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
     info->column_ids.push_back(duckdb::ColumnIndex(0));
     info->column_ids.push_back(duckdb::ColumnIndex(1));
-    info->scan_output_arity      = 2;
+    info->projected_output_count = 2;
     info->approximate_batch_size = std::size_t{1} << 30;
 
     if (filter_expects_null) {
@@ -215,13 +215,13 @@ TEST_CASE_METHOD(NullCountFixture,
   info->column_ids = {
     duckdb::ColumnIndex(0),
     duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER)};
-  info->scan_output_arity = 2;
-  info->virtual_columns   = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER,
-                              "file_row_number",
-                              sirius::logical_type::make(sirius::type_id::BIGINT),
-                              scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER}};
-  auto filters            = duckdb::make_uniq<duckdb::TableFilterSet>();
-  auto lower_third_rg     = sirius::test::constant_filter(
+  info->projected_output_count = 2;
+  info->virtual_columns        = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER,
+                                   "file_row_number",
+                                   sirius::logical_type::make(sirius::type_id::BIGINT),
+                                   scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER}};
+  auto filters                 = duckdb::make_uniq<duckdb::TableFilterSet>();
+  auto lower_third_rg          = sirius::test::constant_filter(
     duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(4097));
   filters->PushFilter(duckdb::ProjectionIndex(0), std::move(lower_third_rg));
   info->table_filters = std::move(filters);

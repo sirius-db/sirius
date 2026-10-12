@@ -703,7 +703,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                                             bind.projection_ids,
                                                             bind.names,
                                                             bind.returned_types,
-                                                            bind.scan_output_arity,
+                                                            bind.projected_output_count,
                                                             bind.partition_indices,
                                                             bind.virtual_columns));
   for (auto const& column : bind.virtual_columns) {
@@ -826,7 +826,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
     if (_duckdb_filter_expression) {
       std::unordered_set<std::size_t> filter_only;
       std::unordered_set<std::size_t> answerable_positions;
-      for (auto const batch_pos : _plan->pure_filter_batch_positions()) {
+      for (auto const batch_pos : _plan->filter_only_batch_positions()) {
         auto const primary_idx = _plan->data_columns.at(batch_pos).primary_idx;
         if (_plan->partition_primary_indices.count(primary_idx)) { continue; }
         filter_only.insert(primary_idx);
@@ -836,7 +836,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                                           bind.returned_types,
                                                           _plan->partition_primary_indices,
                                                           filter_only);
-      for (auto const batch_pos : _plan->pure_filter_batch_positions()) {
+      for (auto const batch_pos : _plan->filter_only_batch_positions()) {
         auto const primary_idx = _plan->data_columns.at(batch_pos).primary_idx;
         if (_filter_analysis.equality_sets.count(primary_idx)) {
           answerable_positions.insert(batch_pos);
@@ -1216,15 +1216,10 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   std::vector<std::size_t> selected_chunk_decoded_width;
   std::unordered_set<std::size_t> pure_filter_chunk_indices;
   if (file_projected) {
-    auto const pure_filter_positions = _plan->pure_filter_batch_positions();
-    bool has_data_output             = false;
-    for (auto const& output : _plan->output_layout) {
-      if (output.source == scan_plan::output_entry::DATA &&
-          output.idx < _plan->data_columns.size()) {
-        has_data_output = true;
-        break;
-      }
-    }
+    auto const filter_only_positions = _plan->filter_only_batch_positions();
+    bool const has_data_output = std::ranges::any_of(_plan->columns.data_roles, [](auto role) {
+      return role == scan_column_layout::data_role::OUTPUT;
+    });
     selected_chunk_indices.reserve(data_column_names.size());
     selected_chunk_decoded_width.reserve(data_column_names.size());
     for (std::size_t k = 0; k < data_column_names.size(); ++k) {
@@ -1256,7 +1251,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       }
       // When no data column is projected, use the decoded columns as a nonzero
       // history basis. This covers count-style and partition-only outputs.
-      bool const is_pure_filter = has_data_output && pure_filter_positions.count(k);
+      bool const is_pure_filter = has_data_output && filter_only_positions.count(k);
       for (auto const leaf : leaves) {
         selected_chunk_indices.push_back(leaf);
         selected_chunk_decoded_width.push_back(decoded_width);
@@ -1952,20 +1947,7 @@ std::optional<std::size_t> parquet_gpu_ingestible::output_prefix_width() const n
 //===----------------------------------------------------------------------===//
 std::vector<std::size_t> parquet_gpu_ingestible::materialized_column_order() const
 {
-  // The reader materializes columns in _plan->data_columns order (output columns first,
-  // pure-filter columns trailing), followed by synthesized virtual columns; partitions are
-  // excluded. This is exactly the M-space layout post_filter_and_project's filter refs
-  // (batch_position_by_column_id) and output_layout assume. Expose it as primary/storage indices
-  // for cache compatibility checks; virtual-column scans currently bypass pinned entries.
-  std::vector<std::size_t> order;
-  order.reserve(_plan->data_columns.size());
-  for (auto const& dc : _plan->data_columns) {
-    order.push_back(dc.primary_idx);
-  }
-  for (auto const& vc : _plan->virtual_columns) {
-    order.push_back(static_cast<std::size_t>(vc.column_id));
-  }
-  return order;
+  return _plan->columns.materialized_primary_indices;
 }
 
 }  // namespace sirius::op::scan

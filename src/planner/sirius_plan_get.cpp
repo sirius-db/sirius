@@ -910,6 +910,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // Save the original types before we modify projection_ids, because modifying projection_ids
   // might affect the types when we call ResolveOperatorTypes()
   duckdb::vector<duckdb::LogicalType> original_types = op.types;
+  auto const projected_output_count                  = original_types.size();
 
   if (table_filters && !projection_ids.empty()) {
     auto include_column = [&](duckdb::ProjectionIndex index) {
@@ -997,6 +998,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       std::move(op.extra_info),
       std::move(op.parameters),
       std::move(op.virtual_columns),
+      projected_output_count,
       op.returned_types);
     node->named_parameters             = std::move(op.named_parameters);
     node->read_views                   = read_views;
@@ -1072,6 +1074,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.extra_info),
     std::move(op.parameters),
     std::move(op.virtual_columns),
+    projected_output_count,
     original_types);
   if (!physical_types.empty() && physical_types.size() == node->types.size()) {
     node->set_physical_types(std::move(physical_types));

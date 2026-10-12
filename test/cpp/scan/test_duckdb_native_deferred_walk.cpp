@@ -118,10 +118,11 @@ std::unique_ptr<duckdb_native_ingestible_table_info> make_info(
     info->returned_types.push_back(t);
     info->output_types.push_back(t);
   }
-  info->table_filters = std::move(filters);
-  info->table_name    = table_name;
-  info->catalog_name  = "memory";
-  info->schema_name   = "main";
+  info->projected_output_count = info->output_types.size();
+  info->table_filters          = std::move(filters);
+  info->table_name             = table_name;
+  info->catalog_name           = "memory";
+  info->schema_name            = "main";
   return info;
 }
 
