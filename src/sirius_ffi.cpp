@@ -41,6 +41,7 @@
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "log/logging.hpp"                // SIRIUS_LOG_INFO
 #include "parquet_extension.hpp"          // duckdb::ParquetExtension
+#include "planner/unsupported_optimizers.hpp"
 #include "sirius/ffi.hpp"
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
@@ -199,10 +200,8 @@ struct Context::Impl {
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
-    disabled.insert(duckdb::OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN);
-    disabled.insert(duckdb::OptimizerType::GROUPING_SETS);
-    disabled.insert(duckdb::OptimizerType::AGGREGATE_REUSE);
-    disabled.insert(duckdb::OptimizerType::DISTINCT_AGGREGATE_REWRITE);
+    disabled.insert(sirius::planner::unsupported_aggregate_optimizers.begin(),
+                    sirius::planner::unsupported_aggregate_optimizers.end());
     // Keep this FFI-only restriction until its no-fallback execution path has
     // dedicated GPU_VALUES coverage.
     disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);

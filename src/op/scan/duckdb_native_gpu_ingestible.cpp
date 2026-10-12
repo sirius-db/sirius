@@ -1,4 +1,3 @@
-#include "duckdb/main/attached_database.hpp"
 /*
  * Copyright 2026, Sirius Contributors.
  *
@@ -15,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
+
 #include "transparent/replay_admission.hpp"
 
 // sirius
@@ -28,13 +29,13 @@
 #include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
-#include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <sirius_context.hpp>
 
 // duckdb
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 

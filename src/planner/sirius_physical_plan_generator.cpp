@@ -1,4 +1,3 @@
-#include "duckdb/main/attached_database.hpp"
 /*
  * Copyright 2025, Sirius Contributors.
  *
@@ -15,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "planner/sirius_physical_plan_generator.hpp"
+
 #include "config.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
@@ -23,6 +24,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/function/table/table_scan.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
@@ -70,7 +72,6 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/connector_registry.hpp"
-#include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
@@ -209,7 +210,7 @@ void populate_parquet_schema(sirius::op::scan::parquet_ingestible_table_info& ou
     info->virtual_columns.push_back(sirius::op::scan::bound_virtual_column{
       column_id, column.name.GetIdentifierName(), sirius::from_duckdb(column.type), kind});
   }
-  if (scan_op.function.GetName().GetIdentifierName() != "sirius_read_parquet" &&
+  if (scan_op.function.GetName() != "sirius_read_parquet" &&
       dynamic_cast<duckdb::MultiFileBindData const*>(scan_op.bind_data.get())) {
     auto const& bind_data   = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     info->partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
@@ -267,7 +268,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
                                         scan_op.bind_data.get(),
                                         scan_op.parameters)
       : std::move(scan_op.contract_file_paths);
-  if (scan_op.function.GetName().GetIdentifierName() == "sirius_read_parquet") {
+  if (scan_op.function.GetName() == "sirius_read_parquet") {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] sirius_read_parquet scan "
@@ -574,8 +575,7 @@ plan_lineage collect_semantic_lineage(
     auto& scan = node.Cast<op::sirius_physical_table_scan>();
     plan_lineage result;
     result.columns.resize(scan.types.size());
-    if (scan.function.GetName().GetIdentifierName() != "seq_scan" && scan.children.empty() &&
-        !scan.pre_declined) {
+    if (scan.function.GetName() != "seq_scan" && scan.children.empty() && !scan.pre_declined) {
       op::scan::parquet_ingestible_table_info info;
       populate_parquet_schema(info, scan, context);
       auto layout = op::scan::build_scan_plan(info.column_ids,

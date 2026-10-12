@@ -1,4 +1,3 @@
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 /*
  * Copyright 2026, Sirius Contributors.
  *
@@ -15,14 +14,16 @@
  * limitations under the License.
  */
 
+#include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
+
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/joinside.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
-#include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 
 #include <cstdint>
 #include <limits>

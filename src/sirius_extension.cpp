@@ -76,6 +76,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/unsupported_optimizers.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
@@ -1717,6 +1718,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   auto& entry        = entry_base.Cast<DuckTableEntry>();
   auto& entry_catalog     = entry.ParentCatalog().GetName().GetIdentifierName();
   auto& entry_schema      = entry.ParentSchema().name.GetIdentifierName();
+  auto const& table_name  = entry.name.GetIdentifierName();
   auto const& columns     = entry.GetColumns();
   auto const schema_names = columns.GetColumnNames();
   auto const schema_types = columns.GetColumnTypes();
@@ -1759,7 +1761,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
     scan_mgr.find_pinned_entry_for_duckdb_table(
       entry_catalog,
       entry_schema,
-      entry.name.GetIdentifierName(),
+      table_name,
       {entry.oid, entry.GetStorage().GetRowGroupCollection()});
   sirius::scan_manager::pinned_entry const* pin = pin_owner.get();
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
@@ -1825,7 +1827,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   auto& index_cache      = sirius_ctx->get_cuvs_index_cache();
   std::string index_name = sirius::vss::build_ann_index_cache_key(
-    entry_catalog, entry_schema, entry.name.GetIdentifierName(), data.column_name, data.metric);
+    entry_catalog, entry_schema, table_name, data.column_name, data.metric);
 
   // Check if there's enough memory to build the index before releasing the current one
   auto reservation      = index_cache.reserve_index_memory(footprint, target_gpu);
@@ -1833,9 +1835,8 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   bool removed_existing = false;
   // Destructive path: not enough memory to hold all indexes so release the current one first
   if (!reservation) {
-    removed_existing =
-      index_cache.erase_by_column(
-        entry_catalog, entry_schema, entry.name.GetIdentifierName(), data.column_name, metric) > 0;
+    removed_existing = index_cache.erase_by_column(
+                         entry_catalog, entry_schema, table_name, data.column_name, metric) > 0;
     released_first = true;
     reservation    = index_cache.reserve_index_memory(footprint, target_gpu);
     if (!reservation) {
@@ -1843,15 +1844,15 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
       auto const avail = target_space->get_available_memory();
       std::string msg =
         "sirius_create_ann_index: not enough free GPU memory to build the index for '" +
-        entry.name.GetIdentifierName() + "." + data.column_name + "': need ~" +
-        std::to_string(footprint >> 20) + " MiB, only ~" + std::to_string(avail >> 20) +
-        " MiB free on GPU " + std::to_string(target_gpu) + ".";
+        table_name + "." + data.column_name + "': need ~" + std::to_string(footprint >> 20) +
+        " MiB, only ~" + std::to_string(avail >> 20) + " MiB free on GPU " +
+        std::to_string(target_gpu) + ".";
       if (removed_existing) {
         msg += " The previous index for this column and metric was removed to make room.";
       }
       // Look for indexes on this same column under other metrics to inform users
-      auto const others = index_cache.indexes_on_column(
-        entry_catalog, entry_schema, entry.name.GetIdentifierName(), data.column_name);
+      auto const others =
+        index_cache.indexes_on_column(entry_catalog, entry_schema, table_name, data.column_name);
       if (!others.empty()) {
         std::size_t held_bytes = 0;
         std::string listed;
@@ -1893,8 +1894,8 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   } catch (std::exception const& e) {
     if (removed_existing) {
       throw InvalidInputException(
-        std::string("sirius_create_ann_index: failed to build the index for '") +
-        entry.name.GetIdentifierName() + "." + data.column_name +
+        std::string("sirius_create_ann_index: failed to build the index for '") + table_name + "." +
+        data.column_name +
         "' after the previous index was removed to make room, so this column and metric now has "
         "no index. Underlying error: " +
         e.what());
@@ -1906,7 +1907,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.kind           = ann_index_kind_from_type(data.index_type);
   meta.catalog_name   = entry_catalog;
   meta.schema_name    = entry_schema;
-  meta.table_name     = entry.name.GetIdentifierName();
+  meta.table_name     = table_name;
   meta.table_identity = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
   meta.pin_snapshot   = pin->snapshot_identity;
   meta.column_name    = data.column_name;
@@ -1933,8 +1934,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   // Non-destructive path: remove the old one now that the new one is built
   if (!released_first) {
-    index_cache.erase_by_column(
-      entry_catalog, entry_schema, entry.name.GetIdentifierName(), data.column_name, metric);
+    index_cache.erase_by_column(entry_catalog, entry_schema, table_name, data.column_name, metric);
   }
   index_cache.insert(
     std::move(index_name), std::move(meta), std::move(handle), std::move(build_stream));
@@ -3597,12 +3597,8 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
   // compressed shapes — neither is executable by the rebind path.
   updated.insert(OptimizerType::IN_CLAUSE);
   updated.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-  // These rewrites export DuckDB aggregate states instead of GPU aggregate values.
-  updated.insert(OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN);
-  updated.insert(OptimizerType::GROUPING_SETS);
-  updated.insert(OptimizerType::AGGREGATE_REUSE);
-  // Keep COUNT(DISTINCT row(...)) as an aggregate, not a nested GROUP BY key.
-  updated.insert(OptimizerType::DISTINCT_AGGREGATE_REWRITE);
+  updated.insert(sirius::planner::unsupported_aggregate_optimizers.begin(),
+                 sirius::planner::unsupported_aggregate_optimizers.end());
   // LATE_MATERIALIZATION rewrites `ORDER BY ... LIMIT N` over a scan into a
   // self-RIGHT_SEMI_JOIN keyed on parquet virtual columns the Sirius scan path
   // drops (src/op/scan/scan_plan.cpp), so the join's key columns would not

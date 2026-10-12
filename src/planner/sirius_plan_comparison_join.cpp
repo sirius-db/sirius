@@ -366,9 +366,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   // Reject nested join keys before planning either child.
   for (auto const& condition : op.conditions) {
-    if (!condition.IsComparison()) {
-      throw duckdb::NotImplementedException("Sirius does not support arbitrary join conditions");
-    }
+    D_ASSERT(condition.IsComparison());
     reject_nested_column_operation(*condition.LeftReference(), "a join condition");
     reject_nested_column_operation(*condition.RightReference(), "a join condition");
   }

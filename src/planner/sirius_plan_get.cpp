@@ -511,6 +511,39 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
   return source;
 }
 
+duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> extract_unpushed_scan_filters(
+  duckdb::LogicalGet const& op, duckdb::TableFilterSet& table_filters)
+{
+  if (!op.function.supports_pushdown_type) { return {}; }
+  auto const& column_ids     = op.GetColumnIds();
+  auto const& projection_ids = op.projection_ids;
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
+  duckdb::unordered_set<std::size_t> to_remove;
+  for (auto& entry : table_filters) {
+    auto column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
+    auto& type     = op.returned_types[column_id];
+
+    // If the table function doesn't support pushdown for this column type,
+    // create a separate filter operator for it
+    if (!op.function.supports_pushdown_type(*op.bind_data, column_id)) {
+      auto const pos = std::find(projection_ids.begin(), projection_ids.end(), entry.GetIndex());
+      if (!projection_ids.empty() && pos == projection_ids.end()) {
+        throw duckdb::InternalException("Filter column is missing from the scan projection");
+      }
+      std::size_t column_id_filter = projection_ids.empty()
+                                       ? entry.GetIndex().GetIndex()
+                                       : static_cast<std::size_t>(pos - projection_ids.begin());
+      auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, column_id_filter);
+      select_list.push_back(entry.Filter().ToExpression(*column));
+      to_remove.insert(entry.GetIndex());
+    }
+  }
+  for (auto& col : to_remove) {
+    table_filters.RemoveFilterByColumnIndex(duckdb::ProjectionIndex(col));
+  }
+  return select_list;
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
@@ -582,7 +615,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   std::shared_ptr<sirius::scan_manager::pinned_entry const> pinned_owner;
   sirius::scan_manager::pinned_entry const* pinned = nullptr;
   bool serves_insert_deltas                        = false;
-  if (!marked_decline && sirius_state && op.function.GetName().GetIdentifierName() == "seq_scan") {
+  if (!marked_decline && sirius_state && op.function.GetName() == "seq_scan") {
     auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (bind != nullptr && bind->table.IsDuckTable()) {
       auto& table        = bind->table.Cast<duckdb::DuckTableEntry>();
@@ -646,7 +679,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   }
 
   // STREAMING_SOURCE leaf: fragment-declared repo + senders, not a file scan.
-  if (op.function.GetName().GetIdentifierName() == sirius::exec::kStreamSourceFunctionName) {
+  if (op.function.GetName() == sirius::exec::kStreamSourceFunctionName) {
     return create_streaming_source_plan(op);
   }
 
@@ -656,7 +689,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // becomes a clean CPU fallback — the walker's refusal at pipeline conversion
   // surfaces as a mid-query error with none. Conservative for DICT_FSST, which
   // inlines strings up to 16 KiB (see prepare_duckdb_native_walk).
-  if (op.function.GetName().GetIdentifierName() == "seq_scan" && op.bind_data) {
+  if (op.function.GetName() == "seq_scan" && op.bind_data) {
     auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (table_scan_bind != nullptr && table_scan_bind->table.IsDuckTable()) {
       auto& table   = table_scan_bind->table.Cast<duckdb::DuckTableEntry>();
@@ -861,6 +894,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   }
 
   if (table_filters) {
+    auto const* multi_file = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
     for (auto const& filter : table_filters->GetMultiColumnFilters()) {
       auto const& expression =
         duckdb::ExpressionFilter::GetExpressionFilter(*filter, "scan planning");
@@ -870,8 +904,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
         auto const primary = column_ids[index].GetPrimaryIndex();
         if (!duckdb::ExpressionFilter::IsOptionalFilter(expression)) {
-          auto const* multi_file =
-            dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
           if (multi_file) {
             for (auto const& partition : multi_file->reader_bind.hive_partitioning_indexes) {
               if (partition.index == primary) {
@@ -883,8 +915,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           }
         }
         if (primary < op.returned_types.size()) {
-          reject_nested_column_type(
-            op.returned_types[primary], std::to_string(primary), "a filter predicate");
+          auto const column_name = primary < op.names.size() ? op.names[primary].GetIdentifierName()
+                                                             : std::to_string(primary);
+          reject_nested_column_type(op.returned_types[primary], column_name, "a filter predicate");
         }
       }
       if (!duckdb::ExpressionFilter::IsOptionalFilter(expression) &&
@@ -935,27 +968,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 
   // Handle cases where table function doesn't support pushdown for specific column types
   if (table_filters && op.function.supports_pushdown_type) {
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
-    duckdb::unordered_set<std::size_t> to_remove;
-    for (auto& entry : *table_filters) {
-      auto column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
-      auto& type     = op.returned_types[column_id];
-
-      // If the table function doesn't support pushdown for this column type,
-      // create a separate filter operator for it
-      if (!op.function.supports_pushdown_type(*op.bind_data, column_id)) {
-        auto const pos = std::find(projection_ids.begin(), projection_ids.end(), entry.GetIndex());
-        std::size_t column_id_filter = projection_ids.empty()
-                                         ? entry.GetIndex().GetIndex()
-                                         : static_cast<std::size_t>(pos - projection_ids.begin());
-        auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, column_id_filter);
-        select_list.push_back(entry.Filter().ToExpression(*column));
-        to_remove.insert(entry.GetIndex());
-      }
-    }
-    for (auto& col : to_remove) {
-      table_filters->RemoveFilterByColumnIndex(duckdb::ProjectionIndex(col));
-    }
+    auto select_list = extract_unpushed_scan_filters(op, *table_filters);
 
     if (!select_list.empty()) {
       duckdb::vector<duckdb::LogicalType> filter_types;

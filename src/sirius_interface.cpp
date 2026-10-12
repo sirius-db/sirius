@@ -85,7 +85,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
   duckdb::ClientContext& context,
   const duckdb::string& query,
   duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-  const duckdb::QueryParameters& parameters,
+  const duckdb::QueryParameters& /*parameters*/,
   sirius::query_id_t query_id)
 {
   D_ASSERT(!sirius_active_query);
@@ -95,8 +95,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
     sirius_active_query->sirius_prepared = std::move(statement_p);
     auto& prepared                       = *sirius_active_query->sirius_prepared;
     duckdb::identifier_map_t<duckdb::BoundParameterData> empty_parameters;
-    prepared.prepared->Bind(
-      context, parameters.statement_args ? *parameters.statement_args : empty_parameters);
+    prepared.prepared->Bind(context, empty_parameters);
 
     sirius_active_query->engine =
       duckdb::make_uniq<sirius_engine>(context, query_id, query_label, session_label);

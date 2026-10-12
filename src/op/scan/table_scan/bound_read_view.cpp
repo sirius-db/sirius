@@ -52,6 +52,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 
 namespace sirius::op::scan {
 namespace {
@@ -96,21 +98,22 @@ void boolean(std::string& out, bool value) { append(out, 'b', value ? "1" : "0")
 template <typename MAP, typename VALUE>
 void append_sorted_map(std::string& out, MAP const& map, VALUE&& encode_value)
 {
-  std::vector<std::string> keys;
-  keys.reserve(map.size());
-  for (auto const& [key, unused] : map) {
-    (void)unused;
+  using mapped_type = std::remove_cvref_t<decltype(map.begin()->second)>;
+  std::vector<std::pair<std::string, mapped_type const*>> entries;
+  entries.reserve(map.size());
+  for (auto const& [key, value] : map) {
     if constexpr (std::is_same_v<typename MAP::key_type, duckdb::Identifier>) {
-      keys.push_back(key.GetIdentifierName());
+      entries.emplace_back(key.GetIdentifierName(), &value);
     } else {
-      keys.push_back(key);
+      entries.emplace_back(key, &value);
     }
   }
-  std::sort(keys.begin(), keys.end());
-  number(out, keys.size());
-  for (auto const& key : keys) {
+  std::sort(
+    entries.begin(), entries.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+  number(out, entries.size());
+  for (auto const& [key, value] : entries) {
     append(out, 'k', key);
-    encode_value(out, map.at(typename MAP::key_type(key)));
+    encode_value(out, *value);
   }
 }
 

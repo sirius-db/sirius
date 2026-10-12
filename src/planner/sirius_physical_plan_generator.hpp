@@ -62,6 +62,7 @@ class LogicalProjection;
 class LogicalSetOperation;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
+class TableFilterSet;
 }  // namespace duckdb
 
 namespace sirius::planner {
@@ -93,6 +94,10 @@ struct scan_contract_provenance {
   std::string_view function_name,
   duckdb::FunctionData const* bind_data,
   duckdb::vector<duckdb::Value> const& parameters);
+
+//! Bind unpushed filters to output positions; the scan projection must include their columns.
+duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> extract_unpushed_scan_filters(
+  duckdb::LogicalGet const& op, duckdb::TableFilterSet& table_filters);
 
 //! The physical plan generator generates a physical execution plan from a
 //! logical query plan
