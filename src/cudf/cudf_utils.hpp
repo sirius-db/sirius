@@ -16,13 +16,11 @@
 
 #pragma once
 
+#include "cudf/ast_compat.hpp"
 #include "helper/logical_type.hpp"
 #include "sirius/exception.hpp"
 
-#include <variant>
-
 #include <cudf/aggregation.hpp>
-#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
@@ -65,6 +63,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius {

@@ -43,15 +43,16 @@
 #include <duckdb/common/enums/expression_type.hpp>
 
 // cudf
-#include <variant>
+#include "cudf/ast_compat.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
+
+#include <variant>
 
 // cuda
 #include <cuda_runtime_api.h>

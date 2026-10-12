@@ -99,12 +99,12 @@ execute_process(
 
 vcpkg_cmake_config_fixup(PACKAGE_NAME kvikio CONFIG_PATH lib/cmake/kvikio)
 
-# KvikIO's exported target references CURL::libcurl because remote support is on.
+# KvikIO's exported target references CURL::libcurl because remote support is
+# on.
 vcpkg_replace_string(
   "${CURRENT_PACKAGES_DIR}/share/kvikio/kvikio-dependencies.cmake"
   "include(CMakeFindDependencyMacro)"
-  "include(CMakeFindDependencyMacro)\nfind_dependency(CURL CONFIG)"
-)
+  "include(CMakeFindDependencyMacro)\nfind_dependency(CURL CONFIG)")
 
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")

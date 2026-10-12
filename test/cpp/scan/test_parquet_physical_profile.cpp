@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 
-#include <variant>
+#include "cudf/ast_compat.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
+
+#include <variant>
 
 // R2a T5: RED_FEATURE after commit (b).
 #include <catch.hpp>

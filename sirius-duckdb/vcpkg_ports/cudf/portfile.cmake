@@ -49,9 +49,9 @@ vcpkg_from_github(
   main)
 
 # librtcx's embed helper uses std::variant without including its header.
-vcpkg_replace_string("${RTCX_PATH}/include/rtcx/embed.hpp"
-                     "#include <utility>\n#include <vector>"
-                     "#include <utility>\n#include <variant>\n#include <vector>")
+vcpkg_replace_string(
+  "${RTCX_PATH}/include/rtcx/embed.hpp" "#include <utility>\n#include <vector>"
+  "#include <utility>\n#include <variant>\n#include <vector>")
 
 # Use the static CUDA redistributables supplied by the overlay ports.
 vcpkg_replace_string(
@@ -115,8 +115,8 @@ vcpkg_replace_string(
   "set(CPM_DOWNLOAD_zstd ON)"
   "# CPM_DOWNLOAD_zstd removed - using CPM_zstd_SOURCE instead")
 
-# cuDF only needs DLPack headers. Use the installed vcpkg package directly;
-# its nested include path does not match rapids-cmake's generated module probe.
+# cuDF only needs DLPack headers. Use the installed vcpkg package directly; its
+# nested include path does not match rapids-cmake's generated module probe.
 vcpkg_replace_string(
   "${SOURCE_PATH}/cpp/cmake/thirdparty/get_dlpack.cmake"
   "find_and_configure_dlpack(\${CUDF_MIN_VERSION_dlpack} \${CUDF_EXCLUDE_DEPS_FROM_ALL})"
@@ -124,23 +124,22 @@ vcpkg_replace_string(
 
 # The 26.10 AST header uses std::variant without including its header.
 vcpkg_replace_string(
-  "${SOURCE_PATH}/cpp/include/cudf/ast/expressions.hpp"
-  "#include <vector>"
+  "${SOURCE_PATH}/cpp/include/cudf/ast/expressions.hpp" "#include <vector>"
   "#include <variant>\n#include <vector>")
 
 # cuDF asks CPM to download xxhash unconditionally. Use the installed vcpkg
 # package and its generated find module instead.
 vcpkg_replace_string(
   "${SOURCE_PATH}/cpp/cmake/thirdparty/get_xxhash.cmake"
-  "set(CPM_DOWNLOAD_xxhash ON)"
-  "# Use the vcpkg xxhash package")
+  "set(CPM_DOWNLOAD_xxhash ON)" "# Use the vcpkg xxhash package")
 vcpkg_replace_string(
   "${SOURCE_PATH}/cpp/cmake/thirdparty/get_xxhash.cmake"
   "if(xxhash_ADDED AND NOT TARGET xxhash)"
-  "if(NOT TARGET xxhash)\n  add_library(xxhash INTERFACE IMPORTED)\n  set_target_properties(xxhash PROPERTIES INTERFACE_INCLUDE_DIRECTORIES \"${CURRENT_INSTALLED_DIR}/include\")\nendif()\nif(xxhash_ADDED AND NOT TARGET xxhash)")
+  "if(NOT TARGET xxhash)\n  add_library(xxhash INTERFACE IMPORTED)\n  set_target_properties(xxhash PROPERTIES INTERFACE_INCLUDE_DIRECTORIES \"${CURRENT_INSTALLED_DIR}/include\")\nendif()\nif(xxhash_ADDED AND NOT TARGET xxhash)"
+)
 
-# Preserve explicit static NVRTC/NVJitLink settings without forcing every
-# cuDF dependency to be downloaded and rebuilt through CPM.
+# Preserve explicit static NVRTC/NVJitLink settings without forcing every cuDF
+# dependency to be downloaded and rebuilt through CPM.
 vcpkg_replace_string(
   "${SOURCE_PATH}/cpp/CMakeLists.txt"
   [[if(CUDF_BUILD_STATIC_DEPS STREQUAL "FORCE")
@@ -211,8 +210,7 @@ vcpkg_cmake_config_fixup(PACKAGE_NAME rtcx CONFIG_PATH lib/cmake/rtcx)
 vcpkg_replace_string(
   "${CURRENT_PACKAGES_DIR}/share/rtcx/rtcx-dependencies.cmake"
   "include(CMakeFindDependencyMacro)"
-  "include(CMakeFindDependencyMacro)\nfind_dependency(zstd CONFIG)"
-)
+  "include(CMakeFindDependencyMacro)\nfind_dependency(zstd CONFIG)")
 
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")

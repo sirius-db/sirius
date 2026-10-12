@@ -6,14 +6,12 @@
  */
 
 #include "catch.hpp"
+#include "cudf/ast_compat.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/templated_ioctx.hpp"
 #include "op/scan/parquet_materialize.hpp"
 #include "utils/utils.hpp"
 
-#include <variant>
-
-#include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
@@ -36,6 +34,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {

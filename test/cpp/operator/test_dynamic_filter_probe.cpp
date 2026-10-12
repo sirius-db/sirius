@@ -28,10 +28,9 @@
  *        through 64-bit XXHash_64 fingerprints (pinned against a host reference of the same hash).
  */
 
-#include <cudf/aggregation.hpp>
-#include <variant>
+#include "cudf/ast_compat.hpp"
 
-#include <cudf/ast/expressions.hpp>
+#include <cudf/aggregation.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/hashing.hpp>
@@ -67,6 +66,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using sirius::op::classify_membership_key;

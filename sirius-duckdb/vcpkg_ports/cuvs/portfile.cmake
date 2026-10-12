@@ -94,9 +94,9 @@ vcpkg_replace_string(
 
 # cuVS consumes RTCX, which is installed by the cuDF port and declared as a
 # direct manifest dependency below. Static link forces BUILD_TESTS/
-# BUILD_C_LIBRARY/BUILD_CAGRA_HNSWLIB OFF (so no
-# gtest/hnswlib source is needed). BUILD_MG_ALGOS OFF drops the multi-GPU/NCCL
-# path. Sirius uses GPU brute-force and IVF-Flat; disable CPU OpenMP support.
+# BUILD_C_LIBRARY/BUILD_CAGRA_HNSWLIB OFF (so no gtest/hnswlib source is
+# needed). BUILD_MG_ALGOS OFF drops the multi-GPU/NCCL path. Sirius uses GPU
+# brute-force and IVF-Flat; disable CPU OpenMP support.
 vcpkg_cmake_configure(
   SOURCE_PATH
   "${SOURCE_PATH}/cpp"

@@ -16,13 +16,11 @@
 
 #pragma once
 
+#include "cudf/ast_compat.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
-#include <variant>
-
 #include <cudf/ast/ast_operator.hpp>
-#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -42,6 +40,7 @@
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 namespace sirius::op {

@@ -25,13 +25,14 @@
 #include <duckdb/common/exception.hpp>
 
 // cudf
-#include <variant>
+#include "cudf/ast_compat.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/types.hpp>
 #include <cudf/wrappers/timestamps.hpp>
+
+#include <variant>
 
 // rmm
 #include <cuda/stream>

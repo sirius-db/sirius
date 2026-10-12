@@ -16,9 +16,8 @@
 
 #pragma once
 
-#include <variant>
+#include "cudf/ast_compat.hpp"
 
-#include <cudf/ast/expressions.hpp>
 #include <cudf/table/table.hpp>
 
 #include <cuda/stream>
@@ -31,6 +30,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <variant>
 
 namespace sirius::op::scan {
 
