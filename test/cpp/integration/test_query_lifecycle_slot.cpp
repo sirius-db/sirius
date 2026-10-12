@@ -1185,7 +1185,8 @@ void run_ac6_capture_generation(duckdb::Connection& connection,
     return;
   }
   auto const stats_after_prepare = sirius::test::get_transparent_execution_stats(connection);
-  if (stats_after_prepare.successful_rebinds != stats_before_prepare.successful_rebinds) {
+  // v2 finalizes the physical plan during Prepare. It must use the new binding scope.
+  if (stats_after_prepare.successful_rebinds != stats_before_prepare.successful_rebinds + 1) {
     duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
       *connection.context, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(true));
     (void)connection.Query("ROLLBACK;");

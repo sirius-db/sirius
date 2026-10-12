@@ -2763,7 +2763,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 {
   for (auto const& [option, expected_error] : std::vector<std::pair<std::string, std::string>>{
          {"filename=true", "Option filename adds column \"filename\""},
-         {"file_row_number=true", "Using file_row_number option on file with column named"}}) {
+         {"file_row_number=true", "Option file_row_number adds column"}}) {
     auto const query = "SELECT * FROM read_parquet(" +
                        scratch.file_literal("physical_names.parquet") +
                        ", hive_partitioning=false, " + option + ");";
