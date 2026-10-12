@@ -38,11 +38,13 @@
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/chunk_row_set.hpp>
 #include <codegen/selection/selection.hpp>
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -282,29 +284,6 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
     checked->view(), int32_map(selection.local_indices, selection.survivors), stream, mr);
 }
 
-/// A CUDA event on the device that is current at construction. Recording and
-/// waiting may happen with any device current, which is what orders one GPU's
-/// stream behind another's.
-class scoped_event {
- public:
-  scoped_event() { CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&_event, cudaEventDisableTiming)); }
-  ~scoped_event() { (void)cudaEventDestroy(_event); }
-  scoped_event(scoped_event const&)            = delete;
-  scoped_event& operator=(scoped_event const&) = delete;
-
-  void record(::cuda::stream_ref stream) const
-  {
-    CUCASCADE_CUDA_TRY(cudaEventRecord(_event, stream.get()));
-  }
-  void wait(::cuda::stream_ref stream) const
-  {
-    CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(stream.get(), _event, 0));
-  }
-
- private:
-  cudaEvent_t _event{};
-};
-
 /// Buffers released from a column on another GPU. They stay alive here until
 /// the copies that read them have been ordered ahead of their frees.
 using retired_buffers = std::vector<std::unique_ptr<rmm::device_buffer>>;
@@ -382,13 +361,15 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
   auto const owner_stream = owner.acquire_stream();
   auto const owner_mr     = owner.get_default_allocator();
 
-  // The selection was built on the consumer's stream; the owner follows it.
-  scoped_event const selection_ready;
+  // The selection was built on the consumer's stream; the owner follows it. An
+  // event belongs to the device current when it is created, so the consumer's
+  // are created outside the owner guard and the owner's inside it.
+  cucascade::cuda::cuda_event selection_ready;
   selection_ready.record(stream);
 
   std::unique_ptr<cudf::column> gathered;
   rmm::device_buffer owner_map;
-  std::unique_ptr<scoped_event> gathered_ready;
+  std::optional<cucascade::cuda::cuda_event> gathered_ready;
   {
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{owner_device}};
     selection_ready.wait(owner_stream);
@@ -406,7 +387,7 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
       gathered = gather_one(
         source.uncompressed, int32_map(owner_map, selection.survivors), owner_stream, owner_mr);
     }
-    gathered_ready = std::make_unique<scoped_event>();
+    gathered_ready.emplace();
     gathered_ready->record(owner_stream);
   }
 
@@ -417,7 +398,7 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
 
   // Everything the owner allocated is freed on the owner's stream as it goes
   // out of scope; that free has to come after the copies above have read it.
-  scoped_event const copied;
+  cucascade::cuda::cuda_event copied;
   copied.record(stream);
   {
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{owner_device}};
