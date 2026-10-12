@@ -36,13 +36,13 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
-#include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
+#include <cuda/memory_resource>
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
@@ -304,7 +304,9 @@ struct spread_pin {
 
 /// A memory resource that fails exactly one allocation -- the @p fail_at-th
 /// one it sees -- and passes everything else upstream. Negative never fails.
-class failing_resource final : public rmm::mr::device_memory_resource {
+/// Written against the cuda::mr interface rmm 26 resources use (see
+/// cucascade::memory::null_device_memory_resource for the minimal shape).
+class failing_resource {
  public:
   explicit failing_resource(rmm::device_async_resource_ref upstream, long fail_at = -1)
     : _upstream{upstream}, _fail_at{fail_at}
@@ -312,22 +314,35 @@ class failing_resource final : public rmm::mr::device_memory_resource {
   }
   [[nodiscard]] long allocations() const noexcept { return _seen; }
 
- private:
-  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override
+  void* allocate(::cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t))
   {
     if (_seen++ == _fail_at) { throw rmm::out_of_memory("injected allocation failure"); }
-    return _upstream.allocate_async(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT, stream);
+    return _upstream.allocate(stream, bytes, alignment);
   }
-  void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override
+  void deallocate(::cuda::stream_ref stream,
+                  void* p,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    _upstream.deallocate_async(ptr, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT, stream);
+    _upstream.deallocate(stream, p, bytes, alignment);
   }
-  [[nodiscard]] bool do_is_equal(
-    rmm::mr::device_memory_resource const& other) const noexcept override
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
-    return this == &other;
+    if (_seen++ == _fail_at) { throw rmm::out_of_memory("injected allocation failure"); }
+    return _upstream.allocate_sync(bytes, alignment);
   }
+  void deallocate_sync(void* p,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    _upstream.deallocate_sync(p, bytes, alignment);
+  }
+  bool operator==(failing_resource const& other) const noexcept { return this == &other; }
+  friend void get_property(failing_resource const&, ::cuda::mr::device_accessible) noexcept {}
 
+ private:
   rmm::device_async_resource_ref _upstream;
   long _fail_at;
   long _seen = 0;
