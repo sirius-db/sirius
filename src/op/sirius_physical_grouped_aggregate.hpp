@@ -55,7 +55,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
     duckdb::vector<std::unique_ptr<sirius::ast::node>> groups,
     duckdb::vector<duckdb::GroupingSet> grouping_sets,
-    duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions,
+    duckdb::vector<duckdb::unsafe_vector<duckdb::ProjectionIndex>> grouping_functions,
     std::size_t estimated_cardinality,
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity,

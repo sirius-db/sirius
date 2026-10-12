@@ -27,10 +27,13 @@
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/execution/executor.hpp>
 #include <duckdb/execution/operator/helper/physical_result_collector.hpp>
+#include <duckdb/execution/operator/helper/physical_result_sink.hpp>
+#include <duckdb/main/buffered_data/batched_buffered_data.hpp>
+#include <duckdb/main/buffered_data/simple_buffered_data.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_context.hpp>
-#include <duckdb/main/pending_query_result.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+#include <duckdb/main/query_parameters.hpp>
 #include <duckdb/main/query_result.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
@@ -66,13 +69,22 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
   duckdb::PreparedStatementData& cpu_prepared,
   duckdb::unique_ptr<duckdb::Executor>& out_executor)
 {
-  // Force a materialized (non-streaming) result so the whole plan runs before any
-  // row is streamed out of the operator.
-  cpu_prepared.output_type = duckdb::QueryResultOutputType::FORCE_MATERIALIZED;
-  cpu_prepared.memory_type = duckdb::QueryResultMemoryType::IN_MEMORY;
-
   auto collector = duckdb::PhysicalResultCollector::GetResultCollector(client, cpu_prepared);
   D_ASSERT(collector->type == duckdb::PhysicalOperatorType::RESULT_COLLECTOR);
+  auto& sink = collector->Cast<duckdb::PhysicalResultSink>();
+  duckdb::ResultFormatContext format_context{
+    cpu_prepared.types, cpu_prepared.names, client.GetClientProperties(), sink.ordering};
+  // Decide retention before scheduling so nested producers never wait on the
+  // outer query to consume their result.
+  duckdb::shared_ptr<duckdb::BufferedData> buffer;
+  if (sink.ordering == duckdb::ResultOrdering::BATCH_INDEX_ORDERED) {
+    buffer = duckdb::make_shared_ptr<duckdb::BatchedBufferedData>(
+      client, duckdb::ResultLifetime::RETAINED, std::move(format_context), nullptr);
+  } else {
+    buffer = duckdb::make_shared_ptr<duckdb::SimpleBufferedData>(
+      client, duckdb::ResultLifetime::RETAINED, std::move(format_context), nullptr);
+  }
+  sink.SetResultBuffer(buffer);
 
   // Suppress profiling for the nested run: it shares the context's single
   // QueryProfiler with the outer query, so letting it re-initialize would corrupt
@@ -84,10 +96,11 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
   out_executor   = duckdb::make_uniq<duckdb::Executor>(client);
   auto& executor = *out_executor;
   try {
+    executor.SetResultBuffer(buffer);
     executor.Initialize(std::move(collector));
-    duckdb::PendingExecutionResult exec_result;
-    while (!duckdb::PendingQueryResult::IsResultReady(exec_result = executor.ExecuteTask())) {
-      if (exec_result == duckdb::PendingExecutionResult::BLOCKED) { executor.WaitForTask(); }
+    duckdb::QueryResultState exec_result;
+    while (!duckdb::IsTerminal(exec_result = executor.ExecuteTask())) {
+      if (exec_result == duckdb::QueryResultState::BLOCKED) { executor.WaitForTask(); }
     }
     if (executor.HasError()) { executor.ThrowException(); }
     auto result                   = executor.GetResult();
@@ -113,7 +126,7 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   std::vector<sirius::op::scan::bound_read_view> physical_original_views,
   std::string query_sql,
   duckdb::vector<duckdb::LogicalType> types,
-  duckdb::vector<std::string> names,
+  duckdb::vector<duckdb::Identifier> names,
   duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
   plan_source_policy source_policy,
   duckdb::idx_t estimated_cardinality,
@@ -349,7 +362,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       }
 
       // Execute via the standard sirius_interface path.
-      duckdb::PendingQueryParameters parameters;
+      duckdb::QueryParameters parameters;
       state.result = state.iface->sirius_execute_query(
         context.client, "transparent_execution", gpu_prepared, parameters, window->query_id());
 
@@ -458,7 +471,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       auto captured_transaction = captured_transaction_id_;
       if (injections && injections->transaction_mismatch && captured_transaction)
         *captured_transaction ^= 1;
-      if (injections && injections->interrupt_before_replay) context.client.interrupted = true;
+      if (injections && injections->interrupt_before_replay) context.client.Interrupt();
       auto admission = admit_cpu_replay(
         context.client, read_only, captured_transaction, non_rollbackable_state, false);
       failure_trace.replay     = admission.admitted;

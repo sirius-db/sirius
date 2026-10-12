@@ -165,7 +165,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_table_scan> make_scan(
   auto returned_types = types;
   auto scan           = duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
     std::move(types),
-    std::move(function),
+    duckdb::BoundTableFunction(std::move(function)),
     /*bind_data=*/nullptr,
     std::move(returned_types),
     std::move(column_ids),
@@ -215,7 +215,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> make_hash_join(
   duckdb::unique_ptr<sirius_physical_operator> right,
   duckdb::vector<duckdb::LogicalType> output_types)
 {
-  duckdb::LogicalDummyScan stub(0);
+  duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
   stub.types = std::move(output_types);
   duckdb::vector<sirius::join_condition> conditions;
   sirius::join_condition condition;
@@ -270,7 +270,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
     std::move(expressions),
     std::move(groups),
     std::move(grouping_sets),
-    duckdb::vector<duckdb::unsafe_vector<std::size_t>>{},
+    duckdb::vector<duckdb::unsafe_vector<duckdb::ProjectionIndex>>{},
     /*estimated_cardinality=*/1,
     duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
     duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
@@ -500,7 +500,7 @@ TEST_CASE("tier_narrowing_policy - grouped-aggregate keys keep narrow only when 
   SECTION("multiple grouping sets make the aggregate ineligible")
   {
     duckdb::vector<duckdb::GroupingSet> grouping_sets;
-    grouping_sets.push_back(duckdb::GroupingSet{0});
+    grouping_sets.push_back(duckdb::GroupingSet{duckdb::ProjectionIndex(0)});
     grouping_sets.push_back(duckdb::GroupingSet{});
     auto plan = make_grouped_aggregate(
       {0}, {1}, make_integer_scan(2, {k_int8, k_int8}), std::move(grouping_sets));

@@ -16,11 +16,14 @@
 
 #pragma once
 
-#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/common/identifier.hpp>
+#include <duckdb/common/shared_ptr.hpp>
 #include <duckdb/common/typedefs.hpp>
-#include <duckdb/main/client_context.hpp>
-#include <duckdb/main/database_manager.hpp>
-#include <duckdb/transaction/duck_transaction.hpp>
+
+namespace duckdb {
+class ClientContext;
+class AttachedDatabase;
+}  // namespace duckdb
 
 namespace sirius::helper {
 
@@ -38,11 +41,9 @@ namespace sirius::helper {
 /// has its own start_time counter. This helper returns the default DB's value.
 /// Callers targeting a specific AttachedDatabase should call
 /// DuckTransaction::Get(context, that_catalog).start_time directly.
-inline duckdb::transaction_t get_query_start_time(duckdb::ClientContext& context)
-{
-  const auto& default_db_name = duckdb::DatabaseManager::Get(context).GetDefaultDatabase(context);
-  auto& default_catalog       = duckdb::Catalog::GetCatalog(context, default_db_name);
-  return duckdb::DuckTransaction::Get(context, default_catalog).start_time;
-}
+duckdb::transaction_t get_query_start_time(duckdb::ClientContext& context);
+
+duckdb::shared_ptr<duckdb::AttachedDatabase> find_global_database(duckdb::ClientContext& context,
+                                                                  duckdb::Identifier const& name);
 
 }  // namespace sirius::helper

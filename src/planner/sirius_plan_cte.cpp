@@ -41,16 +41,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
   // Initialize an empty vector to collect the scan operators.
   auto right = create_plan(*op.children[1]);
 
-  // _types must match the producer/materialization side (left = children[0]) because execute()
-  // is a passthrough that forwards the producer's batches. The previous right->types declaration
-  // misrepresented the operator's output schema and tripped the column-count validator in
-  // gpu_pipeline_task.cpp — silently at runtime, but visibly noisy in logs at scale.
-  // Capture left->types before std::move(left) so argument evaluation order is well-defined.
-  auto producer_types = left->types;
+  // Parents consume the CTE's result; its materialization sink has a separate schema.
+  auto result_types = right->types;
   duckdb::unique_ptr<sirius::op::sirius_physical_cte> cte;
-  cte                = duckdb::make_uniq<sirius::op::sirius_physical_cte>(op.ctename,
-                                                           op.table_index,
-                                                           std::move(producer_types),
+  cte = duckdb::make_uniq<sirius::op::sirius_physical_cte>(op.ctename.GetIdentifierName(),
+                                                           op.table_index.index,
+                                                           std::move(result_types),
                                                            std::move(left),
                                                            std::move(right),
                                                            op.estimated_cardinality);

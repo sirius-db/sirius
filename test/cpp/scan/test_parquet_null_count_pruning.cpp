@@ -27,6 +27,7 @@
 
 // test
 #include <catch.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 // sirius
 #include <io/kvikio/kvikio_context.hpp>
@@ -108,15 +109,15 @@ class NullCountFixture {
 
     std::vector<std::int64_t> const expected_nulls{2048, 0, 1024};
     for (duckdb::idx_t i = 0; i < 3; i++) {
-      auto const rows = layout->GetValue(0, i).GetValue<std::int64_t>();
+      auto const rows = layout->Collection().GetValue(0, i).GetValue<std::int64_t>();
       if (rows != 2048) {
         UNSCOPED_INFO("row group " << i << " has " << rows << " rows, expected 2048");
         REQUIRE(rows == 2048);
       }
       // Absent statistics would make the pruning untestable, not merely
       // unverified — null_count is what the feature reads.
-      REQUIRE_FALSE(layout->GetValue(1, i).IsNull());
-      auto const nulls = layout->GetValue(1, i).GetValue<std::int64_t>();
+      REQUIRE_FALSE(layout->Collection().GetValue(1, i).IsNull());
+      auto const nulls = layout->Collection().GetValue(1, i).GetValue<std::int64_t>();
       if (nulls != expected_nulls[i]) {
         UNSCOPED_INFO("row group " << i << " has " << nulls << " NULLs, expected "
                                    << expected_nulls[i]);
@@ -143,9 +144,11 @@ class NullCountFixture {
       auto filters = duckdb::make_uniq<duckdb::TableFilterSet>();
       // Column 1 is `v`; the index is into column_ids.
       if (*filter_expects_null) {
-        filters->PushFilter(duckdb::ColumnIndex(1), duckdb::make_uniq<duckdb::IsNullFilter>());
+        filters->PushFilter(duckdb::ProjectionIndex(1),
+                            sirius::test::null_filter(duckdb::LogicalType::INTEGER));
       } else {
-        filters->PushFilter(duckdb::ColumnIndex(1), duckdb::make_uniq<duckdb::IsNotNullFilter>());
+        filters->PushFilter(duckdb::ProjectionIndex(1),
+                            sirius::test::null_filter(duckdb::LogicalType::INTEGER, true));
       }
       info->table_filters = std::move(filters);
     }
@@ -218,9 +221,9 @@ TEST_CASE_METHOD(NullCountFixture,
                               sirius::logical_type::make(sirius::type_id::BIGINT),
                               scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER}};
   auto filters            = duckdb::make_uniq<duckdb::TableFilterSet>();
-  auto lower_third_rg     = duckdb::make_uniq<duckdb::ConstantFilter>(
+  auto lower_third_rg     = sirius::test::constant_filter(
     duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(4097));
-  filters->PushFilter(duckdb::ColumnIndex(0), std::move(lower_third_rg));
+  filters->PushFilter(duckdb::ProjectionIndex(0), std::move(lower_third_rg));
   info->table_filters = std::move(filters);
 
   auto ingestible = scan::make_ingestible(std::move(info));

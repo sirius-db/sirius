@@ -309,7 +309,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
   //! Join Keys statistics (optional)
-  duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
   void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
   {

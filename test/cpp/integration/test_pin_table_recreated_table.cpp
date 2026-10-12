@@ -57,10 +57,8 @@ void expect_fallback_matches_cpu(sirius::test::GpuExecutionFixture& fx, const st
   REQUIRE(cpu_result);
   REQUIRE_FALSE(cpu_result->HasError());
 
-  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    gpu_result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    cpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*gpu_result);
+  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*cpu_result);
   REQUIRE(gpu_rows == cpu_rows);
 }
 
@@ -89,10 +87,12 @@ std::uint64_t checkpoint_iteration(duckdb::Connection& con,
   std::uint64_t iteration = 0;
   con.BeginTransaction();
   try {
-    auto& table_entry =
-      duckdb::Catalog::GetEntry(
-        *con.context, duckdb::CatalogType::TABLE_ENTRY, attach_alias, "main", table_name)
-        .Cast<duckdb::DuckTableEntry>();
+    auto& table_entry = duckdb::Catalog::GetEntry(*con.context,
+                                                  duckdb::CatalogType::TABLE_ENTRY,
+                                                  duckdb::Identifier(attach_alias),
+                                                  "main",
+                                                  duckdb::Identifier(table_name))
+                          .Cast<duckdb::DuckTableEntry>();
     auto const* block_manager = dynamic_cast<duckdb::SingleFileBlockManager const*>(
       &table_entry.GetStorage().GetAttached().GetStorageManager().GetBlockManager());
     REQUIRE(block_manager != nullptr);

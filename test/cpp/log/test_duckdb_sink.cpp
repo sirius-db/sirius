@@ -63,7 +63,8 @@ TEST_CASE("duckdb sink forwards Sirius logs into duckdb_logs", "[log]")
 
   bool found = false;
   for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
-    if (result->GetValue(0, i).ToString().find("duckdb sink marker 4242") != std::string::npos) {
+    if (result->Collection().GetValue(0, i).ToString().find("duckdb sink marker 4242") !=
+        std::string::npos) {
       found = true;
     }
   }

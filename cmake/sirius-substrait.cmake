@@ -6,10 +6,29 @@
 # loadable extension — so there is no symbol collision with conda/system
 # protobuf or a duplicate extension.
 set(SIRIUS_SUBSTRAIT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/substrait")
+# Keep the vendored reader pinned while applying its DuckDB v2 API port in the
+# build tree.
+set(SIRIUS_SUBSTRAIT_READER_DIR "${CMAKE_CURRENT_BINARY_DIR}/substrait-v2")
+set(SIRIUS_SUBSTRAIT_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/substrait-v2.patch")
+file(MAKE_DIRECTORY "${SIRIUS_SUBSTRAIT_READER_DIR}")
+configure_file("${SIRIUS_SUBSTRAIT_DIR}/src/from_substrait.cpp"
+               "${SIRIUS_SUBSTRAIT_READER_DIR}/from_substrait.cpp" COPYONLY)
+set_property(
+  DIRECTORY
+  APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS "${SIRIUS_SUBSTRAIT_PATCH}")
+find_package(Git REQUIRED)
+execute_process(
+  COMMAND
+    "${CMAKE_COMMAND}" -E env
+    "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}" "${GIT_EXECUTABLE}"
+    apply "${SIRIUS_SUBSTRAIT_PATCH}"
+  WORKING_DIRECTORY "${SIRIUS_SUBSTRAIT_READER_DIR}" COMMAND_ERROR_IS_FATAL ANY)
 file(GLOB_RECURSE SIRIUS_SUBSTRAIT_PROTOBUF_SOURCES
      "${SIRIUS_SUBSTRAIT_DIR}/third_party/google/protobuf/*.cc")
 set(SIRIUS_SUBSTRAIT_SOURCES
-    ${SIRIUS_SUBSTRAIT_DIR}/src/from_substrait.cpp
+    ${SIRIUS_SUBSTRAIT_READER_DIR}/from_substrait.cpp
     ${SIRIUS_SUBSTRAIT_DIR}/src/custom_extensions.cpp
     ${SIRIUS_SUBSTRAIT_DIR}/src/custom_extensions_generated.cpp
     ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/algebra.pb.cc

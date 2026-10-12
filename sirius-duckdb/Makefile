@@ -1,6 +1,5 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-OVERRIDE_GIT_DESCRIBE ?= v1.5.6
 DISABLE_SANITIZER ?= 1
 
 SIRIUS_DUCKDB_LINKAGE ?= $(if $(VCPKG_TOOLCHAIN_PATH),static,shared)

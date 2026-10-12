@@ -93,7 +93,7 @@ jobs:
           CUDAARCHS: "75" # 75 for T4 capability; 89 for L4 capability
         run: |
           set -o pipefail
-          make -j$(nproc) 2>&1 | tee /tmp/build.log
+          make -j$(nproc) EXTRA_EXTENSION_CONFIGS="$PWD/sirius-duckdb/test/extension_config.cmake" 2>&1 | tee /tmp/build.log
 
       - name: Build shared DuckDB scan host tests
         run: |
@@ -185,26 +185,11 @@ jobs:
           ./build/release/scan-host/scan_host_pic
           ./build/release/scan-host/scan_host_nonpie
 
-      - name: Provision DuckDB extensions the tests load
-        # The iceberg cases LOAD without INSTALL on purpose: a test must not reach the network,
-        # and an INSTALL inside the test would silently paper over an unprovisioned runner
-        # instead of failing with the install command. So provisioning happens here, out of
-        # band. avro comes in as an iceberg dependency but is named explicitly so a failure
-        # says which extension is missing.
-        #
-        # This resolves only because OVERRIDE_GIT_DESCRIBE (sirius-duckdb/Makefile) gives the
-        # build a real DuckDB version. Against the dummy v0.0.1 a shallow submodule would
-        # otherwise produce, there is no extension repository to install from.
+      - name: Install matching test extensions
         run: |
-          for attempt in 1 2 3; do
-            if ./sirius-duckdb/build/release/duckdb -c "INSTALL avro; INSTALL iceberg;"; then
-              exit 0
-            fi
-            echo "::warning::Extension install attempt ${attempt} failed; retrying in $((attempt * 10))s"
-            sleep $((attempt * 10))
-          done
-          echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
-          exit 1
+          ./sirius-duckdb/build/release/duckdb -unsigned -c "
+            INSTALL './sirius-duckdb/build/release/extension/avro/avro.duckdb_extension';
+            INSTALL './sirius-duckdb/build/release/extension/iceberg/iceberg.duckdb_extension';"
 
       - name: Run C++ unit tests
         env:

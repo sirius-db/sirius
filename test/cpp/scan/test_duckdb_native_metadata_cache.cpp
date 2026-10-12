@@ -28,6 +28,7 @@
 #include <duckdb/storage/data_table.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <op/scan/duckdb_native_metadata_cache.hpp>
+#include <utils/table_filter_test_utils.hpp>
 #include <utils/utils.hpp>
 
 #include <atomic>
@@ -60,7 +61,8 @@ duckdb::DataTable& get_storage_in_txn(duckdb::Connection& con, const std::string
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto entry =
+    schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
@@ -86,8 +88,8 @@ filter_ctx make_constant_filter(duckdb::idx_t col_key,
                                 duckdb::Value constant)
 {
   filter_ctx ctx;
-  ctx.filters.filters[col_key] =
-    duckdb::make_uniq<duckdb::ConstantFilter>(cmp, std::move(constant));
+  ctx.filters.SetFilterByColumnIndex(duckdb::ProjectionIndex(col_key),
+                                     sirius::test::constant_filter(cmp, std::move(constant)));
   ctx.column_ids.resize(col_key + 1, duckdb::ColumnIndex(storage_idx));
   ctx.column_ids[col_key] = duckdb::ColumnIndex(storage_idx);
   return ctx;
@@ -367,6 +369,47 @@ TEST_CASE("walk product cache serves repeated query shapes and misses on new pre
   REQUIRE(cache.rebuilds() == 1);  // one snapshot fed every shape
 }
 
+TEST_CASE("walk product cache reuses null, IN and optional predicates",
+          "[scan][duckdb_native_metadata_cache]")
+{
+  auto& cache = duckdb_native_metadata_cache::instance();
+  cache.clear();
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE static_predicates AS SELECT range::INTEGER AS a FROM range(300000)");
+  exec_ok(con, "CHECKPOINT");
+  exec_ok(con, "BEGIN TRANSACTION");
+  auto& storage = get_storage_in_txn(con, "static_predicates");
+  auto f        = make_constant_filter(
+    0, 0, duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::INTEGER(250000));
+  duckdb::unique_ptr<duckdb::TableFilter> predicate;
+  SECTION("IS NULL") { predicate = sirius::test::null_filter(duckdb::LogicalType::INTEGER); }
+  SECTION("IS NOT NULL")
+  {
+    predicate = sirius::test::null_filter(duckdb::LogicalType::INTEGER, true);
+  }
+  SECTION("IN")
+  {
+    predicate =
+      sirius::test::in_filter({duckdb::Value::INTEGER(250000), duckdb::Value::INTEGER(250001)});
+  }
+  SECTION("optional")
+  {
+    predicate = sirius::test::optional_filter(
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_EQUAL,
+                                    duckdb::Value::INTEGER(250000)),
+      duckdb::LogicalType::INTEGER);
+  }
+  REQUIRE(predicate);
+  f.filters = duckdb::TableFilterSet();
+  f.filters.PushFilter(duckdb::ProjectionIndex(0), std::move(predicate));
+  std::vector<projected_column> cols = {real_col(0)};
+  auto first = walk_all(storage, *con.context, cols, int_types(1), &f.filters, &f.column_ids);
+  REQUIRE(first.viable);
+  auto again = walk_all(storage, *con.context, cols, int_types(1), &f.filters, &f.column_ids);
+  REQUIRE(cache.product_hits() == 1);
+  require_same_walk(first, again);
+}
+
 TEST_CASE("walk product cache drops products when the snapshot rebuilds",
           "[scan][duckdb_native_metadata_cache]")
 {
@@ -433,8 +476,8 @@ TEST_CASE("walk product store is dropped when the entry was evicted and recreate
     key.projection_signature = "0:INTEGER;";
     key.prunable_filters.emplace_back(
       0,
-      duckdb::make_uniq<duckdb::ConstantFilter>(
-        duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000)));
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                                    duckdb::Value::INTEGER(250000)));
     return key;
   };
   auto make_view = [](const walk_product_key& key,

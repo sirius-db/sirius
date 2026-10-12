@@ -37,7 +37,9 @@
 #include <duckdb/catalog/catalog_search_path.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_data.hpp>
-#include <duckdb/main/pending_query_result.hpp>
+#include <duckdb/main/query_result.hpp>
+#include <duckdb/main/query_result_stream.hpp>
+#include <duckdb/main/settings.hpp>
 #include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -204,7 +206,7 @@ bool run_prepared_scalar(duckdb::PreparedStatement& prepared,
                          std::string& error)
 {
   duckdb::vector<duckdb::Value> parameters;
-  auto result = prepared.Execute(parameters, false);
+  auto result = prepared.Execute(parameters);
   return require_scalar_result(result.get(), operation, expected, error);
 }
 
@@ -332,14 +334,14 @@ void run_async_scalar_query(duckdb::Connection& connection,
   out.completed.store(true, std::memory_order_release);
 }
 
-void run_async_pending_scalar(duckdb::PendingQueryResult& pending,
+void run_async_pending_scalar(duckdb::QueryResult& pending,
                               std::string const& expected,
                               char const* operation,
                               async_query_result& out)
 {
   try {
-    auto result = pending.Execute();
-    (void)require_scalar_result(result.get(), operation, expected, out.error);
+    pending.Complete();
+    (void)require_scalar_result(&pending, operation, expected, out.error);
   } catch (std::exception const& error) {
     out.error = std::string(operation) + " threw: " + error.what();
   } catch (...) {
@@ -661,20 +663,16 @@ void run_abandoned_result_scenario(std::string const& variant,
 
   // Connection A establishes and then abandons a result, per the variant.
   std::unique_ptr<duckdb::PreparedStatement> prepared;
-  std::unique_ptr<duckdb::QueryResult> streamed;
-  std::unique_ptr<duckdb::PendingQueryResult> pending;
+  std::unique_ptr<duckdb::QueryResultStream<>> streamed;
+  std::unique_ptr<duckdb::QueryResult> pending;
 
   if (variant == "stream") {
     if (!set_gpu_execution(a, true, out.error)) { return; }
     auto const stats_before = sirius::test::get_transparent_execution_stats(a);
     prepared                = a.Prepare("SELECT i FROM t;");
     if (!require_success(prepared.get(), "stream Prepare", out)) { return; }
-    streamed = prepared->Execute();  // streaming by default
+    streamed = std::make_unique<duckdb::QueryResultStream<>>(prepared->Submit());
     if (!require_success(streamed.get(), "stream Execute", out)) { return; }
-    if (streamed->type != duckdb::QueryResultType::STREAM_RESULT) {
-      out.error = "stream Execute did not return a streaming result";
-      return;
-    }
     auto chunk = streamed->Fetch();
     if (!chunk || chunk->size() == 0) {
       out.error = "stream Execute produced no first chunk";
@@ -693,7 +691,7 @@ void run_abandoned_result_scenario(std::string const& variant,
     if (gpu_follow_up) { ac1_context = sirius::test::get_registered_sirius_context(a); }
     auto const pending_execution_baseline =
       ac1_context ? ac1_context->get_transparent_execution_stats().executions : 0;
-    pending = prepared->PendingQuery();  // created, never executed to a result
+    pending = prepared->Submit();  // created, never executed to a result
     if (!require_success(pending.get(), "prepared PendingQuery", out)) { return; }
     if (gpu_follow_up) {
       // DuckDB may legally schedule a PendingQuery's pipeline on a background
@@ -739,10 +737,6 @@ void run_abandoned_result_scenario(std::string const& variant,
     {
       auto first = prepared->Execute();
       if (!require_success(first.get(), "cached first Execute", out)) { return; }
-      if (first->type != duckdb::QueryResultType::STREAM_RESULT) {
-        out.error = "cached first Execute did not return a streaming result";
-        return;
-      }
       while (auto chunk = first->Fetch()) {
         (void)chunk;
       }
@@ -751,12 +745,8 @@ void run_abandoned_result_scenario(std::string const& variant,
         return;
       }
     }
-    streamed = prepared->Execute();  // second execution: cached, no rebind
+    streamed = std::make_unique<duckdb::QueryResultStream<>>(prepared->Submit());
     if (!require_success(streamed.get(), "cached second Execute", out)) { return; }
-    if (streamed->type != duckdb::QueryResultType::STREAM_RESULT) {
-      out.error = "cached second Execute did not return a streaming result";
-      return;
-    }
     auto chunk = streamed->Fetch();
     if (!chunk || chunk->size() == 0) {
       out.error = "cached second Execute produced no first chunk";
@@ -1182,20 +1172,22 @@ void run_ac6_capture_generation(duckdb::Connection& connection,
   // planning generation, not incidentally cleared by another QueryBegin.
   connection.context->client_data->catalog_search_path->Set(
     duckdb::CatalogSearchEntry::Parse("new_scope"), duckdb::CatalogSetPathType::SET_SCHEMAS);
-  auto& client_config            = duckdb::ClientConfig::GetConfig(*connection.context);
-  client_config.enable_optimizer = false;
+  duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+    *connection.context, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(false));
 
   auto const stats_before_prepare = sirius::test::get_transparent_execution_stats(connection);
   mark_workload_started(output_path, out);
   auto prepared = connection.Prepare("SELECT count(*) FROM t;");
   if (!require_success(prepared.get(), "AC-6 Prepare", out)) {
-    client_config.enable_optimizer = true;
+    duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+      *connection.context, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(true));
     (void)connection.Query("ROLLBACK;");
     return;
   }
   auto const stats_after_prepare = sirius::test::get_transparent_execution_stats(connection);
   if (stats_after_prepare.successful_rebinds != stats_before_prepare.successful_rebinds) {
-    client_config.enable_optimizer = true;
+    duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+      *connection.context, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(true));
     (void)connection.Query("ROLLBACK;");
     out.error = "AC-6 first Prepare changed successful_rebinds from " +
                 std::to_string(stats_before_prepare.successful_rebinds) + " to " +
@@ -1207,10 +1199,12 @@ void run_ac6_capture_generation(duckdb::Connection& connection,
   try {
     execute_ok = run_prepared_scalar(*prepared, "7", "AC-6 Execute", out.error);
   } catch (...) {
-    client_config.enable_optimizer = true;
+    duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+      *connection.context, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(true));
     throw;
   }
-  client_config.enable_optimizer = true;
+  duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+    *connection.context, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(true));
   if (!execute_ok) {
     (void)connection.Query("ROLLBACK;");
     return;
@@ -1339,7 +1333,7 @@ void run_ac8_worker_pressure(duckdb::DuckDB& db,
   }
   std::array<std::unique_ptr<duckdb::Connection>, kWaiters> waiter_connections;
   std::array<std::unique_ptr<duckdb::PreparedStatement>, kWaiters> waiter_prepared;
-  std::array<std::unique_ptr<duckdb::PendingQueryResult>, kWaiters> waiter_pending;
+  std::array<std::unique_ptr<duckdb::QueryResult>, kWaiters> waiter_pending;
   auto const gpu_sql      = "SELECT sum(i) FROM slot_bench_range;";
   auto const gpu_expected = range_sum(kCount);
   for (std::size_t index = 0; index < kWaiters; ++index) {
@@ -1347,7 +1341,7 @@ void run_ac8_worker_pressure(duckdb::DuckDB& db,
     if (!set_gpu_execution(*waiter_connections[index], true, out.error)) { return; }
     waiter_prepared[index] = waiter_connections[index]->Prepare(gpu_sql);
     if (!require_success(waiter_prepared[index].get(), "AC-8 waiter Prepare", out)) { return; }
-    waiter_pending[index] = waiter_prepared[index]->PendingQuery();
+    waiter_pending[index] = waiter_prepared[index]->Submit();
     if (!require_success(waiter_pending[index].get(), "AC-8 waiter PendingQuery", out)) { return; }
   }
   if (!set_gpu_execution(holder_connection, true, out.error)) { return; }
@@ -1528,7 +1522,7 @@ void run_ac9_cancelled_waiter(duckdb::Connection& holder_connection,
   auto const waiter_expected = std::to_string(std::stoull(range_sum(kCount)) + 9);
   auto waiter_prepared       = waiter_connection.Prepare(waiter_sql);
   if (!require_success(waiter_prepared.get(), "AC-9 waiter Prepare", out)) { return; }
-  auto waiter_pending = waiter_prepared->PendingQuery();
+  auto waiter_pending = waiter_prepared->Submit();
   if (!require_success(waiter_pending.get(), "AC-9 waiter PendingQuery", out)) { return; }
 
   auto context            = sirius::test::get_registered_sirius_context(holder_connection);
@@ -2036,7 +2030,7 @@ void run_ac13_concurrent_logging(duckdb::Connection& a,
 
   auto pending_prepared = a.Prepare("SELECT sum(i) + 301 FROM ac13_a;");
   if (!require_success(pending_prepared.get(), "AC-13 abandoned Prepare", out)) { return; }
-  auto pending = pending_prepared->PendingQuery();
+  auto pending = pending_prepared->Submit();
   if (!require_success(pending.get(), "AC-13 abandoned PendingQuery", out)) { return; }
   if (!sirius::log::get_sink()->flush()) {
     out.error = "AC-13 could not flush the Sirius file log";

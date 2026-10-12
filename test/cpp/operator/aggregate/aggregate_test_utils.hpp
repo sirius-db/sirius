@@ -60,8 +60,15 @@ inline duckdb::AggregateFunction MakeDummyAggregate(const std::string& name,
                                                     const duckdb::vector<duckdb::LogicalType>& args,
                                                     const duckdb::LogicalType& ret_type)
 {
-  return duckdb::AggregateFunction(
-    name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  return duckdb::AggregateFunction(duckdb::Identifier(name),
+                                   args,
+                                   ret_type,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   duckdb::FunctionNullHandling::DEFAULT_NULL_HANDLING);
 }
 
 /**
@@ -136,12 +143,14 @@ AggregateExpressionResult create_aggregate_expressions(
       MakeDummyAggregate(agg_name, {Traits::logical_type()}, ret_type);
 
     // Create the BoundAggregateExpression
-    auto agg_expr =
-      duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_function,
-                                                          std::move(agg_children),
-                                                          nullptr,  // filter
-                                                          nullptr,  // bind_info
-                                                          duckdb::AggregateType::NON_DISTINCT);
+    auto agg_expr = duckdb::make_uniq<duckdb::BoundAggregateExpression>(
+      duckdb::BoundAggregateFunction(agg_function),
+      std::move(agg_children),
+      nullptr,
+      // filter
+      nullptr,
+      // bind_info
+      duckdb::AggregateType::NON_DISTINCT);
 
     result.aggregates.push_back(sirius::ast::from_duckdb(*agg_expr));
   }
@@ -450,12 +459,14 @@ AggregateExpressionResult create_count_distinct_expressions(
   duckdb::AggregateFunction agg_function =
     MakeDummyAggregate("count", {ValTraits::logical_type()}, duckdb::LogicalType::BIGINT);
 
-  auto agg_expr =
-    duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_function,
-                                                        std::move(agg_children),
-                                                        nullptr,  // filter
-                                                        nullptr,  // bind_info
-                                                        duckdb::AggregateType::DISTINCT);
+  auto agg_expr = duckdb::make_uniq<duckdb::BoundAggregateExpression>(
+    duckdb::BoundAggregateFunction(agg_function),
+    std::move(agg_children),
+    nullptr,
+    // filter
+    nullptr,
+    // bind_info
+    duckdb::AggregateType::DISTINCT);
 
   result.aggregates.push_back(sirius::ast::from_duckdb(*agg_expr));
   return result;
@@ -504,7 +515,7 @@ inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
 
   duckdb::ScalarFunction struct_fn("struct_pack", struct_arg_types, struct_return_type, nullptr);
   auto struct_expr = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
-    struct_return_type, std::move(struct_fn), std::move(struct_children), nullptr);
+    duckdb::BoundScalarFunction(std::move(struct_fn)), std::move(struct_children), nullptr);
 
   // COUNT(DISTINCT struct_expr) aggregate expression
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> agg_children;
@@ -512,10 +523,12 @@ inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
 
   auto agg_fn = MakeDummyAggregate("count", {struct_return_type}, duckdb::LogicalType::BIGINT);
   auto count_distinct_expr =
-    duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_fn,
+    duckdb::make_uniq<duckdb::BoundAggregateExpression>(duckdb::BoundAggregateFunction(agg_fn),
                                                         std::move(agg_children),
-                                                        nullptr,  // filter
-                                                        nullptr,  // bind_info
+                                                        nullptr,
+                                                        // filter
+                                                        nullptr,
+                                                        // bind_info
                                                         duckdb::AggregateType::DISTINCT);
   result.aggregates.push_back(sirius::ast::from_duckdb(*count_distinct_expr));
   return result;

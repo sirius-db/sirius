@@ -38,8 +38,8 @@ class TimestampExtractionFixture : public sirius::test::GpuExecutionFixture {
     auto cpu = con->Query(query);
     REQUIRE(cpu);
     REQUIRE_FALSE(cpu->HasError());
-    auto expected = collect_rows(cpu->Cast<duckdb::MaterializedQueryResult>());
-    for (auto const& type : cpu->types) {
+    auto expected = collect_rows(*cpu);
+    for (auto const& type : cpu->GetTypes()) {
       REQUIRE(type == duckdb::LogicalType::BIGINT);
     }
 
@@ -52,8 +52,8 @@ class TimestampExtractionFixture : public sirius::test::GpuExecutionFixture {
     REQUIRE_FALSE(gpu->HasError());
     // A CPU fallback must not turn this regression green.
     sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-    REQUIRE(gpu->types == cpu->types);
-    CHECK(collect_rows(gpu->Cast<duckdb::MaterializedQueryResult>()) == expected);
+    REQUIRE(gpu->GetTypes() == cpu->GetTypes());
+    CHECK(collect_rows(*gpu) == expected);
   }
 
  private:

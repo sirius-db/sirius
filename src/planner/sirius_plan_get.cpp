@@ -15,6 +15,7 @@
  */
 
 #include "cudf/cudf_utils.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/function/table/table_scan.hpp"
@@ -24,6 +25,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -388,15 +390,6 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   return changed ? result : std::vector<cudf::data_type>{};
 }
 
-// Only OPTIONAL_FILTER is advisory. Required predicates, including IS_NOT_NULL,
-// must translate for the scan's row-level evaluator. Keep this in step with
-// convert_table_filters_to_expression (scan_utils.cpp): probing a filter the
-// scan discharges would reject plans the scan handles correctly.
-[[nodiscard]] bool is_discharged_without_translation(duckdb::TableFilterType filter_type)
-{
-  return filter_type == duckdb::TableFilterType::OPTIONAL_FILTER;
-}
-
 // Pushed-down filters bypass LogicalFilter, so validate the remaining predicate at plan
 // time. The runtime translates again because it resolves references against
 // batch-relative positions.
@@ -404,7 +397,7 @@ void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
                                         duckdb::LogicalType const& column_type,
                                         std::string const& column_name)
 {
-  if (is_discharged_without_translation(filter.filter_type)) { return; }
+  if (duckdb::ExpressionFilter::IsOptionalFilter(filter)) { return; }
   auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(column_type, 0);
   auto expression = filter.ToExpression(*column_ref);
   if (sirius::ast::from_duckdb(*expression) == nullptr) {
@@ -440,22 +433,14 @@ void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
   duckdb::TableFilterSet& table_filters, const duckdb::vector<duckdb::ColumnIndex>& column_ids)
 {
-  // create the table filter map
-  auto table_filter_set = duckdb::make_uniq<duckdb::TableFilterSet>();
-  for (auto& table_filter : table_filters.filters) {
-    // find the relative column index from the absolute column index into the table
-    duckdb::optional_idx column_index;
-    for (std::size_t i = 0; i < column_ids.size(); i++) {
-      if (table_filter.first == column_ids[i].GetPrimaryIndex()) {
-        column_index = i;
-        break;
-      }
+  // V2 filter indexes already address column_ids, including multi-column references.
+  auto table_filter_set = table_filters.Copy();
+  for (auto const& entry : *table_filter_set) {
+    if (entry.GetIndex().GetIndex() >= column_ids.size()) {
+      throw duckdb::InternalException("Table filter index is outside scan columns");
     }
-    if (!column_index.IsValid()) {
-      throw duckdb::InternalException("Could not find column index for table filter");
-    }
-    table_filter_set->filters[column_index.GetIndex()] = std::move(table_filter.second);
   }
+
   return table_filter_set;
 }
 
@@ -509,7 +494,7 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
                                              {},
                                              std::move(materializer),
                                              op.returned_types,
-                                             op.table_index);
+                                             op.table_index.index);
   sirius::op::scan::certification_result stream_result;
   stream_result.verdict = sirius::op::scan::eligibility_verdict::supported;
   read_views->record_verdict(contract_id, stream_result);
@@ -529,7 +514,17 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
+  if (op.has_pushed_projection) {
+    throw duckdb::NotImplementedException(
+      "Expressions pushed into a scan are not supported in Sirius");
+  }
   auto column_ids = op.GetColumnIds();
+  for (auto const& column : column_ids) {
+    if (column.IsPushdownExtract()) {
+      throw duckdb::NotImplementedException(
+        "Nested field extraction pushed into a scan is not supported in Sirius");
+    }
+  }
 
   auto const lookup  = lookup_connector_classified(op, context);
   auto const* source = lookup.entry;
@@ -540,7 +535,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
                      : nullptr;
       if (state) {
         sirius::op::scan::eligibility_certificate refusal;
-        auto const& record = read_views->declined_lookups().at(op.table_index);
+        auto const& record = read_views->declined_lookups().at(op.table_index.index);
         refusal.verdict    = record.verdict;
         refusal.reason     = record.reason;
         state->record_scan_certification(refusal);
@@ -550,7 +545,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     throw duckdb::NotImplementedException(
       "Table function '%s' is not supported in Sirius (unverified callbacks, overload or bind "
       "data)",
-      op.function.name);
+      op.function.GetName().GetIdentifierName());
   }
 
   // An iceberg table's data files are parquet, and `iceberg_scan` binds them into the same
@@ -587,24 +582,24 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   std::shared_ptr<sirius::scan_manager::pinned_entry const> pinned_owner;
   sirius::scan_manager::pinned_entry const* pinned = nullptr;
   bool serves_insert_deltas                        = false;
-  if (!marked_decline && sirius_state && op.function.name == "seq_scan") {
+  if (!marked_decline && sirius_state && op.function.GetName().GetIdentifierName() == "seq_scan") {
     auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (bind != nullptr && bind->table.IsDuckTable()) {
       auto& table        = bind->table.Cast<duckdb::DuckTableEntry>();
       auto& scan_manager = sirius_state->get_scan_manager();
-      auto const catalog = table.ParentCatalog().GetName();
-      auto const& schema = table.ParentSchema().name;
+      auto const catalog = table.ParentCatalog().GetName().GetIdentifierName();
+      auto const& schema = table.ParentSchema().name.GetIdentifierName();
       sirius::duckdb_table_identity const identity{table.oid,
                                                    table.GetStorage().GetRowGroupCollection()};
       pinned_owner = scan_manager.find_pinned_entry_for_duckdb_table(
-        catalog, schema, table.name, identity, &column_ids, &op.returned_types);
+        catalog, schema, table.name.GetIdentifierName(), identity, &column_ids, &op.returned_types);
       pinned = pinned_owner.get();
       // A same-name pin for an older table cannot serve this scan, and the disk-native
       // read behind it is MVCC-blind, so it may still hold the dropped table's image or
       // this table's deleted rows.
       if (pinned == nullptr) {
         auto const superseded = scan_manager.pinned_entry_name_for_superseded_duckdb_table(
-          catalog, schema, table.name, identity);
+          catalog, schema, table.name.GetIdentifierName(), identity);
         if (superseded && diverges_from_checkpointed_image(context, table)) {
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' was dropped and recreated (or altered) after "
@@ -627,8 +622,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       }
     }
   } else if (!marked_decline && sirius_state && compressed_materialization_on) {
-    auto const files =
-      resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
+    auto const files = resolve_parquet_scan_file_paths(
+      op.function.GetName().GetIdentifierName(), op.bind_data.get(), op.parameters);
     if (!files.empty()) {
       pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
       pinned       = pinned_owner.get();
@@ -651,7 +646,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   }
 
   // STREAMING_SOURCE leaf: fragment-declared repo + senders, not a file scan.
-  if (op.function.name == sirius::exec::kStreamSourceFunctionName) {
+  if (op.function.GetName().GetIdentifierName() == sirius::exec::kStreamSourceFunctionName) {
     return create_streaming_source_plan(op);
   }
 
@@ -661,7 +656,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // becomes a clean CPU fallback — the walker's refusal at pipeline conversion
   // surfaces as a mid-query error with none. Conservative for DICT_FSST, which
   // inlines strings up to 16 KiB (see prepare_duckdb_native_walk).
-  if (op.function.name == "seq_scan" && op.bind_data) {
+  if (op.function.GetName().GetIdentifierName() == "seq_scan" && op.bind_data) {
     auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (table_scan_bind != nullptr && table_scan_bind->table.IsDuckTable()) {
       auto& table   = table_scan_bind->table.Cast<duckdb::DuckTableEntry>();
@@ -730,7 +725,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             "snapshot (%llu) for table '%s'",
             static_cast<unsigned long long>(start_time),
             static_cast<unsigned long long>(pinned->mvcc->v_base),
-            table.name);
+            table.name.GetIdentifierName());
         }
         // (b) transaction-local appends: rows in this transaction's
         // LocalStorage live outside the table's segment trees, so neither the
@@ -741,7 +736,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' has uncommitted appends in this transaction; "
             "transaction-local inserts are not served from the cache",
-            table.name);
+            table.name.GetIdentifierName());
         }
         bool pin_serves = !has_unservable_column;
         if (pin_serves && !column_ids.empty()) {
@@ -755,7 +750,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' is MVCC-pinned and the pin cannot serve the "
             "requested columns",
-            table.name);
+            table.name.GetIdentifierName());
         }
         // Every guard passed, so the pinned entry serves this scan.
 #if 0
@@ -785,7 +780,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
               "duckdb-native scan: table '%s' is MVCC-pinned, the pin cannot serve the "
               "requested columns, and the table has diverged from its last-checkpointed "
               "image",
-              table.name);
+              table.name.GetIdentifierName());
           }
         } else if (sirius::op::scan::any_update_chains(storage, projected, n_cache)) {
           // (c) update-present on a column the cache would serve: update
@@ -794,7 +789,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' has in-memory update chains on a scanned "
             "column; updated values are not served from the cache",
-            table.name);
+            table.name.GetIdentifierName());
         }
 #endif
       }
@@ -824,7 +819,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' has uncommitted appends in this transaction; "
             "the disk-native read cannot see transaction-local rows",
-            table.name);
+            table.name.GetIdentifierName());
         }
         auto& txn = duckdb::DuckTransaction::Get(context, table.ParentCatalog());
         switch (sirius::op::scan::check_native_read_mvcc_state(
@@ -833,13 +828,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             throw duckdb::NotImplementedException(
               "duckdb-native scan: table '%s' has in-memory update chains on a scanned "
               "column; the disk-native read would return stale values",
-              table.name);
+              table.name.GetIdentifierName());
           case sirius::op::scan::native_read_mvcc_state::has_invisible_rows:
             throw duckdb::NotImplementedException(
               "duckdb-native scan: table '%s' has rows not visible to this transaction "
               "(uncheckpointed deletes or in-flight inserts); the disk-native read is "
               "MVCC-blind",
-              table.name);
+              table.name.GetIdentifierName());
           case sirius::op::scan::native_read_mvcc_state::exact: break;
         }
       }
@@ -848,18 +843,55 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   }
 
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
-  if (!op.table_filters.filters.empty()) {
+  if (op.table_filters.HasFilters() || op.table_filters.HasMultiColumnFilters()) {
     table_filters = create_table_filter_set(op.table_filters, column_ids);
     // Predicates pushed into table_filters bypass the LogicalFilter guard —
     // reject nested columns here too (e.g. `WHERE items IS NULL`).
-    for (auto const& entry : table_filters->filters) {
-      auto const column_id = column_ids[entry.first].GetPrimaryIndex();
+    for (auto const& entry : *table_filters) {
+      auto const column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
       if (column_id < op.returned_types.size()) {
-        auto const column_name =
-          column_id < op.names.size() ? op.names[column_id] : std::to_string(column_id);
+        auto const column_name = column_id < op.names.size()
+                                   ? op.names[column_id].GetIdentifierName()
+                                   : std::to_string(column_id);
         reject_nested_column_type(op.returned_types[column_id], column_name, "a filter predicate");
         reject_untranslatable_table_filter(
-          *entry.second, op.returned_types[column_id], column_name);
+          entry.Filter(), op.returned_types[column_id], column_name);
+      }
+    }
+  }
+
+  if (table_filters) {
+    for (auto const& filter : table_filters->GetMultiColumnFilters()) {
+      auto const& expression =
+        duckdb::ExpressionFilter::GetExpressionFilter(*filter, "scan planning");
+      for (auto index : expression.column_indexes) {
+        if (index.GetIndex() >= column_ids.size()) {
+          throw duckdb::InternalException("Multi-column filter index is outside scan columns");
+        }
+        auto const primary = column_ids[index].GetPrimaryIndex();
+        if (!duckdb::ExpressionFilter::IsOptionalFilter(expression)) {
+          auto const* multi_file =
+            dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
+          if (multi_file) {
+            for (auto const& partition : multi_file->reader_bind.hive_partitioning_indexes) {
+              if (partition.index == primary) {
+                throw duckdb::NotImplementedException(
+                  "Multi-column scan predicates on Hive partition columns are not supported in "
+                  "Sirius");
+              }
+            }
+          }
+        }
+        if (primary < op.returned_types.size()) {
+          reject_nested_column_type(
+            op.returned_types[primary], std::to_string(primary), "a filter predicate");
+        }
+      }
+      if (!duckdb::ExpressionFilter::IsOptionalFilter(expression) &&
+          sirius::ast::from_duckdb(*expression.expr) == nullptr) {
+        throw duckdb::NotImplementedException(
+          "Unsupported multi-column scan predicate (falling back to CPU): %s",
+          expression.expr->ToString());
       }
     }
   }
@@ -880,20 +912,23 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   duckdb::vector<duckdb::LogicalType> original_types = op.types;
 
   if (table_filters && !projection_ids.empty()) {
-    for (auto& entry : table_filters->filters) {
-      // entry.first is the column index in the table_filters (after remapping by
-      // create_table_filter_set) We need to ensure this column is in projection_ids so it gets
-      // scanned by DuckDB
-
-      bool found_in_projection = false;
-      for (std::size_t j = 0; j < projection_ids.size(); j++) {
-        if (projection_ids[j] == entry.first) {
-          found_in_projection = true;
-          break;
-        }
+    auto include_column = [&](duckdb::ProjectionIndex index) {
+      if (index.GetIndex() >= column_ids.size()) {
+        throw duckdb::InternalException("Table filter index is outside scan columns");
       }
-
-      if (!found_in_projection) { projection_ids.push_back(entry.first); }
+      if (std::find(projection_ids.begin(), projection_ids.end(), index) == projection_ids.end()) {
+        projection_ids.push_back(index);
+      }
+    };
+    for (auto const& entry : *table_filters) {
+      include_column(entry.GetIndex());
+    }
+    for (auto const& filter : table_filters->GetMultiColumnFilters()) {
+      auto const& expr_filter =
+        duckdb::ExpressionFilter::GetExpressionFilter(*filter, "scan projection");
+      for (auto const index : expr_filter.column_indexes) {
+        include_column(index);
+      }
     }
   }
 
@@ -901,21 +936,24 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   if (table_filters && op.function.supports_pushdown_type) {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
     duckdb::unordered_set<std::size_t> to_remove;
-    for (auto& entry : table_filters->filters) {
-      auto column_id = column_ids[entry.first].GetPrimaryIndex();
+    for (auto& entry : *table_filters) {
+      auto column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
       auto& type     = op.returned_types[column_id];
 
       // If the table function doesn't support pushdown for this column type,
       // create a separate filter operator for it
       if (!op.function.supports_pushdown_type(*op.bind_data, column_id)) {
-        std::size_t column_id_filter = entry.first;
+        auto const pos = std::find(projection_ids.begin(), projection_ids.end(), entry.GetIndex());
+        std::size_t column_id_filter = projection_ids.empty()
+                                         ? entry.GetIndex().GetIndex()
+                                         : static_cast<std::size_t>(pos - projection_ids.begin());
         auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, column_id_filter);
-        select_list.push_back(entry.second->ToExpression(*column));
-        to_remove.insert(entry.first);
+        select_list.push_back(entry.Filter().ToExpression(*column));
+        to_remove.insert(entry.GetIndex());
       }
     }
     for (auto& col : to_remove) {
-      table_filters->filters.erase(col);
+      table_filters->RemoveFilterByColumnIndex(duckdb::ProjectionIndex(col));
     }
 
     if (!select_list.empty()) {
@@ -930,7 +968,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
           duckdb::ExpressionType::CONJUNCTION_AND);
         for (auto& expr : select_list) {
-          conjunction->children.push_back(std::move(expr));
+          conjunction->GetChildrenMutable().push_back(std::move(expr));
         }
         combined = std::move(conjunction);
       } else {
@@ -953,7 +991,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       sirius::from_duckdb_vec(op.returned_types),
       column_ids,
       duckdb::vector<duckdb::column_t>(),
-      op.names,
+      duckdb::IdentifiersToStrings(op.names),
       std::move(table_filters),
       op.estimated_cardinality,
       std::move(op.extra_info),
@@ -963,7 +1001,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     node->named_parameters             = std::move(op.named_parameters);
     node->read_views                   = read_views;
     node->scan_node_id                 = next_scan_node_id++;
-    node->table_index                  = op.table_index;
+    node->table_index                  = op.table_index.index;
     node->contract_window_id           = contract_provenance.window_id;
     node->contract_finalize_generation = contract_provenance.finalize_generation;
     node->host_export_available        = contract_provenance.host_export_available;
@@ -1027,8 +1065,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.bind_data),
     sirius::from_duckdb_vec(op.returned_types),
     column_ids,
-    op.projection_ids,
-    op.names,
+    duckdb::vector<std::size_t>(op.projection_ids.begin(), op.projection_ids.end()),
+    duckdb::IdentifiersToStrings(op.names),
     std::move(table_filters),
     op.estimated_cardinality,
     std::move(op.extra_info),
@@ -1047,7 +1085,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   node->named_parameters             = std::move(op.named_parameters);
   node->read_views                   = read_views;
   node->scan_node_id                 = next_scan_node_id++;
-  node->table_index                  = op.table_index;
+  node->table_index                  = op.table_index.index;
   node->contract_window_id           = contract_provenance.window_id;
   node->contract_finalize_generation = contract_provenance.finalize_generation;
   node->host_export_available        = contract_provenance.host_export_available;

@@ -30,6 +30,7 @@
 #include <expression/ast/from_duckdb.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/sirius_physical_table_scan.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -43,14 +44,13 @@ using namespace sirius::test::operator_utils;
 duckdb::unique_ptr<duckdb::Expression> make_untranslatable_filter_expression()
 {
   auto expression = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
-    duckdb::LogicalType::BOOLEAN,
-    duckdb::ScalarFunction("sirius_unmapped_filter",
-                           {duckdb::LogicalType::BIGINT},
-                           duckdb::LogicalType::BOOLEAN,
-                           nullptr),
+    duckdb::BoundScalarFunction(duckdb::ScalarFunction("sirius_unmapped_filter",
+                                                       {duckdb::LogicalType::BIGINT},
+                                                       duckdb::LogicalType::BOOLEAN,
+                                                       nullptr)),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
     nullptr);
-  expression->children.push_back(
+  expression->GetChildrenMutable().push_back(
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0));
   return expression;
 }
@@ -107,9 +107,9 @@ TEMPLATE_TEST_CASE(
 
   // Create table filter set with a filter on first column (filter_vals > 3)
   auto table_filters   = duckdb::make_uniq<duckdb::TableFilterSet>();
-  auto constant_filter = duckdb::make_uniq<duckdb::ConstantFilter>(
-    duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(3));
-  table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(constant_filter));
+  auto constant_filter = sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                                       duckdb::Value::BIGINT(3));
+  table_filters->PushFilter(duckdb::ProjectionIndex(0), std::move(constant_filter));
 
   // Setup types for the table scan
   duckdb::vector<duckdb::LogicalType> types;
@@ -134,7 +134,7 @@ TEMPLATE_TEST_CASE(
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
   sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
-                                        std::move(table_function),
+                                        duckdb::BoundTableFunction(table_function),
                                         nullptr,  // bind_data
                                         sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
@@ -203,7 +203,7 @@ TEST_CASE("sirius_physical_table_scan with no filters passes through data", "[ph
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
   sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
-                                        std::move(table_function),
+                                        duckdb::BoundTableFunction(table_function),
                                         nullptr,
                                         sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
@@ -255,7 +255,7 @@ TEST_CASE("sirius_physical_table_scan projection keeps its input batch valid",
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
   sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
-                                        std::move(table_function),
+                                        duckdb::BoundTableFunction(table_function),
                                         nullptr,
                                         sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
@@ -302,13 +302,13 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
   // col0 > 2 AND col1 <= 30
   auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
 
-  auto filter0 = duckdb::make_uniq<duckdb::ConstantFilter>(
-    duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(2));
-  table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(filter0));
+  auto filter0 = sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                               duckdb::Value::BIGINT(2));
+  table_filters->PushFilter(duckdb::ProjectionIndex(0), std::move(filter0));
 
-  auto filter1 = duckdb::make_uniq<duckdb::ConstantFilter>(
-    duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO, duckdb::Value::INTEGER(30));
-  table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(filter1));
+  auto filter1 = sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO,
+                                               duckdb::Value::INTEGER(30));
+  table_filters->PushFilter(duckdb::ProjectionIndex(1), std::move(filter1));
 
   // Setup types
   duckdb::vector<duckdb::LogicalType> types;
@@ -329,7 +329,7 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
   sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
-                                        std::move(table_function),
+                                        duckdb::BoundTableFunction(table_function),
                                         nullptr,
                                         sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
@@ -375,9 +375,9 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
 
   // Filter that excludes all rows: col0 > 100
   auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  auto filter        = duckdb::make_uniq<duckdb::ConstantFilter>(
-    duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(100));
-  table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(filter));
+  auto filter        = sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                              duckdb::Value::BIGINT(100));
+  table_filters->PushFilter(duckdb::ProjectionIndex(0), std::move(filter));
 
   // Setup types
   duckdb::vector<duckdb::LogicalType> types;
@@ -398,7 +398,7 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
   sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
-                                        std::move(table_function),
+                                        duckdb::BoundTableFunction(table_function),
                                         nullptr,
                                         sirius::from_duckdb_vec(returned_types),
                                         std::move(column_ids),
@@ -432,8 +432,10 @@ TEST_CASE("table-filter conversion distinguishes discharged filters from failed 
   SECTION("partition-only filter is discharged")
   {
     duckdb::TableFilterSet filters;
-    filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::BIGINT(1));
+    filters.SetFilterByColumnIndex(
+      duckdb::ProjectionIndex(0),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_EQUAL,
+                                    duckdb::Value::BIGINT(1)));
     CHECK(sirius::op::convert_table_filters_to_expression(
             filters, column_ids, returned_types, batch_map, {0}) == nullptr);
   }
@@ -441,8 +443,10 @@ TEST_CASE("table-filter conversion distinguishes discharged filters from failed 
   SECTION("plain data filter produces a translatable expression")
   {
     duckdb::TableFilterSet filters;
-    filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(1));
+    filters.SetFilterByColumnIndex(
+      duckdb::ProjectionIndex(0),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                    duckdb::Value::BIGINT(1)));
     auto expression = sirius::op::convert_table_filters_to_expression(
       filters, column_ids, returned_types, batch_map);
     REQUIRE(expression);
@@ -452,8 +456,8 @@ TEST_CASE("table-filter conversion distinguishes discharged filters from failed 
   SECTION("unsupported data filter remains distinguishable from an empty conversion")
   {
     duckdb::TableFilterSet filters;
-    filters.filters[0] = make_untranslatable_filter();
-    auto expression    = sirius::op::convert_table_filters_to_expression(
+    filters.SetFilterByColumnIndex(duckdb::ProjectionIndex(0), make_untranslatable_filter());
+    auto expression = sirius::op::convert_table_filters_to_expression(
       filters, column_ids, returned_types, batch_map);
     REQUIRE(expression);
     CHECK(sirius::ast::from_duckdb(*expression) == nullptr);
@@ -462,10 +466,14 @@ TEST_CASE("table-filter conversion distinguishes discharged filters from failed 
   SECTION("partition and data filters retain the data predicate")
   {
     duckdb::TableFilterSet filters;
-    filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::BIGINT(1));
-    filters.filters[1] = duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(2));
+    filters.SetFilterByColumnIndex(
+      duckdb::ProjectionIndex(0),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_EQUAL,
+                                    duckdb::Value::BIGINT(1)));
+    filters.SetFilterByColumnIndex(
+      duckdb::ProjectionIndex(1),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                    duckdb::Value::BIGINT(2)));
     auto expression = sirius::op::convert_table_filters_to_expression(
       filters, column_ids, returned_types, batch_map, {0});
     REQUIRE(expression);
@@ -485,8 +493,8 @@ TEST_CASE("sirius_physical_table_scan fails closed for an untranslatable pushed-
   auto input_batch = make_two_column_batch<int64_t, int32_t>(
     *space, filter_values, data_values, cudf::type_id::INT32, std::nullopt);
 
-  auto table_filters        = duckdb::make_uniq<duckdb::TableFilterSet>();
-  table_filters->filters[0] = make_untranslatable_filter();
+  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  table_filters->SetFilterByColumnIndex(duckdb::ProjectionIndex(0), make_untranslatable_filter());
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::BIGINT,
                                             duckdb::LogicalType::INTEGER};
   duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
@@ -497,7 +505,7 @@ TEST_CASE("sirius_physical_table_scan fails closed for an untranslatable pushed-
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
   sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
-                                        std::move(table_function),
+                                        duckdb::BoundTableFunction(table_function),
                                         nullptr,
                                         sirius::from_duckdb_vec(types),
                                         std::move(column_ids),

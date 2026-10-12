@@ -67,8 +67,15 @@ AggregateFunction MakeDummyAggregate(const std::string& name,
                                      const duckdb::vector<LogicalType>& args,
                                      const LogicalType& ret_type)
 {
-  return AggregateFunction(
-    name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  return AggregateFunction(duckdb::Identifier(name),
+                           args,
+                           ret_type,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           duckdb::FunctionNullHandling::DEFAULT_NULL_HANDLING);
 }
 
 TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COUNT",
@@ -120,7 +127,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
       children.push_back(make_uniq<BoundReferenceExpression>(Traits::logical_type(), 0));
       aggregates.push_back(make_uniq<BoundAggregateExpression>(
-        MakeDummyAggregate("sum", {Traits::logical_type()}, Traits::logical_type()),
+        duckdb::BoundAggregateFunction(
+          MakeDummyAggregate("sum", {Traits::logical_type()}, Traits::logical_type())),
         std::move(children),
         nullptr,
         nullptr,
@@ -133,7 +141,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
       children.push_back(make_uniq<BoundReferenceExpression>(Traits::logical_type(), 0));
       aggregates.push_back(make_uniq<BoundAggregateExpression>(
-        MakeDummyAggregate("min", {Traits::logical_type()}, Traits::logical_type()),
+        duckdb::BoundAggregateFunction(
+          MakeDummyAggregate("min", {Traits::logical_type()}, Traits::logical_type())),
         std::move(children),
         nullptr,
         nullptr,
@@ -146,7 +155,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
       children.push_back(make_uniq<BoundReferenceExpression>(Traits::logical_type(), 0));
       aggregates.push_back(make_uniq<BoundAggregateExpression>(
-        MakeDummyAggregate("max", {Traits::logical_type()}, Traits::logical_type()),
+        duckdb::BoundAggregateFunction(
+          MakeDummyAggregate("max", {Traits::logical_type()}, Traits::logical_type())),
         std::move(children),
         nullptr,
         nullptr,
@@ -159,8 +169,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
       children.push_back(make_uniq<BoundReferenceExpression>(Traits::logical_type(), 0));
       aggregates.push_back(make_uniq<BoundAggregateExpression>(
-        MakeDummyAggregate(
-          "count", {Traits::logical_type()}, LogicalType(duckdb::LogicalTypeId::BIGINT)),
+        duckdb::BoundAggregateFunction(MakeDummyAggregate(
+          "count", {Traits::logical_type()}, LogicalType(duckdb::LogicalTypeId::BIGINT))),
         std::move(children),
         nullptr,
         nullptr,
@@ -171,7 +181,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
     // COUNT_STAR
     {
       aggregates.push_back(make_uniq<BoundAggregateExpression>(
-        MakeDummyAggregate("count_star", {}, LogicalType(duckdb::LogicalTypeId::BIGINT)),
+        duckdb::BoundAggregateFunction(
+          MakeDummyAggregate("count_star", {}, LogicalType(duckdb::LogicalTypeId::BIGINT))),
         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
         nullptr,
         nullptr,
@@ -304,12 +315,13 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
     children.push_back(make_uniq<BoundReferenceExpression>(Traits::logical_type(), 0));
     auto return_type =
       Traits::is_decimal ? Traits::logical_type() : LogicalType(duckdb::LogicalTypeId::DOUBLE);
-    aggregates.push_back(make_uniq<BoundAggregateExpression>(
-      MakeDummyAggregate("avg", {Traits::logical_type()}, return_type),
-      std::move(children),
-      nullptr,
-      nullptr,
-      AggregateType::NON_DISTINCT));
+    aggregates.push_back(
+      make_uniq<BoundAggregateExpression>(duckdb::BoundAggregateFunction(MakeDummyAggregate(
+                                            "avg", {Traits::logical_type()}, return_type)),
+                                          std::move(children),
+                                          nullptr,
+                                          nullptr,
+                                          AggregateType::NON_DISTINCT));
     ret_types.push_back(return_type);
     return aggregates;
   };

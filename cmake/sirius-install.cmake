@@ -35,7 +35,6 @@ if(SIRIUS_BUILD_STATIC)
     TARGETS sirius_core
             simpatico
             duckdb_static
-            dummy_static_extension_loader
             core_functions_extension
             parquet_extension
             cucascade_static

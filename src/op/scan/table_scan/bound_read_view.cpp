@@ -28,6 +28,7 @@
 #include <duckdb/common/multi_file/multi_file_list.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <duckdb/common/multi_file/table_function_multi_file.hpp>
 #include <duckdb/common/serializer/binary_deserializer.hpp>
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
@@ -99,13 +100,17 @@ void append_sorted_map(std::string& out, MAP const& map, VALUE&& encode_value)
   keys.reserve(map.size());
   for (auto const& [key, unused] : map) {
     (void)unused;
-    keys.push_back(key);
+    if constexpr (std::is_same_v<typename MAP::key_type, duckdb::Identifier>) {
+      keys.push_back(key.GetIdentifierName());
+    } else {
+      keys.push_back(key);
+    }
   }
   std::sort(keys.begin(), keys.end());
   number(out, keys.size());
   for (auto const& key : keys) {
     append(out, 'k', key);
-    encode_value(out, map.at(key));
+    encode_value(out, map.at(typename MAP::key_type(key)));
   }
 }
 
@@ -116,6 +121,18 @@ void append_multi_file_options(std::string& out, duckdb::MultiFileOptions const&
   boolean(out, options.auto_detect_hive_partitioning);
   boolean(out, options.union_by_name);
   boolean(out, options.hive_types_autocast);
+  boolean(out, options.allow_empty);
+  number(out, options.maximum_sample_files);
+  boolean(out, options.sampled_schema_is_union);
+  boolean(out, options.file_row_number);
+  duckdb::MemoryStream schema;
+  duckdb::BinarySerializer serializer(schema);
+  serializer.Begin();
+  serializer.WriteProperty(100, "schema", options.schema);
+  serializer.End();
+  append(out,
+         's',
+         std::string_view(reinterpret_cast<char const*>(schema.GetData()), schema.GetPosition()));
   number(out, static_cast<uint8_t>(options.mapping));
   append(out, 's', options.filename_column);
   append_sorted_map(out, options.hive_types_schema, [](std::string& target, auto const& value) {
@@ -208,76 +225,14 @@ std::string canonical_encryption_config(duckdb::ParquetEncryptionConfig const& c
   return serializer.finish();
 }
 
-duckdb::ParquetOptionsSerialization export_parquet_options(duckdb::TableFunction const& function,
-                                                           duckdb::MultiFileBindData const& bind)
+std::string parquet_options_text(duckdb::ParquetOptions const& options)
 {
-  if (!function.serialize || !bind.bind_data) {
-    throw std::runtime_error("verified parquet source has no serializable format bind data");
-  }
-  duckdb::MultiFileBindData temporary;
-  auto format_copy = bind.bind_data->Copy();
-  auto* typed_copy = dynamic_cast<duckdb::TableFunctionData*>(format_copy.get());
-  if (!typed_copy) {
-    throw std::runtime_error("verified parquet source copied an invalid format bind payload");
-  }
-  (void)format_copy.release();
-  temporary.bind_data = duckdb::unique_ptr<duckdb::TableFunctionData>(typed_copy);
-  temporary.file_list =
-    duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(duckdb::vector<duckdb::OpenFileInfo>{});
-  temporary.file_options = bind.file_options;
-  temporary.initial_reader.reset();
-  temporary.union_readers.clear();
-
-  duckdb::MemoryStream buffer;
-  duckdb::BinarySerializer serializer(buffer);
-  serializer.Begin();
-  function.serialize(serializer, &temporary, function);
-  serializer.End();
-  buffer.Rewind();
-
-  duckdb::BinaryDeserializer deserializer(buffer);
-  deserializer.Begin();
-  (void)deserializer.ReadProperty<duckdb::vector<std::string>>(100, "files");
-  (void)deserializer.ReadProperty<duckdb::vector<duckdb::LogicalType>>(101, "types");
-  (void)deserializer.ReadProperty<duckdb::vector<std::string>>(102, "names");
-  auto options =
-    deserializer.ReadProperty<duckdb::ParquetOptionsSerialization>(103, "parquet_options");
-  deserializer.End();
-  return options;
-}
-
-duckdb::TableFunction const& trusted_parquet_serializer()
-{
-  static duckdb::TableFunction const function = [] {
-    auto functions = duckdb::ParquetScanFunction::GetFunctionSet().functions;
-    if (functions.empty() || !functions.front().serialize) {
-      throw std::runtime_error("trusted Parquet function has no serializer");
-    }
-    return functions.front();
-  }();
-  return function;
-}
-
-std::string parquet_selector(duckdb::TableFunction const& function,
-                             duckdb::MultiFileBindData const& bind)
-{
-  auto const exported = export_parquet_options(function, bind);
   std::string out;
-  append(out, 'v', "sirius.parquet-options.1");
-  append_multi_file_options(out, exported.file_options);
-  auto const& options = exported.parquet_options;
   boolean(out, options.binary_as_string);
-  boolean(out, options.file_row_number);
+  boolean(out, options.variant_legacy_encoding);
   number(out, options.explicit_cardinality);
   boolean(out, options.can_have_nan);
-  number(out, options.schema.size());
-  for (auto const& column : options.schema) {
-    number(out, static_cast<uint32_t>(column.field_id));
-    append(out, 's', column.name);
-    append(out, 't', column.type.ToString());
-    append(out, 'v', canonical_value_text(column.default_value));
-    append(out, 'v', canonical_value_text(column.identifier));
-  }
+  number(out, static_cast<uint8_t>(options.utf8_validation_option));
   boolean(out, options.encryption_config != nullptr);
   if (options.encryption_config) {
     append(out, 'e', canonical_encryption_config(*options.encryption_config));
@@ -285,8 +240,51 @@ std::string parquet_selector(duckdb::TableFunction const& function,
   return out;
 }
 
+std::string parquet_selector(duckdb::MultiFileBindData const& bind, duckdb::ClientContext& context)
+{
+  auto const* wrapped =
+    dynamic_cast<duckdb::TableFunctionMultiFileData const*>(bind.bind_data.get());
+  if (!wrapped) throw std::runtime_error("verified parquet source has no bound file options");
+
+  std::optional<std::string> file_options;
+  auto capture_options = [&](duckdb::FunctionData const& data) {
+    auto text = parquet_options_text(duckdb::ParquetScanFunction::GetFileOptions(data));
+    if (file_options && *file_options != text) {
+      throw std::runtime_error("verified parquet files have different bound options");
+    }
+    file_options = std::move(text);
+  };
+  if (wrapped->options.schema_bind_data) capture_options(*wrapped->options.schema_bind_data);
+  if (bind.initial_reader) {
+    auto const* reader =
+      dynamic_cast<duckdb::TableFunctionFileReader const*>(bind.initial_reader.get());
+    if (reader && reader->bind_data) capture_options(*reader->bind_data);
+  }
+  for (auto const& reader : bind.union_readers) {
+    auto const* data = dynamic_cast<duckdb::TableFunctionUnionData const*>(reader.get());
+    if (data && data->bind_data) capture_options(*data->bind_data);
+  }
+  if (!file_options) {
+    // Explicit schemas bind no file; the reader resolves these options when it opens one.
+    duckdb::ParquetFileReaderOptions options(context);
+    auto multi_options = bind.file_options;
+    duckdb::ParquetMultiFileInfo interface;
+    for (auto const& [name, value] : wrapped->options.named_parameters) {
+      if (!interface.ParseOption(context, name, value, multi_options, options)) {
+        throw std::runtime_error("verified parquet source has an unknown file option");
+      }
+    }
+    file_options = parquet_options_text(options.options);
+  }
+  std::string out;
+  append(out, 'v', "sirius.parquet-options.2");
+  append_multi_file_options(out, bind.file_options);
+  append(out, 'o', *file_options);
+  return out;
+}
+
 std::string selector_evidence(duckdb::vector<duckdb::Value> const& parameters,
-                              duckdb::named_parameter_map_t const& named_parameters)
+                              duckdb::named_argument_map_t const& named_parameters)
 {
   std::string out;
   append(out, 'v', "sirius.selector-evidence.1");
@@ -307,10 +305,10 @@ uint64_t transaction_id(duckdb::ClientContext& context)
 }
 
 struct capture_input {
-  duckdb::TableFunction const& function;
+  duckdb::BoundTableFunction const& function;
   duckdb::FunctionData const* bind_data;
   duckdb::vector<duckdb::Value> const& parameters;
-  duckdb::named_parameter_map_t const* named_parameters;
+  duckdb::named_argument_map_t const* named_parameters;
   std::span<std::string const> resolved_paths;
   bool collect_evidence;
 };
@@ -376,13 +374,13 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     identity.bound_types = columns.GetColumnTypes();
     identity.bound_names = columns.GetColumnNames();
     auto& attached       = table.GetStorage().GetAttached();
-    identity.data_view   = native_table_identity{table.ParentCatalog().GetName(),
+    identity.data_view = native_table_identity{table.ParentCatalog().GetName().GetIdentifierName(),
                                                table.ParentCatalog().GetOid(),
-                                               table.ParentSchema().name,
-                                               table.name,
+                                               table.ParentSchema().name.GetIdentifierName(),
+                                               table.name.GetIdentifierName(),
                                                table.oid,
                                                attached.GetStorageManager().GetDBPath()};
-    view.provider        = provider_borrow{
+    view.provider      = provider_borrow{
       context.transaction.GetActiveQuery(), view.transaction_id, &context, &table.GetStorage()};
   } else if (source->kind == source_kind::stream_source) {
     auto const* typed = dynamic_cast<exec::stream_source_bind_data const*>(input.bind_data);
@@ -455,11 +453,9 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
       }
     }
     identity.bound_types = typed->types;
-    identity.bound_names = typed->names;
-    // iceberg_scan owns a different outer serializer. Its nested format payload is still the
-    // Parquet bind payload, so export it through the verified built-in Parquet protocol.
-    identity.selector  = parquet_selector(trusted_parquet_serializer(), *typed);
-    identity.data_view = file_inventory{static_cast<uint32_t>(paths.size())};
+    identity.bound_names = duckdb::IdentifiersToStrings(typed->names);
+    identity.selector    = parquet_selector(*typed, context);
+    identity.data_view   = file_inventory{static_cast<uint32_t>(paths.size())};
 
     if (input.collect_evidence) {
       std::vector<std::size_t> order;
@@ -694,7 +690,7 @@ std::vector<logical_bound_read_view> capture_bound_read_views(duckdb::LogicalOpe
     if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
       auto const& get = op.Cast<duckdb::LogicalGet>();
       if (planner::lookup_connector(get, context)) {
-        captured.push_back({get.table_index, capture_bound_read_view(get, context)});
+        captured.push_back({get.table_index.index, capture_bound_read_view(get, context)});
       }
     }
     for (auto const& child : op.children) {

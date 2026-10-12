@@ -25,6 +25,8 @@
 
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/aggregate.hpp"
+
+#include <duckdb/main/settings.hpp>
 // Reaching a join operator through these headers instantiates `vector<join_condition>`'s
 // destructor, which needs the AST node definition.
 #include "expression/ast/node.hpp"
@@ -141,7 +143,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
 
     auto plan = std::move(planner.plan);
 
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -149,7 +151,8 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
     resolver.VisitOperator(*plan);
 
     sirius::planner::sirius_physical_plan_generator gen(context);
@@ -238,14 +241,13 @@ std::string tree_to_string(sirius_physical_operator* root)
 duckdb::unique_ptr<duckdb::Expression> untranslatable_table_filter_expression()
 {
   auto expression = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
-    duckdb::LogicalType::BOOLEAN,
-    duckdb::ScalarFunction("sirius_unmapped_filter",
-                           {duckdb::LogicalType::BIGINT},
-                           duckdb::LogicalType::BOOLEAN,
-                           nullptr),
+    duckdb::BoundScalarFunction(duckdb::ScalarFunction("sirius_unmapped_filter",
+                                                       {duckdb::LogicalType::BIGINT},
+                                                       duckdb::LogicalType::BOOLEAN,
+                                                       nullptr)),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
     nullptr);
-  expression->children.push_back(
+  expression->GetChildrenMutable().push_back(
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0));
   return expression;
 }
@@ -358,6 +360,8 @@ struct plan_tree_shape_fixture {
                "minimal.yaml";
     db  = sirius::test::open_sirius_db(_db_path.path().c_str(), cfg);
     con = std::make_unique<Connection>(*db);
+    // This suite checks the explicit DELIM_JOIN operator's wiring.
+    REQUIRE_FALSE(con->Query("SET delim_join_as_cte=false")->HasError());
 
     // big_left is larger so the optimizer keeps small_right as the build side.
     con->Query("CREATE TABLE big_left (id INTEGER, val INTEGER)");
@@ -475,7 +479,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
     "JOIN small_c c ON r.other = c.ckey";
   const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
-                                              OptimizerType::BUILD_SIDE_PROBE_SIDE};
+                                              OptimizerType::BUILD_SIDE_PROBE_SIDE,
+                                              OptimizerType::OUTER_JOIN_SIMPLIFICATION};
 
   auto require_nested_join = [](sirius_physical_operator* plan) {
     auto joins = collect(plan, SiriusPhysicalOperatorType::HASH_JOIN);
@@ -956,8 +961,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("COUNT(DISTINCT) records LIST locally and BIGINT after merge")
   {
-    auto plan =
-      generate_sirius_plan(*con, "SELECT val, count(DISTINCT id) FROM big_left GROUP BY val");
+    auto plan = generate_sirius_plan(*con,
+                                     "SELECT val, count(DISTINCT id) FROM big_left GROUP BY val",
+                                     {OptimizerType::DISTINCT_AGGREGATE_REWRITE});
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
@@ -991,7 +997,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("AVG records its two-column local accumulator schema below MERGE_AGGREGATE")
   {
-    auto plan = generate_sirius_plan(*con, "SELECT avg(val) FROM big_left");
+    auto plan = generate_sirius_plan(
+      *con, "SELECT avg(val) FROM big_left", {OptimizerType::AGGREGATE_FUNCTION_REWRITER});
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
@@ -1009,7 +1016,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("AVG widens its DECIMAL local sum carrier to DECIMAL(38, scale) below MERGE_AGGREGATE")
   {
-    auto plan = generate_sirius_plan(*con, "SELECT avg(amount) FROM decimal_values");
+    auto plan = generate_sirius_plan(
+      *con, "SELECT avg(amount) FROM decimal_values", {OptimizerType::AGGREGATE_FUNCTION_REWRITER});
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
@@ -1216,7 +1224,7 @@ duckdb::unique_ptr<sirius_physical_operator> make_wrap_hash_join(
   duckdb::unique_ptr<sirius_physical_operator> left,
   duckdb::unique_ptr<sirius_physical_operator> right)
 {
-  duckdb::LogicalDummyScan stub(0);
+  duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
   stub.types = {duckdb::LogicalType::INTEGER,
                 duckdb::LogicalType::INTEGER,
                 duckdb::LogicalType::INTEGER,
@@ -1398,7 +1406,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   // nothing to copy.
   sirius::planner::sirius_physical_plan_generator gen(*con->context);
 
-  duckdb::LogicalDummyScan stub(0);
+  duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
   stub.types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
   duckdb::unique_ptr<sirius_physical_operator> plan =
     duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(
@@ -1431,9 +1439,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     scan = scan->children.front().get();
   }
   auto& get = scan->Cast<duckdb::LogicalGet>();
-  REQUIRE(get.function.name == "seq_scan");
-  get.table_filters.filters[0] =
-    duckdb::make_uniq<duckdb::ExpressionFilter>(untranslatable_table_filter_expression());
+  REQUIRE(get.function.GetName() == "seq_scan");
+  get.table_filters.SetFilterByColumnIndex(
+    duckdb::ProjectionIndex(0),
+    duckdb::make_uniq<duckdb::ExpressionFilter>(untranslatable_table_filter_expression()));
 
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
   CHECK_THROWS_WITH(
@@ -1497,9 +1506,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - UNION arm sinks declare the union's schema, not the arm's",
                  "[plan_tree_shape][union_all][isolated_context]")
 {
-  // Each arm's sink must declare the union's schema. A materialized CTE declares its
-  // materialization side instead, so copying the arm's `types` misdeclares the sink's width --
-  // which `validate_operator_output_types` only warns about, so no end-to-end test can see it.
+  // CTE results and UNION arm sinks use the consumer schema, even when materialization
+  // stores a different number of columns.
   auto require_sinks_match_union = [&](const std::string& query) {
     auto plan = generate_sirius_plan(*con, query);
     INFO(tree_to_string(plan.get()));
@@ -1508,14 +1516,13 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(union_op != nullptr);
     REQUIRE(union_op->children.size() == 2);
 
-    // The premise, pinned: the arm is really a CTE node and its width really differs from the
-    // union's, or the sink would be right by accident. DuckDB's unused-column optimizer prunes the
-    // materialization down to what the body reads and can collapse these queries silently. If this
-    // fires, reshape so the definition is unprunable or the body widens; do not relax it.
     auto* cte = find_first(plan.get(), SiriusPhysicalOperatorType::CTE);
     REQUIRE(cte != nullptr);
-    INFO("cte width=" << cte->types.size() << " union width=" << union_op->types.size());
-    REQUIRE(cte->types.size() != union_op->types.size());
+    REQUIRE(cte->children.size() == 2);
+    REQUIRE(cte->children[0]->types.size() != union_op->types.size());
+    CHECK(cte->types == cte->children[1]->types);
+    CHECK(cte->types == union_op->types);
+    CHECK_FALSE(cte->declared_output_schema_is_runtime_schema());
 
     for (auto& child : union_op->children) {
       REQUIRE(child->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);

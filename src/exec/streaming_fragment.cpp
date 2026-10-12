@@ -87,7 +87,7 @@ duckdb::shared_ptr<duckdb::PreparedStatementData> synthesize_prepared(
   prepared->types = sirius::to_duckdb_vec(types);
   prepared->names.reserve(types.size());
   for (duckdb::idx_t i = 0; i < types.size(); ++i) {
-    prepared->names.push_back("col_" + std::to_string(i));
+    prepared->names.emplace_back("col_" + std::to_string(i));
   }
   return prepared;
 }

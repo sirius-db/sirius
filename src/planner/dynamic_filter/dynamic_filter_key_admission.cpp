@@ -1,3 +1,4 @@
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 /*
  * Copyright 2026, Sirius Contributors.
  *
@@ -14,8 +15,6 @@
  * limitations under the License.
  */
 
-#include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
-
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/joinside.hpp"
@@ -23,6 +22,7 @@
 #include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
+#include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -103,9 +103,9 @@ op::dynamic_filter_key_shape classify_key_side(duckdb::Expression const& key_sid
   if (expression_class == duckdb::ExpressionClass::BOUND_REF) {
     return op::dynamic_filter_key_shape::direct;
   }
-  if (expression_class == duckdb::ExpressionClass::BOUND_CAST) {
-    return key_side.Cast<duckdb::BoundCastExpression>().child->GetExpressionClass() ==
-               duckdb::ExpressionClass::BOUND_REF
+  if (duckdb::BoundCastExpression::IsCast(key_side)) {
+    return duckdb::BoundCastExpression::Child(key_side.Cast<duckdb::BoundFunctionExpression>())
+                 .GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF
              ? op::dynamic_filter_key_shape::cast
              : op::dynamic_filter_key_shape::computed;
   }
@@ -118,8 +118,9 @@ std::vector<op::dynamic_filter_condition_shape> classify_join_key_shapes(
   std::vector<op::dynamic_filter_condition_shape> shapes;
   shapes.reserve(conditions.size());
   for (auto const& condition : conditions) {
-    shapes.push_back(op::dynamic_filter_condition_shape{
-      .probe = classify_key_side(*condition.left), .build = classify_key_side(*condition.right)});
+    shapes.push_back(
+      op::dynamic_filter_condition_shape{.probe = classify_key_side(condition.GetLHS()),
+                                         .build = classify_key_side(condition.GetRHS())});
   }
   return shapes;
 }

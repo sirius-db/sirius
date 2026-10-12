@@ -28,6 +28,9 @@
 #include <op/scan/scan_utils.hpp>
 
 // standard library
+#include <duckdb/planner/expression_iterator.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
+
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -92,8 +95,11 @@ std::vector<table_filter_conjunct> decompose_table_filters(
 {
   std::vector<table_filter_conjunct> conjuncts;
 
-  for (auto& [column_index, filter] : filters.filters) {
-    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER) { continue; }
+  for (auto const& entry : filters) {
+    auto const column_index = entry.GetIndex().GetIndex();
+    auto const& filter =
+      duckdb::ExpressionFilter::GetExpressionFilter(entry.Filter(), "scan filter decomposition");
+    if (duckdb::ExpressionFilter::IsOptionalFilter(filter)) { continue; }
 
     auto const column = resolve_filtered_column(
       column_index, column_ids, batch_position_by_column_id, skip_primary_indices);
@@ -126,13 +132,37 @@ std::vector<table_filter_conjunct> decompose_table_filters(
       column_index,
       column.primary_index,
       col_type.to_string(),
-      static_cast<int>(filter->filter_type),
+      static_cast<int>(filter.filter_type),
       batch_column_index);
 
     auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
       sirius::to_duckdb(col_type), batch_column_index);
     conjuncts.push_back(
-      {column.primary_index, column.batch_position, filter->ToExpression(*column_ref)});
+      {column.primary_index, column.batch_position, filter.ToExpression(*column_ref)});
+  }
+
+  for (auto const& entry : filters.GetMultiColumnFilters()) {
+    auto const* filter =
+      &duckdb::ExpressionFilter::GetExpressionFilter(*entry, "multi-column scan filter");
+    if (duckdb::ExpressionFilter::IsOptionalFilter(*filter)) { continue; }
+    auto expr                                      = filter->expr->Copy();
+    std::function<void(duckdb::Expression&)> remap = [&](duckdb::Expression& node) {
+      if (node.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+        auto& ref             = node.Cast<duckdb::BoundReferenceExpression>();
+        auto const scan_index = filter->column_indexes.at(ref.Index()).GetIndex();
+        auto const column     = resolve_filtered_column(
+          scan_index, column_ids, batch_position_by_column_id, skip_primary_indices);
+        if (column.status != filter_column_status::usable) {
+          throw std::runtime_error(
+            "TABLE_SCAN multi-column filter references an unavailable batch column");
+        }
+        ref.IndexMutable() = column.batch_position;
+      }
+      duckdb::ExpressionIterator::EnumerateChildren(
+        node, [&](duckdb::unique_ptr<duckdb::Expression>& child) { remap(*child); });
+    };
+    remap(*expr);
+    conjuncts.push_back({std::nullopt, std::nullopt, std::move(expr)});
   }
 
   return conjuncts;
@@ -159,7 +189,7 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   auto conjunction =
     duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
   for (auto& conjunct : conjuncts) {
-    conjunction->children.push_back(std::move(conjunct.expr));
+    conjunction->GetChildrenMutable().push_back(std::move(conjunct.expr));
   }
   return conjunction;
 }

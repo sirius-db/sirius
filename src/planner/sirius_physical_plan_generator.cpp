@@ -1,3 +1,4 @@
+#include "duckdb/main/attached_database.hpp"
 /*
  * Copyright 2025, Sirius Contributors.
  *
@@ -13,8 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-#include "planner/sirius_physical_plan_generator.hpp"
 
 #include "config.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -71,6 +70,7 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
@@ -205,9 +205,9 @@ void populate_parquet_schema(sirius::op::scan::parquet_ingestible_table_info& ou
       kind = sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
     }
     info->virtual_columns.push_back(sirius::op::scan::bound_virtual_column{
-      column_id, column.name, sirius::from_duckdb(column.type), kind});
+      column_id, column.name.GetIdentifierName(), sirius::from_duckdb(column.type), kind});
   }
-  if (scan_op.function.name != "sirius_read_parquet" &&
+  if (scan_op.function.GetName().GetIdentifierName() != "sirius_read_parquet" &&
       dynamic_cast<duckdb::MultiFileBindData const*>(scan_op.bind_data.get())) {
     auto const& bind_data   = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     info->partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
@@ -259,10 +259,11 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
   info->table_filters = std::move(scan_op.table_filters);
   auto resolved_file_paths =
     scan_op.contract_file_paths.empty()
-      ? resolve_parquet_scan_file_paths(
-          scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters)
+      ? resolve_parquet_scan_file_paths(scan_op.function.GetName().GetIdentifierName(),
+                                        scan_op.bind_data.get(),
+                                        scan_op.parameters)
       : std::move(scan_op.contract_file_paths);
-  if (scan_op.function.name == "sirius_read_parquet") {
+  if (scan_op.function.GetName().GetIdentifierName() == "sirius_read_parquet") {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] sirius_read_parquet scan "
@@ -298,7 +299,7 @@ void collect_iceberg_schema(std::vector<duckdb::MultiFileColumnDefinition> const
   for (auto const& column : columns) {
     if (!column.identifier.IsNull() &&
         column.identifier.type().id() == duckdb::LogicalTypeId::INTEGER) {
-      schema.fields.push_back({column.name,
+      schema.fields.push_back({column.name.GetIdentifierName(),
                                column.identifier.GetValue<int32_t>(),
                                column.children.empty() ? column.type.ToString() : std::string{}});
     }
@@ -405,9 +406,9 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   info->context = &context;
   info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
   // Derive the cache identity from the resolved entry on both pin and scan paths.
-  info->catalog_name           = table.ParentCatalog().GetName();
-  info->schema_name            = table.ParentSchema().name;
-  info->table_name             = table.name;
+  info->catalog_name           = table.ParentCatalog().GetName().GetIdentifierName();
+  info->schema_name            = table.ParentSchema().name.GetIdentifierName();
+  info->table_name             = table.name.GetIdentifierName();
   info->table_identity         = {table.oid, table.GetStorage().GetRowGroupCollection()};
   info->approximate_batch_size = op_params.scan_task_batch_size;
 
@@ -439,12 +440,7 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   }
 
   // Filters drive row-group pruning in the metadata walk and post-decode filtering.
-  if (scan_op.table_filters) {
-    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-    for (auto& [col_idx, filt] : scan_op.table_filters->filters) {
-      info->table_filters->filters[col_idx] = filt->Copy();
-    }
-  }
+  if (scan_op.table_filters) { info->table_filters = scan_op.table_filters->Copy(); }
   info->column_ids     = scan_op.column_ids;
   info->projection_ids = scan_op.projection_ids;
   info->returned_types = scan_op.returned_types;
@@ -546,7 +542,7 @@ void mark_expression(ast::node const* expression, plan_lineage const& input)
 void mark_expression(duckdb::Expression const& expression, plan_lineage const& input)
 {
   if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    mark_semantic(lineage_at(input, expression.Cast<duckdb::BoundReferenceExpression>().index));
+    mark_semantic(lineage_at(input, expression.Cast<duckdb::BoundReferenceExpression>().Index()));
   } else {
     duckdb::ExpressionIterator::EnumerateChildren(
       expression, [&](duckdb::Expression const& child) { mark_expression(child, input); });
@@ -573,7 +569,8 @@ plan_lineage collect_semantic_lineage(
     auto& scan = node.Cast<op::sirius_physical_table_scan>();
     plan_lineage result;
     result.columns.resize(scan.types.size());
-    if (scan.function.name != "seq_scan" && scan.children.empty() && !scan.pre_declined) {
+    if (scan.function.GetName().GetIdentifierName() != "seq_scan" && scan.children.empty() &&
+        !scan.pre_declined) {
       op::scan::parquet_ingestible_table_info info;
       populate_parquet_schema(info, scan);
       auto layout = op::scan::build_scan_plan(info.column_ids,
@@ -593,7 +590,9 @@ plan_lineage collect_semantic_lineage(
           result.columns[i].push_back(result.inputs[output.idx]);
       }
       if (scan.table_filters) {
-        for (auto const& [c, filter] : scan.table_filters->filters) {
+        if (!scan.table_filters->GetMultiColumnFilters().empty()) mark_semantic(result.inputs);
+        for (auto const& filter : *scan.table_filters) {
+          auto const c = filter.GetIndex().GetIndex();
           if (c >= layout.batch_position_by_column_id.size()) {
             mark_semantic(result.inputs);
             continue;
@@ -616,13 +615,16 @@ plan_lineage collect_semantic_lineage(
         else
           mark_semantic(result.inputs);
       }
-      if (scan.table_filters)
-        for (auto const& [c, filter] : scan.table_filters->filters) {
+      if (scan.table_filters) {
+        if (!scan.table_filters->GetMultiColumnFilters().empty()) mark_semantic(result.inputs);
+        for (auto const& filter : *scan.table_filters) {
+          auto const c = filter.GetIndex().GetIndex();
           if (c < result.inputs.size())
             mark_semantic({result.inputs[c]});
           else
             mark_semantic(result.inputs);
         }
+      }
     }
     if (force_all) mark_semantic(result.inputs);
     return result;
@@ -812,7 +814,7 @@ void certify_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   if (!table_scan_slot->children.empty()) { return; }
 
   auto& scan        = table_scan_slot->Cast<sirius::op::sirius_physical_table_scan>();
-  const auto& fn    = scan.function.name;
+  const auto& fn    = scan.function.GetName().GetIdentifierName();
   auto const* entry = lookup_connector(scan.function, scan.bind_data.get(), context);
   if (!entry || !entry->lower) {
     throw duckdb::NotImplementedException(
@@ -834,8 +836,8 @@ void certify_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     return;
   }
 
-  scan.contract_file_paths =
-    resolve_parquet_scan_file_paths(scan.function.name, scan.bind_data.get(), scan.parameters);
+  scan.contract_file_paths = resolve_parquet_scan_file_paths(
+    scan.function.GetName().GetIdentifierName(), scan.bind_data.get(), scan.parameters);
   scan.bound_view = std::make_shared<sirius::op::scan::bound_read_view const>(
     sirius::op::scan::capture_bound_read_view(scan, context, scan.contract_file_paths));
 
@@ -1252,8 +1254,7 @@ void wrap_union_child(sirius::op::sirius_physical_operator& union_op, std::size_
       auto child_physical = child_orig->has_physical_overrides() ? child_orig->get_physical_types()
                                                                  : std::vector<cudf::data_type>{};
 
-      // The union's schema, not the arm's: the binder has already cast every arm to it, and a
-      // materialized CTE's own `types` are its materialization side rather than what it emits.
+      // The binder has already cast every arm to the union's schema.
       auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
         union_op.types, est_card, sirius::op::sirius_physical_union::port_label(child_idx));
       // Expected to be empty: the compressed-schema pass treats UNION as a native boundary and
@@ -1502,12 +1503,12 @@ void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expr
                                                                     std::string_view operation)
 {
   // A nested-typed BOUND_REF names the offending column directly.
-  if (is_nested_logical_type(expr.return_type) &&
+  if (is_nested_logical_type(expr.GetReturnType()) &&
       expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    auto name = expr.GetName();
+    auto name = expr.GetName().GetIdentifierName();
     if (name.empty()) { name = expr.ToString(); }
     throw std::runtime_error("nested column operation on column '" + name + "' (" +
-                             expr.return_type.ToString() + ") is unsupported in " +
+                             expr.GetReturnType().ToString() + ") is unsupported in " +
                              std::string(operation) +
                              ": Sirius reads and projects nested columns but cannot operate on "
                              "them yet");
@@ -1521,9 +1522,9 @@ void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expr
 
   // Constructed nested values (struct_pack, list constructors, ...) cannot run
   // on the GPU path either.
-  if (is_nested_logical_type(expr.return_type)) {
+  if (is_nested_logical_type(expr.GetReturnType())) {
     throw std::runtime_error("nested column operation on '" + expr.ToString() + "' (" +
-                             expr.return_type.ToString() + ") is unsupported in " +
+                             expr.GetReturnType().ToString() + ") is unsupported in " +
                              std::string(operation));
   }
 }
@@ -1615,7 +1616,7 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   op.set_parent_op(parent);
 
   // CTE is transparent on its consumer side: children[0] materializes into the CTE while
-  // children[1]'s result IS the CTE's output (CTE::execute just forwards it). Assign the CTE's
+  // children[1]'s result is the CTE's tree output. Assign the CTE's
   // own parent to children[1] so the tree-parent wiring never emits
   // consumer_sink -> CTE_pipeline edges, which would close a cycle with the CTE sink's own
   // CTE_pipeline -> consumer emissions.
@@ -1836,19 +1837,15 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
 {
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
-  // Resolve the types of each operator.
-  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
-  op->ResolveOperatorTypes();
-  profiler.EndPhase();
-
-  // Resolve the column references.
-  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);
-  duckdb::ColumnBindingResolver resolver;
-  resolver.VisitOperator(*op);
-  profiler.EndPhase();
-
-  // then create the main physical plan
-  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_CREATE_PLAN);
+  {
+    auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerResolveTypes>();
+    op->ResolveOperatorTypes();
+  }
+  {
+    auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerColumnBinding>();
+    duckdb::ColumnBindingResolver resolver;
+    resolver.VisitOperator(*op);
+  }
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan;
   auto preserve_first_pre_decline = [&] {
     if (!contract_provenance.first_pre_decline) return;
@@ -1863,7 +1860,8 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw duckdb::NotImplementedException(message);
   };
   try {
-    plan = create_plan(*op);
+    auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerCreatePlan>();
+    plan       = create_plan(*op);
   } catch (duckdb::NotImplementedException const&) {
     // A pre-capture refusal used to throw before parent planning. Preserve
     // that first error if a later ordinary planner decline aborts tree build.
@@ -1884,7 +1882,6 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     preserve_first_pre_decline();
     throw;
   }
-  profiler.EndPhase();
 
   plan = fold_adjacent_projections(std::move(plan));
   if (compressed_materialization_active(context)) {

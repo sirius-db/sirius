@@ -99,7 +99,8 @@ duckdb_parquet_bind_shape duckdb_read_parquet_shape(fs::path const& path)
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : ""));
   REQUIRE_FALSE(result->HasError());
-  return duckdb_parquet_bind_shape{result->types, result->names};
+  return duckdb_parquet_bind_shape{result->GetTypes(),
+                                   duckdb::IdentifiersToStrings(result->GetNames())};
 }
 
 std::vector<std::string> bind_names(parquet_bind_result const& result)

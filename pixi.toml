@@ -56,6 +56,7 @@ librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
+# Fixture/data-generation Python client; the engine and LOAD tests use the pinned v2 source.
 duckdb = "=1.5.6"
 spdlog = "1.8.*"
 sqlite = "3.*"
@@ -68,6 +69,9 @@ pnpm = "*"
 python = "3.14.*"
 pyarrow = ">=14"
 seaweedfs = ">=4.48"
+liblzma-devel = "*"
+jansson = "*"
+snappy = "*"
 fastavro = "1.12.2.*"
 
 [tasks]

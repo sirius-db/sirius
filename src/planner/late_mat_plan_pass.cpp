@@ -395,7 +395,7 @@ step trace_through(sirius_physical_operator const& node,
         if (order.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
           return step::reads();
         }
-        auto const index = order.expression->Cast<duckdb::BoundReferenceExpression>().index;
+        auto const index = order.expression->Cast<duckdb::BoundReferenceExpression>().Index();
         if (static_cast<std::size_t>(index) == in_pos) { return step::reads_and_moves(in_pos); }
       }
       return step::to(in_pos);

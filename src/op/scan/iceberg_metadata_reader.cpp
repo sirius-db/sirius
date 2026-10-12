@@ -28,6 +28,7 @@
 #include <duckdb/common/types/vector.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
+#include <duckdb/main/query_result_stream.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
 #include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
@@ -170,10 +171,6 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   // status is the entry's liveness (ADDED / EXISTING / DELETED); a manifest keeps listing entries
   // that later commits retired. Without this filter a delete file that a compaction replaced is
   // read back as live and removes rows the current snapshot keeps.
-  //
-  // ⚠️ status and content BOTH use the string "EXISTING" for unrelated things: status EXISTING
-  // means "carried over from an earlier snapshot", content EXISTING means "this is a DATA file"
-  // (which is what kExisting below tests). Do not merge these two tests.
   auto const live = source + " WHERE status <> 'DELETED'";
 
   // Injection is latched by the planning attempt, after the original scan bound successfully.
@@ -183,7 +180,7 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   // inventory. Retain raw chunks until the count is known; a refusal discards
   // them without copying their path strings or issuing a second manifest walk.
   if (counters) ++counters->iceberg_manifest_walks;
-  auto meta_result = conn.SendQuery(
+  auto meta_result = conn.Submit(
     "SELECT content::VARCHAR, file_path, manifest_sequence_number, file_format, manifest_path "
     "FROM " +
     live);
@@ -194,7 +191,8 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   uint64_t bytes      = sizeof(iceberg_delete_inventory);
   uint64_t peak_bytes = bytes;
   try {
-    while (auto chunk = meta_result->Fetch()) {
+    duckdb::QueryResultStream<> stream(std::move(meta_result));
+    while (auto chunk = stream.Fetch()) {
       if (chunk->size() == 0) break;
       duckdb::UnifiedVectorFormat content;
       chunk->data[0].ToUnifiedFormat(chunk->size(), content);
@@ -215,10 +213,10 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
         chunks.push_back(std::move(chunk));
       }
     }
+    if (stream.HasError()) throw std::runtime_error(stream.GetError());
   } catch (std::exception const& error) {
     throw inventory_query_error(error.what(), false);
   }
-  if (meta_result->HasError()) throw inventory_query_error(meta_result->GetError(), false);
   if (result.equality_count) result.inventory.reset();
   for (auto& chunk : chunks) {
     for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
@@ -259,14 +257,9 @@ iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext& context,
   auto& conn = metadata_conn.get();
 
   // Values of iceberg_metadata()'s `content` column -- what KIND of file an entry describes.
-  //
-  // ⚠️ `content` and `status` both use the string "EXISTING" for unrelated things. On `status`
-  // (which the query above filters on) it means "carried over from an earlier snapshot". Here it
-  // means "this is a DATA file" -- DuckDB's name for what the Iceberg spec calls DATA. Reading
-  // one as the other silently reclassifies every data file as a delete file, or vice versa.
   static constexpr auto kPositionDeletes = "POSITION_DELETES";
   static constexpr auto kEqualityDeletes = "EQUALITY_DELETES";
-  static constexpr auto kContentDataFile = "EXISTING";
+  static constexpr auto kContentDataFile = "DATA";
   static constexpr auto kFormatPuffin    = "PUFFIN";
 
   // iceberg_metadata() returns one PUFFIN row per deletion vector, but read_avro returns ALL of
@@ -324,15 +317,12 @@ iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext& context,
     } else if (content == kContentDataFile) {
       result.data_file_manifest_sequence_numbers[filepath] = seq;
     } else {
-      // Refuse rather than skip. "EXISTING" is DuckDB's name for the spec's DATA, so if a
-      // future iceberg extension corrects it, this branch is the difference between the scan
-      // declining and it quietly collecting NO data-file sequence numbers -- which is what
-      // decides whether an equality delete applies to a file. Silently ignoring an unknown
-      // content kind would also drop a delete class Iceberg adds later.
+      // Unknown content could omit data-file sequence numbers or a new delete class.
+      // Decline rather than risk applying or skipping deletes incorrectly.
       throw std::runtime_error(
         "[iceberg] iceberg_metadata() returned an unrecognized content kind '" + content +
         "' for '" + filepath +
-        "'; this scan path knows only POSITION_DELETES, EQUALITY_DELETES and EXISTING (data), "
+        "'; this scan path knows only POSITION_DELETES, EQUALITY_DELETES and DATA, "
         "and guessing which one it resembles would risk applying or skipping deletes wrongly");
     }
   }

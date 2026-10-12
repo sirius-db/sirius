@@ -47,8 +47,8 @@
         "CMAKE_C_COMPILER_LAUNCHER": "sccache",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_LINKER_TYPE": "MOLD",
+        "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
         "EXPORT_DYNAMIC_SYMBOLS": "ON",
-        "OVERRIDE_GIT_DESCRIBE": "v1.5.6",
         "SIRIUS_BUILD_TESTS": "ON"
       },
       "generator": "Ninja",

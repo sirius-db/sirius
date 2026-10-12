@@ -21,6 +21,7 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/common/column_index.hpp>
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
@@ -29,6 +30,7 @@
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 #include <cstdio>
 #include <filesystem>
@@ -78,7 +80,8 @@ duckdb::DataTable& get_storage(duckdb::Connection& con, const std::string& table
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto entry =
+    schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
@@ -167,9 +170,11 @@ TEST_CASE("deferred walk: filter-stat pruning is preserved when the walk runs la
 
   auto make_filters = [] {
     // k < -1: provably empty per row group -> every row group stats-pruned.
-    auto filters        = duckdb::make_uniq<duckdb::TableFilterSet>();
-    filters->filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value::INTEGER(-1));
+    auto filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    filters->SetFilterByColumnIndex(
+      duckdb::ProjectionIndex(0),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                    duckdb::Value::INTEGER(-1)));
     return filters;
   };
 

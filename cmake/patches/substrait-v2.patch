@@ -1,0 +1,307 @@
+--- a/from_substrait.cpp
++++ b/from_substrait.cpp
+@@ -1,3 +1,4 @@
++#include "duckdb/catalog/catalog.hpp"
+ #include "from_substrait.hpp"
+ 
+ #include <cinttypes>
+@@ -195,7 +196,7 @@
+ }
+ 
+ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformLiteralExpr(const substrait::Expression &sexpr) {
+-	return make_uniq<ConstantExpression>(TransformLiteralToValue(sexpr.literal()));
++	return ConstantExpression::FromValue(TransformLiteralToValue(sexpr.literal()));
+ }
+ 
+ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformSelectionExpr(const substrait::Expression &sexpr) {
+@@ -251,14 +252,14 @@
+ 		for (idx_t child_idx = 0; child_idx < 2; child_idx++) {
+ 			if (children[child_idx]->GetExpressionClass() == ExpressionClass::CONSTANT) {
+ 				auto &constant = children[child_idx]->Cast<ConstantExpression>();
+-				if (constant.value.type() == LogicalType::VARCHAR) {
++				if (constant.GetLiteral().kind == LiteralKind::STRING) {
+ 					is_it_string = true;
+ 				}
+ 			}
+ 		}
+ 		if (is_it_string) {
+ 			string not_equal = "!~~";
+-			return make_uniq<FunctionExpression>(not_equal, std::move(children));
++			return make_uniq<FunctionExpression>(Identifier(not_equal), std::move(children));
+ 		} else {
+ 			return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL, std::move(children[0]),
+ 			                                       std::move(children[1]));
+@@ -301,11 +302,11 @@
+ 		D_ASSERT(enum_expressions.size() == 1);
+ 		auto &subfield = enum_expressions[0];
+ 		VerifyCorrectExtractSubfield(subfield);
+-		auto constant_expression = make_uniq<ConstantExpression>(Value(subfield));
++		auto constant_expression = ConstantExpression::FromValue(Value(subfield));
+ 		children.insert(children.begin(), std::move(constant_expression));
+ 	}
+ 
+-	return make_uniq<FunctionExpression>(RemapFunctionName(function_name), std::move(children));
++	return make_uniq<FunctionExpression>(Identifier(RemapFunctionName(function_name)), std::move(children));
+ }
+ 
+ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformIfThenExpr(const substrait::Expression &sexpr) {
+@@ -315,9 +316,9 @@
+ 		CaseCheck dif;
+ 		dif.when_expr = TransformExpr(sif.if_());
+ 		dif.then_expr = TransformExpr(sif.then());
+-		dcase->case_checks.push_back(std::move(dif));
+-	}
+-	dcase->else_expr = TransformExpr(scase.else_());
++		dcase->CaseChecksMutable().push_back(std::move(dif));
++	}
++	dcase->ElseMutable() = TransformExpr(scase.else_());
+ 	return std::move(dcase);
+ }
+ 
+@@ -393,7 +394,7 @@
+ 		for (idx_t i = 0; i < s_struct_type.types_size(); i++) {
+ 			auto field_name = "f" + std::to_string(i);
+ 			auto field_type = SubstraitToDuckType(s_struct_type.types(i));
+-			children.push_back(make_pair(field_name, field_type));
++			children.push_back(make_pair(Identifier(field_name), field_type));
+ 		}
+ 
+ 		return LogicalType::STRUCT(children);
+@@ -439,7 +440,7 @@
+ 		}
+ 		if (iterator && !iterator->Finished() && iterator->Unique(children.size())) {
+ 			for (auto &child : children) {
+-				child->alias = iterator->GetCurrentName();
++				child->SetAlias(Identifier(iterator->GetCurrentName()));
+ 				iterator->Next();
+ 			}
+ 			return make_uniq<FunctionExpression>("struct_pack", std::move(children));
+@@ -701,7 +702,7 @@
+ 	for (size_t i = 0; i < expressions.size(); i++) {
+ 		mock_aliases.push_back("expr_" + to_string(i));
+ 	}
+-	return make_shared_ptr<ProjectionRelation>(input_rel, std::move(expressions), std::move(mock_aliases));
++	return make_shared_ptr<ProjectionRelation>(input_rel, std::move(expressions), StringsToIdentifiers(mock_aliases));
+ }
+ 
+ shared_ptr<Relation> SubstraitToDuckDB::TransformAggregateOp(const substrait::Rel &sop) {
+@@ -727,7 +728,7 @@
+ 			// expression_references contains indices into the grouping_expressions array
+ 			for (auto ref_idx : sgrp.expression_references()) {
+ 				if (ref_idx < (uint32_t)sop.aggregate().grouping_expressions_size()) {
+-					grouping_set.insert(ref_idx);
++					grouping_set.emplace(ref_idx);
+ 				} else {
+ 					throw InternalException("Invalid expression reference index in grouping");
+ 				}
+@@ -754,7 +755,7 @@
+ 				if (arg_expr->GetExpressionClass() == ExpressionClass::POSITIONAL_REFERENCE) {
+ 					auto &pos_ref = arg_expr->Cast<PositionalReferenceExpression>();
+ 					// The position is 1-based, convert to 0-based index
+-					idx_t group_idx = pos_ref.index - 1;
++					idx_t group_idx = pos_ref.Index() - 1;
+ 					// Get the corresponding grouping expression and make a copy
+ 					if (group_idx < group_node.group_expressions.size()) {
+ 						children.push_back(group_node.group_expressions[group_idx]->Copy());
+@@ -775,7 +776,7 @@
+ 			if (function_name == "count" && children.empty()) {
+ 				function_name = "count_star";
+ 			}
+-			expressions.push_back(make_uniq<FunctionExpression>(RemapFunctionName(function_name), std::move(children),
++			expressions.push_back(make_uniq<FunctionExpression>(Identifier(RemapFunctionName(function_name)), std::move(children),
+ 			                                                    nullptr, nullptr, is_distinct));
+ 		}
+ 	}
+@@ -784,13 +785,13 @@
+ }
+ unique_ptr<TableDescription> TableInfo(ClientContext &context, const string &schema_name, const string &table_name) {
+ 	// obtain the table info
+-	auto table = Catalog::GetEntry<TableCatalogEntry>(context, INVALID_CATALOG, schema_name, table_name,
++	auto table = Catalog::GetEntry<TableCatalogEntry>(context, INVALID_CATALOG, Identifier(schema_name), Identifier(table_name),
+ 	                                                  OnEntryNotFound::RETURN_NULL);
+ 	if (!table) {
+ 		return {};
+ 	}
+ 	// write the table info to the result
+-	auto result = make_uniq<TableDescription>(INVALID_CATALOG, schema_name, table_name);
++	auto result = make_uniq<TableDescription>(QualifiedName(INVALID_CATALOG, Identifier(schema_name), Identifier(table_name)));
+ 	for (auto &column : table->GetColumns().Logical()) {
+ 		result->columns.emplace_back(column.Copy());
+ 	}
+@@ -817,10 +818,10 @@
+ 			}
+ 		} catch (...) {
+ 			if (acquire_lock) {
+-				scan = make_shared_ptr<ViewRelation>(context, DEFAULT_SCHEMA, table_name);
++				scan = make_shared_ptr<ViewRelation>(context, DEFAULT_SCHEMA, Identifier(table_name));
+ 
+ 			} else {
+-				scan = make_shared_ptr<ViewRelation>(context_wrapper, DEFAULT_SCHEMA, table_name);
++				scan = make_shared_ptr<ViewRelation>(context_wrapper, DEFAULT_SCHEMA, Identifier(table_name));
+ 			}
+ 		}
+ 	} else if (sget.has_local_files()) {
+@@ -980,7 +981,7 @@
+ 				auto &col_name = base_schema.names(i);
+ 				bool found = false;
+ 				for (size_t j = 0; j < scan_columns.size(); j++) {
+-					if (StringUtil::CIEquals(scan_columns[j].Name(), col_name)) {
++					if (scan_columns[j].Name() == Identifier(col_name)) {
+ 						proj_exprs.push_back(make_uniq<PositionalReferenceExpression>(j + 1));
+ 						proj_aliases.push_back(col_name);
+ 						found = true;
+@@ -992,7 +993,7 @@
+ 					    "baseSchema column '%s' not found in physical table (schema mismatch)", col_name);
+ 				}
+ 			}
+-			scan = make_shared_ptr<ProjectionRelation>(std::move(scan), std::move(proj_exprs), std::move(proj_aliases));
++			scan = make_shared_ptr<ProjectionRelation>(std::move(scan), std::move(proj_exprs), StringsToIdentifiers(proj_aliases));
+ 		}
+ 	}
+ 
+@@ -1010,7 +1011,7 @@
+ 			// TODO make sure nothing else is in there
+ 			expressions.push_back(make_uniq<PositionalReferenceExpression>(sproj.field() + 1));
+ 		}
+-		scan = make_shared_ptr<ProjectionRelation>(std::move(scan), std::move(expressions), std::move(aliases));
++		scan = make_shared_ptr<ProjectionRelation>(std::move(scan), std::move(expressions), StringsToIdentifiers(aliases));
+ 	}
+ 
+ 	return scan;
+@@ -1021,7 +1022,7 @@
+ 	vector<unique_ptr<ParsedExpression>> expression_row;
+ 	expressions.emplace_back(std::move(expression_row));
+ 	Value result(LogicalType::BOOLEAN);
+-	expressions[0].emplace_back(make_uniq<ConstantExpression>(result));
++	expressions[0].emplace_back(ConstantExpression::FromValue(result));
+ 	vector<string> column_names;
+ 	shared_ptr<Relation> scan;
+ 	if (acquire_lock) {
+@@ -1114,21 +1115,21 @@
+ 		}
+ 		
+ 		// Create window expression
+-		auto window_expr = make_uniq<WindowExpression>(expr_type, "", "", remapped_name);
++		auto window_expr = make_uniq<WindowExpression>("", "", remapped_name);
+ 		
+ 		// Add function arguments
+ 		for (auto &arg : window_func.arguments()) {
+-			window_expr->children.push_back(TransformExpr(arg.value()));
++			window_expr->GetArgumentsMutable().push_back(TransformExpr(arg.value()));
+ 		}
+ 		
+ 		// Add partition expressions
+ 		for (auto &partition_expr : sop.window().partition_expressions()) {
+-			window_expr->partitions.push_back(TransformExpr(partition_expr));
++			window_expr->PartitionsMutable().push_back(TransformExpr(partition_expr));
+ 		}
+ 		
+ 		// Add order by expressions
+ 		for (auto &sort_field : sop.window().sorts()) {
+-			window_expr->orders.push_back(TransformOrder(sort_field));
++			window_expr->OrderByMutable().push_back(TransformOrder(sort_field));
+ 		}
+ 		
+ 		// Handle window bounds
+@@ -1140,15 +1141,15 @@
+ 			if (window_func.has_lower_bound()) {
+ 				auto &lower = window_func.lower_bound();
+ 				if (lower.has_unbounded()) {
+-					window_expr->start = WindowBoundary::UNBOUNDED_PRECEDING;
++					window_expr->WindowStartMutable() = WindowBoundary::UNBOUNDED_PRECEDING;
+ 				} else if (lower.has_current_row()) {
+-					window_expr->start = is_rows ? WindowBoundary::CURRENT_ROW_ROWS : WindowBoundary::CURRENT_ROW_RANGE;
++					window_expr->WindowStartMutable() = is_rows ? WindowBoundary::CURRENT_ROW_ROWS : WindowBoundary::CURRENT_ROW_RANGE;
+ 				} else if (lower.has_preceding()) {
+-					window_expr->start_expr = make_uniq<ConstantExpression>(Value::BIGINT(lower.preceding().offset()));
+-					window_expr->start = is_rows ? WindowBoundary::EXPR_PRECEDING_ROWS : WindowBoundary::EXPR_PRECEDING_RANGE;
++					window_expr->StartExprMutable() = ConstantExpression::FromValue(Value::BIGINT(lower.preceding().offset()));
++					window_expr->WindowStartMutable() = is_rows ? WindowBoundary::EXPR_PRECEDING_ROWS : WindowBoundary::EXPR_PRECEDING_RANGE;
+ 				} else if (lower.has_following()) {
+-					window_expr->start_expr = make_uniq<ConstantExpression>(Value::BIGINT(lower.following().offset()));
+-					window_expr->start = is_rows ? WindowBoundary::EXPR_FOLLOWING_ROWS : WindowBoundary::EXPR_FOLLOWING_RANGE;
++					window_expr->StartExprMutable() = ConstantExpression::FromValue(Value::BIGINT(lower.following().offset()));
++					window_expr->WindowStartMutable() = is_rows ? WindowBoundary::EXPR_FOLLOWING_ROWS : WindowBoundary::EXPR_FOLLOWING_RANGE;
+ 				}
+ 			}
+ 			
+@@ -1156,21 +1157,21 @@
+ 			if (window_func.has_upper_bound()) {
+ 				auto &upper = window_func.upper_bound();
+ 				if (upper.has_unbounded()) {
+-					window_expr->end = WindowBoundary::UNBOUNDED_FOLLOWING;
++					window_expr->WindowEndMutable() = WindowBoundary::UNBOUNDED_FOLLOWING;
+ 				} else if (upper.has_current_row()) {
+-					window_expr->end = is_rows ? WindowBoundary::CURRENT_ROW_ROWS : WindowBoundary::CURRENT_ROW_RANGE;
++					window_expr->WindowEndMutable() = is_rows ? WindowBoundary::CURRENT_ROW_ROWS : WindowBoundary::CURRENT_ROW_RANGE;
+ 				} else if (upper.has_preceding()) {
+-					window_expr->end_expr = make_uniq<ConstantExpression>(Value::BIGINT(upper.preceding().offset()));
+-					window_expr->end = is_rows ? WindowBoundary::EXPR_PRECEDING_ROWS : WindowBoundary::EXPR_PRECEDING_RANGE;
++					window_expr->EndExprMutable() = ConstantExpression::FromValue(Value::BIGINT(upper.preceding().offset()));
++					window_expr->WindowEndMutable() = is_rows ? WindowBoundary::EXPR_PRECEDING_ROWS : WindowBoundary::EXPR_PRECEDING_RANGE;
+ 				} else if (upper.has_following()) {
+-					window_expr->end_expr = make_uniq<ConstantExpression>(Value::BIGINT(upper.following().offset()));
+-					window_expr->end = is_rows ? WindowBoundary::EXPR_FOLLOWING_ROWS : WindowBoundary::EXPR_FOLLOWING_RANGE;
++					window_expr->EndExprMutable() = ConstantExpression::FromValue(Value::BIGINT(upper.following().offset()));
++					window_expr->WindowEndMutable() = is_rows ? WindowBoundary::EXPR_FOLLOWING_ROWS : WindowBoundary::EXPR_FOLLOWING_RANGE;
+ 				}
+ 			}
+ 		}
+ 		
+ 		// Handle invocation (DISTINCT, etc.)
+-		window_expr->distinct =
++		window_expr->DistinctMutable() =
+ 			window_func.invocation() == substrait::AggregateFunction_AggregationInvocation_AGGREGATION_INVOCATION_DISTINCT;
+ 		
+ 		expressions.push_back(std::move(window_expr));
+@@ -1179,7 +1180,7 @@
+ 	
+ 	// Return a projection with the window expressions
+ 	// Window functions in DuckDB are handled as projections with window expressions
+-	return input_rel->Project(std::move(expressions), aliases);
++	return input_rel->Project(std::move(expressions), std::move(aliases));
+ }
+ 
+ static SetOperationType TransformSetOperationType(substrait::SetRel_SetOp setop) {
+@@ -1239,19 +1240,19 @@
+ 	auto input = TransformOp(swrite.input());
+ 	switch (swrite.op()) {
+ 	case substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_CTAS:
+-		return input->CreateRel(schema_name, table_name);
++		return input->CreateRel(Identifier(schema_name), Identifier(table_name));
+ 	case substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_INSERT:
+-		return input->InsertRel(schema_name, table_name);
++		return input->InsertRel(Identifier(schema_name), Identifier(table_name));
+ 	case substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_DELETE: {
+ 		switch (input->type) {
+ 		case RelationType::PROJECTION_RELATION: {
+ 			auto project = std::move(input.get()->Cast<ProjectionRelation>());
+ 			auto filter = std::move(project.child->Cast<FilterRelation>());
+-                        return make_shared_ptr<DeleteRelation>(filter.context, std::move(filter.condition), catalog_name, schema_name, table_name);
++                        return make_shared_ptr<DeleteRelation>(filter.context, std::move(filter.condition), Identifier(catalog_name), Identifier(schema_name), Identifier(table_name));
+ 		}
+ 		case RelationType::FILTER_RELATION: {
+ 			auto filter = std::move(input.get()->Cast<FilterRelation>());
+-			return make_shared_ptr<DeleteRelation>(filter.context, std::move(filter.condition), catalog_name, schema_name, table_name);
++			return make_shared_ptr<DeleteRelation>(filter.context, std::move(filter.condition), Identifier(catalog_name), Identifier(schema_name), Identifier(table_name));
+ 		}
+ 		default:
+ 			throw NotImplementedException("Unsupported relation type for delete operation");
+@@ -1367,7 +1368,7 @@
+ 		switch (write.op()) {
+ 		case substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_CTAS: {
+ 			const auto create_table = static_cast<CreateTableRelation *>(child.get());
+-			auto proj = make_shared_ptr<ProjectionRelation>(create_table->child, std::move(expressions), aliases);
++			auto proj = make_shared_ptr<ProjectionRelation>(create_table->child, std::move(expressions), StringsToIdentifiers(aliases));
+ 			return proj->CreateRel(create_table->schema_name, create_table->table_name);
+ 		}
+ 		default:
+@@ -1375,7 +1376,7 @@
+ 		}
+ 	}
+ 
+-	return make_shared_ptr<ProjectionRelation>(child, std::move(expressions), aliases);
++	return make_shared_ptr<ProjectionRelation>(child, std::move(expressions), StringsToIdentifiers(aliases));
+ }
+ 
+ shared_ptr<Relation> SubstraitToDuckDB::TransformPlan() {

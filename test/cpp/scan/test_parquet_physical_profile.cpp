@@ -791,7 +791,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
            " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
   auto batch_setting = con->Query("SELECT current_setting('scan_task_batch_size')");
   REQUIRE_FALSE(batch_setting->HasError());
-  auto previous_batch = batch_setting->GetValue(0, 0).ToString();
+  auto previous_batch = batch_setting->Collection().GetValue(0, 0).ToString();
   run_ok("SET scan_task_batch_size=1");
   run_ok("SET gpu_execution=true");
   auto state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -824,7 +824,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     con->Query("SELECT sum(x) FROM read_parquet(" + directory.file_literal("*.parquet") + ")");
   REQUIRE_FALSE(result->HasError());
   REQUIRE(result->RowCount() == 1);
-  CHECK(result->GetValue(0, 0).ToString() == "16773120");
+  CHECK(result->Collection().GetValue(0, 0).ToString() == "16773120");
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
   CHECK(observed);

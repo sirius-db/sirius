@@ -24,12 +24,14 @@
 #include "sirius_context.hpp"
 #include "test_utils.hpp"
 #include "transparent/read_view_registry.hpp"
+#include "utils/table_filter_test_utils.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
@@ -137,9 +139,11 @@ std::unique_ptr<duckdb_native_ingestible_table_info> native_info(native_database
   info->returned_types.push_back(type);
   info->output_types.push_back(type);
   if (all_pruned) {
-    info->table_filters             = duckdb::make_uniq<duckdb::TableFilterSet>();
-    info->table_filters->filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value::INTEGER(-1));
+    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info->table_filters->SetFilterByColumnIndex(
+      duckdb::ProjectionIndex(0),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                    duckdb::Value::INTEGER(-1)));
   }
   return info;
 }

@@ -28,7 +28,11 @@
 #include <duckdb/function/compression_function.hpp>
 #include <duckdb/function/partition_stats.hpp>
 #include <duckdb/main/attached_database.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/expression_iterator.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 #include <duckdb/storage/block_manager.hpp>
 #include <duckdb/storage/segment/uncompressed.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
@@ -39,9 +43,11 @@
 #include <duckdb/storage/table/column_segment.hpp>
 #include <duckdb/storage/table/row_group.hpp>
 #include <duckdb/storage/table/row_group_collection.hpp>
+#include <duckdb/storage/table/row_group_segment_tree.hpp>
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
 #include <duckdb/storage/table_storage_info.hpp>
+#include <scan_manager/pinned_chunk_stats.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -147,7 +153,7 @@ duckdb_segment_descriptor fill_segment_descriptor(duckdb::ColumnSegment& segment
   desc.compression   = segment.GetCompressionFunction().type;
   desc.segment_start = segment_start;
   desc.segment_count = segment.count;
-  if (segment.segment_type == duckdb::ColumnSegmentType::PERSISTENT) {
+  if (segment.GetSegmentType() == duckdb::ColumnSegmentType::PERSISTENT) {
     desc.block_id     = segment.GetBlockId();
     desc.block_offset = segment.GetBlockOffset();
   } else {
@@ -165,7 +171,7 @@ duckdb_segment_descriptor fill_segment_descriptor(duckdb::ColumnSegment& segment
   if (desc.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
     // Snapshot the segment's own stats: the constant value lives here, and
     // row-group-level stats drift as later appends merge into them.
-    desc.segment_stats = std::make_shared<duckdb::BaseStatistics>(segment.stats.statistics.Copy());
+    desc.segment_stats = std::make_shared<duckdb::BaseStatistics>(segment.GetStats().Copy());
   }
   return desc;
 }
@@ -176,7 +182,7 @@ duckdb_segment_descriptor fill_segment_descriptor(duckdb::ColumnSegment& segment
 bool constant_validity_is_all_null(duckdb::ColumnSegment& segment)
 {
   return segment.GetCompressionFunction().type == duckdb::CompressionType::COMPRESSION_CONSTANT &&
-         segment.stats.statistics.CanHaveNull();
+         segment.GetStats().CanHaveNull();
 }
 
 // Grants access to ArrayColumnData's protected child/validity members. C++
@@ -328,12 +334,12 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
       }
       // Read the per-segment Max String Length stat TYPED (exact)
       // Absent stat -> refuse so consumers deref unchecked.
-      if (!duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
+      if (!duckdb::StringStats::HasMaxStringLength(segment.GetStats())) {
         reason_out = verdict_reason::native_varchar_overflow;
         return "varchar segment on column " + std::to_string(column_id) + " row group " +
                std::to_string(rg_idx) + ": Max String Length stat absent from segment stats";
       }
-      desc.max_string_length = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
+      desc.max_string_length = duckdb::StringStats::MaxStringLength(segment.GetStats());
       // Stats-drift guard: a marker-bearing segment must never reach the GPU string
       // decoder. Mirrors the refusal in prepare_duckdb_native_walk (see rationale there).
       if (*desc.max_string_length >=
@@ -399,17 +405,6 @@ void compute_segment_bytes_size(std::vector<duckdb_row_group_metadata>& row_grou
   }
 }
 
-/// @brief Check if the filter can be applied to row-group pruning.
-///
-/// This DuckDB-native statistics walker only consumes the static payloads represented directly by
-/// DuckDB @c TableFilter nodes. @c DYNAMIC_FILTER is a routing placeholder, while Sirius runtime
-/// join filters use their own publication channel and scan-consumer paths, so it is not translated
-/// by this walker.
-bool filter_is_prunable(duckdb::TableFilterType t)
-{
-  return t != duckdb::TableFilterType::DYNAMIC_FILTER;
-}
-
 std::size_t estimate_decoded_bytes_budget(duckdb::idx_t row_count,
                                           const std::vector<projected_column>& projected_cols,
                                           const std::vector<sirius::logical_type>& projected_types)
@@ -467,12 +462,14 @@ std::vector<resolved_prunable_filter> resolve_prunable_filters(
 {
   std::vector<resolved_prunable_filter> out;
   if (table_filters == nullptr || column_ids == nullptr || column_ids->empty()) { return out; }
-  for (auto const& [col_idx, filter] : table_filters->filters) {
-    if (!filter_is_prunable(filter->filter_type)) { continue; }
+  for (auto const& entry : *table_filters) {
+    auto const col_idx = entry.GetIndex().GetIndex();
+    auto const* filter = &entry.Filter();
+    if (!sirius::scan_manager::filter_safe_for_stats(*filter)) { continue; }
     if (col_idx >= column_ids->size()) { continue; }  // defensive
     auto const& column_id = (*column_ids)[col_idx];
     if (!column_index_can_have_storage_stats(column_id)) { continue; }
-    out.push_back({column_id.GetPrimaryIndex(), filter.get()});
+    out.push_back({column_id.GetPrimaryIndex(), filter});
   }
   // Canonical order for the product-cache key; pruning is order-independent.
   std::stable_sort(
@@ -541,8 +538,8 @@ fused_pass_result run_fused_stats_pass(std::size_t n_row_groups,
         auto const* stats = fused_stats_ptr(holder);
         if (stats == nullptr) { continue; }  // no stats -> cannot prune
         // CheckStatistics takes a non-const ref but is read-only.
-        if (f.filter->CheckStatistics(const_cast<duckdb::BaseStatistics&>(*stats)) ==
-            duckdb::FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+        if (duckdb::ExpressionFilter::GetExpressionFilter(*f.filter, "native statistics")
+              .CheckStatistics(*stats) == duckdb::FilterPropagateResult::FILTER_ALWAYS_FALSE) {
           pruned = true;
           break;
         }
@@ -966,7 +963,9 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
         key.projection_signature = std::move(projection_signature);
         key.prunable_filters.reserve(prunable_filters.size());
         for (auto const& f : prunable_filters) {
-          key.prunable_filters.emplace_back(f.primary, f.filter->Copy());
+          key.prunable_filters.emplace_back(
+            f.primary,
+            duckdb::ExpressionFilter::GetExpressionFilter(*f.filter, "native statistics").Copy());
         }
         cache.store_product(storage, snapshot->generation, std::move(key), product);
       }
@@ -1007,10 +1006,15 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
              "].row_start is not valid; cannot synthesize rowids");
       return plan;
     }
-    // PartitionStatistics order matches `RowGroupCollection::SegmentNodes()`
-    // iteration order at v1.5.2.
+    // v2 partition counts describe visible rows. Native decoding needs physical
+    // coverage; visibility is applied separately.
+    auto node = row_groups.GetRowGroups()->GetSegmentByIndex(static_cast<int64_t>(i));
+    if (!node || node->GetRowStart() != ps.row_start.GetIndex()) {
+      refuse("partition statistics do not match physical row-group coverage");
+      return plan;
+    }
     plan.row_group_start[i]      = ps.row_start.GetIndex();
-    plan.row_count[i]            = ps.count;
+    plan.row_count[i]            = node->GetNode().count.load();
     plan.partition_row_groups[i] = ps.partition_row_group;
   }
 

@@ -156,7 +156,7 @@ TEST_CASE_METHOD(isolation_fixture,
     REQUIRE(state(b)->attempt_decline_reason() == decline_reason::provider_internal);
     REQUIRE(result->RowCount() == 3);
     for (int row = 0; row < 3; ++row) {
-      REQUIRE(result->GetValue(0, row).GetValue<int32_t>() == row);
+      REQUIRE(result->Collection().GetValue(0, row).GetValue<int32_t>() == row);
     }
     b.context->registered_state->Remove("ducklake_internal_connection");
   }
@@ -171,7 +171,7 @@ TEST_CASE_METHOD(isolation_fixture,
   auto result = query(c, "SELECT 42::INTEGER");
   auto user   = get_transparent_execution_stats(c);
   sirius::test::require_transparent_execution_delta(before, user, 1, 0, 1);
-  REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  REQUIRE(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
   REQUIRE(state(c)->provenance() == connection_provenance::user);
   REQUIRE_FALSE(state(c)->attempt_declined());
   REQUIRE(user.provider_internal_skips == before.provider_internal_skips);
@@ -193,7 +193,7 @@ TEST_CASE_METHOD(isolation_fixture,
     REQUIRE(state(c)->provenance() == connection_provenance::provider_internal);
     REQUIRE(state(c)->attempt_declined());
     REQUIRE(state(c)->attempt_decline_reason() == decline_reason::provider_internal);
-    REQUIRE(marked->GetValue(0, 0).GetValue<int32_t>() == 43);
+    REQUIRE(marked->Collection().GetValue(0, 0).GetValue<int32_t>() == 43);
   }
 }
 
@@ -219,7 +219,7 @@ TEST_CASE_METHOD(isolation_fixture,
   REQUIRE(state(b)->attempt_decline_reason() == decline_reason::provider_internal);
   REQUIRE(result->RowCount() == 3);
   for (int row = 0; row < 3; ++row) {
-    REQUIRE(result->GetValue(0, row).GetValue<int32_t>() == row + 1);
+    REQUIRE(result->Collection().GetValue(0, row).GetValue<int32_t>() == row + 1);
   }
 }
 
@@ -249,7 +249,7 @@ TEST_CASE_METHOD(isolation_fixture,
     REQUIRE(state(b)->provenance() == connection_provenance::unclassified);
     REQUIRE(state(b)->attempt_declined());
     REQUIRE(state(b)->attempt_decline_reason() == decline_reason::classification_failed);
-    REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+    REQUIRE(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
   }
 }
 
@@ -270,7 +270,7 @@ TEST_CASE_METHOD(isolation_fixture,
   REQUIRE(state(b)->attempt_decline_reason() == decline_reason::provider_internal);
   REQUIRE(result->RowCount() == 3);
   for (int i = 0; i < 3; ++i) {
-    REQUIRE(result->GetValue(0, i).GetValue<int32_t>() == i + 1);
+    REQUIRE(result->Collection().GetValue(0, i).GetValue<int32_t>() == i + 1);
   }
 }
 
@@ -286,7 +286,7 @@ TEST_CASE_METHOD(isolation_fixture,
   unchanged_gpu(before, after);
   REQUIRE(after.provider_internal_skips == before.provider_internal_skips + 1);
   REQUIRE(state(b)->provenance() == connection_provenance::provider_internal);
-  REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  REQUIRE(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
 }
 
 TEST_CASE_METHOD(isolation_fixture,
@@ -350,13 +350,13 @@ TEST_CASE_METHOD(isolation_fixture,
   };
   auto result = provider_query("SELECT 42::INTEGER");
   REQUIRE(result->RowCount() == 1);
-  REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  REQUIRE(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
   for (auto const& name : {hidden, renamed}) {
     CAPTURE(name);
     auto rows = provider_query("SELECT i FROM " + name + ".main.t ORDER BY i");
     REQUIRE(rows->RowCount() == 3);
     for (int row = 0; row < 3; ++row) {
-      REQUIRE(rows->GetValue(0, row).GetValue<int32_t>() == row + 1);
+      REQUIRE(rows->Collection().GetValue(0, row).GetValue<int32_t>() == row + 1);
     }
   }
   query(b, "ROLLBACK");
@@ -367,7 +367,7 @@ TEST_CASE_METHOD(isolation_fixture,
   auto const expected_gpu = gpu_enabled ? 1u : 0u;
   sirius::test::require_transparent_execution_delta(before, after, expected_gpu, 0, expected_gpu);
   REQUIRE(user_result->RowCount() == 1);
-  REQUIRE(user_result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  REQUIRE(user_result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
   REQUIRE(after.provider_internal_skips == before.provider_internal_skips);
   REQUIRE(after.hidden_catalog_skips == before.hidden_catalog_skips);
   REQUIRE(after.classification_failures == before.classification_failures);
@@ -402,7 +402,7 @@ TEST_CASE_METHOD(isolation_fixture,
   auto const expected_gpu = gpu_enabled ? 1u : 0u;
   sirius::test::require_transparent_execution_delta(before, after, expected_gpu, 0, expected_gpu);
   REQUIRE(result->RowCount() == 1);
-  REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  REQUIRE(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
   REQUIRE(after.hidden_catalog_skips == before.hidden_catalog_skips);
   REQUIRE(after.provider_internal_skips == before.provider_internal_skips);
   REQUIRE(after.classification_failures == before.classification_failures);
@@ -429,11 +429,11 @@ TEST_CASE_METHOD(
   auto rows = hidden_query("SELECT i FROM " + hidden + ".main.t ORDER BY i");
   REQUIRE(rows->RowCount() == 3);
   for (int row = 0; row < 3; ++row) {
-    REQUIRE(rows->GetValue(0, row).GetValue<int32_t>() == row + 1);
+    REQUIRE(rows->Collection().GetValue(0, row).GetValue<int32_t>() == row + 1);
   }
   auto count = hidden_query("SELECT count(*) FROM " + hidden + ".main.t");
   REQUIRE(count->RowCount() == 1);
-  REQUIRE(count->GetValue(0, 0).GetValue<int64_t>() == 3);
+  REQUIRE(count->Collection().GetValue(0, 0).GetValue<int64_t>() == 3);
   query(a, "ROLLBACK");
 }
 
@@ -443,7 +443,7 @@ TEST_CASE_METHOD(isolation_fixture,
 {
   using sirius::transparent::inspect_statement_for_hidden_catalog;
   auto& manager          = duckdb::DatabaseManager::Get(*a.context);
-  auto hidden_database   = manager.GetDatabase(hidden);
+  auto hidden_database   = manager.GetDatabase(duckdb::Identifier(hidden));
   auto ordinary_database = manager.GetDatabase("memory");
   REQUIRE(hidden_database);
   REQUIRE(ordinary_database);
@@ -454,14 +454,14 @@ TEST_CASE_METHOD(isolation_fixture,
   CHECK(inspect_statement_for_hidden_catalog(*a.context, props) ==
         decline_reason::classification_failed);
   props.read_databases.clear();
-  props.read_databases[hidden] = {oid + 1, duckdb::optional_idx()};
+  props.read_databases[duckdb::Identifier(hidden)] = {oid + 1, duckdb::optional_idx()};
   CHECK(inspect_statement_for_hidden_catalog(*a.context, props) ==
         decline_reason::classification_failed);
-  props.read_databases[hidden] = {oid, duckdb::optional_idx()};
+  props.read_databases[duckdb::Identifier(hidden)] = {oid, duckdb::optional_idx()};
   CHECK(inspect_statement_for_hidden_catalog(*a.context, props) == decline_reason::hidden_catalog);
   props.read_databases.clear();
-  props.modified_databases[hidden] = {{oid, duckdb::optional_idx()},
-                                      duckdb::DatabaseModificationType::INSERT_DATA};
+  props.modified_databases[duckdb::Identifier(hidden)] = {
+    {oid, duckdb::optional_idx()}, duckdb::DatabaseModificationType::INSERT_DATA};
   CHECK(inspect_statement_for_hidden_catalog(*a.context, props) == decline_reason::hidden_catalog);
   props.modified_databases.clear();
   props.read_databases["memory"] = {ordinary_database->oid, duckdb::optional_idx()};
@@ -479,7 +479,7 @@ TEST_CASE_METHOD(isolation_fixture,
   sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
   REQUIRE_FALSE(state(a)->attempt_declined());
   REQUIRE(state(a)->provenance() == connection_provenance::user);
-  REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  REQUIRE(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
 }
 
 TEST_CASE_METHOD(isolation_fixture,
@@ -550,7 +550,11 @@ TEST_CASE("hidden catalog inspection fails closed when get_bind_info throws",
   function.get_bind_info = [](duckdb::optional_ptr<duckdb::FunctionData>) -> duckdb::BindInfo {
     throw std::runtime_error("injected get_bind_info failure");
   };
-  duckdb::LogicalGet get(0, std::move(function), nullptr, {duckdb::LogicalType::INTEGER}, {"i"});
+  duckdb::LogicalGet get(duckdb::TableIndex(0),
+                         duckdb::BoundTableFunction(function),
+                         nullptr,
+                         {duckdb::LogicalType::INTEGER},
+                         {"i"});
   REQUIRE(sirius::transparent::inspect_plan_for_hidden_catalog(get) ==
           decline_reason::classification_failed);
 }
@@ -574,7 +578,7 @@ TEST_CASE_METHOD(isolation_fixture,
     auto before = get_transparent_execution_stats(b);
     auto result = query(b, "SELECT 42::INTEGER");
     auto after  = get_transparent_execution_stats(b);
-    REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+    REQUIRE(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
     unchanged_gpu(before, after);
     REQUIRE(after.classification_failures == before.classification_failures + 1);
     REQUIRE(after.provider_internal_skips == before.provider_internal_skips);
@@ -588,7 +592,7 @@ TEST_CASE_METHOD(isolation_fixture,
   auto before = get_transparent_execution_stats(b);
   auto result = query(b, "SELECT 42::INTEGER");
   auto after  = get_transparent_execution_stats(b);
-  REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  REQUIRE(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 42);
   sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
   REQUIRE(after.classification_failures == before.classification_failures);
   REQUIRE(after.provider_internal_skips == before.provider_internal_skips);
@@ -615,7 +619,7 @@ bool load_ducklake(duckdb::Connection& con)
                        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = "
                        "'ducklake' AND loaded");
   REQUIRE(version->RowCount() == 1);
-  REQUIRE(version->GetValue(0, 0).ToString() == "d8a1881e");
+  REQUIRE(version->Collection().GetValue(0, 0).ToString() == "d8a1881e");
   return true;
 }
 
@@ -642,13 +646,13 @@ void check_lake_rows(duckdb::Connection& con)
   auto rows = query(con, "SELECT id, extra FROM lake.t ORDER BY id");
   REQUIRE(rows->RowCount() == 131);
   for (int row = 0; row < 131; ++row) {
-    REQUIRE(rows->GetValue(0, row).GetValue<int32_t>() == (row < 5 ? row : row + 1));
-    REQUIRE(rows->GetValue(1, row).GetValue<int32_t>() == 7);
+    REQUIRE(rows->Collection().GetValue(0, row).GetValue<int32_t>() == (row < 5 ? row : row + 1));
+    REQUIRE(rows->Collection().GetValue(1, row).GetValue<int32_t>() == 7);
   }
   auto aggregates = query(con, "SELECT count(*), sum(id), sum(extra) FROM lake.t");
-  REQUIRE(aggregates->GetValue(0, 0).GetValue<int64_t>() == 131);
-  REQUIRE(aggregates->GetValue(1, 0).GetValue<int64_t>() == 8641);
-  REQUIRE(aggregates->GetValue(2, 0).GetValue<int64_t>() == 917);
+  REQUIRE(aggregates->Collection().GetValue(0, 0).GetValue<int64_t>() == 131);
+  REQUIRE(aggregates->Collection().GetValue(1, 0).GetValue<int64_t>() == 8641);
+  REQUIRE(aggregates->Collection().GetValue(2, 0).GetValue<int64_t>() == 917);
 }
 
 auto lake_config() { return sirius::test::integration_config_path(); }
@@ -703,8 +707,8 @@ TEST_CASE("DuckLake flush preserves rows and file paths after closing every conn
     auto files = query(con, "SELECT data_file FROM ducklake_list_files('lake', 't')");
     REQUIRE(files->RowCount() > 0);
     for (duckdb::idx_t row = 0; row < files->RowCount(); ++row) {
-      REQUIRE_FALSE(files->GetValue(0, row).IsNull());
-      REQUIRE(std::filesystem::is_regular_file(files->GetValue(0, row).ToString()));
+      REQUIRE_FALSE(files->Collection().GetValue(0, row).IsNull());
+      REQUIRE(std::filesystem::is_regular_file(files->Collection().GetValue(0, row).ToString()));
     }
     query(con, "DETACH lake");
     query(con, "ATTACH '" + disk.directory + "/meta.ducklake' AS meta (READ_ONLY)");
@@ -717,13 +721,13 @@ TEST_CASE("DuckLake flush preserves rows and file paths after closing every conn
       "WHERE t.end_snapshot IS NULL AND s.end_snapshot IS NULL");
     REQUIRE(paths->RowCount() > 0);
     for (duckdb::idx_t row = 0; row < paths->RowCount(); ++row) {
-      REQUIRE_FALSE(paths->GetValue(0, row).IsNull());
-      auto path = std::filesystem::path(paths->GetValue(0, row).ToString());
-      if (paths->GetValue(1, row).GetValue<bool>()) {
-        auto table_path = std::filesystem::path(paths->GetValue(2, row).ToString());
-        if (paths->GetValue(3, row).GetValue<bool>()) {
-          auto schema_path = std::filesystem::path(paths->GetValue(4, row).ToString());
-          if (paths->GetValue(5, row).GetValue<bool>()) {
+      REQUIRE_FALSE(paths->Collection().GetValue(0, row).IsNull());
+      auto path = std::filesystem::path(paths->Collection().GetValue(0, row).ToString());
+      if (paths->Collection().GetValue(1, row).GetValue<bool>()) {
+        auto table_path = std::filesystem::path(paths->Collection().GetValue(2, row).ToString());
+        if (paths->Collection().GetValue(3, row).GetValue<bool>()) {
+          auto schema_path = std::filesystem::path(paths->Collection().GetValue(4, row).ToString());
+          if (paths->Collection().GetValue(5, row).GetValue<bool>()) {
             schema_path = std::filesystem::path(disk.directory) / "data" / schema_path;
           }
           table_path = schema_path / table_path;

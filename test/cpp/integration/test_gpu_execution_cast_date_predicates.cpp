@@ -20,17 +20,9 @@
 //   d <= DATE '1998-12-01' - INTERVAL '72' DAY
 //     ⇒ table filter  CAST(d AS TIMESTAMP) <= TIMESTAMP '1998-09-20 00:00:00'
 //
-// These arrive as EXPRESSION_FILTERs, which scan_filter_analysis.cpp lowers to
-// stored-day bounds. An off-by-one bound silently changes results, so every
-// comparison op runs at midnight and non-midnight constants against rows
-// sitting exactly on the cutoffs, on three scan paths:
-//
-//  * plain DuckDB table and DuckDB-format GPU pin: the filter is evaluated by
-//    the residual GPU cast (cudf::cast), the fold is not consulted;
-//  * Parquet GPU pin compressed with a bitpack plan: the only path on which
-//    analyze_scan_filters runs AND the decoder applies its ranges while
-//    decoding, dropping the residual when coverage is full. This is the path
-//    the change is for, and the one whose bounds these tests actually exercise.
+// Exercise residual casts and stored-day filter bounds on native and compressed
+// Parquet scans. V2 retains potentially throwing casts above the scan, so both
+// the GPU cast and scan pruning must preserve DuckDB's infinity/overflow behavior.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -165,33 +157,23 @@ class CastDatePredicateFixture : public sirius::test::GpuExecutionFixture {
     }
   }
 
-  /// The query raises on CPU (DuckDB refuses to cast the far date) but the GPU,
-  /// which cannot raise from a decode-time range and whose residual cast would
-  /// not raise either, answers by the instant each date denotes. Documents that
-  /// divergence rather than hiding it.
-  void expect_cpu_raises_gpu_answers(const std::string& query,
-                                     const std::vector<std::vector<std::string>>& expected_rows)
+  void expect_cast_overflow(const std::string& query)
   {
     run_ok("SET gpu_execution = false;");
     auto cpu_result = con->Query(query);
     run_ok("SET gpu_execution = true;");
     REQUIRE(cpu_result);
-    if (!cpu_result->HasError()) {
-      UNSCOPED_INFO("expected DuckDB to raise a conversion error on the far date");
-    }
     REQUIRE(cpu_result->HasError());
+    REQUIRE(cpu_result->GetError().find("Conversion Error") != std::string::npos);
 
-    auto const before = sirius::test::get_transparent_execution_stats(*con);
-    auto gpu_result   = con->Query(query);
-    auto const after  = sirius::test::get_transparent_execution_stats(*con);
+    run_ok("SET enable_duckdb_fallback = false;");
+    auto gpu_result = con->Query(query);
+    run_ok("SET enable_duckdb_fallback = true;");
     REQUIRE(gpu_result);
-    if (gpu_result->HasError()) {
-      UNSCOPED_INFO("transparent GPU execution error: " << gpu_result->GetError());
-    }
-    REQUIRE_FALSE(gpu_result->HasError());
-    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-    auto rows = collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>(), true);
-    CHECK(rows == expected_rows);
+    REQUIRE(gpu_result->HasError());
+    INFO(gpu_result->GetError());
+    REQUIRE(gpu_result->GetError().find("DATE value is out of range for TIMESTAMP") !=
+            std::string::npos);
   }
 
  private:
@@ -337,10 +319,7 @@ TEST_CASE_METHOD(CastDatePredicateFixture,
     pin_compressed_parquet("t_inf");
     compare_all(kFiniteConstantsOnInfinityRows, "p_t_inf");
     {
-      // DuckDB #25139 calls Timestamp::GetTime on infinite constants while
-      // rewriting DATE/TIMESTAMP comparisons, before either execution path runs.
-      // TODO: Remove this guard once our DuckDB pin includes
-      // the v1.5 backport of https://github.com/duckdb/duckdb/pull/26225.
+      // Retain the casts to exercise residual infinity conversion.
       sirius::test::disabled_optimizers_guard guard(*con, "expression_rewriter");
       compare_all(kInfinityConstants, "p_t_inf");
     }
@@ -352,21 +331,32 @@ TEST_CASE_METHOD(CastDatePredicateFixture,
                  "gpu_execution cast-shaped DATE predicates on dates beyond TIMESTAMP's range",
                  "[integration][gpu_execution][filter][fused_scan_filter][cast_date]")
 {
-  // DuckDB: CAST(DATE '300000-01-01' AS TIMESTAMP) overflows int64 micros and
-  // raises for the whole query. The fold answers by the instant each date
-  // denotes: the far date is above any finite cutoff and below +infinity.
-  // (The residual cudf::cast path, taken by unpinned and DuckDB-format scans,
-  // wraps the overflow instead and is not what this pins.)
   pin_compressed_parquet("t_far");
   {
-    // Preserve the DATE-to-TIMESTAMP cast so DuckDB exercises its overflow path.
+    // Preserve the DATE-to-TIMESTAMP cast so both engines exercise overflow.
     sirius::test::disabled_optimizers_guard guard(*con, "expression_rewriter");
-    expect_cpu_raises_gpu_answers("SELECT id FROM p_t_far WHERE d <= TIMESTAMP '2000-06-01'",
-                                  {{"1"}});
-    expect_cpu_raises_gpu_answers("SELECT id FROM p_t_far WHERE d >  TIMESTAMP '2000-06-01'",
-                                  {{"2"}});
-    expect_cpu_raises_gpu_answers("SELECT id FROM p_t_far WHERE d <  TIMESTAMP 'infinity'",
-                                  {{"1"}, {"2"}});
+    expect_cast_overflow("SELECT id FROM p_t_far WHERE d <= TIMESTAMP '2000-06-01'");
+    expect_cast_overflow("SELECT id FROM p_t_far WHERE d >  TIMESTAMP '2000-06-01'");
+    expect_cast_overflow("SELECT id FROM p_t_far WHERE d <  TIMESTAMP 'infinity'");
   }
   unpin_parquet("t_far");
+}
+
+TEST_CASE_METHOD(CastDatePredicateFixture,
+                 "gpu_execution DATE casts preserve infinities and TRY_CAST overflow",
+                 "[integration][gpu_execution][cast_date]")
+{
+  run_ok(
+    "CREATE TABLE t_bounds AS SELECT DATE '1970-01-01' + days AS d FROM "
+    "(VALUES (-106751992), (-106751991), (-106752), (-106751), (-1), (0), (1), "
+    "(106751), (106752), (106751991), (106751992), (NULL)) v(days);");
+  run_ok("CHECKPOINT;");
+  for (auto const* type : {"TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP", "TIMESTAMP_NS"}) {
+    DYNAMIC_SECTION(type)
+    {
+      compare_gpu_vs_cpu("SELECT CAST(d AS " + std::string(type) + ") FROM t_inf");
+      compare_gpu_vs_cpu("SELECT TRY_CAST(d AS " + std::string(type) + ") FROM t_bounds");
+      expect_cast_overflow("SELECT CAST(d AS " + std::string(type) + ") FROM t_far");
+    }
+  }
 }
