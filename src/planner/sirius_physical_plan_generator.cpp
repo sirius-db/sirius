@@ -189,11 +189,12 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
 void populate_parquet_schema(sirius::op::scan::parquet_ingestible_table_info& out,
                              sirius::op::sirius_physical_table_scan const& scan_op)
 {
-  auto* info           = &out;
-  info->returned_types = scan_op.returned_types;
-  info->column_ids     = scan_op.column_ids;
-  info->projection_ids = scan_op.projection_ids;
-  info->names          = scan_op.names;
+  auto* info                   = &out;
+  info->returned_types         = scan_op.returned_types;
+  info->column_ids             = scan_op.column_ids;
+  info->projection_ids         = scan_op.projection_ids;
+  info->projected_output_count = scan_op.projected_output_count;
+  info->names                  = scan_op.names;
   info->virtual_columns.reserve(scan_op.virtual_columns.size());
   for (auto const& [column_id, column] : scan_op.virtual_columns) {
     std::optional<sirius::op::scan::scan_plan::parquet_virtual_column_kind> kind;
@@ -277,9 +278,6 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
     info->resolved_file_paths = std::move(resolved_file_paths);
   }
 
-  // `scan_output_arity` drives the provider's expected column count — without it the runtime
-  // task skips the hive-partition columns it should inject post-read, mis-sizing the output.
-  info->scan_output_arity      = scan_op.types.size();
   info->approximate_batch_size = op_params.scan_task_batch_size;
   info->read_views             = scan_op.read_views;
 }
@@ -445,10 +443,11 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
       info->table_filters->filters[col_idx] = filt->Copy();
     }
   }
-  info->column_ids     = scan_op.column_ids;
-  info->projection_ids = scan_op.projection_ids;
-  info->returned_types = scan_op.returned_types;
-  info->output_types   = scan_op.types;
+  info->column_ids             = scan_op.column_ids;
+  info->projection_ids         = scan_op.projection_ids;
+  info->projected_output_count = scan_op.projected_output_count;
+  info->returned_types         = scan_op.returned_types;
+  info->output_types           = scan_op.types;
   return info;
 }
 
@@ -580,7 +579,7 @@ plan_lineage collect_semantic_lineage(
                                               info.projection_ids,
                                               info.names,
                                               info.returned_types,
-                                              scan.types.size(),
+                                              info.projected_output_count,
                                               info.partition_indices,
                                               info.virtual_columns);
       scan.semantic_columns.assign(layout.data_columns.size(), false);
@@ -602,9 +601,8 @@ plan_lineage collect_semantic_lineage(
           if (d && *d < result.inputs.size()) mark_semantic({result.inputs[*d]});
         }
       }
-      for (auto d : layout.pure_filter_batch_positions())
-        if (!layout.carrier_batch_index || d != *layout.carrier_batch_index)
-          mark_semantic({result.inputs.at(d)});
+      for (auto d : layout.filter_only_batch_positions())
+        mark_semantic({result.inputs.at(d)});
     } else {
       scan.semantic_columns.assign(scan.column_ids.size(), false);
       for (std::size_t c = 0; c < scan.column_ids.size(); ++c)
