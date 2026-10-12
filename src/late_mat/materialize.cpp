@@ -291,20 +291,28 @@ using retired_buffers = std::vector<std::unique_ptr<rmm::device_buffer>>;
 /// What a remote gather allocated on the owning GPU: the gather map and the
 /// gathered column's buffers once they have been handed to the peer copies.
 ///
-/// Every buffer here is freed on the OWNER's stream when it dies (rmm frees on
-/// the stream a buffer was allocated on), while the copies that read them run
-/// on the CONSUMER's stream. The destructor orders the frees behind those copies
-/// on every exit path -- a throw mid-transfer, say an OOM allocating a string
-/// column's characters after its offsets were already queued for copying, must
-/// not free a buffer a queued copy is still reading. Everything in it is
-/// no-throw; if the event cannot be recorded or waited on, the consumer's
-/// stream is synchronized outright, which is slower but equally safe.
+/// Two streams read each other's memory here. The owner's stream copies the
+/// consumer's selection indices over and gathers; the consumer's stream copies
+/// the gathered buffers back. rmm frees a buffer on the stream it was allocated
+/// on, so on every exit path each stream must be ordered behind the other's
+/// outstanding reads before anything is freed: a throw in the owner's gather
+/// must not let the consumer free `local_indices` while the owner's index copy
+/// still reads it, and a throw mid-transfer (an OOM allocating a string
+/// column's characters after its offsets were queued for copying) must not let
+/// the owner free a buffer the consumer's copy still reads. The destructor
+/// orders both directions, then frees. Everything in it is no-throw; where an
+/// event cannot be recorded or waited on, the stream being waited for is
+/// synchronized outright, which is slower but equally safe.
 class owner_scratch {
  public:
   owner_scratch(int owner_device,
                 ::cuda::stream_ref owner_stream,
+                int consumer_device,
                 ::cuda::stream_ref consumer_stream)
-    : _owner_device{owner_device}, _owner_stream{owner_stream}, _consumer_stream{consumer_stream}
+    : _owner_device{owner_device},
+      _owner_stream{owner_stream},
+      _consumer_device{consumer_device},
+      _consumer_stream{consumer_stream}
   {
   }
   ~owner_scratch() { release(); }
@@ -314,12 +322,22 @@ class owner_scratch {
   rmm::device_buffer map;   ///< batch-local indices, copied to the owner
   retired_buffers retired;  ///< the gathered column's buffers, after release()
 
-  /// Free everything, after the consumer's copies. Idempotent.
+  /// Order each stream behind the other's queued work, then free the owner's
+  /// buffers. Idempotent. The consumer's own buffers (the selection) are freed
+  /// by their owners later, on the consumer stream, which this has made wait.
   void release() noexcept
   {
     if (_released) { return; }
     _released = true;
-    if (!order_frees_behind_consumer()) { (void)cudaStreamSynchronize(_consumer_stream.get()); }
+    // Consumer behind owner: the owner's index copy reads `local_indices`.
+    if (!order(_owner_stream, _owner_device, _consumer_stream, _consumer_device)) {
+      rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{_owner_device}};
+      (void)cudaStreamSynchronize(_owner_stream.get());
+    }
+    // Owner behind consumer: the consumer's copies read the gathered buffers.
+    if (!order(_consumer_stream, _consumer_device, _owner_stream, _owner_device)) {
+      (void)cudaStreamSynchronize(_consumer_stream.get());
+    }
     (void)cudaGetLastError();
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{_owner_device}};
     retired.clear();
@@ -327,15 +345,23 @@ class owner_scratch {
   }
 
  private:
-  /// Make the owner's stream wait for what the consumer has queued so far.
-  [[nodiscard]] bool order_frees_behind_consumer() const noexcept
+  /// Make `waiter` wait for everything `producer` has queued so far. The event
+  /// is created on the producer's device, which is where it is recorded.
+  [[nodiscard]] static bool order(::cuda::stream_ref producer,
+                                  int producer_device,
+                                  ::cuda::stream_ref waiter,
+                                  int waiter_device) noexcept
   {
     cudaEvent_t event{};
-    if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) { return false; }
-    bool ordered = cudaEventRecord(event, _consumer_stream.get()) == cudaSuccess;
+    bool ordered = false;
+    {
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{producer_device}};
+      if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) { return false; }
+      ordered = cudaEventRecord(event, producer.get()) == cudaSuccess;
+    }
     if (ordered) {
-      rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{_owner_device}};
-      ordered = cudaStreamWaitEvent(_owner_stream.get(), event, 0) == cudaSuccess;
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{waiter_device}};
+      ordered = cudaStreamWaitEvent(waiter.get(), event, 0) == cudaSuccess;
     }
     (void)cudaEventDestroy(event);
     return ordered;
@@ -343,6 +369,7 @@ class owner_scratch {
 
   int _owner_device;
   ::cuda::stream_ref _owner_stream;
+  int _consumer_device;
   ::cuda::stream_ref _consumer_stream;
   bool _released = false;
 };
@@ -429,8 +456,10 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
 
   // Declared before `gathered` so the gathered column's buffers that were NOT
   // yet handed over (a throw mid-transfer) are freed first, then the scratch
-  // orders the rest behind the consumer's copies.
-  owner_scratch scratch{owner_device, owner_stream, stream};
+  // orders the two streams behind each other and frees the rest. `selection`
+  // belongs to the caller and is freed after this returns or unwinds, on a
+  // consumer stream that by then waits for the owner's index copy.
+  owner_scratch scratch{owner_device, owner_stream, consumer_device, stream};
   std::unique_ptr<cudf::column> gathered;
   std::optional<cucascade::cuda::cuda_event> gathered_ready;
   {
