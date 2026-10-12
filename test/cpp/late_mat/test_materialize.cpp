@@ -40,7 +40,7 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda/stream>
