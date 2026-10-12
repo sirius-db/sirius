@@ -80,6 +80,34 @@ std::string require_fixture(std::string path)
   return path;
 }
 
+class vector_puffin_source final : public puffin_byte_source {
+ public:
+  explicit vector_puffin_source(std::vector<std::byte> bytes) : bytes_(std::move(bytes)) {}
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || static_cast<std::uint64_t>(offset) > bytes_.size()) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte> destination) override
+  {
+    if (offset_ < 0 || static_cast<std::uint64_t>(offset_) > bytes_.size() ||
+        destination.size() > bytes_.size() - static_cast<std::uint64_t>(offset_))
+      return false;
+    std::copy_n(bytes_.data() + offset_, destination.size(), destination.data());
+    offset_ += static_cast<std::streamoff>(destination.size());
+    return true;
+  }
+  [[nodiscard]] std::streamoff size() const override
+  {
+    return static_cast<std::streamoff>(bytes_.size());
+  }
+
+ private:
+  std::vector<std::byte> bytes_;
+  std::streamoff offset_ = 0;
+};
+
 /// The manifest entry as the fixture actually writes it. Each test below changes exactly one
 /// field, so a failure names the check that fired rather than "something threw".
 DeletionVectorRef fixture_ref()
@@ -91,9 +119,13 @@ DeletionVectorRef fixture_ref()
           .record_count          = kCardinality};
 }
 
-std::vector<int64_t> read_for_test(DeletionVectorRef ref, bool charged)
+std::vector<int64_t> read_for_test(DeletionVectorRef ref,
+                                   bool charged,
+                                   puffin_byte_source* supplied_source = nullptr)
 {
-  if (!charged) return read_deletion_vector(ref);
+  if (!charged)
+    return supplied_source ? read_deletion_vector(ref, *supplied_source)
+                           : read_deletion_vector(ref);
   using namespace sirius::scan_manager;
   test::test_reservation_provider provider;
   auto path = ref.puffin_path;
@@ -114,7 +146,19 @@ std::vector<int64_t> read_for_test(DeletionVectorRef ref, bool charged)
   auto permit = ledger.acquire_permit({1, 1});
   REQUIRE(permit);
   auto allocator = ledger.allocator(permit);
-  auto result    = read_deletion_vector_charged(ref, allocator);
+  auto result    = supplied_source
+                     ? read_deletion_vector_charged(DeletionVectorRefView{ref.puffin_path,
+                                                                       ref.content_offset,
+                                                                       ref.content_size_in_bytes,
+                                                                       ref.referenced_data_file,
+                                                                       ref.file_size_in_bytes,
+                                                                       ref.record_count},
+                                                 allocator,
+                                                 ref.referenced_data_file,
+                                                 std::make_shared<int>(0),
+                                                 1,
+                                                 *supplied_source)
+                     : read_deletion_vector_charged(ref, allocator);
   return {result->positions.begin(), result->positions.end()};
 }
 
@@ -291,6 +335,23 @@ TEST_CASE("puffin reader reads the fixture deletion vector", "[scan][iceberg]")
   // The fixture deletes 2 of its 5 rows — the same 3 survivors the integration case asserts.
   REQUIRE(positions.size() == 2);
   REQUIRE(std::is_sorted(positions.begin(), positions.end()));
+}
+
+TEST_CASE("charged Puffin reader accepts an injected byte source",
+          "[scan][iceberg][charged_reader]")
+{
+  auto ref = fixture_ref();
+  std::ifstream input(ref.puffin_path, std::ios::binary | std::ios::ate);
+  REQUIRE(input);
+  auto const size = input.tellg();
+  REQUIRE(size >= 0);
+  std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+  input.seekg(0);
+  input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  REQUIRE(input);
+
+  vector_puffin_source source(std::move(bytes));
+  CHECK(read_for_test(ref, true, &source) == read_deletion_vector(ref));
 }
 
 TEST_CASE("puffin reader accepts a file:// URI", "[scan][iceberg]")

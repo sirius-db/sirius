@@ -87,6 +87,12 @@ std::shared_ptr<io_object_metadata> sirius_datasource::metadata(std::string cons
   return true;
 }
 
+std::unique_lock<std::mutex> sirius_datasource::lock_metadata_miss(std::string const& profile) const
+{
+  if (!_io_ctx || !_io_object) return {};
+  return _io_ctx->metadata_store().lock_metadata_miss(*_io_object, profile);
+}
+
 size_t sirius_datasource::size() const { return _io_object->size(); }
 
 bool sirius_datasource::supports_device_read() const { return _io_ctx->supports_device_read(); }

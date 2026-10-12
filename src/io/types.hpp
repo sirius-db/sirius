@@ -102,17 +102,19 @@ class io_object : public std::enable_shared_from_this<io_object> {
   [[nodiscard]] virtual object_identity identity() const
   {
     auto tag = validation_tag();
-    return {tag.empty() ? identity_kind::opened_handle : identity_kind::object_tag,
-            size(),
-            tag.empty() ? std::to_string(_open_generation) : std::string(tag)};
+    object_identity result;
+    result.kind    = tag.empty() ? identity_kind::opened_handle : identity_kind::object_tag;
+    result.size    = size();
+    result.version = tag.empty() ? std::to_string(_open_generation) : std::string(tag);
+    return result;
   }
 
   [[nodiscard]] std::string identity_cache_key() const
   {
-    return identity().cache_key(object_path());
+    return identity().cache_key(raw_file_cache_id());
   }
 
-  /// Stable identifier used as the prefetching-cache key.  Often equal to
+  /// Backend locator used as part of the identity-aware prefetching-cache key.  Often equal to
   /// @c object_path() but may differ for backends that need to distinguish
   /// otherwise-equal paths (versioned S3 keys, normalized URLs, …).
   [[nodiscard]] virtual const std::string& raw_file_cache_id() const noexcept = 0;

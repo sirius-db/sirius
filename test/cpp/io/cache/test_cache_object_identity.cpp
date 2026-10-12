@@ -263,6 +263,7 @@ void metadata_overwrite(sirius::io::cache::cache_mode mode)
   CHECK(old_key == rest_io_object::generation_key(objects.uri, old_tag));
   auto& store = first->io_ctx()->metadata_store();
   CHECK(store.has_path(objects.uri));
+  CHECK(store.get_metadata(old_key) == old_metadata);
   objects.publish(objects.second);
   auto second_shape = manager.describe_parquet(objects.uri);
   REQUIRE(second_shape.names.size() == 1);

@@ -18,6 +18,7 @@
 
 #include "op/scan/iceberg_delete_set.hpp"
 
+#include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 
@@ -50,6 +51,71 @@ static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
 namespace sirius::op::scan {
 
 namespace {
+
+class local_puffin_source final : public puffin_byte_source {
+ public:
+  explicit local_puffin_source(std::string_view path) : file_(std::string(path), std::ios::binary)
+  {
+    if (file_) {
+      file_.seekg(0, std::ios::end);
+      size_ = static_cast<std::streamoff>(file_.tellg());
+      file_.seekg(0);
+    }
+  }
+  bool seek(std::streamoff offset) override
+  {
+    file_.clear();
+    file_.seekg(offset);
+    return static_cast<bool>(file_);
+  }
+  bool read(std::span<std::byte> destination) override
+  {
+    file_.read(reinterpret_cast<char*>(destination.data()),
+               static_cast<std::streamsize>(destination.size()));
+    return static_cast<bool>(file_);
+  }
+  [[nodiscard]] std::streamoff size() const override { return size_; }
+  explicit operator bool() const noexcept { return static_cast<bool>(file_); }
+
+ private:
+  std::ifstream file_;
+  std::streamoff size_{-1};
+};
+
+class datasource_puffin_source final : public puffin_byte_source {
+ public:
+  explicit datasource_puffin_source(std::unique_ptr<io::sirius_datasource> source)
+    : source_(std::move(source))
+  {
+  }
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || static_cast<std::uint64_t>(offset) > source_->size()) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte> destination) override
+  {
+    auto const size = source_->size();
+    if (offset_ < 0 || static_cast<std::uint64_t>(offset_) > size ||
+        destination.size() > size - static_cast<std::uint64_t>(offset_))
+      return false;
+    auto const read = source_->host_read(static_cast<std::size_t>(offset_),
+                                         destination.size(),
+                                         reinterpret_cast<std::uint8_t*>(destination.data()));
+    if (read != destination.size()) return false;
+    offset_ += static_cast<std::streamoff>(read);
+    return true;
+  }
+  [[nodiscard]] std::streamoff size() const override
+  {
+    return static_cast<std::streamoff>(source_->size());
+  }
+
+ private:
+  std::unique_ptr<io::sirius_datasource> source_;
+  std::streamoff offset_ = 0;
+};
 
 uint32_t read_u32_le(const uint8_t* p)
 {
@@ -420,7 +486,7 @@ void parse_footer_descriptor(std::span<char> payload_bytes,
 /// the FILE cannot hold, and believing them is a value-initialized allocation of whatever they say.
 template <typename Ref>
 std::streamoff validate_footer_descriptor(
-  std::ifstream& f,
+  puffin_byte_source& f,
   std::streamoff file_size,
   Ref const& ref,
   char const (&puffin_magic)[4],
@@ -432,10 +498,9 @@ std::streamoff validate_footer_descriptor(
     throw std::runtime_error("[puffin] File too small to hold a footer: " + ref.puffin_path);
   }
 
-  f.seekg(file_size - kFooterTail);
+  f.seek(file_size - kFooterTail);
   uint8_t tail[kFooterTail];
-  f.read(reinterpret_cast<char*>(tail), kFooterTail);
-  if (!f) {
+  if (!f.read(std::as_writable_bytes(std::span{tail}))) {
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Cannot read footer tail of " + ref.puffin_path);
@@ -455,10 +520,10 @@ std::streamoff validate_footer_descriptor(
   }
 
   auto const footer_start = file_size - kFooterTail - payload_size - 4;
-  f.seekg(footer_start);
+  f.seek(footer_start);
   char magic[4];
-  f.read(magic, 4);
-  if (!f || std::memcmp(magic, puffin_magic, 4) != 0) {
+  if (!f.read(std::as_writable_bytes(std::span{magic})) ||
+      std::memcmp(magic, puffin_magic, 4) != 0) {
     throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
   }
 
@@ -482,8 +547,7 @@ std::streamoff validate_footer_descriptor(
     legacy_payload.resize(size);
     payload = legacy_payload.data();
   }
-  f.read(payload, payload_size);
-  if (!f) {
+  if (!f.read(std::as_writable_bytes(std::span{payload, size}))) {
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Cannot read footer payload of " + ref.puffin_path);
@@ -629,7 +693,8 @@ decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
 }
 template <typename Ref>
 decoded_positions read_deletion_vector_impl(Ref const& ref,
-                                            sirius::scan_manager::charging_allocator* allocator)
+                                            sirius::scan_manager::charging_allocator* allocator,
+                                            puffin_byte_source* supplied_source = nullptr)
 {
   auto const& puffin_path          = ref.puffin_path;
   auto const content_offset        = ref.content_offset;
@@ -659,11 +724,12 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
       std::to_string(kMaxDeletionVectorPositions) + " this reader will materialize while planning");
   }
 
-  // Apache manifests record URIs; this reader bypasses ioctx, so nothing else strips them.
   std::string_view local_view(puffin_path);
   if (local_view.starts_with("file://")) local_view.remove_prefix(7);
-  std::ifstream f(local_view.data(), std::ios::binary);
-  if (!f) {
+  std::unique_ptr<local_puffin_source> local_source;
+  if (supplied_source == nullptr) local_source = std::make_unique<local_puffin_source>(local_view);
+  auto* source = supplied_source ? supplied_source : local_source.get();
+  if (source == nullptr || (supplied_source == nullptr && !*local_source)) {
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Cannot open file: " + std::string(local_view) +
@@ -674,22 +740,22 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
   // wrong offset would silently yield wrong deletes. Check the framing first.
   static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
   char magic[4];
-  f.read(magic, 4);
-  if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
+  if (!source->seek(0) || !source->read(std::as_writable_bytes(std::span{magic})) ||
+      std::memcmp(magic, kPuffinMagic, 4) != 0) {
     throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + puffin_path);
   }
-  f.seekg(0, std::ios::end);
-  auto const file_size = static_cast<std::streamoff>(f.tellg());
-  f.seekg(file_size - 4);
-  f.read(magic, 4);
-  if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
+  auto const file_size = source->size();
+  if (file_size < 4 || !source->seek(file_size - 4) ||
+      !source->read(std::as_writable_bytes(std::span{magic})) ||
+      std::memcmp(magic, kPuffinMagic, 4) != 0) {
     throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + puffin_path);
   }
 
   if (allocator && (ref.file_size_in_bytes < 0 || file_size > ref.file_size_in_bytes))
     throw sirius::scan_manager::preparation_resource_error(
       "Puffin container exceeds the lowering-time envelope", true);
-  auto const footer_start = validate_footer_descriptor(f, file_size, ref, kPuffinMagic, allocator);
+  auto const footer_start =
+    validate_footer_descriptor(*source, file_size, ref, kPuffinMagic, allocator);
 
   // The blob must lie entirely between the leading magic and the footer. Both bounds are compared
   // by SUBTRACTION against a length the file actually has: `content_offset + content_size` is a
@@ -707,8 +773,7 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
                              std::to_string(footer_start) + ") of " + puffin_path);
   }
 
-  f.seekg(content_offset);
-  if (!f) {
+  if (!source->seek(content_offset)) {
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Cannot seek to offset " + std::to_string(content_offset) + " in " + puffin_path);
@@ -725,8 +790,7 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
     legacy_blob.resize(content_size_in_bytes);
     blob = legacy_blob;
   }
-  f.read(reinterpret_cast<char*>(blob.data()), content_size_in_bytes);
-  if (!f) {
+  if (!source->read(std::as_writable_bytes(blob))) {
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Failed to read " + std::to_string(content_size_in_bytes) + " bytes from " +
@@ -740,6 +804,18 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
 std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
 {
   return read_deletion_vector_impl(ref, nullptr).legacy;
+}
+
+std::unique_ptr<puffin_byte_source> make_puffin_byte_source(
+  std::unique_ptr<io::sirius_datasource> source)
+{
+  if (!source) return nullptr;
+  return std::make_unique<datasource_puffin_source>(std::move(source));
+}
+
+std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref, puffin_byte_source& source)
+{
+  return read_deletion_vector_impl(ref, nullptr, &source).legacy;
 }
 
 namespace {
@@ -757,10 +833,11 @@ void check_count(Ref const& ref, size_t count)
 template <typename Ref>
 decoded_positions read_charged_checked(Ref const& ref,
                                        sirius::scan_manager::charging_allocator& allocator,
-                                       scan_contract_id contract)
+                                       scan_contract_id contract,
+                                       puffin_byte_source* source = nullptr)
 {
   try {
-    auto result = read_deletion_vector_impl(ref, &allocator);
+    auto result = read_deletion_vector_impl(ref, &allocator, source);
     check_count(ref, result.count);
     return result;
   } catch (sirius::transparent::classified_execution_error const&) {
@@ -791,6 +868,21 @@ std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
   scan_contract_id contract)
 {
   auto result     = read_charged_checked(ref, allocator, contract);
+  auto* positions = reinterpret_cast<int64_t*>(result.backing.data());
+  if (result.count) result.count = std::unique(positions, positions + result.count) - positions;
+  return std::make_shared<iceberg_delete_set const>(
+    canonical_path, std::move(result.backing), result.count, 1, std::move(path_owner));
+}
+
+std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
+  DeletionVectorRefView const& ref,
+  sirius::scan_manager::charging_allocator& allocator,
+  std::string_view canonical_path,
+  std::shared_ptr<void const> path_owner,
+  scan_contract_id contract,
+  puffin_byte_source& source)
+{
+  auto result     = read_charged_checked(ref, allocator, contract, &source);
   auto* positions = reinterpret_cast<int64_t*>(result.backing.data());
   if (result.count) result.count = std::unique(positions, positions + result.count) - positions;
   return std::make_shared<iceberg_delete_set const>(

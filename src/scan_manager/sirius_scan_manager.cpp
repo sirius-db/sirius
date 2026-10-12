@@ -1448,7 +1448,8 @@ void sirius_scan_manager::prepare_for_query(
   const sirius::planner::query& query,
   bool enable_pinned_zone_map_pruning,
   const std::vector<int>& allocated_gpu_ids,
-  std::shared_ptr<pipeline::completion_handler> completion)
+  std::shared_ptr<pipeline::completion_handler> completion,
+  std::function<bool()> interrupted)
 {
   auto const query_id = query.query_id();
   _execution_completion.store(completion);
@@ -1505,8 +1506,8 @@ void sirius_scan_manager::prepare_for_query(
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
   // whole pool. Oversubscription across concurrent queries is absorbed by the dispatcher's
   // pending queue and the pool, not by a per-query cap.
-  state->dispatcher =
-    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
+  state->dispatcher = std::make_unique<exec::scoped_dispatcher>(
+    _thread_pool, _thread_pool.num_threads(), sirius::query_priority_bits(query_id));
   state->metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
   // ioctxs are process/query-manager resources and remain alive across query
@@ -1970,10 +1971,11 @@ void sirius_scan_manager::prepare_for_query(
     _query_states.emplace(query_id, state);
   }
 
-  start_metadata_processing(*state);
+  start_metadata_processing(*state, std::move(interrupted));
 }
 
-void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state)
+void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state,
+                                                    std::function<bool()> interrupted)
 {
   std::shared_ptr<preparation_admission> admission;
   for (auto const& entry : state.scans) {
@@ -1998,6 +2000,7 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
     if (auto* disk = std::get_if<query_scan_manager_state::disk_scan>(&scan.source))
       state.metadata_processor->register_coordinator_source(
         scan.op, *disk->provider, *state.coordinator);
+  state.coordinator->set_interrupt_check(std::move(interrupted));
   state.coordinator->arm();
 }
 
@@ -2019,6 +2022,8 @@ void sirius_scan_manager::run_preparation_on_query_thread(sirius::query_id_t id)
     observation.preparation_runner    = stats.runner;
     observation.preparation_publisher = stats.publisher;
     observation.preparation_runs      = stats.runs;
+    observation.partial_emissions     = stats.partial_emissions;
+    observation.max_residence         = stats.max_residence;
   }
 }
 
@@ -2092,8 +2097,8 @@ void sirius_scan_manager::list_objects_paged(
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
                              s3_prefix_uri + "'");
   }
-  auto* rest = rest_ioctx_for_list();
-  if (rest == nullptr) {
+  auto rest = rest_ioctx_for_list(s3_prefix_uri);
+  if (!rest) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
   }
@@ -2107,8 +2112,8 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: malformed URI '" + s3_uri +
                              "'");
   }
-  auto* rest = rest_ioctx_for_list();
-  if (rest == nullptr) {
+  auto rest = rest_ioctx_for_list(s3_uri);
+  if (!rest) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
   }
@@ -2122,45 +2127,84 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::stri
   auto file_path = normalize_path(std::string(path));
   auto type      = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
-  return ioctx_for_type(*type);
+  return ioctx_for_type(*type, file_path);
 }
 
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
-  sirius::io::io_context_type type)
+  sirius::io::io_context_type type, std::string_view path)
 {
+  auto const snapshot  = path.empty()
+                           ? std::optional<sirius::io::scoped_object_store_configs::snapshot>{}
+                           : _s3_configs.resolve(normalize_path(std::string(path)));
+  auto const config_id = snapshot ? snapshot->id : 0;
   // The local default `_io_ctx` already serves uring/kvikio; only an off-default
   // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
-  if (_io_ctx && _io_ctx->type() == type) { return _io_ctx; }
+  if (_io_ctx && _io_ctx->type() == type && !snapshot) { return _io_ctx; }
 
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
+    if (auto it = _routed_io_ctxs.find({type, config_id}); it != _routed_io_ctxs.end()) {
+      return it->second;
+    }
   }
   // Build outside the map mutex: make_ioctx/start spawn reactor threads and
   // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
   // park every concurrent lookup behind one long critical section. The build
   // mutex serializes builders instead, so two first-touches of the same type
   // never construct twice (a losing ioctx would need drain/stop teardown).
-  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+  std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
+  if (!path.empty()) {
+    auto latest          = _s3_configs.resolve(normalize_path(std::string(path)));
+    auto const latest_id = latest ? latest->id : 0;
+    if (latest_id != config_id) {
+      build_lk.unlock();
+      return ioctx_for_type(type, path);
+    }
+  }
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
+    if (auto it = _routed_io_ctxs.find({type, config_id}); it != _routed_io_ctxs.end()) {
+      return it->second;
+    }
   }
-  auto io_ctx = _ioctx_registry.make_ioctx(type);
+  auto backend_config = _config;
+  if (snapshot) { backend_config.object_store = *snapshot->config; }
+  auto io_ctx = _ioctx_registry.make_ioctx(type, backend_config);
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
   if (_config.cache.use_prefetching_cache() && io_ctx->can_use_prefetching_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
   }
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] = _routed_io_ctxs.emplace(type, std::move(io_ctx));
+  auto [it, inserted] =
+    _routed_io_ctxs.emplace(routed_ioctx_key{type, config_id}, std::move(io_ctx));
   return it->second;
 }
 
-sirius::io::rest::rest_ioctx* sirius_scan_manager::rest_ioctx_for_list()
+std::shared_ptr<sirius::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(
+  std::string_view path)
 {
-  auto io_ctx = ioctx_for_type(sirius::io::io_context_type::restful);
-  return dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  auto io_ctx = ioctx_for_type(sirius::io::io_context_type::restful, path);
+  return std::dynamic_pointer_cast<sirius::io::rest::rest_ioctx>(io_ctx);
+}
+
+void sirius_scan_manager::install_s3_config(std::string_view path,
+                                            sirius::io::object_store_config config)
+{
+  auto scope = normalize_path(std::string(path));
+  std::vector<std::shared_ptr<sirius::io::ioctx>> retired;
+  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+  auto superseded_id = _s3_configs.install(scope, std::move(config));
+  if (!superseded_id) { return; }
+  std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
+  for (auto const type :
+       {sirius::io::io_context_type::restful, sirius::io::io_context_type::kvikio}) {
+    auto it = _routed_io_ctxs.find(routed_ioctx_key{type, *superseded_id});
+    if (it != _routed_io_ctxs.end()) {
+      retired.push_back(std::move(it->second));
+      _routed_io_ctxs.erase(it);
+    }
+  }
 }
 
 void sirius_scan_manager::query_scan_manager_state::drain() noexcept

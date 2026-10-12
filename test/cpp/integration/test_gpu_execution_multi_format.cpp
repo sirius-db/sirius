@@ -3897,6 +3897,21 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     pending.reset();
     prepared.reset();
   }
+  SECTION("abandoned materialized GPU collector does not retain its client context")
+  {
+    duckdb::weak_ptr<duckdb::ClientContext> weak_context = con->context;
+    // Let DuckDB's executor finish initializing its collector before dropping
+    // the handles; this used to expose the collector -> ClientContext cycle.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    con.reset();
+    pending.reset();
+    prepared.reset();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!weak_context.expired() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(weak_context.expired());
+  }
   CHECK(provider->outstanding() == 0);
   CHECK(provider->seen->allocated_bytes == 0);
 }
