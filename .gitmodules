@@ -7,7 +7,7 @@
 [submodule "substrait"]
 	path = substrait
 	url = https://github.com/sirius-db/duckdb-substrait-extension.git
-	branch = main
+	branch = v2
 [submodule "cucascade"]
 	path = cucascade
 	url = https://github.com/NVIDIA/cuCascade.git
