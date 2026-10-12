@@ -180,15 +180,9 @@ class task_creator {
   void prepare_for_query(const sirius::planner::query& query,
                          std::shared_ptr<pipeline::completion_handler> handler);
 
-  /// \brief Drop everything held for @p query_id: pending creation requests, in-flight creation
-  /// work, and the per-query state entry. Other queries are untouched.
-  ///
-  /// Runs on both the success and the failure path (SiriusContext::run_mandatory_cleanup, which
-  /// StandaloneQueryScope guarantees exactly once), so a failed query cannot leave the shared
-  /// creator holding stale operator pointers.
-  ///
-  /// Must complete before @p query_id's planner::query is destroyed: queued requests hold raw
-  /// operator pointers into its plan.
+  /// Release a retired query's creator state, including lookahead hints. The owner must first
+  /// settle publication, dispose of queued requests, and wait for all work leases. Rejects live
+  /// registered queries; unknown IDs are harmless for partial initialization/repeated cleanup.
   void reset(sirius::query_id_t query_id);
 
   /// \brief Drop every query's state. Teardown only (SiriusContext::terminate).
@@ -215,15 +209,9 @@ class task_creator {
    */
   void stop_thread_pool();
 
-  /**
-   * @brief Drop @p query_id's pending creation requests and wait for its in-flight creation
-   *        work to finish. Other queries keep running.
-   *
-   * Call this after a query completes (future resolved) but before destroying the engine/operators
-   * to ensure no stale operator pointers are accessed by the task creator threads. Unlike the
-   * previous global drain, this neither interrupts the queue nor waits on other queries' work.
-   */
-  void drain_pending_tasks(sirius::query_id_t query_id);
+  /// Discard queued requests/callables after publication settles. Does not join workers or
+  /// clear query state: the owner must wait_for_work() before reset() or resource release.
+  void discard_pending_tasks(sirius::query_id_t query_id);
 
   /**
    * @brief Schedule a task creation info for processing.
@@ -252,13 +240,13 @@ class task_creator {
   /// from the streaming-source close callback) route the exception here instead, so the query
   /// surfaces the error rather than the process terminating. The error goes to that query's own
   /// completion handler and nothing else; other in-flight queries keep running, and the failing
-  /// query is unwound by sirius_engine::execute's drain_after_error(query_id).
+  /// query is unwound by SiriusContext::retire_query_work(query_id).
   ///
   /// Deliberately does NOT stop any thread pool itself: this can run on a worker thread that is
   /// itself a member of one of those pools (this creator's own, or a GPU executor's, via
   /// ~gpu_pipeline_task), and synchronously stopping/draining a pool from its own worker is a
   /// self-wait deadlock (bounded_thread_pool::wait_all() blocks on the very slot the caller is
-  /// occupying). Only fulfills the completion future; drain_after_error(query_id), called by the
+  /// occupying). Only fulfills the completion future; retire_query_work(query_id), called by the
   /// query thread once it observes the error, does the actual draining.
   void report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error);
   void report_fatal_error(sirius::query_id_t query_id,
@@ -394,9 +382,7 @@ class task_creator {
     std::size_t index_of_next_lookahead{0};
     std::vector<op::sirius_physical_operator*> lookahead_queue;
 
-    // (In-flight creation work is tracked by the pool itself, keyed by the query the slot is
-    // attached to; see bounded_thread_pool::drain_and_wait. The bespoke counter that used to live
-    // here duplicated that accounting and had to be kept in sync by hand across every exit path.)
+    // Creator requests carry work leases through manager processing and worker destruction.
   };
 
   //! Resolve a query's state, or nullptr when it has already been reset.

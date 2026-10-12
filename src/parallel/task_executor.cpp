@@ -164,24 +164,8 @@ void itask_executor::resume_manager()
   _manager_thread = std::thread([this] { manager_loop(); });
 }
 
-void itask_executor::wait_and_validate_empty(sirius::query_id_t query_id)
+void itask_executor::validate_query_empty(sirius::query_id_t query_id)
 {
-  // Never started (or already stopped): nothing dispatched, nothing to validate. drain_and_wait()
-  // has always had this guard; the whole-executor variant this replaced did not, and
-  // null-dereferenced when a query failed before any work reached this executor.
-  if (!_bounded_pool) { return; }
-
-  // Per-query wait, no quiesce bracket. This is the success path: the query's completion handler
-  // has already fired, so nothing of this query remains to be popped and the pop-to-attach window
-  // that the error path must worry about cannot occur here. Untagged slots (a manager parked in
-  // pop()) are ignored by drain_and_wait, which is exactly what lets this return without stopping
-  // the executor -- and therefore without interrupting the shared queue and dropping a co-tenant's
-  // in-transit task, which the previous bracket did on EVERY successful completion.
-  // wait_for_query, NOT drain_and_wait: this is the success path, so the query's remaining work
-  // must be allowed to RUN. Dropping it here would silently discard tasks the query legitimately
-  // scheduled and then report success.
-  _bounded_pool->wait_for_query(query_id);
-
   // Only THIS query's tasks must be gone. The original validated the WHOLE queue, so a query
   // completing normally threw because a co-tenant had work legitimately queued.
   const std::size_t remaining =
@@ -189,7 +173,7 @@ void itask_executor::wait_and_validate_empty(sirius::query_id_t query_id)
 
   if (remaining != 0) {
     SIRIUS_LOG_ERROR(
-      "itask_executor::wait_and_validate_empty: task queue NOT empty for query {} at completion — "
+      "itask_executor::validate_query_empty: task queue NOT empty for query {} at completion — "
       "{} task(s) still queued; tasks were still being scheduled when the query was marked "
       "complete",
       query_id,
@@ -200,14 +184,13 @@ void itask_executor::wait_and_validate_empty(sirius::query_id_t query_id)
   }
 }
 
-void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
+void itask_executor::discard_query_tasks(sirius::query_id_t query_id)
 {
   // Leave accepted staging tasks for the manager: each consumed a device_ready signal.
   // Removing one here could strand the manager in pop() with no scheduler readiness left.
   // The GPU manager discards cancelled tasks before preparation and advertises readiness again.
-  // The caller must close publication first, then wait_for_work() after draining workers to
-  // cover staged and manager-local tasks that have not yet been attributed to a pool slot.
-  if (_bounded_pool) { _bounded_pool->drain_and_wait(query_id); }
+  // The owner waits for leases after disposal, covering staging and manager-local tasks too.
+  if (_bounded_pool) { _bounded_pool->discard_queued(query_id); }
 }
 
 }  // namespace parallel

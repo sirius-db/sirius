@@ -185,13 +185,14 @@ After the future resolves:
 If any task throws an exception during execution:
 
 1. The GPU executor catches it and calls `completion_handler->report_error(exception)`
-2. `drain_after_error()` is called on the pipeline executor which:
-   - Closes the query's submission gate and waits for admitted publishers before draining
-   - Stops the task creator threads
-   - Drains the task queue
-   - Calls `drain_and_wait()` on the GPU executors
-   - Restarts the task creator for the next query
-3. The error propagates through the future to the main thread, surfacing as an error-carrying result at `PhysicalSiriusExecution::GetData()`
+2. The query owner observes the error through its future and calls `SiriusContext::retire_query_work()`:
+   - Closes the query's submission gate and waits for admitted publishers
+   - Stops and joins that query's scan producers while retaining buffers
+   - Discards that query's creator/scheduler queues and queued pool work
+   - Leaves accepted GPU staging tasks for their managers to consume, preserving readiness
+   - Waits for work leases before releasing query resources
+3. The error surfaces as an error-carrying result at `PhysicalSiriusExecution::GetData()`.
+   Shared pools and managers remain available for other queries.
 
 On the transparent path, that error triggers the runtime CPU fallback described in Step 2 (unless `enable_duckdb_fallback` is false, the error is a user interrupt, or the query reads S3). The fallback runs the stashed DuckDB CPU plan in the same transaction, so a runtime GPU failure completes on CPU rather than failing the query.
 

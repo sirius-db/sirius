@@ -22,9 +22,9 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Motivation:** During pipeline executor drain (e.g., for error recovery or pipeline transitions), in-flight task creation must be safely completed before operator destruction.
 
-**Mechanism:** `drain_pending_tasks(query_id)` drains that query's requests using the queue's query index, waits for its in-flight creation lambdas, and clears its look-ahead state. Other queries' queued requests remain available.
+**Current mechanism:** `discard_pending_tasks(query_id)` disposes of queued requests/callables. The runtime owner then waits for work leases before `reset(query_id)` releases creator state and lookahead hints. Other queries remain active. See [Query lifetime and retirement](query-lifecycle.md).
 
-**Code path:** `src/creator/task_creator.cpp` — `drain_pending_tasks()`
+**Code path:** `src/creator/task_creator.cpp` — `discard_pending_tasks()` and `reset()`
 
 ### 3-Phase Sort Pipeline (PR #866)
 

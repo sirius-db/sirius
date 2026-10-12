@@ -219,7 +219,7 @@ The `mark_task_created()` call before data popping prevents a race condition whe
 
 **Files:** `src/creator/config.hpp`, `src/creator/task_creator.cpp`
 
-The task creator is constructed with a `task_creator_config` whose internal `strategy` is `request_type::active` (the current shipped, purely demand-driven policy) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds that query's `lookahead_queue` with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_hint)`: the creator walks the query's queue, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is cleared by `drain_pending_tasks(query_id)` and `reset(query_id)` so no dangling operator pointers survive `QueryEnd`. This primitive is retained for engine-controlled policy; it is not exposed through YAML.
+The task creator is constructed with a `task_creator_config` whose internal `strategy` is `request_type::active` (the current shipped, purely demand-driven policy) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds that query's `lookahead_queue` with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_hint)`: the creator walks the query's queue, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is released by `reset(query_id)` after the runtime owner retires the query, so no dangling operator pointers survive `QueryEnd`. This primitive is retained for engine-controlled policy; it is not exposed through YAML.
 
 ## Device Assignment for GPU Tasks
 
@@ -249,17 +249,17 @@ These methods signal task exhaustion:
 
 Both throw `not implemented` in the base class and must be overridden by operators that need them.
 
-## `drain_pending_tasks()`
+## Query retirement
 
 **File:** `src/creator/task_creator.cpp`
 
-`drain_pending_tasks(query_id)` is called during error cleanup and query reset:
+After publication settles, `discard_pending_tasks(query_id)` removes the query's queued creation
+requests and queued pool callables. It does not wait or release lookahead state. Manager-held
+requests and running callables retain their work leases through their last resource access.
 
-1. Drains that query's requests from `_task_creation_queue` using its query index.
-2. Waits for that query's in-flight task-creation lambdas to finish.
-3. Clears that query's look-ahead queue and cursor under its state mutex.
-
-The shared queue remains open for other queries.
+`SiriusContext::retire_query_work()` waits for those leases before `reset(query_id)` releases the
+query's creator state, including its lookahead queue. Other queries keep using the shared queue.
+See [Query lifetime and retirement](query-lifecycle.md) for the full sequence.
 
 ## Key Files
 

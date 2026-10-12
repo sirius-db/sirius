@@ -571,18 +571,16 @@ void SiriusContext::retire_query_work(sirius::query_id_t query_id, query_retirem
   query_lifecycle_.quiesce_and_wait_for_submissions(query_id);
   if (scan_manager_) { scan_manager_->quiesce(query_id); }
 
-  if (task_scheduler_) {
-    if (mode == query_retirement_mode::completed) {
-      task_scheduler_->wait_for_completion(query_id);
-    } else {
-      task_scheduler_->drain_after_error(query_id);
-    }
-  } else if (task_creator_) {
-    // Partial initialization: no scheduler exists, but any creator requests must still retire.
-    task_creator_->drain_pending_tasks(query_id);
+  if (mode == query_retirement_mode::completed && task_scheduler_) {
+    task_scheduler_->validate_query_complete(query_id);
   }
-  // Also covers partial initialization and repository borrowers. Keep the scheduler's own
-  // barriers: standalone callers use that API without the runtime's scan-producer phase.
+  // Creator hints can be redundant at completion. Dispose of them before the work barrier,
+  // including on partial initialization where there is no scheduler yet.
+  if (task_creator_) { task_creator_->discard_pending_tasks(query_id); }
+  if (mode == query_retirement_mode::cancelled && task_scheduler_) {
+    task_scheduler_->discard_query_tasks(query_id);
+  }
+  // The sole query-wide work barrier: includes manager-held tasks, callbacks and spill victims.
   query_lifecycle_.wait_for_work(query_id);
 }
 

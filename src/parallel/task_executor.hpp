@@ -115,31 +115,14 @@ class itask_executor {
    */
   void drain_and_wait();
 
-  /**
-   * @brief Wait for in-flight work, then assert @p query_id has nothing queued here.
-   *
-   * The success-path counterpart of wait_and_drain_query(). A non-empty queue for @p query_id at
-   * completion means tasks were still being scheduled when the query was declared done, so this
-   * throws rather than draining, which would hide the bug.
-   *
-   * Unlike the whole-executor version it replaced, this neither interrupts the shared queue nor
-   * stops and restarts the manager thread — both of which dropped co-tenant queries' queued work
-   * and stalled their producers on every completion. It also no longer validates the *whole*
-   * queue, which made one query fail because another had work legitimately queued.
-   *
-   * The pool wait is scoped to this query; idle manager slots and other queries are ignored.
-   */
-  void wait_and_validate_empty(sirius::query_id_t query_id);
+  /// Validate successful completion after publication settles. Never drops queued execution
+  /// tasks or waits for workers; the owner uses the lifecycle work barrier afterward.
+  void validate_query_empty(sirius::query_id_t query_id);
 
-  /**
-   * @brief Discard queued pool work and wait for this query's attributed worker slots.
-   *
-   * The caller must close publication first. Accepted staging tasks stay queued for the manager
-   * to consume and discard, preserving its readiness handoff. This pool wait does not cover
-   * staged or manager-local tasks before slot attribution: the caller must also wait_for_work()
-   * before releasing query resources.
-   */
-  void wait_and_drain_query(sirius::query_id_t query_id);
+  /// Discard this query's queued pool callables after publication settles, without waiting.
+  /// Accepted staging tasks stay queued for their manager to preserve readiness handoffs.
+  /// The owner must wait for work leases before releasing query resources.
+  void discard_query_tasks(sirius::query_id_t query_id);
 
  protected:
   /**

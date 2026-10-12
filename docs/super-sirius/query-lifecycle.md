@@ -58,11 +58,20 @@ Retirement must finish before resources are released:
 3. On cancellation, drain Q's creator and scheduler queues and queued executor worker-pool work.
    Leave accepted GPU staging tasks for their managers to consume and discard before memory
    preparation: removing them directly would consume readiness without allowing the manager to
-   announce it again. On success, validate empty execution queues and settle workers. Leave other
-   queries' workers running.
+   announce it again. On success, validate empty execution queues without dropping execution
+   work. Redundant creator hints may be discarded. Leave other queries' workers running.
 4. Wait for Q's work leases, including in-hand tasks, completion callbacks and spill victims.
 5. Release Q's plan, repositories, scan state and telemetry in dependency order.
 6. Close the registry entry; the surrounding execution scope releases admission.
+
+Only the runtime owner performs the publication and work barriers. Scheduler/executor methods
+validate or discard queues; they do not join workers. Creator `reset()` only releases state and
+rejects registered queries whose gate is open or whose accounting is still live. Shutdown
+`reset_all()` explicitly disposes of leftover creator requests after producers and workers stop.
+Successful completion validation runs before the work barrier so queued execution tasks cannot
+be silently discarded or cause a wait on work that cannot progress. A validation failure follows
+the owner's cancellation path. Repeated retirement calls from the engine/destructor/window
+backstops remain safe; they use the same ordering without a separate retired flag.
 
 An existing lease does not authorize publication after closure. Every queue handoff, including
 retry and spill return, still needs a submission guard. No worker waits for its own lease.

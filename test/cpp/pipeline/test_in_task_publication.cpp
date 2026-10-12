@@ -22,6 +22,7 @@
 #include "operator/partitioned_join_test_utils.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/query_retirement_test_utils.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
@@ -389,15 +390,19 @@ void require_worker_reuse(harness& test)
     pipeline, sirius::test::make_test_telemetry_context());
   auto completion = std::make_shared<pl::completion_handler>();
   global->set_completion_handler(completion);
-  absl::Cleanup quiesce = [&] { test.scheduler->drain_after_error(pipeline->get_query_id()); };
-  auto local            = std::make_unique<pl::gpu_pipeline_task_local_state>(
+  absl::Cleanup quiesce = [&] {
+    sirius::test::retire_scheduler_query(
+      test.lifecycle, *test.scheduler, pipeline->get_query_id(), false, test.creator.get());
+  };
+  auto local = std::make_unique<pl::gpu_pipeline_task_local_state>(
     std::make_unique<op::pipelineable_operator_data>(
       std::vector<acc::batch_ptr>{test.memory.make_batch(0, 0, 100)}));
   local->set_preferred_device_id(0);
   test.scheduler->schedule(std::make_unique<pl::gpu_pipeline_task>(
     100, std::vector<cucascade::shared_data_repository*>{}, std::move(local), global));
   wait_until([&] { return next.deposits.load() == 1 || completion->has_error(); });
-  test.scheduler->wait_for_completion(pipeline->get_query_id());
+  sirius::test::retire_scheduler_query(
+    test.lifecycle, *test.scheduler, pipeline->get_query_id(), true, test.creator.get());
   REQUIRE_FALSE(completion->has_error());
   REQUIRE(next.deposits.load() == 1);
   REQUIRE(pipeline->get_tasks_completed() == 1);
@@ -429,7 +434,8 @@ TEST_CASE("the elected PARTITION task publishes before its first repository depo
   test.wait_completed(1);
   test.schedule(std::move(tasks[0]));
   test.wait_completed(2);
-  test.scheduler->wait_for_completion(test.pipeline->get_query_id());
+  sirius::test::retire_scheduler_query(
+    test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), true, test.creator.get());
   REQUIRE(snapshots.size() == 4);
   REQUIRE((snapshots[0] == std::pair<bool, std::size_t>{false, 0}));
   REQUIRE((snapshots[1] == std::pair<bool, std::size_t>{false, 0}));
@@ -479,7 +485,8 @@ TEST_CASE("mandatory scatter OOM retries the elected identity through the execut
   fail_next.store(true);
   test.schedule(std::move(tasks[1]));
   test.wait_completed(3);
-  test.scheduler->wait_for_completion(test.pipeline->get_query_id());
+  sirius::test::retire_scheduler_query(
+    test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), true, test.creator.get());
   REQUIRE(failures.load() == 1);
   REQUIRE(record->retries.load() == 1);
   REQUIRE(record->resume_index == 0);
@@ -585,8 +592,10 @@ TEST_CASE("scheduler error drain joins collecting and publishing PARTITION tasks
   REQUIRE(gated.load());
   test.completion->report_error("another query task failed");
   test.tree.join->cancel_dynamic_filter_publication();
-  auto drained = std::async(
-    std::launch::async, [&] { test.scheduler->drain_after_error(test.pipeline->get_query_id()); });
+  auto drained       = std::async(std::launch::async, [&] {
+    sirius::test::retire_scheduler_query(
+      test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), false, test.creator.get());
+  });
   auto const blocked = drained.wait_for(std::chrono::milliseconds{100});
   gate->open();
   REQUIRE(blocked == std::future_status::timeout);
@@ -626,7 +635,8 @@ TEST_CASE("optional publication scratch OOM deposits without rescheduling the PA
   absl::Cleanup stop = [&] { test.scheduler->stop(); };
   test.schedule(std::move(tasks[1]));
   test.wait_completed(2);
-  test.scheduler->wait_for_completion(test.pipeline->get_query_id());
+  sirius::test::retire_scheduler_query(
+    test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), true, test.creator.get());
   REQUIRE(scratch_requests.load() == 1);
   REQUIRE(record->retries.load() == 0);
   REQUIRE(test.output.deposits.load() == 4);
@@ -655,7 +665,8 @@ TEST_CASE("a fatal PARTITION task drains its collecting publication and leaves t
   test.schedule(std::move(tasks[1]));
   wait_until([&] { return test.completion->has_error(); });
   test.tree.join->cancel_dynamic_filter_publication();
-  test.scheduler->drain_after_error(test.pipeline->get_query_id());
+  sirius::test::retire_scheduler_query(
+    test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), false, test.creator.get());
   test.output.discard_batches();
   test.tree.join->dynamic_filter_session().finalize_input();
   REQUIRE(record->retries.load() == 0);

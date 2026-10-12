@@ -217,97 +217,27 @@ void task_scheduler::terminate_query(const std::shared_ptr<completion_handler>& 
   if (handler) { handler->report_error(std::move(error)); }
 }
 
-void task_scheduler::drain_after_error(sirius::query_id_t query_id)
+void task_scheduler::discard_query_tasks(sirius::query_id_t query_id)
 {
-  // Close admission and settle publishers before removing this query's queued work.
-  _query_lifecycle.quiesce_and_wait_for_submissions(query_id);
-
-  try {
-    SIRIUS_LOG_INFO("task_scheduler: draining after error for query {}", query_id);
-  } catch (...) {
-    // Retirement must continue even if diagnostic logging fails.
-  }
-  // Teardown ordering is load-bearing. The executor drains below run in-flight tasks to
-  // completion, and a completing task schedules its downstream consumers via
-  // task_creator::schedule(). Each such request holds a raw sirius_physical_operator* owned by
-  // the engine, which is destroyed the moment execute() returns. If those requests are processed
-  // after the plan dies, manager_loop dereferences a freed operator in
-  // get_operator_for_next_task() — a use-after-free seen under multi-partition sort with many
-  // in-flight pipeline tasks.
-  //
-  // This used to be achieved by stopping the shared task_creator and keeping its queue
-  // interrupted across the drains, so that late schedule() pushes returned false. That worked but
-  // was process-wide: it halted task creation for EVERY in-flight query and dropped their queued
-  // requests too. The lifecycle gate does the same job scoped to one query — from here on,
-  // schedule() for this query is refused while every other query keeps producing.
-
-  // Drop this query's queued work so management_eventloop cannot dispatch a stale task from it.
+  // Publication has settled, so no second sweep is needed. A manager or spill worker may
+  // still hold a task; its lease protects it and any later queue handoff must pass the gate.
   _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
-
-  // Drain this query's worker pools. GPU managers consume and discard cancelled staging tasks
-  // themselves so every accepted handoff still leads to another device_ready signal.
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->wait_and_drain_query(query_id);
-  }
-
-  // Discard the creation requests this query accumulated — they hold raw operator pointers into a
-  // plan that QueryEnd is about to destroy. Other queries keep their pending requests.
-  if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
-
-  // A task completing during the drains above can have handed one more task to the scheduler
-  // queue before the gate refused its successor, so sweep this query once more.
-  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
-
-  _query_lifecycle.wait_for_work(query_id);
-
-  try {
-    SIRIUS_LOG_INFO("task_scheduler: DONE draining after error for query {}", query_id);
-  } catch (...) {
-    // Retirement must continue even if diagnostic logging fails.
+    gpu_exec->discard_query_tasks(query_id);
   }
 }
 
-void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
+void task_scheduler::validate_query_complete(sirius::query_id_t query_id)
 {
-  // Settle publishers before interrupting/draining queues. Keep the existing worker joins:
-  // submission accounting does not yet cover running tasks and repository borrowers.
-  _query_lifecycle.quiesce_and_wait_for_submissions(query_id);
-
-  // Once the query has signaled completion, NOTHING should still be queued. Rather
-  // than drain (which would hide the bug), validate that every queue is empty and
-  // throw if not — a non-empty queue means tasks were still being scheduled when we
-  // declared the query done.
-  //
-  // Halt this query's producers so the checks are not racing its own task creation. This used to
-  // be _task_creator->stop_thread_pool(), which tore down the SHARED creation pool and interrupted
-  // the shared queue — halting every other in-flight query, and dropping their queued requests,
-  // on every successful completion. The gate does it for one query.
+  // Check before waiting: silently draining execution queues would hide premature completion.
   const exec::query_index this_query{static_cast<exec::query_key>(sirius::value_of(query_id))};
-  try {
-    // Only THIS query's tasks must be gone. The old check used the whole-queue size(), so query A
-    // completing normally threw "task queue not empty" because query B had work queued.
-    if (const std::size_t remaining = _task_queue.size(this_query); remaining != 0) {
-      SIRIUS_LOG_ERROR(
-        "task_scheduler::wait_for_completion: pipeline _task_queue NOT empty for query {} at "
-        "completion — {} task(s) still queued; work was still scheduled when the query was "
-        "marked complete",
-        query_id,
-        remaining);
-      throw std::runtime_error(
-        "task_scheduler: pipeline task queue not empty at query completion (" +
-        std::to_string(remaining) + " task(s) remaining)");
-    }
-
-    // Each executor must finish its in-flight tasks and then have none of this query's queued.
-    for (auto& [device_id, gpu_exec] : _gpu_executors) {
-      gpu_exec->wait_and_validate_empty(query_id);
-    }
-  } catch (...) {
-    if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
-    throw;
+  if (const std::size_t remaining = _task_queue.size(this_query); remaining != 0) {
+    throw std::runtime_error("task_scheduler: pipeline task queue not empty at query completion (" +
+                             std::to_string(remaining) + " task(s) remaining)");
   }
-  if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
-  _query_lifecycle.wait_for_work(query_id);
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->validate_query_empty(query_id);
+  }
 }
 
 void task_scheduler::management_eventloop()

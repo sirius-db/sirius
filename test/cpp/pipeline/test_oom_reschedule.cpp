@@ -22,6 +22,7 @@
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "pipeline/query_retirement_test_utils.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "scan/test_utils.hpp"
@@ -506,7 +507,8 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   //--------------------------------------------------------------------------
   // Drain remaining tasks and shut down
   //--------------------------------------------------------------------------
-  f.executor->drain_after_error(sirius::make_query_id(0));
+  sirius::test::retire_scheduler_query(
+    f.lifecycle, *f.executor, sirius::make_query_id(0), false, f.creator.get());
   request_handler.join();
   f.executor->stop();
 

@@ -268,8 +268,8 @@ sub-executor or scan-priority queue owned here.
 | `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
 | `start_query(query)` | Schedules `query.get_scan_operators().front()` through `task_creator` |
 | `terminate_query(handler, exception)` | Reports an error to that query's completion handler |
-| `wait_for_completion(query_id)` | Stops task creation and validates the scheduler and executor queues after completion |
-| `drain_after_error(query_id)` | Drains in-flight work after a query error |
+| `validate_query_complete(query_id)` | Checks execution queues after the owner settles publication; does not wait |
+| `discard_query_tasks(query_id)` | Disposes of queued scheduler/pool work; the owner waits for work leases |
 
 ### Management Event Loop
 
@@ -390,8 +390,9 @@ after releasing the lock and finishing all pipeline access.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
-`task_scheduler::wait_for_completion(query_id)` stops task creation and validates the queues before
-operators are destroyed.
+`SiriusContext::retire_query_work(query_id, completed)` closes publication, joins scan producers,
+validates execution queues, discards redundant creator hints, and waits for work leases before
+operators can be destroyed.
 
 ### Task Request Flow
 
@@ -442,17 +443,16 @@ If max retries are exceeded, the error propagates and terminates the query.
 
 ## Error Handling and Draining
 
-**File:** `src/pipeline/task_scheduler.cpp`
+**File:** `src/sirius_context.cpp` — `retire_query_work(query_id, mode)`
 
-`drain_after_error(query_id)` performs a multi-stage clean shutdown while execution windows remain serialized:
+The runtime owner closes the query's publication gate, waits for admitted publishers, and joins
+its scan producers. It then discards that query's creator/scheduler queues and queued pool work.
+GPU staging tasks stay with their managers so accepted handoffs return readiness normally.
+The owner waits for the query's work leases before releasing its resources. Other queries keep
+running; per-query retirement does not stop shared pools or managers.
 
-1. **Stop task creator thread pool** — prevents new tasks from being created
-2. **Drain the task queue** — clears pending pipeline tasks
-3. **Drain GPU executors** — `drain_and_wait()` per device: interrupts the queue, joins the manager thread, waits for all in-flight tasks
-4. **Drain the failed query's pending creation requests** — `drain_pending_tasks(query_id)` (also clears its look-ahead state)
-5. **Clear the task queue again** — catches tasks enqueued during the drain
-
-This ensures that when `drain_after_error()` returns, no tasks are referencing operators or data repositories that are about to be destroyed.
+Successful completion validates execution queues before the work barrier rather than silently
+dropping unfinished execution tasks. See [Query lifetime and retirement](query-lifecycle.md).
 
 ## Key Files
 

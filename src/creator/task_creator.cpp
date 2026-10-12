@@ -265,36 +265,24 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   return priorities;
 }
 
-void task_creator::drain_pending_tasks(sirius::query_id_t query_id)
+void task_creator::discard_pending_tasks(sirius::query_id_t query_id)
 {
-  // Drop only THIS query's queued requests. No interrupt()/reactivate(): the queue stays open
-  // the whole time, so other queries' producers and consumers are never stalled.
+  // Queue disposal is not a lifetime barrier. The owner has settled publication and will
+  // wait for leases, including requests already held by the manager or a worker.
   _task_creation_queue.drain(
     exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
-
-  auto state = get_query_task_global_state(query_id);
-  if (!state) { return; }
-
-  // Wait out this query's in-flight creation work. The pool tracks it per query via the slot
-  // attached in manager_loop, so this waits on THIS query only — never on a co-tenant's lambda,
-  // and never on the manager thread's own idle reservation, which carries no query. Slots are
-  // released by RAII on every exit path including an exception, so a throwing creation lambda
-  // cannot strand this wait.
-  if (_bounded_pool) { _bounded_pool->drain_and_wait(query_id); }
-
-  // Clear lookahead state so any schedule_lookahead() racing with query teardown finds an
-  // empty queue and exits cleanly instead of dereferencing operators that are about to die.
-  std::lock_guard<std::mutex> lookahead_lock(state->lookahead_mutex);
-  state->lookahead_queue.clear();
-  state->index_of_next_lookahead = 0;
+  if (_bounded_pool) { _bounded_pool->discard_queued(query_id); }
 }
 
 void task_creator::reset(sirius::query_id_t query_id)
 {
-  // Requests hold raw operator pointers into this query's plan, and in-flight lambdas
-  // dereference them, so both must be gone before the caller destroys planner::query.
-  drain_pending_tasks(query_id);
-
+  // A closed gate makes the zero-activity observation stable: no new borrower can enter.
+  if (auto state = _query_lifecycle.state(query_id)) {
+    auto activity = _query_lifecycle.activity(query_id);
+    if (*state != exec::query_lifecycle_state::quiescing || activity.submissions || activity.work) {
+      throw std::logic_error("task_creator::reset requires a retired query");
+    }
+  }
   std::shared_ptr<query_task_global_state> state;
   {
     std::lock_guard<std::mutex> lock(_global_state_mutex);
@@ -303,8 +291,7 @@ void task_creator::reset(sirius::query_id_t query_id)
     state = std::move(it->second);
     _query_task_global_states.erase(it);
   }
-  // `state` is released here, outside the lock. Any worker that resolved it before the erase
-  // still holds its own shared_ptr and finishes safely against a map that no longer lists it.
+  // State, including lookahead hints, is released outside the lock after the work barrier.
 }
 
 void task_creator::reset_all()
@@ -317,7 +304,9 @@ void task_creator::reset_all()
       query_ids.push_back(query_id);
     }
   }
+  // Shutdown has stopped producers/workers; dispose of any requests left in their queues.
   for (const auto query_id : query_ids) {
+    discard_pending_tasks(query_id);
     reset(query_id);
   }
 }
@@ -515,7 +504,7 @@ void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion
   // to free -- a self-wait deadlock, since the slot can't free until this call returns -- and
   // would tear down task creation for every other in-flight query besides. terminate_query()
   // only fulfills the completion future; the query thread (sirius_engine.cpp, future.get() catch
-  // block) observes the error and calls task_scheduler::drain_after_error(), which retires this
+  // block) observes the error and calls SiriusContext::retire_query_work(), which retires this
   // query's work from a thread that is never one of the pool's own workers.
   if (_task_scheduler != nullptr) { _task_scheduler->terminate_query(handler, std::move(error)); }
 }
@@ -630,19 +619,8 @@ void task_creator::manager_loop()
       continue;
     }
 
-    // Attribute the slot to this query BEFORE touching `node` again.
-    //
-    // get_operator_for_next_task() dereferences the operator (recursively, via
-    // get_next_task_hint()) on THIS thread. Attaching only just before dispatch would leave that
-    // dereference outside the counted region, so drain_pending_tasks(query_id) could return while
-    // the manager was still walking the query's operators — and the caller's next act is to let
-    // the plan be destroyed.
-    //
-    // The slot's own RAII covers every exit: an early `continue` below destroys it and decrements
-    // the query's count; the dispatch path moves it into the worker, which releases it when the
-    // creation lambda returns. Entered once, left once, with no separate bookkeeping to keep in
-    // sync. (Attribution cannot happen at reserve() time: the manager reserves before it knows
-    // which query it will serve, and an idle manager must not be counted against anyone.)
+    // The request's lease already protects manager-side hint traversal and will move into
+    // the worker owner. Pool attribution is retained temporarily for legacy pool callers.
     try {
       // Attribution can allocate; contain failures in this query's error handler.
       slot.attach(query_id);

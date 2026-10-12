@@ -230,7 +230,7 @@ TEST_CASE("GPU cancellation preserves staged work until the manager restores rea
   // Freeze the queue-insertion-before-pop interleaving. In production the scheduler has
   // consumed readiness for this accepted handoff; cancellation must not remove its task.
   lifecycle.quiesce_and_wait_for_submissions(cancelled_query);
-  executor.wait_and_drain_query(cancelled_query);
+  executor.discard_query_tasks(cancelled_query);
   CHECK_FALSE(executor.is_task_queue_empty());
   CHECK(lifecycle.activity(cancelled_query).work == 1);
   executor.resume_manager_for_test();

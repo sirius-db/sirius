@@ -110,7 +110,7 @@ TEST_CASE("task_creator::schedule accepts a placed operator", "[task_creator][sc
   REQUIRE_NOTHROW(f.creator.schedule(op.get()));
 
   // Drop the queued request before `op` dies: it holds a raw pointer into the plan.
-  f.creator.drain_pending_tasks(query_id);
+  f.creator.discard_pending_tasks(query_id);
 }
 
 TEST_CASE("task_creator::schedule with an explicit query id still requires a pipeline",

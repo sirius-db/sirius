@@ -291,6 +291,14 @@ class bounded_thread_pool {
    */
   void drain_and_wait(sirius::query_id_t query_id)
   {
+    discard_queued(query_id);
+    wait_for_query(query_id);
+  }
+
+  /// Dispose of queued callables only. Manager-held/running work is covered by its work lease;
+  /// callers must close publication before disposal and wait for leases before releasing state.
+  void discard_queued(sirius::query_id_t query_id)
+  {
     std::list<work_item> dropped;
     {
       std::lock_guard lock(mu_);
@@ -304,8 +312,7 @@ class bounded_thread_pool {
         }
       }
     }
-    dropped.clear();  // releases the dropped items' slots, outside the lock
-    wait_for_query(query_id);
+    dropped.clear();  // releases captures and slots outside the lock
   }
 
   /// \brief Number of running slots attributed to @p query_id. Test/diagnostic aid.

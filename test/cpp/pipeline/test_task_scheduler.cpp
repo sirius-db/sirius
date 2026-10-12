@@ -20,6 +20,7 @@
 #include "exec/query_lifecycle_registry.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/query_retirement_test_utils.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "query_id.hpp"
 #include "scan/test_utils.hpp"
@@ -354,15 +355,10 @@ TEST_CASE("wait_for_completion validates only its own query's queue",
   // The assertion this test exists for: completing an unrelated query must not throw because a
   // co-tenant has work queued. Before the per-query size() check, this threw
   // "pipeline task queue not empty at query completion" every time.
-  REQUIRE_NOTHROW(executor.wait_for_completion(completing_query));
+  REQUIRE_NOTHROW(
+    sirius::test::retire_scheduler_query(lifecycle, executor, completing_query, true));
 
-  // NOT asserted here: that every co-tenant task still runs. wait_and_validate_empty() must
-  // release the manager thread's pool slot before wait_all() can return (see
-  // itask_executor::quiesce_manager), and that interrupt makes push() return false for the
-  // duration — so a co-tenant task in transit from the scheduler to a device queue can still be
-  // dropped. Step 3 removes the *whole-queue* drain that used to destroy co-tenants' queued work
-  // outright; eliminating the in-transit drop needs per-query in-flight accounting from the
-  // query-aware bounded_thread_pool, at which point this test should gain a liveness assertion.
+  // Other queries remain live; neither validation nor the lease barrier stops their manager.
   executor.stop();
 }
 
@@ -564,7 +560,7 @@ TEST_CASE("scheduler error cleanup waits for publishers before its existing drai
   auto started = cleanup_started.get_future();
   auto cleanup = std::async(std::launch::async, [&] {
     cleanup_started.set_value();
-    scheduler.drain_after_error(q);
+    sirius::test::retire_scheduler_query(lifecycle, scheduler, q);
   });
   started.wait();
   CHECK(cleanup.wait_for(20ms) == std::future_status::timeout);
@@ -598,7 +594,7 @@ TEST_CASE("scheduler retirement waits for a task removed from its queue",
 
   std::atomic<bool> drained{false};
   std::thread cleanup([&] {
-    scheduler.drain_after_error(q);
+    sirius::test::retire_scheduler_query(lifecycle, scheduler, q);
     drained.store(true);
   });
   // Wait for the observable gate transition, not a timing assumption about thread startup.
@@ -610,5 +606,26 @@ TEST_CASE("scheduler retirement waits for a task removed from its queue",
   cleanup.join();
   CHECK(drained.load());
   CHECK(lifecycle.activity(q).work == 0);
+  lifecycle.close(q);
+}
+
+TEST_CASE("successful retirement reports queued execution work before the work barrier",
+          "[task_scheduler][query_lifecycle_gate]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  task_scheduler scheduler(lifecycle, {2}, *manager, sirius::test::make_test_telemetry_context());
+  const auto q = sirius::make_query_id(0);
+  lifecycle.open_query(q);
+  auto global = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  scheduler.schedule(std::make_unique<mock_gpu_pipeline_task>(
+    1, std::make_unique<mock_gpu_pipeline_task_local_state>(1, 0), global));
+  lifecycle.quiesce_and_wait_for_submissions(q);
+  CHECK_THROWS_AS(scheduler.validate_query_complete(q), std::runtime_error);
+  CHECK(lifecycle.activity(q).work == 1);
+  CHECK_FALSE(scheduler.get_pipeline_task_queue()->empty());
+  // The owner switches to cancellation cleanup after a failed success validation.
+  scheduler.discard_query_tasks(q);
+  lifecycle.wait_for_work(q);
   lifecycle.close(q);
 }

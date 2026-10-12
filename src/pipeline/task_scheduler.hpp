@@ -179,7 +179,7 @@ class task_scheduler {
    * own worker thread (e.g. notify_downstream_pipelines() from ~gpu_pipeline_task), and
    * synchronously stopping a pool from its own worker thread self-deadlocks in
    * bounded_thread_pool::wait_all(). Fulfilling the future here is what makes the query thread's
-   * future.get() throw; sirius_engine::execute's catch block then calls drain_after_error(query_id)
+   * future.get() throw; sirius_engine::execute's catch block then asks SiriusContext to retire work
    * to perform the actual cancellation from a thread that is never a pool worker.
    *
    * @param handler The failing query's completion handler.
@@ -188,14 +188,13 @@ class task_scheduler {
   void terminate_query(const std::shared_ptr<completion_handler>& handler,
                        std::exception_ptr error);
 
-  /// Close publication, drain this query's queues and wait for its workers/borrowers.
-  /// Shared managers keep serving other queries. Runtime owners first stop scan producers
-  /// through SiriusContext::retire_query_work(); standalone fixtures have no such producers.
-  void drain_after_error(sirius::query_id_t query_id);
+  /// Discard this query's scheduler/pool queues after publication settles. Does not wait.
+  /// The owner stops scan producers and waits for lifecycle leases before releasing resources.
+  void discard_query_tasks(sirius::query_id_t query_id);
 
-  /// Close publication and settle workers while validating successful completion.
-  /// Throws if this query left queued execution tasks; it must not silently discard them.
-  void wait_for_completion(sirius::query_id_t query_id);
+  /// Validate execution queues after publication settles, before the owner's work barrier.
+  /// Throws on queued execution tasks rather than silently dropping unfinished work.
+  void validate_query_complete(sirius::query_id_t query_id);
 
  private:
   void management_eventloop();
