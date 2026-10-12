@@ -36,8 +36,11 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda/stream>
@@ -299,6 +302,37 @@ struct spread_pin {
   }
 };
 
+/// A memory resource that fails exactly one allocation -- the @p fail_at-th
+/// one it sees -- and passes everything else upstream. Negative never fails.
+class failing_resource final : public rmm::mr::device_memory_resource {
+ public:
+  explicit failing_resource(rmm::device_async_resource_ref upstream, long fail_at = -1)
+    : _upstream{upstream}, _fail_at{fail_at}
+  {
+  }
+  [[nodiscard]] long allocations() const noexcept { return _seen; }
+
+ private:
+  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override
+  {
+    if (_seen++ == _fail_at) { throw rmm::out_of_memory("injected allocation failure"); }
+    return _upstream.allocate_async(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT, stream);
+  }
+  void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override
+  {
+    _upstream.deallocate_async(ptr, bytes, rmm::CUDA_ALLOCATION_ALIGNMENT, stream);
+  }
+  [[nodiscard]] bool do_is_equal(
+    rmm::mr::device_memory_resource const& other) const noexcept override
+  {
+    return this == &other;
+  }
+
+  rmm::device_async_resource_ref _upstream;
+  long _fail_at;
+  long _seen = 0;
+};
+
 }  // namespace
 
 TEST_CASE("a sorted selection materializes its rows in table order", "[late_mat][materialize]")
@@ -504,4 +538,80 @@ TEST_CASE("a batch pinned on another GPU is gathered there and comes back in the
     expected_strings.push_back(std::to_string(id));
   }
   REQUIRE(read_back_strings(strings->view()) == expected_strings);
+}
+
+TEST_CASE("a remote gather that fails mid-transfer frees nothing a queued copy still reads",
+          "[late_mat][materialize][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  auto mgr     = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto* space0 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* space1 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 1);
+  REQUIRE(space0 != nullptr);
+  REQUIRE(space1 != nullptr);
+
+  // A STRING column, so the transfer back has several allocations in sequence
+  // (the offsets child, then the characters): the failure the test is after is
+  // an allocation that throws AFTER a copy reading an owner buffer was queued.
+  spread_pin pin({{kChunk, space0}, {kChunk, space1}});
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{0}};
+  auto const stream = space0->acquire_stream();
+  auto const layout = pinned_table_layout::from_batch_rows({kChunk, kChunk});
+
+  std::vector<std::uint64_t> const ids{kChunk + 3, 5, kChunk + 1000, kChunk + 3, 0};
+  auto d_ids = upload_ids(ids, stream);
+  prepared_selection const prepared(layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(ids.size()),
+                                                false});
+  std::vector<std::string> expected;
+  for (auto const id : ids) {
+    expected.push_back(std::to_string(id));
+  }
+
+  // How many allocations a clean run makes on the consumer's resource.
+  failing_resource counting{space0->get_default_allocator()};
+  {
+    auto strings =
+      materialize(pin.strings, prepared, stream, rmm::device_async_resource_ref{counting});
+    cudaStreamSynchronize(stream.get());
+    REQUIRE(read_back_strings(strings->view()) == expected);
+  }
+  auto const total = counting.allocations();
+  REQUIRE(total > 0);
+
+  // Fail each of them in turn. Every attempt must either succeed or throw the
+  // injected error, leave both GPUs in a clean state, and leave the pinned
+  // column intact for the next attempt -- a free that raced a queued copy
+  // would show up as a CUDA error at the synchronizations or as wrong values.
+  for (long fail_at = 0; fail_at < total; ++fail_at) {
+    INFO("failing allocation " << fail_at << " of " << total);
+    // Each attempt builds its own selection, so its canonical form is fresh.
+    prepared_selection const attempt(layout,
+                                     row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                 static_cast<std::int64_t>(ids.size()),
+                                                 false});
+    failing_resource failing{space0->get_default_allocator(), fail_at};
+    bool threw = false;
+    try {
+      auto strings =
+        materialize(pin.strings, attempt, stream, rmm::device_async_resource_ref{failing});
+      cudaStreamSynchronize(stream.get());
+      REQUIRE(read_back_strings(strings->view()) == expected);
+    } catch (rmm::out_of_memory const&) {
+      threw = true;
+    }
+    REQUIRE(threw);
+    REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+    {
+      rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{1}};
+      REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    }
+    REQUIRE(cudaGetLastError() == cudaSuccess);
+  }
+
+  // And the pin still reads back whole afterwards.
+  auto strings = materialize(pin.strings, prepared, stream, space0->get_default_allocator());
+  cudaStreamSynchronize(stream.get());
+  REQUIRE(read_back_strings(strings->view()) == expected);
 }

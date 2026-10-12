@@ -288,6 +288,65 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
 /// the copies that read them have been ordered ahead of their frees.
 using retired_buffers = std::vector<std::unique_ptr<rmm::device_buffer>>;
 
+/// What a remote gather allocated on the owning GPU: the gather map and the
+/// gathered column's buffers once they have been handed to the peer copies.
+///
+/// Every buffer here is freed on the OWNER's stream when it dies (rmm frees on
+/// the stream a buffer was allocated on), while the copies that read them run
+/// on the CONSUMER's stream. The destructor orders the frees behind those copies
+/// on every exit path -- a throw mid-transfer, say an OOM allocating a string
+/// column's characters after its offsets were already queued for copying, must
+/// not free a buffer a queued copy is still reading. Everything in it is
+/// no-throw; if the event cannot be recorded or waited on, the consumer's
+/// stream is synchronized outright, which is slower but equally safe.
+class owner_scratch {
+ public:
+  owner_scratch(int owner_device,
+                ::cuda::stream_ref owner_stream,
+                ::cuda::stream_ref consumer_stream)
+    : _owner_device{owner_device}, _owner_stream{owner_stream}, _consumer_stream{consumer_stream}
+  {
+  }
+  ~owner_scratch() { release(); }
+  owner_scratch(owner_scratch const&)            = delete;
+  owner_scratch& operator=(owner_scratch const&) = delete;
+
+  rmm::device_buffer map;   ///< batch-local indices, copied to the owner
+  retired_buffers retired;  ///< the gathered column's buffers, after release()
+
+  /// Free everything, after the consumer's copies. Idempotent.
+  void release() noexcept
+  {
+    if (_released) { return; }
+    _released = true;
+    if (!order_frees_behind_consumer()) { (void)cudaStreamSynchronize(_consumer_stream.get()); }
+    (void)cudaGetLastError();
+    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{_owner_device}};
+    retired.clear();
+    map = rmm::device_buffer{};
+  }
+
+ private:
+  /// Make the owner's stream wait for what the consumer has queued so far.
+  [[nodiscard]] bool order_frees_behind_consumer() const noexcept
+  {
+    cudaEvent_t event{};
+    if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) { return false; }
+    bool ordered = cudaEventRecord(event, _consumer_stream.get()) == cudaSuccess;
+    if (ordered) {
+      rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{_owner_device}};
+      ordered = cudaStreamWaitEvent(_owner_stream.get(), event, 0) == cudaSuccess;
+    }
+    (void)cudaEventDestroy(event);
+    return ordered;
+  }
+
+  int _owner_device;
+  ::cuda::stream_ref _owner_stream;
+  ::cuda::stream_ref _consumer_stream;
+  bool _released = false;
+};
+
 std::unique_ptr<rmm::device_buffer> peer_copy(std::unique_ptr<rmm::device_buffer> source,
                                               int source_device,
                                               int destination_device,
@@ -343,7 +402,8 @@ std::unique_ptr<cudf::column> transfer_column(std::unique_ptr<cudf::column> colu
 /// without is staged through host by the driver. The owner's work runs on a
 /// stream of its own space, ordered behind the consumer's selection build and
 /// ahead of the consumer's copy by events; the owner's temporaries are freed
-/// on that stream only after the copy has been ordered ahead of the free.
+/// on that stream only after the copies have been ordered ahead of the free,
+/// which owner_scratch guarantees on every exit path.
 std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& source,
                                                        batch_selection const& selection,
                                                        int consumer_device,
@@ -367,8 +427,11 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
   cucascade::cuda::cuda_event selection_ready;
   selection_ready.record(stream);
 
+  // Declared before `gathered` so the gathered column's buffers that were NOT
+  // yet handed over (a throw mid-transfer) are freed first, then the scratch
+  // orders the rest behind the consumer's copies.
+  owner_scratch scratch{owner_device, owner_stream, stream};
   std::unique_ptr<cudf::column> gathered;
-  rmm::device_buffer owner_map;
   std::optional<cucascade::cuda::cuda_event> gathered_ready;
   {
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{owner_device}};
@@ -377,35 +440,24 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
       gathered = std::make_unique<cudf::column>(source.uncompressed, owner_stream, owner_mr);
     } else {
       auto const map_bytes = static_cast<std::size_t>(selection.survivors) * sizeof(std::int32_t);
-      owner_map            = rmm::device_buffer(map_bytes, owner_stream, owner_mr);
-      CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(owner_map.data(),
+      scratch.map          = rmm::device_buffer(map_bytes, owner_stream, owner_mr);
+      CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(scratch.map.data(),
                                              owner_device,
                                              selection.local_indices.data(),
                                              consumer_device,
                                              map_bytes,
                                              owner_stream.get()));
       gathered = gather_one(
-        source.uncompressed, int32_map(owner_map, selection.survivors), owner_stream, owner_mr);
+        source.uncompressed, int32_map(scratch.map, selection.survivors), owner_stream, owner_mr);
     }
     gathered_ready.emplace();
     gathered_ready->record(owner_stream);
   }
 
   gathered_ready->wait(stream);
-  retired_buffers retire;
-  auto local =
-    transfer_column(std::move(gathered), owner_device, consumer_device, stream, mr, retire);
-
-  // Everything the owner allocated is freed on the owner's stream as it goes
-  // out of scope; that free has to come after the copies above have read it.
-  cucascade::cuda::cuda_event copied;
-  copied.record(stream);
-  {
-    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{owner_device}};
-    copied.wait(owner_stream);
-    retire.clear();
-    owner_map = rmm::device_buffer{};
-  }
+  auto local = transfer_column(
+    std::move(gathered), owner_device, consumer_device, stream, mr, scratch.retired);
+  scratch.release();
   return local;
 }
 
