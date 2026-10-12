@@ -105,7 +105,10 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
       if (exec_result == duckdb::QueryResultState::BLOCKED) { executor.WaitForTask(); }
     }
     if (executor.HasError()) { executor.ThrowException(); }
-    auto result                   = executor.GetResult();
+    auto result = executor.GetResult();
+    // Pipeline completion precedes task destruction. Drain workers before the
+    // private executor can be released, as DuckDB does in query cleanup.
+    executor.CancelTasks();
     client_config.enable_profiler = saved_enable_profiler;
     return result;
   } catch (...) {
