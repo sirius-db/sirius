@@ -728,10 +728,8 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
            it->second.begin(), it->second.end(), [](auto const& col) { return col != nullptr; });
 }
 
-/// Whether every chunk of a GPU-tier pin records the memory space it lives in.
-/// A consumer on another GPU reaches a chunk through that record
-/// (late_mat::materialize gathers it there and peer-copies the rows), so on
-/// more than one GPU a chunk without one cannot be deferred.
+/// Whether every chunk of a GPU-tier pin records the memory space it lives in,
+/// which is how a consumer on another GPU reaches it.
 [[nodiscard]] bool pinned_chunks_have_placement(pinned_entry const& entry)
 {
   if (!entry.device_chunks.empty()) {
@@ -896,26 +894,19 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   if (entry.tier != cucascade::memory::Tier::GPU) {
     return decline("the pinned entry is not device-resident");
   }
+  bool const has_compressed_chunk =
+    std::any_of(entry.device_chunks.begin(), entry.device_chunks.end(), [](auto const& chunk) {
+      return chunk.compressed != nullptr;
+    });
   if (gpu_space_count > 1) {
-    // A pin is spread round-robin over the GPUs, and the port may run on any of
-    // them. A chunk on another GPU than the consumer is gathered where it lives
-    // and only the surviving rows cross (late_mat::materialize), which needs the
-    // chunk's placement on record and an uncompressed chunk: a compressed one
-    // decodes on the GPU that holds it, against a selection that lives on the
-    // consumer's.
+    // A chunk on another GPU than the consumer is gathered where it lives
+    // (late_mat::materialize), which needs its placement on record. A compressed
+    // chunk decodes only on the GPU that holds it.
     if (!pinned_chunks_have_placement(entry)) {
-      return decline(
-        "the pin spans more than one GPU and a chunk's placement is not recorded, so a consumer "
-        "on another GPU could not reach it");
+      return decline("the pin spans more than one GPU and a chunk's placement is not recorded");
     }
-    bool const compressed_chunks =
-      std::any_of(entry.device_chunks.begin(), entry.device_chunks.end(), [](auto const& chunk) {
-        return chunk.compressed != nullptr;
-      });
-    if (compressed_chunks) {
-      return decline(
-        "the pin spans more than one GPU and holds compressed chunks, which decode only on the "
-        "GPU that holds them");
+    if (has_compressed_chunk) {
+      return decline("the pin spans more than one GPU and holds compressed chunks");
     }
   }
   if (!serves_whole_chunks) {
@@ -928,11 +919,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
     // served chunk. A COMPRESSED chunk is filtered inside the fused decode
     // instead, and those survivors never reach the scan's output path, so a
     // pin with any compressed chunk is refused rather than guessed at.
-    bool const compressed_chunks =
-      std::any_of(entry.device_chunks.begin(), entry.device_chunks.end(), [](auto const& chunk) {
-        return chunk.compressed != nullptr;
-      });
-    if (compressed_chunks) {
+    if (has_compressed_chunk) {
       return decline(
         "the scan restricts rows and its pin is compressed, so the surviving rows are decided "
         "inside the decode");
@@ -956,12 +943,8 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   // alone once the scan can skip decoding what it replaces with a rowid, so it
   // gets its own floor. The two are the same number until someone measures the
   // difference (SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED).
-  bool const compressed_origin =
-    std::any_of(entry.device_chunks.begin(), entry.device_chunks.end(), [](auto const& chunk) {
-      return chunk.compressed != nullptr;
-    });
   late_mat::defer_policy policy;
-  if (compressed_origin) {
+  if (has_compressed_chunk) {
     policy.min_value_bytes = late_mat::min_value_bytes_compressed(policy.min_value_bytes);
   }
   auto const planned = sirius::planner::plan_deferral(scan_op, policy);
@@ -1811,9 +1794,6 @@ void sirius_scan_manager::prepare_for_query(
   // The rides that DID install, so a rider can be argued against the scan that
   // owns the port it would join.
   std::vector<installed_ride> installed_rides;
-  // On more than one GPU a pin's chunks are spread round-robin and the port may
-  // run on any GPU; install_late_materialization checks what a cross-GPU gather
-  // needs (every chunk's placement on record, no compressed chunk).
   auto const gpu_space_count =
     _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size();
   for (auto& assignment : cached_assignments) {

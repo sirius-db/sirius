@@ -288,21 +288,15 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
 /// the copies that read them have been ordered ahead of their frees.
 using retired_buffers = std::vector<std::unique_ptr<rmm::device_buffer>>;
 
-/// What a remote gather allocated on the owning GPU: the gather map and the
-/// gathered column's buffers once they have been handed to the peer copies.
+/// What a remote gather allocated on the owning GPU: the gather map and, once
+/// handed to the peer copies, the gathered column's buffers.
 ///
-/// Two streams read each other's memory here. The owner's stream copies the
-/// consumer's selection indices over and gathers; the consumer's stream copies
-/// the gathered buffers back. rmm frees a buffer on the stream it was allocated
-/// on, so on every exit path each stream must be ordered behind the other's
-/// outstanding reads before anything is freed: a throw in the owner's gather
-/// must not let the consumer free `local_indices` while the owner's index copy
-/// still reads it, and a throw mid-transfer (an OOM allocating a string
-/// column's characters after its offsets were queued for copying) must not let
-/// the owner free a buffer the consumer's copy still reads. The destructor
-/// orders both directions, then frees. Everything in it is no-throw; where an
-/// event cannot be recorded or waited on, the stream being waited for is
-/// synchronized outright, which is slower but equally safe.
+/// The owner's stream reads the consumer's selection indices; the consumer's
+/// stream reads the owner's gathered buffers; rmm frees each buffer on the
+/// stream it was allocated on. So before anything is freed, on every exit path
+/// including a throw mid-way, each stream is ordered behind the other's queued
+/// reads. All no-throw; if an event fails, the stream waited for is
+/// synchronized instead.
 class owner_scratch {
  public:
   owner_scratch(int owner_device,
@@ -322,9 +316,7 @@ class owner_scratch {
   rmm::device_buffer map;   ///< batch-local indices, copied to the owner
   retired_buffers retired;  ///< the gathered column's buffers, after release()
 
-  /// Order each stream behind the other's queued work, then free the owner's
-  /// buffers. Idempotent. The consumer's own buffers (the selection) are freed
-  /// by their owners later, on the consumer stream, which this has made wait.
+  /// Order each stream behind the other, then free the owner's buffers. Idempotent.
   void release() noexcept
   {
     if (_released) { return; }
@@ -345,8 +337,7 @@ class owner_scratch {
   }
 
  private:
-  /// Make `waiter` wait for everything `producer` has queued so far. The event
-  /// is created on the producer's device, which is where it is recorded.
+  /// Make `waiter` wait for everything `producer` has queued so far.
   [[nodiscard]] static bool order(::cuda::stream_ref producer,
                                   int producer_device,
                                   ::cuda::stream_ref waiter,
@@ -427,10 +418,8 @@ std::unique_ptr<cudf::column> transfer_column(std::unique_ptr<cudf::column> colu
 /// the batch-local indices go to the owner, the gathered rows come back. Both
 /// are cudaMemcpyPeerAsync, so a pair with working peer DMA takes it and a pair
 /// without is staged through host by the driver. The owner's work runs on a
-/// stream of its own space, ordered behind the consumer's selection build and
-/// ahead of the consumer's copy by events; the owner's temporaries are freed
-/// on that stream only after the copies have been ordered ahead of the free,
-/// which owner_scratch guarantees on every exit path.
+/// stream of its own space, ordered by events behind the consumer's selection
+/// build and ahead of the consumer's copy.
 std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& source,
                                                        batch_selection const& selection,
                                                        int consumer_device,
@@ -448,17 +437,12 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
   auto const owner_stream = owner.acquire_stream();
   auto const owner_mr     = owner.get_default_allocator();
 
-  // The selection was built on the consumer's stream; the owner follows it. An
-  // event belongs to the device current when it is created, so the consumer's
-  // are created outside the owner guard and the owner's inside it.
+  // An event belongs to the device current when it is created: the consumer's
+  // outside the owner guard, the owner's inside it.
   cucascade::cuda::cuda_event selection_ready;
   selection_ready.record(stream);
 
-  // Declared before `gathered` so the gathered column's buffers that were NOT
-  // yet handed over (a throw mid-transfer) are freed first, then the scratch
-  // orders the two streams behind each other and frees the rest. `selection`
-  // belongs to the caller and is freed after this returns or unwinds, on a
-  // consumer stream that by then waits for the owner's index copy.
+  // Outlives `gathered`, so buffers not yet handed over are freed first.
   owner_scratch scratch{owner_device, owner_stream, consumer_device, stream};
   std::unique_ptr<cudf::column> gathered;
   std::optional<cucascade::cuda::cuda_event> gathered_ready;
