@@ -25,6 +25,7 @@
 #include <catch.hpp>
 #include <op/scan/scan_plan.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -238,5 +239,92 @@ TEST_CASE("scan output assembly routing recognizes pass-through and rebuild layo
       {1, "part", sirius::logical_type::make(sirius::type_id::INTEGER)});
     plan.output_layout = {{scan::scan_plan::output_entry::PARTITION, 0}};
     CHECK(scan::needs_output_assembly(plan));
+  }
+}
+
+TEST_CASE("scan output prefix width and leading prefix follow the output layout",
+          "[scan][parquet][assembly][routing]")
+{
+  scan::scan_plan plan;
+
+  SECTION("identity with a trailing pure-filter column reads a leading prefix")
+  {
+    plan.data_columns  = {data_column(0), data_column(1), data_column(2)};
+    plan.output_layout = {{scan::scan_plan::output_entry::DATA, 0},
+                          {scan::scan_plan::output_entry::DATA, 1}};
+    CHECK(scan::output_prefix_width(plan) == std::size_t{2});
+    CHECK(scan::output_is_leading_prefix(plan));
+  }
+
+  SECTION("plain identity reads every column as its prefix")
+  {
+    plan.data_columns  = {data_column(0), data_column(1)};
+    plan.output_layout = {{scan::scan_plan::output_entry::DATA, 0},
+                          {scan::scan_plan::output_entry::DATA, 1}};
+    CHECK(scan::output_prefix_width(plan) == std::size_t{2});
+    CHECK(scan::output_is_leading_prefix(plan));
+  }
+
+  SECTION("reordered output is not a leading prefix")
+  {
+    plan.data_columns  = {data_column(0), data_column(1), data_column(2)};
+    plan.output_layout = {{scan::scan_plan::output_entry::DATA, 1},
+                          {scan::scan_plan::output_entry::DATA, 0}};
+    CHECK(scan::output_prefix_width(plan) == std::size_t{2});
+    CHECK_FALSE(scan::output_is_leading_prefix(plan));
+  }
+
+  SECTION("duplicate output reads one column but is not a leading prefix")
+  {
+    plan.data_columns  = {data_column(0), data_column(1)};
+    plan.output_layout = {{scan::scan_plan::output_entry::DATA, 0},
+                          {scan::scan_plan::output_entry::DATA, 0}};
+    CHECK(scan::output_prefix_width(plan) == std::size_t{1});
+    CHECK_FALSE(scan::output_is_leading_prefix(plan));
+  }
+
+  SECTION("a synthesized virtual output column is not a leading prefix")
+  {
+    // DATA(1) sits past the one reader column: it is the first virtual column, which only the
+    // assembly synthesizes.
+    plan.data_columns = {data_column(0)};
+    plan.virtual_columns.push_back({duckdb::column_t{1},
+                                    "filename",
+                                    sirius::logical_type::make(sirius::type_id::VARCHAR),
+                                    scan::scan_plan::parquet_virtual_column_kind::FILENAME,
+                                    1});
+    plan.output_layout = {{scan::scan_plan::output_entry::DATA, 0},
+                          {scan::scan_plan::output_entry::DATA, 1}};
+    CHECK(scan::output_prefix_width(plan) == std::size_t{2});
+    CHECK_FALSE(scan::output_is_leading_prefix(plan));
+  }
+
+  SECTION("a partition output is not a leading prefix")
+  {
+    plan.data_columns = {data_column(0), data_column(1)};
+    plan.partition_columns.push_back(
+      {2, "part", sirius::logical_type::make(sirius::type_id::INTEGER)});
+    plan.output_layout = {{scan::scan_plan::output_entry::DATA, 0},
+                          {scan::scan_plan::output_entry::PARTITION, 0}};
+    CHECK(scan::output_prefix_width(plan) == std::size_t{1});
+    CHECK_FALSE(scan::output_is_leading_prefix(plan));
+  }
+
+  SECTION("an empty layout over a row-count carrier reads no column")
+  {
+    plan.data_columns        = {data_column(0)};
+    plan.carrier_batch_index = 0;
+    CHECK_FALSE(scan::output_prefix_width(plan).has_value());
+    CHECK_FALSE(scan::output_is_leading_prefix(plan));
+  }
+
+  SECTION("a partition-only output reads no column")
+  {
+    plan.data_columns = {data_column(0)};
+    plan.partition_columns.push_back(
+      {1, "part", sirius::logical_type::make(sirius::type_id::INTEGER)});
+    plan.output_layout = {{scan::scan_plan::output_entry::PARTITION, 0}};
+    CHECK_FALSE(scan::output_prefix_width(plan).has_value());
+    CHECK_FALSE(scan::output_is_leading_prefix(plan));
   }
 }
