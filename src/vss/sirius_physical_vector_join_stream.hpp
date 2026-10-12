@@ -296,6 +296,12 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// the pinned path. Caller holds _op_mutex.
   bool build_side_ready_locked();
 
+  /// Read the corpus's `earlier_by` column onto the device on first use, as INT64 per pin row
+  /// and, over lists, per layout row. Deferred out of init for the reason the cluster index is.
+  void ensure_earlier_keys(::cucascade::memory::memory_space& space,
+                           rmm::cuda_stream_view stream,
+                           rmm::device_async_resource_ref mr);
+
   /// Peak bytes for one left batch's task: the accumulator, the partial being folded
   /// in, and the stacked pair the merge reads. Independent of the right batch count,
   /// which is the point of the fold.
@@ -327,6 +333,19 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// The pinned corpus, when there is one: where pushed-down corpus predicates read their
   /// columns. Null on the build path.
   std::shared_ptr<const sirius::scan_manager::pinned_entry> _right_pin;
+  /// The pinned probe table, when there is one: where a task reads its rows' `earlier_by` keys.
+  std::shared_ptr<const sirius::scan_manager::pinned_entry> _left_pin;
+  /// The corpus's `earlier_by` keys, INT64, by pin row and (lists only) by layout row. Shared by
+  /// every task and read-only once built.
+  std::unique_ptr<rmm::device_buffer> _corpus_key;
+  std::unique_ptr<rmm::device_buffer> _layout_key;
+  /// The layout keys on the host, kept only when they ascend within every list (a corpus stored
+  /// in key order): a task then searches just the head of each list, the rows whose key is below
+  /// its largest probe key, which for a self-join is half the pairs.
+  std::vector<std::int64_t> _layout_key_host;
+  /// `rowid` keys only: the first pin row of each probe chunk, and the row count after the last.
+  std::vector<std::int64_t> _probe_row_base;
+  bool _earlier_keys_built{false};
   /// Session state: the clustered path reports its prune statistics to it, and a streamed build
   /// side asks its downgrade executor for room. Outlives the query.
   duckdb::SiriusContext* _sirius_ctx{nullptr};

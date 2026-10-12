@@ -2736,8 +2736,9 @@ std::size_t push_count_into_vector_joins(LogicalOperator& plan)
   auto* bind = dynamic_cast<SiriusVectorJoinBindData*>(get.bind_data.get());
   // A filter the planner pushed into the join would be applied to pairs that no longer exist,
   // so any table filter keeps the pairs.
+  // A best-match join emits one pair per probe row; counting its pairs would count the others.
   if (bind == nullptr || bind->req.mode != vector_join_mode::threshold || bind->req.count_only ||
-      !get.table_filters.filters.empty()) {
+      bind->req.best_only || !get.table_filters.filters.empty()) {
     return n;
   }
   if (slot != &plan.children[0]) { plan.children[0] = std::move(*slot); }

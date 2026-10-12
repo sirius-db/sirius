@@ -1602,3 +1602,205 @@ TEST_CASE_METHOD(KMeansFixture,
     }
   }
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a best-match threshold join keeps each row's nearest pair within the radius",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists][best_match]")
+{
+  // keep => 'best' folds a threshold join's pairs into one per probe row inside the operator, and
+  // earlier_by / other_by restrict them to corpus rows with a smaller / a different key. Over
+  // float16 lists only the pairs that can still be a row's nearest are re-scored. Whatever the
+  // path, the answer must be what SQL computes from the plain threshold join's pairs: the same
+  // rows, the same smallest distance, and a partner that is one of the row's pairs at it.
+  auto const bytes   = GENERATE(true, false);
+  auto const earlier = GENERATE(true, false);
+  auto const prefix  = std::string(bytes ? "kmb_u8" : "kmb_f16") + (earlier ? "_lt" : "_ne");
+  create_lists_tables(*this, prefix, bytes ? "gpu" : "host", bytes);
+  auto const table = prefix + "_corpus";
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + table + "','vec', name => '" + prefix +
+         "_c', n_clusters => 16);");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('" + table + "','vec','" + prefix +
+         "_c', storage => '" + (bytes ? "uint8" : "float16") + "');");
+
+  // A self-join. A radius at the median distance to the 3rd nearest row (the row itself is the
+  // 1st): about half the rows have a pair besides themselves, and a few have several.
+  std::vector<double> third;
+  for (auto const& r :
+       ok_rows(*con,
+               "SELECT max(distance) FROM sirius_knn_join('" + table + "','vec','" + table +
+                 "','vec', metric => 'l2', k => 3, search_mode => 'exact-gemm') "
+                 "GROUP BY left_id;")) {
+    third.push_back(std::stod(r.at(0)));
+  }
+  std::sort(third.begin(), third.end());
+  auto const eps  = third.at(third.size() / 2);
+  auto const join = "sirius_knn_join('" + table + "','vec','" + table +
+                    "','vec', metric => 'l2', join_mode => 'threshold', eps => " +
+                    std::to_string(eps) + ", ";
+  auto const on_radius = [&](double d) { return std::abs(d - eps) <= 1e-4 * eps; };
+  auto const close = [](double a, double b) { return std::abs(a - b) <= 1e-5 * std::max(1.0, b); };
+
+  auto const sql_filter =
+    std::string(earlier ? "WHERE right_id < left_id" : "WHERE right_id <> left_id");
+  auto const key = std::string(earlier ? "earlier_by => 'id'" : "other_by => 'id'");
+
+  // The oracle: every pair of the exact threshold join that the filter keeps.
+  std::map<std::pair<std::string, std::string>, double> pairs;
+  std::map<std::string, double> nearest;
+  for (auto const& r : ok_rows(*con,
+                               "SELECT left_id, right_id, distance FROM " + join +
+                                 "search_mode => 'exact-gemm') " + sql_filter + ";")) {
+    auto const d              = std::stod(r.at(2));
+    pairs[{r.at(0), r.at(1)}] = d;
+    auto const it             = nearest.find(r.at(0));
+    if (it == nearest.end() || d < it->second) { nearest[r.at(0)] = d; }
+  }
+  REQUIRE(nearest.size() > 1000);
+  REQUIRE(pairs.size() > nearest.size());
+
+  for (auto const& search :
+       {std::string("search_mode => 'exact-gemm'"),
+        "search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 16"}) {
+    auto const best = ok_rows(*con,
+                              "SELECT left_id, right_id, distance FROM " + join + search +
+                                ", keep => 'best', " + key + ");");
+    std::set<std::string> seen;
+    for (auto const& r : best) {
+      CHECK(seen.insert(r.at(0)).second);  // one pair per probe row
+      auto const d  = std::stod(r.at(2));
+      auto const it = nearest.find(r.at(0));
+      if (it == nearest.end()) {
+        CHECK(on_radius(d));
+        continue;
+      }
+      CHECK(close(d, it->second));
+      auto const pair = pairs.find({r.at(0), r.at(1)});
+      if (pair == pairs.end()) {
+        CHECK(on_radius(d));
+      } else {
+        CHECK(close(pair->second, it->second));
+      }
+    }
+    for (auto const& [left, d] : nearest) {
+      if (seen.count(left) == 0) { CHECK(on_radius(d)); }
+    }
+    // count(*) counts the rows this join emits, not the pairs it folded.
+    CHECK(scalar_i64(*con,
+                     "SELECT count(*) FROM " + join + search + ", keep => 'best', " + key + ");") ==
+          static_cast<std::int64_t>(best.size()));
+
+    // Without keep => 'best' the same keys keep every pair the SQL filter keeps: each pair of
+    // the self-join once under earlier_by, every pair but a row with itself under other_by. The
+    // table is stored in id order, so its row positions (`rowid`) order it the same way.
+    for (auto const& by :
+         {key, std::string(earlier ? "earlier_by => 'rowid'" : "other_by => 'rowid'")}) {
+      std::size_t found = 0;
+      auto const kept   = ok_rows(
+        *con, "SELECT left_id, right_id, distance FROM " + join + search + ", " + by + ");");
+      for (auto const& r : kept) {
+        auto const d    = std::stod(r.at(2));
+        auto const pair = pairs.find({r.at(0), r.at(1)});
+        if (pair == pairs.end()) {
+          CHECK(on_radius(d));
+          continue;
+        }
+        ++found;
+        CHECK(close(d, pair->second));
+      }
+      // Whatever the oracle has and this does not sits on the radius, a handful at most.
+      CHECK(found + 10 >= pairs.size());
+      CHECK(kept.size() <= pairs.size() + 10);
+      // Counted inside the join, where the keys still apply.
+      CHECK(scalar_i64(*con, "SELECT count(*) FROM " + join + search + ", " + by + ");") ==
+            static_cast<std::int64_t>(kept.size()));
+    }
+  }
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a best-match join refuses what it cannot answer",
+                 "[integration][gpu_execution][array][vss][kmeans][best_match]")
+{
+  create_two_group_table(*this, "kmb_err");
+  auto const join = std::string("SELECT * FROM sirius_knn_join('kmb_err','vec','kmb_err','vec', ");
+  expect_error(*con, join + "k => 2, keep => 'best');", "applies to a threshold join");
+  expect_error(*con, join + "k => 2, earlier_by => 'id');", "apply to a threshold join");
+  create_two_group_table(*this, "kmb_err2");
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('kmb_err','vec','kmb_err2','vec', eps => 1.0, "
+               "earlier_by => 'rowid');",
+               "orders a self-join by row position");
+  expect_error(
+    *con, join + "eps => 1.0, keep => 'best', earlier_by => 'nope');", "is not a pinned column");
+  expect_error(*con,
+               join + "eps => 1.0, keep => 'best', earlier_by => 'id', other_by => 'id');",
+               "give one of earlier_by and other_by");
+  expect_error(*con, join + "eps => 1.0, keep => 'first');", "keep must be 'all' or 'best'");
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a keyed threshold self-join orders rows across the pin's chunks",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists][best_match]")
+{
+  // 260,000 rows are three chunks of a host-tier pin. A probe task's keys are its own chunk's:
+  // the `id` column's chunk, or for `rowid` the chunk's first row, which has to be the pin's
+  // exact count of the rows before it. Either way each pair of the self-join comes out once,
+  // exactly the pairs SQL keeps with right_id < left_id.
+  run_ok(
+    "CREATE TABLE kmb_big AS SELECT i::BIGINT AS id, list_transform(range(32), lambda d: "
+    "((hash(i * 1000 + d) % 1000)::FLOAT / 1000.0))::FLOAT[32] AS vec FROM range(260000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'kmb_big', tier => 'host', format => 'duckdb');");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_fit('kmb_big','vec', name => 'kmb_big_c', n_clusters => 16);");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('kmb_big','vec','kmb_big_c', "
+    "storage => 'float16');");
+
+  // A radius that a tenth of the rows have another row within.
+  std::vector<double> nearest_other;
+  for (auto const& r :
+       ok_rows(*con,
+               "SELECT max(distance) FROM sirius_knn_join('kmb_big','vec','kmb_big','vec', "
+               "metric => 'l2', k => 2, search_mode => 'approx', clustering => 'kmb_big_c', "
+               "n_probes => 16) GROUP BY left_id;")) {
+    nearest_other.push_back(std::stod(r.at(0)));
+  }
+  REQUIRE(nearest_other.size() == 260000);
+  std::sort(nearest_other.begin(), nearest_other.end());
+  auto const eps = nearest_other.at(nearest_other.size() / 10);
+  auto const join =
+    "sirius_knn_join('kmb_big','vec','kmb_big','vec', metric => 'l2', "
+    "search_mode => 'approx', clustering => 'kmb_big_c', n_probes => 16, "
+    "join_mode => 'threshold', eps => " +
+    std::to_string(eps);
+  auto const fetch = [&](const std::string& sql) {
+    std::set<std::pair<std::string, std::string>> out;
+    for (auto const& r : ok_rows(*con, sql)) {
+      out.emplace(r.at(0), r.at(1));
+    }
+    return out;
+  };
+  auto const oracle =
+    fetch("SELECT left_id, right_id FROM " + join + ") WHERE right_id < left_id;");
+  REQUIRE(oracle.size() > 10000);
+  for (auto const& by : {std::string("id"), std::string("rowid")}) {
+    auto const once =
+      fetch("SELECT left_id, right_id FROM " + join + ", earlier_by => '" + by + "');");
+    CHECK(once == oracle);
+    CHECK(scalar_i64(*con, "SELECT count(*) FROM " + join + ", earlier_by => '" + by + "');") ==
+          static_cast<std::int64_t>(oracle.size()));
+    // And the best of them per row is a row's pair with the smallest distance.
+    auto const best = ok_rows(
+      *con,
+      "SELECT left_id, right_id FROM " + join + ", keep => 'best', earlier_by => '" + by + "');");
+    std::set<std::string> lefts;
+    for (auto const& pair : oracle) {
+      lefts.insert(pair.first);
+    }
+    CHECK(best.size() == lefts.size());
+    for (auto const& r : best) {
+      CHECK(oracle.count({r.at(0), r.at(1)}) == 1);
+    }
+  }
+}

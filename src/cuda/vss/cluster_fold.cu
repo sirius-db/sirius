@@ -19,6 +19,11 @@
 
 #include <cudf/utilities/error.hpp>
 
+#include <rmm/device_buffer.hpp>
+
+#include <cub/device/device_select.cuh>
+#include <thrust/iterator/counting_iterator.h>
+
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -716,6 +721,382 @@ void remap_radius_edges(int64_t const* query_rows,
   remap_radius_edges_kernel<<<grid, kBlock, 0, stream.value()>>>(
     query_rows, rows, left, neighbors, n_edges, id_base, id_map);
   CUDF_CHECK_CUDA(stream.value());
+}
+
+namespace {
+
+constexpr unsigned int kNoMatchOrder = 0xFFFFFFFFu;  // sorts after every distance a pair can have
+constexpr int64_t kNoMatchId         = INT64_MAX;
+
+__device__ __forceinline__ float from_ordered_bits(unsigned int u)
+{
+  return __uint_as_float((u & 0x80000000u) != 0 ? (u & 0x7FFFFFFFu) : ~u);
+}
+
+__device__ __forceinline__ bool best_match_counts(int32_t row,
+                                                  int64_t id,
+                                                  float distance,
+                                                  float max_distance,
+                                                  float const* limit,
+                                                  earlier_keys const& keys)
+{
+  if (!(distance <= max_distance)) { return false; }
+  if (limit != nullptr && !(distance <= limit[row])) { return false; }
+  if (keys.probe == nullptr) { return true; }
+  auto const corpus_key = keys.corpus != nullptr ? keys.corpus[id] : id;
+  return keys.differ ? corpus_key != keys.probe[row] : corpus_key < keys.probe[row];
+}
+
+__global__ void best_match_reset_kernel(unsigned int* order, int64_t* ids, int64_t n)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    order[i] = kNoMatchOrder;
+    ids[i]   = kNoMatchId;
+  }
+}
+
+__global__ void best_match_min_kernel(int32_t const* rows,
+                                      int64_t const* ids,
+                                      float const* distances,
+                                      int64_t n,
+                                      float max_distance,
+                                      float const* limit,
+                                      earlier_keys keys,
+                                      unsigned int* order)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const r = rows[i];
+    if (best_match_counts(r, ids[i], distances[i], max_distance, limit, keys)) {
+      atomicMin(order + r, ordered_bits(distances[i]));
+    }
+  }
+}
+
+// Among a row's pairs at its smallest distance, the smallest id (or buffer index) wins, so the
+// answer does not depend on the order the threads run in.
+__global__ void best_match_pick_kernel(int32_t const* rows,
+                                       int64_t const* ids,
+                                       float const* distances,
+                                       int64_t n,
+                                       float max_distance,
+                                       float const* limit,
+                                       earlier_keys keys,
+                                       unsigned int const* order,
+                                       long long* best,
+                                       bool by_index)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const r = rows[i];
+    if (best_match_counts(r, ids[i], distances[i], max_distance, limit, keys) &&
+        ordered_bits(distances[i]) == order[r]) {
+      atomicMin(best + r, static_cast<long long>(by_index ? i : ids[i]));
+    }
+  }
+}
+
+// A row whose best distance just dropped forgets the id it held at the old one.
+__global__ void best_match_settle_kernel(
+  unsigned int const* order, unsigned int const* before, int64_t* ids, float* bound, int64_t n)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    if (order[i] < before[i]) {
+      ids[i] = kNoMatchId;
+      if (bound != nullptr) { bound[i] = fminf(bound[i], from_ordered_bits(order[i])); }
+    }
+  }
+}
+
+struct is_winner {
+  int32_t const* rows;
+  int64_t const* winner;
+  __device__ bool operator()(int64_t i) const { return winner[rows[i]] == i; }
+};
+
+struct is_contender {
+  int32_t const* rows;
+  int64_t const* ids;
+  float const* distances;
+  float const* limit;
+  earlier_keys keys;
+  int64_t const* winner;
+  __device__ bool operator()(int64_t i) const
+  {
+    auto const r = rows[i];
+    return winner[r] != i && best_match_counts(r, ids[i], distances[i], INFINITY, limit, keys);
+  }
+};
+
+struct has_match {
+  int64_t const* ids;
+  __device__ bool operator()(int64_t r) const { return ids[r] != kNoMatchId; }
+};
+
+struct is_kept {
+  int32_t const* rows;
+  int64_t const* ids;
+  float const* distances;
+  float max_distance;
+  earlier_keys keys;
+  __device__ bool operator()(int64_t i) const
+  {
+    return best_match_counts(rows[i], ids[i], distances[i], max_distance, nullptr, keys);
+  }
+};
+
+__global__ void take_pairs_kernel(int64_t const* picked,
+                                  int64_t n,
+                                  int32_t const* rows,
+                                  int64_t const* ids,
+                                  float const* distances,
+                                  int64_t const* id_map,
+                                  bool take_sqrt,
+                                  int32_t* out_rows,
+                                  int64_t* out_ids,
+                                  float* out_distances)
+{
+  for (int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; p < n;
+       p += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const i     = picked[p];
+    out_rows[p]      = rows[i];
+    out_ids[p]       = id_map != nullptr ? id_map[ids[i]] : ids[i];
+    out_distances[p] = take_sqrt ? sqrtf(fmaxf(distances[i], 0.f)) : distances[i];
+  }
+}
+
+__global__ void best_match_emit_kernel(int64_t const* picked,
+                                       int64_t n,
+                                       unsigned int const* order,
+                                       int64_t const* ids,
+                                       int64_t const* id_map,
+                                       bool take_sqrt,
+                                       int32_t* out_rows,
+                                       int64_t* out_ids,
+                                       float* out_distances)
+{
+  for (int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; p < n;
+       p += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const r     = picked[p];
+    auto const d     = from_ordered_bits(order[r]);
+    out_rows[p]      = static_cast<int32_t>(r);
+    out_ids[p]       = id_map != nullptr ? id_map[ids[r]] : ids[r];
+    out_distances[p] = take_sqrt ? sqrtf(fmaxf(d, 0.f)) : d;
+  }
+}
+
+// The indices in [0, n) that @p keep selects, in order, and how many (read back, so this blocks).
+template <typename Keep>
+int64_t select_indices(int64_t n,
+                       Keep keep,
+                       rmm::device_uvector<int64_t>& picked,
+                       rmm::cuda_stream_view stream,
+                       rmm::device_async_resource_ref mr)
+{
+  rmm::device_uvector<int64_t> n_picked(1, stream, mr);
+  thrust::counting_iterator<int64_t> const all(0);
+  std::size_t temp_bytes = 0;
+  CUDF_CUDA_TRY(cub::DeviceSelect::If(
+    nullptr, temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.value()));
+  rmm::device_buffer temp(temp_bytes, stream, mr);
+  CUDF_CUDA_TRY(cub::DeviceSelect::If(
+    temp.data(), temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.value()));
+  int64_t count = 0;
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    &count, n_picked.data(), sizeof(count), cudaMemcpyDeviceToHost, stream.value()));
+  stream.synchronize();
+  return count;
+}
+
+}  // namespace
+
+void best_match_reset(uint32_t* best_order,
+                      int64_t* best_ids,
+                      int64_t n_rows,
+                      rmm::cuda_stream_view stream)
+{
+  if (n_rows == 0) { return; }
+  best_match_reset_kernel<<<grid_for(n_rows), kBlock, 0, stream.value()>>>(
+    best_order, best_ids, n_rows);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void best_match_fold(int32_t const* rows,
+                     int64_t const* ids,
+                     float const* distances,
+                     int64_t n,
+                     float max_distance,
+                     earlier_keys keys,
+                     uint32_t* best_order,
+                     int64_t* best_ids,
+                     uint32_t* scratch,
+                     int64_t n_rows,
+                     float* bound,
+                     rmm::cuda_stream_view stream)
+{
+  if (n == 0 || n_rows == 0) { return; }
+  auto const grid = std::min(grid_for(n), 65535);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(scratch,
+                                best_order,
+                                static_cast<std::size_t>(n_rows) * sizeof(uint32_t),
+                                cudaMemcpyDeviceToDevice,
+                                stream.value()));
+  best_match_min_kernel<<<grid, kBlock, 0, stream.value()>>>(
+    rows, ids, distances, n, max_distance, nullptr, keys, best_order);
+  best_match_settle_kernel<<<grid_for(n_rows), kBlock, 0, stream.value()>>>(
+    best_order, scratch, best_ids, bound, n_rows);
+  best_match_pick_kernel<<<grid, kBlock, 0, stream.value()>>>(
+    rows,
+    ids,
+    distances,
+    n,
+    max_distance,
+    nullptr,
+    keys,
+    best_order,
+    reinterpret_cast<long long*>(best_ids),
+    false);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void best_match_winners(int32_t const* rows,
+                        int64_t const* ids,
+                        float const* distances,
+                        int64_t n,
+                        earlier_keys keys,
+                        float const* limit,
+                        uint32_t* scratch,
+                        int64_t* winner,
+                        int64_t n_rows,
+                        rmm::cuda_stream_view stream)
+{
+  if (n_rows == 0) { return; }
+  best_match_reset_kernel<<<grid_for(n_rows), kBlock, 0, stream.value()>>>(scratch, winner, n_rows);
+  if (n > 0) {
+    auto const grid = std::min(grid_for(n), 65535);
+    best_match_min_kernel<<<grid, kBlock, 0, stream.value()>>>(
+      rows, ids, distances, n, INFINITY, limit, keys, scratch);
+    best_match_pick_kernel<<<grid, kBlock, 0, stream.value()>>>(
+      rows,
+      ids,
+      distances,
+      n,
+      INFINITY,
+      limit,
+      keys,
+      scratch,
+      reinterpret_cast<long long*>(winner),
+      true);
+  }
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+kept_pairs best_match_take(int32_t const* rows,
+                           int64_t const* ids,
+                           float const* distances,
+                           int64_t n,
+                           earlier_keys keys,
+                           float const* limit,
+                           int64_t const* winner,
+                           bool winners,
+                           rmm::cuda_stream_view stream,
+                           rmm::device_async_resource_ref mr)
+{
+  kept_pairs out{rmm::device_uvector<int32_t>(0, stream, mr),
+                 rmm::device_uvector<int64_t>(0, stream, mr),
+                 rmm::device_uvector<float>(0, stream, mr)};
+  if (n == 0) { return out; }
+  rmm::device_uvector<int64_t> picked(n, stream, mr);
+  auto const count =
+    winners ? select_indices(n, is_winner{rows, winner}, picked, stream, mr)
+            : select_indices(
+                n, is_contender{rows, ids, distances, limit, keys, winner}, picked, stream, mr);
+  if (count == 0) { return out; }
+  out.rows.resize(count, stream);
+  out.ids.resize(count, stream);
+  out.distances.resize(count, stream);
+  take_pairs_kernel<<<grid_for(count), kBlock, 0, stream.value()>>>(picked.data(),
+                                                                    count,
+                                                                    rows,
+                                                                    ids,
+                                                                    distances,
+                                                                    nullptr,
+                                                                    false,
+                                                                    out.rows.data(),
+                                                                    out.ids.data(),
+                                                                    out.distances.data());
+  CUDF_CHECK_CUDA(stream.value());
+  // `picked` is freed on return; the gather that reads it is ordered before that on this stream.
+  return out;
+}
+
+kept_pairs take_pairs(int32_t const* rows,
+                      int64_t const* ids,
+                      float const* distances,
+                      int64_t n,
+                      earlier_keys keys,
+                      float max_distance,
+                      int64_t const* id_map,
+                      bool take_sqrt,
+                      rmm::cuda_stream_view stream,
+                      rmm::device_async_resource_ref mr)
+{
+  kept_pairs out{rmm::device_uvector<int32_t>(0, stream, mr),
+                 rmm::device_uvector<int64_t>(0, stream, mr),
+                 rmm::device_uvector<float>(0, stream, mr)};
+  if (n == 0) { return out; }
+  rmm::device_uvector<int64_t> picked(n, stream, mr);
+  auto const count =
+    select_indices(n, is_kept{rows, ids, distances, max_distance, keys}, picked, stream, mr);
+  if (count == 0) { return out; }
+  out.rows.resize(count, stream);
+  out.ids.resize(count, stream);
+  out.distances.resize(count, stream);
+  take_pairs_kernel<<<grid_for(count), kBlock, 0, stream.value()>>>(picked.data(),
+                                                                    count,
+                                                                    rows,
+                                                                    ids,
+                                                                    distances,
+                                                                    id_map,
+                                                                    take_sqrt,
+                                                                    out.rows.data(),
+                                                                    out.ids.data(),
+                                                                    out.distances.data());
+  CUDF_CHECK_CUDA(stream.value());
+  return out;
+}
+
+kept_pairs best_match_emit(uint32_t const* best_order,
+                           int64_t const* best_ids,
+                           int64_t n_rows,
+                           int64_t const* id_map,
+                           bool take_sqrt,
+                           rmm::cuda_stream_view stream,
+                           rmm::device_async_resource_ref mr)
+{
+  kept_pairs out{rmm::device_uvector<int32_t>(0, stream, mr),
+                 rmm::device_uvector<int64_t>(0, stream, mr),
+                 rmm::device_uvector<float>(0, stream, mr)};
+  if (n_rows == 0) { return out; }
+  rmm::device_uvector<int64_t> picked(n_rows, stream, mr);
+  auto const count = select_indices(n_rows, has_match{best_ids}, picked, stream, mr);
+  if (count == 0) { return out; }
+  out.rows.resize(count, stream);
+  out.ids.resize(count, stream);
+  out.distances.resize(count, stream);
+  best_match_emit_kernel<<<grid_for(count), kBlock, 0, stream.value()>>>(picked.data(),
+                                                                         count,
+                                                                         best_order,
+                                                                         best_ids,
+                                                                         id_map,
+                                                                         take_sqrt,
+                                                                         out.rows.data(),
+                                                                         out.ids.data(),
+                                                                         out.distances.data());
+  CUDF_CHECK_CUDA(stream.value());
+  return out;
 }
 
 }  // namespace sirius::vss

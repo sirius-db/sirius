@@ -351,9 +351,13 @@ void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
   serializer.WriteProperty(135, "predicate_values", pred_values);
   serializer.WriteProperty(136, "probe_scalar", req.probe_scalar);
   serializer.WriteProperty(137, "count_only", req.count_only);
+  serializer.WriteProperty(138, "best_only", req.best_only);
+  serializer.WriteProperty(139, "earlier_by", req.earlier_by);
   serializer.WriteProperty(140, "left_rows", data.left_rows);
   serializer.WriteProperty(141, "right_rows", data.right_rows);
   serializer.WriteProperty(142, "probe_is_relation", data.probe_is_relation);
+  serializer.WriteProperty(143, "key_differs", req.key_differs);
+  serializer.WriteProperty(144, "key_is_rowid", req.key_is_rowid);
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
@@ -390,9 +394,13 @@ duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
   }
   req.probe_scalar          = deserializer.ReadProperty<bool>(136, "probe_scalar");
   req.count_only            = deserializer.ReadProperty<bool>(137, "count_only");
+  req.best_only             = deserializer.ReadProperty<bool>(138, "best_only");
+  req.earlier_by            = deserializer.ReadProperty<std::string>(139, "earlier_by");
   result->left_rows         = deserializer.ReadProperty<std::uint64_t>(140, "left_rows");
   result->right_rows        = deserializer.ReadProperty<std::uint64_t>(141, "right_rows");
   result->probe_is_relation = deserializer.ReadProperty<bool>(142, "probe_is_relation");
+  req.key_differs           = deserializer.ReadProperty<bool>(143, "key_differs");
+  req.key_is_rowid          = deserializer.ReadProperty<bool>(144, "key_is_rowid");
   return std::move(result);
 }
 

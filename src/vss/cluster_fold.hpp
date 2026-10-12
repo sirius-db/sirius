@@ -17,6 +17,8 @@
 #pragma once
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_uvector.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cstdint>
 
@@ -74,5 +76,119 @@ void remap_radius_edges(int64_t const* query_rows,
                         int64_t id_base,
                         rmm::cuda_stream_view stream,
                         int64_t const* id_map = nullptr);
+
+// A threshold join may be asked for less than every pair within the radius: only the pairs whose
+// corpus row comes before the probe row in some order (each pair of a self-join once), and of
+// those only each probe row's nearest (a best-match join). Both are decided here, on the pairs a
+// search emits, so the rest are neither re-scored nor handed to the operators above.
+
+/// Which pairs a threshold join keeps: those with corpus[id] < probe[row], or with @c differ
+/// those with corpus[id] != probe[row] (a self-join's "any other row"). A null @c corpus stands
+/// for corpus[id] = id, the order of the ids themselves. A null @c probe keeps every pair.
+struct earlier_keys {
+  int64_t const* probe{nullptr};   ///< one key per probe row
+  int64_t const* corpus{nullptr};  ///< one key per candidate id
+  bool differ{false};
+};
+
+/// Pairs taken out of a candidate buffer, or a join's best matches.
+struct kept_pairs {
+  rmm::device_uvector<int32_t> rows;
+  rmm::device_uvector<int64_t> ids;
+  rmm::device_uvector<float> distances;
+};
+
+/**
+ * @brief The pairs among @p n that @p keys keep and whose distance is <= @p max_distance, in
+ * buffer order, with ids mapped through @p id_map when it is given and distances square-rooted
+ * when @p take_sqrt. Blocks until the count is known.
+ */
+kept_pairs take_pairs(int32_t const* rows,
+                      int64_t const* ids,
+                      float const* distances,
+                      int64_t n,
+                      earlier_keys keys,
+                      float max_distance,
+                      int64_t const* id_map,
+                      bool take_sqrt,
+                      rmm::cuda_stream_view stream,
+                      rmm::device_async_resource_ref mr);
+
+// A best-match join keeps, per probe row, only its nearest corpus row within the radius. The
+// pairs are folded into one (distance, id) per row as they arrive; and where the search filters
+// with inexact distances, only the pairs that can still be a row's nearest are re-scored.
+
+/// No row has a match: best_order[r] sorts after every distance, best_ids[r] = INT64_MAX.
+void best_match_reset(uint32_t* best_order,
+                      int64_t* best_ids,
+                      int64_t n_rows,
+                      rmm::cuda_stream_view stream);
+
+/**
+ * @brief Fold @p n pairs into each probe row's best match.
+ *
+ * A pair counts when its distance is <= @p max_distance and @p keys keep it. best_order[r] is row
+ * r's smallest distance so far, as bits that order like the float; best_ids[r] the smallest id at
+ * that distance. With @p bound, bound[r] is lowered to the row's best distance, which is what a
+ * bounded search filters its next pairs with. @p scratch is n_rows entries.
+ */
+void best_match_fold(int32_t const* rows,
+                     int64_t const* ids,
+                     float const* distances,
+                     int64_t n,
+                     float max_distance,
+                     earlier_keys keys,
+                     uint32_t* best_order,
+                     int64_t* best_ids,
+                     uint32_t* scratch,
+                     int64_t n_rows,
+                     float* bound,
+                     rmm::cuda_stream_view stream);
+
+/**
+ * @brief winner[r] = the index of row r's pair with the smallest distance among the @p n pairs
+ * that @p keys keep and limit[r] admits (INT64_MAX when it has none; the lowest index on a tie).
+ *
+ * The distances are a filter's inexact ones. Re-scoring a row's winner bounds its best exact
+ * distance, and the filter limit of that bound then admits few of the row's other pairs.
+ */
+void best_match_winners(int32_t const* rows,
+                        int64_t const* ids,
+                        float const* distances,
+                        int64_t n,
+                        earlier_keys keys,
+                        float const* limit,
+                        uint32_t* scratch,
+                        int64_t* winner,
+                        int64_t n_rows,
+                        rmm::cuda_stream_view stream);
+
+/**
+ * @brief The winners (@p winners) or, without it, every other pair that @p keys keep and
+ * limit[row] admits, in buffer order. Blocks until the count is known.
+ */
+kept_pairs best_match_take(int32_t const* rows,
+                           int64_t const* ids,
+                           float const* distances,
+                           int64_t n,
+                           earlier_keys keys,
+                           float const* limit,
+                           int64_t const* winner,
+                           bool winners,
+                           rmm::cuda_stream_view stream,
+                           rmm::device_async_resource_ref mr);
+
+/**
+ * @brief The rows that have a match, as (row, id, distance) in row order, with ids mapped through
+ * @p id_map when it is given and distances square-rooted when @p take_sqrt. Blocks until the
+ * count is known.
+ */
+kept_pairs best_match_emit(uint32_t const* best_order,
+                           int64_t const* best_ids,
+                           int64_t n_rows,
+                           int64_t const* id_map,
+                           bool take_sqrt,
+                           rmm::cuda_stream_view stream,
+                           rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::vss

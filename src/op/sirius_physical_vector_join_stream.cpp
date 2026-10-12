@@ -578,6 +578,38 @@ filtered_chunk filter_corpus_chunk(const scan_manager::pinned_entry& pin,
   return out;
 }
 
+/// One chunk of an `earlier_by` column as INT64 into @p out. Integer columns without nulls only: a
+/// null key compares false against every other, which the best-match fold has no encoding for.
+void copy_earlier_keys(cudf::column_view const& keys,
+                       std::int64_t* out,
+                       std::string const& name,
+                       rmm::cuda_stream_view stream,
+                       rmm::device_async_resource_ref mr)
+{
+  if (!cudf::is_integral_not_bool(keys.type())) {
+    throw std::runtime_error("[sirius_physical_vector_join_stream] earlier_by column '" + name +
+                             "' must be an integer column");
+  }
+  if (keys.has_nulls()) {
+    throw std::runtime_error("[sirius_physical_vector_join_stream] earlier_by column '" + name +
+                             "' holds NULLs, which a best-match join cannot order");
+  }
+  if (keys.size() == 0) { return; }
+  std::unique_ptr<cudf::column> widened;
+  auto view = keys;
+  if (keys.type().id() != cudf::type_id::INT64) {
+    widened = cudf::cast(keys, cudf::data_type{cudf::type_id::INT64}, stream, mr);
+    view    = widened->view();
+  }
+  CUDF_CUDA_TRY(cudaMemcpyAsync(out,
+                                view.data<std::int64_t>(),
+                                static_cast<std::size_t>(view.size()) * sizeof(std::int64_t),
+                                cudaMemcpyDeviceToDevice,
+                                stream.value()));
+  // The caller drops the staged chunk, and this drops the widened copy, once it returns.
+  stream.synchronize();
+}
+
 /// Whether the GEMM-ranked kernels replace cuVS where they can; SIRIUS_VSS_GEMM_TOPK=0 is the
 /// A/B switch back to cuVS for both the top-k and the threshold searches.
 bool gemm_search_enabled()
@@ -928,6 +960,7 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
       "[sirius_physical_vector_join_stream] left or right table is no longer pinned");
   }
   _right_pin = right_pin;
+  _left_pin  = left_pin;
 
   // Both sides go behind the same seam. The probe side used to be required GPU-resident on
   // the argument that it is the small one; that is false for any join where both sides are
@@ -1050,6 +1083,11 @@ void sirius_physical_vector_join_stream::on_finalize_operator()
   // The lists outlive the query in the session's index cache; only this query's references go.
   drain(_lists_repo);
   _lists_repo = nullptr;
+  _corpus_key.reset();
+  _layout_key.reset();
+  _layout_key_host    = {};
+  _probe_row_base     = {};
+  _earlier_keys_built = false;
   // The probe and corpus batches were only ever borrowed by id (every probe task reads the same
   // corpus); the materialize stage holds its own references to the probe batches it still needs.
   for (auto const* name : {"default", "build"}) {
@@ -1323,6 +1361,93 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
   }
 }
 
+void sirius_physical_vector_join_stream::ensure_earlier_keys(
+  ::cucascade::memory::memory_space& space,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::lock_guard<std::mutex> const lock(_op_mutex);
+  if (_earlier_keys_built) { return; }
+  if (_right_pin == nullptr || _left_pin == nullptr) {
+    throw std::runtime_error(
+      "[sirius_physical_vector_join_stream] earlier_by needs both tables pinned");
+  }
+  auto const bytes = static_cast<std::size_t>(_right_total_rows) * sizeof(std::int64_t);
+  // Every task of the query reads them, so they are allocated the way the lists are: on the
+  // default stream, outside any one task's.
+  auto const persistent    = cudf::get_default_stream();
+  auto const persistent_mr = space.get_default_allocator();
+  // Row positions are their own keys: nothing is read, and over lists the row map is the keys.
+  // A probe task only has to know where its chunk starts, from the chunks' own row counts (the
+  // chunk source's are estimates from byte sizes, good for a reservation and not for an order).
+  std::unique_ptr<rmm::device_buffer> keys;
+  if (_request.key_is_rowid) {
+    std::vector<std::int64_t> base{0};
+    if (_left_pin->tier == cucascade::memory::Tier::HOST) {
+      for (auto const& chunk : _left_pin->host_chunks) {
+        auto const& columns = uncompressed_host_chunk(*chunk).get_host_table()->columns;
+        base.push_back(base.back() + (columns.empty() ? 0 : columns.front().num_rows));
+      }
+    } else {
+      for (auto const& view :
+           vss::pinned_column_chunk_views(*_left_pin, _request.left.column, space)) {
+        base.push_back(base.back() + view.size());
+      }
+    }
+    _probe_row_base = std::move(base);
+  } else {
+    auto const& name    = _request.earlier_by;
+    auto const n_chunks = vss::pinned_column_chunk_count(*_right_pin, name);
+    keys                = std::make_unique<rmm::device_buffer>(bytes, persistent, persistent_mr);
+    std::int64_t row    = 0;
+    for (std::size_t j = 0; j < n_chunks; ++j) {
+      auto const staged =
+        vss::stage_pinned_column_chunk(*_right_pin, name, j, space, stream, batch_telemetry());
+      auto const rows = static_cast<std::int64_t>(staged.view.size());
+      if (row + rows > _right_total_rows) { break; }
+      copy_earlier_keys(
+        staged.view, static_cast<std::int64_t*>(keys->data()) + row, name, stream, mr);
+      row += rows;
+    }
+    if (row != _right_total_rows) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] earlier_by column '" + name +
+                               "' does not hold the corpus's " + std::to_string(_right_total_rows) +
+                               " rows");
+    }
+  }
+  if (_lists != nullptr) {
+    std::unique_ptr<rmm::device_buffer> layout;
+    void const* layout_keys = _lists->row_ids->data();
+    if (keys) {
+      layout = std::make_unique<rmm::device_buffer>(bytes, persistent, persistent_mr);
+      vss::gather_bytes(keys->data(),
+                        sizeof(std::int64_t),
+                        static_cast<std::int64_t const*>(_lists->row_ids->data()),
+                        _right_total_rows,
+                        layout->data(),
+                        stream);
+      layout_keys = layout->data();
+    }
+    // Lists keep the pin's row order, so a corpus stored in key order has ascending keys within
+    // each list, and row positions always do. Checked rather than assumed: the cut it allows
+    // would drop pairs otherwise.
+    std::vector<std::int64_t> host(static_cast<std::size_t>(_right_total_rows));
+    CUDF_CUDA_TRY(
+      cudaMemcpyAsync(host.data(), layout_keys, bytes, cudaMemcpyDeviceToHost, stream.value()));
+    stream.synchronize();
+    bool ascending = true;
+    for (std::size_t c = 0; ascending && c + 1 < _lists->offsets.size(); ++c) {
+      auto const first = host.begin() + _lists->offsets[c];
+      auto const last  = host.begin() + _lists->offsets[c + 1];
+      ascending        = std::is_sorted(first, last);
+    }
+    if (ascending) { _layout_key_host = std::move(host); }
+    _layout_key = std::move(layout);
+  }
+  _corpus_key         = std::move(keys);
+  _earlier_keys_built = true;
+}
+
 std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   const operator_data& input_data, ::cuda::stream_ref stream_ref)
 {
@@ -1505,6 +1630,154 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   auto const radius_eps = _request.output_type == vss::vector_join_output_type::similarity
                             ? static_cast<float>(1.0 - _request.eps)
                             : static_cast<float>(_request.eps);
+
+  // A threshold join asked for the pairs in one order only (earlier_by / other_by) keeps a pair
+  // by its two rows' keys; candidate ids are pin rows, or over inexact lists their layout rows.
+  bool const keyed = radius_join && !_request.earlier_by.empty();
+  // A best-match join folds every pair it finds into one (distance, id) per probe row and emits
+  // those at the end, through the pieces a plain threshold join's pairs leave by.
+  bool const best_only = radius_join && _request.best_only && !count_only;
+  std::optional<rmm::device_uvector<std::uint32_t>> best_order, best_scratch;
+  std::optional<rmm::device_uvector<std::int64_t>> best_ids, probe_keys;
+  std::unique_ptr<cudf::column> probe_positions;
+  vss::earlier_keys pin_keys{}, layout_keys{};
+  // Whether the fold's ids are layout rows of the lists, and its distances squared, at the end.
+  bool best_ids_are_layout = false, best_take_sqrt = false;
+  std::int64_t best_rescored = 0;
+  // Set when the lists' keys ascend within each list: no row at or past probe_key_max can be
+  // earlier than any probe row of this task, so each list is searched only up to there.
+  std::int64_t const* earlier_cut = nullptr;
+  std::int64_t probe_key_max      = 0;
+  if (best_only) {
+    best_order.emplace(static_cast<std::size_t>(n_left), stream, mr);
+    best_scratch.emplace(static_cast<std::size_t>(n_left), stream, mr);
+    best_ids.emplace(static_cast<std::size_t>(n_left), stream, mr);
+    vss::best_match_reset(best_order->data(), best_ids->data(), n_left, stream);
+  }
+  if (keyed) {
+    ensure_earlier_keys(*mem_space, stream, mr);
+    // This task's probe rows are chunk left_idx of the pinned probe table.
+    std::int64_t const* probe_key = nullptr;
+    if (_request.key_is_rowid) {
+      if (left_idx + 1 >= _probe_row_base.size() ||
+          _probe_row_base[left_idx + 1] - _probe_row_base[left_idx] != n_left) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] probe chunk " +
+                                 std::to_string(left_idx) + " holds " + std::to_string(n_left) +
+                                 " rows, not what the pin records for it");
+      }
+      auto const first_row = _probe_row_base[left_idx];
+      cudf::numeric_scalar<std::int64_t> const first(first_row, true, stream),
+        step(1, true, stream);
+      probe_positions =
+        cudf::sequence(static_cast<cudf::size_type>(n_left), first, step, stream, mr);
+      probe_key     = probe_positions->view().data<std::int64_t>();
+      probe_key_max = first_row + n_left - 1;
+    } else {
+      probe_keys.emplace(static_cast<std::size_t>(n_left), stream, mr);
+      auto const staged = vss::stage_pinned_column_chunk(
+        *_left_pin, _request.earlier_by, left_idx, *mem_space, stream, batch_telemetry());
+      if (static_cast<std::int64_t>(staged.view.size()) != n_left) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_stream] earlier_by column '" + _request.earlier_by +
+          "' and the probe vectors are chunked differently; both must come from the same pin");
+      }
+      copy_earlier_keys(staged.view, probe_keys->data(), _request.earlier_by, stream, mr);
+      probe_key = probe_keys->data();
+    }
+    pin_keys = {probe_key,
+                _corpus_key ? static_cast<std::int64_t const*>(_corpus_key->data()) : nullptr,
+                _request.key_differs};
+    if (_lists != nullptr) {
+      layout_keys = {probe_key,
+                     static_cast<std::int64_t const*>(_layout_key ? _layout_key->data()
+                                                                  : _lists->row_ids->data()),
+                     _request.key_differs};
+    }
+    // SIRIUS_VSS_EARLIER_CUT=0 searches the whole lists, the A/B for the cut.
+    bool const cut_enabled = [] {
+      auto const* v = std::getenv("SIRIUS_VSS_EARLIER_CUT");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+    if (cut_enabled && !_request.key_differs && !_layout_key_host.empty()) {
+      if (!_request.key_is_rowid) {
+        std::vector<std::int64_t> host(static_cast<std::size_t>(n_left));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(host.data(),
+                                      probe_keys->data(),
+                                      host.size() * sizeof(std::int64_t),
+                                      cudaMemcpyDeviceToHost,
+                                      stream.value()));
+        stream.synchronize();
+        probe_key_max = *std::max_element(host.begin(), host.end());
+      }
+      earlier_cut = _layout_key_host.data();
+    }
+  }
+  auto fold_best = [&](std::int32_t const* rows,
+                       std::int64_t const* ids,
+                       float const* distances,
+                       std::int64_t n,
+                       float max_distance,
+                       vss::earlier_keys keys,
+                       float* bound_rows) {
+    vss::best_match_fold(rows,
+                         ids,
+                         distances,
+                         n,
+                         max_distance,
+                         keys,
+                         best_order->data(),
+                         best_ids->data(),
+                         best_scratch->data(),
+                         n_left,
+                         bound_rows,
+                         stream);
+  };
+  // A search that returns finished pairs (exact distances, pin-row ids): the ones the keys keep
+  // join the answer, or only its count.
+  auto keep_keyed =
+    [&](std::int32_t const* rows, std::int64_t const* ids, float const* distances, std::int64_t n) {
+      auto kept        = vss::take_pairs(rows,
+                                  ids,
+                                  distances,
+                                  n,
+                                  pin_keys,
+                                  std::numeric_limits<float>::infinity(),
+                                  nullptr,
+                                  false,
+                                  stream,
+                                  mr);
+      auto const pairs = static_cast<std::int64_t>(kept.rows.size());
+      if (pairs == 0) { return; }
+      if (!count_only) {
+        radius_left.push_back(
+          std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
+        radius_neighbors.push_back(
+          std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
+        radius_distances.push_back(
+          std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
+      }
+      note_radius_part(pairs);
+    };
+  auto emit_best = [&] {
+    if (!best_only) { return; }
+    auto best = vss::best_match_emit(
+      best_order->data(),
+      best_ids->data(),
+      n_left,
+      best_ids_are_layout ? static_cast<std::int64_t const*>(_lists->row_ids->data()) : nullptr,
+      best_take_sqrt,
+      stream,
+      mr);
+    auto const pairs = static_cast<std::int64_t>(best.rows.size());
+    if (pairs == 0) { return; }
+    radius_left.push_back(
+      std::make_unique<cudf::column>(std::move(best.rows), rmm::device_buffer{}, 0));
+    radius_neighbors.push_back(
+      std::make_unique<cudf::column>(std::move(best.ids), rmm::device_buffer{}, 0));
+    radius_distances.push_back(
+      std::make_unique<cudf::column>(std::move(best.distances), rmm::device_buffer{}, 0));
+    note_radius_part(pairs);
+  };
 
   // Rows the exhaustive fold searched; a corpus with none has nothing to join against.
   std::int64_t exhaustive_rows_seen = 0;
@@ -1826,7 +2099,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     std::optional<rmm::device_uvector<float>> code_limit;
     // A radius join whose score is never read keeps the filter's verdict where it already proves
     // the pair is inside the radius, and re-scores only the rest.
-    bool const skip_certain = radius_join && rescore && !_request.score_read;
+    bool const skip_certain = radius_join && rescore && !_request.score_read && !best_only;
     std::optional<rmm::device_uvector<float>> certain_limit;
     std::optional<rmm::device_uvector<std::uint16_t>> probe_f16;
     std::optional<rmm::device_uvector<float>> probe_sqf, probe_half_error;
@@ -1919,7 +2192,131 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       if (pending == 0) { return; }
       ++bounded_merges;
       bounded_emitted += pending;
-      auto const t0 = debug_mark();
+      auto const t0      = debug_mark();
+      auto const* c_rows = candidates->rows.data();
+      auto const* c_ids  = candidates->ids.data();
+      auto const* c_dist = candidates->distances.data();
+      auto const done    = [&] {
+        CUDF_CUDA_TRY(
+          cudaMemsetAsync(candidates->count.data(), 0, sizeof(unsigned long long), stream.value()));
+        pending = 0;
+        if (dbg) { rescore_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+      };
+      if (keyed && !best_only) {
+        // The pairs the keys drop are dropped before anything is re-scored; the rest are held to
+        // the radius as every pair of a threshold join is.
+        auto const no_limit = std::numeric_limits<float>::infinity();
+        auto const* row_map =
+          rescore ? static_cast<std::int64_t const*>(_lists->row_ids->data()) : nullptr;
+        auto kept =
+          rescore
+            ? vss::take_pairs(
+                c_rows, c_ids, c_dist, pending, layout_keys, no_limit, nullptr, false, stream, mr)
+            : vss::take_pairs(c_rows,
+                              c_ids,
+                              c_dist,
+                              pending,
+                              pin_keys,
+                              radius_bound,
+                              nullptr,
+                              sqrt_at_end,
+                              stream,
+                              mr);
+        if (rescore && kept.rows.size() > 0) {
+          auto const n = static_cast<std::int64_t>(kept.rows.size());
+          vss::exact_distances(search_queries.data_handle(),
+                               kept.rows.data(),
+                               0,
+                               kept.ids.data(),
+                               kept.distances.data(),
+                               n,
+                               exact_blocks,
+                               _lists->exact_rows_per_block,
+                               dim,
+                               stream,
+                               certain_limit ? certain_limit->data() : nullptr,
+                               radius_bound);
+          kept = vss::take_pairs(kept.rows.data(),
+                                 kept.ids.data(),
+                                 kept.distances.data(),
+                                 n,
+                                 {},
+                                 radius_bound,
+                                 row_map,
+                                 sqrt_at_end,
+                                 stream,
+                                 mr);
+        }
+        if (kept.rows.size() > 0) {
+          auto const pairs = static_cast<std::int64_t>(kept.rows.size());
+          if (!count_only) {
+            radius_left.push_back(
+              std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
+            radius_neighbors.push_back(
+              std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
+            radius_distances.push_back(
+              std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
+          }
+          note_radius_part(pairs);
+        }
+        done();
+        return;
+      }
+      if (best_only) {
+        if (rescore) {
+          // The filter's distances are inexact, so a row's nearest by them is re-scored first: its
+          // exact distance bounds the row's best match, and the filter limit of that bound admits
+          // few of the row's other pairs. Those are re-scored too, and the rest never are.
+          rmm::device_uvector<std::int64_t> winner(static_cast<std::size_t>(n_left), stream, mr);
+          vss::best_match_winners(c_rows,
+                                  c_ids,
+                                  c_dist,
+                                  pending,
+                                  layout_keys,
+                                  code_limit->data(),
+                                  best_scratch->data(),
+                                  winner.data(),
+                                  n_left,
+                                  stream);
+          for (bool const winners : {true, false}) {
+            auto taken   = vss::best_match_take(c_rows,
+                                              c_ids,
+                                              c_dist,
+                                              pending,
+                                              layout_keys,
+                                              code_limit->data(),
+                                              winner.data(),
+                                              winners,
+                                              stream,
+                                              mr);
+            auto const n = static_cast<std::int64_t>(taken.rows.size());
+            if (n == 0) { continue; }
+            vss::exact_distances(search_queries.data_handle(),
+                                 taken.rows.data(),
+                                 0,
+                                 taken.ids.data(),
+                                 taken.distances.data(),
+                                 n,
+                                 exact_blocks,
+                                 _lists->exact_rows_per_block,
+                                 dim,
+                                 stream);
+            fold_best(taken.rows.data(),
+                      taken.ids.data(),
+                      taken.distances.data(),
+                      n,
+                      radius_bound,
+                      {},
+                      bound->data());
+            refresh_code_limit(bound->data());
+            best_rescored += n;
+          }
+        } else {
+          fold_best(c_rows, c_ids, c_dist, pending, radius_bound, pin_keys, bound->data());
+        }
+        done();
+        return;
+      }
       if (rescore) {
         vss::exact_distances(search_queries.data_handle(),
                              candidates->rows.data(),
@@ -2382,7 +2779,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
               " describes row " + std::to_string(slice.end) + " but the vector column's chunk " +
               "holds " + std::to_string(chunk_n) + "; both must come from the same pin");
           }
-          auto const slice_rows = slice.end - slice.begin;
+          auto slice_rows = slice.end - slice.begin;
+          if (earlier_cut != nullptr) {
+            auto const* first = earlier_cut + chunk_base + slice.begin;
+            slice_rows        = std::lower_bound(first, first + slice_rows, probe_key_max) - first;
+            if (slice_rows == 0) { continue; }
+          }
           auto const slice_view =
             raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
               chunk_data == nullptr ? nullptr : chunk_data + slice.begin * dim, slice_rows, dim);
@@ -2446,9 +2848,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             // Same construction as the exhaustive radius path: a slice's in-range pairs are
             // final when produced, so they are appended, never folded, and there is no k. The
             // kernel numbers query rows within the gathered matrix; rows_c maps them back.
-            auto edges = threshold_search(
-              res, slice_view, queries_view, search_radius, search_metric, mr, 0, count_only);
-            if (count_only) {
+            auto edges = threshold_search(res,
+                                          slice_view,
+                                          queries_view,
+                                          search_radius,
+                                          search_metric,
+                                          mr,
+                                          0,
+                                          count_only && !keyed);
+            if (count_only && !keyed) {
               note_radius_part(edges.n_edges);
             } else if (edges.n_edges > 0) {
               auto left =
@@ -2465,6 +2873,23 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                       id_base,
                                       stream,
                                       id_map);
+              if (best_only) {
+                fold_best(left->view().data<std::int32_t>(),
+                          edges.neighbors->view().data<std::int64_t>(),
+                          edges.distances->view().data<float>(),
+                          edges.n_edges,
+                          std::numeric_limits<float>::infinity(),
+                          pin_keys,
+                          nullptr);
+                continue;
+              }
+              if (keyed) {
+                keep_keyed(left->view().data<std::int32_t>(),
+                           edges.neighbors->view().data<std::int64_t>(),
+                           edges.distances->view().data<float>(),
+                           edges.n_edges);
+                continue;
+              }
               radius_left.push_back(std::move(left));
               radius_neighbors.push_back(std::move(edges.neighbors));
               radius_distances.push_back(std::move(edges.distances));
@@ -2572,10 +2997,20 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                      static_cast<long long>(bounded_padded),
                      rescore_seconds,
                      take_seconds);
+        if (best_only) {
+          std::fprintf(stderr,
+                       "[vecjoin-phase] best match: %lld of those pairs re-scored\n",
+                       static_cast<long long>(best_rescored));
+        }
       }
       if (sqrt_at_end && !radius_join) {
         vss::sqrt_in_place(acc_distances->mutable_view().data<float>(), n_left * k_join, stream);
       }
+    }
+    if (best_only) {
+      best_ids_are_layout = any_bounded && rescore;
+      best_take_sqrt      = sqrt_at_end;
+      emit_best();
     }
     if (unit_cosine) {
       if (radius_join) {
@@ -2710,18 +3145,23 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                      static_cast<std::size_t>(dim + 4) * sizeof(float) +
                                    2 * last_edge_bytes);
         }
-        auto edges =
-          searched.extent(0) == 0
-            ? vss::threshold_join_result{nullptr, nullptr, nullptr, 0}
-            : threshold_search(
-                res, searched, queries, radius_eps, metric, mr, kGemmMinProbeRows, count_only);
+        auto edges = searched.extent(0) == 0
+                       ? vss::threshold_join_result{nullptr, nullptr, nullptr, 0}
+                       : threshold_search(res,
+                                          searched,
+                                          queries,
+                                          radius_eps,
+                                          metric,
+                                          mr,
+                                          kGemmMinProbeRows,
+                                          count_only && !keyed);
         last_edge_bytes =
           static_cast<std::size_t>(edges.n_edges) * (2 * sizeof(std::int64_t) + sizeof(float));
         advance(j + 1);
         release_staged(staged);
         auto const chunk_base = offset;
         offset += batch_rows;
-        if (count_only) {
+        if (count_only && !keyed) {
           note_radius_part(edges.n_edges);
         } else if (edges.n_edges > 0) {
           if (kept) {
@@ -2744,6 +3184,27 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           }
           // shaped_join_result carries left_rows as INT32; the kernel emits INT64.
           auto const pairs = static_cast<std::int64_t>(edges.neighbors->size());
+          if (best_only) {
+            auto const left = cudf::cast(
+              edges.query_rows->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
+            fold_best(left->view().data<std::int32_t>(),
+                      edges.neighbors->view().data<std::int64_t>(),
+                      edges.distances->view().data<float>(),
+                      pairs,
+                      std::numeric_limits<float>::infinity(),
+                      pin_keys,
+                      nullptr);
+            continue;
+          }
+          if (keyed) {
+            auto const left = cudf::cast(
+              edges.query_rows->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
+            keep_keyed(left->view().data<std::int32_t>(),
+                       edges.neighbors->view().data<std::int64_t>(),
+                       edges.distances->view().data<float>(),
+                       pairs);
+            continue;
+          }
           radius_left.push_back(cudf::cast(
             edges.query_rows->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr));
           radius_neighbors.push_back(std::move(edges.neighbors));
@@ -2794,6 +3255,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                           chunk_base,
                           stream);
     }
+    emit_best();
   }
 
   // An empty right table joins to nothing: the answer is empty, as DuckDB's is.
@@ -3009,7 +3471,13 @@ std::string sirius_physical_vector_join_stream::params_to_string() const
   return _request.left.table + "(" + _request.left.column + ") x " + _request.right.table + "(" +
          _request.right.column + ") metric=" + _request.metric +
          " k=" + std::to_string(_request.k) +
-         " mode=" + std::to_string(static_cast<int>(_request.mode)) + " streaming";
+         " mode=" + std::to_string(static_cast<int>(_request.mode)) +
+         (_request.best_only ? " keep=best" : "") +
+         (_request.earlier_by.empty()
+            ? ""
+            : (_request.key_differs ? " other_by=" : " earlier_by=") +
+                (_request.key_is_rowid ? std::string("rowid") : _request.earlier_by)) +
+         " streaming";
 }
 
 }  // namespace sirius::op

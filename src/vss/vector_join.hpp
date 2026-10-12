@@ -97,6 +97,20 @@ struct vector_join_request {
   /// the pairs, which past a few hundred million would be written to host memory only to be
   /// counted. Set by push_count_into_vector_joins; the planner then reads no column and no score.
   bool count_only{false};
+  /// `keep => 'best'`: a threshold join that emits, per probe row, only its closest pair within
+  /// the threshold. The operator folds the pairs into one per row as it finds them, so a row with
+  /// thousands of pairs costs neither their exact re-scoring nor an aggregate over them.
+  bool best_only{false};
+  /// `earlier_by => '<column>'` on a threshold join: only pairs whose right row has a smaller
+  /// value of this column than the left row count, which over a self-join is each pair once.
+  /// Both tables carry the column, and both are pinned.
+  std::string earlier_by;
+  /// `other_by => '<column>'` instead: the column (held in earlier_by) only has to differ, which
+  /// in a self-join on a unique column is "any row but itself".
+  bool key_differs{false};
+  /// The column is `rowid`: a self-join ordered by the rows' positions in the pinned table, which
+  /// needs no column and is the order the cluster lists already keep.
+  bool key_is_rowid{false};
   /// Take the corpus from a child scan materialized by the build phase instead of from a
   /// pinned catalog table. Temporary A/B switch (`build_source => 'scan'`) while the build
   /// phase is verified against the pin path; the SQL surface that replaces it is the

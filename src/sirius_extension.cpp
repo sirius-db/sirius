@@ -2987,6 +2987,19 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
       } else if (src != "pin") {
         throw BinderException("sirius_knn_join: build_source must be 'pin' or 'scan'");
       }
+    } else if (key == "keep") {
+      auto const keep = StringUtil::Lower(kv.second.ToString());
+      if (keep == "best") {
+        req.best_only = true;
+      } else if (keep != "all") {
+        throw BinderException("sirius_knn_join: keep must be 'all' or 'best'");
+      }
+    } else if (key == "earlier_by" || key == "other_by") {
+      if (!req.earlier_by.empty()) {
+        throw BinderException("sirius_knn_join: give one of earlier_by and other_by");
+      }
+      req.earlier_by  = kv.second.ToString();
+      req.key_differs = key == "other_by";
     } else if (key == "left_schema_name") {
       left_schema = kv.second.ToString();
     } else if (key == "right_schema_name") {
@@ -3064,6 +3077,23 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     req.output_type = req.metric == "cosine" ? vector_join_output_type::similarity
                                              : vector_join_output_type::distance;
   }
+  if (req.best_only && req.mode != vector_join_mode::threshold) {
+    throw BinderException(
+      "sirius_knn_join: keep => 'best' applies to a threshold join (eps => ...); a top-k join "
+      "already ranks each row's pairs, ask it for k => 1");
+  }
+  if (!req.earlier_by.empty()) {
+    if (req.mode != vector_join_mode::threshold) {
+      throw BinderException(
+        "sirius_knn_join: earlier_by / other_by apply to a threshold join (eps => ...)");
+    }
+    req.key_is_rowid = StringUtil::Lower(req.earlier_by) == "rowid";
+    if (req.probe_from_scan || req.build_from_scan) {
+      throw BinderException(
+        "sirius_knn_join: earlier_by / other_by read their column from both pinned tables; they "
+        "do not apply with probe_source or build_source => 'scan', nor to sirius_knn_join_rel");
+    }
+  }
   // Similarity is only well-defined for cosine (1 - distance). L2 has no natural similarity.
   if (req.metric == "l2" && req.output_type == vector_join_output_type::similarity) {
     throw BinderException(
@@ -3114,6 +3144,29 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
                           "]; both sides must share the same vector dimensionality");
   }
   req.dim = left_dim;
+
+  if (req.key_is_rowid) {
+    // Row positions order one table's rows; between two tables they mean nothing.
+    if (req.left.catalog != req.right.catalog || req.left.schema != req.right.schema ||
+        req.left.table != req.right.table) {
+      throw BinderException(
+        "sirius_knn_join: earlier_by / other_by => 'rowid' orders a self-join by row position; '" +
+        req.left.table + "' and '" + req.right.table +
+        "' are two tables, name a column both carry");
+    }
+  } else if (!req.earlier_by.empty()) {
+    for (auto const* side : {&req.left, &req.right}) {
+      auto const pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+        side->catalog, side->schema, side->table);
+      auto const names_pinned =
+        pin != nullptr ? pin->cache_info.column_names() : std::vector<std::string>{};
+      if (std::find(names_pinned.begin(), names_pinned.end(), req.earlier_by) ==
+          names_pinned.end()) {
+        throw BinderException("sirius_knn_join: earlier_by / other_by column '" + req.earlier_by +
+                              "' is not a pinned column of table '" + side->table + "'");
+      }
+    }
+  }
 
   // The cluster ids reach the fold as a column of the corpus scan, so on the build path they
   // have to exist in the catalog rather than in a pin. Checked here because the plan generator
@@ -3190,8 +3243,9 @@ static void SiriusVectorJoinPushdownFilter(ClientContext&,
   auto* bind = dynamic_cast<SiriusVectorJoinBindData*>(bind_data_p);
   if (bind == nullptr) { return; }
   auto const& req = bind->req;
+  // Nor a best-match join's: with the row's best match filtered out, the next best takes its place.
   if (req.mode != vector_join_mode::threshold || req.build_from_scan || req.right.is_view ||
-      req.search_mode == vector_join_search_mode::approx) {
+      req.search_mode == vector_join_search_mode::approx || req.best_only) {
     return;
   }
   auto const n_left_out  = req.left.output_columns.size();
@@ -3643,6 +3697,9 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join.named_parameters["right_output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
   vector_join.named_parameters["build_source"]         = LogicalType::VARCHAR;
   vector_join.named_parameters["probe_source"]         = LogicalType::VARCHAR;
+  vector_join.named_parameters["keep"]                 = LogicalType::VARCHAR;
+  vector_join.named_parameters["earlier_by"]           = LogicalType::VARCHAR;
+  vector_join.named_parameters["other_by"]             = LogicalType::VARCHAR;
   vector_join.cardinality                              = SiriusVectorJoinCardinality;
   // Lets DuckDB narrow column_ids to what the query reads. create_plan_knn_join drops the rest
   // before the corpus's output columns are concatenated, which is where the cost is.
