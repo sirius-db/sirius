@@ -249,7 +249,6 @@ impl<'a> SiriusModelQueryView<'a> {
 impl QueryEngineModel for SiriusModelQueryView<'_> {
     type Engine = Engine;
     type Query = Query;
-    type QueryGroup = QueryGroup;
     type Worker = Worker;
     type Plan = Plan;
     type Operator = Operator;
@@ -263,12 +262,6 @@ impl QueryEngineModel for SiriusModelQueryView<'_> {
         (self.query.id() == query_id)
             .then_some(self.query)
             .ok_or(AnalyzerError::InvalidId(query_id))
-    }
-
-    fn query_group(&self, query_group_id: Uuid) -> AnalyzerResult<&QueryGroup> {
-        (self.query_group.id() == query_group_id)
-            .then_some(self.query_group)
-            .ok_or(AnalyzerError::InvalidId(query_group_id))
     }
 
     fn worker(&self, worker_id: Uuid) -> AnalyzerResult<&Worker> {
@@ -303,10 +296,6 @@ impl QueryEngineModel for SiriusModelQueryView<'_> {
         std::iter::once(self.query)
     }
 
-    fn query_groups(&self) -> impl Iterator<Item = &QueryGroup> {
-        std::iter::once(self.query_group)
-    }
-
     fn workers(&self) -> impl Iterator<Item = &Worker> {
         self.workers.values().copied()
     }
@@ -337,7 +326,7 @@ impl Model for SiriusModelQueryView<'_> {
         } else if self.workers.contains_key(&entity_id) {
             Ok(EntityRef::Worker(entity_id))
         } else if self.query_group.id() == entity_id {
-            Ok(EntityRef::QueryGroup(entity_id))
+            Ok(EntityRef::ResourceGroup(entity_id))
         } else if self.query.id() == entity_id {
             Ok(EntityRef::Query(entity_id))
         } else if self.plans.contains_key(&entity_id) {

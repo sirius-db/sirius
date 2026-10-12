@@ -18,7 +18,7 @@ use quent_analyzer::{
 use quent_events::Event;
 use quent_query_engine_analyzer::{
     EngineEntity, OperatorEntity, OperatorEntityMut, PlanEntity, PortEntity, QueryEntity,
-    QueryGroupEntity, WorkerEntity,
+    WorkerEntity,
 };
 use quent_query_engine_ui as query_engine_ui;
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, try_to_secs_relative};
@@ -53,7 +53,7 @@ pub use operator::Operator;
 pub use plan::Plan;
 pub use port::Port;
 pub use query::Query;
-pub(crate) use query::QueryBuilder;
+pub(crate) use query::{QUERY_GROUP_ATTRIBUTE, QueryBuilder};
 pub use query_group::QueryGroup;
 pub(crate) use task::TaskBuilder;
 pub use task::{Task, TaskExt};

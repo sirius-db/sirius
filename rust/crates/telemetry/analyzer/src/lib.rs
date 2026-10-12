@@ -8,8 +8,7 @@ use quent_query_engine_analyzer::entities;
 use quent_query_engine_analyzer::ui::UiAnalyzer;
 use quent_query_engine_analyzer::ui::{QuentViewer, ViewerEventStream};
 use quent_query_engine_analyzer::{
-    EngineEntity, OperatorEntity, PlanEntity, PortEntity, QueryEntity, QueryGroupEntity,
-    WorkerEntity,
+    EngineEntity, OperatorEntity, PlanEntity, PortEntity, QueryEntity, WorkerEntity,
 };
 use quent_query_engine_ui::{
     DataFlowTimelineBinned, EntityRef, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
@@ -504,6 +503,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                     duration_s: None,
                     instance_name: label,
                     implementation: None,
+                    custom_attributes: Vec::new(),
                 });
             }
         }
@@ -544,6 +544,10 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         Ok(Self { model })
     }
 
+    fn query_initial_group_by_attribute(&self) -> Option<String> {
+        Some(boilerplate::QUERY_GROUP_ATTRIBUTE.to_owned())
+    }
+
     fn query_bundle(&self, query_id: Uuid) -> AnalyzerResult<QueryBundle> {
         debug!("constructing view");
         // TODO(johanpel): A query view could be cached in an analyzer so
@@ -557,13 +561,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         debug!("converting query engine model entities");
         let engine = view.engine()?.to_ui()?;
-        let query_group_id = query.query_group_id().ok_or_else(|| {
-            quent_analyzer::AnalyzerError::IncompleteEntity(format!(
-                "query {} has no query_group_id",
-                query_id
-            ))
-        })?;
-        let query_group = view.query_group(query_group_id)?.to_ui();
         let query = query.to_ui()?;
         let workers = view.workers().map(|w| (w.id(), w.to_ui(epoch))).collect();
         let plans = view.plans().map(|p| (p.id(), p.to_ui())).collect();
@@ -664,7 +661,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         let entities = QueryEntities {
             engine,
-            query_group,
             query,
             workers,
             plans,

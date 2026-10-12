@@ -3,22 +3,36 @@
 
 use super::*;
 
+use quent_dynamic_attributes::DynamicAttribute;
+
+pub(crate) const QUERY_GROUP_ATTRIBUTE: &str = "query_group";
+
 pub(crate) type QueryBuilder = AnalyzedFsmBuilder<schema::QueryEvent>;
 
 #[derive(Debug)]
-pub struct Query(AnalyzedFsm<schema::QueryEvent>);
+pub struct Query {
+    fsm: AnalyzedFsm<schema::QueryEvent>,
+    group_label: Option<String>,
+}
 
 impl Query {
     pub(crate) fn try_from_builder(builder: QueryBuilder) -> AnalyzerResult<Self> {
-        Ok(Self(builder.try_build()?))
+        Ok(Self {
+            fsm: builder.try_build()?,
+            group_label: None,
+        })
+    }
+
+    pub(crate) fn set_group_label(&mut self, label: Option<String>) {
+        self.group_label = label;
     }
 
     pub(crate) fn transitions(&self) -> &[AnalyzedTransition<schema::QueryEvent>] {
-        self.0.transitions()
+        self.fsm.transitions()
     }
 
     pub(crate) fn query_group_id(&self) -> Option<Uuid> {
-        match self.0.transition(0).map(|transition| &transition.data)? {
+        match self.fsm.transition(0).map(|transition| &transition.data)? {
             schema::QueryEvent::Init { query_group_id, .. } => Some(query_group_id.target),
             _ => None,
         }
@@ -27,19 +41,19 @@ impl Query {
 
 impl Entity for Query {
     fn id(&self) -> Uuid {
-        self.0.id()
+        self.fsm.id()
     }
 
     fn type_name(&self) -> &str {
-        self.0.type_name()
+        self.fsm.type_name()
     }
 
     fn earliest_timestamp(&self) -> TimeUnixNanoSec {
-        self.0.earliest_timestamp()
+        self.fsm.earliest_timestamp()
     }
 
     fn latest_timestamp(&self) -> TimeUnixNanoSec {
-        self.0.latest_timestamp()
+        self.fsm.latest_timestamp()
     }
 }
 
@@ -47,23 +61,23 @@ impl Fsm for Query {
     type TransitionType = AnalyzedTransition<schema::QueryEvent>;
 
     fn len(&self) -> usize {
-        self.0.len()
+        self.fsm.len()
     }
 
     fn transition(&self, index: usize) -> Option<&Self::TransitionType> {
-        self.0.transition(index)
+        self.fsm.transition(index)
     }
 }
 
 impl<'a> FsmUsages<'a> for Query {
     fn usages_with_state_names(&'a self) -> impl Iterator<Item = (&'a str, impl Usage<'a>)> {
-        self.0.usages_with_state_names()
+        self.fsm.usages_with_state_names()
     }
 }
 
 impl Using for Query {
     fn usages(&self) -> impl Iterator<Item = impl Usage<'_>> {
-        self.0.usages()
+        self.fsm.usages()
     }
 }
 
@@ -74,10 +88,6 @@ impl RefTreeEntity for Query {
 }
 
 impl QueryEntity for Query {
-    fn query_group_id(&self) -> Option<Uuid> {
-        self.query_group_id()
-    }
-
     fn to_ui(&self) -> AnalyzerResult<query_engine_ui::Query> {
         let transitions = self.transitions();
         let epoch = transitions.first().map(Timestamp::timestamp);
@@ -104,7 +114,13 @@ impl QueryEntity for Query {
 
         Ok(query_engine_ui::Query {
             id: self.id(),
-            query_group_id: self.query_group_id().unwrap_or_default(),
+            // Preserve session grouping through Quent's generic query attributes.
+            custom_attributes: self.group_label.as_ref().map_or_else(Vec::new, |label| {
+                vec![DynamicAttribute::string(
+                    QUERY_GROUP_ATTRIBUTE,
+                    label.clone(),
+                )]
+            }),
             instance_name: transitions
                 .first()
                 .and_then(|transition| match &transition.data {

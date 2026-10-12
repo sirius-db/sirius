@@ -948,3 +948,22 @@ fn fsm_diagrams_use_final_states() {
         ));
     }
 }
+
+#[test]
+fn query_groups_use_ui_attributes() {
+    use quent_query_engine_analyzer::QueryEntity;
+
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), fixture().into_iter()).unwrap();
+    let query = analyzer.model.queries[&id(4)].to_ui().unwrap();
+    assert_eq!(query.custom_attributes.len(), 1);
+    let attribute = &query.custom_attributes[0];
+    assert_eq!(attribute.key, crate::boilerplate::QUERY_GROUP_ATTRIBUTE);
+    assert!(matches!(
+        &attribute.value,
+        Some(quent_dynamic_attributes::DynamicValue::String(label)) if label == "group"
+    ));
+    assert_eq!(
+        analyzer.query_initial_group_by_attribute().as_deref(),
+        Some(crate::boilerplate::QUERY_GROUP_ATTRIBUTE)
+    );
+}

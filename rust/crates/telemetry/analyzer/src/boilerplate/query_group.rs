@@ -59,14 +59,3 @@ impl RefTreeEntity for QueryGroup {
         self.0.accumulator().engine_id
     }
 }
-
-impl QueryGroupEntity for QueryGroup {
-    fn to_ui(&self) -> query_engine_ui::QueryGroup {
-        let data = self.data();
-        query_engine_ui::QueryGroup {
-            id: self.id(),
-            instance_name: data.instance_name.clone(),
-            engine_id: data.engine_id,
-        }
-    }
-}

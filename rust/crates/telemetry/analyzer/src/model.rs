@@ -140,7 +140,7 @@ impl Model for SiriusModel {
         } else if self.workers.contains_key(&entity_id) {
             Ok(EntityRef::Worker(entity_id))
         } else if self.query_groups.contains_key(&entity_id) {
-            Ok(EntityRef::QueryGroup(entity_id))
+            Ok(EntityRef::ResourceGroup(entity_id))
         } else if self.queries.contains_key(&entity_id) {
             Ok(EntityRef::Query(entity_id))
         } else if self.plans.contains_key(&entity_id) {
@@ -178,7 +178,6 @@ impl Model for SiriusModel {
 impl QueryEngineModel for SiriusModel {
     type Engine = Engine;
     type Query = Query;
-    type QueryGroup = QueryGroup;
     type Worker = Worker;
     type Plan = Plan;
     type Operator = Operator;
@@ -192,12 +191,6 @@ impl QueryEngineModel for SiriusModel {
         self.queries
             .get(&query_id)
             .ok_or(AnalyzerError::InvalidId(query_id))
-    }
-
-    fn query_group(&self, query_group_id: Uuid) -> AnalyzerResult<&QueryGroup> {
-        self.query_groups
-            .get(&query_group_id)
-            .ok_or(AnalyzerError::InvalidId(query_group_id))
     }
 
     fn worker(&self, worker_id: Uuid) -> AnalyzerResult<&Worker> {
@@ -226,10 +219,6 @@ impl QueryEngineModel for SiriusModel {
 
     fn queries(&self) -> impl Iterator<Item = &Query> {
         self.queries.values()
-    }
-
-    fn query_groups(&self) -> impl Iterator<Item = &QueryGroup> {
-        self.query_groups.values()
     }
 
     fn workers(&self) -> impl Iterator<Item = &Worker> {
@@ -262,6 +251,12 @@ impl QueryEngineModelMut for SiriusModel {
 }
 
 impl SiriusModel {
+    pub(crate) fn query_group(&self, query_group_id: Uuid) -> AnalyzerResult<&QueryGroup> {
+        self.query_groups
+            .get(&query_group_id)
+            .ok_or(AnalyzerError::InvalidId(query_group_id))
+    }
+
     pub(crate) fn query_view(&self, query_id: Uuid) -> AnalyzerResult<SiriusModelQueryView<'_>> {
         SiriusModelQueryView::try_new(self, query_id)
     }
@@ -800,7 +795,12 @@ impl SiriusModelBuilder {
         let mut dropped_queries = HashSet::default();
         for (query_id, builder) in self.queries {
             match Query::try_from_builder(builder) {
-                Ok(query) => {
+                Ok(mut query) => {
+                    let label = query
+                        .query_group_id()
+                        .and_then(|id| self.query_groups.get(&id))
+                        .and_then(|group| group.data().instance_name.clone());
+                    query.set_group_label(label);
                     queries.insert(query_id, query);
                 }
                 Err(err) => {

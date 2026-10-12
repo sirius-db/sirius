@@ -70,6 +70,7 @@ impl EngineEntity for Engine {
             duration_s: None,
             instance_name: data.instance_name.clone(),
             implementation: None,
+            custom_attributes: Vec::new(),
         })
     }
 }
