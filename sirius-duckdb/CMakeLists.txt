@@ -30,6 +30,15 @@ endif()
 
 set(EXTENSION_SOURCES src/sirius/sirius_extension.cpp)
 
+# DuckDB's mold options are directory-wide; this backend uses BFD. Keep the
+# override local so the host and sibling extensions retain their linker.
+if(DUCKDB_LINKER STREQUAL "mold")
+  string(REPLACE "${DUCKDB_LINKER_FLAG}" "" CMAKE_SHARED_LINKER_FLAGS
+                 "${CMAKE_SHARED_LINKER_FLAGS}")
+  string(REPLACE "${DUCKDB_MOLD_FLAGS}" "" CMAKE_SHARED_LINKER_FLAGS
+                 "${CMAKE_SHARED_LINKER_FLAGS}")
+endif()
+
 build_static_extension(${extension_name} ${EXTENSION_SOURCES})
 build_loadable_extension(${extension_name} " " ${EXTENSION_SOURCES})
 # Preserve RMM's shared device-resource registry across library boundaries.

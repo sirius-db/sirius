@@ -110,7 +110,9 @@ consumers. Use a separate build directory for each core configuration:
 Pass the absolute config path through `DUCKDB_EXTENSION_CONFIGS`. Backend configs
 use an installed static Sirius package by default; build that package with the
 matching CUDA toolkit and configure its vcpkg dependencies as described above.
-Use `-DDUCKDB_LINKER=bfd -DEXPORT_DYNAMIC_SYMBOLS=ON` for backend builds.
+Use `-DEXPORT_DYNAMIC_SYMBOLS=ON` for backend scan verification.
+The backend selects BFD locally; the host and other extensions keep DuckDB's
+linker settings.
 For shared development testing, override `-DSIRIUS_DUCKDB_LINKAGE=shared` and
 pass `-Dsirius_DIR=/path/to/install/lib/cmake/sirius`.
 The loader-only config needs no engine submodules. Upstream DuckDB's extension
