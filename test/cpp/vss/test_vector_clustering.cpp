@@ -41,8 +41,11 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -397,4 +400,159 @@ TEST_CASE("half and FP32 row norms report the same largest squared norm", "[vss]
   std::memcpy(&fp32_max, &out[1], sizeof(float));
   CHECK(half_max == 1600.f);
   CHECK(fp32_max == 1600.f);
+}
+
+namespace {
+
+// The label the list build promises: the centroid at the smallest FP32 squared distance, summed
+// in component order with fused multiply-adds, the lowest-numbered of equals.
+std::vector<std::int32_t> nearest_by_hand(std::vector<float> const& rows,
+                                          std::vector<float> const& centers,
+                                          std::int64_t dim)
+{
+  auto const n = static_cast<std::int64_t>(rows.size()) / dim;
+  auto const k = static_cast<std::int64_t>(centers.size()) / dim;
+  std::vector<std::int32_t> labels(static_cast<std::size_t>(n));
+  for (std::int64_t r = 0; r < n; ++r) {
+    float best = INFINITY;
+    for (std::int64_t c = 0; c < k; ++c) {
+      float acc = 0.f;
+      for (std::int64_t j = 0; j < dim; ++j) {
+        float const e = rows[static_cast<std::size_t>(r * dim + j)] -
+                        centers[static_cast<std::size_t>(c * dim + j)];
+        acc = std::fmaf(e, e, acc);
+      }
+      if (acc < best) {
+        best                                = acc;
+        labels[static_cast<std::size_t>(r)] = static_cast<std::int32_t>(c);
+      }
+    }
+  }
+  return labels;
+}
+
+std::vector<std::int32_t> labels_of(std::vector<float> const& rows,
+                                    std::vector<float> const& centers,
+                                    cudf::size_type dim)
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  raft::device_resources res{stream};
+  auto const vectors   = make_vectors(rows, dim);
+  auto const centroids = make_vectors(centers, dim);
+  sirius::vss::centroid_labeler labeler{res, centroids->view(), dim, Metric::L2Expanded, mr};
+  rmm::device_uvector<std::int32_t> labels(static_cast<std::size_t>(vectors->size()), stream);
+  labeler.label(vectors->view(), labels.data());
+  std::vector<std::int32_t> host(labels.size());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(host.data(),
+                                labels.data(),
+                                host.size() * sizeof(std::int32_t),
+                                cudaMemcpyDeviceToHost,
+                                stream.value()));
+  stream.synchronize();
+  return host;
+}
+
+}  // namespace
+
+// More rows than one launch ranks, enough centroids for the filtered path, and the cases a
+// rounded filter could get wrong: rows that are a centroid, and two centroids that are equal.
+TEST_CASE("centroid_labeler returns the centroid at the smallest FP32 distance", "[vss][kmeans]")
+{
+  constexpr cudf::size_type dim  = 16;
+  constexpr std::int64_t n_rows  = 140'000;
+  constexpr std::int64_t n_cents = 512;
+  std::mt19937 gen(7);
+  std::uniform_real_distribution<float> uniform(-1.f, 1.f);
+  std::vector<float> centers(static_cast<std::size_t>(n_cents * dim));
+  for (auto& v : centers) {
+    v = uniform(gen);
+  }
+  std::copy_n(centers.begin() + 7 * dim, dim, centers.begin() + 300 * dim);
+  std::vector<float> rows(static_cast<std::size_t>(n_rows * dim));
+  std::normal_distribution<float> noise(0.f, 0.05f);
+  for (std::int64_t r = 0; r < n_rows; ++r) {
+    auto const c = static_cast<std::int64_t>(gen() % n_cents);
+    for (std::int64_t j = 0; j < dim; ++j) {
+      // Every fifth row sits near a centroid, the rest anywhere; every thousandth is a centroid.
+      rows[static_cast<std::size_t>(r * dim + j)] =
+        r % 1000 == 0 ? centers[static_cast<std::size_t>(c * dim + j)]
+        : r % 5 == 0  ? centers[static_cast<std::size_t>(c * dim + j)] + noise(gen)
+                      : uniform(gen);
+    }
+  }
+  auto const expected = nearest_by_hand(rows, centers, dim);
+  auto const labels   = labels_of(rows, centers, dim);
+  REQUIRE(labels.size() == expected.size());
+  std::int64_t different = 0;
+  for (std::size_t r = 0; r < labels.size(); ++r) {
+    different += labels[r] != expected[r];
+  }
+  CHECK(different == 0);
+  CHECK(std::count(labels.begin(), labels.end(), 300) == 0);
+}
+
+// A row past half's range cannot be bounded on the tensor cores; its batch is ranked in FP32.
+TEST_CASE("centroid_labeler ranks a batch with a value outside half's range", "[vss][kmeans]")
+{
+  constexpr cudf::size_type dim  = 16;
+  constexpr std::int64_t n_cents = 256;
+  constexpr std::int64_t n_rows  = 1'000;
+  std::vector<float> centers(static_cast<std::size_t>(n_cents * dim), 0.f);
+  for (std::int64_t c = 0; c < n_cents; ++c) {
+    centers[static_cast<std::size_t>(c * dim)] = 100.f * static_cast<float>(c);
+  }
+  std::vector<float> rows(static_cast<std::size_t>(n_rows * dim), 0.f);
+  std::vector<std::int32_t> expected(static_cast<std::size_t>(n_rows));
+  for (std::int64_t r = 0; r < n_rows; ++r) {
+    auto const c                            = (r * 37) % n_cents;
+    rows[static_cast<std::size_t>(r * dim)] = 100.f * static_cast<float>(c) + 20.f;
+    expected[static_cast<std::size_t>(r)]   = static_cast<std::int32_t>(c);
+  }
+  rows[static_cast<std::size_t>(500 * dim)] = 1e6f;
+  expected[500]                             = n_cents - 1;
+  CHECK(labels_of(rows, centers, dim) == expected);
+}
+
+TEST_CASE("scatter_rows moves whole rows of any width", "[vss][kmeans]")
+{
+  auto const stream = cudf::get_default_stream();
+  for (std::int64_t const width : {3, 8, 96}) {
+    constexpr std::int64_t n = 1'000;
+    std::vector<std::uint8_t> src(static_cast<std::size_t>(n * width));
+    for (std::size_t i = 0; i < src.size(); ++i) {
+      src[i] = static_cast<std::uint8_t>(i * 31 + 7);
+    }
+    std::vector<std::int64_t> dest(static_cast<std::size_t>(n));
+    for (std::int64_t i = 0; i < n; ++i) {
+      dest[static_cast<std::size_t>(i)] = (i * 387) % n;  // 387 and 1,000 are coprime
+    }
+    rmm::device_uvector<std::uint8_t> src_d(src.size(), stream), out_d(src.size(), stream);
+    rmm::device_uvector<std::int64_t> dest_d(dest.size(), stream);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      src_d.data(), src.data(), src.size(), cudaMemcpyHostToDevice, stream.value()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(dest_d.data(),
+                                  dest.data(),
+                                  dest.size() * sizeof(std::int64_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    sirius::vss::scatter_rows(reinterpret_cast<std::byte const*>(src_d.data()),
+                              width,
+                              dest_d.data(),
+                              n,
+                              reinterpret_cast<std::byte*>(out_d.data()),
+                              stream);
+    std::vector<std::uint8_t> out(src.size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      out.data(), out_d.data(), out.size(), cudaMemcpyDeviceToHost, stream.value()));
+    stream.synchronize();
+    std::int64_t wrong = 0;
+    for (std::int64_t i = 0; i < n; ++i) {
+      wrong += std::memcmp(out.data() + dest[static_cast<std::size_t>(i)] * width,
+                           src.data() + i * width,
+                           static_cast<std::size_t>(width)) != 0;
+    }
+    CAPTURE(width);
+    CHECK(wrong == 0);
+  }
 }

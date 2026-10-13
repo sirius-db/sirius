@@ -57,13 +57,16 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -478,6 +481,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       col_max->data(), 0, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.value()));
   }
   {
+    centroid_labeler labeler{res, centroids->view(), dim, entry->meta.metric, mr};
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
       auto staged =
@@ -488,8 +492,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         throw std::runtime_error(fn + ": pinned column holds more rows than the pin reports");
       }
       rmm::device_uvector<std::int32_t> chunk_labels(static_cast<std::size_t>(rows), stream, mr);
-      nearest_centroid_labels(
-        res, staged.view, centroids->view(), dim, entry->meta.metric, chunk_labels.data(), mr);
+      labeler.label(staged.view, chunk_labels.data());
       if (check_uint8) {
         count_non_uint8(list_column_as_dataset_view(staged.view, dim).data_handle(),
                         rows * dim,
@@ -796,57 +799,108 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   phase("allocate");
 
   // Pass 2: stage each chunk again and move its rows into the lists. A list's rows keep pin
-  // order, so the rows one chunk contributes to a list are one contiguous run of that list: the
-  // chunk is grouped by cluster on the device and each group is a single copy (two where it
-  // straddles a host block). Writing rows through mapped host memory from a kernel instead ran
-  // at ~5 GB/s, one scattered PCIe write per row.
+  // order, so the rows one chunk contributes to a list are one contiguous run of that list, and
+  // the chunk is grouped by cluster on the device so that they are one run of the chunk too.
+  // What the lists keep on the device takes the grouped chunk in one scatter. What they keep on
+  // the host takes it in one transfer to pinned staging and a host copy per run, made while the
+  // device works on the next chunk. A device copy per run costs microseconds whatever its size,
+  // which grows with the cluster count and was most of the build at 16,384 clusters; writing
+  // rows through mapped host memory from a kernel ran at ~5 GB/s, one scattered PCIe write per
+  // row.
   {
     struct run {
       std::int64_t first;  // position in the grouped chunk
       std::int64_t dest;   // first layout row
       std::int64_t rows;
     };
-    std::vector<std::int64_t> order;
-    std::vector<std::int64_t> count(static_cast<std::size_t>(n_clusters));
-    std::vector<run> runs;
-    auto const row_bytes_v = lists.row_bytes();
-    auto const copy_kind   = on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
-    // Rows [dest, dest + n) of the layout from device memory @p src: one copy into the device
-    // matrix, or on the HOST tier a run of copies into the chunk's pinned blocks, each bounded by
-    // the chunk and the block it lands in.
-    auto write_rows = [&](std::int64_t dest, std::byte const* src, std::int64_t n) {
-      if (on_device) {
-        CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<std::byte*>(lists.device_vectors->data()) +
-                                        static_cast<std::size_t>(dest) * row_bytes_v,
-                                      src,
-                                      static_cast<std::size_t>(n) * row_bytes_v,
-                                      copy_kind,
-                                      stream.value()));
-        return;
-      }
-      while (n > 0) {
-        auto const chunk    = dest / lists.chunk_rows;
-        auto const in_chunk = dest % lists.chunk_rows;
-        auto const rows_now = std::min(n, lists.chunk_rows - in_chunk);
-        auto& alloc         = host_chunks[static_cast<std::size_t>(chunk)];
-        auto offset         = static_cast<std::size_t>(in_chunk) * row_bytes_v;
-        auto remaining      = static_cast<std::size_t>(rows_now) * row_bytes_v;
-        while (remaining > 0) {
-          auto const block    = offset / block_bytes;
-          auto const in_block = offset % block_bytes;
-          auto const bytes    = std::min(remaining, block_bytes - in_block);
-          CUDF_CUDA_TRY(cudaMemcpyAsync(
-            alloc->at(block).data() + in_block, src, bytes, copy_kind, stream.value()));
-          src += bytes;
-          offset += bytes;
-          remaining -= bytes;
+    auto const row_bytes_v     = lists.row_bytes();
+    auto const exact_row_bytes = static_cast<std::size_t>(dim) * sizeof(float);
+    // Where a byte of the host-resident layout lives, and how many bytes follow it in its block.
+    using piece         = std::pair<std::byte*, std::size_t>;
+    auto const exact_at = [&](std::size_t at) -> piece {
+      auto const row      = static_cast<std::int64_t>(at / exact_row_bytes);
+      auto const in_block = static_cast<std::size_t>(row % exact_rows_per_block) * exact_row_bytes +
+                            at % exact_row_bytes;
+      return {exact_ptrs[static_cast<std::size_t>(row / exact_rows_per_block)] + in_block,
+              static_cast<std::size_t>(exact_rows_per_block) * exact_row_bytes - in_block};
+    };
+    auto const chunk_at = [&](std::size_t at) -> piece {
+      auto const chunk_bytes = static_cast<std::size_t>(lists.chunk_rows) * row_bytes_v;
+      auto const chunk       = at / chunk_bytes;
+      auto const in_chunk    = at % chunk_bytes;
+      auto const in_block    = in_chunk % block_bytes;
+      auto const this_chunk =
+        static_cast<std::size_t>(lists.rows_in_chunk(static_cast<std::int64_t>(chunk))) *
+        row_bytes_v;
+      return {host_chunks[chunk]->at(in_chunk / block_bytes).data() + in_block,
+              std::min(block_bytes - in_block, this_chunk - in_chunk)};
+    };
+
+    // One grouped chunk on its way to the host. `copies` is declared last so that an unwinding
+    // build waits for them before the blocks they read are returned.
+    struct staging {
+      cucascade::memory::fixed_multiple_blocks_allocation blocks;
+      std::vector<std::future<void>> copies;
+      void wait()
+      {
+        for (auto& c : copies) {
+          c.get();
         }
-        dest += rows_now;
-        n -= rows_now;
+        copies.clear();
       }
     };
+    auto const download = [&](staging& s, std::byte const* src, std::size_t bytes) {
+      if (!s.blocks || s.blocks->size_bytes() < bytes) {
+        s.blocks.reset();
+        s.blocks = host_mr->allocate_multiple_blocks(bytes);
+      }
+      for (std::size_t at = 0; at < bytes; at += block_bytes) {
+        CUDF_CUDA_TRY(cudaMemcpyAsync(s.blocks->at(at / block_bytes).data(),
+                                      src + at,
+                                      std::min(block_bytes, bytes - at),
+                                      cudaMemcpyDeviceToHost,
+                                      stream.value()));
+      }
+    };
+    auto const copy_threads =
+      static_cast<std::size_t>(std::clamp<unsigned>(std::thread::hardware_concurrency(), 1u, 4u));
+    // Each run of the chunk staged in @p s to where @p at puts it.
+    auto const copy_out = [&](staging& s,
+                              std::shared_ptr<std::vector<run> const> const& runs,
+                              std::size_t width,
+                              auto const& at) {
+      auto const* blocks = s.blocks.get();
+      auto const n_tasks = std::min(copy_threads, runs->size());
+      for (std::size_t t = 0; t < n_tasks; ++t) {
+        auto const lo = runs->size() * t / n_tasks;
+        auto const hi = runs->size() * (t + 1) / n_tasks;
+        s.copies.push_back(
+          std::async(std::launch::async, [runs, lo, hi, width, at, blocks, block_bytes] {
+            for (auto i = lo; i < hi; ++i) {
+              auto const& g = (*runs)[i];
+              auto from     = static_cast<std::size_t>(g.first) * width;
+              auto to       = static_cast<std::size_t>(g.dest) * width;
+              auto left     = static_cast<std::size_t>(g.rows) * width;
+              while (left > 0) {
+                auto const in_block    = from % block_bytes;
+                auto const [out, room] = at(to);
+                auto const now         = std::min({left, block_bytes - in_block, room});
+                std::memcpy(out, blocks->at(from / block_bytes).data() + in_block, now);
+                from += now;
+                to += now;
+                left -= now;
+              }
+            }
+          }));
+      }
+    };
+    // Two of each, used in turn: the copies out of one overlap the transfer into the other.
+    std::array<staging, 2> exact_stages, row_stages;
+
+    std::vector<std::int64_t> order, grouped_dest;
+    std::vector<std::int64_t> count(static_cast<std::size_t>(n_clusters));
     std::int64_t base = 0;
-    for (std::size_t i = 0; i < n_chunks; ++i) {
+    for (std::size_t i = 0, turn = 0; i < n_chunks; ++i) {
       auto staged =
         stage_pinned_column_chunk(*c.pin, req.column, i, *c.space, stream, telemetry_info);
       auto const rows = static_cast<std::int64_t>(staged.view.size());
@@ -858,8 +912,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       for (std::int64_t r = 0; r < rows; ++r) {
         ++count[static_cast<std::size_t>(chunk_labels[r])];
       }
-      runs.clear();
-      std::int64_t pos = 0;
+      auto const runs_owner = std::make_shared<std::vector<run>>();
+      auto& runs            = *runs_owner;
+      std::int64_t pos      = 0;
       for (std::int64_t k = 0; k < n_clusters; ++k) {
         auto const n = count[static_cast<std::size_t>(k)];
         if (n == 0) { continue; }
@@ -868,16 +923,27 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         pos += n;
       }
       order.resize(static_cast<std::size_t>(rows));
+      grouped_dest.resize(static_cast<std::size_t>(rows));
       for (std::int64_t r = 0; r < rows; ++r) {
-        auto& slot                              = count[static_cast<std::size_t>(chunk_labels[r])];
-        order[static_cast<std::size_t>(slot++)] = r;
+        auto const slot =
+          static_cast<std::size_t>(count[static_cast<std::size_t>(chunk_labels[r])]++);
+        order[slot]        = r;
+        grouped_dest[slot] = dest[static_cast<std::size_t>(base + r)];
       }
       for (auto& g : runs) {
-        g.dest = dest[static_cast<std::size_t>(base + order[static_cast<std::size_t>(g.first)])];
+        g.dest = grouped_dest[static_cast<std::size_t>(g.first)];
       }
+
+      auto& exact_stage = exact_stages[turn % 2];
+      auto& row_stage   = row_stages[turn % 2];
+      ++turn;
+      // The chunk before last was staged here; its copies have had a whole chunk to finish.
+      exact_stage.wait();
+      row_stage.wait();
 
       rmm::device_uvector<std::int64_t> order_d(static_cast<std::size_t>(rows), stream, mr);
       rmm::device_uvector<std::int64_t> chunk_dest(static_cast<std::size_t>(rows), stream, mr);
+      rmm::device_uvector<std::int64_t> grouped_dest_d(static_cast<std::size_t>(rows), stream, mr);
       rmm::device_uvector<float> grouped(static_cast<std::size_t>(rows * dim), stream, mr);
       CUDF_CUDA_TRY(cudaMemcpyAsync(order_d.data(),
                                     order.data(),
@@ -889,6 +955,20 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                     static_cast<std::size_t>(rows) * sizeof(std::int64_t),
                                     cudaMemcpyHostToDevice,
                                     stream.value()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(grouped_dest_d.data(),
+                                    grouped_dest.data(),
+                                    static_cast<std::size_t>(rows) * sizeof(std::int64_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
+      // Per-row values of the grouped chunk into a device-resident part of the layout.
+      auto const scatter = [&](void const* src, std::size_t width, void* out) {
+        scatter_rows(static_cast<std::byte const*>(src),
+                     static_cast<std::int64_t>(width),
+                     grouped_dest_d.data(),
+                     rows,
+                     static_cast<std::byte*>(out),
+                     stream);
+      };
       gather_rows(vectors.data_handle(), dim, order_d.data(), rows, grouped.data(), stream);
       if (unit_rows) { normalize_rows(grouped.data(), rows, dim, grouped.data(), stream); }
       // The copies below read the grouped rows in the list encoding.
@@ -920,28 +1000,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
           float_row_sq_norms(
             grouped.data(), rows, dim, grouped_sqf->data(), max_norm_bits->data(), stream);
         }
-        auto const exact_row_bytes = static_cast<std::size_t>(dim) * sizeof(float);
-        for (auto const& g : runs) {
-          CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<float*>(lists.row_sq_f32->data()) + g.dest,
-                                        grouped_sqf->data() + g.first,
-                                        static_cast<std::size_t>(g.rows) * sizeof(float),
-                                        cudaMemcpyDeviceToDevice,
-                                        stream.value()));
-          for (std::int64_t t = 0; t < g.rows;) {
-            auto const r     = g.dest + t;
-            auto const in_bl = r % exact_rows_per_block;
-            auto const n     = std::min(g.rows - t, exact_rows_per_block - in_bl);
-            CUDF_CUDA_TRY(
-              cudaMemcpyAsync(exact_ptrs[static_cast<std::size_t>(r / exact_rows_per_block)] +
-                                static_cast<std::size_t>(in_bl) * exact_row_bytes,
-                              reinterpret_cast<std::byte const*>(grouped.data()) +
-                                static_cast<std::size_t>(g.first + t) * exact_row_bytes,
-                              static_cast<std::size_t>(n) * exact_row_bytes,
-                              cudaMemcpyDeviceToHost,
-                              stream.value()));
-            t += n;
-          }
-        }
+        scatter(grouped_sqf->data(), sizeof(float), lists.row_sq_f32->data());
+        download(exact_stage,
+                 reinterpret_cast<std::byte const*>(grouped.data()),
+                 static_cast<std::size_t>(rows) * exact_row_bytes);
       }
       if (encoding == list_encoding::int8) {
         grouped_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
@@ -957,13 +1019,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                            stream);
         int8_row_sq_norms(grouped_i8->data(), rows, dim, grouped_sq->data(), stream);
         grouped_bytes = reinterpret_cast<std::byte const*>(grouped_i8->data());
-        for (auto const& g : runs) {
-          CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<std::int32_t*>(lists.row_sq->data()) + g.dest,
-                                        grouped_sq->data() + g.first,
-                                        static_cast<std::size_t>(g.rows) * sizeof(std::int32_t),
-                                        cudaMemcpyDeviceToDevice,
-                                        stream.value()));
-        }
+        scatter(grouped_sq->data(), sizeof(std::int32_t), lists.row_sq->data());
       }
       if (encoding == list_encoding::uint8) {
         grouped_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
@@ -971,24 +1027,26 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         narrow_to_shifted_int8(grouped.data(), rows * dim, grouped_i8->data(), stream);
         int8_row_sq_norms(grouped_i8->data(), rows, dim, grouped_sq->data(), stream);
         grouped_bytes = reinterpret_cast<std::byte const*>(grouped_i8->data());
-        // The norms follow the rows: a run is one contiguous span of layout rows.
-        for (auto const& g : runs) {
-          CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<std::int32_t*>(lists.row_sq->data()) + g.dest,
-                                        grouped_sq->data() + g.first,
-                                        static_cast<std::size_t>(g.rows) * sizeof(std::int32_t),
-                                        cudaMemcpyDeviceToDevice,
-                                        stream.value()));
-        }
+        scatter(grouped_sq->data(), sizeof(std::int32_t), lists.row_sq->data());
       }
       scatter_row_ids(
         chunk_dest.data(), rows, base, static_cast<std::int64_t*>(lists.row_ids->data()), stream);
-      for (auto const& g : runs) {
-        write_rows(g.dest, grouped_bytes + static_cast<std::size_t>(g.first) * row_bytes_v, g.rows);
+      if (on_device) {
+        scatter(grouped_bytes, row_bytes_v, lists.device_vectors->data());
+      } else {
+        download(row_stage, grouped_bytes, static_cast<std::size_t>(rows) * row_bytes_v);
       }
-      // The staged chunk and the pageable sources of the copies above are released or reused
-      // once this iteration ends.
+      // The staged chunk, the grouped rows and the pageable sources of the copies above are
+      // released or reused once this iteration ends.
       stream.synchronize();
+      if (lists.exact_vectors) { copy_out(exact_stage, runs_owner, exact_row_bytes, exact_at); }
+      if (!on_device) { copy_out(row_stage, runs_owner, row_bytes_v, chunk_at); }
       base += rows;
+    }
+    for (auto* stages : {&exact_stages, &row_stages}) {
+      for (auto& s : *stages) {
+        s.wait();
+      }
     }
   }
   labels.clear();

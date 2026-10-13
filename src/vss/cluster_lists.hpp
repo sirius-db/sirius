@@ -25,6 +25,7 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -244,6 +245,16 @@ void scatter_row_ids(std::int64_t const* dest,
                      std::int64_t row_base,
                      std::int64_t* row_ids,
                      rmm::cuda_stream_view stream);
+
+/// Row dest[i] of @p out = row i of @p src for i in [0, n), rows of @p row_bytes bytes; the
+/// destinations are distinct. One launch moves a grouped chunk into the lists, however many
+/// lists its rows belong to.
+void scatter_rows(std::byte const* src,
+                  std::int64_t row_bytes,
+                  std::int64_t const* dest,
+                  std::int64_t n,
+                  std::byte* out,
+                  rmm::cuda_stream_view stream);
 
 /// Adds to @p out the number of the @p n values that are not an integer in [0, 255].
 void count_non_uint8(float const* values,

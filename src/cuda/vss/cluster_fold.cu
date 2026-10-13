@@ -27,6 +27,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -126,6 +127,18 @@ __global__ void scatter_row_ids_kernel(int64_t const* dest,
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     row_ids[dest[i]] = row_base + i;
+  }
+}
+
+template <typename T>
+__global__ void scatter_rows_kernel(
+  T const* src, int64_t width, int64_t const* dest, int64_t n, T* out)
+{
+  auto const total = n * width;
+  for (int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; p < total;
+       p += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const i                           = p / width;
+    out[dest[i] * width + (p - i * width)] = src[p];
   }
 }
 
@@ -446,6 +459,30 @@ void scatter_row_ids(
   if (n == 0) { return; }
   auto const grid = std::min(grid_for(n), 65535);
   scatter_row_ids_kernel<<<grid, kBlock, 0, stream.value()>>>(dest, n, row_base, row_ids);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void scatter_rows(std::byte const* src,
+                  int64_t row_bytes,
+                  int64_t const* dest,
+                  int64_t n,
+                  std::byte* out,
+                  rmm::cuda_stream_view stream)
+{
+  if (n == 0 || row_bytes == 0) { return; }
+  // Whole words when the rows are made of them, which every encoding but an odd-width UINT8 is.
+  auto const words = row_bytes % 4 == 0 && reinterpret_cast<std::uintptr_t>(src) % 4 == 0 &&
+                     reinterpret_cast<std::uintptr_t>(out) % 4 == 0;
+  if (words) {
+    auto const width = row_bytes / 4;
+    scatter_rows_kernel<uint32_t>
+      <<<std::min(grid_for(n * width), 65535), kBlock, 0, stream.value()>>>(
+        reinterpret_cast<uint32_t const*>(src), width, dest, n, reinterpret_cast<uint32_t*>(out));
+  } else {
+    scatter_rows_kernel<uint8_t>
+      <<<std::min(grid_for(n * row_bytes), 65535), kBlock, 0, stream.value()>>>(
+        reinterpret_cast<uint8_t const*>(src), row_bytes, dest, n, reinterpret_cast<uint8_t*>(out));
+  }
   CUDF_CHECK_CUDA(stream.value());
 }
 
