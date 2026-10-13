@@ -11,7 +11,7 @@ export VCPKG_CUDA_ARCHITECTURES ?= $(CUDAARCHS)
 override EXT_FLAGS += -DVCPKG_MANIFEST_FEATURES=static -DVCPKG_INSTALL_OPTIONS=--clean-buildtrees-after-build
 endif
 ifneq ($(strip $(SIRIUS_INSTALL_DIR)),)
-override EXT_FLAGS += -Dsirius_DIR='$(SIRIUS_INSTALL_DIR)/lib/cmake/sirius'
+override EXT_FLAGS += -Dsirius_ROOT='$(SIRIUS_INSTALL_DIR)'
 endif
 
 GEN ?= ninja

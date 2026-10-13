@@ -3790,8 +3790,8 @@ TEST_CASE("ordinary Parquet residual retirement protects source without a consum
                                sirius::logical_type::make(sirius::type_id::BIGINT)};
   info->column_ids          = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
   info->projection_ids      = {0, 1};
-  info->scan_output_arity   = 1;
-  info->table_filters       = duckdb::make_uniq<duckdb::TableFilterSet>();
+  info->projected_output_count = 1;
+  info->table_filters          = duckdb::make_uniq<duckdb::TableFilterSet>();
   info->table_filters->PushFilter(
     duckdb::ColumnIndex(1),
     duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
@@ -3898,13 +3898,13 @@ TEST_CASE("ordinary Parquet projection copies each repeat of a borrowed source b
       return cuda::mr::any_resource<cuda::mr::device_accessible>{counting_resource{tally}};
     }});
   // One materialized column, output three times: the second and third outputs are repeats.
-  auto info               = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
-  info->names             = {"key"};
-  info->returned_types    = {sirius::logical_type::make(sirius::type_id::BIGINT)};
-  info->column_ids        = {duckdb::ColumnIndex(0)};
-  info->projection_ids    = {0, 0, 0};
-  info->scan_output_arity = 3;
-  auto ingestible         = sirius::op::scan::make_ingestible(std::move(info));
+  auto info            = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->names          = {"key"};
+  info->returned_types = {sirius::logical_type::make(sirius::type_id::BIGINT)};
+  info->column_ids     = {duckdb::ColumnIndex(0)};
+  info->projection_ids = {0, 0, 0};
+  info->projected_output_count = 3;
+  auto ingestible              = sirius::op::scan::make_ingestible(std::move(info));
   std::vector<int64_t> expected(100);
   std::iota(expected.begin(), expected.end(), 0);
   auto project = [&](std::shared_ptr<cudf::table const> const& input) {

@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
   PRIVATE aggregate/aggregate_op_util.cpp
+          aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
           aggregate/gpu_aggregate_impl.cpp
           merge/gpu_merge_impl.cpp
@@ -36,6 +37,7 @@ target_sources(
           scan/equality_delete_filter.cpp
           scan/iceberg_delete_pipeline.cpp
           scan/iceberg_gpu_ingestible.cpp
+          scan/iceberg_dv_preparation.cpp
           dynamic_filter/dynamic_filter_key_domain.cpp
           dynamic_filter/dynamic_filter_publish_plan.cpp
           dynamic_filter/complete_build_inventory.cpp

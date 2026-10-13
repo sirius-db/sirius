@@ -107,7 +107,7 @@ sirius:
 
 `run_tpch_parquet_and_generate_telemetry.sh` runs TPC-H queries in Sirius,
 labels each `(query, iteration)` pair with `sirius_set_query_label`, and writes
-Quent postcard files to `sirius.telemetry.output_directory`.
+Quent NDJSON files to `sirius.telemetry.output_directory`.
 
 ```bash
 pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \

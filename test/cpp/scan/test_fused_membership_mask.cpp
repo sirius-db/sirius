@@ -25,6 +25,9 @@
  *        materialized cast — and a nullable probe column yields a non-nullable mask that the
  *        filtered decode consumes. A dictionary-encoded STRING key chunk is reconstructed to
  *        STRING before the probe, which fingerprints it in-kernel against a STRING-built set.
+ *
+ * A probe that declines stands down as the identity of the combined mask, and a decode left with
+ * nothing to select by falls back to the plain decode.
  */
 
 #include "api/simpatico_codegen.hpp"
@@ -108,6 +111,17 @@ std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_decimal_key_set(
   return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
 }
 
+/// A membership directive on @p column whose probe declines every batch, as one does when the key
+/// column's type is outside its key family.
+sirius::codegen::membership_filter_directive make_declining_directive(std::size_t column)
+{
+  return {column,
+          [](cudf::column_view,
+             std::uint32_t const*,
+             ::cuda::stream_ref,
+             rmm::device_async_resource_ref) { return std::unique_ptr<cudf::column>{}; }};
+}
+
 }  // namespace
 
 TEST_CASE("filtered-decode membership probe consumes the static range mask as a prior",
@@ -188,6 +202,86 @@ TEST_CASE("filtered-decode membership probe stays prior-free without another sou
   }
   REQUIRE(result.survivor_count == static_cast<std::int64_t>(expect_k.size()));
   REQUIRE(out->num_columns() == 2);
+  CHECK(column_to_host(out->view().column(1), stream) == expect_k);
+}
+
+TEST_CASE("a declining membership probe leaves the range's survivors",
+          "[fused_scan_filter][dynamic_filter]")
+{
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const mr                   = cudf::get_current_device_resource_ref();
+  auto table                      = make_source_table(stream);
+  auto const ct = simpatico::compress_with_plan(table->view(), kBitpackPlans, stream, mr);
+
+  simpatico::stream_pool pool;
+  REQUIRE(pool.init(4));
+
+  sirius::codegen::scan_filter_request request;
+  request.filters.push_back({0, {0, 19}});  // v in [0, 19]
+  request.membership_filters.push_back(make_declining_directive(1));
+  request.routes = {sirius::codegen::decode_route::bitpack_mask,
+                    sirius::codegen::decode_route::bitpack_mask};
+
+  std::vector<std::size_t> const selected{0, 1};
+  sirius::codegen::scan_filter_result result;
+  auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
+  if (gate_stayed_off(result)) {
+    WARN("filtered-decode env gate off in this process; skipping membership coverage");
+    return;
+  }
+
+  // The declined probe is the identity of the AND, so the range alone selects.
+  REQUIRE(result.applied);
+  CHECK(result.status == sirius::codegen::scan_filter_status::applied);
+  std::vector<std::int32_t> expect_v;
+  std::vector<std::int32_t> expect_k;
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    if (i % 100 <= 19) {
+      expect_v.push_back(i % 100);
+      expect_k.push_back(i % 50);
+    }
+  }
+  REQUIRE(result.survivor_count == static_cast<std::int64_t>(expect_v.size()));
+  REQUIRE(out->num_columns() == 2);
+  CHECK(column_to_host(out->view().column(0), stream) == expect_v);
+  CHECK(column_to_host(out->view().column(1), stream) == expect_k);
+}
+
+TEST_CASE("a declining membership probe alone falls back to the plain decode",
+          "[fused_scan_filter][dynamic_filter]")
+{
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const mr                   = cudf::get_current_device_resource_ref();
+  auto table                      = make_source_table(stream);
+  auto const ct = simpatico::compress_with_plan(table->view(), kBitpackPlans, stream, mr);
+
+  simpatico::stream_pool pool;
+  REQUIRE(pool.init(4));
+
+  sirius::codegen::scan_filter_request request;
+  request.membership_filters.push_back(make_declining_directive(1));
+  request.routes = {sirius::codegen::decode_route::bitpack_mask,
+                    sirius::codegen::decode_route::bitpack_mask};
+
+  std::vector<std::size_t> const selected{0, 1};
+  sirius::codegen::scan_filter_result result;
+  auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
+  if (gate_stayed_off(result)) {
+    WARN("filtered-decode env gate off in this process; skipping membership coverage");
+    return;
+  }
+
+  // With no source left to select by, the decode gives up and returns every row.
+  REQUIRE_FALSE(result.applied);
+  CHECK(result.status == sirius::codegen::scan_filter_status::failed);
+  std::vector<std::int32_t> expect_v;
+  std::vector<std::int32_t> expect_k;
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    expect_v.push_back(i % 100);
+    expect_k.push_back(i % 50);
+  }
+  REQUIRE(out->num_columns() == 2);
+  CHECK(column_to_host(out->view().column(0), stream) == expect_v);
   CHECK(column_to_host(out->view().column(1), stream) == expect_k);
 }
 

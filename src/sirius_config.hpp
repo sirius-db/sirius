@@ -257,15 +257,15 @@ struct operator_params {
   uint64_t avg_variable_column_bytes = 32;
 };
 
+constexpr std::string QUENT_NDJSON_EXPORTER = "ndjson";
+
 struct telemetry_config {
   bool enable_quent{true};
-  /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
-  /// Roughly doubles telemetry volume; no-op when enable_quent is false.
-  bool enable_batch_events{true};
   /// Capture NVTX ranges (Sirius and libcudf) into Quent; no-op when
   /// enable_quent is false.
   bool enable_nvtx{false};
-  std::string exporter{"ndjson"};
+
+  std::string exporter{QUENT_NDJSON_EXPORTER};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
   /// Optional override naming an NVTX injection library. Normally Sirius uses
@@ -319,6 +319,8 @@ struct sirius_config {
   // Explicit hardware-resolving helpers for internal configuration consumers.
   // Runtime startup takes parsed_sirius_config instead.
   void load_from_file(const std::filesystem::path& config_path);
+  /// Replace all settings with hardware-resolved defaults. Apply programmatic
+  /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept

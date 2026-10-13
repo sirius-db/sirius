@@ -1168,7 +1168,7 @@ std::unique_ptr<scan::parquet_ingestible_table_info> resident_parquet_info(
     info->column_ids.emplace_back(column);
     info->projection_ids.push_back(info->projection_ids.size());
   }
-  info->scan_output_arity = output_arity;
+  info->projected_output_count = output_arity;
   if (positive_filter) {
     info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
     info->table_filters->PushFilter(
@@ -1439,7 +1439,7 @@ TEST_CASE("resident Parquet checkpoint sizes its skip policy by the projected ro
     info->column_ids.emplace_back(column);
     info->projection_ids.push_back(column);
   }
-  info->scan_output_arity = 2;
+  info->projected_output_count = 2;
   resident_parquet_fixture f(std::move(info), 2);
   auto filter = f.publish(0, {41, 53});
   scan::detail::consumer_test_access::gate(*f.consumer)
@@ -1628,13 +1628,13 @@ TEST_CASE("resident Parquet declines layouts without a borrowed DATA proof",
   }
   std::shared_ptr<scan::gpu_ingestible> ingestible;
   if (iceberg) {
-    auto ice               = std::make_unique<scan::iceberg_ingestible_table_info>();
-    ice->names             = {"key"};
-    ice->returned_types    = {sirius::logical_type::make(sirius::type_id::BIGINT)};
-    ice->column_ids        = {duckdb::ColumnIndex(0)};
-    ice->scan_output_arity = 1;
-    ice->delete_data       = std::make_shared<scan::IcebergDeleteData>();
-    ingestible             = std::make_shared<scan::iceberg_gpu_ingestible>(std::move(ice));
+    auto ice                    = std::make_unique<scan::iceberg_ingestible_table_info>();
+    ice->names                  = {"key"};
+    ice->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT)};
+    ice->column_ids             = {duckdb::ColumnIndex(0)};
+    ice->projected_output_count = 1;
+    ice->delete_data            = std::make_shared<scan::IcebergDeleteData>();
+    ingestible                  = std::make_shared<scan::iceberg_gpu_ingestible>(std::move(ice));
   } else if (unknown) {
     ingestible = std::make_shared<stub_ingestible>([] { return std::make_unique<cudf::table>(); });
   } else {

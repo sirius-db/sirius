@@ -23,6 +23,7 @@
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/scan_plan.hpp>
 #include <sirius_config.hpp>
 
 // duckdb
@@ -60,6 +61,7 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   duckdb::vector<sirius::logical_type> returned_types;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
+  std::size_t projected_output_count = 0;
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
@@ -227,7 +229,10 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   /// virtual output columns — rowid decodes as a regular leading data column.
   /// If native scans ever synthesize output columns, replace this constant with
   /// a derivation like parquet's.
-  [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override { return true; }
+  [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override
+  {
+    return _column_layout.output_is_identity;
+  }
 
   [[nodiscard]] bool has_row_filter() const noexcept override
   {
@@ -238,6 +243,7 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   void run_metadata_walk();
 
   std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> _info;
+  scan_column_layout _column_layout;
   duckdb_native_walk_plan _plan;
   std::shared_ptr<duckdb::Expression> _filter_expression;
   duckdb::SingleFileBlockManager const* _block_manager = nullptr;

@@ -433,6 +433,26 @@ stub_operator::sink_fn make_allocating_sink_fn(cucascade::memory::memory_space* 
   };
 }
 
+/// Drives a fresh task's Task FSM to `reserving`, as task_executor::schedule and
+/// gpu_pipeline_executor::manager_loop do, so execute() may legally emit `preparing`.
+void advance_to_reserving(sirius::pipeline::sirius_pipeline_itask& task)
+{
+  auto& fsm = task.telemetry_fsm();
+  fsm.queued({.queue = {.target = quent::task_queue::TaskQueueId{quent::nil_uuid()},
+                        .data   = {.entries = 1}}});
+  fsm.reserving({
+    .requested_bytes      = 0,
+    .input_basis          = 0,
+    .peak_estimate        = 0,
+    .bytes_to_materialize = 0,
+    .manager_thread =
+      {
+        .target = quent::task_manager_loop_thread::TaskManagerLoopThreadId{quent::nil_uuid()},
+        .data   = {},
+      },
+  });
+}
+
 //------------------------------------------------------------------------------
 // Helper: build a gpu_pipeline_task from a data batch and reservation size.
 // Pass reservation_size = 0 to skip reservation (for estimation flow).
@@ -464,7 +484,7 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
     REQUIRE(ls != nullptr);
     ls->set_reservation(std::move(reservation), info);
   }
-
+  advance_to_reserving(*task);
   return task;
 }
 
@@ -1028,6 +1048,7 @@ TEST_CASE("gpu_pipeline_task hands a scan receipt through operator OOM and retry
       dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(task->local_state());
     REQUIRE(local != nullptr);
     local->set_reservation(std::move(reservation), info);
+    advance_to_reserving(*task);
     return task;
   };
   auto task = make_task(std::make_unique<sirius::op::pipelineable_operator_data>(
@@ -1138,6 +1159,7 @@ TEST_CASE("gpu_pipeline_task restores a deferral into the scan receipt's own pay
       dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(task->local_state());
     REQUIRE(local != nullptr);
     local->set_reservation(std::move(reservation), info);
+    advance_to_reserving(*task);
     return task;
   };
   auto task = make_task(std::make_unique<sirius::op::pipelineable_operator_data>(
@@ -1213,6 +1235,7 @@ TEST_CASE("gpu_pipeline_task restores a deferral at the sink into a partitioned 
     dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(task->local_state());
   REQUIRE(local != nullptr);
   local->set_reservation(std::move(reservation), info);
+  advance_to_reserving(*task);
   task->execute(stream);
   REQUIRE(sink_partition == 3);
   REQUIRE(sink_device == 0);
@@ -1285,6 +1308,7 @@ TEST_CASE("gpu_pipeline_task does not reschedule dynamic filter cleanup with unj
   auto* local = dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(task->local_state());
   REQUIRE(local != nullptr);
   local->set_reservation(std::move(reservation), info);
+  advance_to_reserving(*task);
   REQUIRE_THROWS_AS(task->execute(stream), sirius::unjoined_gpu_work);
   REQUIRE(execute_calls == 1);
   REQUIRE(sink_calls == 0);
@@ -1350,6 +1374,7 @@ TEST_CASE("gpu_pipeline_task prepare OOM resumes at the current start index",
     rmm::cuda_stream stream;
     bool threw = false;
     try {
+      advance_to_reserving(*task);
       task->execute(stream);
     } catch (sirius::pipeline::oom_reschedule_exception& ex) {
       threw = true;
@@ -1490,6 +1515,7 @@ TEST_CASE("gpu_pipeline_task resumed at the sink sentinel restores and publishes
     std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(carried),
                                                                       operator_count),
     global_state);
+  advance_to_reserving(*retry);
   {
     constexpr std::size_t kReservation = 128ULL * 1024 * 1024;
     auto info                          = retry->get_estimated_reservation_size_info(f.gpu_space);
@@ -1918,6 +1944,7 @@ TEST_CASE(
     current.local_state()
       ->template cast<sirius::pipeline::gpu_pipeline_task_local_state>()
       .set_reservation(std::move(reservation), info);
+    advance_to_reserving(current);
   };
   attach(*task, initial_reservation);
   std::unique_ptr<cucascade::memory::reservation> capacity_pressure;
