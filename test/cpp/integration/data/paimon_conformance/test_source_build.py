@@ -36,6 +36,7 @@ class SourceBuildTests(unittest.TestCase):
             "state": "built",
             "recipe_sha256": digest(builder.RECIPE),
             "builder_sha256": digest(Path(builder.__file__)),
+            "downloader_sha256": digest(builder.DOWNLOADER),
             "pixi_lock_sha256": digest(builder.ROOT / "pixi.lock"),
             "sources": self.recipe["sources"],
             "cmake_options": self.recipe["cmake_options"],
@@ -75,6 +76,7 @@ class SourceBuildTests(unittest.TestCase):
         for key, bad in (
             ("recipe_sha256", "0" * 64),
             ("builder_sha256", "0" * 64),
+            ("downloader_sha256", "0" * 64),
             ("pixi_lock_sha256", "0" * 64),
             ("state", "failed"),
             ("duckdb_identity", {"version": "v1.5.5", "platform": "linux_amd64"}),
@@ -247,7 +249,7 @@ class SourceBuildTests(unittest.TestCase):
         self.assertFalse((output / "build-receipt.json").exists())
 
     def test_inputs_changed_during_build_cannot_receive_success_receipt(self):
-        for key in ("cli", "recipe", "builder", "lock"):
+        for key in ("cli", "recipe", "builder", "downloader", "lock"):
             with self.subTest(key=key):
                 recipe = self.root / (key + "-recipe.json")
                 recipe.write_text(json.dumps(self.recipe))
@@ -256,16 +258,21 @@ class SourceBuildTests(unittest.TestCase):
                 (lock_root / "pixi.lock").write_text("test lock")
                 script = self.root / (key + "-builder.py")
                 script.write_text("test builder")
+                downloader = self.root / (key + "-downloader.py")
+                downloader.write_text("test downloader")
                 path = {
                     "cli": self.cli,
                     "recipe": recipe,
                     "builder": script,
+                    "downloader": downloader,
                     "lock": lock_root / "pixi.lock",
                 }[key]
                 output = self.root / (key + "-mutated-build")
                 with patch.object(builder, "RECIPE", recipe), patch.object(
                     builder, "ROOT", lock_root
-                ), patch.object(builder, "__file__", str(script)):
+                ), patch.object(builder, "__file__", str(script)), patch.object(
+                    builder, "DOWNLOADER", downloader
+                ):
                     with self.assertRaisesRegex(
                         ValueError, "changed during source build"
                     ):

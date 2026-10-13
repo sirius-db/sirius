@@ -234,6 +234,7 @@ for result in results: print(json.dumps(result))
             "state": "built",
             "recipe_sha256": digest(builder.RECIPE),
             "builder_sha256": digest(Path(builder.__file__)),
+            "downloader_sha256": digest(builder.DOWNLOADER),
             "pixi_lock_sha256": digest(builder.ROOT / "pixi.lock"),
             "sources": recipe["sources"],
             "cmake_options": recipe["cmake_options"],

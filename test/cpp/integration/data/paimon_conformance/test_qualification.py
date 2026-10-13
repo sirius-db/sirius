@@ -145,7 +145,8 @@ class QualificationTests(unittest.TestCase):
                 if not isinstance(bad, bytes):
                     first.__enter__ = Mock(return_value=first)
                     first.__exit__ = Mock(return_value=False)
-                    first.read.side_effect = bad
+                    first.headers = {}
+                    first.read1.side_effect = bad
                 fetch = Mock(side_effect=[first, io.BytesIO(self.data)])
                 sleep = Mock()
                 provision(self.record, self.target, opener=fetch, delay=sleep)

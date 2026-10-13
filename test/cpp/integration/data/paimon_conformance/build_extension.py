@@ -14,14 +14,14 @@ import tarfile
 import tempfile
 import time
 from urllib.error import HTTPError
-from urllib.request import urlopen
 
 from corpus_checks import digest
-from qualified_extension import download, DownloadFailure
+from qualified_extension import download, DownloadFailure, open_https
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[4]
 RECIPE = HERE / "source-build.json"
+DOWNLOADER = HERE / "qualified_extension.py"
 BUILD_ENVIRONMENT_KEYS = (
     "CC",
     "CXX",
@@ -43,7 +43,7 @@ def read_recipe():
     return recipe
 
 
-def fetch_source(record, destination, *, opener=urlopen, delay=time.sleep):
+def fetch_source(record, destination, *, opener=open_https, delay=time.sleep):
     """Retry transport errors, but never bypass a source checksum failure."""
     for attempt in range(1, 4):
         try:
@@ -135,6 +135,7 @@ def validate_receipt(receipt_path, extension, cli, identity):
         "state": "built",
         "recipe_sha256": digest(RECIPE),
         "builder_sha256": digest(Path(__file__)),
+        "downloader_sha256": digest(DOWNLOADER),
         "pixi_lock_sha256": digest(ROOT / "pixi.lock"),
         "sources": recipe["sources"],
         "cmake_options": recipe["cmake_options"],
@@ -189,6 +190,7 @@ def build(cli, output, jobs, source_cache=None):
     input_hashes = {
         "recipe_sha256": digest(RECIPE),
         "builder_sha256": digest(Path(__file__)),
+        "downloader_sha256": digest(DOWNLOADER),
         "pixi_lock_sha256": digest(ROOT / "pixi.lock"),
     }
     recipe = read_recipe()
@@ -328,6 +330,7 @@ def build(cli, output, jobs, source_cache=None):
     for name, path in (
         ("recipe_sha256", RECIPE),
         ("builder_sha256", Path(__file__)),
+        ("downloader_sha256", DOWNLOADER),
         ("pixi_lock_sha256", ROOT / "pixi.lock"),
     ):
         if digest(path) != input_hashes[name]:
@@ -337,6 +340,7 @@ def build(cli, output, jobs, source_cache=None):
         "state": "built",
         "recipe_sha256": digest(RECIPE),
         "builder_sha256": digest(Path(__file__)),
+        "downloader_sha256": digest(DOWNLOADER),
         "pixi_lock_sha256": digest(ROOT / "pixi.lock"),
         "sources": recipe["sources"],
         "cmake_options": recipe["cmake_options"],

@@ -14,6 +14,8 @@ reading the corpus. It needs no hosted Paimon binary or community installation.
 by commit, size and SHA256, together with the build options. Native dependencies
 use the upstream bundled versions and checksums. The recipe supports DuckDB
 v1.5.6 on Linux x86_64; other versions/platforms require a reviewed recipe update.
+See [dependency download evidence](DEPENDENCIES.md) for the enabled direct and
+nested downloads, exact checksum-enforcement rules, and Python download policy.
 
 Build through the repository's locked Pixi environment. The local-filesystem
 recipe disables OSS, S3 and REST and produces a loadable extension for the Sirius
@@ -21,12 +23,14 @@ CLI. It does not add a Paimon dependency to ordinary Sirius builds. Cold builds
 compile native dependencies including Arrow and Parquet and take longer than
 reading this small corpus.
 
-A build receipt records the source recipe, builder and Pixi lock hashes, compiler
+A build receipt records the source recipe, builder, shared downloader and Pixi lock hashes, compiler
 versions, target executable identity/hash, and output size/hash. The runner
 requires that receipt by default and rejects stale inputs, a changed executable,
 or changed extension bytes. This is provenance from a trusted local/CI builder,
 not a signed attestation or a promise of byte-identical rebuilds. A successful
 build does not qualify reader correctness; conformance must pass separately.
+Receipts without the current downloader hash require a fresh build; do not update
+old receipts by hand.
 
 `qualified-artifacts.json` retains historical community-binary identities for
 explicit `--registry` investigations. Those results do not qualify a newly built
