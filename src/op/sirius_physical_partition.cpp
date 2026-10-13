@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -390,14 +391,24 @@ sirius_physical_partition::input_totals sirius_physical_partition::compute_input
     if (batch) {
       auto ro = batch->to_read_only();
       if (ro.get_data()) {
-        auto const bytes = ro.get_data()->get_size_in_bytes();
-        totals.bytes += bytes;
+        auto const bytes      = ro.get_data()->get_size_in_bytes();
+        totals.bytes          = memory::saturating_add(totals.bytes, bytes);
+        totals.resident_bytes = memory::saturating_add(
+          totals.resident_bytes, ro.get_data()->get_uncompressed_data_size_in_bytes());
+        auto const measured_rows = representation_num_rows(*ro.get_data());
+        if (totals.measured_rows) {
+          totals.measured_rows = measured_rows ? std::optional<uint64_t>{memory::saturating_add(
+                                                   *totals.measured_rows, *measured_rows)}
+                                               : std::nullopt;
+        }
         if (auto const rows = representation_num_rows(ro.get_data())) {
           totals.rows += *rows;
           counted_bytes += bytes;
         } else {
           uncounted_bytes += bytes;
         }
+      } else {
+        totals.measured_rows = std::nullopt;
       }
     }
   }
@@ -640,7 +651,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
                                       sizing_partition._is_build,
                                       has_build_concat(*this) || has_build_concat(sibling),
                                       sirius::memory::saturating_add(this_bytes, sibling_bytes),
-                                      sizing_totals.rows};
+                                      sizing_totals.rows,
+                                      sizing_totals.measured_rows,
+                                      sizing_totals.resident_bytes};
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy      = consumer->get_partition_strategy(in);
@@ -661,13 +674,17 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
       } else if (in.is_build_side && strategy.num_partitions == 1 && hash_join != nullptr &&
                  hash_join->publishes_dynamic_filters() &&
-                 in.total_bytes < hash_join->max_build_hash_table_bytes()) {
+                 in.resident_bytes.value_or(in.total_bytes) <
+                   hash_join->max_build_probe_resident_bytes &&
+                 in.measured_rows &&
+                 *in.measured_rows <=
+                   static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max())) {
         // Not BUILD_PROBE, but the build lands in one partition and this join publishes a filter
         // from a single build batch, so folding it only moves a batch boundary. Best-effort: no
         // build-side CONCAT means no publication. Build-side sizing is required — right-family
         // joins size from the probe, where one partition says nothing about the build's size.
-        // The byte bound matters when hash_partition_bytes exceeds the build budget: a build
-        // refused BUILD_PROBE for being too large must not be folded whole for a filter either.
+        // The byte bound matters when hash_partition_bytes exceeds the resident budget: a build
+        // too large to hold folded and resident must not be folded whole for a filter either.
         bool const found_this    = enable_build_concat_all(*this);
         bool const found_sibling = enable_build_concat_all(sibling);
         build_arrives_whole      = found_this || found_sibling;
@@ -696,11 +713,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       auto const total_rows = estimated.has_value()
                                 ? scale_rows(received.rows, total_bytes, received.bytes)
                                 : received.rows;
-      partition_sizing_input const in{total_bytes,
-                                      _is_build,
-                                      /*build_foldable=*/false,
-                                      /*combined_total_bytes=*/total_bytes,
-                                      total_rows};
+      partition_sizing_input const in{
+        total_bytes,
+        _is_build,
+        /*build_foldable=*/false,
+        /*combined_total_bytes=*/total_bytes,
+        total_rows,
+        estimated.has_value() ? std::nullopt : received.measured_rows,
+        estimated.has_value() ? std::nullopt : std::optional<uint64_t>{received.resident_bytes}};
       auto const strategy = consumer->get_partition_strategy(in);
       apply_partition_strategy(strategy, *consumer);
       _sizing_bytes = in.total_bytes;

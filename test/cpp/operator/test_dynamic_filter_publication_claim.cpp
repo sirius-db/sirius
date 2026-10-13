@@ -273,9 +273,12 @@ TEST_CASE("hash join in BUILD_PROBE mode still publishes from a whole build",
   claim_fixture fixture;
 
   // Sizing from a small foldable build side selects BUILD_PROBE.
-  auto const strategy =
-    fixture.hash_join->get_partition_strategy(sirius::op::partition_sizing_input{
-      .total_bytes = 1024, .is_build_side = true, .build_foldable = true});
+  auto const strategy = fixture.hash_join->get_partition_strategy(
+    sirius::op::partition_sizing_input{.total_bytes    = 1024,
+                                       .is_build_side  = true,
+                                       .build_foldable = true,
+                                       .measured_rows  = 64,
+                                       .resident_bytes = 1024});
   REQUIRE(strategy.build_probe);
   REQUIRE(fixture.hash_join->is_build_probe_mode());
 

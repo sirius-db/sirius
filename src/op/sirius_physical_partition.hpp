@@ -202,10 +202,13 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 
-  /// Bytes and rows of the batches waiting on this partition's input port.
+  /// Raw storage bytes, best-effort rows, measured metadata rows, and decoded resident bytes of the
+  /// input batches.
   struct input_totals {
-    uint64_t bytes = 0;
-    uint64_t rows  = 0;
+    uint64_t bytes                        = 0;
+    uint64_t rows                         = 0;
+    std::optional<uint64_t> measured_rows = 0;
+    uint64_t resident_bytes               = 0;
   };
 
   /// Sum the bytes and rows of all batches waiting on this partition's input port. Fed to the

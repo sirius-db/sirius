@@ -937,7 +937,8 @@ void require_shared_operator_defaults(const sirius::operator_params& params, uin
   REQUIRE(params.concat_batch_bytes == batch);
   REQUIRE(params.cross_join_task_bytes == batch);
   REQUIRE(params.sort_sample_bytes == batch);
-  REQUIRE(params.max_build_hash_table_bytes == 2 * batch);
+  REQUIRE(params.max_build_hash_table_bytes == 8 * batch);
+  REQUIRE(params.max_build_probe_resident_bytes == 8 * batch);
 }
 
 fs::path config_fixture(std::string const& name)
@@ -1042,6 +1043,7 @@ TEST_CASE("explicit operator batch values override effective-capacity defaults",
   REQUIRE(params.sort_sample_bytes == 4 * mib);
   REQUIRE(params.max_build_hash_table_bytes == 5 * mib);
   REQUIRE(params.cross_join_task_bytes == 6 * mib);
+  REQUIRE(params.max_build_probe_resident_bytes == 7 * mib);
 }
 
 TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",
@@ -1109,7 +1111,8 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
            current_setting('hash_partition_bytes')::UBIGINT,
            current_setting('concat_batch_bytes')::UBIGINT,
            current_setting('sort_sample_bytes')::UBIGINT,
-           current_setting('max_build_hash_table_bytes')::UBIGINT
+           current_setting('max_build_hash_table_bytes')::UBIGINT,
+           current_setting('max_build_probe_resident_bytes')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1117,7 +1120,8 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE(settings->GetValue(1, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(settings->GetValue(2, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(settings->GetValue(3, 0).GetValue<uint64_t>() == expected_batch);
-  REQUIRE(settings->GetValue(4, 0).GetValue<uint64_t>() == 2 * expected_batch);
+  REQUIRE(settings->GetValue(4, 0).GetValue<uint64_t>() == 8 * expected_batch);
+  REQUIRE(settings->GetValue(5, 0).GetValue<uint64_t>() == 8 * expected_batch);
 
   auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
@@ -1426,7 +1430,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
       current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
       current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
-      current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT
+      current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT,
+      current_setting('max_build_probe_resident_bytes')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1454,6 +1459,22 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->GetValue(19, 0).GetValue<double>() == Approx(0.4));
   REQUIRE(settings->GetValue(20, 0).GetValue<bool>());
   REQUIRE(settings->GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
+  REQUIRE(settings->GetValue(22, 0).GetValue<uint64_t>() == 9 * mib);
+  auto require_resident_budget = [&](uint64_t value) {
+    auto result = con.Query("SELECT current_setting('max_build_probe_resident_bytes')::UBIGINT");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0).GetValue<uint64_t>() == value);
+    REQUIRE(sirius_ctx->get_config().get_operator_params().max_build_probe_resident_bytes == value);
+  };
+  auto resident_set = con.Query("SET max_build_probe_resident_bytes = 99");
+  REQUIRE(resident_set != nullptr);
+  REQUIRE_FALSE(resident_set->HasError());
+  require_resident_budget(99);
+  auto resident_reset = con.Query("RESET max_build_probe_resident_bytes");
+  REQUIRE(resident_reset != nullptr);
+  REQUIRE_FALSE(resident_reset->HasError());
+  require_resident_budget(9 * mib);
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =
@@ -1620,6 +1641,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
 
   auto const& params = sirius_ctx->get_config().get_operator_params();
   REQUIRE(params.scan_task_batch_size == 1 * mib);
+  REQUIRE(params.max_build_probe_resident_bytes == 9 * mib);
   REQUIRE(params.max_sort_partition_memory_fraction == Approx(0.25));
   REQUIRE_FALSE(params.enable_dynamic_filter);
   auto const& compression = sirius_ctx->get_config().get_compression_config();

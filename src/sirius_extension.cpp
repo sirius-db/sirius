@@ -2705,6 +2705,16 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
                    params->max_build_hash_table_bytes);
 }
 
+static void SetMaxBuildProbeResidentBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                              = lock_operator_params_slot(context);
+  params->max_build_probe_resident_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_PROBE_RESIDENT_BYTES to {}",
+                   params->max_build_probe_resident_bytes);
+}
+
 static void SetMaxBroadcastJoinSize(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -3402,11 +3412,20 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             SetSortSampleBytes);
 
   config.AddExtensionOption("max_build_hash_table_bytes",
-                            "Maximum size a build-side table can be where it will create a "
-                            "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
+                            "Maximum per-GPU estimated BUILD_PROBE hash-table bytes (measured "
+                            "build rows x 16 B) for a hash join to build a reusable hash table "
+                            "(i.e. BUILD_PROBE mode)",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(operator_defaults.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
+
+  config.AddExtensionOption(
+    "max_build_probe_resident_bytes",
+    "Maximum per-GPU decoded folded build-side bytes a BUILD_PROBE hash join may "
+    "keep GPU-resident (un-spillable) for the whole probe stream",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.max_build_probe_resident_bytes),
+    SetMaxBuildProbeResidentBytes);
 
   config.AddExtensionOption("max_broadcast_join_size",
                             "Maximum build-side size in bytes for a broadcast join, where the "
