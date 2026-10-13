@@ -617,6 +617,7 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
 std::unique_ptr<sirius::op::scan::simpatico_ingestible_table_info> build_simpatico_table_info(
   sirius::op::sirius_physical_table_scan const& scan_op,
   const sirius::operator_params& op_params,
+  duckdb::ClientContext& context,
   duckdb::SiriusContext* sirius_ctx)
 {
   if (sirius_ctx == nullptr) {
@@ -643,6 +644,14 @@ std::unique_ptr<sirius::op::scan::simpatico_ingestible_table_info> build_simpati
   // headers, zone maps) would go through the filesystem, which cannot open a remote object at
   // all. Null when no backend claims the path -- the transport then reads it locally, and
   // refuses it outright if it names a scheme.
+  // S3 credentials come from the query's SIRIUS_S3 secret, as for parquet scans: install them for
+  // this path before routing it, or the REST io_context has nothing to sign with.
+  if (sirius::io::s3::is_s3_path(path)) {
+    sirius_ctx->get_scan_manager().install_s3_config(
+      path,
+      sirius::io::s3::resolve_duckdb_s3_secret(
+        context, path, sirius_ctx->get_config().get_scan_manager_config().object_store));
+  }
   auto io_ctx = sirius_ctx->get_scan_manager().ioctx_for_path(path);
 
   // The payload stages into pinned host memory before its H2D copy; any host space serves, and
@@ -1778,7 +1787,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_simpatico_scan(
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  return make_gpu_scan_leaf(build_simpatico_table_info(scan, op_params, sirius_ctx.get()),
+  return make_gpu_scan_leaf(build_simpatico_table_info(scan, op_params, context, sirius_ctx.get()),
                             scan,
                             op_params,
                             mode,

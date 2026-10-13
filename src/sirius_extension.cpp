@@ -352,6 +352,14 @@ unique_ptr<FunctionData> SiriusReadSimpaticoBind(ClientContext& context,
   // message from the transport rather than as "no such file".
   sirius::hpln_open_options options;
   if (auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    // S3 credentials come from the connection's SIRIUS_S3 secret; install them for this path
+    // before routing it, as sirius_read_parquet does.
+    if (sirius::io::s3::is_s3_path(path)) {
+      state->get_scan_manager().install_s3_config(
+        path,
+        sirius::io::s3::resolve_duckdb_s3_secret(
+          context, path, state->get_config().get_scan_manager_config().object_store));
+    }
     options.io_ctx = state->get_scan_manager().ioctx_for_path(path);
   }
   // Shared and cached, like the plan generator's bind: DuckDB re-binds a view on every query, and
@@ -360,7 +368,8 @@ unique_ptr<FunctionData> SiriusReadSimpaticoBind(ClientContext& context,
   auto schema  = sirius::read_hpln_schema_shared(path, options);
   return_types = schema->types;
   names.assign(schema->names.begin(), schema->names.end());
-  auto bind = make_uniq<SiriusReadSimpaticoBindData>(path, static_cast<std::size_t>(schema->num_rows));
+  auto bind =
+    make_uniq<SiriusReadSimpaticoBindData>(path, static_cast<std::size_t>(schema->num_rows));
   bind->bound_types = return_types;
   bind->bound_names = names;
   return std::move(bind);
@@ -1298,6 +1307,14 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     int const first_gpu_id = gpu_spaces[0]->get_device_id();
     auto* host_space       = host_space_by_gpu.at(first_gpu_id);
 
+    if (sirius::io::s3::is_s3_path(data.args.path)) {
+      scan_mgr.install_s3_config(
+        data.args.path,
+        sirius::io::s3::resolve_duckdb_s3_secret(
+          context,
+          data.args.path,
+          sirius_ctx->get_config().get_scan_manager_config().object_store));
+    }
     auto io_ctx = scan_mgr.ioctx_for_path(data.args.path);
     // The same bind a read_simpatico() scan does, so the entry's identity and column layout are
     // built from the same numbers the query side will present -- the reason a pinned .hpln is
