@@ -22,6 +22,7 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -46,7 +47,9 @@
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace sirius {
 
@@ -64,16 +67,41 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
 
   gpu_ids           = planner::apply_gpu_cap(std::move(gpu_ids), config.gpus_per_query());
   auto const n_gpus = static_cast<int>(gpu_ids.size());
-  if (bpg == 0 || n_gpus <= 1) { return gpu_ids; }
+  if (bpg == 0) { return gpu_ids; }
+  // On a single GPU the estimate cannot change the allocation, but it is still computed and
+  // logged: the `[gpu_alloc] estimated` line is how the estimate is checked against real scan
+  // sizes, and single-GPU hosts are where that check usually runs.
 
   std::vector<const op::sirius_physical_operator*> scans;
   planner::collect_gpu_scans(plan, scans);
   std::vector<planner::scan_estimate> estimates;
   estimates.reserve(scans.size());
+  std::size_t scans_with_table_rows   = 0;
+  std::size_t scans_with_known_widths = 0;
   for (auto const* scan : scans) {
-    estimates.push_back(
-      {static_cast<uint64_t>(scan->estimated_cardinality),
-       planner::estimate_bytes_per_row(scan->types, op_params.avg_variable_column_bytes)});
+    // The plan generator stamped each GPU scan with the table function's unfiltered row count
+    // and any column widths its source could state (see scan_admission_hint). Rows never drop
+    // below the planner estimate; widths only replace the configured variable-width average.
+    std::optional<uint64_t> unfiltered_rows;
+    std::vector<std::optional<uint64_t>> const* widths = nullptr;
+    if (auto const* gpu_scan = dynamic_cast<const op::scan::sirius_gpu_scan_operator*>(scan)) {
+      auto const& hint = gpu_scan->admission_hint();
+      unfiltered_rows  = hint.unfiltered_rows;
+      widths           = &hint.column_widths;
+    }
+    if (unfiltered_rows.has_value()) { ++scans_with_table_rows; }
+    bool const any_width =
+      widths != nullptr &&
+      std::any_of(widths->begin(), widths->end(), [](auto const& w) { return w.has_value(); });
+    if (any_width) { ++scans_with_known_widths; }
+
+    auto const rows = planner::admission_row_count(
+      static_cast<uint64_t>(scan->estimated_cardinality), unfiltered_rows);
+    auto const bytes_per_row =
+      widths != nullptr
+        ? planner::estimate_bytes_per_row(scan->types, op_params.avg_variable_column_bytes, *widths)
+        : planner::estimate_bytes_per_row(scan->types, op_params.avg_variable_column_bytes);
+    estimates.push_back({rows, bytes_per_row});
   }
 
   // nullopt means at least one scan carried no usable row estimate; admit the full capped
@@ -87,7 +115,13 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
                   scans.size(),
                   k,
                   n_gpus);
-  gpu_ids.resize(static_cast<size_t>(k));
+  SIRIUS_LOG_DEBUG(
+    "[gpu_alloc] estimate sources: {} of {} scan(s) sized from the table's unfiltered row count, "
+    "{} with column widths from Parquet footers or table statistics",
+    scans_with_table_rows,
+    scans.size(),
+    scans_with_known_widths);
+  if (static_cast<int>(gpu_ids.size()) > k) { gpu_ids.resize(static_cast<size_t>(k)); }
   return gpu_ids;
 }
 

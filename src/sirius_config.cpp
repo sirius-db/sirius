@@ -40,13 +40,16 @@ namespace sirius {
 
 namespace config {
 
-uint64_t derived_default_batch_size()
+namespace {
+
+/// Total memory of the smallest visible GPU; nullopt when none is visible.
+/// cudaGetDeviceCount/Properties honor CUDA_VISIBLE_DEVICES and do not create a context.
+std::optional<uint64_t> smallest_visible_gpu_memory()
 {
-  // cudaGetDeviceCount/Properties honor CUDA_VISIBLE_DEVICES and do not create a context.
-  static uint64_t const value = [] {
+  static std::optional<uint64_t> const value = []() -> std::optional<uint64_t> {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
-      return DEFAULT_BATCH_SIZE;
+      return std::nullopt;
     }
     uint64_t min_total = 0;
     for (int id = 0; id < device_count; ++id) {
@@ -55,10 +58,32 @@ uint64_t derived_default_batch_size()
       auto const total = static_cast<uint64_t>(prop.totalGlobalMem);
       min_total        = min_total == 0 ? total : std::min(min_total, total);
     }
-    if (min_total == 0) { return DEFAULT_BATCH_SIZE; }
+    if (min_total == 0) { return std::nullopt; }
+    return min_total;
+  }();
+  return value;
+}
+
+}  // namespace
+
+uint64_t derived_default_batch_size()
+{
+  static uint64_t const value = [] {
+    auto const min_total = smallest_visible_gpu_memory();
+    if (!min_total) { return DEFAULT_BATCH_SIZE; }
     constexpr uint64_t min_batch = 512ULL * 1024 * 1024;       // 512 MiB floor
     constexpr uint64_t max_batch = 5ULL * 1024 * 1024 * 1024;  // 5 GiB ceiling
-    return std::clamp(min_total / 40, min_batch, max_batch);   // 2.5%
+    return std::clamp(*min_total / 40, min_batch, max_batch);  // 2.5%
+  }();
+  return value;
+}
+
+uint64_t derived_default_admission_bytes_per_gpu()
+{
+  static uint64_t const value = [] {
+    auto const min_total = smallest_visible_gpu_memory();
+    if (!min_total) { return uint64_t{0}; }  // no GPU: nothing to admit, estimate off
+    return admission_bytes_per_gpu_for_memory(*min_total);
   }();
   return value;
 }
