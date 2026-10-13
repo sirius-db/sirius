@@ -98,14 +98,29 @@ class simpatico_batch_coalescer : public batch_coalescer {
   std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info> info) override
   {
     std::vector<std::unique_ptr<scan_info>> out;
-    auto* split = dynamic_cast<simpatico_scan_info*>(info.get());
-    if (split == nullptr) { return out; }
+    if (!info) { return out; }
+    std::size_t cursor = 0;
+    for (;;) {
+      auto step = advance(*info, cursor, std::numeric_limits<std::size_t>::max());
+      if (step.batch) { out.push_back(std::move(step.batch)); }
+      if (step.finished) { return out; }
+    }
+  }
+
+  /// The preparation coordinator drives the coalescer through this cursor: one call per
+  /// metadata result, at most one batch out per call. A split is one chunk, so @p quantum never
+  /// splits it; a call that has to seal the current batch first returns it unfinished and the next
+  /// call adds the chunk.
+  cursor_step advance(scan_info& input, std::size_t& /*cursor*/, std::size_t /*quantum*/) override
+  {
+    auto* split = dynamic_cast<simpatico_scan_info*>(&input);
+    if (split == nullptr) { return {nullptr, true}; }
 
     static constexpr std::int64_t kCudfMaxRows = std::numeric_limits<cudf::size_type>::max();
     bool const byte_cap_hit =
       _current && _cap > 0 && _current->decoded_bytes + split->decoded_bytes > _cap;
     bool const row_cap_hit = _current && _current->num_rows + split->num_rows > kCudfMaxRows;
-    if (byte_cap_hit || row_cap_hit) { out.push_back(seal(std::move(_current))); }
+    if (byte_cap_hit || row_cap_hit) { return {seal_current(), false}; }
 
     if (!_current) {
       _current       = std::make_unique<simpatico_scan_info>();
@@ -136,17 +151,31 @@ class simpatico_batch_coalescer : public batch_coalescer {
     _current->num_rows += split->num_rows;
     _current->decoded_bytes += split->decoded_bytes;
     _current->ranges.insert(_current->ranges.end(), split->ranges.begin(), split->ranges.end());
-    return out;
+    note_retained();
+    return {nullptr, true};
+  }
+
+  /// An underfilled batch whose wait passed the coordinator's residence deadline.
+  std::unique_ptr<scan_info> partial_emit() override
+  {
+    if (!_current) { return {}; }
+    return seal_current();
   }
 
   std::vector<std::unique_ptr<scan_info>> flush() override
   {
     std::vector<std::unique_ptr<scan_info>> out;
-    if (_current) { out.push_back(seal(std::move(_current))); }
+    if (_current) { out.push_back(seal_current()); }
     return out;
   }
 
  private:
+  [[nodiscard]] std::unique_ptr<scan_info> seal_current()
+  {
+    clear_retained();
+    return seal(std::move(_current));
+  }
+
   /// Turn a finished batch into the split the scan runs: with a prefetch hint for the bytes its
   /// read will fetch, so the cache pulls them in before the task is scheduled rather than the task
   /// waiting on them while it holds its reservation. Each batch gets a datasource of its own
