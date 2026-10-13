@@ -179,21 +179,6 @@ struct cluster_assignment {
                                                      rmm::device_async_resource_ref mr);
 
 /**
- * @brief Each row's single nearest centroid, as INT32 labels written to @p labels.
- *
- * The one-probe case of @ref assign_to_centroids without its edge list: cuVS's k-means predict
- * fuses the distance and the argmin into one pass, where a top-1 search materializes every
- * row-centroid distance and then selects from it. Same enqueue-only contract.
- */
-void nearest_centroid_labels(raft::device_resources const& res,
-                             cudf::column_view const& vectors,
-                             cudf::column_view const& centroids,
-                             std::int64_t dim,
-                             cuvs::distance::DistanceType metric,
-                             std::int32_t* labels,
-                             rmm::device_async_resource_ref mr);
-
-/**
  * @brief Each row's nearest centroid, for the many chunks one list build assigns to one clustering.
  *
  * Under L2, for widths the half-precision filter takes and enough centroids to sample, the rows
@@ -202,8 +187,9 @@ void nearest_centroid_labels(raft::device_resources const& res,
  * centroids keeps those that may be within it, and the FP32 distance picks among what passed.
  * The label is the centroid at the smallest FP32 squared distance, the lowest-numbered of equals:
  * the rounding only decides which pairs are scored, as in the bounded search over FLOAT16 lists.
- * Everything else, and a batch whose candidates do not fit, goes to cuVS's k-means predict
- * (@ref nearest_centroid_labels). SIRIUS_VSS_BOUND_GEMM=0 sends every batch there.
+ * Everything else, and a batch whose candidates do not fit, goes to cuVS's k-means predict, which
+ * fuses an FP32 distance and the argmin into one pass. SIRIUS_VSS_BOUND_GEMM=0 sends every batch
+ * there.
  */
 class centroid_labeler {
  public:

@@ -298,32 +298,6 @@ cluster_assignment assign_to_centroids(raft::device_resources const& res,
   return cluster_assignment{std::move(columns[0]), std::move(columns[1]), std::move(columns[2])};
 }
 
-void nearest_centroid_labels(raft::device_resources const& res,
-                             cudf::column_view const& vectors,
-                             cudf::column_view const& centroids,
-                             std::int64_t dim,
-                             cuvs::distance::DistanceType metric,
-                             std::int32_t* labels,
-                             rmm::device_async_resource_ref mr)
-{
-  auto const queries = list_column_as_dataset_view(vectors, dim);
-  auto const centers = list_column_as_dataset_view(centroids, dim);
-  if (centers.extent(0) == 0) {
-    throw std::invalid_argument("nearest_centroid_labels: no centroids");
-  }
-  if (queries.extent(0) == 0) { return; }
-  // cuVS takes no allocator, so its scratch is routed by the ambient resource.
-  scoped_current_device_resource const route{mr};
-  cuvs::cluster::kmeans::balanced_params params;
-  params.metric = metric;
-  cuvs::cluster::kmeans::predict(
-    res,
-    params,
-    queries,
-    centers,
-    raft::make_device_vector_view<int, std::int64_t>(labels, queries.extent(0)));
-}
-
 namespace {
 
 constexpr int kLabelBlock = 256;
