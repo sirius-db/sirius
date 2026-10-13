@@ -23,12 +23,12 @@
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "exec/stream_bind_catalog.hpp"
+#include "helper/transaction_utils.hpp"
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
 #include "log/noop_sink.hpp"
@@ -500,8 +500,7 @@ SiriusContext::internal_connection SiriusContext::open_internal_connection(Clien
   }
   // These lookups inspect the committed database map and search path only; using
   // GetDatabase(outer, name) here could start a transaction before the gate.
-  auto database =
-    DatabaseManager::Get(*outer.db).GetDatabase(DatabaseManager::GetDefaultDatabase(outer));
+  auto database = sirius::helper::find_default_global_database(outer);
   if (!database) {
     throw InvalidInputException("Sirius internal connection target database is unavailable");
   }

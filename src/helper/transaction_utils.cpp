@@ -17,6 +17,7 @@
 #include "transaction_utils.hpp"
 
 #include <duckdb/catalog/catalog.hpp>
+#include <duckdb/main/client_context.hpp>
 #include <duckdb/main/database_manager.hpp>
 #include <duckdb/transaction/duck_transaction.hpp>
 
@@ -27,6 +28,13 @@ duckdb::transaction_t get_query_start_time(duckdb::ClientContext& context)
   auto const& name = duckdb::DatabaseManager::Get(context).GetDefaultDatabase(context);
   auto& catalog    = duckdb::Catalog::GetCatalog(context, name);
   return duckdb::DuckTransaction::Get(context, catalog).start_time;
+}
+
+duckdb::shared_ptr<duckdb::AttachedDatabase> find_default_global_database(
+  duckdb::ClientContext& context)
+{
+  return duckdb::DatabaseManager::Get(*context.db)
+    .GetDatabase(duckdb::DatabaseManager::GetDefaultDatabase(context));
 }
 
 duckdb::shared_ptr<duckdb::AttachedDatabase> find_global_database(duckdb::ClientContext& context,

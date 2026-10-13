@@ -43,6 +43,10 @@ namespace sirius::helper {
 /// DuckTransaction::Get(context, that_catalog).start_time directly.
 duckdb::transaction_t get_query_start_time(duckdb::ClientContext& context);
 
+/// Looks up the default database in the committed map without starting a transaction.
+duckdb::shared_ptr<duckdb::AttachedDatabase> find_default_global_database(
+  duckdb::ClientContext& context);
+
 duckdb::shared_ptr<duckdb::AttachedDatabase> find_global_database(duckdb::ClientContext& context,
                                                                   duckdb::Identifier const& name);
 
