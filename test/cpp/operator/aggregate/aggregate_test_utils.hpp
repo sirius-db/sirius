@@ -90,7 +90,11 @@ AggregateExpressionResult create_aggregate_expressions(
     result.output_types.push_back(sirius::from_duckdb(Traits::logical_type()));
   }
   for (std::size_t i = 0; i < aggregations.size(); ++i) {
-    if (aggregations[i] == "avg") {
+    if (aggregations[i] == "count") {
+      result.output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::BIGINT));
+    } else if (aggregations[i] == "stddev_samp") {
+      result.output_types.push_back(sirius::from_duckdb(duckdb::LogicalType::DOUBLE));
+    } else if (aggregations[i] == "avg") {
       // DECIMAL AVG preserves the DECIMAL type; non-DECIMAL AVG returns DOUBLE
       if constexpr (Traits::is_decimal) {
         result.output_types.push_back(sirius::from_duckdb(Traits::logical_type()));
@@ -116,7 +120,11 @@ AggregateExpressionResult create_aggregate_expressions(
 
     // AVG on DECIMAL preserves the DECIMAL type; on other types returns DOUBLE
     duckdb::LogicalType ret_type;
-    if (agg_name == "avg") {
+    if (agg_name == "count") {
+      ret_type = duckdb::LogicalType::BIGINT;
+    } else if (agg_name == "stddev_samp") {
+      ret_type = duckdb::LogicalType::DOUBLE;
+    } else if (agg_name == "avg") {
       if constexpr (Traits::is_decimal) {
         ret_type = Traits::logical_type();
       } else {
@@ -190,7 +198,7 @@ make_test_data_for_grouped_aggregate(std::size_t num_groups,
   std::vector<std::string> expected_group_by1(num_groups);  // Used when num_group_key_columns == 2
   std::vector<typename Traits::type> expected_min(num_groups);
   std::vector<typename Traits::type> expected_max(num_groups);
-  std::vector<int32_t> expected_count(num_groups);
+  std::vector<int64_t> expected_count(num_groups);
 
   // Populate data for each group
   std::size_t offset = 0;
@@ -265,7 +273,7 @@ make_test_data_for_grouped_aggregate(std::size_t num_groups,
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_min, stream, mr));
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_max, stream, mr));
   expected_cols.push_back(
-    vector_to_cudf_column<operator_utils::gpu_type_traits<int32_t>>(expected_count, stream, mr));
+    vector_to_cudf_column<operator_utils::gpu_type_traits<int64_t>>(expected_count, stream, mr));
   auto expected_table = std::make_unique<cudf::table>(std::move(expected_cols));
 
   return {std::move(input_table), std::move(expected_table)};
@@ -307,7 +315,7 @@ make_test_data_for_grouped_aggregate_with_avg(std::size_t num_groups,
   std::vector<std::string> expected_group_by1(num_groups);
   std::vector<typename Traits::type> expected_min(num_groups);
   std::vector<typename Traits::type> expected_max(num_groups);
-  std::vector<int32_t> expected_count(num_groups);
+  std::vector<int64_t> expected_count(num_groups);
 
   // For DECIMAL, AVG preserves the DECIMAL type; otherwise FLOAT64
   std::vector<double> expected_avg_f64(num_groups);
@@ -399,7 +407,7 @@ make_test_data_for_grouped_aggregate_with_avg(std::size_t num_groups,
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_min, stream, mr));
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_max, stream, mr));
   expected_cols.push_back(
-    vector_to_cudf_column<operator_utils::gpu_type_traits<int32_t>>(expected_count, stream, mr));
+    vector_to_cudf_column<operator_utils::gpu_type_traits<int64_t>>(expected_count, stream, mr));
   if constexpr (Traits::is_decimal) {
     expected_cols.push_back(vector_to_cudf_column<Traits>(expected_avg_dec, stream, mr));
   } else {

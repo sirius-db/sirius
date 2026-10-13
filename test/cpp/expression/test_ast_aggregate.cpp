@@ -90,8 +90,8 @@ AggregateFunction make_dummy_aggregate(std::string const& name,
 
 static_assert(std::is_enum_v<aggregate_id>, "sirius::aggregate_id must be an enum class.");
 static_assert(sizeof(aggregate_id) == 2, "sirius::aggregate_id is uint16_t-backed (locked ABI).");
-static_assert(static_cast<uint16_t>(aggregate_id::first) + 1 == 8,
-              "sirius::aggregate_id has exactly 8 entries (locked ABI).");
+static_assert(static_cast<uint16_t>(aggregate_id::stddev_samp) + 1 == 9,
+              "sirius::aggregate_id has exactly 9 entries (locked ABI).");
 
 // ============================================================================
 // aggregate_id name mapper round-trips
@@ -112,6 +112,7 @@ TEST_CASE("ast_aggregate - every supported aggregate name maps to its id", "[ast
     {"max", aggregate_id::max},
     {"avg", aggregate_id::avg},
     {"first", aggregate_id::first},
+    {"stddev_samp", aggregate_id::stddev_samp},
   };
   for (auto const& c : cases) {
     auto const id = from_duckdb_aggregate_name(c.name);
