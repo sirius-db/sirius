@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import run_conformance
 from corpus_checks import canonical_json, digest
 from run_conformance import main
 
@@ -23,7 +24,7 @@ HERE = Path(__file__).resolve().parent
 
 class OrchestrationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(prefix="paimon reader's; ")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
         self.corpus = self.root / "corpus"
@@ -78,7 +79,22 @@ if '-cmd' in sys.argv:
     assert sys.argv[sys.argv.index('-cmd') + 1] == '.output sql-results.json'
     sys.stdout = open('sql-results.json', 'w')
 
+def fixture_query(candidate):
+    table = manifest['tables'][candidate['table']]
+    snapshot = table['snapshots'][candidate['snapshot']] if candidate['snapshot'] else None
+    scan = "paimon_scan('" + (corpus+'/'+table['path']).replace("'", "''") + "'"
+    if snapshot is not None: scan += ', snapshot_from_id='+str(snapshot)
+    return candidate['sql'].format(scan=scan+')')
+
+# This double recognizes our finite generated protocol, not arbitrary SQL.
+# Compare the whole tail, not a DESCRIBE substring. In particular, do not split
+# on semicolons: quoted filesystem paths can contain them.
+_, separator, tail = sql.partition("SELECT current_setting('gpu_execution') AS gpu;")
+if not separator: raise RuntimeError('Unexpected test SQL: missing setup boundary')
 if 'SET enable_duckdb_fallback=false;' in sql:
+    candidate = next(c for c in spec['cases'] if c['id']=='append_b')
+    if tail != 'SET enable_duckdb_fallback=false;'+fixture_query(candidate):
+        raise RuntimeError('Unexpected test SQL: rejection requires the actual Paimon query')
     print("GPU plan generation failed: Table function 'paimon_scan' is not supported in Sirius", file=sys.stderr, flush=True)
     if fault == 'rejection_crash':
         import resource, signal
@@ -90,13 +106,14 @@ if fault == 'mutate_warehouse':
 attached = 'ATTACH ' in sql
 case = None
 for candidate in spec['cases']:
-    table = manifest['tables'][candidate['table']]
-    snapshot = table['snapshots'][candidate['snapshot']] if candidate['snapshot'] else None
-    scan = "paimon_scan('" + (corpus+'/'+table['path']).replace("'", "''") + "'"
-    if snapshot is not None: scan += ', snapshot_from_id='+str(snapshot)
-    scan += ')'
-    query = candidate['sql'].format(scan=scan)
-    if (attached and candidate['id']=='pk_d') or (not attached and 'DESCRIBE '+query+';' in sql):
+    prefix = ''
+    query = fixture_query(candidate)
+    if attached:
+        if candidate['id'] != 'pk_d': continue
+        prefix = "ATTACH '"+(corpus+'/warehouse').replace("'", "''")+"' AS p (TYPE paimon, READ_ONLY);"
+        query = 'SELECT id, amount FROM p.reference.orders_pk'
+    expected = prefix+'DESCRIBE '+query+';'+query+"; SELECT 'LIVENESS_OK' AS probe;"
+    if tail == expected:
         case=candidate
         break
 if case is None: raise RuntimeError('Unexpected test SQL: '+sql)
@@ -131,6 +148,7 @@ for result in results: print(json.dumps(result))
         source=False,
         sirius=None,
         default_sirius=False,
+        sql_mutation=None,
     ):
         (self.corpus / "expectations.json").write_text(canonical_json(self.spec))
         args = [
@@ -159,17 +177,36 @@ for result in results: print(json.dumps(result))
         for case in selected:
             args.extend(["--case", case])
         error = None
+        execute = run_conformance.execute
+        mutated = []
+
+        def execute_with_mutation(command, **kwargs):
+            if sql_mutation and kwargs["log"].name == sql_mutation[0]:
+                command = list(command)
+                index = command.index("-c") + 1
+                original = command[index]
+                command[index] = sql_mutation[1](original)
+                self.assertNotEqual(command[index], original)
+                mutated.append(command[index])
+            return execute(command, **kwargs)
+
         with patch.dict(
             os.environ,
             PAIMON_TEST_FAULT=fault,
             PAIMON_TEST_TARGET=target,
             PAIMON_TEST_REQUIRE_UNSIGNED="1" if source or sirius else "0",
             PAIMON_TEST_SIRIUS=str(sirius) if sirius else "",
-        ), contextlib.redirect_stdout(io.StringIO()):
+        ), patch.object(
+            run_conformance, "execute", execute_with_mutation
+        ), contextlib.redirect_stdout(
+            io.StringIO()
+        ):
             try:
                 main(args)
             except Exception as caught:
                 error = caught
+        if sql_mutation:
+            self.assertEqual(len(mutated), 1, "Mutation must reach one real CLI call")
         report = json.loads(
             next((self.root / "reports").glob("run-*/report.json")).read_text()
         )
@@ -266,6 +303,104 @@ for result in results: print(json.dumps(result))
         self.assertNotIn(
             "Engine diagnostic", (run_dir / "transparent.results.json").read_text()
         )
+
+    def assert_sql_mutation_fails(self, label, transform, case_id, mode):
+        shutil.rmtree(self.root / "reports", ignore_errors=True)
+        report, error = self.run_suite(["append_b"], sql_mutation=(label, transform))
+        self.assertIsNotNone(error)
+        self.assertEqual(report["state"], "failed")
+        self.assertEqual(
+            (report["executed_cases"], report["failed_cases"], report["not_run_cases"]),
+            (5, 1, 0),
+        )
+        failures = [case for case in report["cases"] if case["state"] == "FAIL"]
+        self.assertEqual(
+            [(case["id"], case["mode"]) for case in failures], [(case_id, mode)]
+        )
+        self.assertIn("Unexpected test SQL", failures[0]["error"])
+        self.assertTrue(
+            all(
+                case["state"] == "PASS"
+                for case in report["cases"]
+                if case not in failures
+            )
+        )
+
+    def test_cli_double_requires_ordered_query_and_liveness_in_every_read_path(self):
+        # Change the SQL actually sent to the child, not its fabricated JSON.
+        # DESCRIBE alone must never be enough to obtain a successful response.
+        for label, case_id, mode in (
+            ("disabled-append_b", "append_b", "disabled"),
+            ("cpu-append_b", "append_b", "cpu"),
+            ("transparent", "rows_and_liveness", "transparent"),
+            ("attached", "attached_catalog", "cpu"),
+        ):
+            for fault in (
+                "missing_query",
+                "missing_describe",
+                "missing_liveness",
+                "early_liveness",
+                "query_before_describe",
+                "duplicate_query",
+                "different_query",
+                "extra_statement",
+            ):
+                with self.subTest(label=label, fault=fault):
+
+                    def transform(sql):
+                        prefix, tail = sql.split("DESCRIBE ", 1)
+                        ending = "; SELECT 'LIVENESS_OK' AS probe;"
+                        # The generated tail repeats the exact query twice. Avoid
+                        # splitting on semicolons, which can occur in quoted paths.
+                        repeated = tail.removesuffix(ending)
+                        query = repeated[: (len(repeated) - 1) // 2]
+                        self.assertEqual(repeated, query + ";" + query)
+                        describe = "DESCRIBE " + query + ";"
+                        read = query + ";"
+                        live = " SELECT 'LIVENESS_OK' AS probe;"
+                        tails = {
+                            "missing_query": describe + live,
+                            "missing_describe": read + live,
+                            "missing_liveness": describe + read,
+                            "early_liveness": describe + live + read,
+                            "query_before_describe": read + describe + live,
+                            "duplicate_query": describe + read + read + live,
+                            "different_query": describe + "SELECT 42;" + live,
+                            "extra_statement": describe + read + live + "SELECT 42;",
+                        }
+                        return prefix + tails[fault]
+
+                    self.assert_sql_mutation_fails(label, transform, case_id, mode)
+
+    def test_cli_double_requires_actual_paimon_query_for_rejection(self):
+        for fault in (
+            "missing_query",
+            "different_query",
+            "wrong_table",
+            "wrong_snapshot",
+            "query_before_setting",
+            "extra_statement",
+        ):
+            with self.subTest(fault=fault):
+
+                def transform(sql):
+                    setting = "SET enable_duckdb_fallback=false;"
+                    prefix, query = sql.split(setting, 1)
+                    tails = {
+                        "missing_query": setting,
+                        "different_query": setting + "SELECT 42",
+                        "wrong_table": setting
+                        + query.replace("append_basic", "empty_table"),
+                        "wrong_snapshot": setting
+                        + query.replace("snapshot_from_id=2", "snapshot_from_id=1"),
+                        "query_before_setting": query + ";" + setting,
+                        "extra_statement": setting + query + ";SELECT 42;",
+                    }
+                    return prefix + tails[fault]
+
+                self.assert_sql_mutation_fails(
+                    "rejection", transform, "planning_rejection", "transparent"
+                )
 
     def test_incomplete_and_bad_protocol_fail_but_later_cases_run(self):
         for fault in (
