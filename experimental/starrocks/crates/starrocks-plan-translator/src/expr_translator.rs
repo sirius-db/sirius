@@ -507,14 +507,16 @@ fn translate_function_call(
     let output_type = type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?;
 
     // Null checks the frontend planned as builtin calls rather than IS_NULL_PRED nodes.
-    let (urn, mapped) = match name {
+    // `widens_to_bigint`: DuckDB returns BIGINT where the FE slot is narrower (year SMALLINT,
+    // month/day TINYINT, length INT), so the result is cast back for the next hop's schema.
+    let (urn, mapped, widens_to_bigint) = match name {
         "is_null_pred" => {
             expect_child_count(node, &children, 1)?;
-            (URN_COMPARISON, "is_null")
+            (URN_COMPARISON, "is_null", false)
         }
         "is_not_null_pred" => {
             expect_child_count(node, &children, 1)?;
-            (URN_COMPARISON, "is_not_null")
+            (URN_COMPARISON, "is_not_null", false)
         }
         "if" => {
             expect_child_count(node, &children, 3)?;
@@ -545,7 +547,7 @@ fn translate_function_call(
                     });
                 }
             }
-            (URN_STRING, "like")
+            (URN_STRING, "like", false)
         }
         "substring" | "substr" => {
             // The GPU evaluator supports exactly `substring(col, start, length)` with constant,
@@ -563,17 +565,17 @@ fn translate_function_call(
                     reason: "substring requires constant positive start and length",
                 });
             }
-            (URN_STRING, "substring")
+            (URN_STRING, "substring", false)
         }
         // StarRocks `length` counts bytes; `octet_length` remaps to DuckDB's byte-length
         // (`strlen`), while `char_length` keeps codepoint semantics on both sides.
-        "length" => (URN_STRING, "octet_length"),
-        "char_length" => (URN_STRING, "char_length"),
+        "length" => (URN_STRING, "octet_length", true),
+        "char_length" => (URN_STRING, "char_length", true),
         // `concat` is intentionally absent: StarRocks concat is NULL-strict while DuckDB's
         // ignores NULL arguments, so a name-level mapping would change results. Other string
         // and math builtins (upper/lower/trim/abs/floor/...) are absent because the GPU
         // expression evaluator has no implementations for them yet.
-        "year" | "month" | "day" => (URN_DATETIME, name),
+        "year" | "month" | "day" => (URN_DATETIME, name, true),
         _ => {
             return Err(TranslateError::malformed(format!(
                 "unsupported StarRocks function call {name:?}"
@@ -581,9 +583,7 @@ fn translate_function_call(
         }
     };
     let anchor = ctx.registry.register_function(urn, mapped);
-    // DuckDB returns BIGINT for year/month/day and length/char_length. The FE slot is narrower
-    // (year SMALLINT, month/day TINYINT, length INT). Cast back so the next hop's schema matches.
-    if matches!(name, "year" | "month" | "day" | "length" | "char_length") {
+    if widens_to_bigint {
         let produced = type_mapper::i64_type(node.is_nullable.unwrap_or(true));
         return Ok(Expression {
             rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {

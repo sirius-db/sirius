@@ -181,8 +181,10 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after build() on an unknown id, including any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
 
-  /// Total rows parked on output stream `stream_id`, without draining it. 0 before build().
-  /// @throws after build() on an unknown id, or on a parked batch that is not GPU-resident.
+  /// Total rows parked on output stream `stream_id`, without draining it. A throw means the
+  /// count is unknown: callers feeding declare_input_cardinality() leave the stream undeclared.
+  /// @throws before build(), on an unknown id, or on a parked batch that is not GPU-resident
+  ///         (a spilled batch's row count is not readable without materializing it).
   [[nodiscard]] std::uint64_t output_row_count(std::uint64_t stream_id) const;
 
   /// DuckDB type-name strings for each output column. Matches what declare_input_column accepts.

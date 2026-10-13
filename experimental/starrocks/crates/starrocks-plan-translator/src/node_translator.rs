@@ -369,7 +369,7 @@ pub(crate) fn translate_plan(
 }
 
 /// Common-expr slots, per `PROJECT_NODE`, that an ancestor reads even though no output tuple
-/// materializes them. Q14's aggregate reads such a slot.
+/// materializes them.
 fn common_slots_consumed_above(
     plan: &TPlan,
     desc: &DescriptorTable,
@@ -554,8 +554,8 @@ fn stream_read_rel(schema: substrait::proto::NamedStruct, stream_view: &str) -> 
 
 /// Translates an `AGGREGATION_NODE` into a Substrait aggregate relation.
 ///
-/// The node's phase (one-shot / partial / merge, see [`agg_phase::classify`]) decides whether
-/// two-phase SUM is accepted. One-phase keeps the existing aggregate surface; partial and merge
+/// The node's phase (one-shot / partial / merge, see [`crate::agg_phase::classify`]) decides whether
+/// two-phase SUM is accepted. One-phase accepts every supported aggregate; partial and merge
 /// accept **SUM only**. The output row layout is the aggregation output tuple.
 fn translate_aggregation(
     node: &TPlanNode,

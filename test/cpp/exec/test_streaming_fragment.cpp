@@ -1232,16 +1232,15 @@ TEST_CASE_METHOD(fragment_fixture,
 }
 
 // ============================================================================
-// FRAG-14: two-shard GROUP BY (partial SUM → hash N=2 → merge SUM). Same process,
-// relay_from, sender-set EOS. No FFI, no Arrow — the GPU seam the CN will
-// later hop with Arrow.
+// FRAG-14: two-shard GROUP BY (partial SUM → hash N=2 → merge SUM) in one process via
+// relay_from and sender-set EOS.
 // ============================================================================
 
 TEST_CASE_METHOD(fragment_fixture,
                  "FRAG-14: two-shard GROUP BY via hash sink and sender-set EOS",
                  "[integration][streaming_fragment]")
 {
-  sirius::test::scratch_dir sales("frag6_sales");
+  sirius::test::scratch_dir sales("frag14_sales");
   auto const sales_0 = sales.file("sales_0.parquet");
   auto const sales_1 = sales.file("sales_1.parquet");
 

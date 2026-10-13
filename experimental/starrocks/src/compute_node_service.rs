@@ -408,7 +408,7 @@ impl SiriusComputeNodeService {
             .map(|exec| FragmentInstanceId::from(&exec.fragment_instance_id))
     }
 
-    /// Extracts the parquet path from the binary-thrift attachment and infers its schema.
+    /// Extracts every parquet path from the binary-thrift attachment and infers one schema they all share.
     async fn file_schema_from_attachment(
         attachment: &[u8],
     ) -> std::result::Result<Vec<PSlotDescriptor>, String> {

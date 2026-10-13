@@ -50,6 +50,29 @@ pub(crate) async fn parquet_file_schema(path: &str) -> Result<Vec<PSlotDescripto
     Ok(slots)
 }
 
+/// Footer reads in flight at once; bounds open file descriptors on a large FILES() glob.
+const MAX_CONCURRENT_FOOTER_READS: usize = 16;
+
+/// Reads every file's schema, in `paths` order, with up to [`MAX_CONCURRENT_FOOTER_READS`]
+/// footers in flight. The first failure is returned and the remaining reads are aborted.
+async fn read_schemas_concurrently(paths: &[String]) -> Result<Vec<Vec<PSlotDescriptor>>, String> {
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FOOTER_READS));
+    let mut reads = tokio::task::JoinSet::new();
+    for (idx, path) in paths.iter().cloned().enumerate() {
+        let permits = permits.clone();
+        reads.spawn(async move {
+            let _permit = permits.acquire_owned().await.expect("semaphore is never closed");
+            (idx, parquet_file_schema(&path).await)
+        });
+    }
+    let mut schemas = vec![Vec::new(); paths.len()];
+    while let Some(joined) = reads.join_next().await {
+        let (idx, schema) = joined.map_err(|err| format!("parquet footer read task failed: {err}"))?;
+        schemas[idx] = schema?;
+    }
+    Ok(schemas)
+}
+
 /// Infers one schema for a multi-file FILES() call.
 ///
 /// The schema comes from the first file; every other file must agree on column names
@@ -63,9 +86,9 @@ pub(crate) async fn parquet_files_schema(paths: &[String]) -> Result<Vec<PSlotDe
     let (first, rest) = paths
         .split_first()
         .ok_or_else(|| "no file paths to infer a schema from".to_string())?;
-    let slots = parquet_file_schema(first).await?;
-    for path in rest {
-        let other = parquet_file_schema(path).await?;
+    let mut schemas = read_schemas_concurrently(paths).await?.into_iter();
+    let slots = schemas.next().expect("one schema per path, and paths is non-empty");
+    for (path, other) in rest.iter().zip(schemas) {
         if other.len() != slots.len() {
             return Err(format!(
                 "FILES() schema mismatch: '{path}' has {} columns but '{first}' has {}",

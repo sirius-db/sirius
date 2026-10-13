@@ -490,7 +490,7 @@ std::size_t Fragment::output_batch_count(std::uint64_t stream_id) const
 
 std::uint64_t Fragment::output_row_count(std::uint64_t stream_id) const
 {
-  if (!impl_->fragment) { return 0; }
+  impl_->require_built("output_row_count()");
   return impl_->fragment->output_row_count(stream_id);
 }
 

@@ -2759,7 +2759,7 @@ fn multi_distinct_count_translates_to_distinct_count() {
     assert!(names.contains(&"count".to_string()), "{names:?}");
 }
 
-/// Merge-serialize (a 3/4-phase DISTINCT plan) is still rejected; two-phase merge SUM is not.
+/// Merge-serialize (a 3/4-phase DISTINCT plan) is rejected; two-phase merge SUM is not.
 #[test]
 fn merge_serialize_aggregation_is_rejected() {
     let mut aggregate = aggregate_expr(
@@ -3294,6 +3294,18 @@ fn exchange_translates_to_stream_read() {
     assert_eq!(table.names, vec!["sirius_stream_7"]);
 }
 
+/// Binding one exchange to two input streams is a malformed request, not last-one-wins.
+#[test]
+fn exchange_bound_twice_is_rejected() {
+    let err = translate_with_streams(
+        TPlan::new(vec![exchange_node(7, vec![0])]),
+        base_desc(),
+        &[stream_input(7, &["id", "name"]), stream_input(7, &["id", "name"])],
+    )
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::MalformedPlan(_)), "{err:?}");
+}
+
 /// A merging exchange is a stream read wrapped in the exchange's sort.
 #[test]
 fn merging_exchange_wraps_stream_read_in_sort() {
@@ -3402,7 +3414,7 @@ fn year_call_casts_back_to_the_fe_slot_type() {
     assert!(function.function_reference > 0);
 }
 
-/// Q14's shape: the aggregate reads a common slot the project does not materialize, so the
+/// The aggregate reads a common slot the project does not materialize, so the
 /// project carries it as a trailing column and the aggregate reads it there.
 #[test]
 fn common_slot_read_above_its_project_is_carried() {
