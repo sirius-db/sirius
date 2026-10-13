@@ -276,9 +276,13 @@ impl BrpcRuntime {
                 .enable_io()
                 .build()
                 .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
-            runtime.block_on(
+            let served = runtime.block_on(
                 server.serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
-            )
+            );
+            // Dropping the runtime would join every spawn_blocking task, and a fetch_data poll
+            // waits up to RESULT_WAIT (600 s) on a result that may never come.
+            runtime.shutdown_timeout(Duration::from_secs(5));
+            served
         });
 
         Ok(Self { shutdown, join })

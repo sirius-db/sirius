@@ -56,8 +56,9 @@ pub(crate) struct SiriusComputeNodeService {
     descriptor_tables: Arc<Mutex<HashMap<FragmentInstanceId, TDescriptorTable>>>,
     /// Exchange rendezvous: receivers wait here until every sender has parked its output.
     exchanges: Arc<LocalExchange>,
-    /// This CN's advertised brpc endpoint. A sink destination is local only when host and port
-    /// both match, so two CNs on one host see each other as remote.
+    /// This CN's advertised brpc endpoint, with the host resolved to an IP because the FE
+    /// addresses sink destinations by IP (`ComputeNode.getBrpcIpAddress`). A destination is local
+    /// only when IP and port both match, so two CNs on one host see each other as remote.
     brpc_address: TNetworkAddress,
 }
 
@@ -82,11 +83,26 @@ impl SiriusComputeNodeService {
             descriptor_tables: Arc::new(Mutex::new(HashMap::new())),
             exchanges: Arc::new(LocalExchange::default()),
             brpc_address: TNetworkAddress::new(
-                compute_node.advertise_host.to_string(),
+                resolve_ip(compute_node.advertise_host.as_str()),
                 i32::from(compute_node.brpc_port),
             ),
         }
     }
+}
+
+/// Resolves `host` the way the FE does (Java prefers IPv4), or returns it unchanged if it doesn't
+/// resolve; an IP literal comes back as is.
+fn resolve_ip(host: &str) -> String {
+    use std::net::ToSocketAddrs;
+    let Ok(addrs) = (host, 0).to_socket_addrs() else {
+        return host.to_string();
+    };
+    let addrs: Vec<_> = addrs.map(|addr| addr.ip()).collect();
+    addrs
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .or(addrs.first())
+        .map_or_else(|| host.to_string(), ToString::to_string)
 }
 
 impl PInternalService for SiriusComputeNodeService {
@@ -1254,6 +1270,28 @@ mod tests {
             .unwrap()
             .per_exch_num_senders
             .insert(node_id, senders);
+    }
+
+    /// The FE sends sink destinations by IP, so a CN advertised by hostname must still see a
+    /// destination at its own resolved IP as local.
+    #[test]
+    fn hostname_advertised_cn_matches_its_ip_destination() {
+        assert_eq!(resolve_ip("127.0.0.1"), "127.0.0.1");
+        let config = ComputeNodeConfig {
+            advertise_host: crate::Host::new("localhost").unwrap(),
+            ..ComputeNodeConfig::default()
+        };
+        let service = SiriusComputeNodeService::with_executor(Arc::new(StubExecutor), &config);
+        let destination = TPlanFragmentDestination::new(
+            TUniqueId::new(1, 2),
+            None,
+            Some(TNetworkAddress::new(
+                "127.0.0.1".to_string(),
+                i32::from(config.brpc_port),
+            )),
+            None,
+        );
+        assert_eq!(service.ensure_local(&destination), Ok(()));
     }
 
     /// Makes `params` sender 0 of fragment instance `instance` of its query, served on `port`.
