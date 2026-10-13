@@ -23,10 +23,12 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/owning_table_view.hpp>
 #include <op/scan/scan_filter_analysis.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/simpatico_gpu_ingestible.hpp>
+#include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
@@ -862,6 +864,49 @@ bool hpln_range_read_enabled()
 
 }  // namespace
 
+std::pair<std::shared_ptr<const sirius::decompression_pushdown_scan>, std::uint64_t>
+simpatico_gpu_ingestible::batch_pushdown_scan() const
+{
+  auto const& channel = _info->sirius_dynamic_filters;
+  if (!sirius::decompression_pushdown_enabled() || !channel || !channel->has_filters()) {
+    return {_pushdown_scan, 0};
+  }
+  // Snapshotted per batch, not at bind: the scan is planned before any join build has run, and
+  // builds publish while it is being served.
+  auto const snapshot = channel->snapshot();
+  // The snapshot names scan OUTPUT positions; the decode's slots are the plan's data columns,
+  // which hold the output columns first but not necessarily in output order. Route each output
+  // position to the decode slot that produces it.
+  auto const& layout = _plan->output_layout;
+  auto by_output     = snapshot_membership_probes(snapshot, layout.size());
+  std::vector<std::vector<sirius::membership_probe>> by_slot(_info->column_ids.size());
+  std::size_t attached = 0;
+  for (std::size_t out = 0; out < layout.size(); ++out) {
+    if (by_output.probes[out].empty() || layout[out].source != scan_plan::output_entry::DATA) {
+      continue;
+    }
+    auto const slot = layout[out].idx;
+    if (slot >= by_slot.size()) { continue; }
+    attached += by_output.probes[out].size();
+    by_slot[slot] = std::move(by_output.probes[out]);
+  }
+  SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+    "[decompression-pushdown] .hpln join filter attach (decode time) channel={}: slots={} "
+    "attached={} generation={} skipped_non_maskable={}",
+    static_cast<void const*>(channel.get()),
+    by_slot.size(),
+    attached,
+    by_output.generation,
+    by_output.skipped_non_mask);
+  if (attached == 0) { return {_pushdown_scan, 0}; }
+  auto const base =
+    _pushdown_scan
+      ? _pushdown_scan
+      : std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
+  return {base->with_membership_probes(std::move(by_slot), by_output.generation),
+          by_output.generation};
+}
+
 filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   scan_info const& info,
   cucascade::memory::memory_space const& mem_space,
@@ -927,8 +972,12 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   rmm::device_async_resource_ref mr(mem_space.get_default_allocator());
   std::vector<std::unique_ptr<cudf::table>> decoded;
   decoded.reserve(n_chunks);
-  // Cleared by any chunk the decode did not fully filter; see the decision below.
-  bool row_filtered_batch = _pushdown_scan != nullptr;
+  // Cleared by any chunk the decode did not fully filter; see the decision below. Only the
+  // bind-time filter counts: join filters never make a batch ROW_FILTERED, because the
+  // dynamic-filter operator above the scan applies them again anyway.
+  bool row_filtered_batch                  = _pushdown_scan != nullptr;
+  auto const [batch_scan, join_generation] = batch_pushdown_scan();
+  bool const join_probed                   = batch_scan && batch_scan != _pushdown_scan;
   static pinned_compressed_blob const no_blob{};
   // Direct: reconstruct every chunk's table first (which only allocates leaf buffers and records
   // the reads that fill them), then issue the WHOLE batch's reads as one vectored request before
@@ -1071,8 +1120,9 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     // decode chunks -- so the narrowing, and everything the decode decides off a plan tree, is
     // about the rows that will actually decode rather than about the chunk they came from.
     std::shared_ptr<const sirius::decompression_pushdown_scan> chunk_scan;
-    if (_pushdown_scan && !_row_selection_dropped.load(std::memory_order_relaxed)) {
-      chunk_scan = _pushdown_scan->for_chunk(compressed, selection);
+    auto const dropped_at = _row_selection_dropped_at.load(std::memory_order_relaxed);
+    if (batch_scan && (dropped_at == 0 || join_generation >= dropped_at)) {
+      chunk_scan = batch_scan->for_chunk(compressed, selection);
     }
 
     if (!chunk_scan) {
@@ -1092,6 +1142,7 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     auto result = sirius::decompress_chunk(
       compressed, selection, chunk_scan.get(), sirius::decode_visibility_mask{}, stream, mr);
     _pushdown_offered.fetch_add(1, std::memory_order_relaxed);
+    if (join_probed) { _pushdown_join_probed.fetch_add(1, std::memory_order_relaxed); }
     if (result.outcome.row_filtered) {
       _pushdown_row_filtered.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -1102,7 +1153,7 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     }
     if (result.outcome.selection_unprofitable) {
       _pushdown_unprofitable.fetch_add(1, std::memory_order_relaxed);
-      _row_selection_dropped.store(true, std::memory_order_relaxed);
+      _row_selection_dropped_at.store(join_generation + 1, std::memory_order_relaxed);
     }
     if (!result.outcome.predicate_columns.empty()) {
       // A column answered in place arrives as the BOOL8 answer instead of its values, which this

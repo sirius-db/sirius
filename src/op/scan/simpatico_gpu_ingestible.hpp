@@ -57,6 +57,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace cucascade::memory {
@@ -342,15 +343,26 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
     /// ... and the ones where too many rows survived for compaction to pay for itself. The decode
     /// then returns ordinary full-width columns and the post-decode filter still applies.
     std::size_t chunks_unprofitable{0};
+    /// Chunks whose decode also probed join filters published by a hash-join build. Those rows
+    /// are dropped during the decode; the dynamic-filter operator above the scan re-applies the
+    /// same filters, which is idempotent.
+    std::size_t chunks_join_probed{0};
   };
   [[nodiscard]] pushdown_stats decode_filtering() const noexcept
   {
     return {_pushdown_offered.load(std::memory_order_relaxed),
             _pushdown_row_filtered.load(std::memory_order_relaxed),
-            _pushdown_unprofitable.load(std::memory_order_relaxed)};
+            _pushdown_unprofitable.load(std::memory_order_relaxed),
+            _pushdown_join_probed.load(std::memory_order_relaxed)};
   }
 
  private:
+  /// This batch's decode request: the bind-time filter plus the join filters published so far,
+  /// remapped from scan output positions onto decode slots. Also returns the join-filter
+  /// generation it was built from (0 when none). Null when there is nothing to ask for.
+  [[nodiscard]] std::pair<std::shared_ptr<const sirius::decompression_pushdown_scan>, std::uint64_t>
+  batch_pushdown_scan() const;
+
   /// Which file columns the decode emits and how that D-order batch is reshaped into the scan's
   /// output -- the same abstraction the parquet source uses, so the two agree on what a
   /// filter-only column is and where a filter's operand lands. Never null.
@@ -418,8 +430,11 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
   /// Set once a decode reports that too many rows survived for compaction to pay for itself.
   /// Selectivity barely varies across one file's chunks, so one such chunk predicts the rest and
   /// the remaining ones stop paying for the attempt -- the same conclusion the pinned path draws
-  /// from @c pushdown_outcome::selection_unprofitable.
-  std::atomic<bool> _row_selection_dropped{false};
+  /// from @c pushdown_outcome::selection_unprofitable. Holds the join-filter generation the
+  /// verdict was reached under, plus one (0: never dropped): a join build that publishes a newer,
+  /// possibly much more selective filter set earns the attempt back.
+  std::atomic<std::uint64_t> _row_selection_dropped_at{0};
+  std::atomic<std::size_t> _pushdown_join_probed{0};
   std::atomic<std::size_t> _pushdown_offered{0};
   std::atomic<std::size_t> _pushdown_row_filtered{0};
   std::atomic<std::size_t> _pushdown_unprofitable{0};

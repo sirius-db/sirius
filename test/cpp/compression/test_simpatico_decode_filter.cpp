@@ -33,6 +33,7 @@
 #include "compression/simpatico_file_ingest.hpp"
 #include "compression/simpatico_test_utils.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/simpatico_gpu_ingestible.hpp"
 #include "operator/operator_test_utils.hpp"
 
@@ -45,6 +46,7 @@
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -418,4 +420,120 @@ TEST_CASE("simpatico decode filter - no filter asks the decode for nothing",
   REQUIRE(decoded.keys.size() == static_cast<std::size_t>(kChunks) * kRowsPerChunk);
   REQUIRE_FALSE(decoded.all_row_filtered);
   REQUIRE(ing->decode_filtering().chunks_offered == 0);
+}
+
+namespace {
+
+/// Every (k, v) of the file with `k >= key_lo` and `v` in @p values, in file order.
+scan_result expected_join_rows(std::int32_t key_lo, std::vector<std::int32_t> const& values)
+{
+  scan_result out;
+  for (int c = 0; c < kChunks; ++c) {
+    for (int i = 0; i < kRowsPerChunk; ++i) {
+      auto const k = c * 1000000 + i;
+      auto const v = value_at(i);
+      if (k >= key_lo && std::find(values.begin(), values.end(), v) != values.end()) {
+        out.keys.push_back(k);
+        out.values.push_back(v);
+      }
+    }
+  }
+  return out;
+}
+
+/// A join build that published `v IN values` on the scan's output column 1.
+struct published_join_filter {
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> set =
+    std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  sirius::op::sirius_dynamic_filter_set::producer producer = set->register_producer({1});
+
+  explicit published_join_filter(std::vector<std::int32_t> const& values)
+  {
+    auto const keys   = int32_column(values);
+    auto const stream = cudf::get_default_stream();
+    REQUIRE(
+      producer.push_filter(1,
+                           std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
+                             keys->view(), stream, rmm::mr::get_current_device_resource_ref())));
+    stream.synchronize();
+  }
+};
+
+}  // namespace
+
+TEST_CASE("simpatico decode filter - a published join filter is probed while the column decodes",
+          "[compression][simpatico_decode_filter][dynamic_filter]")
+{
+  if (no_gpu()) { return; }
+  require_pushdown_gate();
+  fixture_dir fx("joinfilter");
+  std::vector<std::int32_t> const wanted{3, 700};
+  published_join_filter join(wanted);
+
+  // No predicate of its own: the join filter is the only thing that can drop rows, and the scan
+  // is planned before the build publishes, so it can only reach the decode per batch.
+  auto info                    = bind_with_filters(fx.path, nullptr, nullptr);
+  info->sirius_dynamic_filters = join.set;
+  auto ing                     = scan::make_ingestible(std::move(info));
+
+  // What the DECODE produced: the dynamic-filter operator above the scan is not part of this, so
+  // only rows the decode itself dropped can be missing here.
+  auto const decoded  = run_scan(*ing, collect_splits(*ing), /*apply_filter=*/false);
+  auto const expected = expected_join_rows(0, wanted);
+  REQUIRE(decoded.keys == expected.keys);
+  REQUIRE(decoded.values == expected.values);
+  // Join filters never make a batch ROW_FILTERED: the operator above re-applies them.
+  REQUIRE_FALSE(decoded.all_row_filtered);
+  auto const stats = ing->decode_filtering();
+  REQUIRE(stats.chunks_join_probed == static_cast<std::size_t>(kChunks));
+  REQUIRE(stats.chunks_offered == static_cast<std::size_t>(kChunks));
+}
+
+TEST_CASE("simpatico decode filter - a join filter composes with the scan's own predicate",
+          "[compression][simpatico_decode_filter][dynamic_filter]")
+{
+  if (no_gpu()) { return; }
+  require_pushdown_gate();
+  fixture_dir fx("joinandstatic");
+  std::vector<std::int32_t> const wanted{3, 700};
+  published_join_filter join(wanted);
+
+  // k >= 2,000,000 prunes chunks 0 and 1 at bind; the join filter then narrows what decodes.
+  auto info                    = bind_with_filters(fx.path, ge(2000000), nullptr);
+  info->sirius_dynamic_filters = join.set;
+  auto ing                     = scan::make_ingestible(std::move(info));
+
+  auto const decoded  = run_scan(*ing, collect_splits(*ing), /*apply_filter=*/false);
+  auto const expected = expected_join_rows(2000000, wanted);
+  REQUIRE(decoded.keys == expected.keys);
+  REQUIRE(decoded.values == expected.values);
+  REQUIRE(ing->decode_filtering().chunks_join_probed == 2);
+
+  // With the post-decode filter the answer is unchanged: re-applying the key range is idempotent.
+  auto ing2 = [&] {
+    auto i2                    = bind_with_filters(fx.path, ge(2000000), nullptr);
+    i2->sirius_dynamic_filters = join.set;
+    return scan::make_ingestible(std::move(i2));
+  }();
+  auto const filtered = run_scan(*ing2, collect_splits(*ing2), /*apply_filter=*/true);
+  REQUIRE(filtered.keys == expected.keys);
+}
+
+TEST_CASE("simpatico decode filter - without the gate a join filter is left to the operator above",
+          "[compression][simpatico_decode_filter][dynamic_filter]")
+{
+  if (no_gpu()) { return; }
+  fixture_dir fx("joinnogate");
+  published_join_filter join({3, 700});
+  ::setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "0", /*overwrite=*/1);
+  REQUIRE_FALSE(sirius::decompression_pushdown_enabled());
+
+  auto info                    = bind_with_filters(fx.path, nullptr, nullptr);
+  info->sirius_dynamic_filters = join.set;
+  auto ing                     = scan::make_ingestible(std::move(info));
+  auto const decoded           = run_scan(*ing, collect_splits(*ing), /*apply_filter=*/false);
+  require_pushdown_gate();  // restore for the cases that follow in this process
+
+  REQUIRE(decoded.keys.size() == static_cast<std::size_t>(kChunks) * kRowsPerChunk);
+  REQUIRE(ing->decode_filtering().chunks_join_probed == 0);
 }
