@@ -15,8 +15,9 @@
 //! streaming evolution.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,6 +46,16 @@ struct ExecuteRequest {
     respond: Sender<Result<Option<FragmentResult>, String>>,
 }
 
+/// One request to the engine thread, the only one that touches the context.
+enum EngineRequest {
+    Run(ExecuteRequest),
+    /// Drop one destination's claim on parked output.
+    DropParked {
+        slot: SenderSlot,
+        respond: Sender<Result<(), String>>,
+    },
+}
+
 /// GPU-backed [`FragmentExecutor`] running plans on an embedded Sirius engine.
 ///
 /// The engine context lives on a dedicated thread; this handle forwards plans to it and waits for
@@ -54,9 +65,12 @@ struct ExecuteRequest {
 pub struct SiriusEngine {
     /// Sender to the engine thread. `Mutex<Option<..>>` makes the `!Sync` sender shareable and
     /// lets `Drop` close the channel before joining; sends are brief (the thread serializes work).
-    requests: Mutex<Option<Sender<ExecuteRequest>>>,
+    requests: Mutex<Option<Sender<EngineRequest>>>,
     /// Engine thread handle, taken and joined on drop.
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Parked sender fragments, published by the engine thread after every request so a reader
+    /// never waits behind a running fragment.
+    parked: Arc<AtomicUsize>,
 }
 
 impl SiriusEngine {
@@ -66,20 +80,41 @@ impl SiriusEngine {
     /// failure surfaces here, before any RPC is served. `config` is the optional Sirius YAML path
     /// (built-in defaults when `None`).
     pub fn start(config: Option<PathBuf>) -> Result<Self, String> {
-        let (request_tx, request_rx) = channel::<ExecuteRequest>();
+        let (request_tx, request_rx) = channel::<EngineRequest>();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+        let parked = Arc::new(AtomicUsize::new(0));
+        let published = Arc::clone(&parked);
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
-            .spawn(move || engine_thread(config, request_rx, ready_tx))
+            .spawn(move || engine_thread(config, request_rx, ready_tx, published))
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 requests: Mutex::new(Some(request_tx)),
                 thread: Mutex::new(Some(thread)),
+                parked,
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
         }
+    }
+
+    /// Sends one request to the engine thread and waits for its answer.
+    fn call<T>(
+        &self,
+        request: impl FnOnce(Sender<Result<T, String>>) -> EngineRequest,
+    ) -> Result<T, String> {
+        let (respond_tx, respond_rx) = channel();
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .ok_or_else(|| "sirius-engine is shutting down".to_string())?
+            .send(request(respond_tx))
+            .map_err(|_| "sirius-engine thread is not running".to_string())?;
+        respond_rx
+            .recv()
+            .map_err(|_| "sirius-engine thread dropped the response".to_string())?
     }
 }
 
@@ -87,8 +122,9 @@ impl SiriusEngine {
 /// request channel closes. The context is dropped here, on this thread, when the loop ends.
 fn engine_thread(
     config: Option<PathBuf>,
-    requests: Receiver<ExecuteRequest>,
+    requests: Receiver<EngineRequest>,
     ready: Sender<Result<(), String>>,
+    published: Arc<AtomicUsize>,
 ) {
     let context = match build_context(config) {
         Ok(context) => {
@@ -106,18 +142,31 @@ fn engine_thread(
     info!("sirius-engine thread ready");
     // Declared after `context` so parked fragments, which borrow it, drop first.
     let mut parked = ParkedRegistry::new();
-    // One fragment at a time until the handle (and its sender) is dropped.
+    // One request at a time until the handle (and its sender) is dropped. Ignore a send error on
+    // a response: the waiting caller may have been dropped/cancelled.
     while let Ok(request) = requests.recv() {
-        let result = run_fragment(&context, &mut parked, &request);
-        if result.is_err() {
-            // A failed fragment may stop before relaying every input; release them all so the
-            // senders' GPU batches are freed. An input already relayed is gone and just errors.
-            for slot in request.inputs.iter().flat_map(|(_, slots)| slots) {
-                let _ = parked.release(slot);
+        match request {
+            EngineRequest::Run(request) => {
+                let result = run_fragment(&context, &mut parked, &request);
+                if result.is_err() {
+                    // A failed fragment may stop before relaying every input; release them all so
+                    // the senders' GPU batches are freed. An input already relayed is gone and
+                    // just errors.
+                    for slot in request.inputs.iter().flat_map(|(_, slots)| slots) {
+                        let _ = parked.release(slot);
+                    }
+                }
+                // Published before the reply, so a caller that reads the count after its answer
+                // sees this request's effect.
+                published.store(parked.len(), Ordering::Relaxed);
+                let _ = request.respond.send(result);
+            }
+            EngineRequest::DropParked { slot, respond } => {
+                let released = parked.release(&slot);
+                published.store(parked.len(), Ordering::Relaxed);
+                let _ = respond.send(released);
             }
         }
-        // Ignore a send error: the waiting fragment may have been dropped/cancelled.
-        let _ = request.respond.send(result);
     }
     info!("sirius-engine thread shutting down");
 }
@@ -321,26 +370,25 @@ impl FragmentExecutor for SiriusEngine {
     }
 
     fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
-        let (respond_tx, respond_rx) = channel();
-        let request = ExecuteRequest {
-            plan: run.plan.to_substrait_bytes(),
-            stream_inputs: run.plan.stream_inputs.clone(),
-            inputs: run.inputs,
-            outputs: run.outputs,
-            broadcast: run.broadcast,
-            hash_keys: run.hash_keys,
-            respond: respond_tx,
-        };
-        self.requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .ok_or_else(|| "sirius-engine is shutting down".to_string())?
-            .send(request)
-            .map_err(|_| "sirius-engine thread is not running".to_string())?;
-        respond_rx
-            .recv()
-            .map_err(|_| "sirius-engine thread dropped the response".to_string())?
+        self.call(|respond| {
+            EngineRequest::Run(ExecuteRequest {
+                plan: run.plan.to_substrait_bytes(),
+                stream_inputs: run.plan.stream_inputs.clone(),
+                inputs: run.inputs,
+                outputs: run.outputs,
+                broadcast: run.broadcast,
+                hash_keys: run.hash_keys,
+                respond,
+            })
+        })
+    }
+
+    fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
+        self.call(|respond| EngineRequest::DropParked { slot, respond })
+    }
+
+    fn parked_fragments(&self) -> usize {
+        self.parked.load(Ordering::Relaxed)
     }
 }
 
@@ -537,7 +585,7 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .send(ExecuteRequest {
+            .send(EngineRequest::Run(ExecuteRequest {
                 plan,
                 stream_inputs: Vec::new(),
                 inputs: Vec::new(),
@@ -545,7 +593,7 @@ mod tests {
                 broadcast: false,
                 hash_keys: Vec::new(),
                 respond: respond_tx,
-            })
+            }))
             .unwrap();
         let result = respond_rx
             .recv()
