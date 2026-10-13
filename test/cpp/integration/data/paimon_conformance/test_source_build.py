@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -73,7 +74,7 @@ class SourceBuildTests(unittest.TestCase):
                 receipt.pop(key)
                 with self.assertRaises(ValueError):
                     self.verify(receipt)
-        for key in ("SCCACHE_RECACHE", "CCACHE_DISABLE"):
+        for key in ("SCCACHE_RECACHE", "CCACHE_DISABLE", "GIT_CEILING_DIRECTORIES"):
             receipt = copy.deepcopy(self.receipt)
             del receipt["build_environment"][key]
             with self.subTest(missing_cache_control=key), self.assertRaisesRegex(
@@ -157,7 +158,13 @@ class SourceBuildTests(unittest.TestCase):
         self.assertFalse((self.root / "source").exists())
 
     def exercise_build(
-        self, output, fail=False, mutate=None, source_cache=None, real_child=False
+        self,
+        output,
+        fail=False,
+        mutate=None,
+        source_cache=None,
+        real_child=False,
+        build_check=None,
     ):
         actual_run = subprocess.run
         actual_logged_run = builder.run
@@ -182,6 +189,8 @@ class SourceBuildTests(unittest.TestCase):
 
         def command(args, _log, _env):
             if "--build" in args:
+                if build_check:
+                    build_check(_env)
                 path = output / "build/extension/paimon/paimon.duckdb_extension"
                 path.parent.mkdir(parents=True)
                 if real_child:
@@ -248,6 +257,72 @@ class SourceBuildTests(unittest.TestCase):
             self.identity,
         )
         self.assertEqual(result["sha256"], digest(output / "paimon.duckdb_extension"))
+
+    def test_archive_patches_apply_inside_an_unrelated_git_checkout(self):
+        subprocess.run(
+            ["git", "init", "--quiet", str(self.root)],
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith("GIT_")
+            },
+            check=True,
+        )
+        parent_file = self.root / "CMakeLists.txt"
+        parent_file.write_text("parent must stay unchanged\n")
+        patch_file = self.root / "install.patch"
+        patch_file.write_text(
+            "diff --git a/CMakeLists.txt b/CMakeLists.txt\n"
+            "--- a/CMakeLists.txt\n+++ b/CMakeLists.txt\n"
+            "@@ -1 +1 @@\n-before\n+after\n"
+        )
+        for overrides in (False, True):
+            with self.subTest(inherited_git_overrides=overrides):
+                output = self.root / ("build-overrides" if overrides else "build")
+
+                def check(env):
+                    native = output / "extension/third_party/paimon-cpp"
+                    cmake = native / "CMakeLists.txt"
+                    cmake.write_text("before\n")
+                    command = f"git -C {shlex.quote(str(native))} apply "
+                    quoted_patch = shlex.quote(str(patch_file))
+                    # Same idempotent patch decision as the pinned extension.
+                    subprocess.run(
+                        [
+                            "sh",
+                            "-c",
+                            f"{command}--reverse --check {quoted_patch} "
+                            f"2>/dev/null || {command}{quoted_patch}",
+                        ],
+                        env=env,
+                        check=True,
+                    )
+                    self.assertEqual(cmake.read_text(), "after\n")
+                    self.assertEqual(
+                        parent_file.read_text(), "parent must stay unchanged\n"
+                    )
+
+                inherited = (
+                    {
+                        "GIT_DIR": str(self.root / ".git"),
+                        "GIT_WORK_TREE": str(self.root),
+                        "GIT_CEILING_DIRECTORIES": "/",
+                    }
+                    if overrides
+                    else {}
+                )
+                with patch.dict(os.environ, inherited):
+                    self.exercise_build(output, build_check=check)
+                receipt = json.loads((output / "build-receipt.json").read_text())
+                self.assertEqual(
+                    receipt["build_environment"]["GIT_CEILING_DIRECTORIES"], str(output)
+                )
+
+    def test_ambiguous_git_ceiling_path_fails_before_build(self):
+        output = self.root / "ambiguous:build"
+        with self.assertRaisesRegex(ValueError, "Git ceiling separator"):
+            self.exercise_build(output)
+        self.assertFalse(output.exists())
 
     def test_corrupt_source_cache_fails_before_configure(self):
         cached = self.root / "cache"

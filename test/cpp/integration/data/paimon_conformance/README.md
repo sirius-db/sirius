@@ -71,6 +71,12 @@ pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_ext
 
 The builder refuses an existing output directory, including a failed build. Use
 another directory for a retry; logs from the failed attempt remain available.
+The build subprocess clears inherited `GIT_*` settings and limits Git repository
+discovery to the new output directory. This lets the pinned extension apply its
+archive-local patches even when the output is inside the Sirius checkout;
+otherwise Git can silently skip a patch against an unrelated ancestor worktree.
+Output paths containing `:` are rejected because Git treats it as a separator
+between repository discovery limits.
 Source downloads retry transport failures up to three times; checksum mismatches
 fail immediately. The optional `--source-cache DIR` accepts previously downloaded
 archives named `<sha256>.tar.gz`, verifying their length and checksum before use.

@@ -35,6 +35,7 @@ BUILD_ENVIRONMENT_KEYS = (
     "CONDA_PREFIX",
     "SCCACHE_RECACHE",
     "CCACHE_DISABLE",
+    "GIT_CEILING_DIRECTORIES",
 )
 
 
@@ -198,6 +199,8 @@ def build(cli, output, jobs, source_cache=None):
     recipe = read_recipe()
     if platform.system() != "Linux" or platform.machine() not in ("x86_64", "AMD64"):
         raise ValueError("The source recipe currently supports Linux x86_64 only")
+    if ":" in str(output):
+        raise ValueError("Build output cannot contain the Git ceiling separator ':'")
     if (
         not os.environ.get("CONDA_PREFIX")
         or not os.environ.get("CC")
@@ -219,7 +222,7 @@ def build(cli, output, jobs, source_cache=None):
     env = os.environ.copy()
     # Inherited dependency overrides must not substitute unrelated local libraries.
     for key in list(env):
-        if key.startswith(("PAIMON_", "ARROW_")) or key in (
+        if key.startswith(("PAIMON_", "ARROW_", "GIT_")) or key in (
             "CMAKE_PREFIX_PATH",
             "CMAKE_TOOLCHAIN_FILE",
             "CMAKE_PROJECT_INCLUDE",
@@ -229,6 +232,9 @@ def build(cli, output, jobs, source_cache=None):
             "C_INCLUDE_PATH",
         ):
             env.pop(key)
+    # These are source archives, even when output is inside the Sirius checkout.
+    # An ancestor Git worktree makes upstream `git apply` silently skip patches.
+    env["GIT_CEILING_DIRECTORIES"] = str(output)
     # Compiler selection is shared by DuckDB's outer build and nested native build.
     env["CC"] = str(Path(shutil.which(env["CC"]) or env["CC"]).resolve(strict=True))
     env["CXX"] = str(Path(shutil.which(env["CXX"]) or env["CXX"]).resolve(strict=True))
