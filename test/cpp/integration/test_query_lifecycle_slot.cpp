@@ -2425,7 +2425,9 @@ void run_concurrent_admission(std::string const& variant,
     if (!error.empty()) out.error = error;
   }
   if (!memory_wait_observed || !memory_cancel_prompt)
-    out.error = "memory wait was not observable or cancellation/timeout did not settle";
+    out.error = "memory wait observed=" + std::to_string(memory_wait_observed) +
+                ", cancellation/timeout settled=" + std::to_string(memory_cancel_prompt) +
+                "; query error: " + out.error;
   if (!overlapping || !queued || !cancelled_promptly || !maintenance_waiting)
     out.error = "admission overlap/queue/cancellation/maintenance invariant failed";
   auto counts = runtime->admission_counts();
