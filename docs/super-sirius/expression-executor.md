@@ -237,6 +237,8 @@ tagged `[timestamp_extraction]`.
 
 `DATE + INTEGER`, `INTEGER + DATE`, `DATE - INTEGER`, and `DATE - DATE`
 match their already-bound signatures and execute through `date_arithmetic_checked()`.
+The helper uses a libcudf JIT transform with checked integer arithmetic and error
+collection; DATE inputs are bitcast to day counts without copying.
 Offsets preserve NULLs and infinity and reject finite overflow or infinity-sentinel
 collisions. Date differences widen both day counts before subtraction and return
 BIGINT. These operations materialize under every evaluator strategy; standalone
