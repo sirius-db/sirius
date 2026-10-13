@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "scan_manager/config.hpp"
 #include "sirius_config.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cucascade/io/cache/config.hpp>
@@ -594,16 +595,15 @@ TEST_CASE("apply_defaults derives the readahead budgets like the file path does"
   auto const& scan_manager = cfg.get_scan_manager_config();
 
   // Having no sirius.yaml must size the readahead exactly like an empty one.
-  // The local (uring) backend defaults to the pipeline width; the rest backend
+  // The local (uring) backend stays at 0 (readahead off); the rest backend
   // defaults to max(8, 2x the pipeline width).
   CHECK(scan_manager.pipeline_width == pipeline_threads);
-  CHECK(scan_manager.uring.n_max_concurrent_scans == pipeline_threads);
+  CHECK(scan_manager.uring.n_max_concurrent_scans == 0);
   CHECK_FALSE(scan_manager.uring.n_max_concurrent_scans_explicit);
   CHECK(scan_manager.rest.n_max_concurrent_scans == std::max<std::size_t>(8, 2 * pipeline_threads));
 }
 
-TEST_CASE("uring scan budget defaults to the pipeline width and honors an explicit value",
-          "[scan_manager][config][readahead]")
+TEST_CASE("uring scan budget stays 0 unless set", "[scan_manager][config][readahead]")
 {
   constexpr std::size_t pipeline_width = 7;
   constexpr std::size_t other_explicit = 5;
@@ -627,17 +627,17 @@ TEST_CASE("uring scan budget defaults to the pipeline width and honors an explic
     return text;
   };
 
-  // Omitted: one outstanding scan per pipeline thread.
+  // Omitted: the local backend stays off and is not scaled to the pipeline width.
   auto const omitted = load_scan_manager("sirius_uring_budget_omitted.yaml", yaml(std::nullopt));
   CHECK_FALSE(omitted.uring.n_max_concurrent_scans_explicit);
-  CHECK(omitted.uring.n_max_concurrent_scans == pipeline_width);
+  CHECK(omitted.uring.n_max_concurrent_scans == 0);
 
   // An explicit 0 is recorded as explicit and keeps the local readahead off.
   auto const explicit_zero = load_scan_manager("sirius_uring_budget_explicit_zero.yaml", yaml(0));
   CHECK(explicit_zero.uring.n_max_concurrent_scans_explicit);
   CHECK(explicit_zero.uring.n_max_concurrent_scans == 0);
 
-  // An explicit positive value wins over the pipeline width.
+  // An explicit positive value opts the local path in and wins.
   auto const explicit_other =
     load_scan_manager("sirius_uring_budget_explicit_other.yaml", yaml(other_explicit));
   CHECK(explicit_other.uring.n_max_concurrent_scans_explicit);
@@ -745,7 +745,7 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
   CHECK(io.kvikio.task_size == std::optional<std::size_t>{std::size_t{8} << 20});
   CHECK(io.rest.max_connections == 17);
   CHECK(io.cache.eviction == eviction_policy::idle);
-  // The struct's uring budget (0, before sirius_config derives one) reaches cuCascade unchanged.
+  // Sirius's uring default (readahead off) reaches cuCascade unchanged.
   CHECK(io.uring.n_max_concurrent_scans == 0);
   CHECK_FALSE(io.uring.n_max_concurrent_scans_explicit);
   CHECK(io.rest.n_max_concurrent_scans == cfg.rest.n_max_concurrent_scans);
@@ -849,23 +849,20 @@ TEST_CASE("sirius_config forces the native backend for multi-GPU",
 
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
 {
-  auto const check_defaults = [&](scan_manager_config const& cfg, std::size_t uring_budget) {
+  auto const check_defaults = [&](scan_manager_config const& cfg) {
     CHECK(cfg.uring_n_reactors == 4);
     CHECK(cfg.rest_n_reactors == 2);
-    CHECK(cfg.uring.n_max_concurrent_scans == uring_budget);
+    CHECK(cfg.uring.n_max_concurrent_scans == 0);
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
     CHECK(cfg.uring.slices_per_pass == 4);
     CHECK(cfg.uring.range_batch_slices == 8);
   };
 
-  // The struct default is 0; sirius_config derives the pipeline width on load.
-  SECTION("default-constructed") { check_defaults(scan_manager_config{}, 0); }
+  SECTION("default-constructed") { check_defaults(scan_manager_config{}); }
 
   SECTION("empty uring block")
   {
-    auto const cfg = load_scan_manager("sirius_uring_empty_block.yaml", uring_yaml("        {}\n"));
-    check_defaults(cfg, cfg.pipeline_width);
-    CHECK(cfg.pipeline_width > 0);
+    check_defaults(load_scan_manager("sirius_uring_empty_block.yaml", uring_yaml("        {}\n")));
   }
 }
 
@@ -909,14 +906,37 @@ TEST_CASE("sirius_config reads uring.range_batch_slices", "[scan_manager][config
                      "'uring.range_batch_slices': must be 0 or more (0 = no split), got -1");
 }
 
-TEST_CASE("uring prefetch_reactors is no longer a config key", "[scan_manager][config][uring]")
+TEST_CASE("uring prefetch_reactors is accepted as a deprecated no-op",
+          "[scan_manager][config][uring]")
 {
   // Reserving reactors for prefetch was replaced by each reactor's priority
-  // tiers, so a config that still names the key fails loudly instead of being
-  // silently ignored.
-  require_load_error("sirius_uring_prefetch_reactors.yaml",
-                     uring_yaml("        prefetch_reactors: 1\n"),
-                     "unknown config key: 'prefetch_reactors' in uring");
+  // tiers.  A config that still names the key loads with a deprecation WARN
+  // and nothing is partitioned.
+  auto const baseline =
+    load_scan_manager("sirius_uring_no_prefetch_reactors.yaml", uring_yaml("        {}\n"));
+
+  sirius::test::scoped_recording_log_sink logs{"warn"};
+  auto const cfg = load_scan_manager("sirius_uring_prefetch_reactors.yaml",
+                                     uring_yaml("        prefetch_reactors: 1\n"));
+
+  auto const io          = cfg.to_io_config().uring;
+  auto const baseline_io = baseline.to_io_config().uring;
+  CHECK(io.n_max_concurrent_scans == baseline_io.n_max_concurrent_scans);
+  CHECK(io.n_max_concurrent_scans_explicit == baseline_io.n_max_concurrent_scans_explicit);
+  CHECK(io.slices_per_pass == baseline_io.slices_per_pass);
+  CHECK(io.range_batch_slices == baseline_io.range_batch_slices);
+  CHECK(io.use_odirect == baseline_io.use_odirect);
+  CHECK(cfg.uring_n_reactors == baseline.uring_n_reactors);
+
+  std::size_t warnings = 0;
+  for (auto const& record : logs.records()) {
+    if (record.message.find("'uring.prefetch_reactors' is deprecated and ignored") !=
+        std::string::npos) {
+      ++warnings;
+      CHECK(record.level == sirius::log::level::warn);
+    }
+  }
+  CHECK(warnings == 1);
 }
 
 TEST_CASE("Native runtime YAML rejects insufficient reader capacity",

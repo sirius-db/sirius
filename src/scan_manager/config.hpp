@@ -46,12 +46,13 @@ namespace sirius::scan_manager {
 inline constexpr std::size_t default_uring_n_reactors = 4;
 
 /// Sirius's default uring backend config: cuCascade's struct defaults with
-/// @c n_max_concurrent_scans = 0.  cuCascade's own default is 0 as well; the
-/// explicit assignment keeps Sirius's choice independent of it.
+/// readahead off (@c n_max_concurrent_scans = 0).  cuCascade's own default is
+/// 0 as well; the explicit assignment keeps Sirius's choice independent of it.
 ///
-/// This is only the struct default: @c sirius_config re-defaults the budget to
-/// the pipeline pool size (one outstanding scan per pipeline thread) unless the
-/// config names it, so a config that sets 0 keeps the local readahead off.
+/// Local NVMe has no round trip to hide, so a readahead competes with the
+/// executor's own reads for the same device and just reorders the queue rather
+/// than adding throughput.  Set a positive value (or @c max_readahead_scans) to
+/// opt the local path in.
 /// @c n_max_concurrent_scans_explicit stays false: this is a default, not a
 /// value the config named.
 [[nodiscard]] inline cucascade::io::uring::config default_uring_config() noexcept
@@ -275,7 +276,7 @@ struct scan_manager_config {
 
   /// Local (uring) reactor configuration. @c use_odirect is derived from
   /// @ref cache; physical operation size is selected by the worker.  Defaults
-  /// to @ref default_uring_config; @c sirius_config derives its readahead budget.
+  /// to @ref default_uring_config (readahead off).
   cucascade::io::uring::config uring{default_uring_config()};
 
   /// REST (S3/object-store) reactor configuration — timeouts, TLS, logical
