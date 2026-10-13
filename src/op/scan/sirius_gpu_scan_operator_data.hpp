@@ -205,6 +205,25 @@ class scan_operator_input : public op::operator_data {
            (!row_filter_pending || pushdown_row_filtered);
   }
 
+  /// Whether materialize_table will serve a view of the cached batch itself: the split is resident,
+  /// carries no mvcc keep-mask, and prepare_for_processing has not taken its table.
+  [[nodiscard]] bool borrows_resident_batch() const noexcept
+  {
+    return is_resident() && !mvcc_keep_mask.has_mask() && stolen_table == nullptr &&
+           !stolen_table_consumed;
+  }
+
+  /// Whether `sirius_gpu_scan_operator::execute`, after any transfer, offers this split to the
+  /// scan's cached dynamic-filter checkpoint. The working-set estimate reserves the checkpoint's
+  /// envelope on the same condition unless the split's decode is forecast to compact. Before
+  /// prepare_for_processing this also holds for a split whose table a steal or execute's transfer
+  /// will take, so a cold estimate may reserve the envelope for a split that never reaches the
+  /// checkpoint, but never misses one that does.
+  [[nodiscard]] bool cached_checkpoint_possible() const noexcept
+  {
+    return cached_view_possible && borrows_resident_batch();
+  }
+
   [[nodiscard]] bool has_scan_metadata() const noexcept
   {
     return std::holds_alternative<std::shared_ptr<scan_info>>(materialization_info) &&
@@ -339,6 +358,9 @@ class scan_operator_input : public op::operator_data {
   /// membership probes for this split's decode through its decode bindings; null when no decode
   /// attachment is permitted.
   std::shared_ptr<dynamic_filter_consumer> consumer;
+  /// `sirius_gpu_scan_operator::cached_view_possible`, stamped by
+  /// `sirius_gpu_scan_operator::get_next_task_input_data` before any reservation estimate runs.
+  bool cached_view_possible{false};
   /// Possible membership applications attached to this split's current decoded rows.
   std::vector<applied_entry> decode_attached;
   /// Operator-shared latch for "compacting this scan's batches during decode

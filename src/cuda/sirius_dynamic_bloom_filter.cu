@@ -43,6 +43,7 @@
 #include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
+#include <sirius/exception.hpp>
 #include <telemetry/nvtx.hpp>
 
 #include <algorithm>
@@ -515,12 +516,34 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
+  return compute_mask_impl(probe, prior_mask_words, nullptr, device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask_if(
+  cudf::column_view const& probe,
+  cudf::column_view const& prior_keep,
+  int device_id,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr) const
+{
+  return compute_mask_impl(
+    probe, nullptr, detail::checked_prior_keep(probe, prior_keep), device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask_impl(
+  cudf::column_view const& probe,
+  std::uint32_t const* prior_mask_words,
+  bool const* prior_keep,
+  int device_id,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr) const
+{
   auto const resolved = detail::resolve_dynamic_filter_device_id(device_id);
   if (auto const* accumulated = _impl ? _impl->find_accumulated(resolved) : nullptr) {
     return detail::dispatch_key_rep(_domain.rep, [&]<class Key>(Key) {
       auto const ref = accumulated_ref<Key>(accumulated->bits->data(), accumulated->blocks);
       return detail::run_membership_probe<Key>(
-        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref});
+        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref}, prior_keep);
     });
   }
   auto const* replica = _impl ? _impl->find(resolved) : nullptr;
@@ -532,7 +555,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
       using key_type   = typename owner_type::element_type::key_type;
       auto ref         = bloom->ref();
       return detail::run_membership_probe<key_type>(
-        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref});
+        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref}, prior_keep);
     },
     replica->bloom);
 }

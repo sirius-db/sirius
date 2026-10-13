@@ -28,9 +28,10 @@ namespace sirius::op {
  * @brief Folds an optional BOOL8 mask into a nonnullable conjunction and counts survivors
  *
  * With `initialize`, the prior conjunction is all true. Otherwise `running` contains the preceding
- * conjunction. Null incoming values reject rows; offsets are honored. A null `count` skips
- * counting; otherwise the caller zeros `count` on `stream`. The caller retains every buffer until
- * completion. No host readback is performed.
+ * conjunction. Null incoming values reject rows; offsets are honored. `running` may alias
+ * `incoming`; the fold is elementwise. A null `count` skips counting; otherwise the caller zeros
+ * `count` on `stream`. The caller retains every buffer until completion. No host readback is
+ * performed.
  */
 void fold_dynamic_filter_mask(cudf::mutable_column_view running,
                               std::optional<cudf::column_view> incoming,

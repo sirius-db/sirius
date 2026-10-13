@@ -526,16 +526,24 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
   // consumer that can attach probes gets the same conservative envelope as a known static filter
   // rather than falling through to the zero-copy view estimate below. A consumer without decode
   // bindings never attaches a probe.
+  //
+  // The scan's cached checkpoint filters a borrowed resident batch whether or not decompression
+  // pushdown is enabled: it builds the membership masks over the batch, then gathers the survivors
+  // into a new table.
+  bool const cached_checkpoint = cached_checkpoint_possible();
   bool const dynamic_filter_possible =
     sirius::decompression_pushdown_enabled() && consumer != nullptr &&
     !consumer->decode_bindings().empty() && !mvcc_keep_mask.has_mask();
-  if (row_filter_pending || dynamic_filter_possible) {
+  if (row_filter_pending || dynamic_filter_possible || cached_checkpoint) {
     // Once compaction has been measured unprofitable, later batches drop the
     // row selection and decode full width — keep the full-width envelope.
     bool const unprofitable = pushdown_selection_unprofitable &&
                               pushdown_selection_unprofitable->load(std::memory_order_relaxed);
-    if (auto const forecast = pushdown_compaction_forecast(*this);
-        forecast.compacts && !unprofitable && !dynamic_filter_possible) {
+    // The forecast reads the cached batch, so it is skipped when its result cannot matter.
+    auto const forecast = row_filter_pending && !dynamic_filter_possible && !unprofitable
+                            ? pushdown_compaction_forecast(*this)
+                            : sirius::decompression_pushdown_scan::compaction_forecast{};
+    if (forecast.compacts) {
       // Reservation for a compacting decode: the selection mask (1 bit/row per
       // filtered column — <= batch/4 across the source limit at >= 4 B/row
       // columns) plus the compacted outputs, and such splits steal their table,
@@ -552,24 +560,26 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
       // decode + BOOL8 mask on top, which this envelope has no way to
       // size. Excluded here so that extra cost falls back to the
       // conservative branch below instead of being silently unreserved.
+      //
+      // The cached checkpoint needs no more: such a split's table leaves the cached batch once
+      // decoded, unless a refused carrier-converting transfer leaves the checkpoint the compacted
+      // table, which this envelope sizes as it does post_filter_and_project's copy.
       auto const cap =
         forecast.survivors_bounded ? sirius::decompression_pushdown_max_selectivity() : 1.0;
       return batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
     }
-    if (!row_filter_pending) {
-      // A wired dynamic filter and NO static one, so nothing here filters by
-      // copy. The decode either compacts (output far below full width) or
-      // declines and hands back full-width columns it did NOT row-filter -- see
-      // pushdown_outcome::selection_unprofitable -- and post_filter_and_project
-      // then has no predicate to apply. Either way the peak is one full-width
-      // decode plus the probe's BOOL8 mask (1 B/row, under batch/4 at the >= 4
-      // B/row a projected column carries), not two full widths.
+    if (!row_filter_pending && !cached_checkpoint) {
+      // A wired dynamic filter, NO static one and no cached checkpoint, so nothing here filters by
+      // copy. The decode either compacts (output far below full width) or declines and hands back
+      // full-width columns it did NOT row-filter -- see pushdown_outcome::selection_unprofitable --
+      // and post_filter_and_project then has no predicate to apply. Either way the peak is one
+      // full-width decode plus the probe's BOOL8 mask (1 B/row, under batch/4 at the >= 4 B/row a
+      // projected column carries), not two full widths.
       return batch_bytes + batch_bytes / 4;
     }
-    // post_filter_and_project filters by copy: the materialized input and the
-    // compacted output (up to input-sized) coexist at peak. The BOOL8
-    // predicate column (1 B/row) hides inside the 2x conservatism (any
-    // projected column is >= 4 B/row).
+    // post_filter_and_project or the cached checkpoint filters by copy: the materialized input and
+    // the compacted output (up to input-sized) coexist at peak. The BOOL8 predicate column (1
+    // B/row) hides inside the 2x conservatism (any projected column is >= 4 B/row).
     return 2 * batch_bytes;
   }
   // An unmasked, unfiltered chunk serves a zero-copy view whose output copy is
