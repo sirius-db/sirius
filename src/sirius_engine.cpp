@@ -267,7 +267,7 @@ void sirius_engine::execute()
   if (!completion_handler_) {
     throw std::logic_error("execution requires a live window completion handler");
   }
-  auto* registry = &sirius_ctx->get_query_lifecycle_registry();
+  auto* registry                       = &sirius_ctx->get_query_lifecycle_registry();
   completion_handler_->execution_owner = std::this_thread::get_id();
   auto future                          = completion_handler_->get_awaitable();
 
