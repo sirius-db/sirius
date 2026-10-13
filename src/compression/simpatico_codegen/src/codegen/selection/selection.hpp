@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace cudf {
@@ -192,6 +193,12 @@ struct scan_filter_request {
   // mask-only request is refused. Must outlive the decompress_scan_filter call.
   uint32_t const* keep_mask_words = nullptr;
   int64_t keep_mask_rows          = 0;
+  // On an applied decode only selected[0, n) are returned, in order; the columns past n act only as
+  // wave-1 filter sources and are neither decoded nor gathered in wave 2. Unset = every selected
+  // column. Outside [1, selected.size()] the request is refused (plain decode). Every non-applied
+  // outcome (refused, declined_unselective, failed, or an assembly refusal) returns every selected
+  // column.
+  std::optional<std::size_t> delivered_prefix;
 };
 
 // Outcome of a decompress_scan_filter call. `declined_unselective` is worth remembering
@@ -217,9 +224,8 @@ struct scan_filter_result {
   bool keep_mask_applied     = false;                        // true only when status == applied
   int64_t num_rows           = 0;                            // pre-filter batch rows
   int64_t survivor_count     = -1;
-  std::vector<decode_route> routes;  // EFFECTIVE per-output route (a requested
-                                     // compacted route is demoted to `full` on
-                                     // probe fail)
+  std::vector<decode_route> routes;  // EFFECTIVE route per DELIVERED output: the requested route,
+                                     // or bitpack_mask for a range-filter source column
   rmm::device_buffer mask_words;     // uint32 x WordsFor(num_rows) (full chunk strips)
   rmm::device_buffer chunk_offsets;  // uint32 x (ChunksFor(num_rows)+1)
   rmm::device_buffer row_indices;    // int32 x survivor_count (empty when no

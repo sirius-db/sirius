@@ -149,6 +149,10 @@ struct operator_params {
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
+  /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
+  /// join is larger is split into tasks over row ranges of the left batch.
+  uint64_t cross_join_task_bytes = config::derived_default_batch_size();
+
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 

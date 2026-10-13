@@ -44,7 +44,7 @@ The single GPU scan source operator. It owns:
 
 The operator handles two split shapes transparently, both delivered as `scan_operator_input`: a **fresh read** (the input carries a `scan_info`, materialized via the ingestible) and a **pinned-cache hit** (the input carries a resident `data_batch`, filtered when required and normalized to the planned carrier schema). The operator never sees the source format directly.
 
-Before execution, a resident split is converted or decompressed to a plain GPU table when necessary. An unmasked split with no filtering ahead of it — unfiltered, or decode-row-filtered by the pushdown decode — may detach that per-query table: a split needing no carrier cast transfers it directly to the output, while a carrier-casting split keeps the wrapper as the retained source of a transactional steal in which execute builds every replacement column before committing the take, so an OOM mid-cast leaves the split rematerializable. Because the transactional steal bypasses `post_filter_and_project`, a decode-row-filtered split takes it only when the ingestible reports its output assembly as a leading identity (no partition synthesis, no reordering); a width match alone cannot prove that, since trailing pure-filter columns can offset synthesized output columns. Masked or still-to-be-filtered splits retain the wrapper view, which preserves the source for copy-based filtering.
+Before execution, a resident split is converted or decompressed to a plain GPU table when necessary. An unmasked split with no filtering ahead of it — unfiltered, or decode-row-filtered by the pushdown decode — may detach that per-query table: a split needing no carrier cast transfers it directly to the output, while a carrier-casting split keeps the wrapper as the retained source of a transactional steal in which execute builds every replacement column before committing the take, so an OOM mid-cast leaves the split rematerializable. Because the transactional steal bypasses `post_filter_and_project`, a decode-row-filtered split takes it only when the planned column layout says its output is a leading identity (no partition synthesis or output reordering) and the decoded batch is exactly the output width. A compressed pin's filtered decode reaches that width by omitting slots marked filter-only after it has applied the whole filter. A width match alone cannot prove the layout, since filter-only slots can offset synthesized output columns. Masked or still-to-be-filtered splits retain the wrapper view, which preserves the source for copy-based filtering.
 
 `no_history_peak_memory_estimate()` uses the larger of stored and working-set bytes for resident inputs that need no carrier conversion. For a known conversion it adds the exact destination bytes to the working set. The named maximum carrier expansion (8) is used only when a converting destination cannot be sized. A resident input with a physical sidecar but no reported conversion reserves the working set plus stored bytes as a source-bounded floor. For fresh reads the estimate remains 8 times the projected-column estimate plus decoded filter-only column buffers. The projected-column estimate remains the execution-history basis, and history-based reservations are clamped to the known decoded column-buffer footprint.
 
@@ -67,7 +67,8 @@ Before execution, a resident split is converted or decompressed to a plain GPU t
 | `materialize_metadata_to_table(info, mem_space, stream)` | Issue the read/decode for one split into a `cudf::table`. `mem_space` names the destination: its allocator is where the decoded columns land. It does not select an ioctx. |
 | `post_filter_and_project(table, mem_space, stream)` | Apply a pending post-decode filter and/or projection to output layout. |
 | `table_info()` | The per-table bind data (`ingestible_table_info`). |
-| `materialized_column_order()` | Storage indices in the exact order `materialize_table` emits columns (output columns first, then pure-filter columns). The pinned-cache path serves columns in this order so a cached batch is laid out identically to a fresh read. |
+| `materialized_column_order()` | Storage indices from the planned column layout, in the order `materialize_table` emits them. The pinned-cache path serves columns in this order so a cached batch matches a fresh read. |
+| `output_prefix_width()` | A view of the planned layout's output prefix. A compressed pin's filtered decode may omit trailing filter-only slots after applying the scan's whole filter. Nullopt makes no promise; zero-output scans have no output prefix. |
 
 ### Bind data vs. split descriptors
 
@@ -93,7 +94,12 @@ Required scan predicates, including `IS NOT NULL` introduced by DuckDB's string-
 rewrites, belong to the scan's row-level evaluator. Native reads and pinned batches retain
 them through materialization and evaluate them before dropping filter-only columns. An empty
 `projection_ids` means all `column_ids` are read; an explicit projection is extended with
-filter-only columns while preserving the original output arity.
+filter-only columns while recording the output boundary before the append. The parquet scan plan
+assigns each reader data slot an output, filter-only, or row-count-carrier role. A slot read by
+both output and filter is an output; duplicate outputs share its slot. Hive and parquet virtual
+outputs remain in the output layout. A count-style scan with a filter uses its filter column to
+carry the row count; a column-less scan may add a dedicated carrier. The native scan uses the
+same recorded boundary for its materialized order and output projection.
 
 Parquet (and its Iceberg subclass) also retains NULL predicates in the residual. Null-count
 statistics can prune whole row groups, but mixed groups still need row filtering. NULL tests

@@ -25,6 +25,7 @@
 #include <codegen/selection/selection.hpp>
 #include <codegen/util/stream_pool.hpp>
 #include <log/logging.hpp>
+#include <sirius/exception.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -395,6 +396,12 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   for (std::size_t i = 0; i < selected.size(); ++i) {
     wave_request.routes.push_back(config.routes[i]);
   }
+  // A pure-filter column is dead once this decode carries the scan's whole filter -- exactly the
+  // condition row_filtered is set under below -- so only the output prefix is delivered.
+  if (config.covers_whole_filter && request.output_prefix_width &&
+      *request.output_prefix_width < selected.size()) {
+    wave_request.delivered_prefix = *request.output_prefix_width;
+  }
   std::string order_echo;
   for (auto const& source : sources) {
     switch (source.what) {
@@ -444,7 +451,18 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   if (result.status == sirius::codegen::scan_filter_status::declined_unselective) {
     outcome.selection_unprofitable = true;
   } else if (result.applied && config.covers_whole_filter) {
-    outcome.row_filtered = true;
+    outcome.row_filtered                = true;
+    outcome.filter_only_columns_dropped = wave_request.delivered_prefix.has_value();
+  }
+  auto const expected_width =
+    outcome.filter_only_columns_dropped ? *wave_request.delivered_prefix : selected.size();
+  if (static_cast<std::size_t>(table->num_columns()) != expected_width) {
+    throw sirius::internal_exception(
+      "[decompression_pushdown_scan] the decode returned {} column(s), expected {} "
+      "(filter_only_columns_dropped={})",
+      table->num_columns(),
+      expected_width,
+      outcome.filter_only_columns_dropped);
   }
   // Every equality the request carried was ANDed into the batch mask before
   // wave 2 ran, so on an applied decode the surviving rows already satisfy
@@ -455,7 +473,7 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decompression-pushdown] decode {} (status={} generation={}): ranges={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
-    "selection_unprofitable={}",
+    "selection_unprofitable={} filter_only_columns_dropped={}",
     result.applied ? "APPLIED" : "NOT applied (plain output)",
     static_cast<int>(result.status),
     result.source_generation,
@@ -467,7 +485,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
     table->num_columns(),
     config.covers_whole_filter,
     outcome.row_filtered,
-    outcome.selection_unprofitable);
+    outcome.selection_unprofitable,
+    outcome.filter_only_columns_dropped);
   return table;
 }
 
@@ -619,10 +638,12 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
                   ? simpatico::decompress(chunk, selected, decode_pool(), mr)
                   : simpatico::decompress(chunk, selected, predicates, decode_pool(), mr);
   }
-  // An active equality directive yields BOOL8 on every path — the filtered
-  // decode and the plain rerun alike — so the substituted positions are exactly
-  // the active entries.
-  for (std::size_t i = 0; i < predicates.size(); ++i) {
+  // An active equality directive yields BOOL8 on every path — the filtered decode and the plain
+  // rerun alike — so the substituted positions are exactly the active entries the decoded table
+  // still holds (a filter-only column past the delivered prefix is not in it, and neither is its
+  // answer).
+  auto const width = static_cast<std::size_t>(out.table->num_columns());
+  for (std::size_t i = 0; i < predicates.size() && i < width; ++i) {
     if (predicates[i].active()) { out.outcome.predicate_columns.push_back(i); }
   }
   return out;

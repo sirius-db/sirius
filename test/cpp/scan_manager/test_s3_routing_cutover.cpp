@@ -211,7 +211,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_tab
   for (duckdb::idx_t i = 0; i < info->returned_types.size(); ++i) {
     info->column_ids.push_back(duckdb::ColumnIndex(i));
   }
-  info->scan_output_arity = info->returned_types.size();
+  info->projected_output_count = info->returned_types.size();
   return info;
 }
 

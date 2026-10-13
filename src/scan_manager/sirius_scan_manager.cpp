@@ -1840,15 +1840,16 @@ void sirius_scan_manager::prepare_for_query(
     // answer instead of values, and range conjuncts can drop rows while the
     // batch decodes rather than after it. The ingestible analysed its filter
     // once at bind; here it is only mapped onto the slots this entry serves.
-    auto const slot_map = primary_index_by_slot(*assignment.entry, assignment.columns);
-    auto pushdown_req   = sirius::op::build_pushdown_request(
-      assignment.op->get_ingestible().filter_analysis(), slot_map);
+    auto const slot_map    = primary_index_by_slot(*assignment.entry, assignment.columns);
+    auto const& ingestible = assignment.op->get_ingestible();
+    auto pushdown_req      = sirius::op::build_pushdown_request(
+      ingestible.filter_analysis(), slot_map, ingestible.output_prefix_width());
     // The provider captures the operator's dynamic-filter CHANNEL (not a
     // snapshot) so each compressed batch can pick up join-published filters at
     // serve time.
     std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
     if (sirius::decompression_pushdown_enabled()) {
-      auto const& info = assignment.op->get_ingestible().table_info();
+      auto const& info = ingestible.table_info();
       if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
         dynamic_filters = pq->sirius_dynamic_filters;
       } else if (auto const* native =
@@ -2950,15 +2951,7 @@ namespace {
 /// representation (a host pin may mix compressed and uncompressed chunks).
 std::size_t pinned_host_chunk_rows(cucascade::idata_representation const& chunk)
 {
-  if (auto const* compressed =
-        dynamic_cast<sirius::compressed_host_representation const*>(&chunk)) {
-    return static_cast<std::size_t>(compressed->num_rows());
-  }
-  auto const& host_table = chunk.cast<cucascade::host_data_representation>().get_host_table();
-  if (host_table && !host_table->columns.empty()) {
-    return static_cast<std::size_t>(host_table->columns.front().num_rows);
-  }
-  return 0;
+  return sirius::representation_num_rows(chunk).value_or(0);
 }
 
 }  // namespace
