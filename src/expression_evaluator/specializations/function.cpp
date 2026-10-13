@@ -99,7 +99,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   // TODO: Remove this special-case once Sirius pins cuDF >= 26.10 (cuDF PR
   // https://github.com/rapidsai/cudf/pull/21996 merged after the 26.08 cut,
   // so the fix will ship in 26.10).
-  auto const skip_ast      = alt.return_type().id() == sirius::type_id::DECIMAL;
+  auto const date_operation = alt.date_operation();
+  auto const skip_ast       = alt.return_type().id() == sirius::type_id::DECIMAL ||
+                        date_operation != date_arithmetic_operation::none;
   auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
                                                     supported_ast_functions.end(),
                                                     resolved_id) != supported_ast_functions.end();
@@ -152,6 +154,21 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     return materialize_as_ast_column(result.release_column());
   }
   auto const output_type = sirius::require_cudf_type(alt.return_type());
+
+  if (date_operation != date_arithmetic_operation::none) {
+    auto left  = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto right = evaluate(*args[1], evaluation_mode::MATERIALIZE);
+    if (left.is_scalar()) {
+      left = evaluate_result(
+        cudf::make_column_from_scalar(left.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    if (right.is_scalar()) {
+      right = evaluate_result(
+        cudf::make_column_from_scalar(right.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    return evaluate_result(temporal::date_arithmetic_checked(
+      left.get_column_view(), right.get_column_view(), date_operation, _stream, _mr));
+  }
 
   //----------Numeric Binary Functions----------//
   auto execute_numeric_binary_func = [&](cudf::binary_operator op) -> evaluate_result {

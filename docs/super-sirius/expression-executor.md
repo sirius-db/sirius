@@ -248,6 +248,14 @@ so sentinel handling has one implementation. The evaluator boundary regressions
 are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
 tagged `[timestamp_extraction]`.
 
+`DATE + INTEGER`, `INTEGER + DATE`, `DATE - INTEGER`, and `DATE - DATE`
+match their already-bound signatures and execute through `date_arithmetic_checked()`.
+Offsets preserve NULLs and infinity and reject finite overflow or infinity-sentinel
+collisions. Date differences widen both day counts before subtraction and return
+BIGINT. These operations materialize under every evaluator strategy; standalone
+cuDF AST translation declines them because it cannot implement the checks.
+The existing reference evaluator restores compressed operands before execution.
+
 ### Rounding
 
 `round(x)` and `round(x, n)` on FLOAT and DOUBLE map to `function_id::round` and run in

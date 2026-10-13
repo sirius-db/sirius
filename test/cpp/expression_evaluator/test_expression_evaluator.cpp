@@ -3313,3 +3313,41 @@ TEST_CASE("subsecond extraction preserves minimum finite ticks",
                                                       ? 5224192
                                                       : 5224));
 }
+
+TEST_CASE("DATE arithmetic restores narrow inputs before checked execution",
+          "[expression_evaluator][compressed_materialization][date_arithmetic]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const strategy = GENERATE(
+    exp_strategy_enum::MATERIALIZE, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const signature  = GENERATE(0, 1, 2, 3);
+  auto const date       = logical_type::make(type_id::DATE);
+  auto const integer    = logical_type::make(type_id::INTEGER);
+  auto const difference = signature == 3;
+  std::vector<std::unique_ptr<sirius::ast::node>> arguments;
+  arguments.push_back(make_ref_typed(0, signature == 1 ? integer : date));
+  arguments.push_back(make_ref_typed(1, signature == 1 || difference ? date : integer));
+  sirius::ast::node expression{
+    sirius::ast::function_call{signature < 2 ? sirius::function_id::add : sirius::function_id::sub,
+                               std::move(arguments),
+                               difference ? logical_type::make(type_id::BIGINT) : date}};
+  exp_executor executor(
+    expression, get_resource_ref(*space), cudf::get_default_stream(), strategy, 1);
+  auto left = make_carrier_column(
+    *space, cudf::data_type{cudf::type_id::INT16}, std::vector<int16_t>{-1, 11016, 32760});
+  auto right = make_carrier_column(
+    *space, cudf::data_type{cudf::type_id::INT16}, std::vector<int16_t>{-2, 5, -32760});
+  auto result = executor.evaluate(cudf::table_view{{left->view(), right->view()}});
+  REQUIRE(executor.restored_reference_cast_count_for_testing() == 2);
+  if (difference) {
+    REQUIRE(result->view().column(0).type() == cudf::data_type{cudf::type_id::INT64});
+    REQUIRE(copy_column_to_host<int64_t>(result->view().column(0)) ==
+            std::vector<int64_t>{1, 11011, 65520});
+  } else {
+    REQUIRE(result->view().column(0).type() == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
+    REQUIRE(copy_column_to_host<int32_t>(result->view().column(0)) ==
+            (signature == 2 ? std::vector<int32_t>{1, 11011, 65520}
+                            : std::vector<int32_t>{-3, 11021, 0}));
+  }
+}

@@ -130,4 +130,81 @@ std::unique_ptr<cudf::column> cast_to_microseconds_checked(cudf::column_view con
                             mr);
 }
 
+std::unique_ptr<cudf::column> date_arithmetic_checked(cudf::column_view const& left,
+                                                      cudf::column_view const& right,
+                                                      date_arithmetic_operation operation,
+                                                      ::cuda::stream_ref stream,
+                                                      rmm::device_async_resource_ref mr)
+{
+  using recipe          = date_arithmetic_operation;
+  auto const date_type  = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+  auto const int32_type = cudf::data_type{cudf::type_id::INT32};
+  auto const int64_type = cudf::data_type{cudf::type_id::INT64};
+  auto const bool_type  = cudf::data_type{cudf::type_id::BOOL8};
+  auto const reversed   = operation == recipe::days_add_date;
+  auto const difference = operation == recipe::date_difference;
+  auto date             = reversed ? right : left;
+  auto days             = reversed ? left : right;
+  if (operation == recipe::none || date.type() != date_type ||
+      days.type() != (difference ? date_type : int32_type) || left.size() != right.size()) {
+    throw internal_exception("[date_arithmetic] source type or shape mismatch");
+  }
+  auto date_ticks = cudf::bit_cast(date, int32_type);
+  auto days_ticks = difference ? cudf::bit_cast(days, int32_type) : days;
+  auto wide_date  = cudf::cast(date_ticks, int64_type, stream, mr);
+  auto wide_days  = cudf::cast(days_ticks, int64_type, stream, mr);
+  auto result     = cudf::binary_operation(wide_date->view(),
+                                       wide_days->view(),
+                                       operation == recipe::date_sub_days || difference
+                                             ? cudf::binary_operator::SUB
+                                             : cudf::binary_operator::ADD,
+                                       int64_type,
+                                       stream,
+                                       mr);
+  if (difference) { return result; }
+
+  auto finite = finite_mask(date, stream, mr);
+  cudf::numeric_scalar<int64_t> lower(std::numeric_limits<int32_t>::min(), true, stream, mr);
+  cudf::numeric_scalar<int64_t> upper(std::numeric_limits<int32_t>::max(), true, stream, mr);
+  cudf::numeric_scalar<int64_t> negative_infinity(
+    -std::numeric_limits<int32_t>::max(), true, stream, mr);
+  auto below = cudf::binary_operation(
+    result->view(), lower, cudf::binary_operator::LESS, bool_type, stream, mr);
+  auto above = cudf::binary_operation(
+    result->view(), upper, cudf::binary_operator::GREATER_EQUAL, bool_type, stream, mr);
+  auto collision = cudf::binary_operation(
+    result->view(), negative_infinity, cudf::binary_operator::EQUAL, bool_type, stream, mr);
+  auto outside = cudf::binary_operation(
+    below->view(), above->view(), cudf::binary_operator::LOGICAL_OR, bool_type, stream, mr);
+  auto invalid_range = cudf::binary_operation(
+    outside->view(), collision->view(), cudf::binary_operator::LOGICAL_OR, bool_type, stream, mr);
+  auto invalid_finite = cudf::binary_operation(invalid_range->view(),
+                                               finite->view(),
+                                               cudf::binary_operator::LOGICAL_AND,
+                                               bool_type,
+                                               stream,
+                                               mr);
+  auto any            = cudf::reduce(invalid_finite->view(),
+                          *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
+                          bool_type,
+                          stream,
+                          mr);
+  auto const& invalid = static_cast<cudf::numeric_scalar<bool> const&>(*any);
+  if (invalid.is_valid(stream) && invalid.value(stream)) {
+    throw invalid_input_exception("Date out of range");
+  }
+  // Preserve the offset's validity even when the DATE is infinite.
+  cudf::numeric_scalar<int32_t> zero(0, true, stream, mr);
+  auto offset_zero =
+    cudf::binary_operation(days, zero, cudf::binary_operator::MUL, int32_type, stream, mr);
+  auto sentinel = cudf::binary_operation(
+    date_ticks, offset_zero->view(), cudf::binary_operator::ADD, int32_type, stream, mr);
+  auto narrow = cudf::cast(result->view(), int32_type, stream, mr);
+  return cudf::copy_if_else(cudf::bit_cast(narrow->view(), date_type),
+                            cudf::bit_cast(sentinel->view(), date_type),
+                            finite->view(),
+                            stream,
+                            mr);
+}
+
 }  // namespace sirius::temporal
