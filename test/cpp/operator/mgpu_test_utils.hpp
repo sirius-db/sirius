@@ -120,6 +120,8 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
        "      num_threads: 1\n"
        "      monitor_period: 10ms\n"
        "  operator_params:\n"
+       // Distribution tests must keep all configured GPUs, even for small fixtures.
+       "    admission_bytes_per_gpu: 0\n"
        "    scan_task_batch_size: "
     << params.scan_task_batch_size
     << "\n"

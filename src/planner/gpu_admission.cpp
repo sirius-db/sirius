@@ -23,6 +23,7 @@
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
+#include <duckdb/common/multi_file/multi_file_list.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
@@ -67,11 +68,7 @@ std::optional<uint64_t> table_function_row_count(duckdb::ClientContext& context,
   try {
     auto stats = scan.function.cardinality(context, scan.bind_data.get());
     if (!stats) { return std::nullopt; }
-    // max_cardinality includes rows appended in this transaction; prefer it.
-    if (stats->has_max_cardinality) { return static_cast<uint64_t>(stats->max_cardinality); }
-    if (stats->has_estimated_cardinality) {
-      return static_cast<uint64_t>(stats->estimated_cardinality);
-    }
+    return detail::reported_row_count(*stats);
   } catch (std::exception const& e) {
     SIRIUS_LOG_DEBUG(
       "gpu_admission: cardinality callback of {} threw: {}", scan.function.name, e.what());
@@ -79,72 +76,20 @@ std::optional<uint64_t> table_function_row_count(duckdb::ClientContext& context,
   return std::nullopt;
 }
 
-/// Average uncompressed bytes per value of each leaf column of the first Parquet file behind a
-/// read_parquet / parquet_scan bind, for columns stored verbatim. Empty when the bind is not a
-/// multi-file Parquet bind, no file has been opened, the schema is nested (leaf columns no longer
-/// line up with table columns), or a row group disagrees on the column count.
+/// Only use an already-open footer when it covers the entire scan. Do not open additional
+/// files just to size admission; multi-file scans retain their configured width.
 std::vector<std::optional<uint64_t>> parquet_leaf_column_widths(const duckdb::FunctionData* bind)
 {
   auto const* multi = dynamic_cast<const duckdb::MultiFileBindData*>(bind);
-  if (multi == nullptr || !multi->initial_reader) { return {}; }
+  if (multi == nullptr || !multi->initial_reader || !multi->file_list) { return {}; }
   auto const* reader = dynamic_cast<const duckdb::ParquetReader*>(multi->initial_reader.get());
   if (reader == nullptr) { return {}; }
   auto const* metadata = reader->GetFileMetadata();
-  if (metadata == nullptr || metadata->row_groups.empty()) { return {}; }
-
-  auto const num_leaves = metadata->row_groups.front().columns.size();
-  // Flat schema only: one leaf per bound column. Nested types add leaves the table column
-  // indices do not account for.
-  if (num_leaves == 0 || num_leaves != multi->names.size()) { return {}; }
-
-  // Two sources per leaf, best first. (1) Parquet size statistics (format 2.10+): the unencoded
-  // byte count of a BYTE_ARRAY column, exact whatever the encoding. (2) The chunk's uncompressed
-  // size, usable only when no dictionary is involved (a dictionary chunk's size says nothing about
-  // the decoded width). Either way cuDF adds a 4-byte offset per string.
-  constexpr uint64_t k_string_offset_bytes = 4;
-  std::vector<uint64_t> unencoded(num_leaves, 0), unencoded_values(num_leaves, 0);
-  std::vector<uint64_t> bytes(num_leaves, 0), values(num_leaves, 0);
-  std::vector<bool> dictionary(num_leaves, false), byte_array(num_leaves, false);
-  for (auto const& row_group : metadata->row_groups) {
-    if (row_group.columns.size() != num_leaves) { return {}; }
-    for (std::size_t c = 0; c < num_leaves; ++c) {
-      auto const& meta = row_group.columns[c].meta_data;
-      if (meta.num_values <= 0) { continue; }
-      auto const n = static_cast<uint64_t>(meta.num_values);
-      if (meta.type == duckdb_parquet::Type::BYTE_ARRAY) { byte_array[c] = true; }
-      if (meta.__isset.size_statistics &&
-          meta.size_statistics.__isset.unencoded_byte_array_data_bytes &&
-          meta.size_statistics.unencoded_byte_array_data_bytes > 0) {
-        unencoded[c] += static_cast<uint64_t>(meta.size_statistics.unencoded_byte_array_data_bytes);
-        unencoded_values[c] += n;
-      }
-      if (meta.total_uncompressed_size > 0) {
-        bytes[c] += static_cast<uint64_t>(meta.total_uncompressed_size);
-        values[c] += n;
-      }
-      if (meta.__isset.dictionary_page_offset) { dictionary[c] = true; }
-      for (auto const encoding : meta.encodings) {
-        if (encoding == duckdb_parquet::Encoding::PLAIN_DICTIONARY ||
-            encoding == duckdb_parquet::Encoding::RLE_DICTIONARY) {
-          dictionary[c] = true;
-        }
-      }
-    }
-  }
-
-  std::vector<std::optional<uint64_t>> widths(num_leaves);
-  for (std::size_t c = 0; c < num_leaves; ++c) {
-    if (byte_array[c] && unencoded_values[c] > 0) {
-      widths[c] =
-        (unencoded[c] + unencoded_values[c] - 1) / unencoded_values[c] + k_string_offset_bytes;
-      continue;
-    }
-    if (dictionary[c] || values[c] == 0) { continue; }
-    // PLAIN / DELTA_LENGTH byte arrays already carry a 4-byte length per value, so the encoded
-    // average is within a few bytes of chars + offset; take it as is.
-    widths[c] = std::max<uint64_t>(1, (bytes[c] + values[c] - 1) / values[c]);
-  }
-  return widths;
+  if (metadata == nullptr) { return {}; }
+  return detail::parquet_column_widths(
+    *metadata,
+    multi->names.size(),
+    multi->file_list->GetExpandResult() == duckdb::FileExpandResult::SINGLE_FILE);
 }
 
 /// The table column behind output column @p output_idx of @p scan, or nullopt for virtual
@@ -163,6 +108,68 @@ std::optional<duckdb::column_t> table_column_of_output(const op::sirius_physical
 }
 
 }  // namespace
+
+namespace detail {
+
+std::optional<uint64_t> reported_row_count(const duckdb::NodeStatistics& stats)
+{
+  std::optional<uint64_t> rows;
+  if (stats.has_max_cardinality) { rows = stats.max_cardinality; }
+  if (stats.has_estimated_cardinality) {
+    rows = std::max(rows.value_or(0), static_cast<uint64_t>(stats.estimated_cardinality));
+  }
+  return rows;
+}
+
+std::vector<std::optional<uint64_t>> parquet_column_widths(
+  const duckdb_parquet::FileMetaData& metadata, std::size_t bound_columns, bool single_file)
+{
+  if (!single_file || metadata.row_groups.empty()) { return {}; }
+  auto const num_leaves = metadata.row_groups.front().columns.size();
+  // Only flat schemas have one leaf per bound column.
+  if (num_leaves == 0 || num_leaves != bound_columns) { return {}; }
+  std::vector<uint64_t> bytes(num_leaves, 0), values(num_leaves, 0);
+  std::vector<bool> complete(num_leaves, true);
+  for (auto const& row_group : metadata.row_groups) {
+    if (row_group.columns.size() != num_leaves) { return {}; }
+    for (std::size_t c = 0; c < num_leaves; ++c) {
+      auto const& chunk = row_group.columns[c];
+      auto const& meta  = chunk.meta_data;
+      if (row_group.num_rows == 0) { continue; }
+      // Encoded sizes (including DELTA and dictionary encodings) cannot describe decoded
+      // strings. Require unencoded size statistics for EVERY nonempty row group.
+      if (!chunk.__isset.meta_data || meta.type != duckdb_parquet::Type::BYTE_ARRAY ||
+          meta.num_values <= 0 || meta.num_values != row_group.num_rows ||
+          !meta.__isset.size_statistics ||
+          !meta.size_statistics.__isset.unencoded_byte_array_data_bytes ||
+          meta.size_statistics.unencoded_byte_array_data_bytes < 0) {
+        complete[c] = false;
+        continue;
+      }
+      auto const n    = static_cast<uint64_t>(meta.num_values);
+      auto const size = static_cast<uint64_t>(meta.size_statistics.unencoded_byte_array_data_bytes);
+      // Reject overflowing metadata rather than turning it into a small admission estimate.
+      constexpr auto k_max = std::numeric_limits<uint64_t>::max();
+      if (bytes[c] > k_max - size || values[c] > k_max - n) {
+        complete[c] = false;
+        continue;
+      }
+      bytes[c] += size;
+      values[c] += n;
+    }
+  }
+  std::vector<std::optional<uint64_t>> widths(num_leaves);
+  for (std::size_t c = 0; c < num_leaves; ++c) {
+    if (!complete[c] || values[c] == 0) { continue; }
+    // Ceiling average of decoded chars plus cuDF's four-byte offset per row. Zero-byte
+    // statistics are valid for empty/all-null strings and still need offsets.
+    auto const chars = bytes[c] / values[c] + (bytes[c] % values[c] != 0);
+    widths[c]        = accumulate_scan_bytes(chars, 1, 4);
+  }
+  return widths;
+}
+
+}  // namespace detail
 
 op::scan::scan_admission_hint derive_scan_admission_hint(duckdb::ClientContext& context,
                                                          const op::sirius_physical_table_scan& scan)
