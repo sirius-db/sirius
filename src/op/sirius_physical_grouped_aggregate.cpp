@@ -22,6 +22,8 @@
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <algorithm>
+
 namespace sirius {
 namespace op {
 
@@ -75,8 +77,19 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   cudf_aggregate_idx                = std::move(cudf_defs.cudf_aggregate_idx);
   cudf_aggregate_struct_col_indices = std::move(cudf_defs.cudf_aggregate_struct_col_indices);
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
+  local_types                       = std::move(cudf_defs.local_types);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+  // Grouping-set expansion inserts the set id and GROUPING() values before the partial
+  // aggregate carriers. Keep their types from the planner's final schema; AVG may expand
+  // the aggregate suffix, and STDDEV_SAMP / COUNT(DISTINCT) replace its scalar carriers.
+  if (has_grouping_sets()) {
+    auto const keys_end   = static_cast<std::ptrdiff_t>(group_idx.size());
+    auto const groups_end = static_cast<std::ptrdiff_t>(num_output_group_columns());
+    local_types.insert(local_types.begin() + keys_end,
+                       this->types.begin() + keys_end,
+                       this->types.begin() + groups_end);
+  }
   // A bound belongs to the aggregate's SUM slot; AVG's COUNT_VALID slot (cudf_idx + 1) needs none.
   cudf_aggregate_input_max_abs.assign(cudf_aggregates.size(), std::nullopt);
   for (size_t i = 0; i < aggregate_slots.size() && i < aggregate_input_max_abs.size(); ++i) {
@@ -102,6 +115,11 @@ sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
     }
   }
   return local_types;
+}
+
+bool sirius_physical_grouped_aggregate::has_stddev_samp() const
+{
+  return std::ranges::any_of(aggregate_slots, [](auto const& slot) { return slot.is_stddev_samp; });
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
