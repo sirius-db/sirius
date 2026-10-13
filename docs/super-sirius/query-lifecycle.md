@@ -37,6 +37,13 @@ when a GPU worker destroys its task before scheduling consumers. Logical complet
 the query owner; workers never join creator work or wait for their own query to retire. A rejected handoff leaves the caller's existing claim intact through
 disposal. Queue drains detach under their mutex and destroy outside it.
 
+Submission failure must be reported before disposing of a GPU task: its destructor updates pipeline
+completion and can otherwise publish success before an outer catch reports the error. Scheduler and
+executor handoffs catch exceptions while still owning the task. Bounded-pool dispatch allocates its
+queue entry before moving the slot or callable; the leased submission adapter reports failures before
+releasing either possible callable owner. Error diagnostics use `log_noexcept()` at the GPU and pool
+exception boundaries so logging cannot replace the original failure or terminate a worker.
+
 Tier-1 spilling acquires a borrow for the actual victim query before inspecting its repositories.
 Each dispatched candidate receives its own lease. A manager snapshot alone does not pin every
 query, and shared ownership of a repository manager alone does not protect repositories being
@@ -61,7 +68,9 @@ Retirement must finish before resources are released:
    announce it again. On success, validate empty execution queues without dropping execution
    work. Redundant creator hints may be discarded. Leave other queries' workers running.
 4. Wait for Q's work leases, including in-hand tasks, completion callbacks and spill victims.
-5. Release Q's plan, repositories, scan state and telemetry in dependency order.
+5. Release Q's repositories and scan state, then its retained plan and remaining telemetry.
+   Scan state borrows plan operators; its drain runs once while they are alive, and later
+   retirement calls preserve that completed barrier without revisiting the operators.
 6. Close the registry entry; the surrounding execution scope releases admission.
 
 Only the runtime owner performs the publication and work barriers. Scheduler/executor methods

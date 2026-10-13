@@ -61,34 +61,40 @@ bool itask_executor::schedule(std::unique_ptr<itask> input)
   // Declared before task so an exception destroys unsubmitted work before settling its publisher.
   exec::query_lifecycle_registry::submission_guard submission;
   auto task = std::move(input);
-  if (task) {
-    // The OOM reschedule path re-enters here from a pool worker after a 50 ms backoff, so a
-    // drain for this query may already have passed. Refuse rather than re-arm work behind it.
+  try {
+    if (task) {
+      // The OOM reschedule path re-enters here from a pool worker after a 50 ms backoff, so a
+      // drain for this query may already have passed. Refuse rather than re-arm work behind it.
 
-    submission = pipeline::begin_submission(
-      _query_lifecycle, *task, "task_executor: query lifecycle registration is missing");
-    if (!submission) { return false; }
+      submission = pipeline::begin_submission(
+        _query_lifecycle, *task, "task_executor: query lifecycle registration is missing");
+      if (!submission) { return false; }
 
-    if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
-      pipeline_task->telemetry_fsm().queued({
-        .queue =
-          {
-            .target = _task_queue_telemetry.id(),
-            .data   = {.entries = 1},
-          },
-      });
-    }
-  }
-  if (!_task_queue.try_push(task)) {
-    if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
-      if (auto handler = gpu_task->get_completion_handler()) {
-        handler->report_error("task executor queue closed before dispatch");
+      if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
+        pipeline_task->telemetry_fsm().queued(
+          {.queue = {.target = _task_queue_telemetry.id(), .data = {.entries = 1}}});
       }
     }
-    SIRIUS_LOG_WARN("Task queue interrupted, dropping task");
-    return false;
+    if (!_task_queue.try_push(task)) {
+      if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+        if (auto handler = gpu_task->get_completion_handler()) {
+          handler->report_error("task executor queue closed before dispatch");
+        }
+      }
+      SIRIUS_LOG_WARN("Task queue interrupted, dropping task");
+      return false;
+    }
+    return true;
+  } catch (...) {
+    // try_push preserves ownership on failure. Report before task destruction can complete
+    // its pipeline; the caller's catch runs after this local owner has already unwound.
+    if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+      if (auto completion = gpu_task->get_completion_handler()) {
+        completion->report_error(std::current_exception());
+      }
+    }
+    throw;
   }
-  return true;
 }
 
 void itask_executor::start()

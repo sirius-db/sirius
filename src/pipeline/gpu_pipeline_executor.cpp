@@ -403,6 +403,9 @@ void gpu_pipeline_executor::process_task(
       std::move(slot),
       query_id,
       std::move(work),
+      [iteration_completion](std::exception_ptr error) noexcept {
+        if (iteration_completion) { iteration_completion->report_error(error); }
+      },
       [this,
        task       = std::move(pipeline_task),
        exc_stream = std::move(exc_stream),
@@ -538,18 +541,23 @@ void gpu_pipeline_executor::process_task(
           _task_creator->reschedule(std::move(new_task));
           return;
         } catch (const std::exception& e) {
-          SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
           if (completion) {
             completion->report_error(std::current_exception(),
                                      transparent::late_failure_cause::gpu_error);
           }
+          log::log_noexcept([&] {
+            SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}",
+                             e.what());
+          });
           return;
         } catch (...) {
-          SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error during task execution");
           if (completion) {
             completion->report_error(std::current_exception(),
                                      transparent::late_failure_cause::gpu_error);
           }
+          log::log_noexcept([&] {
+            SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error during task execution");
+          });
           return;
         }
         if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
@@ -583,12 +591,14 @@ void gpu_pipeline_executor::process_task(
               if (consumer) { _task_creator->schedule(consumer); }
             }
           } catch (const std::exception& e) {
-            SIRIUS_LOG_ERROR("GPU Pipeline Executor: failed to schedule downstream consumers: {}",
-                             e.what());
             if (completion) {
               completion->report_error(std::current_exception(),
                                        transparent::late_failure_cause::gpu_error);
             }
+            log::log_noexcept([&] {
+              SIRIUS_LOG_ERROR("GPU Pipeline Executor: failed to schedule downstream consumers: {}",
+                               e.what());
+            });
             return;
           }
         }
@@ -600,18 +610,16 @@ void gpu_pipeline_executor::process_task(
         }
       });
   } catch (const std::exception& e) {
-    SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception while preparing task for dispatch: {}",
-                     e.what());
-    try {
-      if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
-    } catch (...) {  // reporting must never take down the manager thread
-    }
+    if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
+    log::log_noexcept([&] {
+      SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception while preparing task for dispatch: {}",
+                       e.what());
+    });
   } catch (...) {
-    SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error while preparing task for dispatch");
-    try {
-      if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
-    } catch (...) {
-    }
+    if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
+    log::log_noexcept([] {
+      SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error while preparing task for dispatch");
+    });
   }
 }
 

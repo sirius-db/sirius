@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
+#include "log/logging.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_build_context.hpp"
@@ -25,6 +26,7 @@
 #include "scan/test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
 
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <atomic>
@@ -145,6 +147,63 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
   }
 
   std::vector<sirius::op::sirius_physical_operator*> get_output_consumers() override { return {}; }
+};
+
+// Only the error diagnostic throws; normal manager startup/shutdown remains usable.
+class throwing_error_sink : public sirius::log::sink {
+ public:
+  explicit throwing_error_sink(
+    std::shared_ptr<sirius::pipeline::completion_handler> completion = {})
+    : completion_(std::move(completion))
+  {
+  }
+  void set_level(sirius::log::level) override {}
+  bool should_log(sirius::log::level level) const override
+  {
+    return level == sirius::log::level::error;
+  }
+  void log(sirius::log::level, const std::source_location&, std::string_view) override
+  {
+    ++attempts;
+    if (completion_ && !completion_->has_error()) { reported_first = false; }
+    throw std::runtime_error("diagnostic failure");
+  }
+  bool flush() override { return true; }
+
+  std::atomic<int> attempts{0};
+  std::atomic<bool> reported_first{true};
+
+ private:
+  std::shared_ptr<sirius::pipeline::completion_handler> completion_;
+};
+
+class failing_gpu_task : public sirius_pipeline_task {
+ public:
+  failing_gpu_task(std::shared_ptr<test_gpu_pipeline_task_global_state> global,
+                   bool preparation_failure,
+                   bool nonstandard_exception)
+    : sirius_pipeline_task(
+        1, std::make_unique<test_gpu_pipeline_task_local_state>(nullptr), std::move(global)),
+      preparation_failure_(preparation_failure),
+      nonstandard_exception_(nonstandard_exception)
+  {
+  }
+  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space* space) const override
+  {
+    if (preparation_failure_) { fail(); }
+    return sirius_pipeline_task::get_estimated_reservation_size_info(space);
+  }
+  void execute(::cuda::stream_ref) override { fail(); }
+
+ private:
+  [[noreturn]] void fail() const
+  {
+    if (nonstandard_exception_) { throw 42; }
+    throw std::runtime_error("original task failure");
+  }
+  bool preparation_failure_;
+  bool nonstandard_exception_;
 };
 
 // Hold the production manager before it can pop any staging task. The gate is test-local;
@@ -375,4 +434,122 @@ TEST_CASE("GPU pipeline executor schedules GPU tasks directly (push-model)",
       REQUIRE(consumed_bytes >= kReservationBytes);
     }
   }
+}
+
+TEST_CASE("GPU errors precede terminal task destruction even when logging throws",
+          "[gpu_pipeline_executor][query_lifecycle_gate]")
+{
+  using namespace std::chrono_literals;
+  bool preparation_failure   = false;
+  bool nonstandard_exception = false;
+  SECTION("preparation error") { preparation_failure = true; }
+  SECTION("unknown preparation error")
+  {
+    preparation_failure   = true;
+    nonstandard_exception = true;
+  }
+  SECTION("worker error") {}
+  SECTION("unknown worker error") { nonstandard_exception = true; }
+
+  auto completion    = std::make_shared<sirius::pipeline::completion_handler>();
+  auto done          = completion->get_awaitable();
+  auto previous_sink = sirius::log::get_sink();
+  auto sink          = std::make_shared<throwing_error_sink>(completion);
+  sirius::log::set_sink(sink);
+  absl::Cleanup restore_sink = [&] { sirius::log::set_sink(previous_sink); };
+
+  const auto failed_query = sirius::make_query_id(7);
+  const auto next_query   = sirius::make_query_id(0);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(failed_query);
+  lifecycle.open_query(next_query);
+  auto manager    = initialize_memory_manager(1);
+  auto* mem_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(mem_space);
+
+  // A real exhausted terminal pipeline: destroying its sole task attempts success publication.
+  sirius::op::sirius_physical_operator terminal(
+    sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR, {}, 0);
+  auto pipe = std::make_shared<sirius::pipeline::sirius_pipeline>(
+    sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*pipe, terminal);
+  build_state.set_pipeline_sink(*pipe, &terminal, 1);
+  pipe->set_query_id(failed_query);
+  pipe->set_completion_handler(completion);
+  auto global = std::make_shared<test_gpu_pipeline_task_global_state>();
+  global->set_pipeline(pipe);
+  global->set_completion_handler(completion);
+
+  sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> requests;
+  sirius::pipeline::gpu_pipeline_executor executor(lifecycle,
+                                                   {1, "error-logging"},
+                                                   mem_space,
+                                                   requests.make_publisher(),
+                                                   nullptr,
+                                                   sirius::test::make_test_telemetry_context());
+  executor.start();
+  REQUIRE(executor.schedule(
+    std::make_unique<failing_gpu_task>(global, preparation_failure, nonstandard_exception)));
+  REQUIRE(done.wait_for(5s) == std::future_status::ready);
+  if (nonstandard_exception) {
+    try {
+      done.get();
+      FAIL("expected original nonstandard task exception");
+    } catch (int error) {
+      CHECK(error == 42);
+    }
+  } else {
+    CHECK_THROWS_WITH(done.get(), "original task failure");
+  }
+  lifecycle.quiesce_and_wait_for_submissions(failed_query);
+  lifecycle.wait_for_work(failed_query);
+  CHECK(completion->has_error());
+  CHECK(pipe->is_pipeline_finished());
+  CHECK(lifecycle.activity(failed_query).work == 0);
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_ERROR
+  CHECK(sink->attempts == 1);
+  CHECK(sink->reported_first);
+#endif
+  lifecycle.close(failed_query);
+
+  // An unrelated query can use the same manager and worker after the error.
+  auto next_state = std::make_shared<test_gpu_pipeline_task_global_state>();
+  REQUIRE(executor.schedule(std::make_unique<sirius_pipeline_task>(
+    2, std::make_unique<test_gpu_pipeline_task_local_state>(nullptr), next_state)));
+  auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (next_state->executed_count.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  executor.stop();
+  CHECK(next_state->executed_count.load() == 1);
+  CHECK(next_state->error_count.load() == 0);
+  lifecycle.quiesce_and_wait_for_submissions(next_query);
+  CHECK(lifecycle.activity(next_query).work == 0);
+  lifecycle.close(next_query);
+}
+
+TEST_CASE("bounded pool survives a throwing error sink and releases its slot",
+          "[bounded_thread_pool]")
+{
+  bool nonstandard_exception = false;
+  SECTION("standard exception") {}
+  SECTION("unknown exception") { nonstandard_exception = true; }
+  auto previous_sink = sirius::log::get_sink();
+  auto sink          = std::make_shared<throwing_error_sink>();
+  sirius::log::set_sink(sink);
+  absl::Cleanup restore_sink = [&] { sirius::log::set_sink(previous_sink); };
+  sirius::exec::bounded_thread_pool pool(1, "throwing-log");
+  pool.dispatch(pool.reserve(), [=] {
+    if (nonstandard_exception) { throw 42; }
+    throw std::runtime_error("worker failure");
+  });
+  pool.wait_all();
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_ERROR
+  CHECK(sink->attempts == 1);
+#endif
+  std::atomic<bool> ran{false};
+  pool.dispatch(pool.reserve(), [&] { ran = true; });
+  pool.wait_all();
+  CHECK(ran);
 }

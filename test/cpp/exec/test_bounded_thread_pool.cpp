@@ -376,14 +376,26 @@ TEST_CASE("query retirement ignores other queries and idle pool reservations",
   release_on_exit guard{release_b};
   std::atomic<int> a_done{0};
   auto work_b = lifecycle.try_acquire_work(qb);
-  dispatch_with_work(pool, pool.reserve(), qb, std::move(work_b), [&] {
-    while (!release_b.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
-  });
+  dispatch_with_work(
+    pool,
+    pool.reserve(),
+    qb,
+    std::move(work_b),
+    [](std::exception_ptr) noexcept {},
+    [&] {
+      while (!release_b.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+    });
   for (int i = 0; i < 3; ++i) {
     auto work = lifecycle.try_acquire_work(qa);
-    dispatch_with_work(pool, pool.reserve(), qa, std::move(work), [&] { ++a_done; });
+    dispatch_with_work(
+      pool,
+      pool.reserve(),
+      qa,
+      std::move(work),
+      [](std::exception_ptr) noexcept {},
+      [&] { ++a_done; });
   }
   lifecycle.quiesce_and_wait_for_submissions(qa);
   lifecycle.wait_for_work(qa);
@@ -413,7 +425,13 @@ TEST_CASE("a manager-held lease covers dispatch after the pool cancellation swee
   auto retired = std::async(std::launch::async, [&] { lifecycle.wait_for_work(q); });
   CHECK(retired.wait_for(20ms) == std::future_status::timeout);
   std::atomic<bool> ran{false};
-  dispatch_with_work(pool, std::move(slot), q, std::move(held_work), [&] { ran = true; });
+  dispatch_with_work(
+    pool,
+    std::move(slot),
+    q,
+    std::move(held_work),
+    [](std::exception_ptr) noexcept {},
+    [&] { ran = true; });
   retired.get();
   CHECK(ran);
   CHECK(lifecycle.activity(q).work == 0);
@@ -449,11 +467,28 @@ TEST_CASE("pool cancellation discards only matching queued work outside its mute
   auto owned      = std::unique_ptr<reentrant_capture>(new reentrant_capture{pool, destroyed});
   auto first_work = lifecycle.try_acquire_work(qa);
   dispatch_with_work(
-    pool, std::move(first), qa, std::move(first_work), [&, owned = std::move(owned)] { ++ran; });
+    pool,
+    std::move(first),
+    qa,
+    std::move(first_work),
+    [](std::exception_ptr) noexcept {},
+    [&, owned = std::move(owned)] { ++ran; });
   auto second_work = lifecycle.try_acquire_work(qa);
-  dispatch_with_work(pool, std::move(second), qa, std::move(second_work), [&] { ++ran; });
+  dispatch_with_work(
+    pool,
+    std::move(second),
+    qa,
+    std::move(second_work),
+    [](std::exception_ptr) noexcept {},
+    [&] { ++ran; });
   auto other_work = lifecycle.try_acquire_work(qb);
-  dispatch_with_work(pool, std::move(other), qb, std::move(other_work), [&] { ++ran; });
+  dispatch_with_work(
+    pool,
+    std::move(other),
+    qb,
+    std::move(other_work),
+    [](std::exception_ptr) noexcept {},
+    [&] { ++ran; });
   absl::Cleanup cleanup = [&] {
     pool.discard_queued(qa);
     pool.discard_queued(qb);

@@ -19,6 +19,7 @@
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 
+#include <exception>
 #include <type_traits>
 #include <utility>
 
@@ -51,15 +52,28 @@ class leased_callable {
 };
 
 /// Submit work with a queue-disposal tag; the lease owns its query resource lifetime.
-/// The caller's claim remains intact if constructing the callable argument throws.
-template <typename F>
+/// Report submission failure while captures are still alive: their destructors may signal success.
+/// Constructing the caller's callable argument must not throw after taking ownership of a task.
+template <typename ReportError, typename F>
 void dispatch_with_work(bounded_thread_pool& pool,
                         bounded_thread_pool::slot&& slot,
                         query_id_t query,
                         query_lifecycle_registry::work_lease&& work,
+                        ReportError&& report_error,
                         F&& fn)
 {
-  pool.dispatch(std::move(slot), leased_callable{std::move(work), std::forward<F>(fn)}, query);
+  static_assert(std::is_nothrow_invocable_v<ReportError, std::exception_ptr>);
+  auto owned = leased_callable{std::move(work), std::forward<F>(fn)};
+  invocable<void()> queued;
+  try {
+    // Allocation precedes the nonthrowing callable move. Either owned or queued retains all
+    // captures until the catch below; pool.dispatch also preserves queued on insertion failure.
+    queued = std::move(owned);
+    pool.dispatch(std::move(slot), std::move(queued), query);
+  } catch (...) {
+    report_error(std::current_exception());
+    throw;
+  }
 }
 
 }  // namespace sirius::exec

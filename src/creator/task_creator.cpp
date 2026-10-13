@@ -664,12 +664,16 @@ void task_creator::manager_loop()
         continue;
       }
       // Keep the request claim through destruction of every worker capture.
-      auto work = std::move(request->work);
+      auto completion = query_state->completion_handler;
+      auto work       = std::move(request->work);
       exec::dispatch_with_work(
         *_bounded_pool,
         std::move(slot),
         query_id,
         std::move(work),
+        [completion](std::exception_ptr error) noexcept {
+          if (completion) { completion->report_error(error); }
+        },
         [this,
          request = std::move(request),
          node,

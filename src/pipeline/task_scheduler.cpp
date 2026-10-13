@@ -117,43 +117,55 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
   // Declared before task so an exception destroys unsubmitted work before settling its publisher.
   exec::query_lifecycle_registry::submission_guard submission;
   auto task = std::move(input);
-  // Refuse work for a query that is tearing down. A task creation worker can land here after
-  // that query's queue drain already ran, and the task would then sit in the shared queue holding
-  // raw repository pointers into a manager about to be erased.
-  if (task) {
-    submission = begin_submission(
-      _query_lifecycle, *task, "task_scheduler: query lifecycle registration is missing");
-    if (!submission) { return; }
-  }
-  if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-    pipeline_task->telemetry_fsm().queued(
-      {.queue = {.target = _task_queue_telemetry.id(), .data = {.entries = 1}}});
-  }
-  // Read before the move: reporting a drop needs the query, and `task` is gone after push().
-  const auto pushed_query =
-    task ? sirius::make_query_id(index_keys_for(*task).query_id) : sirius::make_query_id(0);
-  if (!_task_queue.try_push(task)) {
-    if (auto* gpu_task = dynamic_cast<gpu_pipeline_task*>(task.get())) {
-      if (auto handler = gpu_task->get_completion_handler()) {
-        handler->report_error("scheduler queue closed before dispatch");
+  try {
+    // Refuse work for a query that is tearing down. A task creation worker can land here after
+    // that query's queue drain already ran, and the task would then sit in the shared queue holding
+    // raw repository pointers into a manager about to be erased.
+    if (task) {
+      submission = begin_submission(
+        _query_lifecycle, *task, "task_scheduler: query lifecycle registration is missing");
+      if (!submission) { return; }
+    }
+    if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+      pipeline_task->telemetry_fsm().queued(
+        {.queue = {.target = _task_queue_telemetry.id(), .data = {.entries = 1}}});
+    }
+    // Read before the move: reporting a drop needs the query, and `task` is gone after push().
+    const auto pushed_query =
+      task ? sirius::make_query_id(index_keys_for(*task).query_id) : sirius::make_query_id(0);
+    if (!_task_queue.try_push(task)) {
+      if (auto* gpu_task = dynamic_cast<gpu_pipeline_task*>(task.get())) {
+        if (auto handler = gpu_task->get_completion_handler()) {
+          handler->report_error("scheduler queue closed before dispatch");
+        }
+      }
+      // push returns false only when the queue is interrupted. If the gate still reports this query
+      // as accepting work, the task is destroyed and its query waits forever on a completion that
+      // cannot arrive -- the silent-drop failure mode behind several "query just hangs" reports.
+      if (_query_lifecycle.accepts_work(pushed_query)) {
+        SIRIUS_LOG_ERROR(
+          "task_scheduler: task for query {} was DROPPED by an interrupted queue while the query "
+          "was "
+          "still accepting work; that query will not complete",
+          pushed_query);
+      } else {
+        SIRIUS_LOG_DEBUG("task_scheduler: dropped a task for tearing-down query {}", pushed_query);
       }
     }
-    // push returns false only when the queue is interrupted. If the gate still reports this query
-    // as accepting work, the task is destroyed and its query waits forever on a completion that
-    // cannot arrive -- the silent-drop failure mode behind several "query just hangs" reports.
-    if (_query_lifecycle.accepts_work(pushed_query)) {
-      SIRIUS_LOG_ERROR(
-        "task_scheduler: task for query {} was DROPPED by an interrupted queue while the query was "
-        "still accepting work; that query will not complete",
-        pushed_query);
-    } else {
-      SIRIUS_LOG_DEBUG("task_scheduler: dropped a task for tearing-down query {}", pushed_query);
+    if (_self_publisher) {
+      auto wake                 = std::make_unique<task_request>();
+      wake->kind                = task_request_kind::task_available;
+      [[maybe_unused]] auto _ok = _self_publisher->send(std::move(wake));
     }
-  }
-  if (_self_publisher) {
-    auto wake                 = std::make_unique<task_request>();
-    wake->kind                = task_request_kind::task_available;
-    [[maybe_unused]] auto _ok = _self_publisher->send(std::move(wake));
+  } catch (...) {
+    // try_push preserves ownership on failure. Report before task destruction can complete
+    // its pipeline; the caller's catch runs after this local owner has already unwound.
+    if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+      if (auto completion = gpu_task->get_completion_handler()) {
+        completion->report_error(std::current_exception());
+      }
+    }
+    throw;
   }
 }
 
@@ -342,12 +354,12 @@ void task_scheduler::management_eventloop()
           }
         }
 
-      if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-        pipeline_task->telemetry_fsm().routing({
-          .preferred_device_id = device_id,
-          .manager_thread      = {scheduler_thread_telemetry_handle.id()},
-        });
-      }
+        if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+          pipeline_task->telemetry_fsm().routing({
+            .preferred_device_id = device_id,
+            .manager_thread      = {scheduler_thread_telemetry_handle.id()},
+          });
+        }
 
         // // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
         // // load-bearing — verification greps depend on it.

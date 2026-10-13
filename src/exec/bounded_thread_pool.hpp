@@ -196,32 +196,24 @@ class bounded_thread_pool {
   /**
    * @brief Dispatch a function using the given slot.
    *
-   * Consumes the slot (it becomes invalid). The function runs on a worker thread;
-   * the slot is released automatically after callable destruction. An optional query tag is
-   * used only for queue disposal; the caller owns query resource lifetime accounting.
+   * Consumes the slot and callable only after queue allocation succeeds. On exception both
+   * remain with the caller, which can report failure before destroying captured tasks.
+   * The slot is released after callable destruction. The optional query tag is for queue disposal;
+   * the caller owns query resource lifetime accounting.
    */
   void dispatch(slot&& s,
-                sirius::exec::invocable<void()> fn,
+                sirius::exec::invocable<void()>&& fn,
                 std::optional<sirius::query_id_t> query = std::nullopt)
   {
     if (not s) { return; }
-    // Construct before locking: a failed insertion must release the slot outside mu_.
-    work_item item{query, [s = std::move(s), fn = std::move(fn)]() mutable noexcept {
-                     try {
-                       fn();
-                     } catch (const std::exception& e) {
-                       SIRIUS_LOG_ERROR("Exception in bounded_thread_pool task: {}", e.what());
-                     } catch (...) {
-                       SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task");
-                     }
-                     // Destroy before slot is released upon lambda exit.
-                     fn = nullptr;
-                     // When slot, s, goes out of scope, release_slot is automatically
-                     // invoked, clearing the path for another task to pick up that slot.
-                   }};
     {
       std::lock_guard lock(mu_);
-      work_queue_.push_back(std::move(item));
+      auto& item = work_queue_.emplace_back();
+      // Commit with nonthrowing transfers only after allocation. Workers cannot see the empty
+      // entry while mu_ is held. No user captures are destroyed under the queue lock.
+      item.query       = query;
+      item.reservation = std::move(s);
+      item.fn          = std::move(fn);
     }
     cv_work_.notify_one();
   }
@@ -251,8 +243,10 @@ class bounded_thread_pool {
  private:
   /// Query identity is queue metadata only. Idle reservations carry no query or work claim.
   struct work_item {
+    // Reverse member destruction retires captures before returning execution capacity.
+    slot reservation;
     std::optional<sirius::query_id_t> query;
-    sirius::exec::invocable<void() noexcept> fn;
+    sirius::exec::invocable<void()> fn;
   };
 
   // Capacity covers both undispatched reservations and queued/running worker callables.
@@ -269,16 +263,27 @@ class bounded_thread_pool {
   void work_loop()
   {
     while (true) {
-      sirius::exec::invocable<void() noexcept> fn;
+      slot reservation;
+      sirius::exec::invocable<void()> fn;
       {
         std::unique_lock lock(mu_);
         cv_work_.wait(lock, [&] { return !work_queue_.empty() || stop_requested_; });
         if (stop_requested_ && work_queue_.empty()) { break; }
-        fn = std::move(work_queue_.front().fn);
+        reservation = std::move(work_queue_.front().reservation);
+        fn          = std::move(work_queue_.front().fn);
         work_queue_.pop_front();
       }
       if (fn == nullptr) { break; }
-      fn();
+      try {
+        fn();
+      } catch (const std::exception& e) {
+        log::log_noexcept(
+          [&] { SIRIUS_LOG_ERROR("Exception in bounded_thread_pool task: {}", e.what()); });
+      } catch (...) {
+        log::log_noexcept(
+          [] { SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task"); });
+      }
+      // fn is destroyed before reservation, outside mu_, including after worker exceptions.
     }
   }
 
