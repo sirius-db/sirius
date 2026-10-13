@@ -231,14 +231,36 @@ run():    ┌─ in_transaction ─ streaming_fragment::run() ──────
   `BEGIN` would fail and invalidate the open transaction. `in_transaction` holds the `Context`'s
   `conn_mutex`, so concurrent `build()`, `run()`, and `execute_substrait` calls wait for each other.
 
+### `push_arrow()`: host Arrow input
+
+**Files:** `src/helper/arrow_host_import.{hpp,cpp}`
+
+`push_arrow(stream_id, sender_id, array_addr, schema_addr)` feeds an input stream from a
+host-memory Arrow record batch (Arrow C Data Interface), for an embedder that produces data on the
+CPU. `import_arrow_host_table()` checks the batch against the declared schema, then imports one
+column at a time with `cudf::from_arrow_column` on a pool stream, narrowing a `decimal128` to the
+declared precision's width. The stream is synchronized before return, so the caller may release
+the structs at once. `streaming_fragment::push_arrow()` owns the checks, copy and push;
+the batch lands on the context's first GPU.
+
+- **Checks run before the copy**, as listed on `import_arrow_host_table()`. Columns bind by
+  position, and a closed sender or ended stream is refused.
+- **Store-and-forward.** Legal from `build()`'s return until `run()`, from any thread and
+  concurrently; it takes no `Context` lock, so it may overlap another fragment's `run()`. `run()`
+  still needs every input closed.
+- **Unaccounted memory.** The copy takes no reservation, and input repositories live outside the
+  query's `data_repository_manager`, which is all the downgrade executor walks. Pushed batches are
+  neither reserved nor spillable: they must fit in GPU memory beside whatever else runs.
+
 ## Tests
 
 | File | Catch2 tags | Covers |
 |---|---|---|
 | `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` | Catalog verbs |
 | `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` | Spec errors; relay preconditions (FRAG-7); failed runs and single-use calls (FRAG-8); hash partitioning (FRAG-9), with INTEGER and BIGINT senders (FRAG-9b); out-of-order builds and runs (FRAG-10); a window between `build()` and `run()` (FRAG-11); `run()` guards (FRAG-12); runs from two threads (FRAG-13) |
-| `test/cpp/exec/test_sirius_ffi_embedder.cpp` | `[isolated_context][sirius_ffi]` | Public FFI with Substrait built in the test: leaf result, `relay_from` chain, builds before runs (one and two threads), `build()` and `run()` on different threads, drop after `build()`, a failed `build()`, a hash key on one output, concurrent `run()` and `execute_substrait` |
+| `test/cpp/exec/test_sirius_ffi_embedder.cpp` | `[isolated_context][sirius_ffi]` | Public FFI with Substrait built in the test: leaf result, `relay_from` chain, builds before runs (one and two threads), `build()` and `run()` on different threads, drop after `build()`, a failed `build()`, a hash key on one output, concurrent `run()` and `execute_substrait`, `push_arrow` from two senders on two threads and its refusals |
 | `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]` | Rollback of a `build()` that fails while resolving input types |
+| `test/cpp/exec/test_arrow_host_import.cpp` | `[arrow_host_import]` | Type matrix from DuckDB-produced Arrow, struct windows, refusals, decimal scale and precision |
 
 `[isolated_context]` tests bring up their own `SiriusContext` and GPU pools; the listener in
 `test/cpp/unittest.cpp` pauses the shared test environments around them.
@@ -246,7 +268,7 @@ run():    ┌─ in_transaction ─ streaming_fragment::run() ──────
 ## Not yet ported
 
 `Fragment::run()` blocks until `sirius_engine::execute()` finishes, so fragments run
-store-and-forward and every input must be closed first. `relay_from()` only moves batches parked
-on a finished local source. Remote senders need `push_arrow`, `pull_arrow`, and `drained` on
-`sirius::ffi::Fragment`, plus non-blocking execution, tracked in
-[#1590](https://github.com/sirius-db/sirius/issues/1590).
+store-and-forward and every input must be closed first. `relay_from()` and `push_arrow()` fill an
+input before `run()`; pushing while the fragment runs needs a `start()`/`join()` split. Draining
+outputs across the FFI needs `pull_arrow` and `drained` on `sirius::ffi::Fragment`. Both are
+tracked in [#1590](https://github.com/sirius-db/sirius/issues/1590).

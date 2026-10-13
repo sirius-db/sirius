@@ -85,13 +85,15 @@ class SIRIUS_FFI_EXPORT Context {
 /// or a **result** fragment (no output streams, produces Arrow). Both kinds may declare input
 /// streams fed by other fragments without copying.
 ///
-/// Usage order: declare inputs/outputs → build → relay_from every sender → run →
-/// drain via relay_from or result_to_arrow.
+/// Usage order: declare inputs/outputs → build → feed every input (relay_from, or push_arrow then
+/// close_input) → run → drain via relay_from or result_to_arrow.
 ///
 /// Any number of fragments may be built before any runs; run them in any order where each
 /// source runs before its receiver's relay_from. build(), run() and Context::execute_substrait
 /// execute one at a time per Context: a concurrent call waits for the one in progress. run() and
-/// destruction may happen on a thread other than build()'s.
+/// destruction may happen on a thread other than build()'s. Once build() has returned, push_arrow
+/// and close_input may be called from any thread until run(), concurrently with each other and
+/// with other fragments' calls; the Fragment must outlive them.
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
@@ -157,6 +159,25 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// (relay_from closes its own sender). Idempotent per sender.
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
+
+  /// Copy one host Arrow record batch to the GPU as a batch of an input stream. Legal between
+  /// build() and run(); does not close the sender. The batch lands on the Context's first GPU with
+  /// no memory reservation and is not spillable, so everything pushed before run() must fit in GPU
+  /// memory beside other work. Columns bind by position and must have the declared types; a
+  /// decimal128 is narrowed to the declared precision's width.
+  /// @param stream_id A declared input stream.
+  /// @param sender_id A declared sender of that stream that has not closed.
+  /// @param array_addr An `ArrowArray*` holding a struct array (Arrow C Data Interface).
+  /// @param schema_addr Its `ArrowSchema*`. Both stay the caller's: the copy completes before
+  ///        return and neither is released.
+  /// @throws before build(), once run() started, on an undeclared stream or sender, a closed
+  /// sender or ended stream, or a batch `sirius::import_arrow_host_table()` refuses
+  /// (src/helper/arrow_host_import.hpp lists the refused shapes, e.g. a column declared HUGEINT,
+  /// UHUGEINT or nested).
+  void push_arrow(std::uint64_t stream_id,
+                  std::uint32_t sender_id,
+                  std::uintptr_t array_addr,
+                  std::uintptr_t schema_addr);
 
   /// Execute the fragment and block until pipelines finish. Every input must be closed first
   /// (relay_from and close_input close their sender). Runs once; after a failure, build a new
