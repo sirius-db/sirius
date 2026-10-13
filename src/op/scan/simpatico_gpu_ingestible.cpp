@@ -611,29 +611,19 @@ void simpatico_gpu_ingestible::plan_prefetch()
     sirius::hpln_open_options options;
     options.io_ctx = _info->io_ctx;
     auto planner   = std::make_shared<sirius::hpln_read_planner>(path, options, _staged_columns);
+    // No sizing fetch here: each chunk's split job fetches its own (see next_split_provider), so
+    // the first batches execute while later chunks' sizing buffers are still in flight.
     auto const t_planner = std::chrono::steady_clock::now();
-    std::vector<std::size_t> ids;
-    std::vector<std::vector<std::uint32_t>> rows;
-    ids.reserve(_live_chunks.size());
-    rows.reserve(_live_chunks.size());
-    for (auto const& live : _live_chunks) {
-      ids.push_back(live.id);
-      rows.push_back(live.decode_chunks);
-    }
-    planner->prefetch_sizing(ids, rows);
-    auto const t_sizing = std::chrono::steady_clock::now();
     std::shared_ptr<io::sirius_datasource const> base{_info->io_ctx->open_datasource(path)};
     if (!base) { return; }
     auto const ms = [](auto a, auto b) {
       return std::chrono::duration<double, std::milli>(b - a).count();
     };
     SIRIUS_LOG_DEBUG(
-      "[simpatico_gpu_ingestible] '{}': plan phases: planner {:.1f} ms, sizing {:.1f} ms, open "
-      "{:.1f} ms",
+      "[simpatico_gpu_ingestible] '{}': plan phases: planner {:.1f} ms, open {:.1f} ms",
       path,
       ms(t0, t_planner),
-      ms(t_planner, t_sizing),
-      ms(t_sizing, std::chrono::steady_clock::now()));
+      ms(t_planner, std::chrono::steady_clock::now()));
     _planner         = std::move(planner);
     _base_datasource = std::move(base);
     SIRIUS_LOG_DEBUG(
@@ -761,6 +751,13 @@ simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_sp
     // ever costs a miss, so a failure here leaves the split unhinted rather than failing the scan.
     if (_planner) {
       try {
+        // This chunk's sizing buffers, if it is narrowed and an earlier scan of the file has not
+        // fetched them already. Runs in the split job, alongside the batches already executing.
+        if (!live.decode_chunks.empty()) {
+          std::array<std::size_t, 1> const id{live.id};
+          _planner->prefetch_sizing(
+            id, std::span<const std::vector<std::uint32_t>>{&live.decode_chunks, 1});
+        }
         split->ranges = _planner->ranges(live.id, live.decode_chunks);
       } catch (std::exception const& e) {
         SIRIUS_LOG_WARN("[simpatico_gpu_ingestible] '{}': chunk {} left unhinted: {}",

@@ -71,12 +71,16 @@ namespace sirius {
 /// values read, so this converges in a round or two; a range still absent afterwards is simply
 /// read the old way.
 ///
-/// A scan fetches these once, up front, and hands the same cache to every split's read, so no
-/// task spends its time (and its GPU reservation) on them. It is read-only once fetched: the
-/// readers never insert, which is what makes sharing it between tasks safe without a lock.
+/// A scan fetches a chunk's buffers in that chunk's split job, while earlier batches execute, and
+/// hands the cache to every split's read, so no task spends its time (and its GPU reservation) on
+/// them. A published cache is read-only: the readers never insert, which is what makes sharing it
+/// between tasks safe without a lock. The buffers are shared, so extending a cache by one chunk
+/// copies pointers, not bytes.
 class hpln_sizing_cache {
  public:
-  std::map<std::pair<std::uint64_t, std::uint64_t>, std::vector<std::uint8_t>> bytes;
+  std::map<std::pair<std::uint64_t, std::uint64_t>,
+           std::shared_ptr<std::vector<std::uint8_t> const>>
+    bytes;
   std::set<std::pair<std::uint64_t, std::uint64_t>> missing;
   bool collect = false;
 };

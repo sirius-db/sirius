@@ -464,35 +464,36 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
   std::vector<std::uint8_t> subsetted;
   // Reads the small sizing buffers out of the file, translating from the first step's space when
   // there is one.
-  simpatico::payload_host_read_fn read_payload =
-    [&](std::uint64_t off, std::uint64_t size, void* dst) {
-      if (size == 0) { return true; }
-      std::vector<simpatico::gather_range> want{{off, size, 0}};
-      auto const ranges =
-        gather_columns.empty() ? want : simpatico::compose_gathers(gather_columns, want);
-      if (ranges.empty()) { return false; }
-      for (auto const& r : ranges) {
-        auto const file_off = chunk.payload_offset + r.src_offset;
-        if (cache != nullptr) {
-          auto const hit = cache->bytes.find({file_off, r.size});
-          if (hit != cache->bytes.end()) {
-            std::memcpy(static_cast<std::uint8_t*>(dst) + r.dst_offset, hit->second.data(), r.size);
-            continue;
-          }
-          if (cache->collect) {
-            cache->missing.insert({file_off, r.size});
-            return false;
-          }
+  simpatico::payload_host_read_fn read_payload = [&](std::uint64_t off,
+                                                     std::uint64_t size,
+                                                     void* dst) {
+    if (size == 0) { return true; }
+    std::vector<simpatico::gather_range> want{{off, size, 0}};
+    auto const ranges =
+      gather_columns.empty() ? want : simpatico::compose_gathers(gather_columns, want);
+    if (ranges.empty()) { return false; }
+    for (auto const& r : ranges) {
+      auto const file_off = chunk.payload_offset + r.src_offset;
+      if (cache != nullptr) {
+        auto const hit = cache->bytes.find({file_off, r.size});
+        if (hit != cache->bytes.end()) {
+          std::memcpy(static_cast<std::uint8_t*>(dst) + r.dst_offset, hit->second->data(), r.size);
+          continue;
         }
-        // Planning must never block on a read: a range nobody fetched ahead simply means the
-        // chunk cannot be planned, and the caller does not hint it.
-        if (src == nullptr || plan_out != nullptr || plan_chunk != nullptr) { return false; }
-        auto const bytes = src->read_range(file_off, r.size, "sizing");
-        if (bytes.size() != r.size) { return false; }
-        std::memcpy(static_cast<std::uint8_t*>(dst) + r.dst_offset, bytes.data(), r.size);
+        if (cache->collect) {
+          cache->missing.insert({file_off, r.size});
+          return false;
+        }
       }
-      return true;
-    };
+      // Planning must never block on a read: a range nobody fetched ahead simply means the
+      // chunk cannot be planned, and the caller does not hint it.
+      if (src == nullptr || plan_out != nullptr || plan_chunk != nullptr) { return false; }
+      auto const bytes = src->read_range(file_off, r.size, "sizing");
+      if (bytes.size() != r.size) { return false; }
+      std::memcpy(static_cast<std::uint8_t*>(dst) + r.dst_offset, bytes.data(), r.size);
+    }
+    return true;
+  };
   auto const subset_err = simpatico::build_chunk_subset_header(working_header,
                                                                decode_chunks,
                                                                read_payload,
@@ -603,12 +604,11 @@ void prefetch_sizing_reads(std::vector<std::vector<std::uint8_t>> const& headers
     std::vector<hpln_extent> extents;
     extents.reserve(cache.missing.size());
     for (auto const& [off, size] : cache.missing) {
-      // std::map nodes do not move, so the pointer stays valid as the map grows.
-      auto& buf = cache.bytes[{off, size}];
-      buf.resize(size);
+      auto buf                 = std::make_shared<std::vector<std::uint8_t>>(size);
+      cache.bytes[{off, size}] = buf;
       hpln_extent e;
       e.offset = off;
-      e.dst.push_back({buf.data(), size});
+      e.dst.push_back({buf->data(), size});
       extents.push_back(std::move(e));
     }
     auto const n_missing = extents.size();
@@ -857,9 +857,9 @@ struct hpln_read_planner::impl {
   std::unique_ptr<hpln_source> src;
   hpln_io_policy policy;
   std::shared_ptr<hpln_ingest_layout const> layout;
-  std::shared_ptr<hpln_sizing_cache> sizing = std::make_shared<hpln_sizing_cache>();
-  /// The file's shared sizing buffers, when a bind parked metadata to hold them.
-  std::shared_ptr<hpln_sizing_store> store;
+  /// The file's shared sizing buffers, when a bind parked metadata to hold them; else a store of
+  /// this planner's own.
+  std::shared_ptr<hpln_sizing_store> store = std::make_shared<hpln_sizing_store>();
 };
 
 hpln_read_planner::hpln_read_planner(std::string path,
@@ -894,9 +894,12 @@ hpln_read_planner::hpln_read_planner(std::string path,
 
 hpln_read_planner::~hpln_read_planner() = default;
 
-std::shared_ptr<hpln_sizing_cache> const& hpln_read_planner::sizing() const noexcept
+std::shared_ptr<hpln_sizing_cache> hpln_read_planner::sizing() const
 {
-  return _impl->sizing;
+  // Read-only from here on, as every reader of a sizing cache already treats it.
+  auto current = _impl->store->snapshot();
+  return current ? std::const_pointer_cast<hpln_sizing_cache>(std::move(current))
+                 : std::make_shared<hpln_sizing_cache>();
 }
 
 void hpln_read_planner::prefetch_sizing(std::span<const std::size_t> chunk_ids,
@@ -943,35 +946,29 @@ void hpln_read_planner::prefetch_sizing(std::span<const std::size_t> chunk_ids,
   }
   auto const t_listed = std::chrono::steady_clock::now();
 
-  // What earlier scans of this file already fetched.
-  auto const base = _impl->store ? _impl->store->snapshot() : nullptr;
+  // What this file's earlier scans, and this scan's other chunks, already fetched.
+  auto const base = _impl->store->snapshot();
   std::vector<std::pair<std::uint64_t, std::uint64_t>> missing;
   for (auto const& key : wanted) {
     if (!base || !base->bytes.contains(key)) { missing.push_back(key); }
   }
-  if (missing.empty() && base) {
-    // Read-only from here on, as every reader of a sizing cache already treats it.
-    _impl->sizing = std::const_pointer_cast<hpln_sizing_cache>(base);
-  } else {
+  if (!missing.empty()) {
     auto next = std::make_shared<hpln_sizing_cache>();
-    if (base) { next->bytes = base->bytes; }
     std::vector<hpln_extent> extents;
     extents.reserve(missing.size());
     std::uint64_t missing_bytes = 0;
     for (auto const& key : missing) {
-      auto& buf = next->bytes[key];  // std::map nodes do not move as the map grows
-      buf.resize(key.second);
+      auto buf         = std::make_shared<std::vector<std::uint8_t>>(key.second);
+      next->bytes[key] = buf;
       missing_bytes += key.second;
       hpln_extent e;
       e.offset = key.first;
-      e.dst.push_back({buf.data(), key.second});
+      e.dst.push_back({buf->data(), key.second});
       extents.push_back(std::move(e));
     }
-    if (!extents.empty()) { _impl->src->read_extents(std::move(extents), _impl->policy, "sizing"); }
-    _impl->sizing =
-      _impl->store
-        ? std::const_pointer_cast<hpln_sizing_cache>(_impl->store->publish(std::move(next)))
-        : std::move(next);
+    _impl->src->read_extents(std::move(extents), _impl->policy, "sizing");
+    // Folds in everything published meanwhile, so concurrent calls for other chunks keep theirs.
+    std::ignore = _impl->store->publish(std::move(next));
     SIRIUS_LOG_DEBUG(
       "[hpln sizing] '{}': fetched {} ranges / {} B", _impl->path, missing.size(), missing_bytes);
   }
@@ -1005,6 +1002,7 @@ std::vector<hpln_file_range> hpln_read_planner::ranges(
   if (!decode_chunks.empty()) {
     std::vector<hpln_extent> unused;
     std::shared_ptr<pinned_compressed_blob> blob;
+    auto const cache = sizing();
     if (!allocate_chunk_narrowed(headers[chunk_id],
                                  chunk,
                                  _impl->columns,
@@ -1014,7 +1012,7 @@ std::vector<hpln_file_range> hpln_read_planner::ranges(
                                  nullptr,
                                  unused,
                                  blob,
-                                 _impl->sizing.get(),
+                                 cache.get(),
                                  &out)) {
       // Not knowable without a read (or refused): leave it unhinted rather than guess.
       return {};
@@ -1063,6 +1061,7 @@ std::optional<planned_hpln_chunk> hpln_read_planner::plan_chunk(
   if (!decode_chunks.empty()) {
     std::vector<hpln_extent> unused;
     std::shared_ptr<pinned_compressed_blob> blob;
+    auto const cache = sizing();
     if (!allocate_chunk_narrowed(headers[chunk_id],
                                  chunk,
                                  _impl->columns,
@@ -1072,7 +1071,7 @@ std::optional<planned_hpln_chunk> hpln_read_planner::plan_chunk(
                                  nullptr,
                                  unused,
                                  blob,
-                                 _impl->sizing.get(),
+                                 cache.get(),
                                  nullptr,
                                  &plan)) {
       return std::nullopt;
