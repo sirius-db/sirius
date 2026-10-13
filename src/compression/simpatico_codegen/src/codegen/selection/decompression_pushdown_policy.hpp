@@ -64,15 +64,13 @@ double decompression_pushdown_index_walk_max_selectivity();
 /// How many join-filter probes one decode carries
 /// (SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER, default 1).
 ///
-/// Wave-1 probes run at FULL width, so k probes cost k*N rows of probe+adapter
-/// work, while the downstream operator's cascade costs ~1*N (later probes see
-/// compacted survivors). Measured with 3 probes: the added probe-side cost
-/// outweighed the compaction win. One probe is always ~volume-neutral
-/// against the cascade's first probe, so the compaction win survives. Sources
-/// beyond the cap are DROPPED, which is sound — the mask is conjunctive and
-/// such batches are never tagged as fully filtered, so the downstream operator
-/// completes the conjunction on the compacted batch. The caller must order the
-/// probes by ascending expected keep-rate so the kept prefix is the strongest.
+/// Wave-1 probes run at FULL width, so k probes cost k*N rows of probe+adapter work, while the
+/// downstream operator's cascade costs ~1*N (later probes see compacted survivors). Measured with 3
+/// probes: the added probe-side cost outweighed the compaction win. One probe is always
+/// ~volume-neutral against the cascade's first probe, so the compaction win survives. Sources
+/// beyond the cap are DROPPED, which is sound because a join filter is optional: the join stays
+/// authoritative, so a dropped probe only lets through rows the join rejects. The caller must order
+/// the probes by ascending expected keep-rate so the kept prefix is the strongest.
 std::size_t decompression_pushdown_max_membership_sources();
 
 }  // namespace sirius::codegen

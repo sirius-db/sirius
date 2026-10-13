@@ -175,7 +175,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_table_scan> make_scan(
     /*estimated_cardinality=*/1,
     duckdb::ExtraOperatorInfo(),
     duckdb::vector<duckdb::Value>{},
-    duckdb::virtual_column_map_t{});
+    duckdb::virtual_column_map_t{},
+    /*projected_output_count=*/column_count);
   scan->set_physical_types(std::move(physical));
   scan->sidecar_from_gpu_tier_pin = gpu_tier_pin;
   return scan;

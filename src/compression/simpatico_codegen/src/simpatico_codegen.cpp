@@ -33,6 +33,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -385,6 +386,9 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   if (k_total + (has_keep_mask ? 1 : 0) > 8) return refuse("more than 8 mask sources");
   if (request.routes.size() != selected.size())
     return refuse("request.routes not parallel to selected");
+  std::size_t const delivered = request.delivered_prefix.value_or(selected.size());
+  if (delivered == 0 || delivered > selected.size())
+    return refuse("delivered_prefix outside [1, selected.size()]");
   if (streams.empty()) return refuse("no streams supplied");
   int64_t const num_rows = table.num_rows();
   if (num_rows <= 0) return refuse("num_rows <= 0");
@@ -725,12 +729,14 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                    sc::decompression_pushdown_index_walk_max_selectivity());
     }
 
-    // ── Survivor index map on s0, built once per batch and shared by every consumer: the
-    // full-route gathers, the BOOL8 gathers and the index-list decodes.
-    result.routes        = routes;
-    bool const any_bool8 = k_bool8 > 0;
-    bool const indices_needed =
-      (any_full || index_walk_pick || any_bool8) && sel.survivor_count > 0;
+    // Survivor indices are built on s0 and shared by the delivered columns that consume them.
+    result.routes.assign(routes.begin(), routes.begin() + static_cast<std::ptrdiff_t>(delivered));
+    bool const needs_survivor_indices =
+      std::ranges::any_of(std::views::iota(std::size_t{0}, delivered), [&](std::size_t i) {
+        return is_bool8_slot[i] || routes[i] == sc::decode_route::full ||
+               (index_walk_pick && routes[i] == sc::decode_route::bitpack_mask);
+      });
+    bool const indices_needed = needs_survivor_indices && sel.survivor_count > 0;
     cudf::column_view survivor_indices{
       cudf::data_type{cudf::type_id::INT32}, 0, nullptr, nullptr, 0};
     if (indices_needed) {
@@ -754,15 +760,16 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       index_lanes.push_back(lane);
     };
 
-    // ── Wave 2: every column decodes to survivor rows on its own lane. Compacted routes decode
-    // compacted in the kernel; `full` routes decode full width and gather in the same request, so
-    // the full-width column is released on its lane once the gather is queued. A slot answered off
-    // a dictionary gathers its wave-1 BOOL8 on the lane that allocated it, never decoding values.
-    std::vector<std::unique_ptr<cudf::column>> columns(selected.size());
+    // Wave 2 decodes only the delivered prefix to survivor rows. Columns past it may have supplied
+    // wave-1 filters but need no value decode or gather. Compacted routes decode compacted in the
+    // kernel; `full` routes decode full width and gather in the same request, releasing the
+    // full-width column on its lane once the gather is queued. A dictionary answer gathers its
+    // wave-1 BOOL8 on the lane that allocated it.
+    std::vector<std::unique_ptr<cudf::column>> columns(delivered);
     std::vector<std::size_t> decoded_positions;
-    decoded_positions.reserve(selected.size());
+    decoded_positions.reserve(delivered);
     decode_session wave2{streams, mr};
-    for (std::size_t i = 0; i < selected.size(); ++i) {
+    for (std::size_t i = 0; i < delivered; ++i) {
       if (is_bool8_slot[i]) {
         auto const slot = static_cast<std::size_t>(bool8_of_slot[i]);
         auto const lane = bool8_lanes[slot];
@@ -1139,7 +1146,8 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
       }
       std::fprintf(stderr,
                    "simpatico: filtered decode applied: survivors=%lld/%lld "
-                   "routes bitpack=%d delta=%d dict=%d str_split=%d full=%d sources=%zu\n",
+                   "routes bitpack=%d delta=%d dict=%d str_split=%d full=%d sources=%zu "
+                   "delivered=%zu/%zu\n",
                    static_cast<long long>(result.survivor_count),
                    static_cast<long long>(result.num_rows),
                    n_a,
@@ -1147,7 +1155,9 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
                    n_dict,
                    n_str_split,
                    n_b,
-                   request.filters.size() + request.bool8_filters.size());
+                   request.filters.size() + request.bool8_filters.size(),
+                   result.routes.size(),
+                   selected_columns.size());
     }
     // Every route, including `full` and the dictionary-answered BOOL8 slots, came back
     // survivor-sized and completed.

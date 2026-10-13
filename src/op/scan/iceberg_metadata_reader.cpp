@@ -80,7 +80,8 @@ std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
     "COALESCE(data_file.referenced_data_file, ''), "
     "COALESCE(data_file.content_offset, -1), "
     "COALESCE(data_file.content_size_in_bytes, -1), "
-    "COALESCE(data_file.record_count, -1) "
+    "COALESCE(data_file.record_count, -1), "
+    "COALESCE(data_file.file_size_in_bytes, -1) "
     "FROM read_avro('" +
     escape_sql_string(manifest_path) +
     "') "
@@ -106,6 +107,7 @@ std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
       entry.content_offset        = chunk->GetValue(3, i).GetValue<int64_t>();
       entry.content_size_in_bytes = chunk->GetValue(4, i).GetValue<int64_t>();
       entry.record_count          = chunk->GetValue(5, i).GetValue<int64_t>();
+      entry.file_size_in_bytes    = chunk->GetValue(6, i).GetValue<int64_t>();
 
       // Every entry here is live. A Puffin one the manifest failed to locate cannot be skipped:
       // skipping drops its deletes, and dropped deletes are returned rows.
@@ -148,6 +150,29 @@ std::shared_ptr<physical_check_counters> iceberg_counters(duckdb::ClientContext&
 }
 
 }  // namespace
+
+void validate_deletion_vector_claims(iceberg_delete_discovery const& files)
+{
+  int64_t total = 0;
+  for (auto const& dv : files.deletion_vector_entries) {
+    if (dv.record_count < 0 || dv.record_count > kMaxDeletionVectorPositionsPerStatement - total)
+      throw std::runtime_error(
+        "[iceberg] The live deletion vectors of this scan declare more than the " +
+        std::to_string(kMaxDeletionVectorPositionsPerStatement) +
+        " deleted positions this reader will retain while planning (reached at '" + dv.file_path +
+        "'); the scan declines rather than sizing a plan-time allocation "
+        "from what the table wrote");
+    total += dv.record_count;
+  }
+  std::set<std::string_view> claimed;
+  for (auto const& dv : files.deletion_vector_entries) {
+    if (!claimed.insert(dv.referenced_data_file).second)
+      throw std::runtime_error(
+        "[iceberg] Two live deletion vectors both claim data file '" + dv.referenced_data_file +
+        "' (the second is in '" + dv.file_path +
+        "'); which one applies would depend on manifest order, which Iceberg does not define");
+  }
+}
 
 bool IcebergDeleteFileEntry::has_decodable_record_count() const
 {
@@ -522,13 +547,18 @@ void materialize_positional_deletes(duckdb::ClientContext& context,
           "'); which one applies would depend on manifest order, which Iceberg does not define");
       }
 
-      if (auto counters = iceberg_counters(context)) ++counters->iceberg_delete_payload_loads;
+      auto counters = iceberg_counters(context);
+      if (counters) ++counters->iceberg_delete_payload_loads;
+      if (counters && counters->track_units && counters->iceberg_dv_phase_for_testing)
+        counters->iceberg_dv_phase_for_testing(dv_entry.file_path, true);
       auto positions =
         read_deletion_vector({.puffin_path           = dv_entry.file_path,
                               .content_offset        = dv_entry.content_offset,
                               .content_size_in_bytes = dv_entry.content_size_in_bytes,
                               .referenced_data_file  = dv_entry.referenced_data_file,
                               .record_count          = dv_entry.record_count});
+      if (counters && counters->track_units && counters->iceberg_dv_phase_for_testing)
+        counters->iceberg_dv_phase_for_testing(dv_entry.file_path, false);
 
       // The footer check above ties the blob to this entry; this ties the decoded bitmap to the
       // count both of them declare, which is the one thing the footer cannot vouch for.
@@ -658,10 +688,6 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 
 namespace {
 
-/// Per-query memo; the wrapper below explains the key and the scope.
-std::mutex g_delete_data_cache_mtx;
-std::unordered_map<std::string, std::shared_ptr<const IcebergDeleteData>> g_delete_data_cache;
-
 /// See the header.
 std::atomic<uint64_t> g_uncached_read_count{0};
 
@@ -670,12 +696,6 @@ std::atomic<uint64_t> g_uncached_read_count{0};
 uint64_t iceberg_delete_data_uncached_read_count()
 {
   return g_uncached_read_count.load(std::memory_order_relaxed);
-}
-
-void clear_iceberg_delete_data_cache()
-{
-  std::lock_guard lk{g_delete_data_cache_mtx};
-  g_delete_data_cache.clear();
 }
 
 namespace {
@@ -755,34 +775,7 @@ std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   std::optional<uint64_t> snapshot_id,
   iceberg_delete_discovery const& discovery)
 {
-  // Only immutable payloads are cached. Inventory and discovery belong to the scan attempt;
-  // every cache miss, including a context without a transaction, consumes the supplied discovery.
-  std::string key;
-  try {
-    key = std::to_string(context.ActiveTransaction().global_transaction_id) + "|" + table_path +
-          "|" + (snapshot_id.has_value() ? std::to_string(*snapshot_id) : "current");
-  } catch (...) {
-    // No usable transaction identity: skip the cache rather than key it ambiguously.
-    return read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, discovery);
-  }
-
-  {
-    std::lock_guard lk{g_delete_data_cache_mtx};
-    if (auto it = g_delete_data_cache.find(key); it != g_delete_data_cache.end()) {
-      SIRIUS_LOG_DEBUG("[iceberg] delete-data cache hit for '{}'", table_path);
-      return it->second;
-    }
-  }
-
-  // Built outside the lock: this reads manifests and delete files and can throw. Errors must
-  // propagate (never cached, never softened into "no deletes"), and a concurrent duplicate
-  // build is wasteful but harmless, whereas holding the lock across the read would serialize
-  // planning across every iceberg scan in the process.
-  auto data = read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, discovery);
-
-  std::lock_guard lk{g_delete_data_cache_mtx};
-  auto [it, inserted] = g_delete_data_cache.emplace(key, std::move(data));
-  return it->second;
+  return read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, discovery);
 }
 
 std::unordered_map<std::string, int32_t> extract_field_id_map(

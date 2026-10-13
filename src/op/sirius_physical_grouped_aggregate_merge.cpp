@@ -28,8 +28,29 @@
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
 
+#include <algorithm>
+#include <limits>
+
 namespace sirius {
 namespace op {
+
+namespace {
+
+// Target average rows per partition, leaving headroom below cuDF's 2^31 row limit.
+// Hash skew can still put an individual partition over the limit.
+constexpr uint64_t GROUPED_MERGE_TARGET_ROWS_PER_PARTITION = uint64_t{1} << 30;
+
+// max(1, ceil(total_rows / target)), saturating at INT_MAX.
+constexpr int grouped_merge_min_partitions_for_rows(uint64_t total_rows)
+{
+  uint64_t const parts = total_rows / GROUPED_MERGE_TARGET_ROWS_PER_PARTITION +
+                         (total_rows % GROUPED_MERGE_TARGET_ROWS_PER_PARTITION != 0 ? 1 : 0);
+  uint64_t const clamped = std::max<uint64_t>(
+    1, std::min<uint64_t>(parts, static_cast<uint64_t>(std::numeric_limits<int>::max())));
+  return static_cast<int>(clamped);
+}
+
+}  // namespace
 
 // Helpers create_group_chunk_types / copy_expressions were used by the original grouping-sets
 // initialization path (now dead) and by the merge clone-from-parent ctor (which now takes pre-
@@ -156,24 +177,37 @@ partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strate
   const partition_sizing_input& in)
 {
   int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, num_gpus());
+  // The merge concatenates its partition's input and a cuDF column holds fewer than 2^31 rows.
+  // Raise the byte-based count to target at most 2^30 rows per partition on average. This is a
+  // sizing safeguard for large byte targets, not a per-partition bound under hash skew.
+  int const count = std::max(natural, grouped_merge_min_partitions_for_rows(in.total_rows));
+  if (count > natural) {
+    SIRIUS_LOG_DEBUG(
+      "merge_group_by raised the partition count from {} to {} for {} estimated rows, targeting "
+      "at most {} rows per partition on average",
+      natural,
+      count,
+      in.total_rows,
+      GROUPED_MERGE_TARGET_ROWS_PER_PARTITION);
+  }
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
   // repository's set_num_partitions contract.
-  if (natural > 1) {
+  if (count > 1) {
     std::lock_guard<std::mutex> lg(lock);
     if (!ports.empty()) {
       auto& repo = ports.begin()->second->repo;
-      if (repo != nullptr && static_cast<std::size_t>(natural) > repo->num_partitions()) {
-        repo->set_num_partitions(static_cast<std::size_t>(natural));
+      if (repo != nullptr && static_cast<std::size_t>(count) > repo->num_partitions()) {
+        repo->set_num_partitions(static_cast<std::size_t>(count));
       }
     }
   }
-  return partition_strategy{natural,
+  return partition_strategy{count,
                             /*broadcast=*/false,
                             /*build_probe=*/false,
-                            natural == 1 ? partition_placement::unpinned(1)
-                                         : partition_placement::round_robin(
-                                             static_cast<std::size_t>(natural), active_gpu_ids())};
+                            count == 1 ? partition_placement::unpinned(1)
+                                       : partition_placement::round_robin(
+                                           static_cast<std::size_t>(count), active_gpu_ids())};
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()

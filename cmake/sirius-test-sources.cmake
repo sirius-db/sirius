@@ -1,9 +1,15 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/scan_manager/test_preparation_readiness.cpp
+    test/cpp/scan_manager/test_preparation.cpp
+    test/cpp/scan_manager/test_preparation_unit.cpp
+    test/cpp/scan_manager/test_preparation_ledger.cpp
+    test/cpp/scan_manager/test_preparation_config.cpp
     test/cpp/scan/test_native_physical_matrix.cpp
     test/cpp/scan/test_parquet_physical_profile.cpp
     test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp
+    test/cpp/transparent/test_read_view_scaling.cpp
     test/cpp/integration/test_transparent_read_view.cpp
     test/cpp/scan/test_split_certificates.cpp
     test/cpp/transparent/test_late_failure.cpp
@@ -33,6 +39,8 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_query_lifecycle_registry.cpp
+    test/cpp/exec/test_scoped_dispatcher.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
@@ -86,6 +94,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_regexp_replace.cpp
     test/cpp/integration/test_gpu_execution_size_estimation.cpp
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
     test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
@@ -177,6 +186,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_partition_placement.cpp
     test/cpp/operator/test_cross_schedule.cpp
+    test/cpp/operator/test_cross_join_slicing.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp
@@ -221,7 +231,8 @@ set(TEST_SOURCES
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_build_filter_evidence.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
-    test/cpp/planner/test_build_key_domain.cpp
+    test/cpp/planner/test_decimal_sum_input_bounds.cpp
+    test/cpp/planner/test_scan_column_origin.cpp
     test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
     test/cpp/planner/test_dynamic_filter_target_discovery.cpp
@@ -268,6 +279,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_fused_membership_mask.cpp
+    test/cpp/scan/test_fused_scan_filter_delivery.cpp
     test/cpp/scan/test_iceberg_batch_layout.cpp
     test/cpp/scan/test_iceberg_equality_delete.cpp
     test/cpp/scan/test_puffin_reader.cpp

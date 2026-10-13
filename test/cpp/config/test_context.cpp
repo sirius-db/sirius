@@ -211,6 +211,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "sirius_test_budget_declines") == 0);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
+    REQUIRE(setting_count(con, "sirius_test_internal_start_mode") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
@@ -223,6 +224,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
+    REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
     REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
     REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     auto native_option = con.Query("SET sirius_test_sync_native_checkpoint = true");
@@ -261,6 +264,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET concat_batch_bytes = 1048576");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
+    result = con.Query("SET enable_decimal_sum_stats_bound = false");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "true", 1);
@@ -271,6 +277,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "sirius_test_budget_declines") == 0);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
+    REQUIRE(setting_count(con, "sirius_test_internal_start_mode") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
@@ -285,6 +292,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
+    REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
@@ -293,6 +302,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 1);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 1);
+    REQUIRE(setting_count(con, "sirius_test_internal_start_mode") == 1);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 1);
@@ -305,6 +315,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
+    REQUIRE(setting_count(con, "cross_join_task_bytes") == 1);
+    REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 1);
     duckdb::Value native_enabled;
     auto native_setting =
       con.context->TryGetCurrentSetting("sirius_test_sync_native_checkpoint", native_enabled);
@@ -379,6 +391,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET concat_batch_bytes");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_decimal_sum_stats_bound = false");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_decimal_sum_stats_bound");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
   }
@@ -689,23 +707,21 @@ TEST_CASE("Sirius configuration validates telemetry exporters before initializat
 {
   std::source_location loc = std::source_location::current();
   auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
-  auto const invalid       = data_dir / "invalid_telemetry_exporter.yaml";
-  sirius::sirius_config rejected;
-  auto const default_exporter = rejected.get_telemetry_config().exporter;
-  REQUIRE_THROWS_WITH(rejected.load_from_file(invalid),
-                      Catch::Matchers::ContainsSubstring("telemetry.exporter") &&
-                        Catch::Matchers::ContainsSubstring("ndjson, msgpack, postcard"));
-  REQUIRE(rejected.get_telemetry_config().exporter == default_exporter);
-
-  for (auto const& [exporter, fixture] : std::array<std::pair<const char*, const char*>, 3>{{
-         {"ndjson", "valid_telemetry_exporter_ndjson.yaml"},
-         {"msgpack", "valid_telemetry_exporter_msgpack.yaml"},
-         {"postcard", "valid_telemetry_exporter_postcard.yaml"},
-       }}) {
-    sirius::sirius_config accepted;
-    REQUIRE_NOTHROW(accepted.load_from_file(data_dir / fixture));
-    REQUIRE(accepted.get_telemetry_config().exporter == exporter);
+  // Reject unsupported formats before initialization, even with telemetry disabled.
+  for (auto const* fixture : {"invalid_telemetry_exporter.yaml",
+                              "invalid_telemetry_exporter_msgpack.yaml",
+                              "invalid_telemetry_exporter_postcard.yaml"}) {
+    sirius::sirius_config rejected;
+    auto const default_exporter = rejected.get_telemetry_config().exporter;
+    REQUIRE_THROWS_WITH(rejected.load_from_file(data_dir / fixture),
+                        Catch::Matchers::ContainsSubstring("telemetry.exporter") &&
+                          Catch::Matchers::ContainsSubstring("must be ndjson"));
+    REQUIRE(rejected.get_telemetry_config().exporter == default_exporter);
   }
+
+  sirius::sirius_config accepted;
+  REQUIRE_NOTHROW(accepted.load_from_file(data_dir / "valid_telemetry_exporter_ndjson.yaml"));
+  REQUIRE(accepted.get_telemetry_config().exporter == sirius::QUENT_NDJSON_EXPORTER);
 }
 
 TEST_CASE("Sirius configuration keeps NVTX capture off unless telemetry.enable_nvtx is set",
@@ -919,6 +935,7 @@ void require_shared_operator_defaults(const sirius::operator_params& params, uin
   REQUIRE(params.scan_task_batch_size == batch);
   REQUIRE(params.hash_partition_bytes == batch);
   REQUIRE(params.concat_batch_bytes == batch);
+  REQUIRE(params.cross_join_task_bytes == batch);
   REQUIRE(params.sort_sample_bytes == batch);
   REQUIRE(params.max_build_hash_table_bytes == 2 * batch);
 }
@@ -1024,6 +1041,7 @@ TEST_CASE("explicit operator batch values override effective-capacity defaults",
   REQUIRE(params.concat_batch_bytes == 3 * mib);
   REQUIRE(params.sort_sample_bytes == 4 * mib);
   REQUIRE(params.max_build_hash_table_bytes == 5 * mib);
+  REQUIRE(params.cross_join_task_bytes == 6 * mib);
 }
 
 TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",

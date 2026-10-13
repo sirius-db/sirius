@@ -306,6 +306,9 @@ std::unique_ptr<cudf::column> decompress_column_full(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
+/// On an applied decode the table holds the request's delivered prefix of @p selected_columns (see
+/// `sirius::codegen::scan_filter_request::delivered_prefix`); every successful non-applied return
+/// holds every selected column. Execution failures throw without publishing output.
 std::unique_ptr<cudf::table> decompress_scan_filter(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,

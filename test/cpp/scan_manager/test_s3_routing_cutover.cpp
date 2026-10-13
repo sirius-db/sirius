@@ -29,6 +29,7 @@
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -211,7 +212,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_tab
   for (duckdb::idx_t i = 0; i < info->returned_types.size(); ++i) {
     info->column_ids.push_back(duckdb::ColumnIndex(i));
   }
-  info->scan_output_arity = info->returned_types.size();
+  info->projected_output_count = info->returned_types.size();
   return info;
 }
 
@@ -258,7 +259,7 @@ sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager
 sirius::planner::query make_empty_query(sirius::query_id_t query_id = sirius::make_query_id(1))
 {
   auto tctx = sirius::test::make_test_telemetry_context();
-  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
+  sirius::telemetry::query_telemetry_info tinfo{quent::now_v7(), tctx->worker_id().raw(), query_id};
   return sirius::planner::query(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
                                 tctx->context(),
                                 query_id,

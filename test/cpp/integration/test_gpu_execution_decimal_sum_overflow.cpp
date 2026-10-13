@@ -269,3 +269,66 @@ TEST_CASE_METHOD(DecimalSumFixture,
   compare_gpu_vs_cpu_approx(
     "SELECT sum(v) s, avg(v) a FROM nulls WHERE g > 100;", std::set<size_t>{1}, 1e-12);
 }
+
+namespace {
+
+/// Values whose statistics prove no batch can overflow: q in [1.00, 50.00] and p in
+/// [0.00, 1008.99] as DECIMAL(15,2), f in [0.00, 7.50] as DECIMAL(9,2). The planner's bound
+/// decides these without the per-batch scan.
+void create_small_decimal_tables(DecimalSumFixture& fx)
+{
+  fx.run_ok(
+    "CREATE TABLE small AS SELECT (i % 4)::INTEGER g, ((i % 50) + 1)::DECIMAL(15,2) q, "
+    "((i % 1000) * 1.01)::DECIMAL(15,2) p FROM range(20000) r(i);");
+  fx.run_ok(
+    "CREATE TABLE groups AS SELECT i::INTEGER g, (i * 2.5)::DECIMAL(9,2) f FROM range(4) r(i);");
+  fx.run_ok("CHECKPOINT;");
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(DecimalSumFixture,
+                 "decimal sum overflow - statistics-bounded grouped SUM and AVG",
+                 "[integration][gpu_execution][aggregate][decimal_sum_overflow]")
+{
+  create_small_decimal_tables(*this);
+  compare_gpu_vs_cpu_approx(
+    "SELECT g, sum(q) s, avg(q) a, sum(p) t, count(*) c FROM small GROUP BY g;",
+    std::set<size_t>{1, 2, 3},
+    1e-12);
+}
+
+TEST_CASE_METHOD(DecimalSumFixture,
+                 "decimal sum overflow - statistics-bounded ungrouped SUM and AVG",
+                 "[integration][gpu_execution][aggregate][decimal_sum_overflow]")
+{
+  create_small_decimal_tables(*this);
+  compare_gpu_vs_cpu_approx("SELECT sum(q) s, avg(p) a, sum(p) t, count(q) c FROM small;",
+                            std::set<size_t>{0, 1, 2},
+                            1e-12);
+}
+
+TEST_CASE_METHOD(DecimalSumFixture,
+                 "decimal sum overflow - statistics bound traced through a join to both sides",
+                 "[integration][gpu_execution][aggregate][decimal_sum_overflow]")
+{
+  create_small_decimal_tables(*this);
+  compare_gpu_vs_cpu_approx(
+    "SELECT s.g, sum(s.q) sq, sum(r.f) sf FROM small s JOIN groups r ON s.g = r.g "
+    "WHERE s.p >= 0 GROUP BY s.g;",
+    std::set<size_t>{1, 2},
+    1e-12);
+}
+
+TEST_CASE_METHOD(DecimalSumFixture,
+                 "decimal sum overflow - unbounded computed input measured beside a bounded column",
+                 "[integration][gpu_execution][aggregate][decimal_sum_overflow]")
+{
+  create_small_decimal_tables(*this);
+  // q + q is DECIMAL(16,2), a widening candidate without a statistics bound, so the batch is
+  // measured for it while q itself is decided from its bound.
+  compare_gpu_vs_cpu_approx(
+    "SELECT g, sum(q + q) s2, sum(q) s FROM small GROUP BY g;", std::set<size_t>{1, 2}, 1e-12);
+  compare_gpu_vs_cpu_approx(
+    "SELECT sum(q + q) s2, avg(q) a FROM small;", std::set<size_t>{0, 1}, 1e-12);
+}

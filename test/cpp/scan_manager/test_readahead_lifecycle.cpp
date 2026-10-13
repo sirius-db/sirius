@@ -368,8 +368,7 @@ class single_scan_query {
       std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{pipeline},
       _telemetry->context(),
       id,
-      sirius::telemetry::query_telemetry_info{
-        _telemetry->engine_id(), _telemetry->worker_id(), id});
+      sirius::telemetry::query_telemetry_info{quent::now_v7(), _telemetry->worker_id().raw(), id});
   }
 
   [[nodiscard]] const sirius::planner::query& get() const { return *_query; }
@@ -625,8 +624,7 @@ class empty_query {
       std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
       _telemetry->context(),
       id,
-      sirius::telemetry::query_telemetry_info{
-        _telemetry->engine_id(), _telemetry->worker_id(), id});
+      sirius::telemetry::query_telemetry_info{quent::now_v7(), _telemetry->worker_id().raw(), id});
   }
 
   [[nodiscard]] const sirius::planner::query& get() const { return *_query; }

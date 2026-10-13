@@ -32,8 +32,10 @@
 
 // standard library
 #include <concepts>
+#include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -231,22 +233,28 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    */
   [[nodiscard]] virtual bool can_report_survivors() const noexcept { return false; }
 
-  /// Whether @ref post_filter_and_project's assembly is a leading-identity
-  /// projection: output column k is materialized column k, and no partition or
-  /// other synthesized column joins the output. When true, a decode-row-filtered
-  /// batch whose width already matches the output arity needs no assembly at
-  /// all, so the scan's transactional carrier-cast steal may bypass
-  /// post_filter_and_project for it. A width match alone cannot prove this:
-  /// trailing pure-filter columns can offset missing synthesized columns.
-  /// Conservative default: false (the steal then falls back to the generic
-  /// materialize/project path, which is always correct).
-  /// Implementations must derive this from their assembly configuration
-  /// (parquet: `!needs_output_assembly`) or return a structural constant only
-  /// while the invariant is type-level (duckdb-native synthesizes no
-  /// partition/virtual output columns and projects via `std::iota` — see its
-  /// `post_filter_and_project`). An override returning a stale `true` silently
-  /// corrupts decode-row-filtered steals.
+  /// Whether @ref post_filter_and_project's assembly is a leading-identity projection: output
+  /// column k is materialized column k, and no partition or other synthesized column joins the
+  /// output. When true, a decode-row-filtered batch whose width already matches the output arity
+  /// needs no assembly at all, so the scan's transactional carrier-cast steal may bypass
+  /// post_filter_and_project for it. A width match alone cannot prove this: trailing pure-filter
+  /// columns can offset missing synthesized columns. Conservative default: false (the steal then
+  /// falls back to the generic materialize/project path, which is always correct). Implementations
+  /// must derive this from their assembly configuration (parquet: `output_is_leading_prefix`) or
+  /// return a structural constant only while the invariant is type-level (duckdb-native synthesizes
+  /// no partition/virtual output columns and projects via `std::iota` — see its
+  /// `post_filter_and_project`). An override returning a stale `true` silently corrupts
+  /// decode-row-filtered steals.
   [[nodiscard]] virtual bool output_assembly_is_leading_identity() const noexcept { return false; }
+
+  /// How many leading columns of @ref materialized_column_order the output reads; every
+  /// materialized column at or past it is a pure-filter column the output never reads. Nullopt
+  /// makes no promise: the fail-closed default, and also the answer for a scan with no output data
+  /// column, whose row count rides on its materialized columns.
+  [[nodiscard]] virtual std::optional<std::size_t> output_prefix_width() const noexcept
+  {
+    return std::nullopt;
+  }
 
   [[nodiscard]] virtual const ingestible_table_info& table_info() const noexcept = 0;
 

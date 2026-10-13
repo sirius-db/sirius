@@ -19,7 +19,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
-#include "telemetry-bridge/gen/task.rs.h"
+#include "telemetry-bridge/gen/quent.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -107,7 +107,10 @@ class sirius_pipeline_itask : public parallel::itask {
     return _global_state->cast<sirius_pipeline_task_global_state>().get_pipeline_id();
   }
 
-  [[nodiscard]] quent::task::TaskHandle& telemetry_handle() noexcept;
+  [[nodiscard]] quent::DynamicFsmHandle<quent::Task>& telemetry_fsm() noexcept
+  {
+    return _telemetry_fsm;
+  };
   void set_telemetry_finalized() noexcept { _telemetry_finalized = true; }
 
  protected:
@@ -123,7 +126,7 @@ class sirius_pipeline_itask : public parallel::itask {
                         std::shared_ptr<sirius_pipeline_task_global_state> global_state);
 
  private:
-  rust::Box<quent::task::TaskHandle> _telemetry_task_handle;
+  quent::DynamicFsmHandle<quent::Task> _telemetry_fsm;
   bool _telemetry_finalized{false};
 };
 

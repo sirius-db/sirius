@@ -168,6 +168,12 @@ struct pushdown_request {
   /// copy it along with everything else.
   bool row_selection_disabled = false;
 
+  /// The scan reads VALUES only from slots [0, output_prefix_width); the slots after them are
+  /// pure-filter columns, read only by the scan's filter. Set only when it lies in [1,
+  /// columns.size()); unset means every slot is read. Static knowledge about the projection: it
+  /// adds no conjunct and counts towards neither @ref empty nor @ref selects_rows.
+  std::optional<std::size_t> output_prefix_width;
+
   [[nodiscard]] bool empty() const noexcept;
   /// True iff any entry asks for rows to be DROPPED (as opposed to a column
   /// being answered in place, which changes no row count).
@@ -185,6 +191,10 @@ struct pushdown_outcome {
   /// The decode applied the scan's ENTIRE row filter and every column is
   /// compacted to the surviving rows, so the scan can skip filtering
   /// altogether and only project.
+  ///
+  /// The scan's filter is its own pushed-down filter. Join filters
+  /// (`pushdown_request::column_entry::membership`) are not part of it: they are optional, so
+  /// whether any of them ran on a batch does not bear on this flag.
   ///
   /// A partially applied request must leave this false: the residual conjuncts
   /// still have to run, and re-checking already-applied ones on the surviving
@@ -225,10 +235,16 @@ struct pushdown_outcome {
   /// scan must not re-apply it: a positional mask over a compacted batch selects wrongly.
   bool visibility_mask_applied = false;
 
+  /// The decoded table holds only the request's leading @ref pushdown_request::output_prefix_width
+  /// columns: the pure-filter columns after them were tested while decoding but never delivered.
+  /// Set only together with @ref row_filtered, which is what makes their absence safe -- no
+  /// residual filter is left to read them.
+  bool filter_only_columns_dropped = false;
+
   [[nodiscard]] bool any() const noexcept
   {
     return row_filtered || selection_unprofitable || !predicate_columns.empty() ||
-           visibility_mask_applied;
+           visibility_mask_applied || filter_only_columns_dropped;
   }
 };
 

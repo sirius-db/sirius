@@ -44,6 +44,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -97,7 +98,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
   /// the ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-  std::size_t scan_output_arity      = 0;
+  std::size_t projected_output_count = 0;
 
   parquet_ingestible_table_info() = default;
 
@@ -372,6 +373,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
 
   [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override;
+
+  [[nodiscard]] std::optional<std::size_t> output_prefix_width() const noexcept override;
 
   [[nodiscard]] bool has_row_filter() const noexcept override
   {

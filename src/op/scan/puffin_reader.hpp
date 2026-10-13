@@ -15,12 +15,20 @@
  */
 
 #pragma once
+#include "op/scan/table_scan/scan_contract.hpp"
 
 #include <cstdint>
+#include <memory>
+
+namespace sirius::scan_manager {
+class charging_allocator;
+}
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sirius::op::scan {
+struct iceberg_delete_set;
 
 /// Hard ceiling on the positions one deletion vector may decode into, independent of anything the
 /// table says about itself.
@@ -47,12 +55,19 @@ inline constexpr int64_t kMaxDeletionVectorPositionsPerStatement = 256LL * 1024 
 
 /// What a manifest entry claims about the deletion vector it points at. The reader checks every
 /// field against the Puffin footer, so a wrong pointer is caught rather than silently followed.
+struct DeletionVectorRefView {
+  std::string const& puffin_path;
+  int64_t content_offset, content_size_in_bytes;
+  std::string const& referenced_data_file;
+  int64_t file_size_in_bytes, record_count;
+};
 struct DeletionVectorRef {
   std::string puffin_path;            ///< Path to the Puffin file.
   int64_t content_offset{-1};         ///< Byte offset of the DV blob within the file.
   int64_t content_size_in_bytes{-1};  ///< Byte length of the DV blob.
   std::string referenced_data_file;   ///< Data file the entry says this vector deletes from.
-  int64_t record_count{-1};           ///< Deleted positions the entry claims; -1 if absent.
+  int64_t file_size_in_bytes{-1};
+  int64_t record_count{-1};  ///< Deleted positions the entry claims; -1 if absent.
 };
 
 /**
@@ -68,5 +83,14 @@ struct DeletionVectorRef {
  *         or CRC failure.
  */
 std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref);
+std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
+  DeletionVectorRef const&, sirius::scan_manager::charging_allocator&);
+
+std::shared_ptr<iceberg_delete_set const> read_deletion_vector_charged(
+  DeletionVectorRefView const&,
+  sirius::scan_manager::charging_allocator&,
+  std::string_view canonical_path,
+  std::shared_ptr<void const> path_owner,
+  scan_contract_id contract = 0);
 
 }  // namespace sirius::op::scan

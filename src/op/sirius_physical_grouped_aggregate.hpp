@@ -29,9 +29,12 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <set>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -55,7 +58,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions,
     std::size_t estimated_cardinality,
     duckdb::TupleDataValidityType group_validity,
-    duckdb::TupleDataValidityType distinct_validity);
+    duckdb::TupleDataValidityType distinct_validity,
+    std::vector<std::optional<std::uint64_t>> aggregate_input_max_abs = {});
 
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
 
@@ -69,6 +73,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
+  /// Parallel to cudf_aggregates: the plan-time bound on |unscaled value| of a decimal SUM input
+  /// (planner::resolve_decimal_sum_input_bounds); nullopt when unproven.
+  std::vector<std::optional<std::uint64_t>> cudf_aggregate_input_max_abs;
 
   // AVG decomposition metadata
   std::vector<AggregateSlot> aggregate_slots;
