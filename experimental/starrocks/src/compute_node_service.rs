@@ -780,6 +780,7 @@ impl SiriusComputeNodeService {
             parked_senders = exchange.parked_senders,
             remote_batches = exchange.remote_batches,
             parked_fragments = self.executor.parked_fragments(),
+            direct_buffers = self.nixl.as_ref().map_or(0, |nixl| nixl.outstanding()),
             "leak counters"
         );
     }
@@ -1236,6 +1237,10 @@ mod tests {
 
         fn release(&self, token: u64) {
             self.released.lock().unwrap().push(token);
+        }
+
+        fn outstanding(&self) -> usize {
+            0
         }
 
         fn send(

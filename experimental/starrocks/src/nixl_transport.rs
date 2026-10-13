@@ -9,6 +9,7 @@
 //! WRITE goes through it. What peers ask of this CN (Md, Alloc, Release) never touches that thread:
 //! it reads the cached metadata or calls the [`DirectExchange`] on the brpc thread.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -132,6 +133,13 @@ impl NixlEndpoint for NixlTransport {
         release(&self.exchange, token);
     }
 
+    fn outstanding(&self) -> usize {
+        self.exchange.outstanding().unwrap_or_else(|err| {
+            warn!(error = %err, "failed to count direct-exchange buffers");
+            0
+        })
+    }
+
     fn send(
         &self,
         peer: SocketAddr,
@@ -200,6 +208,22 @@ struct Transport {
     window: usize,
     /// Longest a WRITE may take (`SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS`).
     xfer_timeout: Duration,
+    /// WRITEs that failed or timed out, held until the NIC is done with them.
+    quarantine: RefCell<Vec<Quarantined>>,
+}
+
+/// A WRITE that failed or timed out while the NIC may still be writing. Dropping its request
+/// releases it, and freeing either batch lets the NIC write into memory a later query owns, so
+/// all three are held until the WRITE reports success. One that never does stays held for the
+/// life of the process, as it would without the quarantine.
+struct Quarantined {
+    request: XferRequest,
+    peer: SocketAddr,
+    /// The sender's batch on this CN.
+    local: u64,
+    /// The receiver's buffers on `peer`, never announced.
+    remote: u64,
+    since: Instant,
 }
 
 /// One posted WRITE, completed oldest first.
@@ -287,6 +311,7 @@ impl Transport {
             peers: HashMap::new(),
             window,
             xfer_timeout,
+            quarantine: RefCell::new(Vec::new()),
         })
     }
 
@@ -302,6 +327,7 @@ impl Transport {
     /// Announces leave in order from their own thread, so a WRITE never waits on the previous
     /// batch's announce round trip.
     fn send(&mut self, request: &SendRequest) -> Result<(), String> {
+        self.reap_quarantine();
         let started = Instant::now();
         let peer = request.peer;
         let remote = self.remote_agent(peer)?;
@@ -334,7 +360,9 @@ impl Transport {
             // peer stops answering, further Releases would each wait out `RPC_TIMEOUT`.
             let mut peer_up = true;
             for mut write in inflight {
-                if self.complete(&remote, &mut write).is_ok() && peer_up {
+                if self.complete(&remote, &mut write).is_err() {
+                    self.quarantine(peer, write);
+                } else if peer_up {
                     peer_up = release_remote(peer, write.remote);
                 }
             }
@@ -392,7 +420,10 @@ impl Transport {
             let Some(mut write) = inflight.pop_front() else {
                 return Ok(());
             };
-            self.complete(remote, &mut write)?;
+            if let Err(err) = self.complete(remote, &mut write) {
+                self.quarantine(request.peer, write);
+                return Err(err);
+            }
             totals.frames += 1;
             totals.rows += write.rows;
             totals.bytes += write.bytes;
@@ -416,8 +447,14 @@ impl Transport {
         let in_progress = match self.agent.post_xfer_req(&request, None) {
             Ok(in_progress) => in_progress,
             Err(err) => {
-                // The NIC may have started; leak the request and both batches as on a timeout.
-                std::mem::forget(request);
+                // The NIC may have started; hold the request and both batches as on a timeout.
+                self.quarantine.borrow_mut().push(Quarantined {
+                    request,
+                    peer,
+                    local: batch.token,
+                    remote: reply.token,
+                    since: posted,
+                });
                 return Err(format!(
                     "failed to post a nixl WRITE to agent '{remote}': {err}"
                 ));
@@ -461,8 +498,8 @@ impl Transport {
     }
 
     /// Waits for `write` to finish, then frees the sender's batch. A WRITE that fails or times out
-    /// may still be in flight, so its request is leaked rather than released (dropping it would
-    /// release it) and both batches stay held. TODO(#2041): quarantine them until the WRITE ends.
+    /// may still be in flight, so its request stays in `write` (dropping it would release it) and
+    /// both batches stay held; the caller quarantines it.
     fn complete(&self, remote: &str, write: &mut Write) -> Result<(), String> {
         let timeout = self.xfer_timeout;
         // Polls back off from a few microseconds to 100 us, so a long WRITE doesn't keep a core
@@ -477,7 +514,6 @@ impl Transport {
                     backoff = (backoff * 2).min(Duration::from_micros(100));
                 }
                 status => {
-                    std::mem::forget(write.request.take());
                     let bytes = write.bytes;
                     return Err(match status {
                         Ok(_) => format!(
@@ -524,6 +560,57 @@ impl Transport {
 
     fn release(&self, token: u64) {
         release(&self.exchange, token);
+    }
+
+    /// Holds a WRITE that did not finish, with both its batches, until [`reap_quarantine`]
+    /// sees it succeed.
+    fn quarantine(&self, peer: SocketAddr, mut write: Write) {
+        let Some(request) = write.request.take() else {
+            return;
+        };
+        self.quarantine.borrow_mut().push(Quarantined {
+            request,
+            peer,
+            local: write.local,
+            remote: write.remote,
+            since: write.posted,
+        });
+        warn!(
+            peer = %peer,
+            bytes = write.bytes,
+            quarantined = self.quarantine.borrow().len(),
+            "holding a nixl WRITE that did not finish, and both its batches"
+        );
+    }
+
+    /// Frees every quarantined WRITE that has since succeeded: the request, the sender's batch,
+    /// and the receiver's buffers on the peer. Any other status keeps it held.
+    fn reap_quarantine(&self) {
+        let mut quarantine = self.quarantine.borrow_mut();
+        let held = quarantine.len();
+        quarantine.retain(|held| {
+            if !matches!(
+                self.agent.get_xfer_status(&held.request),
+                Ok(XferStatus::Success)
+            ) {
+                return true;
+            }
+            self.release(held.local);
+            let _ = call(
+                held.peer,
+                control_params(),
+                &NixlEnvelope::Release(held.remote),
+            );
+            false
+        });
+        if quarantine.len() < held {
+            info!(
+                reclaimed = held - quarantine.len(),
+                still_held = quarantine.len(),
+                oldest_s = quarantine.iter().map(|q| q.since.elapsed().as_secs()).max(),
+                "reclaimed quarantined nixl WRITEs"
+            );
+        }
     }
 }
 
