@@ -18,6 +18,7 @@
 
 #include "expression/aggregate_id.hpp"
 #include "helper/logical_type.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "planner/scan_column_origin.hpp"
@@ -89,7 +90,7 @@ std::optional<std::uint64_t> scan_column_max_abs(duckdb::ClientContext& context,
 
 }  // namespace
 
-std::vector<std::optional<std::uint64_t>> resolve_decimal_sum_input_bounds(
+std::vector<std::optional<std::uint64_t>> resolve_sum_input_bounds(
   duckdb::ClientContext& context, duckdb::LogicalAggregate const& op)
 {
   std::vector<std::optional<std::uint64_t>> bounds(op.expressions.size());
@@ -109,11 +110,15 @@ std::vector<std::optional<std::uint64_t>> resolve_decimal_sum_input_bounds(
     if (aggregate.children.size() != 1) { continue; }
     auto const& input = *aggregate.children[0];
     auto const& type  = input.return_type;
-    // Wider decimals already run as DECIMAL128 and are never widened.
-    if (type.id() != duckdb::LogicalTypeId::DECIMAL ||
-        duckdb::DecimalType::GetWidth(type) > sirius::logical_type::decimal_max_precision_int64) {
-      continue;
-    }
+    // Wider decimals already run as DECIMAL128 and are never widened. Of the wide integer sums
+    // only BIGINT can overflow INT64 within one batch: INTEGER cannot, and HUGEINT statistics
+    // carry no INT64 bound.
+    bool const narrow_decimal =
+      type.id() == duckdb::LogicalTypeId::DECIMAL &&
+      duckdb::DecimalType::GetWidth(type) <= sirius::logical_type::decimal_max_precision_int64;
+    bool const wide_bigint = type.id() == duckdb::LogicalTypeId::BIGINT &&
+                             op::is_wide_integer_sum(*id, sirius::from_duckdb(type));
+    if (!narrow_decimal && !wide_bigint) { continue; }
     if (input.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
     auto const ordinal =
       static_cast<std::size_t>(input.Cast<duckdb::BoundReferenceExpression>().index);
@@ -129,7 +134,7 @@ std::vector<std::optional<std::uint64_t>> resolve_decimal_sum_input_bounds(
     bounds[i] = scan_column_max_abs(context, *origin, type);
     memo.emplace_back(*origin, bounds[i]);
     if (bounds[i]) {
-      SIRIUS_LOG_DEBUG("decimal sum bound: aggregate {} ({}) has |unscaled value| <= {}",
+      SIRIUS_LOG_DEBUG("sum input bound: aggregate {} ({}) has |unscaled value| <= {}",
                        i,
                        aggregate.function.name,
                        *bounds[i]);

@@ -20,13 +20,16 @@
 #include "duckdb/common/assert.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -73,6 +76,17 @@ std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregat
   return std::nullopt;
 }
 
+bool is_wide_integer_sum(sirius::aggregate_id id, sirius::logical_type const& input_type)
+{
+  if (id != sirius::aggregate_id::sum && id != sirius::aggregate_id::avg) { return false; }
+  switch (input_type.id()) {
+    case sirius::type_id::INTEGER:
+    case sirius::type_id::BIGINT:
+    case sirius::type_id::HUGEINT: return true;
+    default: return false;
+  }
+}
+
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions)
@@ -92,6 +106,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       aggregate.get(), "convert_duckdb_aggregates_to_cudf aggregate");
     auto const fid       = aggr.function();
     auto const& children = aggr.arguments();
+    bool const wide = !children.empty() && is_wide_integer_sum(fid, children[0]->return_type());
 
     // Handle AVG specially: it expands into SUM + COUNT_VALID
     if (fid == sirius::aggregate_id::avg) {
@@ -106,8 +121,10 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       result.cudf_aggregates.push_back(cudf::aggregation::Kind::COUNT_VALID);
       result.cudf_aggregate_idx.push_back(col_idx);
       result.cudf_aggregate_struct_col_indices.push_back({});
-      result.aggregate_slots.push_back(
-        AggregateSlot{true, false, sum_position, sirius::get_cudf_type(aggr.return_type())});
+      result.aggregate_slots.push_back({.is_avg      = true,
+                                        .cudf_idx    = sum_position,
+                                        .output_type = sirius::get_cudf_type(aggr.return_type()),
+                                        .is_wide_integer_sum = wide});
       result.has_avg = true;
       continue;
     }
@@ -168,16 +185,27 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       }
     }
     result.cudf_aggregate_struct_col_indices.push_back({});
-    result.aggregate_slots.push_back(AggregateSlot{false, false, current_position});
+    result.aggregate_slots.push_back({.cudf_idx = current_position, .is_wide_integer_sum = wide});
   }
 
   return result;
 }
 
+std::vector<bool> wide_integer_sum_mask(std::vector<AggregateSlot> const& slots,
+                                        std::size_t num_cudf_aggregates)
+{
+  std::vector<bool> mask(num_cudf_aggregates, false);
+  for (auto const& slot : slots) {
+    if (slot.is_wide_integer_sum) { mask[slot.cudf_idx] = true; }
+  }
+  return mask;
+}
+
 namespace {
 
-/// A DECIMAL32 or DECIMAL64 scalar's unscaled value: its device address and size in bytes, both
-/// derived from the scalar's own type so they cannot disagree. Anything else is a caller bug.
+/// A DECIMAL32, DECIMAL64 or INT64 scalar's (unscaled) value: its device address and size in
+/// bytes, both derived from the scalar's own type so they cannot disagree. Anything else is a
+/// caller bug.
 struct scalar_rep {
   void const* data;
   size_t bytes;
@@ -195,8 +223,13 @@ scalar_rep scalar_rep_of(cudf::scalar& s)
       return {static_cast<cudf::fixed_point_scalar<numeric::decimal64>&>(s).data(),
               sizeof(int64_t),
               cudf::type_id::DECIMAL64};
+    case cudf::type_id::INT64:
+      return {static_cast<cudf::numeric_scalar<int64_t>&>(s).data(),
+              sizeof(int64_t),
+              cudf::type_id::INT64};
     default:
-      throw sirius::internal_exception("scalar_rep_of: expected a DECIMAL32 or DECIMAL64 scalar");
+      throw sirius::internal_exception(
+        "scalar_rep_of: expected a DECIMAL32, DECIMAL64 or INT64 scalar");
   }
 }
 
@@ -236,15 +269,21 @@ std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type)
   }
 }
 
-std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& table,
-                                                      std::vector<int> const& candidates,
-                                                      ::cuda::stream_ref stream,
-                                                      rmm::device_async_resource_ref mr)
+std::optional<cudf::data_type> widened_sum_type(cudf::data_type type)
+{
+  if (type.id() == cudf::type_id::INT64) { return wide_integer_sum_type(); }
+  return widened_decimal_sum_type(type);
+}
+
+std::unordered_set<int> sums_needing_widening(cudf::table_view const& table,
+                                              std::vector<int> const& candidates,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr)
 {
   for (int col_id : candidates) {
-    if (!widened_decimal_sum_type(table.column(col_id).type())) {
+    if (!widened_sum_type(table.column(col_id).type())) {
       throw sirius::internal_exception(
-        "decimal_sums_needing_widening: column {} is not DECIMAL32 or DECIMAL64", col_id);
+        "sums_needing_widening: column {} is not DECIMAL32, DECIMAL64 or INT64", col_id);
     }
   }
   std::unordered_set<int> widen;
@@ -299,31 +338,32 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
       return v;
     };
     auto const max_abs = std::max(decimal_magnitude(read(slot)), decimal_magnitude(read(slot + 1)));
-    if (decimal_sum_may_overflow(cudf::data_type{type_id}, table.num_rows(), max_abs)) {
+    if (sum_may_overflow(cudf::data_type{type_id}, table.num_rows(), max_abs)) {
       widen.insert(candidates[i]);
     }
   }
   return widen;
 }
 
-bool decimal_sum_may_overflow(cudf::data_type type, cudf::size_type num_rows, std::uint64_t max_abs)
+bool sum_may_overflow(cudf::data_type type, cudf::size_type num_rows, std::uint64_t max_abs)
 {
   unsigned __int128 limit = 0;
   switch (type.id()) {
     case cudf::type_id::DECIMAL32: limit = std::numeric_limits<int32_t>::max(); break;
-    case cudf::type_id::DECIMAL64: limit = std::numeric_limits<int64_t>::max(); break;
+    case cudf::type_id::DECIMAL64:
+    case cudf::type_id::INT64: limit = std::numeric_limits<int64_t>::max(); break;
     default:
       throw sirius::internal_exception(
-        "decimal_sum_may_overflow: expected a DECIMAL32 or DECIMAL64 type");
+        "sum_may_overflow: expected a DECIMAL32, DECIMAL64 or INT64 type");
   }
   if (num_rows <= 0) { return false; }
   return static_cast<unsigned __int128>(num_rows) * static_cast<unsigned __int128>(max_abs) > limit;
 }
 
-std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
-                                              std::vector<decimal_sum_candidate> const& candidates,
-                                              ::cuda::stream_ref stream,
-                                              rmm::device_async_resource_ref mr)
+std::unordered_set<int> sums_to_widen(cudf::table_view const& table,
+                                      std::vector<sum_candidate> const& candidates,
+                                      ::cuda::stream_ref stream,
+                                      rmm::device_async_resource_ref mr)
 {
   std::unordered_set<int> widen;
   if (candidates.empty() || table.num_rows() == 0) { return widen; }
@@ -346,14 +386,48 @@ std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
     auto const& max_abs = bound[column];
     if (!max_abs) {
       measured.push_back(column);
-    } else if (decimal_sum_may_overflow(table.column(column).type(), table.num_rows(), *max_abs)) {
+    } else if (sum_may_overflow(table.column(column).type(), table.num_rows(), *max_abs)) {
       widen.insert(column);
     }
   }
-  if (!measured.empty()) {
-    widen.merge(decimal_sums_needing_widening(table, measured, stream, mr));
-  }
+  if (!measured.empty()) { widen.merge(sums_needing_widening(table, measured, stream, mr)); }
   return widen;
+}
+
+bool partial_sums_may_overflow(cudf::column_view const& column,
+                               ::cuda::stream_ref stream,
+                               rmm::device_async_resource_ref mr)
+{
+  if (column.type().id() != cudf::type_id::INT64) {
+    throw sirius::internal_exception("partial_sums_may_overflow: expected an INT64 column");
+  }
+  if (column.size() == 0 || column.null_count() == column.size()) { return false; }
+  // Half of the INT64 range, a margin that dwarfs the rounding error of the double total.
+  constexpr double limit = 0x1p62;
+  return !(sum_of_magnitudes(column, stream, mr) < limit);
+}
+
+std::unique_ptr<cudf::column> narrow_wide_integer_sum(std::unique_ptr<cudf::column> column,
+                                                      ::cuda::stream_ref stream,
+                                                      rmm::device_async_resource_ref mr)
+{
+  auto const type = column->type();
+  if (type.id() == cudf::type_id::INT64) { return column; }
+  if (type != wide_integer_sum_type()) {
+    throw sirius::internal_exception("narrow_wide_integer_sum: unexpected column type {}",
+                                     cudf::type_to_name(type));
+  }
+  // A column with no valid value has nothing to check; any other column whose bounds cannot be
+  // established is treated as out of range.
+  if (column->null_count() < column->size()) {
+    auto const range = compute_exact_numeric_range(column->view(), stream, mr);
+    if (!range || range->minimum < std::numeric_limits<int64_t>::min() ||
+        range->maximum > std::numeric_limits<int64_t>::max()) {
+      throw sirius::not_implemented_exception(
+        "SUM result outside the BIGINT range is not supported on GPU (HUGEINT result)");
+    }
+  }
+  return cudf::cast(column->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
 }
 
 }  // namespace op

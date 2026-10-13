@@ -73,9 +73,12 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
-  /// Parallel to cudf_aggregates: the plan-time bound on |unscaled value| of a decimal SUM input
-  /// (planner::resolve_decimal_sum_input_bounds); nullopt when unproven.
+  /// Parallel to cudf_aggregates: the plan-time bound on |unscaled value| of a decimal or wide
+  /// integer SUM input (planner::resolve_sum_input_bounds); nullopt when unproven.
   std::vector<std::optional<std::uint64_t>> cudf_aggregate_input_max_abs;
+  /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG
+  /// (AggregateSlot::is_wide_integer_sum), whose partial result may be DECIMAL128.
+  std::vector<bool> cudf_aggregate_is_wide_integer_sum;
 
   // AVG decomposition metadata
   std::vector<AggregateSlot> aggregate_slots;
