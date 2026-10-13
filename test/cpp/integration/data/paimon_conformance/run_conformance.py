@@ -26,6 +26,7 @@ from corpus_checks import (
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[4]
 WORK = ROOT / "build/paimon-conformance"
+PLANNING_REJECTION = "GPU plan generation failed: Table function 'paimon_scan' is not supported in Sirius"
 
 
 class ProcessError(RuntimeError):
@@ -41,39 +42,73 @@ def sql_literal(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def execute(args, *, timeout, cwd, env=None, log=None):
-    """Never turn a failed or timed-out reader into an empty successful result."""
-    try:
-        result = subprocess.run(
-            list(map(str, args)),
-            cwd=cwd,
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        if log:
-            # TimeoutExpired may carry bytes even when subprocess uses text=True.
-            def text(value):
-                return (
-                    value.decode("utf-8", errors="replace")
-                    if isinstance(value, bytes)
-                    else value or ""
-                )
+def process_diagnostics():
+    return {
+        "termination": "not_started",
+        "exit_status": None,
+        "timed_out": False,
+        "expected_error_match": None,
+    }
 
-            Path(str(log) + ".stdout").write_text(text(error.stdout))
-            Path(str(log) + ".stderr").write_text(
-                text(error.stderr) + "\n" + str(error) + "\n"
+
+def execute(
+    args, *, timeout, cwd, env=None, log=None, diagnostics=None, expected_error=None
+):
+    """Record observed process facts without inferring a crash's root cause."""
+    diagnostics = diagnostics if diagnostics is not None else process_diagnostics()
+    stdout, stderr = "", ""
+
+    def text(value):
+        # TimeoutExpired may carry bytes even when subprocess uses text=True.
+        return (
+            value.decode("utf-8", errors="replace")
+            if isinstance(value, bytes)
+            else value or ""
+        )
+
+    try:
+        try:
+            result = subprocess.run(
+                list(map(str, args)),
+                cwd=cwd,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
             )
-        raise RuntimeError(f"Process timed out after {timeout}s: {args[0]}") from error
-    if log:
-        Path(str(log) + ".stdout").write_text(result.stdout)
-        Path(str(log) + ".stderr").write_text(result.stderr)
-    if result.returncode:
-        raise ProcessError(result)
-    return result.stdout
+        except subprocess.TimeoutExpired as error:
+            stdout, stderr = text(error.stdout), text(error.stderr)
+            diagnostics.update(termination="timeout", timed_out=True)
+            if expected_error is not None:
+                diagnostics["expected_error_match"] = expected_error in stderr
+            stderr += "\n" + str(error) + "\n"
+            raise RuntimeError(
+                f"Process timed out after {timeout}s: {args[0]}"
+            ) from error
+        except OSError:
+            diagnostics["termination"] = "launch_error"
+            raise
+        except KeyboardInterrupt:
+            diagnostics["termination"] = "interrupted"
+            raise
+        stdout, stderr = result.stdout, result.stderr
+        diagnostics.update(
+            termination="signal" if result.returncode < 0 else "exited",
+            exit_status=result.returncode,
+        )
+        if expected_error is not None:
+            diagnostics["expected_error_match"] = expected_error in stderr
+        if result.returncode:
+            raise ProcessError(result)
+        return result.stdout
+    finally:
+        if log:
+            Path(str(log) + ".stdout").write_text(stdout)
+            Path(str(log) + ".stderr").write_text(stderr)
+            Path(str(log) + ".process.json").write_text(
+                json.dumps(diagnostics, indent=2) + "\n"
+            )
 
 
 def decode_results(output):
@@ -134,10 +169,7 @@ def expect_planning_rejection(action):
     try:
         action()
     except ProcessError as error:
-        if error.returncode == 1 and (
-            "GPU plan generation failed: Table function 'paimon_scan' is not supported in Sirius"
-            in error.stderr
-        ):
+        if error.returncode == 1 and PLANNING_REJECTION in error.stderr:
             return
         raise
     raise AssertionError("Expected planning-time rejection with CPU fallback disabled")
@@ -214,7 +246,7 @@ def scan_sql(path, snapshot):
     return f"paimon_scan({argument})"
 
 
-def probe_identity(cli, directory, timeout):
+def probe_identity(cli, directory, timeout, diagnostics=None):
     env = os.environ.copy()
     env["SIRIUS_DISABLE"] = "1"
     output = execute(
@@ -233,6 +265,7 @@ def probe_identity(cli, directory, timeout):
         cwd=directory,
         env=env,
         log=directory / "reader-identity",
+        diagnostics=diagnostics,
     )
     results = decode_results(output)
     if len(results) != 2 or len(results[0]) != 1 or len(results[1]) != 1:
@@ -258,7 +291,7 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
 """
     )
 
-    def command(sql, mode, label, *, rejection=False):
+    def command(sql, mode, label, item, *, rejection=False):
         env = os.environ.copy()
         env.update(SIRIUS_CONFIG_FILE=str(config), TZ="UTC", SIRIUS_LOG_LEVEL="warn")
         env["SIRIUS_DISABLE"] = "1" if mode == "disabled" else "0"
@@ -308,17 +341,20 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
                 cwd=run_dir,
                 env=env,
                 log=run_dir / label,
+                diagnostics=item["process"],
+                expected_error=PLANNING_REJECTION if rejection else None,
             )
         finally:
             if pending.exists():
                 pending.replace(result)
         return result.read_text()
 
-    def query(case, sql, mode, label, setup=""):
+    def query(case, sql, mode, label, item, setup=""):
         output = command(
             setup + "DESCRIBE " + sql + ";" + sql + "; SELECT 'LIVENESS_OK' AS probe;",
             mode,
             label,
+            item,
         )
         compare_rows(
             case, query_result(output, spec["extension"], case["columns"], mode)
@@ -328,6 +364,7 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
         item = next(
             i for i in report["cases"] if i["id"] == case_id and i["mode"] == mode
         )
+        item["process"] = process_diagnostics()
         try:
             action(item)
             item.update(state="PASS", passed=True)
@@ -355,14 +392,14 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
             def check(item, case=case, mode=mode):
                 sql, snapshot = case_sql(case)
                 item["snapshot_id"] = snapshot
-                query(case, sql, mode, mode + "-" + case["id"])
+                query(case, sql, mode, mode + "-" + case["id"], item)
 
             record(case["id"], mode, check)
 
     def transparent(item):
         case = next(c for c in spec["cases"] if c["id"] == "append_b")
         sql, item["snapshot_id"] = case_sql(case)
-        query(case, sql, "transparent", "transparent")
+        query(case, sql, "transparent", "transparent", item)
 
     record("rows_and_liveness", "transparent", transparent)
 
@@ -370,7 +407,7 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
         case = next(c for c in spec["cases"] if c["id"] == "append_b")
         sql, item["snapshot_id"] = case_sql(case)
         expect_planning_rejection(
-            lambda: command(sql, "transparent", "rejection", rejection=True)
+            lambda: command(sql, "transparent", "rejection", item, rejection=True)
         )
 
     record("planning_rejection", "transparent", rejected)
@@ -385,6 +422,7 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
             "SELECT id, amount FROM p.reference.orders_pk",
             "cpu",
             "attached",
+            item,
             setup,
         )
 
@@ -491,7 +529,8 @@ def main(argv=None):
                 "path": str(args.sirius_extension),
                 "sha256": digest(args.sirius_extension),
             }
-        identity = probe_identity(cli, run_dir, args.timeout)
+        report["reader_process"] = process_diagnostics()
+        identity = probe_identity(cli, run_dir, args.timeout, report["reader_process"])
         if args.registry:
             spec["extension"] = select_qualification(args.registry, identity)
             report["registry_sha256"] = digest(args.registry)

@@ -22,6 +22,9 @@ jobs:
     timeout-minutes: 90
     env:
       SIRIUS_LOG_LEVEL: warn
+      # Force compilation even if the persistent runner already has compiler caches.
+      SCCACHE_RECACHE: "1"
+      CCACHE_DISABLE: "1"
       BUILD_RUN_ID: ${{ inputs.build_run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,6 +33,13 @@ jobs:
         run: |
           mkdir -p build/paimon-conformance
           printf 'Revision: %s\nBuild run: %s\n' "$GITHUB_SHA" "$BUILD_RUN_ID" > build/paimon-conformance/setup.log
+          date +%s > build/paimon-conformance/started-at.txt
+          {
+            printf 'Runner: %s (%s/%s)\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH"
+            echo 'Reader cache policy: fresh output; no source cache; SCCACHE_RECACHE=1; CCACHE_DISABLE=1'
+            echo 'Initial filesystem usage (bytes):'
+            df -B1 .
+          } > build/paimon-conformance/resources.txt
 
       - name: Verify build provenance
         env:
@@ -87,14 +97,16 @@ jobs:
       - name: Build pinned Paimon test dependency
         run: |
           set -euo pipefail
-          pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_extension.py \
+          /usr/bin/time --verbose --output=build/paimon-conformance/build-resources.txt \
+            pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_extension.py \
             --duckdb sirius-duckdb/build/release/duckdb --output build/paimon-conformance/source-build --jobs 4 \
             2>&1 | tee -a build/paimon-conformance/setup.log
 
       - name: Run Paimon cases
         run: |
           set -euo pipefail
-          pixi run --locked python3 test/cpp/integration/data/paimon_conformance/run_conformance.py \
+          /usr/bin/time --verbose --output=build/paimon-conformance/conformance-resources.txt \
+            pixi run --locked python3 test/cpp/integration/data/paimon_conformance/run_conformance.py \
             --duckdb sirius-duckdb/build/release/duckdb \
             --sirius-extension sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension \
             --paimon-extension build/paimon-conformance/source-build/paimon.duckdb_extension \
@@ -105,12 +117,30 @@ jobs:
         env:
           JOB_STATUS: ${{ job.status }}
         run: |
+          mkdir -p build/paimon-conformance
+          {
+            if [[ -f build/paimon-conformance/started-at.txt ]]; then
+              printf 'Seconds since diagnostics initialized: %s\n' "$(( $(date +%s) - $(cat build/paimon-conformance/started-at.txt) ))"
+            fi
+            echo 'Final filesystem usage (bytes):'
+            df -B1 .
+            echo 'Retained directory disk allocation (bytes, not peak):'
+            for directory in build/paimon-conformance build/release sirius-duckdb/build/release .pixi; do
+              if [[ -d "$directory" ]]; then
+                du -s -B1 "$directory"
+              else
+                printf '%s: NOT CREATED\n' "$directory"
+              fi
+            done
+          } >> build/paimon-conformance/resources.txt
           {
             echo '## Paimon conformance'
             printf 'Job status: **%s**\n' "$JOB_STATUS"
             echo 'If no case report exists, source building/build retrieval did not complete; cases are NOT RUN.'
             echo 'Build artifacts expire after one day. An expired/missing artifact requires a new matching build, never substitution with another revision.'
             echo '```'
+            cat build/paimon-conformance/resources.txt 2>/dev/null || true
+            cat build/paimon-conformance/*-resources.txt 2>/dev/null || true
             cat build/paimon-conformance/build-provenance.json 2>/dev/null || true
             tail -60 build/paimon-conformance/setup.log 2>/dev/null || true
             tail -60 build/paimon-conformance/source-build/build.log 2>/dev/null || true
@@ -124,6 +154,7 @@ jobs:
         with:
           name: paimon-conformance-${{ github.run_id }}
           path: |
+            build/paimon-conformance/*.txt
             build/paimon-conformance/*.log
             build/paimon-conformance/*.json
             build/paimon-conformance/run-*/

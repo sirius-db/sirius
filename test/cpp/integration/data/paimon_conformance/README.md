@@ -139,6 +139,19 @@ and child stdout/stderr, including partial timeout output. Shared setup failure
 leaves cases NOT RUN and the command fails. Case-local failure does not suppress
 later independent cases. Interrupts still terminate the run.
 
+Each executed case has a `process` object, and the setup identity probe has
+`reader_process`. The same facts are retained in `<label>.process.json` beside
+stdout/stderr: `termination`, `exit_status` (the subprocess return code),
+`timed_out`, and `expected_error_match`. A negative exit status denotes a POSIX
+signal; a timeout or launch failure has no observed exit status (`null`). The
+error-match field is a Boolean for the planning-rejection check and `null` when
+not applicable or the process did not launch/was interrupted before a result
+was observed. `false` means the captured stderr did not match, including empty
+stderr. A matching error never excuses a
+crash, timeout, unexpected exit code, or successful exit. Only exit 1 plus the
+expected diagnostic passes that check. These fields record observations; they do
+not attribute a failure to a particular upstream issue.
+
 The optional `Paimon conformance` workflow accepts a completed `Test` run whose
 source head matches the dispatched revision. The CUDA 13 artifact must contain both `build/release/` (including the installed
 Sirius libraries) and `sirius-duckdb/build/release/` (CLI and extension).
@@ -150,10 +163,10 @@ summary explicitly distinguish the source head and actual build checkout SHA.
 For manual/merge-group builds, the recorded checkout must equal the dispatched
 revision. Workflow paths with or without an `@ref` suffix are accepted.
 
-This workflow does not rebuild or rerun the ordinary test matrix. It waits until
-the selected Test run completes, which can mean waiting for its full 90-minute
-job budget even when the build artifact is already available. Artifacts expire
-after one day; missing/expired builds fail explicitly.
+This workflow does not rebuild or rerun the ordinary test matrix. It requires an
+already-completed Test run and fails immediately if that run is still in progress;
+it does not poll or wait for completion. Artifacts expire after one day;
+missing/expired builds fail explicitly.
 
 GitHub requires the workflow file to exist on the repository's default branch
 before [`workflow_dispatch`](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onworkflow_dispatch)
@@ -164,6 +177,34 @@ repository where it runs. To validate a fork PR revision in the base repository,
 a maintainer must make that revision available on a base-repository ref. A fork
 can dispatch only when its default branch contains the workflow and its required
 runners are available.
+
+For the first upstream run, ask a maintainer to agree to the bootstrap route:
+register this reviewed workflow on the default branch through the repository's
+CI contribution process, and publish the reviewed source head on a base-repository
+branch. Complete a matching `Test` run, then dispatch `Paimon conformance` on that
+same branch with its `build_run_id`. A workflow-only bootstrap does not qualify
+the tests; retain the actual `gpu-2xt4` run URL and diagnostics before claiming CI
+validation. Do not enable new PR triggers or weaken provenance to bypass this
+prerequisite.
+
+The workflow's **90-minute job budget includes** artifact retrieval, environment
+setup, the four-job reader build and conformance. It deliberately passes no
+source cache and requires a new build directory. `SCCACHE_RECACHE=1` forces
+recompilation in sccache; `CCACHE_DISABLE=1` disables ccache, including nested
+builds. These environment values are recorded in the build receipt. This is a
+cold **reader** build, not a cold Sirius/Pixi installation or a claim that proxies
+and OS caches are empty.
+
+`build-resources.txt` and `conformance-resources.txt` retain GNU time's wall time,
+maximum resident memory and exit status for each command, including a failed
+command. `resources.txt` records runner identity, initial/final filesystem usage,
+final allocated directory sizes, and elapsed time from initialization of
+diagnostics. Directory sizes are boundary measurements, not peak disk usage;
+use the GitHub job's start/end timestamps for the entire 90-minute budget.
+The always-run summary and diagnostic upload retain these records on failure;
+a forcefully terminated job can leave incomplete records, never proof of a pass.
+Local timings on other GPUs or with source/compiler caches do not establish the
+intended runner's budget. Record its cold-run duration and disk use in the PR.
 
 Build/case diagnostics, receipts and nested CMake logs are uploaded even on failure. Normal PR/merge-group
 checks run the CPU harness in its own required job, independently of lint and

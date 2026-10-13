@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import sys
 import tempfile
 import unittest
@@ -95,7 +96,14 @@ if 'SET enable_duckdb_fallback=false;' in sql:
     candidate = next(c for c in spec['cases'] if c['id']=='append_b')
     if tail != 'SET enable_duckdb_fallback=false;'+fixture_query(candidate):
         raise RuntimeError('Unexpected test SQL: rejection requires the actual Paimon query')
-    print("GPU plan generation failed: Table function 'paimon_scan' is not supported in Sirius", file=sys.stderr, flush=True)
+    message = "GPU plan generation failed: Table function 'paimon_scan' is not supported in Sirius"
+    if fault == 'rejection_unrelated': message = 'Binder Error: missing table'
+    print(message, file=sys.stderr, flush=True)
+    if fault == 'rejection_timeout':
+        import time
+        time.sleep(60)
+    if fault == 'rejection_success': sys.exit(0)
+    if fault == 'rejection_wrong_exit': sys.exit(2)
     if fault == 'rejection_crash':
         import resource, signal
         resource.setrlimit(resource.RLIMIT_CORE, (0,0))
@@ -123,6 +131,10 @@ results=[[{'extension_version':spec['extension']['version']}],[{'version':spec['
 target = os.environ.get('PAIMON_TEST_TARGET', 'disabled/empty_rows')
 label = 'attached' if attached else mode+'/'+case['id']
 if label == target:
+    if fault == 'query_crash':
+        import resource, signal
+        resource.setrlimit(resource.RLIMIT_CORE, (0,0))
+        os.kill(os.getpid(), signal.SIGSEGV)
     if fault == 'missing_file': os.unlink('sql-results.json')
     elif fault == 'empty_file': results = []
     elif fault == 'missing': results.pop(4)
@@ -149,6 +161,7 @@ for result in results: print(json.dumps(result))
         sirius=None,
         default_sirius=False,
         sql_mutation=None,
+        timeout=90,
     ):
         (self.corpus / "expectations.json").write_text(canonical_json(self.spec))
         args = [
@@ -161,6 +174,8 @@ for result in results: print(json.dumps(result))
             str(self.registry),
             "--output",
             str(self.root / "reports"),
+            "--timeout",
+            str(timeout),
         ]
         if default_sirius:
             sirius = (
@@ -483,6 +498,115 @@ for result in results: print(json.dumps(result))
         failures = [c for c in report["cases"] if c["state"] == "FAIL"]
         self.assertEqual([c["id"] for c in failures], ["planning_rejection"])
         self.assertEqual(failures[0]["error_type"], "ProcessError")
+        self.assertEqual(
+            failures[0]["process"],
+            {
+                "termination": "signal",
+                "exit_status": -signal.SIGSEGV,
+                "timed_out": False,
+                "expected_error_match": True,
+            },
+        )
+        self.assert_process_logs(report)
+
+    def assert_process_logs(self, report):
+        directory = next((self.root / "reports").glob("run-*"))
+        self.assertEqual(
+            json.loads((directory / "reader-identity.process.json").read_text()),
+            report["reader_process"],
+        )
+        smoke = {
+            "rows_and_liveness": "transparent",
+            "planning_rejection": "rejection",
+            "attached_catalog": "attached",
+        }
+        for case in report["cases"]:
+            label = smoke.get(case["id"], case["mode"] + "-" + case["id"])
+            self.assertEqual(
+                json.loads((directory / (label + ".process.json")).read_text()),
+                case["process"],
+            )
+
+    def test_process_facts_for_success_and_normal_rejection(self):
+        report, error = self.run_suite(["append_b"])
+        self.assertIsNone(error)
+        self.assert_process_logs(report)
+        for case in report["cases"]:
+            rejection = case["id"] == "planning_rejection"
+            self.assertEqual(
+                case["process"],
+                {
+                    "termination": "exited",
+                    "exit_status": 1 if rejection else 0,
+                    "timed_out": False,
+                    "expected_error_match": True if rejection else None,
+                },
+            )
+
+    def test_wrong_rejection_outcomes_retain_independent_process_facts(self):
+        scenarios = [
+            ("rejection_success", 0, True, "exited"),
+            ("rejection_wrong_exit", 2, True, "exited"),
+            ("rejection_unrelated", 1, False, "exited"),
+            ("rejection_timeout", None, True, "timeout"),
+        ]
+        for fault, status, matches, termination in scenarios:
+            with self.subTest(fault=fault):
+                shutil.rmtree(self.root / "reports", ignore_errors=True)
+                report, error = self.run_suite(["append_b"], fault, timeout=2)
+                self.assertIsNotNone(error)
+                failures = [c for c in report["cases"] if c["state"] == "FAIL"]
+                self.assertEqual([c["id"] for c in failures], ["planning_rejection"])
+                self.assertEqual(
+                    failures[0]["process"],
+                    {
+                        "termination": termination,
+                        "exit_status": status,
+                        "timed_out": termination == "timeout",
+                        "expected_error_match": matches,
+                    },
+                )
+                self.assertEqual(
+                    (report["executed_cases"], report["not_run_cases"]), (5, 0)
+                )
+                self.assert_process_logs(report)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signals")
+    def test_query_crash_has_no_expected_rejection_attribution(self):
+        report, error = self.run_suite(["append_b"], "query_crash", "cpu/append_b")
+        self.assertIsNotNone(error)
+        failures = [c for c in report["cases"] if c["state"] == "FAIL"]
+        self.assertEqual([c["mode"] for c in failures], ["cpu"])
+        self.assertEqual(
+            failures[0]["process"],
+            {
+                "termination": "signal",
+                "exit_status": -signal.SIGSEGV,
+                "timed_out": False,
+                "expected_error_match": None,
+            },
+        )
+        self.assert_process_logs(report)
+
+    def test_identity_launch_failure_is_distinct_from_reader_exit(self):
+        self.cli.write_text("not an executable file format\n")
+        report, error = self.run_suite(["append_b"])
+        self.assertIsInstance(error, OSError)
+        self.assertEqual((report["executed_cases"], report["not_run_cases"]), (0, 5))
+        self.assertEqual(
+            report["reader_process"],
+            {
+                "termination": "launch_error",
+                "exit_status": None,
+                "timed_out": False,
+                "expected_error_match": None,
+            },
+        )
+        directory = next((self.root / "reports").glob("run-*"))
+        self.assertEqual(
+            json.loads((directory / "reader-identity.process.json").read_text()),
+            report["reader_process"],
+        )
 
     def test_unqualified_reader_version_fails_before_load(self):
         with patch.dict(os.environ, PAIMON_TEST_VERSION="v1.5.6"):

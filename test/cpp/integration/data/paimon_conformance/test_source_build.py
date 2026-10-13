@@ -73,6 +73,13 @@ class SourceBuildTests(unittest.TestCase):
                 receipt.pop(key)
                 with self.assertRaises(ValueError):
                     self.verify(receipt)
+        for key in ("SCCACHE_RECACHE", "CCACHE_DISABLE"):
+            receipt = copy.deepcopy(self.receipt)
+            del receipt["build_environment"][key]
+            with self.subTest(missing_cache_control=key), self.assertRaisesRegex(
+                ValueError, "lacks build environment provenance"
+            ):
+                self.verify(receipt)
         for key, bad in (
             ("recipe_sha256", "0" * 64),
             ("builder_sha256", "0" * 64),
@@ -229,7 +236,11 @@ class SourceBuildTests(unittest.TestCase):
 
     def test_success_receipt_only_after_completed_build(self):
         output = self.root / "success-build"
-        self.exercise_build(output)
+        with patch.dict(os.environ, SCCACHE_RECACHE="1", CCACHE_DISABLE="1"):
+            self.exercise_build(output)
+        receipt = json.loads((output / "build-receipt.json").read_text())
+        for key in ("SCCACHE_RECACHE", "CCACHE_DISABLE"):
+            self.assertEqual(receipt["build_environment"][key], "1")
         result = builder.validate_receipt(
             output / "build-receipt.json",
             output / "paimon.duckdb_extension",
