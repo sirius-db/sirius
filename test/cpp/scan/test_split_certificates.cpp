@@ -568,7 +568,7 @@ TEST_CASE("File bounded cursors preserve batching and partial emission never fab
     bind->names                       = std::move(info->names);
     bind->returned_types              = std::move(info->returned_types);
     bind->column_ids                  = std::move(info->column_ids);
-    bind->scan_output_arity           = info->scan_output_arity;
+    bind->projected_output_count      = info->projected_output_count;
     bind->resolved_file_paths         = std::move(info->resolved_file_paths);
     bind->approximate_batch_size      = info->approximate_batch_size;
     auto deletes                      = std::make_shared<IcebergDeleteData>();
@@ -1410,16 +1410,16 @@ namespace {
 std::unique_ptr<iceberg_ingestible_table_info> iceberg_info(
   std::vector<std::string> paths, std::shared_ptr<IcebergDeleteData const> payload = nullptr)
 {
-  auto base                 = parquet_info(53);
-  auto info                 = std::make_unique<iceberg_ingestible_table_info>();
-  info->contract_id         = base->contract_id;
-  info->names               = std::move(base->names);
-  info->returned_types      = std::move(base->returned_types);
-  info->column_ids          = std::move(base->column_ids);
-  info->scan_output_arity   = base->scan_output_arity;
-  info->resolved_file_paths = std::move(paths);
-  info->delete_data         = std::move(payload);
-  info->table_path          = "test-table";
+  auto base                    = parquet_info(53);
+  auto info                    = std::make_unique<iceberg_ingestible_table_info>();
+  info->contract_id            = base->contract_id;
+  info->names                  = std::move(base->names);
+  info->returned_types         = std::move(base->returned_types);
+  info->column_ids             = std::move(base->column_ids);
+  info->projected_output_count = base->projected_output_count;
+  info->resolved_file_paths    = std::move(paths);
+  info->delete_data            = std::move(payload);
+  info->table_path             = "test-table";
   return info;
 }
 }  // namespace
