@@ -20,6 +20,7 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "log/logging.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/nvtx.hpp"
@@ -36,6 +37,7 @@
 
 namespace sirius {
 namespace op {
+sirius_physical_table_scan::~sirius_physical_table_scan() = default;
 
 uint64_t get_chunk_data_byte_size(sirius::logical_type type, std::size_t cardinality)
 {

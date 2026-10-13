@@ -18,7 +18,10 @@
 
 #include <op/scan/gpu_ingestible_types.hpp>
 
+#include <chrono>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -35,11 +38,34 @@ namespace sirius::op::scan {
 
 class batch_coalescer {
  public:
+  using clock = std::chrono::steady_clock;
+  struct cursor_step {
+    std::unique_ptr<scan_info> batch;
+    bool finished;
+  };
+  // At most one output and `quantum` row groups per call. No whole-file fan-out.
+  virtual cursor_step advance(scan_info&, size_t&, size_t)
+  {
+    throw std::logic_error("coalescer has no bounded cursor");
+  }
+  // Never emits a final-empty placeholder and never closes input.
+  virtual std::unique_ptr<scan_info> partial_emit() { return {}; }
+  std::optional<clock::time_point> first_retained_time() const { return first_retained_; }
   virtual std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info>) = 0;
 
   virtual std::vector<std::unique_ptr<scan_info>> flush() = 0;
 
   virtual ~batch_coalescer() = default;
+
+ protected:
+  void note_retained(clock::time_point now = clock::now())
+  {
+    if (!first_retained_) first_retained_ = now;
+  }
+  void clear_retained() { first_retained_.reset(); }
+
+ private:
+  std::optional<clock::time_point> first_retained_;
 };
 
 }  // namespace sirius::op::scan

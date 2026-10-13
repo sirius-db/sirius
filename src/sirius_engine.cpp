@@ -22,6 +22,8 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -51,6 +53,15 @@
 namespace sirius {
 
 namespace {
+
+void finish_deferred_preparation(planner::query const* query) noexcept
+{
+  if (!query) return;
+  for (auto* source : query->get_scan_operators())
+    if (auto* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator*>(source))
+      if (auto* ice = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&scan->get_ingestible()))
+        ice->finish_preparation();
+}
 
 /// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
 /// within that cap a non-zero admission_bytes_per_gpu narrows further by estimated scan
@@ -124,10 +135,35 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context,
 {
 }
 
-sirius_engine::~sirius_engine() { query_handle_->exit(); }
+sirius_engine::~sirius_engine()
+{
+  try {
+    quiesce_plan_users();
+  } catch (...) {
+    if (auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state"))
+      ctx->mark_runtime_unavailable();
+  }
+  query_handle_->exit();
+}
+
+void sirius_engine::quiesce_plan_users()
+{
+  if (plan_users_quiescent_) return;
+  if (auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    ctx->get_scan_manager().close_preparation(query_id_,
+                                              scan_manager::stop_reason::failure_induced);
+    ctx->get_scan_manager().drain_query(query_id_);
+    // Keep the established GPU error drain, including its execution serialization.
+    ctx->get_task_scheduler().drain_after_error(query_id_);
+    ctx->get_task_creator().reset(query_id_);
+  }
+  finish_deferred_preparation(query_.get());
+  plan_users_quiescent_ = true;
+}
 
 void sirius_engine::reset()
 {
+  quiesce_plan_users();
   // Before the plan: the query indexes it, so it must not outlive a plan swap.
   query_.reset();
   sirius_physical_plan = nullptr;
@@ -213,8 +249,10 @@ void sirius_engine::execute()
   if (!completion_handler_) {
     throw std::logic_error("execution requires a live window completion handler");
   }
-  auto future = completion_handler_->get_awaitable();
+  completion_handler_->execution_owner = std::this_thread::get_id();
+  auto future                          = completion_handler_->get_awaitable();
 
+  plan_users_quiescent_ = false;
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   try {
     query_ = sirius_ctx->create_query(std::move(new_scheduled),
@@ -224,15 +262,21 @@ void sirius_engine::execute()
                                         .telemetry_query_id = telemetry_uuid,
                                         .worker_id          = telemetry_context_->worker_id(),
                                         .query_id           = query_id_,
-                                      });
+                                      },
+                                      [&client = context] { return client.IsInterrupted(); });
     sirius_ctx->get_task_scheduler().start_query(*query_);
+    sirius_ctx->get_scan_manager().run_preparation_on_query_thread(query_id_);
   } catch (...) {
     // Prepare/start failures and asynchronous failures compete for the same terminal winner.
     completion_handler_->report_error(std::current_exception());
   }
   try {
     future.get();
+    sirius_ctx->get_scan_manager().drain_query(query_id_);
     sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
+    sirius_ctx->get_task_creator().reset(query_id_);
+    finish_deferred_preparation(query_.get());
+    plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     cancel_dynamic_filter_publications();
@@ -240,12 +284,12 @@ void sirius_engine::execute()
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
     // those repositories and cause a use-after-free / heap corruption.
-    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
+    quiesce_plan_users();
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
     cancel_dynamic_filter_publications();
-    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
+    quiesce_plan_users();
     throw;
   }
 
