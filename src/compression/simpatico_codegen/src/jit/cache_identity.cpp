@@ -22,10 +22,13 @@ Digest canonical_digest(XXH128_hash_t hash)
 
 class Encoder {
  public:
-  explicit Encoder(std::string_view domain)
+  explicit Encoder(std::string_view domain_prefix)
   {
     XXH3_128bits_reset(&state_);
-    field(domain);
+    // Encode prefix + version as one field without allocating a combined string.
+    number(domain_prefix.size() + kCacheFormatVersion.size());
+    XXH3_128bits_update(&state_, domain_prefix.data(), domain_prefix.size());
+    XXH3_128bits_update(&state_, kCacheFormatVersion.data(), kCacheFormatVersion.size());
   }
 
   void number(uint64_t value)
@@ -54,7 +57,7 @@ class Encoder {
 
 Digest request_identity(const RequestView& request)
 {
-  Encoder hash("simpatico-request-v2");
+  Encoder hash("simpatico-request-");
   hash.field(request.source);
   hash.field(request.entry);
   hash.field(request.program);
@@ -66,7 +69,7 @@ Digest request_identity(const RequestView& request)
 
 Digest environment_identity(const EnvironmentView& environment)
 {
-  Encoder hash("simpatico-environment-v3");
+  Encoder hash("simpatico-environment-");
   hash.field(environment.project_headers);
   hash.field(environment.cccl_headers);
   hash.number(environment.nvrtc_major);
@@ -92,7 +95,8 @@ std::string hex_digest(const Digest& digest)
 
 std::string CompilationIdentity::relative_path() const
 {
-  return "v2/" + hex_digest(environment) + "/" + hex_digest(request) + ".cubin";
+  return std::string(kCacheFormatVersion) + "/" + hex_digest(environment) + "/" +
+         hex_digest(request) + ".cubin";
 }
 
 std::size_t DigestHash::operator()(const Digest& digest) const noexcept

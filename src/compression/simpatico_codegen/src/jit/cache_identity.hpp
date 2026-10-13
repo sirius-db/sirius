@@ -9,6 +9,9 @@
 
 namespace codegen::jit::detail {
 
+// Request/environment domains and the disk namespace advance together.
+inline constexpr std::string_view kCacheFormatVersion = "v2";
+
 // XXH3-128 in canonical (big-endian) byte order, matching xxhsum -H128.
 using Digest = std::array<unsigned char, 16>;
 
