@@ -568,11 +568,11 @@ static bool parse_hpln_header(Reader& r,
     if (!r.read_le(cr.scale)) return bad("truncated col scale");
     if (field_offsets) field_offsets->columns[ci].num_rows_at = field_at();
     if (!r.read_le(cr.num_rows)) return bad("truncated col num_rows");
-    if (!read_validity(r,
-                       cr.validity,
-                       header_base,
-                       field_offsets ? &field_offsets->columns[ci].validity_payload_offset_at
-                                     : nullptr))
+    if (!read_validity(
+          r,
+          cr.validity,
+          header_base,
+          field_offsets ? &field_offsets->columns[ci].validity_payload_offset_at : nullptr))
       return bad("truncated/unknown col validity");
 
     std::uint16_t nn;
@@ -1650,6 +1650,46 @@ std::string build_column_subset_header(std::span<const std::uint8_t> header,
   }
 
   if (out_payload_bytes) *out_payload_bytes = dst_offset;
+  return {};
+}
+
+std::string list_chunk_sizing_ranges(std::span<const std::uint8_t> header,
+                                     std::vector<gather_range>& out_ranges)
+{
+  out_ranges.clear();
+  Reader r{header.data(), header.size()};
+  std::vector<ColRecord> recs;
+  std::string parse_err;
+  if (!parse_hpln_header(r, recs, &parse_err)) {
+    return parse_err.empty() ? std::string("list_chunk_sizing_ranges: malformed header")
+                             : parse_err;
+  }
+  // Mirrors the `load` in build_chunk_subset_header: the same buffers, the same sizes.
+  for (auto const& cr : recs) {
+    for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
+      auto const& ld = cr.leaf_descs[li];
+      bool const needs_sizing =
+        std::any_of(ld.buffers.begin(), ld.buffers.end(), [&](auto const& bd) {
+          auto const layout = buffer_layout(ld.kind, bd.name);
+          return layout && *layout == ChannelLayout::bulk_variable;
+        });
+      if (!needs_sizing || ld.num_rows == 0) { continue; }
+      auto const n_chunks = (ld.num_rows + kSubsetRowsPerChunk - 1) / kSubsetRowsPerChunk;
+      for (std::size_t bi = 0; bi < ld.buffers.size() && bi < cr.buf_offsets[li].size(); ++bi) {
+        auto const& name   = ld.buffers[bi].name;
+        std::uint64_t want = 0;
+        if (name == "chunk_count") {
+          want = n_chunks * sizeof(std::int32_t);
+        } else if (name == "chunk_bits") {
+          want = n_chunks * sizeof(std::uint8_t);
+        } else {
+          continue;
+        }
+        if (ld.buffers[bi].size_bytes < want) { continue; }
+        out_ranges.push_back(gather_range{cr.buf_offsets[li][bi], want, 0});
+      }
+    }
+  }
   return {};
 }
 

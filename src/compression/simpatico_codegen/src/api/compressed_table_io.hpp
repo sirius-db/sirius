@@ -328,7 +328,7 @@ std::string build_compressed_table_header(compressed_table const& table,
                                           std::vector<std::uint8_t>& out_header,
                                           std::vector<payload_buffer_ref>& out_buffers,
                                           std::uint64_t& out_payload_bytes,
-                                          ::cuda::stream_ref stream    = cudf::get_default_stream(),
+                                          ::cuda::stream_ref stream   = cudf::get_default_stream(),
                                           std::uint64_t payload_align = 1);
 
 /// Copies @p size bytes of the external payload at logical @p offset into the
@@ -500,5 +500,13 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
                                       std::uint64_t max_gap_bytes                     = 0,
                                       std::uint64_t* out_payload_bytes                = nullptr,
                                       std::vector<std::uint8_t>* out_column_subsetted = nullptr);
+
+/// Every payload range @ref build_chunk_subset_header may ask @p read_payload for -- each
+/// bit-packed leaf's `chunk_count` and `chunk_bits` -- found in one parse of @p header, without
+/// building anything. In payload space (`src_offset`, `size`; `dst_offset` unused). A superset: a
+/// leaf the builder would end up emitting whole is still listed. Lets a caller fetch them as one
+/// batch before narrowing, instead of discovering them a request at a time.
+std::string list_chunk_sizing_ranges(std::span<const std::uint8_t> header,
+                                     std::vector<gather_range>& out_ranges);
 
 }  // namespace simpatico

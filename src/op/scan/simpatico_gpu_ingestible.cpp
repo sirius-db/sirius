@@ -57,6 +57,8 @@ namespace sirius::op::scan {
 
 namespace {
 
+double narrow_max_keep_fraction();
+
 /// Decoded footprint of the columns this scan emits, for the reservation.
 ///
 /// Exact for fixed-width columns: the header carries the row count and the decoded type. A
@@ -530,6 +532,15 @@ void simpatico_gpu_ingestible::plan_pruning()
       _live_chunks.push_back({c, {}, _info->chunk_rows[c]});
       continue;
     }
+    // Nearly everything survives: read the chunk whole. Narrowing it saves only the few pruned
+    // groups' bytes but costs a sizing read per column plus a subset header -- for TPC-H q1's
+    // lineitem (98% kept) that planning took ~2 s up front against ~3 s of execution. The filter
+    // still runs on the decoded rows, so this only reads a little more; it never returns more.
+    if (static_cast<double>(kept_groups) >=
+        narrow_max_keep_fraction() * static_cast<double>(n_groups)) {
+      _live_chunks.push_back({c, {}, _info->chunk_rows[c]});
+      continue;
+    }
 
     std::vector<std::uint32_t> decode_chunks;
     decode_chunks.reserve(kept_groups * groups_per_decode_span);
@@ -569,6 +580,7 @@ void simpatico_gpu_ingestible::plan_prefetch()
     sirius::hpln_open_options options;
     options.io_ctx = _info->io_ctx;
     auto planner   = std::make_shared<sirius::hpln_read_planner>(path, options, _staged_columns);
+    auto const t_planner = std::chrono::steady_clock::now();
     std::vector<std::size_t> ids;
     std::vector<std::vector<std::uint32_t>> rows;
     ids.reserve(_live_chunks.size());
@@ -578,8 +590,19 @@ void simpatico_gpu_ingestible::plan_prefetch()
       rows.push_back(live.decode_chunks);
     }
     planner->prefetch_sizing(ids, rows);
+    auto const t_sizing = std::chrono::steady_clock::now();
     std::shared_ptr<io::sirius_datasource const> base{_info->io_ctx->open_datasource(path)};
     if (!base) { return; }
+    auto const ms = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    SIRIUS_LOG_DEBUG(
+      "[simpatico_gpu_ingestible] '{}': plan phases: planner {:.1f} ms, sizing {:.1f} ms, open "
+      "{:.1f} ms",
+      path,
+      ms(t0, t_planner),
+      ms(t_planner, t_sizing),
+      ms(t_sizing, std::chrono::steady_clock::now()));
     _planner         = std::move(planner);
     _base_datasource = std::move(base);
     SIRIUS_LOG_DEBUG(
@@ -668,6 +691,22 @@ simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_sp
 // materialize
 //===----------------------------------------------------------------------===//
 namespace {
+
+/// SIRIUS_HPLN_NARROW_MAX_KEEP -- a chunk whose zone maps keep at least this fraction of its row
+/// groups is read whole instead of narrowed (default 0.9; 1 narrows whenever anything is pruned).
+double narrow_max_keep_fraction()
+{
+  static double const fraction = [] {
+    auto const* value = std::getenv("SIRIUS_HPLN_NARROW_MAX_KEEP");
+    if (value == nullptr) { return 0.9; }
+    try {
+      return std::clamp(std::stod(value), 0.0, 1.0);
+    } catch (...) {
+      return 0.9;
+    }
+  }();
+  return fraction;
+}
 
 /// SIRIUS_HPLN_DIRECT_FETCH -- fetch a planned batch's buffers straight from the prefetching cache
 /// to the device instead of staging the chunk in pinned memory first. On by default; "0" restores
@@ -805,19 +844,51 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   // Cleared by any chunk the decode did not fully filter; see the decision below.
   bool row_filtered_batch = _pushdown_scan != nullptr;
   static pinned_compressed_blob const no_blob{};
-  std::vector<io::slice> pending_reads;  // a direct chunk's recorded buffer reads
+  // Direct: reconstruct every chunk's table first (which only allocates leaf buffers and records
+  // the reads that fill them), then issue the WHOLE batch's reads as one vectored request before
+  // decoding any chunk -- as a parquet batch issues every file's column chunks before it decodes.
+  // Reading chunk by chunk left each chunk's decode waiting on its own read, with nothing
+  // overlapping it.
+  std::vector<simpatico::compressed_table> prebuilt;
+  if (direct) {
+    prebuilt.reserve(n_chunks);
+    std::vector<io::slice> batch_reads;
+    for (std::size_t i = 0; i < n_chunks; ++i) {
+      std::string read_error;
+      prebuilt.push_back(simpatico::read_compressed_table_subset_from_memory(
+        plans[i].header,
+        cache_payload_fetch{&plans[i].file_map, &batch_reads},
+        _decode_selection,
+        stream,
+        mr,
+        &read_error));
+      if (!read_error.empty()) {
+        throw std::runtime_error("[simpatico_gpu_ingestible] '" + split.path + "' chunk " +
+                                 std::to_string(split.chunk_ids[i]) +
+                                 " could not be reconstructed: " + read_error);
+      }
+    }
+    if (!batch_reads.empty()) {
+      std::size_t wanted = 0;
+      for (auto const& r : batch_reads) {
+        wanted += r.size();
+      }
+      auto const got = split.datasource->device_read_ranges_async(batch_reads, stream).get();
+      if (got != wanted) {
+        throw std::runtime_error("[simpatico_gpu_ingestible] '" + split.path + "': read " +
+                                 std::to_string(got) + " of " + std::to_string(wanted) +
+                                 " planned payload bytes");
+      }
+    }
+  }
   for (std::size_t i = 0; i < n_chunks; ++i) {
     auto const& blob         = direct ? no_blob : *ingested[i].blob;
     bool const rows_narrowed = direct ? plans[i].rows_narrowed : ingested[i].rows_narrowed;
     auto const payload_bytes = direct ? plans[i].payload_bytes : blob.payload_bytes;
-    simpatico::payload_fetch_fn whole_fetch;
-    if (direct) {
-      whole_fetch = cache_payload_fetch{&plans[i].file_map, &pending_reads};
-    } else {
-      whole_fetch = [&blob](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
+    simpatico::payload_fetch_fn whole_fetch =
+      [&blob](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
         copy_pinned_blocks_to_device(*blob.payload, off, dst, sz, s);
       };
-    }
 
     // Zone maps ruled some of this chunk's 1024-row decode chunks out. Synthesize a header
     // describing only the survivors and gather only their bytes: the reader and the decode see an
@@ -887,35 +958,22 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
 
     std::string read_error;
     // Reconstruct only the columns this scan reads: a projection of a wide file then never pulls
-    // the other columns' compressed bytes across PCIe at all.
-    auto const compressed = simpatico::read_compressed_table_subset_from_memory(
-      use_subset ? std::span<const std::uint8_t>{subset_header}
-      : direct   ? std::span<const std::uint8_t>{plans[i].header}
-                 : std::span<const std::uint8_t>{blob.header},
-      use_subset ? gathered_fetch : whole_fetch,
-      _decode_selection,
-      stream,
-      mr,
-      &read_error);
+    // the other columns' compressed bytes across PCIe at all. A direct batch did this above.
+    auto const compressed = [&] {
+      if (direct) { return std::move(prebuilt[i]); }
+      return simpatico::read_compressed_table_subset_from_memory(
+        use_subset ? std::span<const std::uint8_t>{subset_header}
+                   : std::span<const std::uint8_t>{blob.header},
+        use_subset ? gathered_fetch : whole_fetch,
+        _decode_selection,
+        stream,
+        mr,
+        &read_error);
+    }();
     if (!read_error.empty()) {
       throw std::runtime_error("[simpatico_gpu_ingestible] '" + split.path + "' chunk " +
                                std::to_string(split.chunk_ids[i]) +
                                " could not be reconstructed: " + read_error);
-    }
-    if (direct && !pending_reads.empty()) {
-      // Every buffer of this chunk in one request, before anything reads them.
-      std::size_t wanted = 0;
-      for (auto const& r : pending_reads) {
-        wanted += r.size();
-      }
-      auto const got = split.datasource->device_read_ranges_async(pending_reads, stream).get();
-      pending_reads.clear();
-      if (got != wanted) {
-        throw std::runtime_error("[simpatico_gpu_ingestible] '" + split.path + "' chunk " +
-                                 std::to_string(split.chunk_ids[i]) + ": read " +
-                                 std::to_string(got) + " of " + std::to_string(wanted) +
-                                 " planned payload bytes");
-      }
     }
 
     // `compressed` already holds only the projected columns, in the requested order.

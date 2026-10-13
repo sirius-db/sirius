@@ -568,6 +568,7 @@ void prefetch_sizing_reads(std::vector<std::vector<std::uint8_t>> const& headers
   constexpr int max_rounds = 8;
   cache.collect            = true;
   for (int round = 0; round < max_rounds; ++round) {
+    auto const t_round = std::chrono::steady_clock::now();
     cache.missing.clear();
     std::set<std::size_t> seen;
     for (std::size_t at = 0; at < chunk_ids.size(); ++at) {
@@ -588,7 +589,17 @@ void prefetch_sizing_reads(std::vector<std::vector<std::uint8_t>> const& headers
                               blob,
                               &cache);
     }
-    if (cache.missing.empty()) { break; }
+    auto const t_collected = std::chrono::steady_clock::now();
+    if (cache.missing.empty()) {
+      SIRIUS_LOG_DEBUG("[hpln sizing] round {}: collect {:.1f} ms, nothing missing",
+                       round,
+                       std::chrono::duration<double, std::milli>(t_collected - t_round).count());
+      break;
+    }
+    std::uint64_t missing_bytes = 0;
+    for (auto const& [off, size] : cache.missing) {
+      missing_bytes += size;
+    }
     std::vector<hpln_extent> extents;
     extents.reserve(cache.missing.size());
     for (auto const& [off, size] : cache.missing) {
@@ -600,7 +611,16 @@ void prefetch_sizing_reads(std::vector<std::vector<std::uint8_t>> const& headers
       e.dst.push_back({buf.data(), size});
       extents.push_back(std::move(e));
     }
+    auto const n_missing = extents.size();
     src.read_extents(std::move(extents), policy, "sizing");
+    SIRIUS_LOG_DEBUG(
+      "[hpln sizing] round {}: collect {:.1f} ms, read {} ranges / {} B in {:.1f} ms",
+      round,
+      std::chrono::duration<double, std::milli>(t_collected - t_round).count(),
+      n_missing,
+      missing_bytes,
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_collected)
+        .count());
   }
   cache.collect = false;
   cache.missing.clear();
@@ -838,6 +858,8 @@ struct hpln_read_planner::impl {
   hpln_io_policy policy;
   std::shared_ptr<hpln_ingest_layout const> layout;
   std::shared_ptr<hpln_sizing_cache> sizing = std::make_shared<hpln_sizing_cache>();
+  /// The file's shared sizing buffers, when a bind parked metadata to hold them.
+  std::shared_ptr<hpln_sizing_store> store;
 };
 
 hpln_read_planner::hpln_read_planner(std::string path,
@@ -854,6 +876,7 @@ hpln_read_planner::hpln_read_planner(std::string path,
   if (auto const parked = _impl->src->metadata()) {
     if (auto const* hm = dynamic_cast<hpln_metadata const*>(parked.get())) {
       _impl->layout = std::static_pointer_cast<hpln_ingest_layout const>(hm->ingest_layout());
+      _impl->store  = hm->sizing_store();
     }
   }
   if (!_impl->layout) {
@@ -880,14 +903,85 @@ void hpln_read_planner::prefetch_sizing(std::span<const std::size_t> chunk_ids,
                                         std::span<const std::vector<std::uint32_t>> decode_chunks)
 {
   if (!std::ranges::any_of(decode_chunks, [](auto const& d) { return !d.empty(); })) { return; }
-  prefetch_sizing_reads(_impl->layout->headers,
-                        _impl->layout->layout,
-                        chunk_ids,
-                        _impl->columns,
-                        decode_chunks,
-                        *_impl->src,
-                        _impl->policy,
-                        *_impl->sizing);
+  auto const t0       = std::chrono::steady_clock::now();
+  auto const& layout  = _impl->layout->layout;
+  auto const& headers = _impl->layout->headers;
+
+  // Every sizing range the narrowed chunks need, listed in ONE parse per chunk header -- not
+  // discovered by building trial subset headers round after round (a column's chunk_bits used to
+  // wait a whole round behind its chunk_count). Keyed exactly as the narrowing read looks them up:
+  // the file range each payload range composes to through the column subset.
+  std::set<std::pair<std::uint64_t, std::uint64_t>> wanted;
+  std::set<std::size_t> seen;
+  std::vector<simpatico::gather_range> listed;
+  for (std::size_t at = 0; at < chunk_ids.size() && at < decode_chunks.size(); ++at) {
+    auto const id = chunk_ids[at];
+    if (id >= layout.chunks.size() || decode_chunks[at].empty() || !seen.insert(id).second) {
+      continue;
+    }
+    auto const& chunk = layout.chunks[id];
+    std::vector<std::uint8_t> header_after_columns;
+    std::vector<simpatico::gather_range> gather_columns;
+    std::span<const std::uint8_t> working = headers[id];
+    if (!_impl->columns.empty()) {
+      if (!simpatico::build_column_subset_header(
+             headers[id], _impl->columns, header_after_columns, gather_columns, nullptr)
+             .empty()) {
+        continue;
+      }
+      working = header_after_columns;
+    }
+    if (!simpatico::list_chunk_sizing_ranges(working, listed).empty()) { continue; }
+    for (auto const& r : listed) {
+      std::vector<simpatico::gather_range> want{{r.src_offset, r.size, 0}};
+      auto const pieces =
+        gather_columns.empty() ? want : simpatico::compose_gathers(gather_columns, want);
+      for (auto const& piece : pieces) {
+        wanted.emplace(chunk.payload_offset + piece.src_offset, piece.size);
+      }
+    }
+  }
+  auto const t_listed = std::chrono::steady_clock::now();
+
+  // What earlier scans of this file already fetched.
+  auto const base = _impl->store ? _impl->store->snapshot() : nullptr;
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> missing;
+  for (auto const& key : wanted) {
+    if (!base || !base->bytes.contains(key)) { missing.push_back(key); }
+  }
+  if (missing.empty() && base) {
+    // Read-only from here on, as every reader of a sizing cache already treats it.
+    _impl->sizing = std::const_pointer_cast<hpln_sizing_cache>(base);
+  } else {
+    auto next = std::make_shared<hpln_sizing_cache>();
+    if (base) { next->bytes = base->bytes; }
+    std::vector<hpln_extent> extents;
+    extents.reserve(missing.size());
+    std::uint64_t missing_bytes = 0;
+    for (auto const& key : missing) {
+      auto& buf = next->bytes[key];  // std::map nodes do not move as the map grows
+      buf.resize(key.second);
+      missing_bytes += key.second;
+      hpln_extent e;
+      e.offset = key.first;
+      e.dst.push_back({buf.data(), key.second});
+      extents.push_back(std::move(e));
+    }
+    if (!extents.empty()) { _impl->src->read_extents(std::move(extents), _impl->policy, "sizing"); }
+    _impl->sizing =
+      _impl->store
+        ? std::const_pointer_cast<hpln_sizing_cache>(_impl->store->publish(std::move(next)))
+        : std::move(next);
+    SIRIUS_LOG_DEBUG(
+      "[hpln sizing] '{}': fetched {} ranges / {} B", _impl->path, missing.size(), missing_bytes);
+  }
+  SIRIUS_LOG_DEBUG(
+    "[hpln sizing] '{}': {} ranges wanted, {} cached; list {:.1f} ms, total {:.1f} ms",
+    _impl->path,
+    wanted.size(),
+    wanted.size() - missing.size(),
+    std::chrono::duration<double, std::milli>(t_listed - t0).count(),
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
 std::vector<hpln_file_range> hpln_read_planner::ranges(

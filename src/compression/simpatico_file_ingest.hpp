@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -81,6 +82,42 @@ class hpln_sizing_cache {
 };
 
 /// A byte range of a .hpln file.
+/// One file's sizing buffers fetched so far, shared by every scan of it through the io_context's
+/// metadata store (@ref hpln_metadata::sizing_store). They depend only on the file, the chunk and
+/// the column -- never on a query's filter -- so a second scan, or the next iteration of the same
+/// query, finds them here instead of fetching them again.
+///
+/// Published as immutable snapshots: a scan whose ranges are all present uses the current
+/// snapshot as it is (no copy, no lock held while reading it); a scan that needs more fetches only
+/// what is missing and publishes an extended copy. Grows for the life of the io_context, by about
+/// 5 bytes per 1024 rows per bit-packed leaf that any scan narrowed.
+class hpln_sizing_store {
+ public:
+  [[nodiscard]] std::shared_ptr<hpln_sizing_cache const> snapshot() const
+  {
+    std::lock_guard lock(_mutex);
+    return _snapshot;
+  }
+
+  /// Make @p next current, first folding in anything a concurrent scan published since @p next
+  /// was copied from the snapshot it extends. Returns what is now current.
+  std::shared_ptr<hpln_sizing_cache const> publish(std::shared_ptr<hpln_sizing_cache> next)
+  {
+    std::lock_guard lock(_mutex);
+    if (_snapshot) {
+      for (auto const& [key, bytes] : _snapshot->bytes) {
+        next->bytes.try_emplace(key, bytes);
+      }
+    }
+    _snapshot = std::move(next);
+    return _snapshot;
+  }
+
+ private:
+  mutable std::mutex _mutex;
+  std::shared_ptr<hpln_sizing_cache const> _snapshot;
+};
+
 struct hpln_file_range {
   std::uint64_t offset = 0;
   std::uint64_t size   = 0;
@@ -201,9 +238,16 @@ class hpln_metadata final : public sirius::io::io_object_metadata {
     return _ingest_layout;
   }
 
+  /// The file's sizing buffers, shared across scans and queries; see @ref hpln_sizing_store.
+  [[nodiscard]] std::shared_ptr<hpln_sizing_store> const& sizing_store() const noexcept
+  {
+    return _sizing_store;
+  }
+
  private:
   std::shared_ptr<hpln_bind_schema const> _schema;
   std::shared_ptr<void const> _ingest_layout;
+  std::shared_ptr<hpln_sizing_store> _sizing_store = std::make_shared<hpln_sizing_store>();
 };
 
 /// Open @p path far enough to answer "what columns does this file have".
