@@ -20,6 +20,7 @@
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -42,7 +43,6 @@ class downgrade_executor;
 
 namespace sirius::telemetry {
 class telemetry_context;
-struct TaskQueueHandleWrapper;
 }  // namespace sirius::telemetry
 
 namespace sirius {
@@ -71,7 +71,8 @@ class task_scheduler {
    * @param sys_topology Optional system topology info for CPU affinity
    * @param downgrade_executors Optional vector of downgrade executors
    */
-  explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
+  explicit task_scheduler(sirius::exec::query_lifecycle_registry& lifecycle,
+                          const exec::thread_pool_config& gpu_executor_config,
                           sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                           std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
@@ -171,50 +172,29 @@ class task_scheduler {
   void start_query(const planner::query& query);
 
   /**
-   * @brief Drop every queued task belonging to @p query_id.
+   * @brief Fail one query by reporting @p error to its own completion handler.
    *
-   * Clears the scheduler's queue and each GPU executor's queue of that query's pending work,
-   * leaving every other query's tasks in place. In-flight tasks are unaffected.
+   * Touches no shared subsystem: other in-flight queries keep running. Deliberately does NOT
+   * stop or drain any executor itself: callers can run on a GPU executor's or the task_creator's
+   * own worker thread (e.g. notify_downstream_pipelines() from ~gpu_pipeline_task), and
+   * synchronously stopping a pool from its own worker thread self-deadlocks in
+   * bounded_thread_pool::wait_all(). Fulfilling the future here is what makes the query thread's
+   * future.get() throw; sirius_engine::execute's catch block then asks SiriusContext to retire work
+   * to perform the actual cancellation from a thread that is never a pool worker.
    *
-   * Called from the per-query cleanup so a finished or failed query leaves nothing queued that
-   * points into the plan about to be destroyed.
-   */
-  void drain_query_tasks(sirius::query_id_t query_id);
-
-  /**
-   * @brief Report a fatal query error via the completion future.
-   *
-   * Deliberately does NOT stop or drain any executor itself: callers can run on a GPU executor's
-   * or the task_creator's own worker thread (e.g. notify_downstream_pipelines() from
-   * ~gpu_pipeline_task), and synchronously stopping a pool from its own worker thread self-
-   * deadlocks in bounded_thread_pool::wait_all(). Fulfilling the future here is what makes the
-   * query thread's future.get() throw; its catch block then calls drain_after_error() to perform
-   * the actual cancellation from a thread that is never a pool worker.
-   *
+   * @param handler The failing query's completion handler.
    * @param error The error to report.
    */
   void terminate_query(const std::shared_ptr<completion_handler>& handler,
                        std::exception_ptr error);
 
-  /**
-   * @brief Drain all in-flight tasks after a query error.
-   *
-   * Drains the top-level task queue and waits for each GPU executor to finish
-   * all in-flight thread-pool tasks.  After this call it is safe for QueryEnd
-   * to destroy data repositories without causing a use-after-free in executing
-   * tasks.  Each GPU executor's manager thread is restarted so the executor is
-   * ready for the next query.
-   */
-  void drain_after_error(sirius::query_id_t query_id);
+  /// Discard this query's scheduler/pool queues after publication settles. Does not wait.
+  /// The owner stops scan producers and waits for lifecycle leases before releasing resources.
+  void discard_query_tasks(sirius::query_id_t query_id);
 
-  /**
-   * @brief This function interrupts executors and waits for all in-flight tasks to complete.
-   * If any tasks are still in flight, an error is logged and an exception is thrown.
-   * This is used to ensure that all tasks have completed before the query returns and tears down
-   * the plan.
-   * @throws std::runtime_error if any tasks are still in flight.
-   */
-  void wait_for_completion(sirius::query_id_t query_id);
+  /// Validate execution queues after publication settles, before the owner's work barrier.
+  /// Throws on queued execution tasks rather than silently dropping unfinished work.
+  void validate_query_complete(sirius::query_id_t query_id);
 
  private:
   void management_eventloop();
@@ -242,6 +222,8 @@ class task_scheduler {
   std::shared_ptr<event::query_event_publisher> _query_event_publisher{
     std::make_shared<event::query_event_publisher>()};
   quent::Handle<quent::TaskQueue> _task_queue_telemetry;
+  /// Non-owning; the runtime registry outlives the scheduler.
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
 };
 

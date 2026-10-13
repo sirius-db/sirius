@@ -1,77 +1,109 @@
 # Query lifetime and retirement
 
-`query_lifecycle_registry` provides per-query publication gates and explicit work
-accounting. This layer introduces the contract and its tests. Runtime publishers,
-spill borrowers and retirement coordinators will adopt it together in the next
-layer; SQL admission and existing runtime cleanup are unchanged here.
+The shared lifecycle registry has one control block per query. Its gate decides whether new
+work can be published or resources borrowed. Unknown IDs refuse both operations.
 
 ## Ownership and handles
 
 | Object | Responsibility |
 |---|---|
-| Registry | Owns the map of registered queries and their control blocks |
-| Query control block | Holds the gate, counters and an optional retained resource owner |
+| Engine | Builds the physical plan, starts execution and obtains the logical result |
+| Lifecycle control | Retains the physical plan independently of engine destruction until retirement |
 | `submission_guard` | Counts a publisher through queue insertion or abandonment |
-| `work_lease` | Counts resource use through queue removal, dispatch, callbacks and destruction |
-| Runtime owner | Stops producers, drains work and waits for users before releasing resources |
+| `work_lease` | Counts asynchronous resource use through queue removal, dispatch, callbacks and destruction |
+| Runtime query registries | Own creator state, repositories and scan providers until their users retire |
 
-Handles are movable and non-copyable. Moving a handle transfers its claim without
-a decrement/reincrement gap. The registry map mutex protects membership; a separate
-per-query mutex protects the gate and accounting. Lookup releases the map mutex
-before taking the query mutex. Neither mutex is held during queue insertion or
-resource destruction.
+Handles are movable and non-copyable. Queue removal transfers a handle without dropping its
+count. The registry map mutex protects membership; a separate per-query mutex protects the
+gate and accounting. Neither mutex is held during work, queue insertion or resource destruction.
 
-Unknown IDs refuse both publication and resource borrowing. Registration must
-precede any producer; duplicate registration cannot reopen a quiescing query.
-Query IDs must not be reused while delayed work could still refer to them.
+`accepts_work()` is an advisory snapshot. It cannot authorize a later queue push. Publishers use
+`try_begin_submission()` and retain the guard through insertion. `take_work_lease()` transfers
+the guard's work claim into a request or task; the guard then accounts only for publication.
+Runtime components require a registry reference at construction, including standalone test
+fixtures. The registry must outlive their workers and queues; there is no ungated mode.
 
-## Publication
+`pipeline::begin_submission()` shares admission/unknown-ID diagnostics across creators,
+schedulers, executors and spill returns. Its task overload attaches the first work lease while
+preserving an existing one. The caller owns rejected tasks and declares its guard before the
+owned task so disposal (including callbacks) precedes publication release. Completion-handler
+lookup occurs only for an unknown ID, avoiding extra creator-state locking on accepted work.
 
-`accepts_work()` is an advisory snapshot. It cannot authorize a later queue push.
-`try_begin_submission()` checks the gate and counts the publisher atomically.
-The returned guard records whether admission succeeded, the query was quiescing,
-or its ID was unknown; callers do not need a second lookup to diagnose refusal.
+Creator requests keep their lease through hint traversal and the creation worker. Execution
+tasks keep theirs through scheduler routing, executor dispatch, retries and destruction. The
+GPU and creator workers transfer their existing lease into an ordered callable owner before
+dispatch. That owner releases the lease after the callable and all captures are destroyed, including
+when a GPU worker destroys its task before scheduling consumers. Logical completion only signals
+the query owner; workers never join creator work or wait for their own query to retire. A rejected handoff leaves the caller's existing claim intact through
+disposal. Queue drains detach under their mutex and destroy outside it.
 
-An accepted guard initially owns one work claim. `take_work_lease()` transfers it
-to a request or task, leaving the guard responsible for publication. For example,
-with a request type that owns the lease and a queue that retains caller ownership
-on refusal:
+Submission failure must be reported before disposing of a GPU task: its destructor updates pipeline
+completion and can otherwise publish success before an outer catch reports the error. Scheduler and
+executor handoffs catch exceptions while still owning the task. Bounded-pool dispatch allocates its
+queue entry before moving the slot or callable; the leased submission adapter reports failures before
+releasing either possible callable owner. Error diagnostics use `log_noexcept()` at the GPU and pool
+exception boundaries so logging cannot replace the original failure or terminate a worker.
 
-```cpp
-auto publication = registry.try_begin_submission(query_id);
-if (publication) {
-  auto request = std::make_unique<Request>(publication.take_work_lease());
-  queue.try_push(request);
-}
-```
+Tier-1 spilling acquires a borrow for the actual victim query before inspecting its repositories.
+Each dispatched candidate receives its own lease. A manager snapshot alone does not pin every
+query, and shared ownership of a repository manager alone does not protect repositories being
+cleared. Tier-2 extraction carries the task's existing lease through conversion and return.
 
-The guard is declared before the owned request: rejection or an exception destroys
-the request and its callbacks before releasing the publisher. Keep the guard
-through insertion or abandonment, rather than through task execution or a blocking
-capacity wait. Existing leases do not authorize publication after quiescence;
-every retry or queue handoff needs its own submission guard.
+Scan producers use their scoped dispatcher join: `quiesce(query_id)` stops producers while
+retaining providers and buffers for downstream consumers. This is separate from task accounting.
 
-Independent resource users acquire a lease with `try_acquire_work()`. Integration
-must carry leases through every interval of use, including callbacks and device
-completion. A worker slot covers worker capacity; it does not cover a task held
-between queue pop and worker attribution.
+## Retirement
 
-## Retirement contract
+Logical completion may precede the final callback. `SiriusContext::retire_query_work()` is the
+shared coordinator used by engine completion/error handling, engine destruction and execution
+window cleanup. It keeps ownership intact while settling borrowers. The private
+`release_query_state()` phase runs only after successful retirement, during window cleanup.
+Retirement must finish before resources are released:
 
-The eventual runtime coordinator must perform these phases in order:
+1. Close Q's publication/borrow gate and wait for admitted publishers.
+2. Stop Q's scan/prefetch producers, retaining their buffers.
+3. On cancellation, drain Q's creator and scheduler queues and queued executor worker-pool work.
+   Leave accepted GPU staging tasks for their managers to consume and discard before memory
+   preparation: removing them directly would consume readiness without allowing the manager to
+   announce it again. On success, validate empty execution queues without dropping execution
+   work. Redundant creator hints may be discarded. Leave other queries' workers running.
+4. Wait for Q's work leases, including in-hand tasks, completion callbacks and spill victims.
+5. Release Q's repositories and scan state, then its retained plan and remaining telemetry.
+   Scan state borrows plan operators; its drain runs once while they are alive, and later
+   retirement calls preserve that completed barrier without revisiting the operators.
+6. Close the registry entry; the surrounding execution scope releases admission.
 
-1. Close the publication/borrow gate with `quiesce_and_wait_for_submissions()` and
-   wait for already admitted publishers to finish inserting or abandoning work.
-2. Stop producers that use separate lifetime tracking, retaining their buffers.
-3. Drain the query's queued work on cancellation, or validate/settle successful
-   execution without silently discarding its work.
-4. Call `wait_for_work()` after queued work can no longer hold unretired leases.
-5. Release retained resources and other query-owned state, then close the entry.
+Only the runtime owner performs the publication and work barriers. Scheduler/executor methods
+validate or discard queues; they do not join workers. Creator `reset()` only releases state and
+rejects registered queries whose gate is open or whose accounting is still live. Shutdown
+`reset_all()` explicitly disposes of leftover creator requests after producers and workers stop.
+Successful completion validation runs before the work barrier so queued execution tasks cannot
+be silently discarded or cause a wait on work that cannot progress. A validation failure follows
+the owner's cancellation path. Repeated retirement calls from the engine/destructor/window
+backstops remain safe; they use the same ordering without a separate retired flag.
 
-`quiesce()` closes the gate without waiting. `wait_for_submissions()` exposes the
-separate publication barrier for coordinators that already closed it. Waiting on
-an open gate is rejected. No caller may wait for its own submission guard or lease,
-or hold a lock needed by a user it is waiting for.
+An existing lease does not authorize new task publication after closure. Handoffs to the creator,
+scheduler and GPU staging queues, including retry and spill return, need a submission guard.
+Internal dispatch from a manager into its bounded worker pool transfers an already-held claim;
+it may finish after the pool cancellation sweep. The final lease barrier covers that work.
+No worker waits for its own lease.
+
+Bounded pool slots count execution capacity only. Query IDs on queued callables identify work
+for `discard_queued(query_id)`; they do not count running work. There is no pool `slot.attach()`,
+per-query counter, or per-query wait. Idle manager reservations cannot delay query retirement,
+and a queue sweep makes no claim that manager-held/running work has finished. Global pool joins
+remain necessary for shutdown and operations whose workers borrow local stack state.
+Scan dispatcher joins retain their separate producer-cancellation role.
+
+The engine retires asynchronous users before member destruction. The registry retains the plan
+as a backstop if cleanup cannot prove quiescence. Such a cleanup failure marks the runtime
+unavailable and preserves the registered state for shutdown, rather than freeing borrowed
+resources. Ordinary query errors and initialization failures do not by themselves poison the
+runtime. Initialization rolls back only the new query's registrations.
+
+`close()` and `release_resources()` reject live accounting. `clear()` is reserved for shutdown
+after workers stop and queues drain. Resource destructors run outside registry locks. Query IDs
+must not be reused for delayed work.
 
 `retain_resources()` requires registration and a non-null owner, and can keep a physical plan
 alive independently of its engine. Queries without resources omit this call. The stored
@@ -93,10 +125,12 @@ Shared control blocks keep accounting storage alive if handles outlive the
 registry; this does not replace the runtime owner's obligation to retire users.
 Only explicitly counted users are covered by the work barrier.
 
-## Validation
+## Validation and scope
 
-The primitive tests cover unknown IDs, duplicate registration, move accounting,
-paused publication, work held after queue pop, both publisher/work release orders,
-refused pushes, exception unwinding and reentrant retained-resource destruction.
-Runtime integration, device health and admission qualification arrive in later
-layers of the concurrency stack.
+Registry tests cover publication races, in-hand leases, move accounting, exceptions, duplicate
+registration and retained resources. Scheduler tests hold a task after removing it from the
+production queue and prove retirement waits for its disposal. Queue tests exercise reentrant
+destructors. SQL lifecycle tests cover cleanup and subsequent queries.
+
+SQL execution remains serialized at this layer. Bounded concurrent admission, session settings,
+memory progress and runtime diagnostics are introduced by later layers of the stack.
