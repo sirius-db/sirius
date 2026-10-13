@@ -27,7 +27,9 @@
 #include <array>
 #include <future>
 #include <limits>
+#include <string>
 #include <thread>
+#include <vector>
 
 using namespace sirius::scan_manager;
 using sirius::scan_manager::test::test_reservation_provider;
@@ -669,9 +671,9 @@ TEST_CASE("Charged DV descriptor names outlive the plan only while a result actu
   auto e = iceberg_dv_preparation::envelope(*discovery, paths);
   REQUIRE(ledger->admit(std::array{e}, host).deferred);
   auto prepared = std::make_shared<iceberg_dv_preparation>(7, "table", paths, discovery, *ledger);
-  REQUIRE(prepared->files.size() == 2);
-  CHECK(prepared->files[0].dv != nullptr);
-  CHECK(prepared->files[1].dv == nullptr);
+  REQUIRE(prepared->files().size() == 2);
+  CHECK(prepared->files()[0].dv != nullptr);
+  CHECK(prepared->files()[1].dv == nullptr);
   auto arena_charge = ledger->charged_bytes({7, 0});
   CHECK(arena_charge == e.retained_descriptors);
   CHECK(ledger->tracked_units() == 1);
@@ -683,20 +685,102 @@ TEST_CASE("Charged DV descriptor names outlive the plan only while a result actu
   values[0]       = 1;
   values[1]       = 3;
   auto result     = std::make_shared<iceberg_delete_set const>(
-    prepared->files[0].path, std::move(allocation), 2, 1, prepared->path_owner());
-  prepared->files[0].result = result;
+    prepared->files()[0].path, std::move(allocation), 2, 1, prepared->path_owner());
+  iceberg_dv_attempt attempt{prepared, ledger};
+  attempt.record(0, result);
   permit.release();
   ledger->retire_unit({7, 1});
   CHECK(ledger->tracked_units() == 2);
-  prepared->finish();
-  prepared.reset();
-  ledger->close();
-  CHECK(result->data_file == "a.parquet");
-  CHECK(result->positions[1] == 3);
-  CHECK(provider.seen->allocated_bytes == arena_charge + 16);
-  result.reset();
-  CHECK(ledger->tracked_units() == 0);
+  SECTION("a retained result survives descriptor retirement")
+  {
+    attempt.finish();
+    prepared.reset();
+    ledger->close();
+    CHECK(result->data_file == "a.parquet");
+    CHECK(result->positions[1] == 3);
+    CHECK(provider.seen->allocated_bytes == arena_charge + 16);
+    result.reset();
+    CHECK(ledger->tracked_units() == 0);
+  }
+  SECTION("an attempt's weak slot does not retain the result")
+  {
+    CHECK(attempt.result(0) == result);
+    result.reset();
+    CHECK(attempt.result(0) == nullptr);
+    CHECK(provider.seen->allocated_bytes == arena_charge);
+    CHECK(ledger->tracked_units() == 1);
+    attempt.finish();
+    prepared.reset();
+    ledger->close();
+    CHECK(ledger->tracked_units() == 0);
+  }
   ledger.reset();
   CHECK(provider.seen->allocated_bytes == 0);
+  CHECK(provider.outstanding() == 0);
+}
+
+TEST_CASE("DV descriptor accounting preserves the base layout and rounded admission",
+          "[scan_preparation][ledger]")
+{
+  using namespace sirius::op::scan;
+  static_assert(sizeof(iceberg_dv_preparation::file) == 40 &&
+                sizeof(iceberg_dv_preparation::file*) == 8);
+  test_reservation_provider provider;
+  provider.grant_bytes = 64 * 1024;
+  std::vector<std::string> paths{"a.parquet", "b.parquet"};
+  uint64_t expected_raw = 116, expected_charge = 116, expected_retained = 132;
+  SECTION("byte-granular storage for two short paths") {}
+  SECTION("sixteen-byte granularity for ten long paths")
+  {
+    paths.clear();
+    for (char value : std::string("abcdefghij"))
+      paths.emplace_back(200, value);
+    provider.quantum  = 16;
+    expected_raw      = 2490;
+    expected_charge   = 2496;
+    expected_retained = 2512;
+  }
+  auto discovery = std::make_shared<iceberg_delete_discovery>();
+  auto empty     = iceberg_dv_preparation::envelope(*discovery, paths);
+  CHECK(empty.qualified);
+  CHECK(empty.units.empty());
+  CHECK(empty.retained_descriptors == 0);
+  IcebergDeleteFileEntry dv;
+  dv.file_format           = "puffin";
+  dv.file_path             = "a.puffin";
+  dv.content_offset        = 4;
+  dv.content_size_in_bytes = 44;
+  dv.record_count          = 2;
+  dv.file_size_in_bytes    = 400;
+  dv.referenced_data_file  = paths.front();
+  discovery->deletion_vector_entries.push_back(dv);
+  auto envelope = iceberg_dv_preparation::envelope(*discovery, paths);
+  REQUIRE(envelope.qualified);
+  REQUIRE(envelope.units.size() == 1);
+  CHECK(envelope.retained_descriptors == expected_raw);
+  CHECK(envelope.resolver_index == 0);
+  CHECK(envelope.units.front().positions == 16);
+  {
+    preparation_ledger ledger(provider);
+    auto decision = ledger.admit(std::array{envelope}, host);
+    REQUIRE(decision.deferred);
+    CHECK(decision.n_permits == 1);
+    CHECK(decision.reason == admission_reason::admitted);
+    CHECK(decision.route_reason == scan_eligibility::eligible);
+    CHECK(decision.sigma_retained == expected_retained);
+    CHECK(decision.allocation_granularity == provider.quantum);
+    CHECK(decision.c_obtained == 65536);
+    CHECK(provider.seen->requests == 1);
+    {
+      iceberg_dv_preparation prepared(7, "table", paths, discovery, ledger);
+      CHECK(ledger.charged_bytes({7, 0}) == expected_charge);
+      CHECK(provider.seen->allocated_bytes == expected_charge);
+      CHECK(ledger.tracked_units() == 1);
+      CHECK(ledger.permits_in_flight() == 0);
+    }
+    CHECK(ledger.tracked_units() == 0);
+    CHECK(provider.seen->allocated_bytes == 0);
+    CHECK(provider.seen->allocations == 1);
+  }
   CHECK(provider.outstanding() == 0);
 }

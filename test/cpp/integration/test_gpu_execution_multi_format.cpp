@@ -3687,9 +3687,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       ++found;
       CHECK(bool(info.deferred) == (limit == 8));
       if (info.deferred) {
-        if (!admission) admission = info.deferred->admission;
-        CHECK(info.deferred->admission == admission);
-        CHECK(info.deferred->files.front().result.expired());
+        if (!admission) admission = info.deferred->admission();
+        CHECK(info.deferred->admission() == admission);
+        CHECK(info.deferred->files().front().result.expired());
       } else {
         REQUIRE(info.delete_data);
         CHECK_FALSE(info.delete_data->positional_deletes.empty());

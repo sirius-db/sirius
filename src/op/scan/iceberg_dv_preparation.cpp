@@ -107,7 +107,7 @@ iceberg_dv_preparation::iceberg_dv_preparation(
   std::vector<std::string> const& paths,
   std::shared_ptr<iceberg_delete_discovery const> discovery,
   scan_manager::preparation_ledger& owner)
-  : contract(id), inventory_(std::move(discovery))
+  : contract_(id), inventory_(std::move(discovery))
 {
   auto bytes = arena_bytes(paths);
   owner.register_unit({id, 0}, bytes);
@@ -130,7 +130,7 @@ iceberg_dv_preparation::iceberg_dv_preparation(
       ++constructed;
       storage_->count = constructed;
     }
-    files = {records, paths.size()};
+    files_ = {records, paths.size()};
     std::span<file*> sorted(index, paths.size());
     std::sort(sorted.begin(), sorted.end(), [](auto* a, auto* b) {
       return basename(a->path) < basename(b->path);
@@ -168,16 +168,44 @@ iceberg_dv_preparation::iceberg_dv_preparation(
     permit.release();
     owner.retire_unit({id, 0});
   } catch (...) {
-    files = {};
+    files_ = {};
     throw;
   }
 }
 iceberg_dv_preparation::~iceberg_dv_preparation() = default;
 std::shared_ptr<void const> iceberg_dv_preparation::path_owner() const { return storage_; }
-void iceberg_dv_preparation::finish() noexcept
+void iceberg_dv_preparation::bind_admission(
+  std::shared_ptr<scan_manager::preparation_admission> admission)
 {
-  files = {};
+  if (admission_) throw std::logic_error("DV preparation already bound to a statement admission");
+  admission_ = std::move(admission);
+}
+void iceberg_dv_preparation::release() noexcept
+{
+  files_ = {};
   storage_.reset();
-  ledger.reset();
+}
+
+iceberg_dv_attempt::iceberg_dv_attempt(std::shared_ptr<iceberg_dv_preparation> plan,
+                                       std::shared_ptr<scan_manager::preparation_ledger> ledger)
+  : plan_(std::move(plan)), ledger_(std::move(ledger))
+{
+  if (!plan_ || !ledger_) throw std::logic_error("DV attempt requires a plan and a ledger");
+}
+void iceberg_dv_attempt::record(size_t index,
+                                std::shared_ptr<iceberg_delete_set const> const& set) noexcept
+{
+  auto slots = plan_->slots();
+  if (index < slots.size()) slots[index].result = set;
+}
+std::shared_ptr<iceberg_delete_set const> iceberg_dv_attempt::result(size_t index) const noexcept
+{
+  auto files = plan_->files();
+  return index < files.size() ? files[index].result.lock() : nullptr;
+}
+void iceberg_dv_attempt::finish() noexcept
+{
+  stop();
+  plan_->release();
 }
 }  // namespace sirius::op::scan
