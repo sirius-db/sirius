@@ -133,22 +133,14 @@ jobs:
           pattern: sirius-*-extension-linux_amd64-cuda${{ matrix.cuda.version }}
           merge-multiple: true
           path: build/bundled
-      - name: Compare bundled v2 CPU and GPU execution
+      - name: Smoke-test bundled GPU execution
         env:
           SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
         run: |
           chmod +x build/validation-host/duckdb
           timeout --kill-after=10s 180s python3 test/scripts/v2_extension_smoke.py \
             --duckdb build/validation-host/duckdb \
-            --extension build/bundled/sirius.duckdb_extension \
-            --output build/v2-smoke
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: bundled-v2-smoke-cuda${{ matrix.cuda.version }}
-          path: build/v2-smoke
-          if-no-files-found: ignore
-          retention-days: 14
+            --extension build/bundled/sirius.duckdb_extension
 
   distribution:
     runs-on: ubuntu-slim

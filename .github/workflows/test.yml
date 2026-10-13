@@ -185,23 +185,14 @@ jobs:
           ./build/release/scan-host/scan_host_pic
           ./build/release/scan-host/scan_host_nonpie
 
-      - name: Compare shared v2 CPU and GPU execution
+      - name: Smoke-test shared GPU execution
         if: github.event_name == 'merge_group'
         env:
           SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
         run: |
           timeout --kill-after=10s 180s python3 test/scripts/v2_extension_smoke.py \
             --duckdb sirius-duckdb/build/release/duckdb \
-            --extension sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension \
-            --output build/v2-smoke
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always() && github.event_name == 'merge_group'
-        with:
-          name: shared-v2-smoke-cuda${{ matrix.cuda.version }}
-          path: build/v2-smoke
-          if-no-files-found: ignore
-          retention-days: 14
+            --extension sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
 
       - name: Install matching test extensions
         run: |
