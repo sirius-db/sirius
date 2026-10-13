@@ -106,6 +106,18 @@ op::scan::certification_result supported_iceberg(op::scan::bound_table_scan cons
   return result;
 }
 
+// A .hpln scan has nothing left to certify per file: bind already read and verified the trailer
+// and every chunk header, and read_simpatico has no CPU body to fall back to.
+op::scan::certification_result supported_simpatico(op::scan::bound_table_scan const&,
+                                                   op::sirius_physical_table_scan const&,
+                                                   duckdb::ClientContext&,
+                                                   scan_contract_provenance&)
+{
+  op::scan::certification_result result;
+  result.verdict = op::scan::eligibility_verdict::supported;
+  return result;
+}
+
 op::scan::certification_result supported_native(op::scan::bound_table_scan const&,
                                                 op::sirius_physical_table_scan const& scan,
                                                 duckdb::ClientContext&,
@@ -324,7 +336,8 @@ connector make_read_simpatico_connector()
           .permits_cpu_replay         = false,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_simpatico};
 }
 
 std::array<connector, 7> const entries{make_seq_scan_connector(),
