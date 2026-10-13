@@ -277,9 +277,10 @@ def main():
     for avro_path in sorted((HERE / "metadata").glob("*.avro")):
         with avro_path.open("rb") as fh:
             reader = fastavro.reader(fh)
+            metadata = dict(reader.metadata)
             schema, records = reader.writer_schema, [rewrite_paths(r) for r in reader]
         with avro_path.open("wb") as fh:
-            fastavro.writer(fh, schema, records, codec="null")
+            fastavro.writer(fh, schema, records, codec="null", metadata=metadata)
 
     # --- a second data file, reusing the first file's schema so the field ids survive --------
     data_dir = HERE / "data"
@@ -302,13 +303,14 @@ def main():
     data_manifest = next((HERE / "metadata").glob("*-m0.avro"))
     with data_manifest.open("rb") as fh:
         reader = fastavro.reader(fh)
+        m0_metadata = dict(reader.metadata)
         m0_schema, m0_records = reader.writer_schema, list(reader)
     entry_b = json.loads(json.dumps(m0_records[0]))  # deep copy through plain types
     entry_b["data_file"]["file_path"] = rel(file_b)
     entry_b["data_file"]["file_size_in_bytes"] = file_b.stat().st_size
     m0_records.append(entry_b)
     with data_manifest.open("wb") as fh:
-        fastavro.writer(fh, m0_schema, m0_records, codec="null")
+        fastavro.writer(fh, m0_schema, m0_records, codec="null", metadata=m0_metadata)
     print(f"wrote {data_manifest.name}: {len(m0_records)} data files")
 
     # --- one container, both vectors ---------------------------------------------------------
@@ -327,6 +329,7 @@ def main():
     delete_manifest = next((HERE / "metadata").glob("*-m1.avro"))
     with delete_manifest.open("rb") as fh:
         reader = fastavro.reader(fh)
+        m1_metadata = dict(reader.metadata)
         m1_schema, m1_records = reader.writer_schema, list(reader)
     template = next(
         r
@@ -354,8 +357,30 @@ def main():
         if (r["data_file"].get("file_format") or "").upper() != "PUFFIN"
     ] + [dv_entry(rel(file_a), desc_b), dv_entry(rel(file_b), desc_a)]
     with delete_manifest.open("wb") as fh:
-        fastavro.writer(fh, m1_schema, m1_records, codec="null")
+        fastavro.writer(fh, m1_schema, m1_records, codec="null", metadata=m1_metadata)
     print(f"wrote {delete_manifest.name}: 2 PUFFIN entries, offsets swapped")
+
+    # Keep the manifest-list counts and lengths consistent with the expanded manifests.
+    for list_path in (HERE / "metadata").glob("snap-*.avro"):
+        with list_path.open("rb") as fh:
+            reader = fastavro.reader(fh)
+            list_metadata = dict(reader.metadata)
+            list_schema, list_records = reader.writer_schema, list(reader)
+        for record in list_records:
+            manifest = pathlib.Path(record["manifest_path"])
+            with manifest.open("rb") as fh:
+                entries = list(fastavro.reader(fh))
+            record["manifest_length"] = manifest.stat().st_size
+            for status, label in ((0, "existing"), (1, "added"), (2, "deleted")):
+                matching = [entry for entry in entries if entry["status"] == status]
+                record[f"{label}_files_count"] = len(matching)
+                record[f"{label}_rows_count"] = sum(
+                    entry["data_file"]["record_count"] for entry in matching
+                )
+        with list_path.open("wb") as fh:
+            fastavro.writer(
+                fh, list_schema, list_records, metadata=list_metadata, codec="null"
+            )
 
     print("validating:")
     return 0 if verify() else 1

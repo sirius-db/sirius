@@ -79,15 +79,14 @@ void write_bit_range(std::span<std::uint32_t> words,
   words[last] = value ? (words[last] | tail_mask) : (words[last] & ~tail_mask);
 }
 
-/// Non-loading per-row-group version-state probe (see header docs for why
-/// this is a safe skip signal). Goes through the public GetPartitionStats
-/// surface: DuckDB marks a row group's count APPROXIMATE exactly when it has
-/// version state — in-memory row versions or unloaded persisted deletes
-/// (RowGroup::HasUnloadedDeletes / GetVersionInfoIfLoaded are private).
-bool row_group_has_version_state(duckdb::SegmentNode<duckdb::RowGroup>& node)
+// An exact count can still exclude committed deletes in v2. Compare it with
+// physical coverage before skipping visibility masks.
+bool row_group_has_version_state(duckdb::SegmentNode<duckdb::RowGroup>& node,
+                                 duckdb::TransactionData transaction)
 {
-  return duckdb::RowGroup::GetPartitionStats(node).count_type ==
-         duckdb::CountType::COUNT_APPROXIMATE;
+  auto const stats = duckdb::RowGroup::GetPartitionStats(node, transaction);
+  return stats.count_type != duckdb::CountType::COUNT_EXACT ||
+         stats.count != node.GetNode().count.load();
 }
 
 }  // namespace
@@ -107,10 +106,10 @@ mvcc_visibility_plan capture_mvcc_visibility_plan(
   auto& txn = duckdb::DuckTransaction::Get(context, storage.GetAttached());
   mvcc_visibility_plan plan{duckdb::TransactionData(txn)};
 
-  if (plan.transaction.start_time < metadata.v_base) {
+  if (txn.start_time < metadata.v_base) {
     throw std::runtime_error(
       "[capture_mvcc_visibility_plan] query snapshot (start_time " +
-      std::to_string(plan.transaction.start_time) + ") predates the pin snapshot (v_base " +
+      std::to_string(txn.start_time) + ") predates the pin snapshot (v_base " +
       std::to_string(metadata.v_base) + ") — a re-pin raced this query between plan and prepare");
   }
 
@@ -174,7 +173,7 @@ mvcc_visibility_plan capture_mvcc_visibility_plan(
     // mask job serializes unaligned chunks into a single fill task.
     auto const chunk_offset = expected_start - chunk_start;
 
-    bool const dirty = row_group_has_version_state(*node);
+    bool const dirty = row_group_has_version_state(*node, plan.transaction);
     plan.mvcc_row_groups[chunk_idx].push_back(
       {&rg, node->GetRowStart(), chunk_offset, covered, dirty});
     if (dirty) { plan.chunk_has_version_state[chunk_idx] = true; }
@@ -263,7 +262,9 @@ struct array_column_access : duckdb::ArrayColumnData {
 bool tree_has_transient_segment(duckdb::ColumnSegmentTree& tree)
 {
   for (auto& seg_node : tree.SegmentNodes()) {
-    if (seg_node.GetNode().segment_type == duckdb::ColumnSegmentType::TRANSIENT) { return true; }
+    if (seg_node.GetNode().GetSegmentType() == duckdb::ColumnSegmentType::TRANSIENT) {
+      return true;
+    }
   }
   return false;
 }
@@ -317,7 +318,7 @@ native_read_mvcc_state check_native_read_mvcc_state(
         return native_read_mvcc_state::has_update_chains;
       }
     }
-    if (!row_group_has_version_state(*node)) { continue; }
+    if (!row_group_has_version_state(*node, transaction)) { continue; }
     // Read the physical count first: a concurrent append makes the two
     // counts diverge in either order, so a race can only refuse.
     auto const physical = static_cast<duckdb::idx_t>(rg.count.load());

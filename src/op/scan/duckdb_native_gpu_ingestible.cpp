@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
+
 #include "transparent/replay_admission.hpp"
 
 // sirius
@@ -27,13 +29,13 @@
 #include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
-#include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <sirius_context.hpp>
 
 // duckdb
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 
@@ -283,7 +285,8 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   auto const& source_ids = bind.projection_ids.empty() ? source_ids_fallback : bind.projection_ids;
 
   // Pre-build the coalesced filter expression once.
-  if (bind.table_filters && !bind.table_filters->filters.empty()) {
+  if (bind.table_filters &&
+      (bind.table_filters->HasFilters() || bind.table_filters->HasMultiColumnFilters())) {
     std::vector<std::optional<std::size_t>> emission_order_map(bind.column_ids.size());
     for (std::size_t k = 0; k < source_ids.size(); ++k) {
       emission_order_map[source_ids[k]] = k;
@@ -475,7 +478,8 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
          _info->profiles->add(native_row_group_profile(
            row_group,
            _info->projected_types,
-           _info->storage->GetAttached().GetStorageManager().GetStorageVersion())),
+           static_cast<uint64_t>(
+             _info->storage->GetAttached().GetStorageManager().GetStorageVersion()))),
          check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range)});
       dependencies.push_back({nullptr, split->datasource, _checkpoint_iteration, _info->profiles});
     }

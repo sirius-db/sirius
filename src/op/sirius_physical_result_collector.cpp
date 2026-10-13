@@ -36,8 +36,8 @@
 #include "sirius/exception.hpp"
 
 // duckdb
-#include <duckdb/main/materialized_query_result.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+#include <duckdb/main/query_result.hpp>
 
 // standard library
 #include <algorithm>
@@ -113,7 +113,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
       duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
   }
 
-  return duckdb::make_uniq<duckdb::MaterializedQueryResult>(
+  return duckdb::make_uniq<duckdb::QueryResult>(
     statement_type, properties, names, std::move(result_collection), props);
 }
 

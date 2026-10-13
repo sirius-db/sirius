@@ -78,14 +78,14 @@ std::string scalar_value(duckdb::QueryResult& result)
   return chunk->GetValue(0, 0).ToString();
 }
 
-std::string scalar_or_error(duckdb::unique_ptr<duckdb::MaterializedQueryResult> result)
+std::string scalar_or_error(duckdb::unique_ptr<duckdb::QueryResult> result)
 {
   if (!result) { return "null query result"; }
   if (result->HasError()) { return result->GetError(); }
   if (result->RowCount() != 1) {
     return "query returned " + std::to_string(result->RowCount()) + " rows instead of one";
   }
-  return result->GetValue(0, 0).ToString();
+  return result->Collection().GetValue(0, 0).ToString();
 }
 
 std::unique_ptr<duckdb::Connection> sibling_connection(NativeLeaseFixture& fixture)
@@ -97,7 +97,8 @@ std::unique_ptr<duckdb::Connection> sibling_connection(NativeLeaseFixture& fixtu
 
 void prepare_native_table(NativeLeaseFixture& fixture, bool sync_observer = true)
 {
-  query_ok(*fixture.con, "RESET disabled_optimizers");
+  // COUNT must scan storage so checkpoint and decode hooks are exercised.
+  query_ok(*fixture.con, "SET disabled_optimizers='statistics_propagation'");
   query_ok(*fixture.con, "SET gpu_execution = true");
   query_ok(*fixture.con, "SET enable_duckdb_fallback = true");
   query_ok(*fixture.con, "SET sirius_test_inject_read_view_mismatch = 'off'");
@@ -213,7 +214,8 @@ void check_metadata_walk_lease(bool cache_hit)
   if (cache_hit) { query_ok(con, sql); }
 
   query_ok(con, "BEGIN TRANSACTION READ ONLY");
-  auto& catalog = duckdb::Catalog::GetCatalog(*con.context, fixture.attach_alias);
+  auto& catalog =
+    duckdb::Catalog::GetCatalog(*con.context, duckdb::Identifier(fixture.attach_alias));
   auto& table = catalog.GetEntry<duckdb::TableCatalogEntry>(*con.context, "main", "native_lease_t")
                   .Cast<duckdb::DuckTableEntry>();
   auto& blocks = dynamic_cast<duckdb::SingleFileBlockManager&>(
@@ -327,7 +329,8 @@ TEST_CASE(kUnavailableChildCase, "[.][scan][native][checkpoint][integration]")
     query_ok(*fixture.con, "SET sirius_test_inject_checkpoint_cleanup_failure = true");
     if (std::string_view{variant} == "cleanup_state") {
       query_ok(*fixture.con, "BEGIN TRANSACTION READ ONLY");
-      auto& catalog = duckdb::Catalog::GetCatalog(*fixture.con->context, fixture.attach_alias);
+      auto& catalog = duckdb::Catalog::GetCatalog(*fixture.con->context,
+                                                  duckdb::Identifier(fixture.attach_alias));
       auto& table =
         catalog.GetEntry<duckdb::TableCatalogEntry>(*fixture.con->context, "main", "native_lease_t")
           .Cast<duckdb::DuckTableEntry>();
@@ -366,7 +369,7 @@ TEST_CASE(kUnavailableChildCase, "[.][scan][native][checkpoint][integration]")
   }
   query_ok(*fixture.con, "SET sirius_test_mark_runtime_unavailable_before_window = true");
 
-  std::unique_ptr<duckdb::MaterializedQueryResult> result;
+  std::unique_ptr<duckdb::QueryResult> result;
   if (std::string_view{variant} == "transparent") {
     result = fixture.con->Query("SELECT count(*) FROM native_lease_t");
   } else if (std::string_view{variant} == "explicit") {
@@ -378,7 +381,7 @@ TEST_CASE(kUnavailableChildCase, "[.][scan][native][checkpoint][integration]")
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : ""));
   REQUIRE_FALSE(result->HasError());
-  CHECK(result->GetValue(0, 0).ToString() == "300000");
+  CHECK(result->Collection().GetValue(0, 0).ToString() == "300000");
   auto const after = context->get_transparent_execution_stats();
   CHECK(after.lease_held_at_replay == before.lease_held_at_replay);
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
@@ -504,7 +507,7 @@ TEST_CASE("native walk refusal is an execution failure and releases before repla
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : ""));
   REQUIRE_FALSE(result->HasError());
-  CHECK(result->GetValue(0, 0).ToString() == "300000");
+  CHECK(result->Collection().GetValue(0, 0).ToString() == "300000");
   auto const after = context->get_transparent_execution_stats();
   CHECK(after.successful_rebinds == before.successful_rebinds + 1);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
@@ -628,7 +631,7 @@ TEST_CASE("native checkpoint lease releases on a decode error-result",
   REQUIRE(replayed);
   INFO((replayed->HasError() ? replayed->GetError() : ""));
   REQUIRE_FALSE(replayed->HasError());
-  CHECK(replayed->GetValue(0, 0).ToString() == "300000");
+  CHECK(replayed->Collection().GetValue(0, 0).ToString() == "300000");
   auto const after = context->get_transparent_execution_stats();
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
   CHECK(after.lease_held_at_replay == before.lease_held_at_replay);
@@ -666,7 +669,7 @@ TEST_CASE("framework internal connections remain read-only while a native lease 
   auto selected        = internal.Query("SELECT count(*) FROM " + qualified);
   REQUIRE(selected);
   REQUIRE_FALSE(selected->HasError());
-  CHECK(selected->GetValue(0, 0).ToString() == "300000");
+  CHECK(selected->Collection().GetValue(0, 0).ToString() == "300000");
 
   CHECK_THROWS_AS(internal.Query("UPDATE " + qualified + " SET i = i WHERE false"),
                   duckdb::InvalidInputException);
@@ -740,7 +743,7 @@ TEST_CASE("a waiting forced checkpoint stalls writes but not read-only transacti
   auto read = reader->Query("SELECT count(*) FROM native_lease_t");
   REQUIRE(read);
   REQUIRE_FALSE(read->HasError());
-  CHECK(read->GetValue(0, 0).ToString() == "300000");
+  CHECK(read->Collection().GetValue(0, 0).ToString() == "300000");
   query_ok(*reader, "ROLLBACK");
 
   CHECK(query.wait_for(5s) == std::future_status::ready);
@@ -805,9 +808,10 @@ TEST_CASE("prepared native re-execution reacquires a fresh checkpoint lease",
   NativeLeaseFixture fixture;
   auto& con = fixture.con;
   prepare_native_table(fixture);
-  auto sibling  = sibling_connection(fixture);
-  auto context  = sirius::test::get_registered_sirius_context(*con);
-  auto prepared = con->Prepare("SELECT count(*) FROM native_lease_t");
+  auto sibling = sibling_connection(fixture);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  // A residual predicate keeps v2 from replacing the scan with a metadata-only count.
+  auto prepared = con->Prepare("SELECT count(*) FROM native_lease_t WHERE i % 2 = 0");
   REQUIRE(prepared);
   REQUIRE_FALSE(prepared->HasError());
 
@@ -823,14 +827,14 @@ TEST_CASE("prepared native re-execution reacquires a fresh checkpoint lease",
   auto first        = prepared->Execute();
   REQUIRE(first);
   REQUIRE_FALSE(first->HasError());
-  CHECK(scalar_value(*first) == "300000");
+  CHECK(scalar_value(*first) == "150000");
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
   query_ok(*sibling, "INSERT INTO native_lease_t VALUES (300000)");
   query_ok(*sibling, "CHECKPOINT");
   auto second = prepared->Execute();
   REQUIRE(second);
   REQUIRE_FALSE(second->HasError());
-  CHECK(scalar_value(*second) == "300001");
+  CHECK(scalar_value(*second) == "150001");
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
   REQUIRE(iterations.size() == 2);
   CHECK(iterations[1] > iterations[0]);
@@ -872,7 +876,7 @@ TEST_CASE("pin_table holds the native checkpoint lease through materialization",
   CHECK(pin.get().empty());
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
   query_ok(*con, "BEGIN TRANSACTION READ ONLY");
-  auto& catalog = duckdb::Catalog::GetCatalog(*con->context, attach_alias);
+  auto& catalog = duckdb::Catalog::GetCatalog(*con->context, duckdb::Identifier(attach_alias));
   auto& table = catalog.GetEntry<duckdb::TableCatalogEntry>(*con->context, "main", "native_lease_t")
                   .Cast<duckdb::DuckTableEntry>();
   auto const entry = context->get_scan_manager().find_pinned_entry_for_duckdb_table(
@@ -1021,7 +1025,7 @@ TEST_CASE("unwinding an unfinished window releases its native checkpoint lease",
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
   query_ok(*con, "BEGIN TRANSACTION READ ONLY");
-  auto& catalog = duckdb::Catalog::GetCatalog(*con->context, attach_alias);
+  auto& catalog = duckdb::Catalog::GetCatalog(*con->context, duckdb::Identifier(attach_alias));
   auto& table = catalog.GetEntry<duckdb::TableCatalogEntry>(*con->context, "main", "native_lease_t")
                   .Cast<duckdb::DuckTableEntry>();
   std::future<std::string> checkpoint;
@@ -1058,7 +1062,7 @@ TEST_CASE("Iceberg metadata settings do not change the database default",
     auto result = connection.Query("SELECT current_setting('unsafe_enable_version_guessing')");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
-    return result->GetValue(0, 0).template GetValue<bool>();
+    return result->Collection().GetValue(0, 0).template GetValue<bool>();
   };
   for (bool global_value : {false, true}) {
     CAPTURE(global_value);
@@ -1088,7 +1092,7 @@ TEST_CASE("internal metadata queries cannot escape their read-only transaction",
   prepare_native_table(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
   query_ok(*con, "BEGIN TRANSACTION READ ONLY");
-  auto& catalog = duckdb::Catalog::GetCatalog(*con->context, attach_alias);
+  auto& catalog = duckdb::Catalog::GetCatalog(*con->context, duckdb::Identifier(attach_alias));
   auto& table = catalog.GetEntry<duckdb::TableCatalogEntry>(*con->context, "main", "native_lease_t")
                   .Cast<duckdb::DuckTableEntry>();
   {
@@ -1109,7 +1113,7 @@ TEST_CASE("internal metadata queries cannot escape their read-only transaction",
     auto selected = internal.Query("SELECT count(*) FROM " + attach_alias + ".main.native_lease_t");
     REQUIRE(selected);
     REQUIRE_FALSE(selected->HasError());
-    CHECK(selected->GetValue(0, 0).ToString() == "300000");
+    CHECK(selected->Collection().GetValue(0, 0).ToString() == "300000");
     window.finish();
   }
   query_ok(*con, "ROLLBACK");
@@ -1171,7 +1175,8 @@ TEST_CASE("checkpoint leases are released only for their owning query",
   auto& manager = context->get_scan_manager();
   auto sibling  = sibling_connection(fixture);
   query_ok(*fixture.con, "BEGIN TRANSACTION READ ONLY");
-  auto& catalog = duckdb::Catalog::GetCatalog(*fixture.con->context, fixture.attach_alias);
+  auto& catalog =
+    duckdb::Catalog::GetCatalog(*fixture.con->context, duckdb::Identifier(fixture.attach_alias));
   auto& table =
     catalog.GetEntry<duckdb::TableCatalogEntry>(*fixture.con->context, "main", "native_lease_t")
       .Cast<duckdb::DuckTableEntry>();
@@ -1213,7 +1218,8 @@ TEST_CASE("native and Iceberg planning completes under a waiting forced checkpoi
   auto context = sirius::test::get_registered_sirius_context(*con);
   query_ok(*con, "SET gpu_execution=false");
   query_ok(*con, "BEGIN TRANSACTION READ ONLY");
-  auto& catalog = duckdb::Catalog::GetCatalog(*con->context, fixture.attach_alias);
+  auto& catalog =
+    duckdb::Catalog::GetCatalog(*con->context, duckdb::Identifier(fixture.attach_alias));
   auto& table = catalog.GetEntry<duckdb::TableCatalogEntry>(*con->context, "main", "native_lease_t")
                   .Cast<duckdb::DuckTableEntry>();
   std::future<std::string> checkpoint;
@@ -1256,8 +1262,9 @@ struct InternalStartFixture : sirius::test::GpuExecutionFixture {
     query_ok(*con, "SET gpu_execution = false");
     query_ok(*con, "CREATE TABLE internal_guard_t AS SELECT 42 AS i");
     query_ok(*con, "CHECKPOINT");
-    context  = sirius::test::get_registered_sirius_context(*con);
-    database = duckdb::DatabaseManager::Get(*con->context->db).GetDatabase(attach_alias);
+    context = sirius::test::get_registered_sirius_context(*con);
+    database =
+      duckdb::DatabaseManager::Get(*con->context->db).GetDatabase(duckdb::Identifier(attach_alias));
     REQUIRE(database);
   }
 

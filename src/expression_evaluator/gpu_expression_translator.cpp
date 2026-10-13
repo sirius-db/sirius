@@ -277,6 +277,11 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
     case ge:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
+    case distinct_from: {
+      auto& equal = _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::NULL_EQUAL, *left_expr, *right_expr);
+      return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, equal);
+    }
     case not_distinct_from:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::NULL_EQUAL, *left_expr, *right_expr);

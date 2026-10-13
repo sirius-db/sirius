@@ -63,10 +63,7 @@ duckdb::JoinCondition make_condition(
   duckdb::unique_ptr<duckdb::Expression> right,
   duckdb::ExpressionType comparison = duckdb::ExpressionType::COMPARE_EQUAL)
 {
-  duckdb::JoinCondition condition;
-  condition.left       = std::move(left);
-  condition.right      = std::move(right);
-  condition.comparison = comparison;
+  duckdb::JoinCondition condition(std::move(left), std::move(right), comparison);
   return condition;
 }
 

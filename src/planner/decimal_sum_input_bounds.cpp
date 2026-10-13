@@ -101,14 +101,15 @@ std::vector<std::optional<std::uint64_t>> resolve_decimal_sum_input_bounds(
     auto const& expression = *op.expressions[i];
     if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) { continue; }
     auto const& aggregate = expression.Cast<duckdb::BoundAggregateExpression>();
-    auto const id         = sirius::from_duckdb_aggregate_name(aggregate.function.name);
+    auto const id =
+      sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName());
     if (!id || (*id != sirius::aggregate_id::sum && *id != sirius::aggregate_id::sum_no_overflow &&
                 *id != sirius::aggregate_id::avg)) {
       continue;
     }
-    if (aggregate.children.size() != 1) { continue; }
-    auto const& input = *aggregate.children[0];
-    auto const& type  = input.return_type;
+    if (aggregate.GetChildren().size() != 1) { continue; }
+    auto const& input = *aggregate.GetChildren()[0];
+    auto const& type  = input.GetReturnType();
     // Wider decimals already run as DECIMAL128 and are never widened.
     if (type.id() != duckdb::LogicalTypeId::DECIMAL ||
         duckdb::DecimalType::GetWidth(type) > sirius::logical_type::decimal_max_precision_int64) {
@@ -116,7 +117,7 @@ std::vector<std::optional<std::uint64_t>> resolve_decimal_sum_input_bounds(
     }
     if (input.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
     auto const ordinal =
-      static_cast<std::size_t>(input.Cast<duckdb::BoundReferenceExpression>().index);
+      static_cast<std::size_t>(input.Cast<duckdb::BoundReferenceExpression>().Index());
     auto const origin = resolve_scan_column_origin(child, ordinal, origin_policy::value_preserving);
     if (!origin) { continue; }
     auto const known = std::find_if(memo.begin(), memo.end(), [&](auto const& entry) {
@@ -131,7 +132,7 @@ std::vector<std::optional<std::uint64_t>> resolve_decimal_sum_input_bounds(
     if (bounds[i]) {
       SIRIUS_LOG_DEBUG("decimal sum bound: aggregate {} ({}) has |unscaled value| <= {}",
                        i,
-                       aggregate.function.name,
+                       aggregate.Function().GetName().GetIdentifierName(),
                        *bounds[i]);
     }
   }

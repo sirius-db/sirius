@@ -27,7 +27,7 @@
 // duckdb
 #include <duckdb/common/types.hpp>
 #include <duckdb/planner/expression.hpp>
-#include <duckdb/planner/table_filter.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 
 // standard library
 #include <cstddef>

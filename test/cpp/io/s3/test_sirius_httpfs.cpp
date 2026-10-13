@@ -20,7 +20,7 @@
 #include <duckdb/common/open_file_info.hpp>
 #include <duckdb/common/virtual_file_system.hpp>
 #include <duckdb/storage/buffer/buffer_handle.hpp>
-#include <duckdb/storage/caching_file_system.hpp>
+#include <duckdb/storage/external_file_cache/caching_file_system.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -314,15 +314,14 @@ class sirius_httpfs_fixture {
   duckdb::Connection con;
 };
 
-std::unique_ptr<duckdb::MaterializedQueryResult> require_query_ok(duckdb::Connection& con,
-                                                                  std::string const& sql)
+std::unique_ptr<duckdb::QueryResult> require_query_ok(duckdb::Connection& con,
+                                                      std::string const& sql)
 {
   auto result = con.Query(sql);
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : ""));
   REQUIRE_FALSE(result->HasError());
-  return std::unique_ptr<duckdb::MaterializedQueryResult>(
-    static_cast<duckdb::MaterializedQueryResult*>(result.release()));
+  return std::unique_ptr<duckdb::QueryResult>(static_cast<duckdb::QueryResult*>(result.release()));
 }
 
 void set_gpu_execution(duckdb::Connection& con, bool enabled)
@@ -585,10 +584,10 @@ TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETa
   auto read_cached_range = [&] {
     auto handle =
       caching_fs.OpenFile(duckdb::OpenFileInfo{uri}, duckdb::FileFlags::FILE_FLAGS_READ);
-    duckdb::data_ptr_t data = nullptr;
-    auto pin                = handle->Read(data, read_size, read_offset);
-    REQUIRE(data != nullptr);
-    return std::vector<std::uint8_t>(data, data + read_size);
+    auto pin = handle->Read(read_size, read_offset);
+    std::vector<std::uint8_t> data(read_size);
+    pin.CopyTo(data.data(), data.size());
+    return data;
   };
 
   auto first_read = read_cached_range();
@@ -600,7 +599,7 @@ TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETa
       " AND loaded AND location <= " + std::to_string(read_offset) +
       " AND location + nr_bytes >= " + std::to_string(read_offset + read_size));
   REQUIRE(cache_rows->RowCount() == 1);
-  CHECK(cache_rows->GetValue(0, 0).GetValue<std::int64_t>() >= 1);
+  CHECK(cache_rows->Collection().GetValue(0, 0).GetValue<std::int64_t>() >= 1);
 
   REQUIRE(sirius::test::put_s3_test_object(key, second));
   auto second_read = read_cached_range();

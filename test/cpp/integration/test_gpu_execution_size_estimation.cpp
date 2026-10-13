@@ -64,7 +64,7 @@ class SizeEstimationFixture : public sirius::test::GpuExecutionFixture {
     REQUIRE_FALSE(result->HasError());
     auto const after = sirius::test::get_transparent_execution_stats(*con);
     sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-    return collect_rows(result->Cast<duckdb::MaterializedQueryResult>(), /*sort=*/true);
+    return collect_rows(*result, /*sort=*/true);
   }
 };
 

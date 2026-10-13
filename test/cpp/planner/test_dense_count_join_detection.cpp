@@ -33,6 +33,7 @@
 #include <duckdb/function/aggregate/distributive_functions.hpp>
 #include <duckdb/function/aggregate_function.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
@@ -42,6 +43,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utils/dynamic_filter_test_utils.hpp>
 
 #include <algorithm>
 #include <cerrno>
@@ -138,7 +140,9 @@ duckdb::BoundAggregateExpression* find_first_count(duckdb::LogicalOperator& op)
         continue;
       }
       auto& bound = expression->Cast<duckdb::BoundAggregateExpression>();
-      if (bound.function.name == "count" || bound.function.name == "count_star") { return &bound; }
+      if (bound.Function().GetName() == "count" || bound.Function().GetName() == "count_star") {
+        return &bound;
+      }
     }
   }
   for (auto& child : op.children) {
@@ -151,7 +155,7 @@ bool spoof_first_count_callback(duckdb::LogicalOperator& op)
 {
   auto* bound = find_first_count(op);
   if (bound == nullptr) { return false; }
-  bound->function.update = spoof_count_update;
+  bound->FunctionMutable().GetCallbacks().update = spoof_count_update;
   return true;
 }
 
@@ -159,12 +163,9 @@ bool replace_first_count_with_internal_count_star(duckdb::LogicalOperator& op)
 {
   auto* bound = find_first_count(op);
   if (bound == nullptr) { return false; }
-  bound->function      = duckdb::CountStarFun::GetFunction();
-  bound->function.name = "count_star";
-  bound->function.catalog_name.clear();
-  bound->function.schema_name.clear();
-  bound->children.clear();
-  bound->bind_info.reset();
+  bound->FunctionMutable() = duckdb::BoundAggregateFunction(duckdb::CountStarFun::GetFunction());
+  bound->GetChildrenMutable().clear();
+  bound->BindInfoMutable().reset();
   return true;
 }
 
@@ -172,8 +173,8 @@ bool assign_non_system_count_provenance(duckdb::LogicalOperator& op)
 {
   auto* bound = find_first_count(op);
   if (bound == nullptr) { return false; }
-  bound->function.catalog_name = "user_catalog";
-  bound->function.schema_name  = "main";
+  bound->FunctionMutable().SetQualifiedName(
+    duckdb::QualifiedName("user_catalog", "main", bound->Function().GetName()));
   return true;
 }
 
@@ -191,7 +192,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> result;
   try {
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
@@ -201,7 +202,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
 
     auto plan = std::move(planner.plan);
 
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -209,7 +210,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
     resolver.VisitOperator(*plan);
     if (options.mutate) { REQUIRE(options.mutate(*plan)); }
 
@@ -342,13 +344,13 @@ void require_q13_counted_filter(sirius::op::sirius_physical_operator* preserved,
                                 sirius::op::sirius_physical_operator* counted)
 {
   auto const& preserved_scan = require_native_scan(preserved, "cust", false);
-  CHECK((preserved_scan.table_filters == nullptr || preserved_scan.table_filters->filters.empty()));
+  CHECK((preserved_scan.table_filters == nullptr || !preserved_scan.table_filters->HasFilters()));
 
   auto const& counted_scan = require_native_scan(counted, "ord", true);
   REQUIRE(counted_scan.table_filters != nullptr);
-  REQUIRE(counted_scan.table_filters->filters.size() == 1);
-  auto const& [column_index, filter] = *counted_scan.table_filters->filters.begin();
-  REQUIRE(filter != nullptr);
+  REQUIRE(counted_scan.table_filters->FilterCount() == 1);
+  auto iterator           = counted_scan.table_filters->begin();
+  auto const column_index = (*iterator).GetIndex().GetIndex();
   REQUIRE(column_index < counted_scan.column_ids.size());
   REQUIRE(counted_scan.column_ids[column_index].HasPrimaryIndex());
   CHECK(counted_scan.column_ids[column_index].GetPrimaryIndex() == 2);
@@ -359,8 +361,10 @@ struct dense_count_join_fixture {
   {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                "minimal.yaml";
-    db           = sirius::test::open_sirius_db(db_path.path().c_str(), cfg);
-    con          = std::make_unique<Connection>(*db);
+    db  = sirius::test::open_sirius_db(db_path.path().c_str(), cfg);
+    con = std::make_unique<Connection>(*db);
+    // Preserve the aggregate-over-join shape that these fusion tests exercise.
+    shape_guard.emplace(*con, "partial_aggregate_pushdown");
     auto enabled = con->Query("SET enable_dense_count_join = true");
     REQUIRE(enabled != nullptr);
     REQUIRE_FALSE(enabled->HasError());
@@ -408,6 +412,7 @@ struct dense_count_join_fixture {
   scoped_temp_db_path db_path;
   std::unique_ptr<DuckDB> db;
   std::unique_ptr<Connection> con;
+  std::optional<sirius::test::disabled_optimizers_guard> shape_guard;
 };
 
 }  // namespace
@@ -706,7 +711,7 @@ TEST_CASE_METHOD(dense_count_join_fixture,
     has_dense_count_join(
       "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust AND c_grp > 0 "
       "GROUP BY c_id"),
-    Catch::Matchers::ContainsSubstring("Any join not supported"));
+    Catch::Matchers::ContainsSubstring("arbitrary join conditions"));
   // INTEGER = BIGINT inserts a CAST, so the plain-reference gate declines.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(o_cust) FROM cust LEFT JOIN ord ON c_id = o_id GROUP BY c_id"));
@@ -741,6 +746,8 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 
   SECTION("nested hash join on the preserved side")
   {
+    // Keep the outer join above the nested input this fusion case exercises.
+    sirius::test::disabled_optimizers_guard retain_order{*con, "join_order"};
     auto const [plan, fused] = require_fused(nested_hash_join_preserved_query);
     CHECK(collect(fused->children[0].get(), T::HASH_JOIN).size() == 1);
     CHECK(collect(fused->children[1].get(), T::HASH_JOIN).empty());
@@ -756,6 +763,8 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 
   SECTION("RIGHT orientation with the nested hash join on the preserved side")
   {
+    // Keep the outer join above the nested input this fusion case exercises.
+    sirius::test::disabled_optimizers_guard retain_order{*con, "join_order"};
     auto const [plan, fused] = require_fused(nested_hash_join_right_preserved_query);
     CHECK(collect(fused->children[0].get(), T::HASH_JOIN).size() == 1);
     CHECK(collect(fused->children[1].get(), T::HASH_JOIN).empty());
@@ -779,6 +788,8 @@ TEST_CASE_METHOD(dense_count_join_fixture,
                  "dense_count_join declines bespoke-wired input roots",
                  "[dense_count_join][plan]")
 {
+  // Keep the correlated join whose input wiring this test exercises.
+  sirius::test::scoped_sirius_setting retain_delim{*con, "delim_join_as_cte", false};
   using T = sirius::op::SiriusPhysicalOperatorType;
 
   SECTION("materialized CTE reference")
@@ -823,9 +834,13 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join declines a delim join at any depth of an input",
+                 "dense_count_join declines correlated producers at any depth of an input",
                  "[dense_count_join][plan]")
 {
+  // Keep the correlated join whose input wiring this test exercises.
+  auto const as_cte = GENERATE(false, true);
+  CAPTURE(as_cte);
+  sirius::test::scoped_sirius_setting representation{*con, "delim_join_as_cte", as_cte};
   using T = sirius::op::SiriusPhysicalOperatorType;
 
   // A correlated EXISTS compared as a value keeps a MARK delim join below the input's root. These
@@ -834,9 +849,13 @@ TEST_CASE_METHOD(dense_count_join_fixture,
     auto plan = generate_sirius_plan(*con, query);
     REQUIRE(plan);
     CHECK(collect(plan.get(), T::DENSE_COUNT_JOIN).empty());
-    CHECK(collect(plan.get(), T::LEFT_DELIM_JOIN).size() +
-            collect(plan.get(), T::RIGHT_DELIM_JOIN).size() ==
-          1);
+    if (as_cte) {
+      CHECK_FALSE(collect(plan.get(), T::CTE).empty());
+    } else {
+      CHECK(collect(plan.get(), T::LEFT_DELIM_JOIN).size() +
+              collect(plan.get(), T::RIGHT_DELIM_JOIN).size() ==
+            1);
+    }
   };
 
   SECTION("below a FILTER root")
@@ -891,106 +910,18 @@ TEST_CASE("dense_count_join recognizes host COUNT callbacks through a dynamicall
 {
   auto const extension = sirius::test::loadable_extension_path();
   if (extension.empty()) SKIP("Set SIRIUS_EXTENSION_PATH to test the loadable extension.");
-  auto const source          = GENERATE("parquet", "native");
-  auto const host_visibility = GENERATE("local", "global");
-  CAPTURE(source, host_visibility);
+  auto const source = GENERATE("parquet", "native");
+  CAPTURE(source);
   scoped_temp_directory temp;
   auto const config = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" /
                       "data" / "configurator_dense_count_join.yaml";
   REQUIRE(std::filesystem::is_regular_file(extension));
   REQUIRE(std::filesystem::is_regular_file(config));
 
-  static constexpr std::string_view script = R"PY(
-import os
-import sys
-from pathlib import Path
-
-extension, config, temp_root, source, host_visibility = sys.argv[1:]
-root = Path(temp_root)
-logs = root / "logs"
-logs.mkdir()
-
-os.environ.pop("SIRIUS_DISABLE", None)
-os.environ["SIRIUS_CONFIG_FILE"] = config
-os.environ["SIRIUS_LOG_DIR"] = str(logs)
-os.environ["SIRIUS_LOG_BACKEND"] = "spdlog"
-os.environ["SIRIUS_LOG_LEVEL"] = "info"
-
-# Preserve the original default-import regression. Global visibility is additional coverage,
-# never a prerequisite for loading Sirius or verifying its scan callbacks.
-if host_visibility == "global":
-    sys.setdlopenflags(os.RTLD_NOW | os.RTLD_GLOBAL)
-else:
-    assert not (sys.getdlopenflags() & os.RTLD_GLOBAL)
-import duckdb
-
-def sql_literal(value):
-    return "'" + str(value).replace("'", "''") + "'"
-
-customer_path = root / "customer.parquet"
-orders_path = root / "orders.parquet"
-con = duckdb.connect(":memory:" if source == "parquet" else str(root / "native.duckdb"),
-                     config={"allow_unsigned_extensions": "true"})
-con.execute(
-    f"COPY (SELECT range::INTEGER AS c_custkey FROM range(9)) "
-    f"TO {sql_literal(customer_path)} (FORMAT PARQUET)"
-)
-con.execute(
-    "COPY (SELECT range::BIGINT AS o_orderkey, "
-    "       (range % 8)::INTEGER AS o_custkey, "
-    "       CASE WHEN range % 5 = 0 THEN 'special x requests' ELSE 'ordinary' END AS o_comment "
-    "FROM range(64)) "
-    f"TO {sql_literal(orders_path)} (FORMAT PARQUET)"
-)
-con.execute(f"CREATE VIEW customer AS SELECT * FROM read_parquet([{sql_literal(customer_path)}])")
-con.execute(f"CREATE VIEW orders AS SELECT * FROM read_parquet([{sql_literal(orders_path)}])")
-if source == "native":
-    con.execute("CREATE TABLE native_customer AS SELECT * FROM customer")
-    con.execute("CREATE TABLE native_orders AS SELECT * FROM orders")
-    con.execute("DROP VIEW customer")
-    con.execute("DROP VIEW orders")
-    con.execute("ALTER TABLE native_customer RENAME TO customer")
-    con.execute("ALTER TABLE native_orders RENAME TO orders")
-    con.execute("CHECKPOINT")
-
-con.execute(f"LOAD {sql_literal(extension)}")
-con.execute("SET gpu_execution = true")
-con.execute("SET enable_duckdb_fallback = false")
-# Check fresh scans before pinning, so cached inputs cannot hide host scan verification failures.
-for query, expected in [
-    ("SELECT sum(c_custkey) FROM customer WHERE c_custkey >= 3", [(33,)]),
-    ("SELECT sum(o_orderkey) FROM orders WHERE o_custkey < 3", [(696,)]),
-]:
-    actual = con.execute(query).fetchall()
-    if actual != expected:
-        raise AssertionError((query, actual, expected))
-for name, path, cols in [("customer", customer_path, "['c_custkey']"),
-                         ("orders", orders_path, "['o_custkey','o_orderkey','o_comment']")]:
-    source_arg = sql_literal(path) if source == "parquet" else "format='duckdb'"
-    con.execute(f"CALL pin_table({source_arg}, tier='host', name='{name}', cols={cols})").fetchall()
-
-queries = [
-    (
-        "SELECT c_custkey, count(o_orderkey) FROM customer c LEFT JOIN orders o "
-        "ON c.c_custkey = o.o_custkey AND o.o_comment NOT LIKE '%special%requests%' "
-        "GROUP BY c_custkey ORDER BY c_custkey",
-        [(0, 6), (1, 7), (2, 6), (3, 7), (4, 6), (5, 6), (6, 7), (7, 6), (8, 0)],
-    ),
-    (
-        "SELECT c_custkey, count(*) FROM customer c LEFT JOIN orders o "
-        "ON c.c_custkey = o.o_custkey AND o.o_comment NOT LIKE '%special%requests%' "
-        "GROUP BY c_custkey ORDER BY c_custkey",
-        [(0, 6), (1, 7), (2, 6), (3, 7), (4, 6), (5, 6), (6, 7), (7, 6), (8, 1)],
-    ),
-]
-for query, expected in queries:
-    actual = con.execute(query).fetchall()
-    if actual != expected:
-        raise AssertionError((query, actual, expected))
-con.close()
-)PY";
-
-  auto const child_output_path = temp.path() / "python-output.txt";
+  auto const host =
+    std::filesystem::read_symlink("/proc/self/exe").parent_path() / "sirius_extension_host";
+  REQUIRE(std::filesystem::is_regular_file(host));
+  auto const child_output_path = temp.path() / "host-output.txt";
   auto const child_output_fd =
     ::open(child_output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
   REQUIRE(child_output_fd >= 0);
@@ -1003,16 +934,10 @@ con.close()
       ::_exit(126);
     }
     ::close(child_output_fd);
-    ::execlp("python",
-             "python",
-             "-c",
-             script.data(),
-             extension.c_str(),
-             config.c_str(),
-             temp.path().c_str(),
-             source,
-             host_visibility,
-             static_cast<char*>(nullptr));
+    setenv("SIRIUS_DENSE_COUNT_SOURCE", source, 1);
+    setenv("SIRIUS_DENSE_COUNT_ROOT", temp.path().c_str(), 1);
+    setenv("SIRIUS_CONFIG_FILE", config.c_str(), 1);
+    ::execl(host.c_str(), host.c_str(), "Dynamic COUNT join child", static_cast<char*>(nullptr));
     ::_exit(127);
   }
 
