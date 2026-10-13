@@ -1,0 +1,478 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+// Ingesting a .hpln file as a pinned compressed chunk.
+//
+// A pin today reads parquet, materializes it on the GPU, and compresses it on the way into the
+// cache -- which is why pinning dominates the SF1000 wall clock (~151 s) while the queries it
+// serves take ~9 s. A file that is ALREADY in the pinned representation needs none of that: the
+// payload lands in pinned host blocks byte-for-byte as stored, so ingest is an I/O copy rather
+// than a decode plus a re-compress. Nothing is decoded here and no GPU is touched.
+//
+// The served-from side then needs no new code at all: a compressed_host_representation built this
+// way goes through the same converter as a pinned one, including the range-skipped fetch.
+
+#include "compressed_representation.hpp"
+#include "hpln_io.hpp"
+#include "scan_manager/pinned_chunk_stats.hpp"
+
+#include <cudf/table/table_view.hpp>
+
+#include <api/compressed_table_io.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/types.hpp>
+#include <duckdb/common/vector.hpp>
+
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <span>
+#include <string>
+#include <vector>
+
+namespace sirius {
+
+/// How a .hpln is opened and read.
+///
+/// The transport is the whole point of carrying this: with an @ref io_ctx every read -- the tail
+/// that locates the file, the metadata region, each chunk's payload -- goes through that backend,
+/// which is the only way an `s3://` path can be read at all. Without one the reads go through the
+/// local filesystem, and a scheme path is refused rather than silently read locally.
+/// Whether payload checksums are verified unless a caller says otherwise;
+/// `SIRIUS_HPLN_VERIFY_PAYLOAD` in the environment, read once.
+[[nodiscard]] bool hpln_verify_payload_default();
+
+/// The small sizing buffers a narrowed read needs, keyed by their FILE range.
+///
+/// Sizing one chunk blocks on a read per buffer, and a scan stages tens of chunks, so over an
+/// object store those reads -- one round trip each, strictly one after another -- cost far more
+/// than the bytes they spare. They are instead collected first and fetched as one planned batch:
+/// a collecting pass records every range it is asked for (and answers "unavailable", which only
+/// makes that column look unsubsettable for the moment), the misses are read together, and the
+/// pass repeats until nothing is missing. Which ranges a chunk asks for never depends on the
+/// values read, so this converges in a round or two; a range still absent afterwards is simply
+/// read the old way.
+///
+/// A scan fetches a chunk's buffers in that chunk's split job, while earlier batches execute, and
+/// hands the cache to every split's read, so no task spends its time (and its GPU reservation) on
+/// them. A published cache is read-only: the readers never insert, which is what makes sharing it
+/// between tasks safe without a lock. The buffers are shared, so extending a cache by one chunk
+/// copies pointers, not bytes.
+class hpln_sizing_cache {
+ public:
+  std::map<std::pair<std::uint64_t, std::uint64_t>,
+           std::shared_ptr<std::vector<std::uint8_t> const>>
+    bytes;
+  std::set<std::pair<std::uint64_t, std::uint64_t>> missing;
+  bool collect = false;
+};
+
+/// A byte range of a .hpln file.
+/// One file's sizing buffers fetched so far, shared by every scan of it through the io_context's
+/// metadata store (@ref hpln_metadata::sizing_store). They depend only on the file, the chunk and
+/// the column -- never on a query's filter -- so a second scan, or the next iteration of the same
+/// query, finds them here instead of fetching them again.
+///
+/// Published as immutable snapshots: a scan whose ranges are all present uses the current
+/// snapshot as it is (no copy, no lock held while reading it); a scan that needs more fetches only
+/// what is missing and publishes an extended copy. Grows for the life of the io_context, by about
+/// 5 bytes per 1024 rows per bit-packed leaf that any scan narrowed.
+class hpln_sizing_store {
+ public:
+  [[nodiscard]] std::shared_ptr<hpln_sizing_cache const> snapshot() const
+  {
+    std::lock_guard lock(_mutex);
+    return _snapshot;
+  }
+
+  /// Make @p next current, first folding in anything a concurrent scan published since @p next
+  /// was copied from the snapshot it extends. Returns what is now current.
+  std::shared_ptr<hpln_sizing_cache const> publish(std::shared_ptr<hpln_sizing_cache> next)
+  {
+    std::lock_guard lock(_mutex);
+    if (_snapshot) {
+      for (auto const& [key, bytes] : _snapshot->bytes) {
+        next->bytes.try_emplace(key, bytes);
+      }
+    }
+    _snapshot = std::move(next);
+    return _snapshot;
+  }
+
+ private:
+  mutable std::mutex _mutex;
+  std::shared_ptr<hpln_sizing_cache const> _snapshot;
+};
+
+struct hpln_file_range {
+  std::uint64_t offset = 0;
+  std::uint64_t size   = 0;
+};
+
+struct hpln_open_options {
+  /// Backend serving this path. Null means the local filesystem.
+  std::shared_ptr<io::ioctx> io_ctx;
+  /// Read through this datasource instead of opening one. A scan split reads through the
+  /// datasource that carries its prefetch request, because that is the only one whose reads are
+  /// served from the cache the request filled. Ignored without an @ref io_ctx.
+  std::shared_ptr<io::sirius_datasource> datasource;
+  /// Sizing buffers fetched ahead of the read. When set, the read uses them as they are and never
+  /// fetches or inserts; when null, the read fetches its own.
+  std::shared_ptr<hpln_sizing_cache> sizing;
+  /// How reads are coalesced into requests. Unset takes the opened source's
+  /// @ref hpln_source::default_policy, which differs between local files and object stores.
+  std::optional<hpln_io_policy> policy;
+  /// Verify each staged chunk payload against the file's CRC32C.
+  ///
+  /// Off by default, and the default is a policy rather than a constant: a payload checksum costs
+  /// a full pass over every byte read, on the hot path, to catch something the metadata checks
+  /// (which are always on, and cover the offsets that decide WHERE the payload is read from) do
+  /// not. Set `SIRIUS_HPLN_VERIFY_PAYLOAD=1` to turn it on for a process, or set this directly.
+  ///
+  /// Only whole-chunk reads are covered -- the checksum is per chunk, and a scan that narrows a
+  /// chunk to a few decode chunks has no way to check part of one.
+  bool verify_payload = hpln_verify_payload_default();
+  /// Filled with what the transport actually did, when non-null. The only way to observe that a
+  /// read went through the io_context and how many requests it cost -- the bytes are the same
+  /// either way.
+  hpln_io_stats* stats = nullptr;
+};
+
+/// One chunk of a .hpln staged into pinned host memory: the bytes and the row count.
+struct ingested_hpln_chunk {
+  std::shared_ptr<pinned_compressed_blob> blob;
+  std::int64_t num_rows = 0;
+  /// Whether the READ was narrowed to the caller's surviving decode chunks. False either because
+  /// none were asked for or because the narrowing was refused, and the two are indistinguishable
+  /// to a consumer: both mean this blob holds the chunk's whole rows and still needs filtering.
+  bool rows_narrowed = false;
+};
+
+/// A .hpln file staged into pinned host memory, plus what its header says is in it.
+struct ingested_hpln {
+  std::shared_ptr<pinned_compressed_blob> blob;
+  simpatico::hpln_schema schema;
+  /// Per-group min/max read straight out of the file's `zone_maps` segment. Empty when the file
+  /// carries none, or when the segment did not decode — both mean "serve unpruned", never
+  /// "prune wrongly". This is what lets an ingested table prune without decoding anything.
+  scan_manager::group_bounds_arena group_bounds;
+  /// The engine's logical type per column, from the file's `logical_types` segment. Empty when the
+  /// file carries none — a caller then has only the cuDF physical types, which cannot express
+  /// DECIMAL precision, nullability or a timestamp's zone.
+  duckdb::vector<duckdb::LogicalType> column_types;
+};
+
+/// The schema a reader binds against: column names and the engine's logical types, obtained
+/// without touching the payload and without a GPU.
+struct hpln_bind_schema {
+  std::vector<std::string> names;
+  duckdb::vector<duckdb::LogicalType> types;
+  /// The cuDF type each column DECODES to, which is not always the physical layout of @ref types:
+  /// a DECIMAL(12,2) is INT64 to the engine but may be DECIMAL32 in the file. A reader sizing the
+  /// decoded table has to size it by these.
+  std::vector<cudf::data_type> physical_types;
+  /// Rows over the WHOLE file, i.e. summed over its chunks.
+  std::int64_t num_rows = 0;
+  /// Rows in each chunk, in file order. One entry per chunk, so its size is the file's chunk
+  /// count -- which is how many splits a scan over the file emits.
+  std::vector<std::int64_t> chunk_rows;
+  /// Per-(column, chunk, group) min/max, straight out of the file's `zone_maps` segment. This is
+  /// what makes a scan able to drop a chunk without reading it: the bounds travel with the data,
+  /// so deciding costs one small out-of-band read rather than a decode. Empty when the file
+  /// carries none or the segment did not decode -- both mean "serve unpruned", never "prune
+  /// wrongly". Positional with the FILE's columns, not with any projection.
+  scan_manager::group_bounds_arena group_bounds;
+  /// Whether each FILE column can contain NULL, ORed over the file's chunks. Positional with
+  /// @ref names. A .hpln records validity per chunk, so a column with nulls in only one chunk is
+  /// still a nullable column to a reader binding the whole file.
+  std::vector<bool> column_has_nulls;
+};
+
+/// A parsed @ref hpln_bind_schema parked in the io_context's metadata store, so every scan of the
+/// file after the first skips the parse.
+///
+/// The parse is not cheap the way a parquet footer is: it reads and CRC-verifies every chunk's
+/// header and then UNPACKS the zone-map segment, which at SF100 lineitem is ~73k groups x 16
+/// columns of bounds -- 22 ms, paid once per scan, and TPC-H q21 scans lineitem four times. That
+/// was 153 ms of a 279 ms query spent before the first pipeline started, against parquet's 9 ms.
+///
+/// Held by shared_ptr and handed out by shared_ptr: the arena is the bulk of it and it is
+/// immutable once parsed, so no consumer needs its own copy.
+class hpln_metadata final : public sirius::io::io_object_metadata {
+ public:
+  explicit hpln_metadata(std::shared_ptr<hpln_bind_schema const> schema,
+                         std::shared_ptr<void const> ingest_layout = nullptr)
+    : _schema(std::move(schema)), _ingest_layout(std::move(ingest_layout))
+  {
+  }
+
+  [[nodiscard]] std::shared_ptr<hpln_bind_schema const> const& schema() const noexcept
+  {
+    return _schema;
+  }
+
+  /// The file's located layout and chunk headers, as the ingest reader wants them. Opaque outside
+  /// simpatico_file_ingest.cpp, which is the only place that knows the type. Null when the bind
+  /// that parked this did not capture it, in which case a split locates the file itself.
+  ///
+  /// Bind already read and CRC-verified every chunk header to build the schema; handing them on
+  /// means a split's read does not pay again, per split, for the tail read that locates the file
+  /// and the round trip that re-reads the headers -- ~0.2-0.35 s a split over S3, spent inside
+  /// the scan task while it holds its GPU reservation.
+  [[nodiscard]] std::shared_ptr<void const> const& ingest_layout() const noexcept
+  {
+    return _ingest_layout;
+  }
+
+  /// The file's sizing buffers, shared across scans and queries; see @ref hpln_sizing_store.
+  [[nodiscard]] std::shared_ptr<hpln_sizing_store> const& sizing_store() const noexcept
+  {
+    return _sizing_store;
+  }
+
+ private:
+  std::shared_ptr<hpln_bind_schema const> _schema;
+  std::shared_ptr<void const> _ingest_layout;
+  std::shared_ptr<hpln_sizing_store> _sizing_store = std::make_shared<hpln_sizing_store>();
+};
+
+/// Open @p path far enough to answer "what columns does this file have".
+///
+/// This is what a `read_simpatico()` bind needs, and what an ingestible's table_info reports. The
+/// logical types come from the file's `logical_types` segment when it has one; otherwise they are
+/// derived from the cuDF physical types in the header, which is lossy in exactly the ways that
+/// matter (DECIMAL precision, nullability, time zone) — so a file
+/// written without that segment binds to approximate types rather than failing.
+///
+/// Throws std::runtime_error if the file cannot be read or parsed.
+[[nodiscard]] hpln_bind_schema read_hpln_schema(std::string const& path,
+                                                hpln_open_options const& options = {});
+
+/// As @ref read_hpln_schema, but shared and CACHED.
+///
+/// The result is parked in the io_context's metadata store as an @ref hpln_metadata, so a second
+/// call for the same file returns the same object without reading or parsing anything. Callers
+/// that bind a file once per scan -- which is every query with more than one reference to a table
+/// -- should prefer this; @ref read_hpln_schema remains for callers that want an owned copy.
+///
+/// Falls back to an uncached parse when the transport has no metadata store (a local ifstream
+/// source, or a host test with no io_context), so the answer never depends on whether a cache
+/// exists.
+[[nodiscard]] std::shared_ptr<hpln_bind_schema const> read_hpln_schema_shared(
+  std::string const& path, hpln_open_options const& options = {});
+
+/// Write a .hpln one chunk at a time: compress, capture bounds, emit, forget.
+///
+/// @ref write_tables_to_hpln compresses every chunk before it writes anything, so a file costs its
+/// whole compressed size in GPU memory at once -- and the `COPY ... (FORMAT simpatico)` that feeds
+/// it holds the UNCOMPRESSED chunks until finalize, which at TPC-H SF1000 lineitem is ~780 GB of a
+/// 256 GB device. That is the reason SF1000 was unreachable as a .hpln at all.
+///
+/// Here the caller hands over one decoded chunk at a time and may free it as soon as @ref append
+/// returns: the chunk is compressed, its zone maps are captured from the decoded values, its
+/// payload is written, and only its header bytes and its bounds are retained. Peak device memory
+/// is one chunk rather than one table.
+///
+/// Construct, @ref append in chunk order, then @ref finish exactly once.
+class hpln_table_writer {
+ public:
+  hpln_table_writer(std::string path,
+                    duckdb::vector<duckdb::LogicalType> column_types,
+                    std::vector<std::string> column_names,
+                    std::string plan_dsl,
+                    std::size_t group_rows);
+  ~hpln_table_writer();
+
+  hpln_table_writer(hpln_table_writer const&)            = delete;
+  hpln_table_writer& operator=(hpln_table_writer const&) = delete;
+
+  /// Compress @p table, capture its per-group bounds and write its payload. Empty on success.
+  std::string append(cudf::table_view const& table,
+                     rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr);
+
+  /// Emit the metadata regions: the headers, the directory, the engine's logical types, every
+  /// chunk's zone maps, the checksums and the trailer. Empty on success.
+  std::string finish();
+
+  [[nodiscard]] std::size_t chunks_written() const noexcept;
+
+ private:
+  struct impl;
+  std::unique_ptr<impl> _impl;
+};
+
+/// Pack @p types into the bytes a `logical_types` segment carries, and back.
+///
+/// Positional with the header's columns. Only the types Sirius can pin are representable; an
+/// unrepresentable one packs as SQLNULL, which a reader treats as "this column has no declared
+/// type" rather than silently substituting a wrong one.
+[[nodiscard]] std::vector<std::uint8_t> pack_logical_types(
+  duckdb::vector<duckdb::LogicalType> const& types);
+[[nodiscard]] duckdb::vector<duckdb::LogicalType> unpack_logical_types(
+  std::span<const std::uint8_t> bytes, std::string* error = nullptr);
+
+/// Read @p path into pinned host memory belonging to @p host_space.
+///
+/// The header is located from the trailer; a file written before the trailer existed falls back
+/// to reading a speculative prefix and growing it if the parse reports truncation.
+/// Throws std::runtime_error on a missing, truncated or malformed
+/// file, since a partially ingested table must never become a pinned entry.
+///
+/// Single-chunk files only: the result is one blob, so a multi-chunk file would have to be
+/// silently truncated to its first chunk. Such a file is refused; use
+/// @ref read_hpln_chunks_into_pinned, which is what a scan over one drives.
+[[nodiscard]] ingested_hpln read_hpln_into_pinned(std::string const& path,
+                                                  cucascade::memory::memory_space& host_space,
+                                                  hpln_open_options const& options = {});
+
+/// Read the chunks @p chunk_ids of @p path into pinned host memory, in the order named.
+///
+/// The chunk directory says where each chunk's header and payload are, so a batch of chunks is
+/// this many ranged reads and nothing else -- no chunk outside @p chunk_ids is touched. Throws
+/// std::runtime_error if the file is unreadable or an id is out of range; a scan that decoded a
+/// neighbouring chunk instead would return plausible rows from the wrong place.
+///
+/// @p columns, when non-empty, narrows every chunk to those FILE columns (strictly ascending):
+/// each chunk's header is rebuilt to describe exactly them and only their payload bytes are read,
+/// so the result is an ordinary chunk that HAS only those columns rather than a wide chunk behind
+/// a narrow description.
+///
+/// @p decode_chunks, when non-empty, narrows the READ to the surviving 1024-row decode chunks of
+/// each requested chunk -- positional with @p chunk_ids, so entry i describes chunk_ids[i]. This is
+/// the difference between skipping a chunk's bytes and merely skipping its decode: without it a
+/// chunk that survives whole-chunk pruning is read in full even when its group bounds rule out
+/// almost all of it. Sizing the surviving ranges requires the small per-chunk metadata buffers,
+/// which live in the payload, so a narrowed read is two rounds rather than one. A chunk whose
+/// narrowing is refused is staged whole, and @ref ingested_hpln_chunk::rows_narrowed says which
+/// happened.
+///
+/// Payload checksums are not verified for a narrowed or column-subsetted read -- the recorded CRC
+/// covers the whole chunk.
+[[nodiscard]] std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
+  std::string const& path,
+  cucascade::memory::memory_space& host_space,
+  std::span<const std::size_t> chunk_ids,
+  hpln_open_options const& options                          = {},
+  std::span<const std::size_t> columns                      = {},
+  std::span<const std::vector<std::uint32_t>> decode_chunks = {});
+
+/// A chunk's read, planned but not performed: the header the decode reads and, for each span of
+/// the payload that header addresses, where those bytes live in the FILE (`src_offset` is an
+/// absolute file offset, `dst_offset` the offset the header addresses). Enough to fetch every
+/// buffer the decode asks for straight from the datasource -- and so from the prefetching cache --
+/// without staging the chunk in pinned host memory first.
+struct planned_hpln_chunk {
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::gather_range> file_map;
+  std::uint64_t payload_bytes = 0;
+  std::int64_t num_rows       = 0;
+  /// Whether the plan is narrowed to the caller's surviving decode chunks (as
+  /// @ref ingested_hpln_chunk::rows_narrowed): its header describes only those rows.
+  bool rows_narrowed = false;
+};
+
+/// Works out, for a scan over one .hpln, exactly which bytes each chunk's read will fetch -- so a
+/// scan can tell the prefetching cache before the read happens, as a parquet scan does.
+///
+/// The ranges are computed by the same narrowing the read itself performs (the same column subset,
+/// the same surviving decode chunks, the same sizing buffers), so a hint and the read it hints
+/// cannot disagree about what a chunk needs. A hint that is wrong would only cost a miss -- the
+/// cache serves what it has and the read fetches the rest -- but there is no reason to guess.
+class hpln_read_planner {
+ public:
+  /// Locates @p path (or takes the layout a bind parked) and keeps what it needs to plan reads of
+  /// @p columns, which has the meaning it has for @ref read_hpln_chunks_into_pinned: empty is the
+  /// whole chunk. @p options carries the io_context. Throws like an open does.
+  hpln_read_planner(std::string path, hpln_open_options options, std::vector<std::size_t> columns);
+  ~hpln_read_planner();
+  hpln_read_planner(hpln_read_planner const&)            = delete;
+  hpln_read_planner& operator=(hpln_read_planner const&) = delete;
+
+  /// The sizing buffers fetched so far, to be passed on as @ref hpln_open_options::sizing.
+  [[nodiscard]] std::shared_ptr<hpln_sizing_cache> sizing() const;
+
+  /// Fetch the sizing buffers the narrowed chunks in @p chunk_ids need and do not have yet, as one
+  /// planned batch. Positional like @ref read_hpln_chunks_into_pinned's @c decode_chunks. Safe to
+  /// call concurrently, e.g. once per chunk from the split jobs: each call publishes what it
+  /// fetched alongside what others published.
+  void prefetch_sizing(std::span<const std::size_t> chunk_ids,
+                       std::span<const std::vector<std::uint32_t>> decode_chunks);
+
+  /// The merged, ascending file ranges the read of @p chunk_id narrowed to @p decode_chunks (empty:
+  /// the whole chunk) will fetch. Empty when that cannot be known without a read -- a narrowed
+  /// chunk whose sizing buffers are not in @ref sizing -- in which case the scan simply does not
+  /// hint it. Never reads; safe to call from several threads.
+  [[nodiscard]] std::vector<hpln_file_range> ranges(
+    std::size_t chunk_id, std::span<const std::uint32_t> decode_chunks) const;
+
+  /// The file range holding @p chunk_id's payload, straight from the chunk directory: no planning,
+  /// no reads. Empty past the last chunk.
+  [[nodiscard]] hpln_file_range chunk_payload(std::size_t chunk_id) const noexcept;
+
+  /// The header and file map a read of @p chunk_id narrowed to @p decode_chunks (empty: the whole
+  /// chunk) would stage -- the same narrowing @ref ranges plans -- without reading or allocating.
+  /// Nullopt when that cannot be known without a read; the caller then stages the chunk as before.
+  /// Safe to call from several threads.
+  [[nodiscard]] std::optional<planned_hpln_chunk> plan_chunk(
+    std::size_t chunk_id, std::span<const std::uint32_t> decode_chunks) const;
+
+ private:
+  struct impl;
+  std::unique_ptr<impl> _impl;
+};
+
+/// Compress @p tables with @p plan_dsl and write them to @p path as one multi-chunk file.
+///
+/// Every chunk is compressed independently with the same plan, and all of them must share a
+/// schema -- the reader rejects a file whose chunks disagree, so building one is not useful.
+/// The `zone_maps` segment carries every chunk's per-group bounds, in chunk order, which is what
+/// makes pruning a wiring job rather than a format change.
+///
+/// @p group_rows of 0 writes no zone-map segment. Returns an empty string on success.
+[[nodiscard]] std::string write_tables_to_hpln(
+  std::vector<cudf::table_view> const& tables,
+  duckdb::vector<duckdb::LogicalType> const& column_types,
+  std::vector<std::string> const& column_names,
+  std::string const& plan_dsl,
+  std::size_t group_rows,
+  std::string const& path,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/// Compress @p table with @p plan_dsl and write it to @p path, carrying per-group zone maps.
+///
+/// The counterpart of read_hpln_into_pinned: without a writer that emits statistics there is
+/// nothing for an ingesting reader to prune with, since the bounds cannot be recovered from
+/// compressed bytes without decoding them. @p group_rows of 0 writes no zone-map segment.
+///
+/// Returns an empty string on success.
+[[nodiscard]] std::string write_table_to_hpln(
+  cudf::table_view const& table,
+  duckdb::vector<duckdb::LogicalType> const& column_types,
+  std::vector<std::string> const& column_names,
+  std::string const& plan_dsl,
+  std::size_t group_rows,
+  std::string const& path,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+}  // namespace sirius

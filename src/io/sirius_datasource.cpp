@@ -100,6 +100,12 @@ bool sirius_datasource::is_device_read_preferred(size_t) const
   return _io_ctx->supports_device_read();
 }
 
+std::size_t sirius_datasource::resident_bytes(std::span<const range> ranges) const
+{
+  if (!uses_prefetching_cache()) { return 0; }
+  return _io_ctx->cache()->resident_bytes(*_io_object, ranges);
+}
+
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
   if (uses_prefetching_cache()) {

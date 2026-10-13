@@ -45,6 +45,7 @@
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/simpatico_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -77,6 +78,7 @@
 #include "scan_manager/preparation_ledger.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "sirius_registration.hpp"
 #include "transparent/read_view_registry.hpp"
 
 #include <cudf/cudf_utils.hpp>
@@ -605,6 +607,125 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   return info;
 }
 
+//! Build a `simpatico_ingestible_table_info` from a `read_simpatico` TABLE_SCAN.
+//!
+//! The bind is redone here rather than carried over from `SiriusReadSimpaticoBind`: a .hpln bind
+//! is two small reads with no GPU, and the ingestible additionally needs a host memory space,
+//! which only exists once the Sirius runtime is up. The path travels in `parameters[0]`, the same
+//! channel `sirius_read_parquet` uses, because the bind data is Sirius's own rather than a
+//! MultiFileBindData the plan generator could walk.
+std::unique_ptr<sirius::op::scan::simpatico_ingestible_table_info> build_simpatico_table_info(
+  sirius::op::sirius_physical_table_scan const& scan_op,
+  const sirius::operator_params& op_params,
+  duckdb::ClientContext& context,
+  duckdb::SiriusContext* sirius_ctx)
+{
+  if (sirius_ctx == nullptr) {
+    throw std::runtime_error(
+      "[sirius_physical_plan_generator::build_simpatico_table_info] read_simpatico requires the "
+      "Sirius runtime; there is no CPU reader for .hpln");
+  }
+  if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
+    throw std::runtime_error(
+      "[sirius_physical_plan_generator::build_simpatico_table_info] read_simpatico scan has no "
+      "path parameter");
+  }
+  auto const path = scan_op.parameters.front().GetValue<std::string>();
+
+  auto host_spaces =
+    sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (host_spaces.empty()) {
+    throw std::runtime_error(
+      "[sirius_physical_plan_generator::build_simpatico_table_info] no HOST memory space "
+      "available to stage the .hpln payload");
+  }
+  // Route the file to its backend, exactly as a scan split will: `s3://` reaches the REST
+  // io_context and a local path the uring one. Without this the bind's own reads (trailer,
+  // headers, zone maps) would go through the filesystem, which cannot open a remote object at
+  // all. Null when no backend claims the path -- the transport then reads it locally, and
+  // refuses it outright if it names a scheme.
+  // S3 credentials come from the query's SIRIUS_S3 secret, as for parquet scans: install them for
+  // this path before routing it, or the REST io_context has nothing to sign with.
+  if (sirius::io::s3::is_s3_path(path)) {
+    sirius_ctx->get_scan_manager().install_s3_config(
+      path,
+      sirius::io::s3::resolve_duckdb_s3_secret(
+        context, path, sirius_ctx->get_config().get_scan_manager_config().object_store));
+  }
+  auto io_ctx = sirius_ctx->get_scan_manager().ioctx_for_path(path);
+
+  // The payload stages into pinned host memory before its H2D copy; any host space serves, and
+  // the first is the one every other single-space consumer takes.
+  auto info = sirius::op::scan::bind_simpatico_file(
+    path, *const_cast<cucascade::memory::memory_space*>(host_spaces.front()), std::move(io_ctx));
+  // The file's chunks are bundled up to the same byte budget every other source batches to, so a
+  // .hpln of many small chunks does not pay a decode per chunk.
+  info->approximate_batch_size = op_params.scan_task_batch_size;
+
+  // The scan emits one column per entry of `column_ids`, in that order, because that is what the
+  // projection this branch of create_plan(LogicalGet&) pushes above the scan references. Binding
+  // the full file width instead would leave every reference pointing at the wrong column.
+  info->column_ids.clear();
+  info->column_ids.reserve(scan_op.column_ids.size());
+  for (auto const& column_id : scan_op.column_ids) {
+    if (!column_id.HasPrimaryIndex() || column_id.IsRowIdColumn() || column_id.IsVirtualColumn()) {
+      throw duckdb::NotImplementedException(
+        "read_simpatico: rowid and virtual columns have no backing in a .hpln file");
+    }
+    auto const file_column = static_cast<std::size_t>(column_id.GetPrimaryIndex());
+
+    // The file records what a column DECODES to and, separately, what it means to the engine.
+    // Nothing forces the two to agree -- a writer may store a DECIMAL(12,2) as DECIMAL32 where the
+    // engine carries it as DECIMAL64, or a DATE as a bare INT32 -- and a decoded column whose
+    // carrier is not the one the plan assumes is read as a different type without any conversion.
+    // Refuse here rather than hand the pipeline a mistyped column.
+    auto const carrier = sirius::try_get_cudf_type(sirius::from_duckdb(info->types[file_column]));
+    if (!carrier.has_value()) {
+      throw duckdb::NotImplementedException(
+        "read_simpatico: column '%s' has type %s, which has no native cuDF carrier",
+        info->names[file_column],
+        info->types[file_column].ToString());
+    }
+    if (*carrier != info->physical_types[file_column]) {
+      throw duckdb::NotImplementedException(
+        "read_simpatico: column '%s' is declared %s but the file decodes it as cuDF type id %d; "
+        "the .hpln reader does not convert carriers",
+        info->names[file_column],
+        info->types[file_column].ToString(),
+        static_cast<int>(info->physical_types[file_column].id()));
+    }
+    info->column_ids.push_back(file_column);
+  }
+
+  // The filter is what makes the file's zone maps usable: it drives whole-chunk and sub-chunk
+  // pruning in the metadata walk, and is then applied exactly after the decode. Deep-copied
+  // because this scan operator is destroyed as the leaf replaces it in the plan.
+  if (scan_op.table_filters) {
+    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    for (auto const& [col_idx, filt] : scan_op.table_filters->filters) {
+      info->table_filters->filters[col_idx] = filt->Copy();
+    }
+  }
+  info->duckdb_column_ids = scan_op.column_ids;
+  info->returned_types    = scan_op.returned_types;
+  // What the ingestible's scan_plan splits into output columns and columns read only so the
+  // filter can be evaluated. Both are decoded; only the first group is emitted.
+  info->projection_ids    = scan_op.projection_ids;
+  info->scan_output_arity = scan_op.types.size();
+
+  // The IS NULL conjuncts the scan harvested for itself (see
+  // SiriusReadSimpaticoPushdownComplexFilter). They ride in the bind data because no TableFilter
+  // ever carries them, and they prune only -- the LogicalFilter that owns the predicate is still
+  // above this scan and still applies it.
+  if (auto const* bind =
+        dynamic_cast<duckdb::SiriusReadSimpaticoBindData const*>(scan_op.bind_data.get())) {
+    for (auto const column : bind->is_null_columns) {
+      if (column < info->names.size()) { info->is_null_columns.push_back(column); }
+    }
+  }
+  return info;
+}
+
 /**
  * @brief Builds a GPU scan, wrapping it when registered dynamic-filter producers exist
  *
@@ -1014,6 +1135,8 @@ void certify_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     materializer_kind = sirius::op::scan::materializer_kind::duckdb_native;
   } else if (entry->function_name == "iceberg_scan") {
     materializer_kind = sirius::op::scan::materializer_kind::iceberg;
+  } else if (entry->kind == sirius::op::scan::source_kind::simpatico_file) {
+    materializer_kind = sirius::op::scan::materializer_kind::simpatico;
   }
   scan.contract_id =
     sirius::op::scan::allocate_scan_contract(*scan.read_views,
@@ -1648,6 +1771,27 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_iceberg_scan(
   // binding, so install each path's credential snapshot before the ingestible opens them later.
   install_parquet_s3_configs(*table_info, context, sirius_ctx.get());
   return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
+}
+
+// A .hpln decode applies the pushed-down filter itself, post-decode, so a membership mask from a
+// join build side is the same kind of work and is applied the same way: AST row masks included,
+// as the duckdb-native source does. The leaf's own output is the scan's output (projection
+// pushdown is on), which is what makes the dynamic filter's push ordinals -- which index
+// scan.types -- line up with the columns the leaf actually emits.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_simpatico_scan(
+  sirius::op::sirius_physical_table_scan& scan,
+  sirius::operator_params const& op_params,
+  duckdb::ClientContext& context,
+  sirius::op::scan::dynamic_filter_apply_mode mode)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  return make_gpu_scan_leaf(build_simpatico_table_info(scan, op_params, context, sirius_ctx.get()),
+                            scan,
+                            op_params,
+                            mode,
+                            sirius_ctx.get());
 }
 
 void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expression const& expr,

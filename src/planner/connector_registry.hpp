@@ -115,6 +115,11 @@ duckdb::unique_ptr<op::sirius_physical_operator> lower_iceberg_scan(
   operator_params const&,
   duckdb::ClientContext&,
   op::scan::dynamic_filter_apply_mode);
+duckdb::unique_ptr<op::sirius_physical_operator> lower_simpatico_scan(
+  op::sirius_physical_table_scan&,
+  operator_params const&,
+  duckdb::ClientContext&,
+  op::scan::dynamic_filter_apply_mode);
 op::scan::pre_capture_result registered_iceberg_decline_reason(duckdb::LogicalGet&,
                                                                duckdb::ClientContext&,
                                                                scan_contract_provenance&);

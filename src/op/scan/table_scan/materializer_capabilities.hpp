@@ -20,7 +20,7 @@
 #include <string>
 
 namespace sirius::op::scan {
-enum class materializer_kind : uint8_t { duckdb_native, parquet, iceberg, stream };
+enum class materializer_kind : uint8_t { duckdb_native, parquet, iceberg, stream, simpatico };
 struct materializer_contract_identity {
   materializer_kind kind = materializer_kind::duckdb_native;
   std::string profile;

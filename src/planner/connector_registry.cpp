@@ -106,6 +106,18 @@ op::scan::certification_result supported_iceberg(op::scan::bound_table_scan cons
   return result;
 }
 
+// A .hpln scan has nothing left to certify per file: bind already read and verified the trailer
+// and every chunk header, and read_simpatico has no CPU body to fall back to.
+op::scan::certification_result supported_simpatico(op::scan::bound_table_scan const&,
+                                                   op::sirius_physical_table_scan const&,
+                                                   duckdb::ClientContext&,
+                                                   scan_contract_provenance&)
+{
+  op::scan::certification_result result;
+  result.verdict = op::scan::eligibility_verdict::supported;
+  return result;
+}
+
 op::scan::certification_result supported_native(op::scan::bound_table_scan const&,
                                                 op::sirius_physical_table_scan const& scan,
                                                 duckdb::ClientContext&,
@@ -310,12 +322,31 @@ connector make_sirius_stream_source_connector()
           .certify                    = nullptr};
 }
 
-std::array<connector, 6> const entries{make_seq_scan_connector(),
+// A .hpln is read by Sirius alone: the CPU body of read_simpatico only raises, so there is
+// nothing to replay a failed GPU run on.
+connector make_read_simpatico_connector()
+{
+  return {.function_name              = "read_simpatico",
+          .kind                       = kind::simpatico_file,
+          .registry_profile           = "sirius.read_simpatico.v1",
+          .bind_data_matches          = matches_bind<duckdb::SiriusReadSimpaticoBindData>,
+          .lower                      = lower_simpatico_scan,
+          .filter_mode                = mode::INCLUDE_AST_ROW_MASKS,
+          .byte_source                = bytes::local_file,
+          .permits_cpu_replay         = false,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt,
+          .certify                    = supported_simpatico};
+}
+
+std::array<connector, 7> const entries{make_seq_scan_connector(),
                                        make_parquet_scan_connector(),
                                        make_read_parquet_connector(),
                                        make_sirius_read_parquet_connector(),
                                        make_iceberg_scan_connector(),
-                                       make_sirius_stream_source_connector()};
+                                       make_sirius_stream_source_connector(),
+                                       make_read_simpatico_connector()};
 
 duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::DatabaseInstance& db)
 {
@@ -385,6 +416,7 @@ duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& nam
     return get ? get().functions : duckdb::vector<duckdb::TableFunction>{};
   }
   if (name == "sirius_read_parquet") return {duckdb::GetSiriusReadParquetFunction()};
+  if (name == "read_simpatico") return {duckdb::GetSiriusReadSimpaticoFunction()};
   if (name == "sirius_stream_source") return {exec::get_stream_source_function()};
   // Iceberg is initialized at extension load, never during a planning lookup.
   return {};

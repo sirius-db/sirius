@@ -20,6 +20,7 @@
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/simpatico_gpu_ingestible.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
 #include "transparent/replay_admission.hpp"
@@ -622,6 +623,9 @@ scan_contract_id allocate_scan_contract(transparent::read_view_registry& registr
       eligibility.later_checks = check_bit(later_check::footer_per_file);
       break;
     case materializer_kind::stream: eligibility.later_checks = {}; break;
+    // A .hpln split carries no per-file certificate: bind already read and verified the file's
+    // trailer and every chunk header, so there is nothing left to check per split.
+    case materializer_kind::simpatico: eligibility.later_checks = {}; break;
   }
 
   auto const index = registry.entries_.size();
@@ -807,6 +811,13 @@ void validate_split_for_gpu(scan_contract_id expected,
       }
       coverage(i, checks);
     }
+    return;
+  }
+  if (dynamic_cast<simpatico_scan_info const*>(&split) != nullptr) {
+    // A .hpln split carries no per-file certificate (see allocate_scan_contract): bind verified the
+    // file's trailer and chunk headers, and the contract id was checked above.
+    if (!certificates.empty()) fail("simpatico split carries certificates");
+    if (required.any()) fail("simpatico contract requires physical checks", required);
     return;
   }
   fail("unknown input class");

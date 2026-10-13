@@ -404,6 +404,19 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     identity.bound_names = typed->bound_names;
     identity.selector    = canonical_value_text(duckdb::Value(typed->uri));
     identity.data_view   = file_inventory{static_cast<uint32_t>(paths.size())};
+  } else if (source->kind == source_kind::simpatico_file) {
+    auto const* typed = dynamic_cast<duckdb::SiriusReadSimpaticoBindData const*>(input.bind_data);
+    if (!typed) throw std::runtime_error("read_simpatico capture has no typed bind data");
+    if (paths.empty()) {
+      owned_paths.push_back(typed->path);
+      transient_path_string_capacity += owned_paths.back().capacity() + 1;
+      paths     = {owned_paths, {}};
+      path_info = analyze_paths(paths);
+    }
+    identity.bound_types = typed->bound_types;
+    identity.bound_names = typed->bound_names;
+    identity.selector    = canonical_value_text(duckdb::Value(typed->path));
+    identity.data_view   = file_inventory{static_cast<uint32_t>(paths.size())};
   } else {
     auto const* typed = dynamic_cast<duckdb::MultiFileBindData const*>(input.bind_data);
     if (!typed || !typed->file_list) {

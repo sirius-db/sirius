@@ -15,6 +15,10 @@ set(TEST_SOURCES
     test/cpp/transparent/test_late_failure.cpp
     test/cpp/transparent/test_plan_source_policy.cpp
     test/cpp/scan/test_scan_contracts.cpp
+    test/cpp/compression/test_hpln_ingest.cpp
+    test/cpp/compression/test_hpln_io.cpp
+    test/cpp/compression/test_simpatico_ingestible.cpp
+    test/cpp/compression/test_simpatico_pruning.cpp
     test/cpp/scan/test_scan_verdicts.cpp
     test/cpp/scan/test_certification_cost.cpp
     test/cpp/integration/test_transparent_verdicts.cpp
@@ -104,6 +108,9 @@ set(TEST_SOURCES
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_required_null_scan.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
+    test/cpp/integration/test_pin_simpatico_sql.cpp
+    test/cpp/integration/test_read_simpatico_sql.cpp
+    test/cpp/integration/test_simpatico_copy_sql.cpp
     test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
@@ -169,6 +176,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_insert_delta_job.cpp
     test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
+    test/cpp/scan_manager/test_pin_clustering.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/scan_manager/test_pin_registry_epoch_mutations.cpp
     test/cpp/scan_manager/test_pinned_entry_column_lookup.cpp
@@ -325,6 +333,13 @@ set(TEST_SOURCES
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)
 # cmake-format: on
+
+# Appended after every other test source on purpose: these cases turn
+# SIRIUS_EXP_FUSED_SCAN_FILTER on, the knob is read once per process and cached,
+# and Catch2 runs cases in declaration order -- which is link order, which is
+# this list's order. Declared anywhere earlier, they would leave the
+# experimental decode-time filtering enabled for every case after them.
+list(APPEND TEST_SOURCES test/cpp/compression/test_simpatico_decode_filter.cpp)
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
 # caught by the check-orphan-tests pre-commit hook

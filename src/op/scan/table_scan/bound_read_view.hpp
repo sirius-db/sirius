@@ -41,7 +41,13 @@ class sirius_physical_table_scan;
 }
 namespace sirius::op::scan {
 /// Storage or streaming source category used by scan admission.
-enum class source_kind : uint8_t { duckdb_native, parquet_local, parquet_s3, stream_source };
+enum class source_kind : uint8_t {
+  duckdb_native,
+  parquet_local,
+  parquet_s3,
+  stream_source,
+  simpatico_file
+};
 /// Detail available in captured file observations, not a snapshot guarantee.
 enum class evidence_depth : uint8_t { path, path_and_size, path_size_and_tag };
 

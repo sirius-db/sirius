@@ -516,6 +516,7 @@ char const* dump_source_kind(op::scan::source_kind kind)
     case op::scan::source_kind::parquet_local: return "parquet_local";
     case op::scan::source_kind::parquet_s3: return "parquet_s3";
     case op::scan::source_kind::stream_source: return "stream_source";
+    case op::scan::source_kind::simpatico_file: return "simpatico_file";
   }
   return "unknown";
 }

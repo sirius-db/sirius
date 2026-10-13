@@ -367,6 +367,12 @@ class prefetching_cache {
   /// rather than a value to compute an exact target from.
   [[nodiscard]] std::size_t claimed_bytes() const noexcept;
 
+  /// Bytes of @p ranges of @p obj already loaded in this cache (chunks cached or being read).
+  /// Read-only: subscribes, pins and reorders nothing. A partly filled chunk counts by its overlap
+  /// with the range, so this is an estimate -- meant for choosing what to read first.
+  [[nodiscard]] std::size_t resident_bytes(const io_object& obj,
+                                           std::span<const range> ranges) const;
+
   /// Ask the evictor to free at least @p bytes_to_free bytes of staging memory.
   ///
   /// Asynchronous and best-effort: this enqueues the demand and returns.  The

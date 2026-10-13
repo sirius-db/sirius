@@ -281,6 +281,18 @@ def _pin_call(
         f"SIRIUS_PIN_TIER_{table.upper()}", os.environ.get("SIRIUS_PIN_TIER", "gpu")
     )
     col_literals = ",".join(f"'{c}'" for c in cols)
+    # SIRIUS_PIN_CLUSTER_<TABLE>=col[,col] sorts each pin chunk on those columns, so its zone maps
+    # describe a narrow key range instead of the whole one. Only keys that are actually pinned may
+    # be named (pin_table throws otherwise), so a key outside `cols` is dropped here rather than
+    # failing the run. Not supported for duckdb-native pins, whose rows must keep table order.
+    cluster = [
+        c.strip()
+        for c in os.environ.get(f"SIRIUS_PIN_CLUSTER_{table.upper()}", "").split(",")
+        if c.strip() and c.strip() in cols
+    ]
+    cluster_arg = (
+        ", cluster_by=[" + ",".join(f"'{c}'" for c in cluster) + "]" if cluster else ""
+    )
     if data_source == "duckdb":
         return (
             f"CALL pin_table(format='duckdb', tier='{tier}', "
@@ -288,7 +300,10 @@ def _pin_call(
         )
     path = pin_globs[table] if pin_globs is not None else detect_pin_glob(source, table)
     path_literal = path.replace("'", "''")
-    return f"CALL pin_table('{path_literal}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
+    return (
+        f"CALL pin_table('{path_literal}', tier='{tier}', name='{table}', "
+        f"cols=[{col_literals}]{cluster_arg});"
+    )
 
 
 def emit_pin(
