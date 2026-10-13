@@ -5,18 +5,28 @@
 #include "codegen/jit/nvrtc_compiler.hpp"
 
 #include <array>
+#include <cstdio>
 #include <limits>
+#include <stdexcept>
 
 namespace codegen::jit::detail {
 
 struct CompilationRequest {
   CompilationRequest(const std::string& source,
                      const std::string& entry,
-                     const CompileOptions& opts);
+                     const CompileOptions& opts)
+    : source(source), entry(entry)
+  {
+    if (opts.arch_cc <= 0) throw std::invalid_argument("NVRTC architecture must be positive");
+    std::snprintf(architecture.data(), architecture.size(), "-arch=sm_%d", opts.arch_cc);
+    options = {"-std=c++20", architecture.data(), "--no-source-include", "-default-device"};
+    for (std::size_t i = 0; i < options.size(); ++i)
+      option_views[i] = options[i];
+  }
   CompilationRequest(const CompilationRequest&)            = delete;
   CompilationRequest& operator=(const CompilationRequest&) = delete;
 
-  RequestView identity_view() const;
+  RequestView identity_view() const { return {source, entry, program_name, option_views}; }
 
   const std::string& source;
   const std::string& entry;

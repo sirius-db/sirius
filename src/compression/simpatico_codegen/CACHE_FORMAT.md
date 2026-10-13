@@ -26,6 +26,12 @@ For example, `v2.1` would use `simpatico-request-v2.1`,
 automatic semantic versioning. Update lookup/cleanup consumers, format expectations,
 and this document in the same change.
 
+The host identity test uses the production request builder in
+[compilation_request.hpp](src/jit/compilation_request.hpp), including its program
+name and effective options, and the production environment encoder. Expected
+digests stay hard-coded in the test. Changes to these inputs or their encoding
+fail the test; review the format version before updating the golden vectors.
+
 New source, entry/program names, options, header contents/inventory, or NVRTC
 versions change the digests automatically; they need no format bump. Neither do
 Sirius releases. An unreleased format can be revised in place.

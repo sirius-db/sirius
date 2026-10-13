@@ -28,23 +28,6 @@
 
 namespace codegen::jit {
 
-detail::CompilationRequest::CompilationRequest(const std::string& source,
-                                               const std::string& entry,
-                                               const CompileOptions& opts)
-  : source(source), entry(entry)
-{
-  if (opts.arch_cc <= 0) throw std::invalid_argument("NVRTC architecture must be positive");
-  std::snprintf(architecture.data(), architecture.size(), "-arch=sm_%d", opts.arch_cc);
-  options = {"-std=c++20", architecture.data(), "--no-source-include", "-default-device"};
-  for (std::size_t i = 0; i < options.size(); ++i)
-    option_views[i] = options[i];
-}
-
-detail::RequestView detail::CompilationRequest::identity_view() const
-{
-  return {source, entry, program_name, option_views};
-}
-
 int arch_cc_for_current_device()
 {
   int dev = 0;

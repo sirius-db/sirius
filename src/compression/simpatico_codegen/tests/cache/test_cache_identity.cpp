@@ -1,4 +1,5 @@
 #include "jit/cache_identity.hpp"
+#include "jit/compilation_request.hpp"
 
 #include <array>
 #include <cstdio>
@@ -35,9 +36,15 @@ int main(int argc, char** argv)
     require(hex_digest(content_identity("abc")) == "06b05ab6733a618578af5f94892f3950",
             "XXH3-128 canonical known vector");
     require(sizeof(Digest) == 16, "128-bit binary digest");
-    std::array<std::string_view, 3> options{"-std=c++20", "-arch=sm_90", "-default-device"};
-    RequestView request{"kernel", "entry", "codegen_jit.cu", options};
+    const std::string source = "kernel", entry = "entry";
+    const CompilationRequest prepared(source, entry, codegen::jit::CompileOptions{90});
+    auto request        = prepared.identity_view();
     const auto expected = request_identity(request);
+    // Golden v2 records: review kCacheFormatVersion before updating either digest.
+    require(hex_digest(expected) == "3af63c078a713e6b594f52722f83d6c1",
+            "request inputs or encoding changed: review kCacheFormatVersion and golden vectors");
+    auto options    = prepared.option_views;
+    request.options = options;
     require(expected == request_identity(request), "request stability");
     require(DigestHash{}(expected) == DigestHash{}(request_identity(request)), "hash stability");
     auto changed   = request;
@@ -51,10 +58,10 @@ int main(int argc, char** argv)
     require(expected != request_identity(changed), "program name");
     options[1] = "-arch=sm_80";
     require(expected != request_identity(request), "architecture option");
-    options[1] = "-arch=sm_90";
+    options[1] = prepared.option_views[1];
     options[0] = "-std=c++17";
     require(expected != request_identity(request), "language option");
-    options[0] = "-std=c++20";
+    options[0] = prepared.option_views[0];
     std::swap(options[0], options[1]);
     require(expected != request_identity(request), "option ordering");
     std::swap(options[0], options[1]);
@@ -74,6 +81,8 @@ int main(int argc, char** argv)
 
     EnvironmentView environment{"project-bytes", "cccl-bytes", 13, 4};
     const auto env = environment_identity(environment);
+    require(hex_digest(env) == "53fbd8bb1756e5116ad915d7c949ea87",
+            "environment encoding changed: review kCacheFormatVersion and golden vectors");
     require(env == environment_identity(environment), "environment stability");
     for (int component = 0; component < 4; ++component) {
       auto variant = environment;
