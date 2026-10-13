@@ -48,7 +48,13 @@ std::unique_ptr<cudf::column> make_stddev_state(std::unique_ptr<cudf::column> co
   children.push_back(std::move(count));
   children.push_back(std::move(mean));
   children.push_back(std::move(m2));
-  return cudf::make_structs_column(rows, std::move(children), 0, rmm::device_buffer{}, stream, mr);
+  return cudf::make_structs_column(
+    rows,
+    std::move(children),
+    0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+    stream,
+    mr);
 }
 
 std::unique_ptr<cudf::column> local_stddev_state(cudf::column_view input,
