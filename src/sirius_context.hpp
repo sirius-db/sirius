@@ -343,7 +343,7 @@ class SiriusContext : public ClientContextState {
     uint64_t checkpoint_revalidation_failures = 0;
     uint64_t lease_held_at_replay             = 0;
     static constexpr std::size_t semantic_reason_count =
-      static_cast<std::size_t>(sirius::op::scan::verdict_reason::callback_mismatch) + 1;
+      static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_delete_corrupt) + 1;
     std::array<uint64_t, semantic_reason_count> semantic_declines{};
     std::array<uint64_t, 3> semantic_verdicts{};
     uint64_t certification_added_time_us_sum = 0;
@@ -354,8 +354,8 @@ class SiriusContext : public ClientContextState {
     uint64_t delete_preparation_time_us      = 0;
     std::array<uint64_t, 2> budget_exceeded{};
     uint64_t setting_lookups_per_attempt = 0;
-    std::array<uint64_t, 8> late_failures{};
-    std::array<uint64_t, 8> late_replays{};
+    std::array<uint64_t, sirius::transparent::late_failure_cause_count> late_failures{};
+    std::array<uint64_t, sirius::transparent::late_failure_cause_count> late_replays{};
     std::array<uint64_t, 6> late_failure_no_replay{};
     uint64_t late_replay_not_read_only  = 0;
     uint64_t discarded_speculative_work = 0;
@@ -436,6 +436,10 @@ class SiriusContext : public ClientContextState {
    * state (Sirius not registered) makes the guard a no-op.
    */
   struct InternalQueryGuard {
+    /// Check the owning execution window before DuckDB starts a database transaction.
+    static void before_transaction_start(ClientContext& outer,
+                                         AttachedDatabase const& database,
+                                         bool read_only);
     explicit InternalQueryGuard(ClientContext& context) noexcept
       : state_(get_sirius_connection_state(context))
     {
@@ -731,7 +735,8 @@ class SiriusContext : public ClientContextState {
     std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
     sirius::query_id_t query_id,
     std::shared_ptr<sirius::pipeline::completion_handler> handler,
-    sirius::telemetry::query_telemetry_info telemetry_info);
+    sirius::telemetry::query_telemetry_info telemetry_info,
+    std::function<bool()> interrupted = {});
 
   /// \brief Get the current query.
   /// \brief Get the current Sirius configuration (const).
@@ -944,10 +949,18 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =
     std::make_shared<sirius::op::scan::physical_check_counters>();
+  // The existing lifecycle slot permits one active window. This borrowed outer
+  // context is valid only within that scope; release clears the association.
+  struct active_execution_window {
+    ClientContext const* outer;
+    sirius::query_id_t query_id;
+    bool internal_start_read_only;  // Test mode, captured once before window entry.
+  };
   mutable std::mutex window_completions_mutex_;
+  std::optional<active_execution_window> active_window_;
   std::map<uint64_t, std::shared_ptr<sirius::pipeline::completion_handler>> window_completions_;
-  std::array<std::atomic<uint64_t>, 8> late_failures_{};
-  std::array<std::atomic<uint64_t>, 8> late_replays_{};
+  std::array<std::atomic<uint64_t>, sirius::transparent::late_failure_cause_count> late_failures_{};
+  std::array<std::atomic<uint64_t>, sirius::transparent::late_failure_cause_count> late_replays_{};
   std::array<std::atomic<uint64_t>, 6> late_failure_no_replay_{};
   std::atomic<uint64_t> late_replay_not_read_only_{0};
   std::atomic<uint64_t> discarded_speculative_work_{0};

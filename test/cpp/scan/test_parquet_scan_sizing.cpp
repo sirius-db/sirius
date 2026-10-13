@@ -67,7 +67,7 @@ std::unique_ptr<scan::parquet_ingestible_table_info> make_nation_info(bool pure_
     info->column_ids.push_back(duckdb::ColumnIndex(3));
     info->projection_ids = {0, 1};
   }
-  info->scan_output_arity      = zero_output ? 0 : 1;
+  info->projected_output_count = zero_output ? 0 : 1;
   info->approximate_batch_size = std::size_t{1} << 30;
   return info;
 }
@@ -114,7 +114,7 @@ scan_estimates read_estimates(std::unique_ptr<scan::parquet_ingestible_table_inf
   CHECK(batch->estimated_working_set_bytes() == file_working);
   return {batch->estimated_bytes(),
           batch->estimated_working_set_bytes(),
-          batch->plan->pure_filter_batch_positions().size()};
+          batch->plan->non_output_batch_positions().size()};
 }
 
 scan_estimates read_estimates(bool pure_filter, bool zero_output = false)
@@ -248,10 +248,10 @@ struct carrier_file_fixture {
       for (std::size_t i = 0; i < info->names.size(); ++i) {
         info->column_ids.emplace_back(i);
       }
-      info->scan_output_arity = info->names.size();
+      info->projected_output_count = info->names.size();
     } else {
-      info->column_ids        = {duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID)};
-      info->scan_output_arity = 0;
+      info->column_ids             = {duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID)};
+      info->projected_output_count = 0;
     }
     return info;
   }
@@ -265,9 +265,9 @@ struct carrier_file_fixture {
     auto const partition_index = info->names.size();
     info->names.push_back("part");
     info->returned_types.push_back(sirius::logical_type::make(partition_type));
-    info->column_ids        = {duckdb::ColumnIndex(partition_index)};
-    info->partition_indices = {duckdb::HivePartitioningIndex("2024", partition_index)};
-    info->scan_output_arity = 1;
+    info->column_ids             = {duckdb::ColumnIndex(partition_index)};
+    info->partition_indices      = {duckdb::HivePartitioningIndex("2024", partition_index)};
+    info->projected_output_count = 1;
     return info;
   }
 
@@ -406,7 +406,7 @@ TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
     info->names          = {"x"};
     info->returned_types = {sirius::logical_type::make(sirius::type_id::INTEGER)};
     info->column_ids = {duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME)};
-    info->scan_output_arity      = 1;
+    info->projected_output_count = 1;
     info->approximate_batch_size = cap;
     info->contract_id            = 1;
     info->virtual_columns        = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
@@ -553,7 +553,7 @@ TEST_CASE("parquet scan plan avoids empty reader projection for hive count star"
                                       projection_ids,
                                       names,
                                       types,
-                                      /*output_types_size=*/0,
+                                      /*projected_output_count=*/0,
                                       year_partition());
 
     CHECK(plan.needs_reader_projection);
@@ -574,7 +574,7 @@ TEST_CASE("parquet scan plan avoids empty reader projection for hive count star"
                                       projection_ids,
                                       names,
                                       types,
-                                      /*output_types_size=*/0,
+                                      /*projected_output_count=*/0,
                                       duckdb::vector<duckdb::HivePartitioningIndex>{});
 
     CHECK(plan.needs_reader_projection);
@@ -593,7 +593,7 @@ TEST_CASE("parquet scan plan avoids empty reader projection for hive count star"
                                       projection_ids,
                                       names,
                                       types,
-                                      /*output_types_size=*/1,
+                                      /*projected_output_count=*/1,
                                       year_partition());
 
     CHECK(plan.needs_reader_projection);
@@ -623,7 +623,7 @@ TEST_CASE("parquet scan plan avoids empty reader projection for hive count star"
                                       projection_ids,
                                       data_names,
                                       data_types,
-                                      /*output_types_size=*/4,
+                                      /*projected_output_count=*/4,
                                       duckdb::vector<duckdb::HivePartitioningIndex>{});
 
     CHECK_FALSE(plan.needs_reader_projection);
@@ -879,17 +879,17 @@ TEST_CASE_METHOD(carrier_file_fixture,
         " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
   }
 
-  auto hive_info                 = std::make_unique<scan::parquet_ingestible_table_info>();
-  hive_info->resolved_file_paths = {first_path, missing_path};
-  hive_info->names               = {"id", "year", "flag"};
-  hive_info->returned_types      = {sirius::logical_type::make(sirius::type_id::BIGINT),
-                                    sirius::logical_type::make(sirius::type_id::BIGINT),
-                                    sirius::logical_type::make(sirius::type_id::BOOLEAN)};
-  hive_info->column_ids          = {duckdb::ColumnIndex(1)};
-  hive_info->partition_indices   = {duckdb::HivePartitioningIndex("2024", 1)};
-  hive_info->scan_output_arity   = 1;
-  auto hive_reader               = scan::make_ingestible(std::move(hive_info));
-  auto first                     = read_file(*hive_reader);
+  auto hive_info                    = std::make_unique<scan::parquet_ingestible_table_info>();
+  hive_info->resolved_file_paths    = {first_path, missing_path};
+  hive_info->names                  = {"id", "year", "flag"};
+  hive_info->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT),
+                                       sirius::logical_type::make(sirius::type_id::BIGINT),
+                                       sirius::logical_type::make(sirius::type_id::BOOLEAN)};
+  hive_info->column_ids             = {duckdb::ColumnIndex(1)};
+  hive_info->partition_indices      = {duckdb::HivePartitioningIndex("2024", 1)};
+  hive_info->projected_output_count = 1;
+  auto hive_reader                  = scan::make_ingestible(std::move(hive_info));
+  auto first                        = read_file(*hive_reader);
   REQUIRE_FALSE(first->carrier_unavailable);
   REQUIRE(first->reader_options->get_column_names().has_value());
   CHECK(*first->reader_options->get_column_names() == std::vector<std::string>{"flag"});
@@ -899,15 +899,15 @@ TEST_CASE_METHOD(carrier_file_fixture,
   REQUIRE_FALSE(fallback->reader_options->get_column_names().has_value());
   CHECK(fallback->partition_values == std::vector<std::string>{"2024"});
 
-  auto identity_info                 = std::make_unique<scan::parquet_ingestible_table_info>();
-  identity_info->resolved_file_paths = {missing_path};
-  identity_info->names               = {"id", "year"};
-  identity_info->returned_types      = {sirius::logical_type::make(sirius::type_id::BIGINT),
-                                        sirius::logical_type::make(sirius::type_id::VARCHAR)};
-  identity_info->column_ids          = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
-  identity_info->scan_output_arity   = 2;
-  auto identity_reader               = scan::make_ingestible(std::move(identity_info));
-  auto identity                      = read_file(*identity_reader);
+  auto identity_info                    = std::make_unique<scan::parquet_ingestible_table_info>();
+  identity_info->resolved_file_paths    = {missing_path};
+  identity_info->names                  = {"id", "year"};
+  identity_info->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT),
+                                           sirius::logical_type::make(sirius::type_id::VARCHAR)};
+  identity_info->column_ids             = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  identity_info->projected_output_count = 2;
+  auto identity_reader                  = scan::make_ingestible(std::move(identity_info));
+  auto identity                         = read_file(*identity_reader);
   REQUIRE_FALSE(identity->carrier_unavailable);
   REQUIRE_FALSE(identity->reader_options->get_column_names().has_value());
   REQUIRE(identity->partition_values.empty());
@@ -965,16 +965,16 @@ TEST_CASE_METHOD(carrier_file_fixture,
                  "parquet projected data sizing also includes partition output",
                  "[scan][parquet][sizing][carrier]")
 {
-  auto info                 = make_partition_info({"a"});
-  info->column_ids          = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(info->names.size() - 1)};
-  info->scan_output_arity   = 2;
-  auto baseline_info        = make_info({"a"});
-  baseline_info->column_ids = {duckdb::ColumnIndex(0)};
-  baseline_info->scan_output_arity = 1;
-  auto reader                      = scan::make_ingestible(std::move(info));
-  auto baseline_reader             = scan::make_ingestible(std::move(baseline_info));
-  auto file                        = read_file(*reader);
-  auto baseline                    = read_file(*baseline_reader);
+  auto info        = make_partition_info({"a"});
+  info->column_ids = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(info->names.size() - 1)};
+  info->projected_output_count          = 2;
+  auto baseline_info                    = make_info({"a"});
+  baseline_info->column_ids             = {duckdb::ColumnIndex(0)};
+  baseline_info->projected_output_count = 1;
+  auto reader                           = scan::make_ingestible(std::move(info));
+  auto baseline_reader                  = scan::make_ingestible(std::move(baseline_info));
+  auto file                             = read_file(*reader);
+  auto baseline                         = read_file(*baseline_reader);
   REQUIRE_FALSE(file->carrier_unavailable);
   REQUIRE(file->reader_options->get_column_names().has_value());
   REQUIRE(baseline->reader_options->get_column_names().has_value());
@@ -1069,13 +1069,13 @@ TEST_CASE_METHOD(carrier_file_fixture,
                  "parquet count star sizing does not charge unprojected hive partitions",
                  "[scan][parquet][sizing][carrier]")
 {
-  auto info               = make_partition_info({"a"});
-  info->column_ids        = {duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID)};
-  info->scan_output_arity = 0;
-  auto reader             = scan::make_ingestible(std::move(info));
-  auto baseline_reader    = scan::make_ingestible(make_info({"a"}));
-  auto file               = read_file(*reader);
-  auto baseline           = read_file(*baseline_reader);
+  auto info                    = make_partition_info({"a"});
+  info->column_ids             = {duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID)};
+  info->projected_output_count = 0;
+  auto reader                  = scan::make_ingestible(std::move(info));
+  auto baseline_reader         = scan::make_ingestible(make_info({"a"}));
+  auto file                    = read_file(*reader);
+  auto baseline                = read_file(*baseline_reader);
   REQUIRE_FALSE(file->carrier_unavailable);
   CHECK(file->partition_values.empty());
   check_partition_byte_delta(*file, *baseline, 0);
@@ -1100,15 +1100,15 @@ TEST_CASE_METHOD(carrier_file_fixture,
   // missing filename-construction scratch in the admission estimate.
   auto info        = make_info({"路径-非常长"}, 1);
   info->column_ids = {duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME)};
-  info->scan_output_arity = 1;
-  info->virtual_columns   = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
-                              "filename",
-                              sirius::logical_type::make(sirius::type_id::VARCHAR),
-                              scan::scan_plan::parquet_virtual_column_kind::FILENAME}};
-  auto reader             = scan::make_ingestible(std::move(info));
-  auto baseline_reader    = scan::make_ingestible(make_info({"路径-非常长"}));
-  auto file               = read_file(*reader);
-  auto baseline           = read_file(*baseline_reader);
+  info->projected_output_count = 1;
+  info->virtual_columns        = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
+                                   "filename",
+                                   sirius::logical_type::make(sirius::type_id::VARCHAR),
+                                   scan::scan_plan::parquet_virtual_column_kind::FILENAME}};
+  auto reader                  = scan::make_ingestible(std::move(info));
+  auto baseline_reader         = scan::make_ingestible(make_info({"路径-非常长"}));
+  auto file                    = read_file(*reader);
+  auto baseline                = read_file(*baseline_reader);
   REQUIRE(file->row_groups.size() == baseline->row_groups.size());
   for (std::size_t i = 0; i < file->row_groups.size(); ++i) {
     auto const rows  = static_cast<std::size_t>(file->row_groups[i].num_rows);

@@ -812,7 +812,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
       info->projection_ids.push_back(static_cast<duckdb::idx_t>(k));
     }
   }
-  info->scan_output_arity      = keep.size();
+  info->projected_output_count = keep.size();
   info->approximate_batch_size = batch_size;
   return info;
 }
@@ -943,6 +943,7 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
     info->projected_types.push_back(t);
     info->output_types.push_back(t);
   }
+  info->projected_output_count = keep.size();
   return info;
 }
 
@@ -3205,6 +3206,12 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     "fail native decode for '*' or the named table after its lease is taken",
                     LogicalType::VARCHAR,
                     Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_internal_start_mode",
+                    "component-only internal transaction start probe: read_only or read_write",
+                    LogicalType::VARCHAR,
+                    Value("read_only"));
   add_sirius_option(config,
                     option_visibility::internal,
                     "sirius_test_sync_native_checkpoint",

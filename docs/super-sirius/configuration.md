@@ -483,6 +483,34 @@ Those two knobs derive the settings below, which are therefore **not** individua
 | `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
 | `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
+### `sirius.executor.scan_manager.preparation`
+
+These settings are loaded at initialization. Count limits must be positive integers. Omitted limits are derived from the scan worker count, N (`scan_manager.num_threads`). Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
+
+| Key | Default | Description |
+|---|---|---|
+| `max_inflight_jobs` | N | Maximum concurrent preparation jobs. |
+| `max_active_units` | 2N | Maximum active preparation units. |
+| `max_pending_results` | 2N | Capacity for result slots and pending output batches. |
+| `max_control_work` | N | Maximum coordinator actions per iteration. |
+| `drain_quantum` | N | Maximum coalescing work per result advancement. |
+| `underfilled_batch_residence` | 10 ms | Time from the first retained input until an underfilled batch becomes due. New arrivals do not reset it. `0` disables timed publication; negative values are rejected. Output backpressure and scheduling can delay publication. |
+| `interrupt_check_interval` | 10 ms | Maximum wait between interruption checks while preparation is idle. Must be positive. Draining an active read can take longer. |
+
+```yaml
+sirius:
+  executor:
+    scan_manager:
+      preparation:
+        max_inflight_jobs: 4
+        max_active_units: 8
+        max_pending_results: 8
+        max_control_work: 4
+        drain_quantum: 4
+        underfilled_batch_residence: 20ms
+        interrupt_check_interval: 5ms
+```
+
 ### `scan_manager.memory_prefetcher` — background host→GPU upload of pinned-cache scan splits (`scan_manager/config.hpp`)
 
 Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
