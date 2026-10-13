@@ -157,6 +157,7 @@ TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order
 #include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <unistd.h>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/pinned_entry_census.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -677,7 +678,9 @@ TEST_CASE("pin_table compression - predicate pushdown declines a non-dictionary 
 // pin whose decode carries that filter returns only the projected columns, and the scan takes the
 // batch over without copying it; every other shape -- a decode that falls back, a count(*) with no
 // projected column, a filtered column that is also projected, an equality the scan still has to
-// evaluate -- must come back with every column. The observable contract is that no answer moves.
+// evaluate -- must come back with every column. A join filter published onto the pinned scan (the
+// TPC-H q3 shape) is not part of the scan's own filter and does not keep the column. The observable
+// contract is that no answer moves.
 TEST_CASE("pin_table compression - decode-time pure-filter column omission preserves results",
           "[compression][pin_table][isolated_context]")
 {
@@ -697,6 +700,13 @@ TEST_CASE("pin_table compression - decode-time pure-filter column omission prese
     "range::BIGINT AS v, CASE range % 4 WHEN 0 THEN 'DELIVER IN PERSON' WHEN 1 THEN 'COLLECT COD' "
     "WHEN 2 THEN 'NONE' ELSE 'TAKE BACK RETURN' END AS s, CASE WHEN range % 7 = 0 THEN NULL ELSE "
     "'n_' || (range % 30)::VARCHAR END AS n FROM range(20000)",
+    1);
+  // A selective dimension to join on v: tag = 'x' keeps the keys that are multiples of 20.
+  auto const dim_dir = tmp / "dim";
+  sirius::test::mgpu::generate_parquet_surface(
+    dim_dir,
+    "SELECT (range * 4)::BIGINT AS key, CASE WHEN range % 5 = 0 THEN 'x' ELSE 'y' END AS tag "
+    "FROM range(5000)",
     1);
 
   sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
@@ -745,6 +755,20 @@ TEST_CASE("pin_table compression - decode-time pure-filter column omission prese
     CAPTURE(query);
     sirius::test::mgpu::require_gpu_matches_cpu(con, query, /*force_cpu_reference=*/true);
   }
+
+  // The join on dim publishes a membership filter for the pinned scan. Whether it reaches the
+  // decode of a given batch is decided at run time, so these assert the answers and that a filter
+  // was built; the decode-time attach itself is covered by the cached-serving tests.
+  auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
+  auto const join   = from + " t JOIN read_parquet('" + sirius::test::mgpu::parquet_glob(dim_dir) +
+                    "') dim ON t.v = dim.key WHERE t.k < 5 AND dim.tag = 'x'";
+  for (auto const& query : std::vector<std::string>{"SELECT SUM(t.d), SUM(t.v) " + join,
+                                                    "SELECT t.d, t.v " + join + " ORDER BY t.v"}) {
+    CAPTURE(query);
+    sirius::test::mgpu::require_gpu_matches_cpu(con, query, /*force_cpu_reference=*/true);
+  }
+  CHECK(sirius::test::get_dynamic_filter_stats_snapshot(con).membership_filters_built >
+        before.membership_filters_built);
 
   run_ok(con, "CALL unpin_table('t_dropfilter');", "unpin dropfilter");
 

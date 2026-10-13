@@ -20,7 +20,9 @@
  * `simpatico::decompress_scan_filter`'s delivered prefix: an applied decode returns exactly that
  * prefix, and every other outcome returns every selected column. The engine cases pin
  * `sirius::decompress_chunk`: a decode drops a scan's trailing pure-filter columns only once it has
- * applied the scan's whole filter, and every other shape keeps them.
+ * applied the scan's whole filter, and every other shape keeps them. A join filter is not part of
+ * that filter, so whether one ran, declined, or was dropped by the decode's probe cap never changes
+ * the decision.
  *
  * Every source has two output columns followed by one column only the filter reads. The numeric
  * sources output "v" = i % 100 and "k" = i % 50 (bitpack) and end in "f" = i % 1000 (bitpack, a
@@ -67,13 +69,6 @@ namespace {
 
 namespace sc = sirius::codegen;
 
-constexpr char const* kRangeSourcePlans =
-  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
-  "---\n"
-  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
-  "---\n"
-  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-
 constexpr char const* kEqualitySourcePlans =
   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
   "---\n"
@@ -102,31 +97,9 @@ constexpr char const* kNullableStringSourcePlans =
   "---\n"
   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 
-/// "f" = i % 1000 under [0, 49] keeps 250 of the 4096 rows, below every selectivity ceiling.
-constexpr std::int32_t kFilterModulus = 1000;
-constexpr std::int64_t kFilterLo      = 0;
-constexpr std::int64_t kFilterHi      = 49;
-
-constexpr std::size_t kOutputWidth = 2;
-std::vector<std::size_t> const kSelected{0, 1, 2};
-
-bool in_filter_range(cudf::size_type i)
-{
-  auto const f = i % kFilterModulus;
-  return f >= kFilterLo && f <= kFilterHi;
-}
-
 bool every_row(cudf::size_type) { return true; }
 
 bool null_in_nullable_source(cudf::size_type i) { return i % 7 == 0; }
-
-simpatico::compressed_table compress_range_source(::cuda::stream_ref stream)
-{
-  auto table = make_source_table(
-    stream, cudf::data_type{cudf::type_id::INT32}, std::optional<std::int32_t>{kFilterModulus});
-  return simpatico::compress_with_plan(
-    table->view(), kRangeSourcePlans, stream, cudf::get_current_device_resource_ref());
-}
 
 simpatico::compressed_table compress_equality_source(::cuda::stream_ref stream)
 {
@@ -173,26 +146,6 @@ simpatico::compressed_table compress_string_source(bool nullable, ::cuda::stream
                                        nullable ? kNullableStringSourcePlans : kStringSourcePlans,
                                        stream,
                                        cudf::get_current_device_resource_ref());
-}
-
-/// The rows of a numeric source that @p keep selects, column by column.
-struct source_rows {
-  std::vector<std::int32_t> v;
-  std::vector<std::int32_t> k;
-  std::vector<std::int32_t> f;
-};
-
-source_rows rows_where(std::predicate<cudf::size_type> auto keep)
-{
-  source_rows rows;
-  for (cudf::size_type i = 0; i < kRows; ++i) {
-    if (keep(i)) {
-      rows.v.push_back(i % 100);
-      rows.k.push_back(i % 50);
-      rows.f.push_back(i % kFilterModulus);
-    }
-  }
-  return rows;
 }
 
 /// The rows of a string source that @p keep selects, column by column ("n" is nullopt where null).
@@ -287,18 +240,6 @@ sc::scan_filter_request equality_request(std::vector<std::string> keys)
   return request;
 }
 
-/// An engine request that carries the scan's whole filter -- the range on "f" -- and says the
-/// output reads only the leading @p output_prefix_width slots.
-sirius::pushdown_request covered_request(std::optional<std::size_t> output_prefix_width)
-{
-  sirius::pushdown_request request;
-  request.columns.resize(kSelected.size());
-  request.columns[2].range          = sirius::decode_range{kFilterLo, kFilterHi};
-  request.ranges_cover_whole_filter = true;
-  request.output_prefix_width       = output_prefix_width;
-  return request;
-}
-
 sirius::decompress_result decompress_with(simpatico::compressed_table const& chunk,
                                           sirius::pushdown_request request,
                                           ::cuda::stream_ref stream)
@@ -310,6 +251,62 @@ sirius::decompress_result decompress_with(simpatico::compressed_table const& chu
                                   sirius::decode_visibility_mask{},
                                   stream,
                                   cudf::get_current_device_resource_ref());
+}
+
+/// Join filters per selected slot, as a scan attaches them to a batch.
+using slot_probes = std::vector<std::vector<sirius::membership_probe>>;
+
+/// A join filter backed by @p keys and ordered by @p selectivity_rank, which defaults to the rank a
+/// snapshot gives an exact hash set.
+sirius::membership_probe key_set_probe(
+  std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> keys,
+  std::uint8_t selectivity_rank = 1)
+{
+  auto const num_keys = static_cast<std::uint64_t>(keys->size());
+  return {[keys = std::move(keys)](cudf::column_view const& column,
+                                   std::uint32_t const* prior_mask_words,
+                                   ::cuda::stream_ref s,
+                                   rmm::device_async_resource_ref mr) {
+            return keys->compute_mask(column, prior_mask_words, /*device_id=*/0, s, mr);
+          },
+          selectivity_rank,
+          num_keys};
+}
+
+/// A join filter that declines every batch, as one does when the slot's type is outside its key
+/// family.
+sirius::membership_probe declining_probe()
+{
+  return {[](cudf::column_view const&,
+             std::uint32_t const*,
+             ::cuda::stream_ref,
+             rmm::device_async_resource_ref) { return std::unique_ptr<cudf::column>{}; },
+          /*selectivity_rank=*/1,
+          /*num_keys=*/10};
+}
+
+/// @p probe as the only join filter, on @p slot.
+slot_probes one_probe(std::size_t slot, sirius::membership_probe probe)
+{
+  slot_probes probes(kSelected.size());
+  probes[slot].push_back(std::move(probe));
+  return probes;
+}
+
+/// Decodes @p chunk under @p request with @p probes attached through
+/// `decompression_pushdown_scan::with_membership_probes`, the way a scan refreshes a batch's join
+/// filters.
+sirius::decompress_result decompress_with_probes(
+  simpatico::compressed_table const& chunk,
+  sirius::pushdown_request request,
+  slot_probes probes,
+  ::cuda::stream_ref stream,
+  sirius::decode_visibility_mask const& keep_mask = {})
+{
+  auto const scan = sirius::decompression_pushdown_scan{std::move(request)}.with_membership_probes(
+    std::move(probes), /*generation=*/1);
+  return sirius::decompress_chunk(
+    chunk, kSelected, scan.get(), keep_mask, stream, cudf::get_current_device_resource_ref());
 }
 
 /// The codec and the engine read the same env gate; an explicit SIRIUS_EXP_FUSED_SCAN_FILTER=0
@@ -509,32 +506,178 @@ TEST_CASE("a decode carrying the whole filter drops the trailing pure-filter col
   require_columns(decoded.table->view(), rows_where(in_filter_range), kOutputWidth, stream);
 }
 
-TEST_CASE("a decode with a join filter keeps every column", "[fused_scan_filter][delivery]")
+TEST_CASE("a decode with a join filter still drops the pure-filter column",
+          "[fused_scan_filter][delivery]")
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
   auto const ct                   = compress_range_source(stream);
 
-  // A join filter can decline per batch, so a decode carrying one never claims the whole filter.
-  auto request = covered_request(kOutputWidth);
-  auto keys    = make_key_set(stream);
-  request.columns[0].membership.push_back({[keys](cudf::column_view const& column,
-                                                  std::uint32_t const* prior_mask_words,
-                                                  ::cuda::stream_ref s,
-                                                  rmm::device_async_resource_ref mr) {
-                                             return keys->compute_mask(
-                                               column, prior_mask_words, /*device_id=*/0, s, mr);
-                                           },
-                                           /*selectivity_rank=*/1,
-                                           /*num_keys=*/10});
-  auto const decoded = decompress_with(ct, std::move(request), stream);
+  // A join filter is not part of the scan's own filter, so the range alone decides coverage.
+  auto const decoded = decompress_with_probes(
+    ct, covered_request(kOutputWidth), one_probe(0, key_set_probe(make_key_set(stream))), stream);
+
+  CHECK(decoded.outcome.row_filtered);
+  CHECK(decoded.outcome.filter_only_columns_dropped);
+  CHECK(decoded.outcome.predicate_columns.empty());
+  // The join filter keeps v = i % 100 in its key set {0, 5, ..., 45}.
+  auto const expected =
+    rows_where([](cudf::size_type i) { return in_filter_range(i) && in_key_set(i % 100); });
+  require_columns(decoded.table->view(), expected, kOutputWidth, stream);
+}
+
+TEST_CASE("a join filter past the delivered prefix is applied but not delivered",
+          "[fused_scan_filter][delivery]")
+{
+  if (gate_off()) { return; }
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const ct                   = compress_range_source(stream);
+
+  // The join filter tests the pure-filter column "f" while the selection is built; "f" is still
+  // dropped from the delivered columns.
+  auto const decoded = decompress_with_probes(
+    ct, covered_request(kOutputWidth), one_probe(2, key_set_probe(make_key_set(stream))), stream);
+
+  CHECK(decoded.outcome.row_filtered);
+  CHECK(decoded.outcome.filter_only_columns_dropped);
+  auto const expected = rows_where(
+    [](cudf::size_type i) { return in_filter_range(i) && in_key_set(i % kFilterModulus); });
+  require_columns(decoded.table->view(), expected, kOutputWidth, stream);
+}
+
+TEST_CASE("a join filter that declines leaves the range's survivors and the drop",
+          "[fused_scan_filter][delivery]")
+{
+  if (gate_off()) { return; }
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const ct                   = compress_range_source(stream);
+
+  auto const decoded = decompress_with_probes(
+    ct, covered_request(kOutputWidth), one_probe(0, declining_probe()), stream);
+
+  // The declined join filter removed nothing, so every survivor is a row of the range.
+  CHECK(decoded.outcome.row_filtered);
+  CHECK(decoded.outcome.filter_only_columns_dropped);
+  require_columns(decoded.table->view(), rows_where(in_filter_range), kOutputWidth, stream);
+}
+
+TEST_CASE("a decode whose only source is a join filter keeps every column",
+          "[fused_scan_filter][delivery]")
+{
+  if (gate_off()) { return; }
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const ct                   = compress_range_source(stream);
+
+  sirius::pushdown_request request;
+  request.columns.resize(kSelected.size());
+  request.output_prefix_width = kOutputWidth;
+  SECTION("the request claims no coverage") { request.ranges_cover_whole_filter = false; }
+  // Coverage needs a range the decode evaluates; a claim with none is not enough.
+  SECTION("the request claims coverage with no range") { request.ranges_cover_whole_filter = true; }
+  auto const decoded = decompress_with_probes(
+    ct, std::move(request), one_probe(0, key_set_probe(make_key_set(stream))), stream);
 
   CHECK_FALSE(decoded.outcome.row_filtered);
   CHECK_FALSE(decoded.outcome.filter_only_columns_dropped);
-  // The join filter keeps v = i % 100 in its key set {0, 5, ..., 45}.
-  auto const expected = rows_where(
-    [](cudf::size_type i) { return in_filter_range(i) && i % 100 < 50 && (i % 100) % 5 == 0; });
+  auto const expected = rows_where([](cudf::size_type i) { return in_key_set(i % 100); });
   require_columns(decoded.table->view(), expected, kSelected.size(), stream);
+}
+
+TEST_CASE("a join filter does not complete a partly carried filter",
+          "[fused_scan_filter][delivery]")
+{
+  if (gate_off()) { return; }
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const ct                   = compress_range_source(stream);
+
+  auto const in_range_and_keys = [](cudf::size_type i) {
+    return in_filter_range(i) && in_key_set(i % 100);
+  };
+  auto request = covered_request(kOutputWidth);
+  SECTION("the ranges are not the scan's whole filter")
+  {
+    request.ranges_cover_whole_filter = false;
+  }
+  // A provably empty conjunct is dropped from the decode and left to the scan, which rejects
+  // every row.
+  SECTION("a conjunct is dropped") { request.columns[1].range = sirius::decode_range{5, 3}; }
+  auto const decoded = decompress_with_probes(
+    ct, std::move(request), one_probe(0, key_set_probe(make_key_set(stream))), stream);
+
+  CHECK_FALSE(decoded.outcome.row_filtered);
+  CHECK_FALSE(decoded.outcome.filter_only_columns_dropped);
+  require_columns(decoded.table->view(), rows_where(in_range_and_keys), kSelected.size(), stream);
+}
+
+TEST_CASE("a decode with a join filter that fails keeps every row and column",
+          "[fused_scan_filter][delivery]")
+{
+  if (gate_off()) { return; }
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const ct                   = compress_string_source(/*nullable=*/true, stream);
+
+  auto const decoded = decompress_with_probes(
+    ct, covered_request(kOutputWidth), one_probe(0, key_set_probe(make_key_set(stream))), stream);
+
+  CHECK_FALSE(decoded.outcome.row_filtered);
+  CHECK_FALSE(decoded.outcome.filter_only_columns_dropped);
+  require_columns(decoded.table->view(),
+                  string_rows_where(every_row, /*nullable=*/true),
+                  kSelected.size(),
+                  stream);
+}
+
+TEST_CASE("a decode with a join filter and a visibility mask consumes both",
+          "[fused_scan_filter][delivery]")
+{
+  if (gate_off()) { return; }
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const ct                   = compress_range_source(stream);
+
+  // Keep every even row.
+  static_assert(kRows % 32 == 0);
+  sirius::decode_visibility_mask keep_even;
+  keep_even.words     = std::make_shared<std::uint32_t[]>(kRows / 32, 0x55555555U);
+  keep_even.row_count = kRows;
+  auto const decoded  = decompress_with_probes(ct,
+                                              covered_request(kOutputWidth),
+                                              one_probe(0, key_set_probe(make_key_set(stream))),
+                                              stream,
+                                              keep_even);
+
+  CHECK(decoded.outcome.row_filtered);
+  CHECK(decoded.outcome.visibility_mask_applied);
+  CHECK(decoded.outcome.filter_only_columns_dropped);
+  auto const expected = rows_where(
+    [](cudf::size_type i) { return i % 2 == 0 && in_filter_range(i) && in_key_set(i % 100); });
+  require_columns(decoded.table->view(), expected, kOutputWidth, stream);
+}
+
+TEST_CASE("join filters past the decode's cap leave the drop in place",
+          "[fused_scan_filter][delivery]")
+{
+  if (gate_off()) { return; }
+  INFO(
+    "fused_gate_armer sets SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER=2 unless the environment overrides it");
+  REQUIRE(sc::decompression_pushdown_max_membership_sources() == 2);
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const ct                   = compress_range_source(stream);
+
+  // Listed out of rank order: the decode sorts them strongest first and carries the first two.
+  slot_probes probes(kSelected.size());
+  probes[1].push_back(key_set_probe(make_key_set(stream, /*step=*/3), /*selectivity_rank=*/2));
+  probes[0].push_back(key_set_probe(make_key_set(stream, /*step=*/5), /*selectivity_rank=*/0));
+  probes[1].push_back(key_set_probe(make_key_set(stream, /*step=*/2), /*selectivity_rank=*/1));
+  auto const decoded =
+    decompress_with_probes(ct, covered_request(kOutputWidth), std::move(probes), stream);
+
+  CHECK(decoded.outcome.row_filtered);
+  CHECK(decoded.outcome.filter_only_columns_dropped);
+  // The capped multiples-of-3 filter on "k" did not run.
+  auto const expected = rows_where([](cudf::size_type i) {
+    return in_filter_range(i) && in_key_set(i % 100) && in_key_set(i % 50, 2);
+  });
+  require_columns(decoded.table->view(), expected, kOutputWidth, stream);
 }
 
 TEST_CASE("a decode carrying part of the filter keeps every column",
