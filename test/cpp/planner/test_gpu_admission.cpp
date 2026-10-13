@@ -18,6 +18,9 @@
 #include "planner/gpu_admission.hpp"
 #include "sirius_config.hpp"
 
+#include <duckdb/storage/statistics/node_statistics.hpp>
+#include <parquet_types.h>
+
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -334,4 +337,92 @@ TEST_CASE("admission default scales with GPU memory between 1 and 8 GiB", "[admi
   CHECK(admission_bytes_per_gpu_for_memory(24 * GiB) == 1 * GiB);
   CHECK(admission_bytes_per_gpu_for_memory(16 * GiB) == 1 * GiB);
   CHECK(admission_bytes_per_gpu_for_memory(0) == 1 * GiB);
+}
+
+TEST_CASE("admission uses the largest available callback row count", "[gpu_admission]")
+{
+  using sirius::planner::detail::reported_row_count;
+  CHECK_FALSE(reported_row_count(duckdb::NodeStatistics{}).has_value());
+  CHECK(reported_row_count(duckdb::NodeStatistics{0}) == 0);
+  CHECK(reported_row_count(duckdb::NodeStatistics{120}) == 120);
+  // Pinned DuckDB reports stored rows as estimated and transaction-local rows in max.
+  CHECK(reported_row_count(duckdb::NodeStatistics{100, 120}) == 120);
+  // Other callbacks may report the two counts in the opposite order.
+  CHECK(reported_row_count(duckdb::NodeStatistics{120, 100}) == 120);
+  duckdb::NodeStatistics max_only;
+  max_only.has_max_cardinality = true;
+  max_only.max_cardinality     = 120;
+  CHECK(reported_row_count(max_only) == 120);
+}
+
+namespace {
+duckdb_parquet::RowGroup admission_string_group(int64_t rows,
+                                                std::optional<int64_t> chars,
+                                                duckdb_parquet::Encoding::type encoding)
+{
+  duckdb_parquet::ColumnMetaData meta;
+  meta.__set_type(duckdb_parquet::Type::BYTE_ARRAY);
+  meta.__set_num_values(rows);
+  meta.__set_encodings({encoding});
+  meta.__set_total_uncompressed_size(10);  // deliberately smaller than the decoded strings
+  if (chars) {
+    duckdb_parquet::SizeStatistics sizes;
+    sizes.__set_unencoded_byte_array_data_bytes(*chars);
+    meta.__set_size_statistics(sizes);
+  }
+  duckdb_parquet::ColumnChunk chunk;
+  chunk.__set_meta_data(meta);
+  duckdb_parquet::RowGroup group;
+  group.__set_num_rows(rows);
+  group.__set_columns({chunk});
+  return group;
+}
+}  // namespace
+
+TEST_CASE("Parquet admission requires decoded sizes for the entire scan", "[gpu_admission]")
+{
+  using duckdb_parquet::Encoding;
+  using sirius::planner::detail::parquet_column_widths;
+  duckdb_parquet::FileMetaData metadata;
+  metadata.__set_row_groups({admission_string_group(10, 100, Encoding::PLAIN),
+                             admission_string_group(30, 900, Encoding::RLE_DICTIONARY)});
+  auto widths = parquet_column_widths(metadata, 1, true);
+  REQUIRE(widths.size() == 1);
+  CHECK(widths[0] == 29);  // (100 + 900) / 40 chars + four-byte offsets
+
+  SECTION("first-file statistics never describe a multi-file scan")
+  {
+    CHECK(parquet_column_widths(metadata, 1, false).empty());
+  }
+  SECTION("one missing row group invalidates the column width")
+  {
+    metadata.row_groups[1] = admission_string_group(30, std::nullopt, Encoding::PLAIN);
+    CHECK_FALSE(parquet_column_widths(metadata, 1, true)[0].has_value());
+  }
+  SECTION("encoded-only chunks retain the configured fallback")
+  {
+    for (auto encoding : {Encoding::PLAIN,
+                          Encoding::DELTA_LENGTH_BYTE_ARRAY,
+                          Encoding::DELTA_BYTE_ARRAY,
+                          Encoding::RLE_DICTIONARY}) {
+      metadata.__set_row_groups({admission_string_group(10, std::nullopt, encoding)});
+      CHECK_FALSE(parquet_column_widths(metadata, 1, true)[0].has_value());
+    }
+  }
+  SECTION("decoded statistics work for delta-encoded strings")
+  {
+    metadata.__set_row_groups({admission_string_group(10, 101, Encoding::DELTA_BYTE_ARRAY)});
+    CHECK(parquet_column_widths(metadata, 1, true)[0] == 15);
+  }
+  SECTION("empty and all-null strings still require offsets")
+  {
+    metadata.__set_row_groups({admission_string_group(10, 0, Encoding::PLAIN)});
+    CHECK(parquet_column_widths(metadata, 1, true)[0] == 4);
+  }
+  SECTION("malformed and nested metadata cannot supply a width")
+  {
+    CHECK(parquet_column_widths(metadata, 2, true).empty());
+    metadata.row_groups[1].columns.clear();
+    CHECK(parquet_column_widths(metadata, 1, true).empty());
+  }
 }
