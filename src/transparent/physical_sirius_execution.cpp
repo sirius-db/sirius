@@ -33,7 +33,6 @@
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
-#include <duckdb/main/query_parameters.hpp>
 #include <duckdb/main/query_result.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
@@ -367,9 +366,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       }
 
       // Execute via the standard sirius_interface path.
-      duckdb::QueryParameters parameters;
       state.result = state.iface->sirius_execute_query(
-        context.client, "transparent_execution", gpu_prepared, parameters, window->query_id());
+        context.client, "transparent_execution", std::move(gpu_prepared), window->query_id());
 
       if (state.result->HasError()) {
         gpu_error = state.result->GetErrorObject();

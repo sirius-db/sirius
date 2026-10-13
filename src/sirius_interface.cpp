@@ -25,6 +25,8 @@
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
 
+#include <absl/cleanup/cleanup.h>
+
 #include <optional>
 #include <stdexcept>
 
@@ -84,15 +86,15 @@ void sirius_interface::cleanup_internal() { sirius_active_query.reset(); }
 duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
   duckdb::ClientContext& context,
   const duckdb::string& query,
-  duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-  const duckdb::QueryParameters& /*parameters*/,
+  duckdb::shared_ptr<sirius_prepared_statement_data> statement,
   sirius::query_id_t query_id)
 {
   D_ASSERT(!sirius_active_query);
   try {
+    absl::Cleanup cleanup                = [this] { cleanup_internal(); };
     sirius_active_query                  = duckdb::make_uniq<sirius_active_query_context>();
     sirius_active_query->query           = query;
-    sirius_active_query->sirius_prepared = std::move(statement_p);
+    sirius_active_query->sirius_prepared = std::move(statement);
     auto& prepared                       = *sirius_active_query->sirius_prepared;
     duckdb::identifier_map_t<duckdb::BoundParameterData> empty_parameters;
     prepared.prepared->Bind(context, empty_parameters);
@@ -105,26 +107,18 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
     D_ASSERT(collector->result_column_types == prepared.prepared->types);
     engine.initialize(std::move(collector));
     engine.execute();
-    auto result = engine.get_result();
     // Detach the materialized result before releasing the plan and executor.
-    cleanup_internal();
-    return result;
+    return engine.get_result();
   } catch (duckdb::SiriusBeginWindowFailureException&) {
     // Preserve the dynamic type: a partially mutated runtime must not fall back.
-    cleanup_internal();
     throw;
   } catch (duckdb::SiriusRuntimeUnavailableException&) {
     // The caller routes this typed error to the transaction-preserving fallback.
-    cleanup_internal();
     throw;
   } catch (std::exception& e) {
-    cleanup_internal();
     duckdb::ErrorData error(e);
     sirius_process_error(error, query);
     return duckdb::make_uniq<duckdb::QueryResult>(std::move(error));
-  } catch (...) {
-    cleanup_internal();
-    throw;
   }
 }
 

@@ -18,7 +18,6 @@
 
 #include "data/data_repository_manager_registry.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/query_parameters.hpp"
 #include "sirius_engine.hpp"
 
 #include <optional>
@@ -68,8 +67,7 @@ class sirius_interface {
   duckdb::unique_ptr<duckdb::QueryResult> sirius_execute_query(
     duckdb::ClientContext& context,
     const duckdb::string& query,
-    duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-    const duckdb::QueryParameters& parameters,
+    duckdb::shared_ptr<sirius_prepared_statement_data> statement,
     sirius::query_id_t query_id);
 
  private:

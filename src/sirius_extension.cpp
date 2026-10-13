@@ -603,7 +603,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
         gstate.sirius_iface =
           make_uniq<::sirius::sirius_interface>(context, data.query_label, session_label);
         gstate.res = gstate.sirius_iface->sirius_execute_query(
-          context, data.query, gpu_prepared, {}, window->query_id());
+          context, data.query, std::move(gpu_prepared), window->query_id());
         if (gstate.res->HasError()) {
           gpu_error = gstate.res->GetErrorObject();
           gstate.res.reset();
