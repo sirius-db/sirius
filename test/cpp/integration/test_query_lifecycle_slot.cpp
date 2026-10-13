@@ -40,6 +40,7 @@
 #include <duckdb/catalog/catalog_search_path.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_data.hpp>
+#include <duckdb/main/database_manager.hpp>
 #include <duckdb/main/query_result.hpp>
 #include <duckdb/main/query_result_stream.hpp>
 #include <duckdb/main/settings.hpp>
@@ -2184,6 +2185,36 @@ void run_concurrent_admission(std::string const& variant,
       return;
     connections.push_back(std::move(con));
   }
+  if (variant == "concurrent_internal_guards") {
+    out.b_started = true;
+    auto& first   = *connections[0]->context;
+    auto& second  = *connections[1]->context;
+    auto database = duckdb::DatabaseManager::Get(*first.db).GetDatabase(
+      duckdb::DatabaseManager::GetDefaultDatabase(first));
+    if (!database) throw std::runtime_error("missing test database");
+    duckdb::SiriusContext::StandaloneQueryScope first_window(*runtime, first, "guard_first");
+    runtime->get_scan_manager().acquire_checkpoint_key(first_window.query_id(), *database);
+    duckdb::SiriusContext::StandaloneQueryScope second_window(*runtime, second, "guard_second");
+    auto rejects_write = [&](duckdb::ClientContext& owner) {
+      try {
+        duckdb::SiriusContext::InternalQueryGuard::before_transaction_start(
+          owner, *database, false);
+        return false;
+      } catch (duckdb::NotImplementedException const&) {
+        return true;
+      }
+    };
+    if (!rejects_write(first) || rejects_write(second))
+      throw std::runtime_error("concurrent windows lost their checkpoint-key ownership");
+    second_window.finish();
+    if (!rejects_write(first))
+      throw std::runtime_error("retiring another window removed the owner's transaction guard");
+    first_window.finish();
+    if (rejects_write(first))
+      throw std::runtime_error("retired window retained its transaction guard");
+    out.b_completed = true;
+    return;
+  }
   if (compressed_pin) {
     auto plan_dir = output.parent_path() / "compressed-plans";
     fs::create_directories(plan_dir);
@@ -2705,6 +2736,7 @@ TEST_CASE_METHOD(QueryLifecycleSlotFixture,
                               "concurrent_cancel",
                               "concurrent_maintenance",
                               "concurrent_many_scans",
+                              "concurrent_internal_guards",
                               "concurrent_two_failures",
                               "concurrent_active_cancel",
                               "concurrent_mixed",

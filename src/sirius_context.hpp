@@ -999,8 +999,8 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =
     std::make_shared<sirius::op::scan::physical_check_counters>();
-  // The existing lifecycle slot permits one active window. This borrowed outer
-  // context is valid only within that scope; release clears the association.
+  // Each admitted window borrows its outer context until that scope releases.
+  // The window mutex protects associations across concurrent connections.
   struct active_execution_window {
     ClientContext const* outer;
     sirius::query_id_t query_id;
