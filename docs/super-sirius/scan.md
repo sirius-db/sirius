@@ -582,7 +582,7 @@ Connection limits, the logical merge-gap hint, footer-probe size, retry budgets,
 
 The prefetching cache is owned by `ioctx`, and `sirius_datasource` forwards reads to it when armed. The cache resolves hits immediately, claims missing chunks, and builds `prepared_io_slice`s that describe the caller's logical range plus contiguous host memory, cache fragments, and/or a device destination. It dispatches misses through `host_device_readv_async_io`; reactors see only this prepared buffer shape and a per-slice completion callback, not cache lookup policy.
 
-A cache is attached only when the backend can benefit from it — `can_use_prefetching_cache()` is true iff the backend supports vectored host reads or bounce-staged host-to-device reads. The cache constructs itself *armed* or *unarmed* from that capability; the ioctx is unaware of the distinction and simply forwards through `cache()`.
+A cache is attached only when the backend can benefit from it — `can_use_prefetching_cache()` is true iff the backend supports vectored host reads or bounce-staged host-to-device reads. The cache constructs itself *armed* or *unarmed* from that capability; the ioctx is unaware of the distinction and simply forwards through `cache()`. Each cache reserves `min_prefetching_budget_fraction` of the host tier when built, so the default (local) ioctx builds its cache only when a query first scans through it (`sirius_scan_manager::ensure_default_cache`); `reset_caches` rebuilds only caches that exist.
 
 The cache does two things beyond classic prefetch:
 
