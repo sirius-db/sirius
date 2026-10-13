@@ -20,10 +20,14 @@
 #include "io/rest/authorizer.hpp"
 #include "io/types.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace sirius::io::rest {
 
@@ -80,16 +84,52 @@ struct rest_io_op_request {
   std::size_t auth_attempt{0};
   bool needs_staging{false};
   std::size_t logical_bytes{0};
+  /// Indices into @c op->iovecs that still need reactor-owned staging. They are
+  /// placeholders (null base, final length) until the worker allocates staging
+  /// just before the GET is armed, which replaces each one with the pinned
+  /// blocks backing it. Empty with @c needs_staging set means the whole
+  /// physical range is staged (the unfused shape). A null iovec that is NOT
+  /// listed here is a hole: bytes a fused GET bridges and discards.
+  std::vector<std::size_t> staging_slots;
+  /// When this request first found no staging; it fails once it has waited
+  /// @c config::staging_wait_timeout. Unset while it has never had to wait.
+  std::optional<std::chrono::steady_clock::time_point> staging_wait_start;
 
-  [[nodiscard]] bool is_device() const noexcept
+  [[nodiscard]] bool is_device() const noexcept { return first_device_copy() != nullptr; }
+
+  /// The first constituent with a device destination; its device owns the
+  /// completion event. A fused operation only mixes copies on one device and
+  /// stream, so any constituent would do.
+  [[nodiscard]] device_cpy_request const* first_device_copy() const noexcept
   {
-    return op != nullptr && op->device_copy != nullptr;
+    if (op == nullptr) return nullptr;
+    if (op->device_copy != nullptr) return op->device_copy.get();
+    for (auto const& part : op->fused_extra) {
+      if (part.device_copy != nullptr) return part.device_copy.get();
+    }
+    return nullptr;
   }
 
+  /// Copy every constituent's window out of the shared read buffers. The event is
+  /// recorded on the last copy only -- it marks the whole operation drained, and
+  /// recording it earlier would let the staging be reused while copies are live.
   [[nodiscard]] cudaError_t copy_h2d_async(cudaEvent_t event = nullptr) const noexcept
   {
     if (!is_device()) return cudaSuccess;
-    return op->device_copy->copy_async(op->io_rng, op->iovecs, event);
+
+    std::vector<device_cpy_request const*> copies;
+    copies.reserve(op->logical_slices());
+    if (op->device_copy != nullptr) copies.push_back(op->device_copy.get());
+    for (auto const& part : op->fused_extra) {
+      if (part.device_copy != nullptr) copies.push_back(part.device_copy.get());
+    }
+    if (copies.empty()) return cudaSuccess;
+
+    for (std::size_t i = 0; i + 1 < copies.size(); ++i) {
+      auto const status = copies[i]->copy_async(op->io_rng, op->iovecs, nullptr);
+      if (status != cudaSuccess) return status;
+    }
+    return copies.back()->copy_async(op->io_rng, op->iovecs, event);
   }
 };
 
