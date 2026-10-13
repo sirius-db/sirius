@@ -82,6 +82,19 @@ struct staged_pinned_chunk {
 [[nodiscard]] std::size_t pinned_column_chunk_count(const scan_manager::pinned_entry& pin,
                                                     const std::string& column_name);
 
+/// Who pays for the device copy of a HOST-tier chunk.
+enum class staging_charge {
+  /// A reservation of its own, held by the staged chunk: for copies that outlive a task or are
+  /// made outside one.
+  own_reservation,
+  /// The reservation the calling task was admitted with: for a copy a task makes on its own
+  /// stream and drops before it ends. A task that asked the space for a second reservation was
+  /// refused whenever its siblings had reserved the rest, however small the chunk and however
+  /// much of its own reservation was unused, and each retry doubled the task's reservation
+  /// until nothing could grant it.
+  task_reservation,
+};
+
 /// Stage chunk @p chunk_index of a pinned column, whatever tier the pin lives on.
 ///
 /// The per-chunk form of @ref stage_pinned_column: a caller that walks a column larger than
@@ -93,7 +106,8 @@ struct staged_pinned_chunk {
   std::size_t chunk_index,
   ::cucascade::memory::memory_space& gpu_space,
   rmm::cuda_stream_view stream,
-  const telemetry::batch_telemetry_info& telemetry_info);
+  const telemetry::batch_telemetry_info& telemetry_info,
+  staging_charge charge = staging_charge::own_reservation);
 
 /**
  * @brief Tier-agnostic replacement for @ref pinned_column_chunk_views.

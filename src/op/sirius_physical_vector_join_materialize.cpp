@@ -539,8 +539,13 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_rig
     std::vector<vss::staged_pinned_chunk> staged;
     std::vector<cudf::column_view> views;
     for (auto const c : needed) {
-      staged.push_back(vss::stage_pinned_column_chunk(
-        *_right_pin, name, static_cast<std::size_t>(c), space, stream, batch_telemetry()));
+      staged.push_back(vss::stage_pinned_column_chunk(*_right_pin,
+                                                      name,
+                                                      static_cast<std::size_t>(c),
+                                                      space,
+                                                      stream,
+                                                      batch_telemetry(),
+                                                      vss::staging_charge::task_reservation));
       views.push_back(staged.back().view);
     }
     auto concat   = views.size() == 1 ? std::make_unique<cudf::column>(views.front(), stream, mr)

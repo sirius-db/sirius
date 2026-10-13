@@ -681,6 +681,44 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a large batch of pairs reads a host-pinned corpus's columns chunk by chunk",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // 30,000 probe rows x top-10 is 300,000 values per corpus column, past what a task gathers
+  // straight from host memory, so each task copies in the corpus chunks its neighbours fall in
+  // (three row groups here) on the reservation it was admitted with. Both columns of a pair
+  // must come from the same corpus row, and a few probe rows' pairs must be DuckDB's.
+  SqlRewriteTables tables(*this);
+  run_ok(
+    "CREATE TABLE sr_wide AS SELECT i::INTEGER AS id, (i * 7 + 3)::BIGINT AS tag, "
+    "[sin(i)::FLOAT, cos(i * 1.3)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.31)::FLOAT]::FLOAT[4] "
+    "AS vec FROM range(300000) t(i);");
+  run_ok(
+    "CREATE TABLE sr_wide_probe AS SELECT i::INTEGER AS id, "
+    "[sin(i * 2.1)::FLOAT, cos(i * 0.9)::FLOAT, sin(i * 1.7)::FLOAT, cos(i * 0.53)::FLOAT]"
+    "::FLOAT[4] AS vec FROM range(30000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_wide', tier => 'host', format => 'duckdb');");
+  std::string const pairs =
+    " FROM sr_wide_probe p, LATERAL (SELECT c.id, c.tag, array_distance(p.vec, c.vec) AS d "
+    "FROM sr_wide c ORDER BY d LIMIT 10) n";
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto const got    = sorted_rows(
+    *con,
+    "SELECT count(*), sum((n.tag - n.id * 7 - 3) * (n.tag - n.id * 7 - 3)), min(n.id) >= 0, "
+       "max(n.id) < 300000" +
+      pairs + ";");
+  sirius::test::require_transparent_execution_delta(
+    before, sirius::test::get_transparent_execution_stats(*con), 1, 0, 1);
+  REQUIRE(got.size() == 1);
+  CHECK(got[0][0] == "300000");
+  CHECK(got[0][1] == "0");
+  CHECK(got[0][2] == "true");
+  CHECK(got[0][3] == "true");
+  require_gpu_matches_duckdb(*con, "SELECT p.id, n.id, n.tag" + pairs + " WHERE p.id < 20;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "a join over a pinned corpus with no lists can build them inside the query",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {

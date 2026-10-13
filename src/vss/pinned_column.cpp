@@ -78,7 +78,8 @@ staged_pinned_chunk stage_pinned_column_chunk(const scan_manager::pinned_entry& 
                                               std::size_t chunk_index,
                                               cucascade::memory::memory_space& gpu_space,
                                               rmm::cuda_stream_view stream,
-                                              const telemetry::batch_telemetry_info& telemetry_info)
+                                              const telemetry::batch_telemetry_info& telemetry_info,
+                                              staging_charge charge)
 {
   if (pin.tier != cucascade::memory::Tier::HOST) {
     auto const views = pinned_column_chunk_views(pin, column_name, gpu_space);
@@ -108,13 +109,15 @@ staged_pinned_chunk stage_pinned_column_chunk(const scan_manager::pinned_entry& 
 
   auto data_rep    = host->slice(cols);
   auto const bytes = data_rep->get_size_in_bytes();
-  std::shared_ptr<cucascade::memory::reservation> reservation{
-    gpu_space.make_reservation_or_null(bytes)};
-  if (!reservation) {
-    throw_staging_shortfall(
-      gpu_space,
-      bytes,
-      "VSS: staging host-tier column '" + column_name + "' chunk " + std::to_string(chunk_index));
+  std::shared_ptr<cucascade::memory::reservation> reservation;
+  if (charge == staging_charge::own_reservation) {
+    reservation = gpu_space.make_reservation_or_null(bytes);
+    if (!reservation) {
+      throw_staging_shortfall(
+        gpu_space,
+        bytes,
+        "VSS: staging host-tier column '" + column_name + "' chunk " + std::to_string(chunk_index));
+    }
   }
 
   auto const batch_id = sirius::get_next_batch_id();
@@ -124,8 +127,13 @@ staged_pinned_chunk stage_pinned_column_chunk(const scan_manager::pinned_entry& 
     telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(
-      sirius::converter_registry::get(), *reservation, stream);
+    if (reservation) {
+      mut.convert_to<cucascade::gpu_table_representation>(
+        sirius::converter_registry::get(), *reservation, stream);
+    } else {
+      mut.convert_to<cucascade::gpu_table_representation>(
+        sirius::converter_registry::get(), &gpu_space, stream);
+    }
     // The converter copies on a stream of its own and binds the copy to it, so the copy's free
     // would be ordered behind nothing the caller does: dropping the chunk right after enqueueing a
     // gather on `stream` hands its memory back while the gather still reads it, and another task
