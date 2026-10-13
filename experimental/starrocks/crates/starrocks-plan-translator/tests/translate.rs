@@ -3300,7 +3300,10 @@ fn exchange_bound_twice_is_rejected() {
     let err = translate_with_streams(
         TPlan::new(vec![exchange_node(7, vec![0])]),
         base_desc(),
-        &[stream_input(7, &["id", "name"]), stream_input(7, &["id", "name"])],
+        &[
+            stream_input(7, &["id", "name"]),
+            stream_input(7, &["id", "name"]),
+        ],
     )
     .unwrap_err();
     assert!(matches!(err, TranslateError::MalformedPlan(_)), "{err:?}");

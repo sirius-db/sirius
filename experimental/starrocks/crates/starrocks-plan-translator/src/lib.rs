@@ -252,17 +252,18 @@ impl PlanTranslator {
 
         let desc = DescriptorTable::try_from(desc_tbl)?;
         let scan_paths = ScanFilePaths::from_fragment(params, &desc)?;
-        let exchange_inputs = exchange_inputs
-            .iter()
-            .try_fold(HashMap::new(), |mut map, input| {
-                match map.insert(input.node_id, input) {
-                    None => Ok(map),
-                    Some(_) => Err(TranslateError::malformed(format!(
-                        "exchange node {} is bound to more than one input stream",
-                        input.node_id
-                    ))),
-                }
-            })?;
+        let exchange_inputs =
+            exchange_inputs
+                .iter()
+                .try_fold(HashMap::new(), |mut map, input| {
+                    match map.insert(input.node_id, input) {
+                        None => Ok(map),
+                        Some(_) => Err(TranslateError::malformed(format!(
+                            "exchange node {} is bound to more than one input stream",
+                            input.node_id
+                        ))),
+                    }
+                })?;
         let mut registry = ExtensionRegistry::new();
         let node_translator::TranslatedFragment {
             root: mut translated,

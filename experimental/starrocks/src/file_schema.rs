@@ -61,13 +61,17 @@ async fn read_schemas_concurrently(paths: &[String]) -> Result<Vec<Vec<PSlotDesc
     for (idx, path) in paths.iter().cloned().enumerate() {
         let permits = permits.clone();
         reads.spawn(async move {
-            let _permit = permits.acquire_owned().await.expect("semaphore is never closed");
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
             (idx, parquet_file_schema(&path).await)
         });
     }
     let mut schemas = vec![Vec::new(); paths.len()];
     while let Some(joined) = reads.join_next().await {
-        let (idx, schema) = joined.map_err(|err| format!("parquet footer read task failed: {err}"))?;
+        let (idx, schema) =
+            joined.map_err(|err| format!("parquet footer read task failed: {err}"))?;
         schemas[idx] = schema?;
     }
     Ok(schemas)
@@ -87,7 +91,9 @@ pub(crate) async fn parquet_files_schema(paths: &[String]) -> Result<Vec<PSlotDe
         .split_first()
         .ok_or_else(|| "no file paths to infer a schema from".to_string())?;
     let mut schemas = read_schemas_concurrently(paths).await?.into_iter();
-    let slots = schemas.next().expect("one schema per path, and paths is non-empty");
+    let slots = schemas
+        .next()
+        .expect("one schema per path, and paths is non-empty");
     for (path, other) in rest.iter().zip(schemas) {
         if other.len() != slots.len() {
             return Err(format!(
