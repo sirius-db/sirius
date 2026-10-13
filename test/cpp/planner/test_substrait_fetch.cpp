@@ -111,9 +111,9 @@ TEST_CASE("Substrait FetchRel: count_expr and offset_expr bound the rows", "[sub
   CHECK(f.rows([](auto& fetch) { *fetch.mutable_count_expr() = i64_literal(3); }) == 3);
   CHECK(f.rows([](auto& fetch) { *fetch.mutable_offset_expr() = i64_literal(7); }) == 3);
   CHECK(f.rows([](auto& fetch) {
-          *fetch.mutable_count_expr()  = i64_literal(4);
-          *fetch.mutable_offset_expr() = i64_literal(8);
-        }) == 2);
+    *fetch.mutable_count_expr()  = i64_literal(4);
+    *fetch.mutable_offset_expr() = i64_literal(8);
+  }) == 2);
   CHECK(f.rows([](auto& fetch) { *fetch.mutable_count_expr() = i64_literal(0); }) == 0);
 }
 
@@ -131,9 +131,9 @@ TEST_CASE("Substrait FetchRel: the deprecated count and offset still work", "[su
   CHECK(f.rows([](auto& fetch) { fetch.set_count(5); }) == 5);
   CHECK(f.rows([](auto& fetch) { fetch.set_count(-1); }) == kRows);
   CHECK(f.rows([](auto& fetch) {
-          fetch.set_count(2);
-          fetch.set_offset(9);
-        }) == 1);
+    fetch.set_count(2);
+    fetch.set_offset(9);
+  }) == 1);
 }
 
 TEST_CASE("Substrait FetchRel: a negative or non-literal bound is refused", "[substrait_fetch]")
@@ -144,7 +144,7 @@ TEST_CASE("Substrait FetchRel: a negative or non-literal bound is refused", "[su
   CHECK_THAT(f.error([](auto& fetch) { *fetch.mutable_offset_expr() = i64_literal(-2); }),
              Catch::Matchers::ContainsSubstring("must not be negative"));
   CHECK_THAT(f.error([](auto& fetch) {
-               fetch.mutable_count_expr()->mutable_selection()->mutable_direct_reference();
-             }),
+    fetch.mutable_count_expr()->mutable_selection()->mutable_direct_reference();
+  }),
              Catch::Matchers::ContainsSubstring("must be a literal"));
 }
