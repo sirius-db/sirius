@@ -28,6 +28,10 @@
 #include <memory>
 #include <optional>
 
+namespace sirius::op::scan {
+class iceberg_ingestible_table_info;
+}
+
 namespace sirius {
 namespace transparent {
 class read_view_registry;
@@ -82,6 +86,10 @@ class sirius_physical_table_scan : public sirius_physical_operator {
                              duckdb::virtual_column_map_t virtual_columns,
                              std::size_t projected_output_count,
                              duckdb::vector<duckdb::LogicalType> duckdb_types = {});
+
+  ~sirius_physical_table_scan() override;
+
+  std::unique_ptr<scan::iceberg_ingestible_table_info> prepared_iceberg_info;
 
   //! The table function
   duckdb::BoundTableFunction function;
