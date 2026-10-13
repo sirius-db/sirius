@@ -4438,6 +4438,15 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                     Value::BIGINT(0));
   add_sirius_option(config,
                     option_visibility::user,
+                    "vector_join_clusters",
+                    "Clusters of the lists a vector join builds inside a statement under "
+                    "vector_join_probes (0, the default: chosen by cost from the probe side's "
+                    "estimated rows, with vector_join_probes stated against sqrt(rows) clusters, "
+                    "at most 1024, and scaled to the count chosen)",
+                    LogicalType::BIGINT,
+                    Value::BIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::user,
                     "vector_join_clustering",
                     "Clustering whose lists vector_join_probes searches (empty: lists of the "
                     "corpus column that would answer exactly)",

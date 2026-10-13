@@ -65,3 +65,61 @@ TEST_CASE("the access path cost model scales each rate by its own resource", "[v
   CHECK(tensor2.brute(s) == a5000.brute(s));
   CHECK(tensor2.lists(s) < a5000.lists(s));
 }
+
+TEST_CASE("lists a statement builds for itself get more clusters for a larger probe side", "[vss]")
+{
+  using sirius::vss::choose_cluster_count;
+  using sirius::vss::scaled_probes;
+  access_path_cost const cost{device_scale{}};
+  sirius::vss::access_path_shape s;
+  s.corpus_rows          = 1e8;
+  s.dim                  = 128;
+  s.list_bytes_per_value = 1;
+  s.lists_on_device      = true;
+
+  // A few thousand probe rows cannot repay a larger build: the reference count, probes as given.
+  s.probe_rows     = 1e4;
+  auto const small = choose_cluster_count(cost, s, 16);
+  CHECK(small.n_clusters == 1024);
+  CHECK(small.probes == 16);
+
+  // A self-join can, and its probes follow the square root of the count.
+  s.probe_rows    = 1e8;
+  auto const self = choose_cluster_count(cost, s, 16);
+  CHECK(self.n_clusters > 1024);
+  CHECK(self.n_clusters <= 16 * 1024);
+  CHECK(self.probes == scaled_probes(16, self.n_clusters, 1024));
+
+  std::int64_t last = 0;
+  for (double const m : {1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9}) {
+    s.probe_rows = m;
+    auto const c = choose_cluster_count(cost, s, 16).n_clusters;
+    CHECK(c >= last);
+    last = c;
+  }
+
+  // Probing every reference cluster asks for the exact answer, which more clusters only delay.
+  s.probe_rows = 1e8;
+  CHECK(choose_cluster_count(cost, s, 1024).n_clusters == 1024);
+
+  // No count leaves a cluster fewer than 256 rows.
+  s.corpus_rows = 1e5;
+  CHECK(choose_cluster_count(cost, s, 4).n_clusters == 316);
+
+  CHECK(scaled_probes(16, 1024, 1024) == 16);
+  CHECK(scaled_probes(16, 4096, 1024) == 32);
+  CHECK(scaled_probes(16, 16384, 1024) == 64);
+  CHECK(scaled_probes(5, 2048, 1024) == 8);
+  CHECK(scaled_probes(1024, 4096, 1024) == 4096);
+  CHECK(scaled_probes(16, 512, 1024) == 16);
+  CHECK(scaled_probes(900, 512, 1024) == 512);
+
+  // The two sides of the trade: the build grows with the count, the search falls.
+  s.corpus_rows       = 1e8;
+  s.probe_rows        = 1e7;
+  s.n_clusters        = 1024;
+  auto const build_1k = cost.build(s), search_1k = cost.probed(s, 16);
+  s.n_clusters = 16384;
+  CHECK(cost.build(s) > build_1k);
+  CHECK(cost.probed(s, 64) < search_1k);
+}

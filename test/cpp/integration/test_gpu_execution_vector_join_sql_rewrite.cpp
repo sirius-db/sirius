@@ -624,6 +624,63 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "vector_join_clusters sets the count of an in-query build, and probes follow it",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // 4,000 rows: the reference count is 63. An explicit vector_join_clusters builds that many
+  // lists and searches exactly vector_join_probes of them. With the setting back at 0 the probes
+  // are stated against the reference and scaled to what the kept lists have: 2 of 63 is
+  // ceil(2 * sqrt(252 / 63)) = 4 of 252.
+  SqlRewriteTables tables(*this);
+  auto const bytes = [](const std::string& seed) {
+    return "list_transform(range(16), lambda d: (hash(i * 100 + d + " + seed +
+           ") % 256)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE sr_count AS SELECT i::INTEGER AS id, " + bytes("0") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE sr_count_probe AS SELECT i::INTEGER AS id, " + bytes("9999") +
+         " AS vec FROM range(30) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_count', tier => 'gpu', format => 'duckdb');");
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit()
+    {
+      con.Query("RESET vector_join_probes;");
+      con.Query("RESET vector_join_clusters;");
+    }
+  } reset{*con};
+  auto const sql =
+    "SELECT p.id, n.id, n.d FROM sr_count_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_count c ORDER BY d LIMIT 5) n;";
+  auto const tvf = [&](int probes) {
+    return sorted_rows(
+      *con,
+      "SELECT left_id, right_id, distance FROM sirius_knn_join('sr_count_probe','vec','sr_count',"
+      "'vec', probe_source => 'scan', search_mode => 'approx', "
+      "clustering => '__sirius_auto_sr_count_vec', n_probes => " +
+        std::to_string(probes) + ", k => 5);");
+  };
+  run_ok("SET vector_join_clusters = 252;");
+  run_ok("SET vector_join_probes = 2;");
+  auto const fixed = sorted_rows(*con, sql);
+  auto centroids   = con->Query(
+    "SELECT count(DISTINCT cluster_id) FROM "
+      "sirius_kmeans_centroids('__sirius_auto_sr_count_vec');");
+  REQUIRE_FALSE(centroids->HasError());
+  REQUIRE(centroids->GetValue(0, 0).GetValue<std::int64_t>() == 252);
+  auto const two = tvf(2), four = tvf(4);
+  REQUIRE_FALSE(rows_match(two, four));
+  CHECK(rows_match(fixed, two));
+
+  run_ok("RESET vector_join_clusters;");
+  CHECK(rows_match(sorted_rows(*con, sql), four));
+  // Every reference cluster is still every cluster.
+  run_ok("SET vector_join_probes = 63;");
+  require_gpu_matches_duckdb(*con, sql);
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "a join over a pinned corpus with no lists can build them inside the query",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
