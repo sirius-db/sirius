@@ -23,6 +23,15 @@
 
 namespace sirius {
 
+// Checked day arithmetic; distinct from generic numeric add/subtract.
+enum class date_arithmetic_operation : uint8_t {
+  none,
+  date_add_days,
+  days_add_date,
+  date_sub_days,
+  date_difference
+};
+
 /**
  * @brief Closed identifier for every named scalar function the Sirius GPU
  *        executor recognises today.

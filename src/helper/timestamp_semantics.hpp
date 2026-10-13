@@ -23,6 +23,8 @@
 
 #include <cuda/stream>
 
+#include <expression/function_id.hpp>
+
 #include <memory>
 
 namespace sirius::temporal {
@@ -50,5 +52,16 @@ namespace sirius::temporal {
  */
 [[nodiscard]] std::unique_ptr<cudf::column> cast_to_microseconds_checked(
   cudf::column_view const& input, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr);
+
+// Applies a bound DATE/day signature. Offsets preserve NULL and infinity and
+// throw invalid_input_exception on finite overflow. Differences subtract raw day
+// counts in INT64. Inputs must have equal lengths; overflow checks synchronize
+// the supplied stream.
+[[nodiscard]] std::unique_ptr<cudf::column> date_arithmetic_checked(
+  cudf::column_view const& left,
+  cudf::column_view const& right,
+  date_arithmetic_operation operation,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::temporal
