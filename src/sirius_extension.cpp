@@ -2461,7 +2461,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
 // latched unavailable (stable, session-preserving error). Connection-local
 // settings (gpu_execution, enable_duckdb_fallback, fuse_merge_pipelines,
 // like_swar_fastpath) and operator_params setters are not gated here; the latter
-// serialize via lock_operator_params_slot instead.
+// use connection-local operator parameters instead.
 static void throw_if_sirius_runtime_unavailable(ClientContext& context)
 {
   if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -2602,9 +2602,7 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
 
 static void SetCrossJoinTaskBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  auto slot                     = lock_operator_params_slot(context);
+  auto* params                  = get_operator_params(context, scope);
   params->cross_join_task_bytes = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config CROSS_JOIN_TASK_BYTES to {}", params->cross_join_task_bytes);
 }
@@ -2919,9 +2917,7 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
 
 static void SetEnableDecimalSumStatsBound(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  auto slot                              = lock_operator_params_slot(context);
+  auto* params                           = get_operator_params(context, scope);
   params->enable_decimal_sum_stats_bound = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DECIMAL_SUM_STATS_BOUND to {}",
                    params->enable_decimal_sum_stats_bound);
