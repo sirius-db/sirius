@@ -43,6 +43,9 @@ set(NIXL_CUDA_STUBDIR "${NIXL_CUDA_LIBDIR}/stubs")
 if(NOT EXISTS "${NIXL_CUDA_STUBDIR}/libcuda.so")
   message(FATAL_ERROR "NIXL requires the CUDA toolkit driver stub library")
 endif()
+
+# Cache the toolchain before Meson prepends Python's directory to PATH.
+vcpkg_cmake_get_vars(nixl_cmake_vars)
 vcpkg_configure_meson(
   SOURCE_PATH
   "${SOURCE_PATH}"

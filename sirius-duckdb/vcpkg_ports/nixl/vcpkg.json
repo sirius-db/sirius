@@ -7,6 +7,10 @@
     "ucx",
     {
       "host": true,
+      "name": "vcpkg-cmake-get-vars"
+    },
+    {
+      "host": true,
       "name": "vcpkg-tool-meson"
     }
   ],
