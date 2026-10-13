@@ -669,6 +669,57 @@ simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_sp
 //===----------------------------------------------------------------------===//
 namespace {
 
+/// SIRIUS_HPLN_DIRECT_FETCH -- fetch a planned batch's buffers straight from the prefetching cache
+/// to the device instead of staging the chunk in pinned memory first. On by default; "0" restores
+/// the staged read for every batch.
+bool direct_fetch_enabled()
+{
+  static bool const enabled = [] {
+    auto const* value = std::getenv("SIRIUS_HPLN_DIRECT_FETCH");
+    return value == nullptr || std::string_view{value} != "0";
+  }();
+  return enabled;
+}
+
+/// The decode's payload fetch for a planned chunk: translates the header's payload offsets to file
+/// offsets through the plan's map and RECORDS the reads into @ref pending rather than issuing them.
+/// Reconstruction only allocates the leaf buffers and asks for their bytes; nothing reads them
+/// until the decode, so the caller issues every recorded read of the chunk as one vectored request
+/// first (see the materialize loop). One request lets the cache serve what it holds and send the
+/// rest out together, where a read per buffer would turn every cache miss into its own blocking
+/// round trip. Fails loudly on a range the map does not cover: that would be a planning bug, and a
+/// silent short fill would decode garbage.
+struct cache_payload_fetch {
+  std::vector<simpatico::gather_range> const* file_map;  // sorted by dst_offset
+  std::vector<io::slice>* pending;
+
+  void operator()(std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref) const
+  {
+    if (sz == 0) { return; }
+    auto const& map = *file_map;
+    auto it         = std::upper_bound(
+      map.begin(), map.end(), off, [](std::uint64_t v, simpatico::gather_range const& g) {
+        return v < g.dst_offset;
+      });
+    if (it != map.begin()) { --it; }
+    std::uint64_t at        = off;
+    std::uint64_t const end = off + sz;
+    for (; it != map.end() && at < end; ++it) {
+      if (it->dst_offset + it->size <= at) { continue; }
+      if (it->dst_offset > at) { break; }  // a hole: reported below
+      auto const take = std::min(end, it->dst_offset + it->size) - at;
+      pending->emplace_back(static_cast<std::size_t>(it->src_offset + (at - it->dst_offset)),
+                            static_cast<std::size_t>(take),
+                            static_cast<std::uint8_t*>(dst) + (at - off));
+      at += take;
+    }
+    if (at != end) {
+      throw std::runtime_error("[simpatico_gpu_ingestible] payload range " + std::to_string(off) +
+                               "+" + std::to_string(sz) + " is not covered by the chunk's plan");
+    }
+  }
+};
+
 /// SIRIUS_EXP_HPLN_RANGE_READ -- narrow a .hpln chunk's READ to its surviving decode chunks,
 /// rather than reading the chunk whole and narrowing afterwards.
 ///
@@ -713,26 +764,60 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   // group bounds mostly rule out costs only its surviving bytes. Narrowing after the read -- which
   // is what this did, and what a host pin still does because its bytes are already resident --
   // saves the PCIe copy and the decode but not the I/O, and the I/O is what a network charges for.
-  auto ingested = sirius::read_hpln_chunks_into_pinned(
-    split.path,
-    *_info->host_space,
-    split.chunk_ids,
-    options,
-    _staged_columns,
-    hpln_range_read_enabled() ? std::span<const std::vector<std::uint32_t>>{split.decode_chunks}
-                              : std::span<const std::vector<std::uint32_t>>{});
+  //
+  // When every chunk's read can be planned and the batch has a datasource carrying its prefetch,
+  // nothing is staged at all: the decode's buffer fetches go straight through that datasource,
+  // which serves them from the prefetching cache's pinned chunks to the device -- the copy a
+  // parquet read makes -- instead of copying the cache into a pinned blob and the blob to the
+  // device. Any chunk that cannot be planned without a read sends the batch down the staged path.
+  std::vector<sirius::planned_hpln_chunk> plans;
+  if (_planner && split.datasource && direct_fetch_enabled() && hpln_range_read_enabled()) {
+    plans.reserve(split.chunk_ids.size());
+    for (std::size_t i = 0; i < split.chunk_ids.size(); ++i) {
+      auto const rows = i < split.decode_chunks.size()
+                          ? std::span<const std::uint32_t>{split.decode_chunks[i]}
+                          : std::span<const std::uint32_t>{};
+      auto plan       = _planner->plan_chunk(split.chunk_ids[i], rows);
+      if (!plan) {
+        plans.clear();
+        break;
+      }
+      plans.push_back(std::move(*plan));
+    }
+  }
+  bool const direct = !plans.empty();
+  std::vector<sirius::ingested_hpln_chunk> ingested;
+  if (!direct) {
+    ingested = sirius::read_hpln_chunks_into_pinned(
+      split.path,
+      *_info->host_space,
+      split.chunk_ids,
+      options,
+      _staged_columns,
+      hpln_range_read_enabled() ? std::span<const std::vector<std::uint32_t>>{split.decode_chunks}
+                                : std::span<const std::vector<std::uint32_t>>{});
+  }
+  auto const n_chunks = direct ? plans.size() : ingested.size();
 
   rmm::device_async_resource_ref mr(mem_space.get_default_allocator());
   std::vector<std::unique_ptr<cudf::table>> decoded;
-  decoded.reserve(ingested.size());
+  decoded.reserve(n_chunks);
   // Cleared by any chunk the decode did not fully filter; see the decision below.
   bool row_filtered_batch = _pushdown_scan != nullptr;
-  for (std::size_t i = 0; i < ingested.size(); ++i) {
-    auto const& blob = *ingested[i].blob;
-    simpatico::payload_fetch_fn whole_fetch =
-      [&blob](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
+  static pinned_compressed_blob const no_blob{};
+  std::vector<io::slice> pending_reads;  // a direct chunk's recorded buffer reads
+  for (std::size_t i = 0; i < n_chunks; ++i) {
+    auto const& blob         = direct ? no_blob : *ingested[i].blob;
+    bool const rows_narrowed = direct ? plans[i].rows_narrowed : ingested[i].rows_narrowed;
+    auto const payload_bytes = direct ? plans[i].payload_bytes : blob.payload_bytes;
+    simpatico::payload_fetch_fn whole_fetch;
+    if (direct) {
+      whole_fetch = cache_payload_fetch{&plans[i].file_map, &pending_reads};
+    } else {
+      whole_fetch = [&blob](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
         copy_pinned_blocks_to_device(*blob.payload, off, dst, sz, s);
       };
+    }
 
     // Zone maps ruled some of this chunk's 1024-row decode chunks out. Synthesize a header
     // describing only the survivors and gather only their bytes: the reader and the decode see an
@@ -744,10 +829,10 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     bool use_subset = false;
     // Already narrowed at read time: the blob IS the surviving rows, so there is nothing left to
     // subset and the whole-payload fetch below addresses exactly them.
-    if (ingested[i].rows_narrowed) {
+    if (rows_narrowed) {
       _chunks_read_narrowed.fetch_add(1, std::memory_order_relaxed);
-      _bytes_staged.fetch_add(ingested[i].blob->payload_bytes, std::memory_order_relaxed);
-    } else if (i < split.decode_chunks.size() && !split.decode_chunks[i].empty()) {
+      _bytes_staged.fetch_add(payload_bytes, std::memory_order_relaxed);
+    } else if (!direct && i < split.decode_chunks.size() && !split.decode_chunks[i].empty()) {
       simpatico::payload_host_read_fn read_metadata =
         [&blob](std::uint64_t off, std::uint64_t size, void* dst) {
           copy_pinned_blocks_to_host(*blob.payload, off, dst, size);
@@ -804,7 +889,9 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     // Reconstruct only the columns this scan reads: a projection of a wide file then never pulls
     // the other columns' compressed bytes across PCIe at all.
     auto const compressed = simpatico::read_compressed_table_subset_from_memory(
-      use_subset ? std::span<const std::uint8_t>{subset_header} : blob.header,
+      use_subset ? std::span<const std::uint8_t>{subset_header}
+      : direct   ? std::span<const std::uint8_t>{plans[i].header}
+                 : std::span<const std::uint8_t>{blob.header},
       use_subset ? gathered_fetch : whole_fetch,
       _decode_selection,
       stream,
@@ -814,6 +901,21 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
       throw std::runtime_error("[simpatico_gpu_ingestible] '" + split.path + "' chunk " +
                                std::to_string(split.chunk_ids[i]) +
                                " could not be reconstructed: " + read_error);
+    }
+    if (direct && !pending_reads.empty()) {
+      // Every buffer of this chunk in one request, before anything reads them.
+      std::size_t wanted = 0;
+      for (auto const& r : pending_reads) {
+        wanted += r.size();
+      }
+      auto const got = split.datasource->device_read_ranges_async(pending_reads, stream).get();
+      pending_reads.clear();
+      if (got != wanted) {
+        throw std::runtime_error("[simpatico_gpu_ingestible] '" + split.path + "' chunk " +
+                                 std::to_string(split.chunk_ids[i]) + ": read " +
+                                 std::to_string(got) + " of " + std::to_string(wanted) +
+                                 " planned payload bytes");
+      }
     }
 
     // `compressed` already holds only the projected columns, in the requested order.

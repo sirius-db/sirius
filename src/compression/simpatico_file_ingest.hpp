@@ -327,6 +327,21 @@ class hpln_table_writer {
   std::span<const std::size_t> columns                      = {},
   std::span<const std::vector<std::uint32_t>> decode_chunks = {});
 
+/// A chunk's read, planned but not performed: the header the decode reads and, for each span of
+/// the payload that header addresses, where those bytes live in the FILE (`src_offset` is an
+/// absolute file offset, `dst_offset` the offset the header addresses). Enough to fetch every
+/// buffer the decode asks for straight from the datasource -- and so from the prefetching cache --
+/// without staging the chunk in pinned host memory first.
+struct planned_hpln_chunk {
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::gather_range> file_map;
+  std::uint64_t payload_bytes = 0;
+  std::int64_t num_rows       = 0;
+  /// Whether the plan is narrowed to the caller's surviving decode chunks (as
+  /// @ref ingested_hpln_chunk::rows_narrowed): its header describes only those rows.
+  bool rows_narrowed = false;
+};
+
 /// Works out, for a scan over one .hpln, exactly which bytes each chunk's read will fetch -- so a
 /// scan can tell the prefetching cache before the read happens, as a parquet scan does.
 ///
@@ -358,6 +373,13 @@ class hpln_read_planner {
   /// chunk whose sizing buffers are not in @ref sizing -- in which case the scan simply does not
   /// hint it. Never reads, and safe to call from several threads once @ref prefetch_sizing is done.
   [[nodiscard]] std::vector<hpln_file_range> ranges(
+    std::size_t chunk_id, std::span<const std::uint32_t> decode_chunks) const;
+
+  /// The header and file map a read of @p chunk_id narrowed to @p decode_chunks (empty: the whole
+  /// chunk) would stage -- the same narrowing @ref ranges plans -- without reading or allocating.
+  /// Nullopt when that cannot be known without a read; the caller then stages the chunk as before.
+  /// Safe to call from several threads once @ref prefetch_sizing is done.
+  [[nodiscard]] std::optional<planned_hpln_chunk> plan_chunk(
     std::size_t chunk_id, std::span<const std::uint32_t> decode_chunks) const;
 
  private:

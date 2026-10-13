@@ -437,7 +437,8 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
                              std::vector<hpln_extent>& out_extents,
                              std::shared_ptr<pinned_compressed_blob>& out_blob,
                              hpln_sizing_cache* cache               = nullptr,
-                             std::vector<hpln_file_range>* plan_out = nullptr)
+                             std::vector<hpln_file_range>* plan_out = nullptr,
+                             planned_hpln_chunk* plan_chunk         = nullptr)
 {
   out_blob.reset();
 
@@ -485,7 +486,7 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
         }
         // Planning must never block on a read: a range nobody fetched ahead simply means the
         // chunk cannot be planned, and the caller does not hint it.
-        if (src == nullptr || plan_out != nullptr) { return false; }
+        if (src == nullptr || plan_out != nullptr || plan_chunk != nullptr) { return false; }
         auto const bytes = src->read_range(file_off, r.size, "sizing");
         if (bytes.size() != r.size) { return false; }
         std::memcpy(static_cast<std::uint8_t*>(dst) + r.dst_offset, bytes.data(), r.size);
@@ -515,6 +516,15 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
   if (plan_out != nullptr) {
     for (auto const& g : file_ranges) {
       plan_out->push_back({chunk.payload_offset + g.src_offset, g.size});
+    }
+    return true;
+  }
+  if (plan_chunk != nullptr) {
+    plan_chunk->header        = std::move(narrowed_header);
+    plan_chunk->payload_bytes = payload_bytes;
+    plan_chunk->file_map.reserve(file_ranges.size());
+    for (auto const& g : file_ranges) {
+      plan_chunk->file_map.push_back({chunk.payload_offset + g.src_offset, g.size, g.dst_offset});
     }
     return true;
   }
@@ -936,6 +946,66 @@ std::vector<hpln_file_range> hpln_read_planner::ranges(
     }
   }
   return merged;
+}
+
+std::optional<planned_hpln_chunk> hpln_read_planner::plan_chunk(
+  std::size_t chunk_id, std::span<const std::uint32_t> decode_chunks) const
+{
+  auto const& layout  = _impl->layout->layout;
+  auto const& headers = _impl->layout->headers;
+  if (chunk_id >= layout.chunks.size()) { return std::nullopt; }
+  auto const& chunk = layout.chunks[chunk_id];
+
+  // The same three cases the read walks through, in the same order.
+  planned_hpln_chunk plan;
+  plan.num_rows = chunk.num_rows;
+  if (!decode_chunks.empty()) {
+    std::vector<hpln_extent> unused;
+    std::shared_ptr<pinned_compressed_blob> blob;
+    if (!allocate_chunk_narrowed(headers[chunk_id],
+                                 chunk,
+                                 _impl->columns,
+                                 decode_chunks,
+                                 nullptr,
+                                 _impl->policy,
+                                 nullptr,
+                                 unused,
+                                 blob,
+                                 _impl->sizing.get(),
+                                 nullptr,
+                                 &plan)) {
+      return std::nullopt;
+    }
+    constexpr std::size_t decode_chunk_rows = static_cast<std::size_t>(::codegen::kChunkSize);
+    auto const chunk_rows                   = static_cast<std::size_t>(chunk.num_rows);
+    std::size_t kept                        = 0;
+    for (auto const d : decode_chunks) {
+      auto const begin = static_cast<std::size_t>(d) * decode_chunk_rows;
+      if (begin >= chunk_rows) { continue; }
+      kept += std::min(decode_chunk_rows, chunk_rows - begin);
+    }
+    plan.num_rows      = static_cast<std::int64_t>(kept);
+    plan.rows_narrowed = true;
+  } else if (_impl->columns.empty()) {
+    plan.header        = headers[chunk_id];
+    plan.payload_bytes = chunk.payload_bytes;
+    if (chunk.payload_bytes > 0) {
+      plan.file_map.push_back({chunk.payload_offset, chunk.payload_bytes, 0});
+    }
+  } else {
+    std::vector<simpatico::gather_range> gather;
+    if (!simpatico::build_column_subset_header(
+           headers[chunk_id], _impl->columns, plan.header, gather, &plan.payload_bytes)
+           .empty()) {
+      return std::nullopt;
+    }
+    plan.file_map.reserve(gather.size());
+    for (auto const& g : gather) {
+      plan.file_map.push_back({chunk.payload_offset + g.src_offset, g.size, g.dst_offset});
+    }
+  }
+  std::ranges::sort(plan.file_map, {}, &simpatico::gather_range::dst_offset);
+  return plan;
 }
 
 ingested_hpln read_hpln_into_pinned(std::string const& path,
