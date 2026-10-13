@@ -11,8 +11,7 @@ export VCPKG_CUDA_ARCHITECTURES ?= $(CUDAARCHS)
 override EXT_FLAGS += -DVCPKG_MANIFEST_FEATURES=static -DVCPKG_INSTALL_OPTIONS=--clean-buildtrees-after-build
 endif
 ifneq ($(strip $(SIRIUS_INSTALL_DIR)),)
-# Let CMake discover the package under lib or lib64.
-override EXT_FLAGS += -DCMAKE_PREFIX_PATH='$(SIRIUS_INSTALL_DIR)'
+override EXT_FLAGS += -Dsirius_ROOT='$(SIRIUS_INSTALL_DIR)'
 endif
 
 GEN ?= ninja
