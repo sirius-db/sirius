@@ -43,13 +43,15 @@ using sirius::creator::task_creator_config;
 //! wired because none of the per-query lifecycle entry points below dispatch tasks.
 struct query_state_fixture {
   query_state_fixture()
-    : memory_manager(initialize_memory_manager(1)), creator(task_creator_config{}, *memory_manager)
+    : memory_manager(initialize_memory_manager(1)),
+      creator(lifecycle, task_creator_config{}, *memory_manager)
   {
   }
 
   duckdb::DuckDB db{nullptr};
   duckdb::Connection con{db};
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
+  sirius::exec::query_lifecycle_registry lifecycle;
   task_creator creator;
 };
 
@@ -94,7 +96,8 @@ TEST_CASE("task_creator reset is idempotent for one query", "[task_creator][quer
   REQUIRE_NOTHROW(f.creator.reset(kQueryA));
 }
 
-TEST_CASE("task_creator drain_pending_tasks targets a single query", "[task_creator][query_state]")
+TEST_CASE("task_creator discard_pending_tasks targets a single query",
+          "[task_creator][query_state]")
 {
   query_state_fixture f;
   f.creator.set_client_context(kQueryA, *f.con.context);
@@ -102,9 +105,9 @@ TEST_CASE("task_creator drain_pending_tasks targets a single query", "[task_crea
 
   // Draining one query must not require the other to have queued anything, and an unknown
   // query drains cleanly — the queue stays open for every other producer either way.
-  REQUIRE_NOTHROW(f.creator.drain_pending_tasks(kQueryA));
-  REQUIRE_NOTHROW(f.creator.drain_pending_tasks(kQueryB));
-  REQUIRE_NOTHROW(f.creator.drain_pending_tasks(sirius::make_query_id(99)));
+  REQUIRE_NOTHROW(f.creator.discard_pending_tasks(kQueryA));
+  REQUIRE_NOTHROW(f.creator.discard_pending_tasks(kQueryB));
+  REQUIRE_NOTHROW(f.creator.discard_pending_tasks(sirius::make_query_id(99)));
 
   // Both entries survive a drain: draining pending work is not the same as dropping the query.
   REQUIRE_NOTHROW(f.creator.reset(kQueryA));
@@ -121,4 +124,20 @@ TEST_CASE("task_creator reset_all drops every query's state", "[task_creator][qu
   // not survive into ~task_creator during database destruction.
   REQUIRE_NOTHROW(f.creator.reset_all());
   REQUIRE_NOTHROW(f.creator.reset(kQueryA));
+}
+
+TEST_CASE("task_creator reset requires the owner's lifetime barrier", "[task_creator][query_state]")
+{
+  query_state_fixture f;
+  f.lifecycle.open_query(kQueryA);
+  f.creator.set_client_context(kQueryA, *f.con.context);
+  REQUIRE_THROWS_AS(f.creator.reset(kQueryA), std::logic_error);
+  auto work = f.lifecycle.try_acquire_work(kQueryA);
+  f.lifecycle.quiesce_and_wait_for_submissions(kQueryA);
+  f.creator.discard_pending_tasks(kQueryA);
+  REQUIRE_THROWS_AS(f.creator.reset(kQueryA), std::logic_error);
+  work.reset();
+  f.lifecycle.wait_for_work(kQueryA);
+  REQUIRE_NOTHROW(f.creator.reset(kQueryA));
+  f.lifecycle.close(kQueryA);
 }

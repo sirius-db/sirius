@@ -266,10 +266,10 @@ sub-executor or scan-priority queue owned here.
 |--------|---------|
 | `start()` | Starts every GPU executor, then launches the management thread |
 | `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
-| `prepare_for_query(query)` | Drains executor leftovers and installs query/completion state |
-| `start_query()` | Schedules `query.get_scan_operators().front()` through `task_creator` and returns the completion future |
-| `terminate_query(exception)` | Reports error to completion handler |
-| `drain_after_error()` | Multi-stage drain for clean shutdown |
+| `start_query(query)` | Schedules `query.get_scan_operators().front()` through `task_creator` |
+| `terminate_query(handler, exception)` | Reports an error to that query's completion handler |
+| `validate_query_complete(query_id)` | Checks execution queues after the owner settles publication; does not wait |
+| `discard_query_tasks(query_id)` | Disposes of queued scheduler/pool work; the owner waits for work leases |
 
 ### Management Event Loop
 
@@ -382,15 +382,17 @@ This epilogue is the usual signaller, but not the only one — see the completio
 query-terminal pipeline signals completion there because task-creator, streaming-source, and
 parent-cascade paths can finish a pipeline without returning through the GPU epilogue.
 
-`task_scheduler::prepare_for_query()` installs the handler on terminal pipelines as a
-`std::weak_ptr`, preventing retired pipelines from retaining or signaling a later query's handler.
+`sirius_engine::execute()` creates the handler and future, then passes the handler through
+`SiriusContext::create_query()` to `task_creator::prepare_for_query()`. Terminal pipelines hold it
+as a `std::weak_ptr`, preventing retired pipelines from retaining a handler.
 The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
 after releasing the lock and finishing all pipeline access.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
-`task_scheduler::wait_for_completion()` joins the task creator and in-flight GPU work before
-operators are destroyed.
+`SiriusContext::retire_query_work(query_id, completed)` closes publication, joins scan producers,
+validates execution queues, discards redundant creator hints, and waits for work leases before
+operators can be destroyed.
 
 ### Task Request Flow
 
@@ -441,17 +443,16 @@ If max retries are exceeded, the error propagates and terminates the query.
 
 ## Error Handling and Draining
 
-**File:** `src/pipeline/task_scheduler.cpp`
+**File:** `src/sirius_context.cpp` — `retire_query_work(query_id, mode)`
 
-`drain_after_error()` performs a multi-stage clean shutdown:
+The runtime owner closes the query's publication gate, waits for admitted publishers, and joins
+its scan producers. It then discards that query's creator/scheduler queues and queued pool work.
+GPU staging tasks stay with their managers so accepted handoffs return readiness normally.
+The owner waits for the query's work leases before releasing its resources. Other queries keep
+running; per-query retirement does not stop shared pools or managers.
 
-1. **Stop task creator thread pool** — prevents new tasks from being created
-2. **Drain the task queue** — clears pending pipeline tasks
-3. **Drain GPU executors** — `drain_and_wait()` per device: interrupts the queue, joins the manager thread, waits for all in-flight tasks
-4. **Drain the task creator's pending tasks** — `drain_pending_tasks()` (also clears look-ahead state)
-5. **Clear the task queue again** — catches tasks enqueued during the drain
-
-This ensures that when `drain_after_error()` returns, no tasks are referencing operators or data repositories that are about to be destroyed.
+Successful completion validates execution queues before the work barrier rather than silently
+dropping unfinished execution tasks. See [Query lifetime and retirement](query-lifecycle.md).
 
 ## Key Files
 

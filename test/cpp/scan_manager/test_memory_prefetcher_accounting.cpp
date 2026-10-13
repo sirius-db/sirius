@@ -249,7 +249,8 @@ TEST_CASE("prefetcher admission floor holds against concurrent workers",
 
   stop_counters counters;
   {
-    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space);
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space, lifecycle);
     REQUIRE(
       wait_until([&] { return prefetcher.batches_prefetched() >= 1; }, std::chrono::seconds(60)));
     // Give the other two workers every chance to (incorrectly) admit on the
@@ -314,7 +315,8 @@ TEST_CASE("prefetcher conversion draws down its reservation instead of double-co
   });
 
   {
-    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space);
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space, lifecycle);
     REQUIRE(
       wait_until([&] { return prefetcher.batches_prefetched() >= 1; }, std::chrono::seconds(60)));
     prefetcher.stop();
@@ -354,7 +356,8 @@ TEST_CASE("prefetched batch converts to GPU tier bit-exactly and reads back on a
   cfg.drain_quiet_ms    = 50;
 
   {
-    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space);
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space, lifecycle);
     REQUIRE(
       wait_until([&] { return prefetcher.batches_prefetched() >= 1; }, std::chrono::seconds(60)));
     prefetcher.stop();
@@ -415,7 +418,8 @@ TEST_CASE("prefetcher backs off cleanly when the peak reservation cannot be admi
 
   stop_counters counters;
   {
-    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space);
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space, lifecycle);
     // Let it sweep (and be refused) repeatedly.
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     prefetcher.stop();
@@ -446,7 +450,9 @@ TEST_CASE("Resident certificate refusal is invisible to an active memory prefetc
   cfg.num_threads       = 1;
   cfg.min_free_fraction = 0.05;
   cfg.poll_interval_ms  = 1;
-  memory_prefetcher prefetcher(cfg, {rejected_connector, control_connector}, e.gpu_space);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  memory_prefetcher prefetcher(
+    cfg, {rejected_connector, control_connector}, e.gpu_space, lifecycle);
   scripted_provider invalid;
   invalid.contract_id            = 81;
   invalid.validation.query_token = 17;
