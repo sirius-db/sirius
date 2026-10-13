@@ -65,7 +65,9 @@ std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregat
     case sirius::aggregate_id::sum_no_overflow: return cudf::aggregation::Kind::SUM;
     case sirius::aggregate_id::count: return cudf::aggregation::Kind::COUNT_VALID;
     case sirius::aggregate_id::count_star: return cudf::aggregation::Kind::COUNT_ALL;
-    case sirius::aggregate_id::min: return cudf::aggregation::Kind::MIN;
+    case sirius::aggregate_id::min:
+    // Any non-NULL value of the group is a valid any_value result; MIN is one.
+    case sirius::aggregate_id::any_value: return cudf::aggregation::Kind::MIN;
     case sirius::aggregate_id::max: return cudf::aggregation::Kind::MAX;
     case sirius::aggregate_id::stddev_samp: return cudf::aggregation::Kind::M2;
     case sirius::aggregate_id::avg:

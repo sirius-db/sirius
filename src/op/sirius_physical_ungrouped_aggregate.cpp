@@ -203,8 +203,12 @@ aggregate_layout build_aggregate_layout(
         layout.merge_nth_index.push_back(std::nullopt);
         break;
       case sirius::aggregate_id::min:
+      // Any non-NULL input value is a valid any_value result; MIN is one.
+      case sirius::aggregate_id::any_value:
         if (children.empty()) {
-          throw not_implemented_exception("min() without arguments not supported");
+          throw not_implemented_exception(
+            "{}() without arguments not supported",
+            std::string{sirius::to_duckdb_aggregate_name(agg.function())});
         }
         spec.kind          = aggregate_kind::MIN;
         spec.input_idx     = child_ref_index();

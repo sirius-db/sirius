@@ -478,3 +478,84 @@ TEST_CASE("stream_session SESS-11: a moved session still routes", "[stream_sessi
   REQUIRE(moved.push(1, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32)));
   REQUIRE(in.repo->total_size() == 1);
 }
+
+// ============================================================================
+// SESS-12: one input id read by several plan leaves (a shared subtree the plan
+// instantiates twice) fans every push and close out to all of them
+// ============================================================================
+
+TEST_CASE("stream_session SESS-12: a fan-out input reaches every leaf with its own batch",
+          "[stream_session]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  auto a = make_source({0, 1});
+  auto b = make_source({0, 1});
+  auto c = make_source({0, 1});
+
+  stream_session session;
+  session.add_sources(5, {a.source.get(), b.source.get(), c.source.get()});
+  REQUIRE(session.input_streams() == std::vector<stream_id_t>{5});
+
+  auto batch          = make_numeric_batch<int32_t>(*gpu_space, {1, 2, 3}, cudf::type_id::INT32);
+  auto const original = batch->get_batch_id();
+  REQUIRE(session.push(5, batch));
+  REQUIRE(a.repo->total_size() == 1);
+  REQUIRE(b.repo->total_size() == 1);
+  REQUIRE(c.repo->total_size() == 1);
+
+  // Leaf 0 gets the pushed handle; the others get independent copies with their own ids and the
+  // same rows.
+  auto from_a = a.source->stream().try_pull();
+  auto from_b = b.source->stream().try_pull();
+  auto from_c = c.source->stream().try_pull();
+  REQUIRE(from_a == batch);
+  REQUIRE(from_b != nullptr);
+  REQUIRE(from_c != nullptr);
+  REQUIRE(from_b != batch);
+  REQUIRE(from_c != batch);
+  REQUIRE(from_b->get_batch_id() != original);
+  REQUIRE(from_c->get_batch_id() != original);
+  REQUIRE(from_b->get_batch_id() != from_c->get_batch_id());
+  for (auto const& copy : {from_b, from_c}) {
+    auto read_only = copy->to_read_only();
+    REQUIRE(read_only.get_memory_space() == gpu_space);
+    auto const& table = sirius::get_cudf_table_view(read_only);
+    REQUIRE(table.num_rows() == 3);
+  }
+
+  // Closing a sender closes it on every leaf; the input ends once every leaf has ended.
+  session.close_input(5, 0);
+  REQUIRE(session.input_sender_closed(5, 0));
+  REQUIRE_FALSE(session.input_sender_closed(5, 1));
+  REQUIRE_FALSE(session.input_closed(5));
+  session.close_input(5, 1);
+  REQUIRE(a.source->stream().terminal());
+  REQUIRE(b.source->stream().terminal());
+  REQUIRE(c.source->stream().terminal());
+  REQUIRE(session.input_closed(5));
+
+  // An ended fan-out input refuses further pushes.
+  REQUIRE_FALSE(
+    session.push(5, make_numeric_batch<int32_t>(*gpu_space, {4}, cudf::type_id::INT32)));
+}
+
+TEST_CASE("stream_session SESS-13: fan-out registration is validated", "[stream_session]")
+{
+  auto a = make_source();
+  auto b = make_source();
+
+  stream_session session;
+  REQUIRE_THROWS_AS(session.add_sources(1, {}), sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(session.add_sources(1, {a.source.get(), nullptr}),
+                    sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(session.add_sources(1, {a.source.get(), a.source.get()}),
+                    sirius::invalid_input_exception);
+  REQUIRE(session.input_streams().empty());
+
+  session.add_sources(1, {a.source.get(), b.source.get()});
+  REQUIRE_THROWS_AS(session.add_source(1, *a.source), sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(session.add_sources(1, {b.source.get()}), sirius::invalid_input_exception);
+}

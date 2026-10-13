@@ -20,6 +20,7 @@
 
 #include <duckdb/main/client_context.hpp>
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -77,21 +78,33 @@ const stream_input_binding& stream_bind_catalog::get(stream_id_t id) const
   return it->second;
 }
 
-void stream_bind_catalog::set_built(stream_id_t id, op::sirius_physical_streaming_source* built)
+std::shared_ptr<cucascade::shared_data_repository> stream_bind_catalog::repository_for_next_leaf(
+  stream_id_t id) const
 {
   std::lock_guard<std::mutex> guard(_mutex);
   auto it = _entries.find(id);
   if (it == _entries.end()) { throw_undeclared(id); }
-  if (it->second.built != nullptr) {
-    // Each declared stream backs exactly one batch_stream; a second plan leaf reading the same
-    // id (e.g. a self-join) would silently overwrite the first leaf's pointer here, so pushes
-    // and closes would never reach it and its pipeline would wait forever.
-    throw sirius::invalid_input_exception(
-      "stream_bind_catalog: input stream " + std::to_string(id) +
-      " is read by more than one operator in the same plan — fan-out reads of a single "
-      "declared stream are not supported");
+  if (it->second.built.empty()) { return it->second.repository; }
+  return std::make_shared<cucascade::shared_data_repository>();
+}
+
+void stream_bind_catalog::add_built(stream_id_t id, op::sirius_physical_streaming_source* built)
+{
+  std::lock_guard<std::mutex> guard(_mutex);
+  auto it = _entries.find(id);
+  if (it == _entries.end()) { throw_undeclared(id); }
+  if (built == nullptr) {
+    throw sirius::invalid_input_exception("stream_bind_catalog: input stream " +
+                                          std::to_string(id) + " got a null plan leaf");
   }
-  it->second.built = built;
+  auto& leaves = it->second.built;
+  if (std::find(leaves.begin(), leaves.end(), built) != leaves.end()) {
+    throw sirius::invalid_input_exception("stream_bind_catalog: input stream " +
+                                          std::to_string(id) + " already records this plan leaf");
+  }
+  // A stream read by several leaves (a shared subtree instantiated more than once) gets one
+  // source per leaf; stream_session fans every push and close out to all of them.
+  leaves.push_back(built);
 }
 
 std::vector<stream_id_t> stream_bind_catalog::declared_streams() const

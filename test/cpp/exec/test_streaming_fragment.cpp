@@ -278,6 +278,63 @@ TEST_CASE_METHOD(fragment_fixture,
 }
 
 // ============================================================================
+// FRAG-2b: one declared input stream read by more than one plan leaf (a self-join, or a shared
+// subtree the plan instantiates twice) delivers every batch to every leaf
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-2b: a stream read twice in one plan feeds both reads",
+                 "[integration][streaming_fragment]")
+{
+  struct fan_out_case {
+    const char* query;
+    std::vector<std::int32_t> expected;
+  };
+  const std::vector<fan_out_case> cases{
+    {"SELECT a FROM sirius_stream_source(0) UNION ALL SELECT a FROM sirius_stream_source(0)",
+     {1, 1, 2, 2, 3, 3, 4, 4, 5, 5}},
+    {"SELECT x.a FROM sirius_stream_source(0) x JOIN sirius_stream_source(0) y ON x.a = y.a + 1",
+     {2, 3, 4, 5}},
+    {"SELECT a FROM sirius_stream_source(0) x WHERE a > (SELECT avg(a) FROM "
+     "sirius_stream_source(0))",
+     {4, 5}}};
+
+  for (const auto& test : cases) {
+    CAPTURE(test.query);
+    con->BeginTransaction();
+    try {
+      fragment_spec sender_spec;
+      sender_spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+      sender_spec.outputs     = {0};
+      streaming_fragment sender(*con->context, std::move(sender_spec));
+
+      fragment_spec receiver_spec;
+      receiver_spec.plan_source = sirius::test::sql_plan_source(test.query);
+      receiver_spec.inputs[0]   = stream_input_spec{
+          {"a"},
+        sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+          {0}};
+      receiver_spec.outputs = {1};
+      streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+      sender.build();
+      sender.run();
+      receiver.build();
+      REQUIRE(receiver.relay_from(sender, 0, 0, 0) > 0);
+      receiver.run();
+
+      auto received = drain_values(receiver, 1);
+      std::sort(received.begin(), received.end());
+      REQUIRE(received == test.expected);
+      con->Rollback();
+    } catch (...) {
+      con->Rollback();
+      throw;
+    }
+  }
+}
+
+// ============================================================================
 // FRAG-3: malformed specs are rejected at construction
 // ============================================================================
 

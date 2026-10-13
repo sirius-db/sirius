@@ -29,6 +29,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -123,6 +124,21 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
+  /// The declared spec of input stream `id`, or nullptr when it was never declared.
+  [[nodiscard]] const stream_input_spec* find_input(stream_id_t id) const;
+
+  /// True between a successful build() and run(): the only phase that accepts input batches.
+  [[nodiscard]] bool accepts_input() const { return _phase.load() == phase::built; }
+
+  /// True once `sender` closed input `id`, or the input ended.
+  /// @throws sirius::invalid_input_exception before build() or on an unknown id.
+  [[nodiscard]] bool input_sender_closed(stream_id_t id, sender_id_t sender) const;
+
+  /// Push one externally produced batch into input stream `id`. The caller checks the batch
+  /// against find_input(id)->types. @return false when the input already ended.
+  /// @throws sirius::invalid_input_exception unless accepts_input(), or on an unknown id.
+  bool push_input(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch);
+
   /// nullopt means no batch is parked now, not EOS; use drained(id) for EOS.
   /// @throws sirius::invalid_input_exception before run() or on an unknown id.
   /// @throws the output's poison error, which after a failed run() is that run's cause.
@@ -165,6 +181,12 @@ class streaming_fragment {
     duckdb::shared_ptr<duckdb::PreparedStatementData> prepared);
   void register_sources();
   void poison_outputs(std::exception_ptr cause) noexcept;
+  // Record that input `id` received a batch.
+  void note_input_data(stream_id_t id);
+  // Close `sender` on input `id`. When that ends an input that never received a batch, push one
+  // zero-row batch of the declared types first (see push_empty_batch).
+  void close_sender(stream_id_t id, sender_id_t sender);
+  void push_empty_batch(stream_id_t id, const duckdb::vector<sirius::logical_type>& types);
 
   duckdb::ClientContext& _context;
   fragment_spec _spec;
@@ -185,6 +207,10 @@ class streaming_fragment {
   // Pinned-table registry epoch the plan was generated against; run() rejects a changed one.
   std::uint64_t _planned_pin_epoch{0};
   duckdb::vector<sirius::logical_type> _sink_types;
+  // Inputs that received at least one batch; guarded by _input_mutex, which also serializes
+  // sender closes (close_sender).
+  std::mutex _input_mutex;
+  std::set<stream_id_t> _inputs_with_data;
 };
 
 }  // namespace sirius::exec

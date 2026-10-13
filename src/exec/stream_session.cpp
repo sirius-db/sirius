@@ -16,8 +16,19 @@
 
 #include "exec/stream_session.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/data_batch_probe.hpp"
 
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/cuda_device.hpp>
+
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
+#include <algorithm>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -26,10 +37,28 @@ namespace sirius::exec {
 
 void stream_session::add_source(stream_id_t id, op::sirius_physical_streaming_source& source)
 {
-  if (!_sources.emplace(id, &source).second) {
+  add_sources(id, {&source});
+}
+
+void stream_session::add_sources(stream_id_t id,
+                                 const std::vector<op::sirius_physical_streaming_source*>& sources)
+{
+  if (_sources.find(id) != _sources.end()) {
     throw sirius::invalid_input_exception("stream_session: input stream " + std::to_string(id) +
                                           " is already registered");
   }
+  if (sources.empty()) {
+    throw sirius::invalid_input_exception("stream_session: input stream " + std::to_string(id) +
+                                          " has no source");
+  }
+  std::set<op::sirius_physical_streaming_source*> seen;
+  for (auto* source : sources) {
+    if (source == nullptr || !seen.insert(source).second) {
+      throw sirius::invalid_input_exception("stream_session: input stream " + std::to_string(id) +
+                                            " lists a null or repeated source");
+    }
+  }
+  _sources.emplace(id, sources);
 }
 
 void stream_session::add_sink(std::vector<stream_id_t> ids,
@@ -82,14 +111,15 @@ std::vector<stream_id_t> stream_session::output_streams() const
   return ids;
 }
 
-op::sirius_physical_streaming_source& stream_session::resolve_source(stream_id_t id) const
+const std::vector<op::sirius_physical_streaming_source*>& stream_session::resolve_sources(
+  stream_id_t id) const
 {
   auto it = _sources.find(id);
   if (it == _sources.end()) {
     throw sirius::invalid_input_exception("stream_session: no input stream with id " +
                                           std::to_string(id));
   }
-  return *it->second;
+  return it->second;
 }
 
 const stream_session::sink_output& stream_session::resolve_sink(stream_id_t id) const
@@ -104,17 +134,60 @@ const stream_session::sink_output& stream_session::resolve_sink(stream_id_t id) 
 
 bool stream_session::push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch)
 {
-  return resolve_source(id).push(std::move(batch));
+  const auto& sources = resolve_sources(id);
+  if (sources.size() == 1) { return sources.front()->push(std::move(batch)); }
+
+  // Fan-out: leaves 1..N-1 each get an independent deep copy in the batch's current memory space
+  // (as a broadcast sink does), made before leaf 0 receives the original handle so its pipeline
+  // cannot touch the batch while the copies are read.
+  std::vector<std::shared_ptr<cucascade::data_batch>> copies;
+  if (batch != nullptr) {
+    copies.reserve(sources.size() - 1);
+    auto read_only = batch->to_read_only();
+    auto* space    = read_only.get_memory_space();
+    std::optional<rmm::cuda_set_device_raii> device_guard;
+    if (space != nullptr && space->get_tier() == cucascade::memory::Tier::GPU) {
+      device_guard.emplace(rmm::cuda_device_id{space->get_device_id()});
+    }
+    auto stream = cudf::get_default_stream();
+    for (std::size_t i = 1; i < sources.size(); ++i) {
+      const auto clone_batch_id = sirius::get_next_batch_id();
+      copies.push_back(read_only.clone(
+        clone_batch_id,
+        stream,
+        telemetry::quent_data_batch_probe::create(sources[i]->batch_telemetry(), clone_batch_id)));
+    }
+    // The leaves run on their own streams; the copies must be complete before any reads them.
+    stream.synchronize();
+  }
+  bool accepted = true;
+  for (std::size_t i = 1; i < sources.size(); ++i) {
+    accepted = sources[i]->push(batch != nullptr ? std::move(copies[i - 1]) : nullptr) && accepted;
+  }
+  return sources.front()->push(std::move(batch)) && accepted;
 }
 
 void stream_session::close_input(stream_id_t id, sender_id_t sender)
 {
-  resolve_source(id).close_input(sender);
+  for (auto* source : resolve_sources(id)) {
+    source->close_input(sender);
+  }
 }
 
 bool stream_session::input_closed(stream_id_t id) const
 {
-  return resolve_source(id).stream().terminal();
+  const auto& sources = resolve_sources(id);
+  return std::all_of(
+    sources.begin(), sources.end(), [](auto* source) { return source->stream().terminal(); });
+}
+
+bool stream_session::input_sender_closed(stream_id_t id, sender_id_t sender) const
+{
+  const auto& sources = resolve_sources(id);
+  return std::all_of(sources.begin(), sources.end(), [&](auto* source) {
+    const auto& stream = source->stream();
+    return stream.terminal() || stream.sender_closed(sender);
+  });
 }
 
 std::optional<std::shared_ptr<cucascade::data_batch>> stream_session::pull(stream_id_t id)

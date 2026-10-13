@@ -498,16 +498,17 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
   sirius::op::scan::certification_result stream_result;
   stream_result.verdict = sirius::op::scan::eligibility_verdict::supported;
   read_views->record_verdict(contract_id, stream_result);
-  auto source =
-    duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(binding.types,
-                                                                    op.EstimateCardinality(context),
-                                                                    binding.repository,
-                                                                    binding.expected_senders,
-                                                                    read_views,
-                                                                    contract_id);
+  auto source = duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(
+    binding.types,
+    op.EstimateCardinality(context),
+    catalog->repository_for_next_leaf(bind->stream_id),
+    binding.expected_senders,
+    read_views,
+    contract_id);
 
-  // Plan owns op; catalog.built back-pointer for session registration.
-  catalog->set_built(bind->stream_id, source.get());
+  // Plan owns op; catalog.built back-pointer for session registration. A stream read by more
+  // than one leaf (a shared subtree inlined twice) records every leaf.
+  catalog->add_built(bind->stream_id, source.get());
   return source;
 }
 

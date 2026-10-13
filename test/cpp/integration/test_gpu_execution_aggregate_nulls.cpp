@@ -238,3 +238,98 @@ WHERE a.month = 1 AND b.month = 2
   REQUIRE(expected->RowCount() == 1);
   compare_gpu_vs_cpu_approx(query, {2, 3, 4, 5});
 }
+
+//===----------------------------------------------------------------------===//
+// any_value (DuckDB introduces it for columns functionally dependent on the
+// group key, e.g. TPC-H Q11/Q15/Q22). Any non-NULL value of the group is a
+// valid result, so the deterministic GPU-vs-CPU comparisons only aggregate
+// columns that hold a single distinct non-NULL value per group (the
+// functional-dependency shape). Multi-valued groups are checked with a
+// membership predicate that holds for every valid answer.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// `g` has a NULL key group and an all-NULL group (g = 3). Within each group,
+// i/b/d/f/s/dt each carry one distinct value (or NULL), and NULLs sit before
+// the value in insertion order so a "first row" answer would be wrong. `m` is
+// multi-valued per group. (No DECIMAL(38,x) column: the native DuckDB-table
+// scan does not put DECIMAL128 on the GPU at all, even for a plain projection,
+// so it would fall back for reasons unrelated to any_value.)
+class AnyValueFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  AnyValueFixture()
+  {
+    run_ok(
+      "CREATE TABLE any_v ("
+      "  g  INTEGER,"
+      "  i  INTEGER,"
+      "  b  BIGINT,"
+      "  d  DECIMAL(15,2),"
+      "  f  DOUBLE,"
+      "  s  VARCHAR,"
+      "  dt DATE,"
+      "  m  INTEGER);");
+    run_ok(
+      "INSERT INTO any_v VALUES "
+      "(1,    NULL, NULL, NULL,   NULL, NULL,    NULL,         7),"
+      "(1,    10,   100,  12.34,  1.5,  'one',   '1998-09-02', 3),"
+      "(1,    10,   100,  12.34,  1.5,  'one',   '1998-09-02', 9),"
+      "(2,    -5,   -50,  -7.25,  -0.25,'two',   '1992-01-01', 4),"
+      "(2,    NULL, NULL, NULL,   NULL, NULL,    NULL,         NULL),"
+      "(NULL, 42,   420,  0.01,   2.0,  'null',  '2000-02-29', 1),"
+      "(NULL, NULL, NULL, NULL,   NULL, NULL,    NULL,         2),"
+      "(3,    NULL, NULL, NULL,   NULL, NULL,    NULL,         NULL);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(AnyValueFixture,
+                 "gpu_execution grouped any_value over every TPC-H type skips NULLs",
+                 "[integration][gpu_execution][aggregate][nulls][any_value]")
+{
+  // One section per type, so a gap in one type does not hide the others.
+  for (auto const* column : {"i", "b", "d", "f", "s", "dt"}) {
+    DYNAMIC_SECTION("any_value(" << column << ")")
+    {
+      compare_gpu_vs_cpu(std::string("SELECT g, any_value(") + column + ") FROM any_v GROUP BY g");
+    }
+  }
+}
+
+TEST_CASE_METHOD(AnyValueFixture,
+                 "gpu_execution ungrouped any_value skips leading NULLs",
+                 "[integration][gpu_execution][aggregate][nulls][any_value]")
+{
+  // A single-valued filter keeps the answer unique: every non-NULL row is g = 1.
+  for (auto const* column : {"i", "b", "d", "f", "s", "dt"}) {
+    DYNAMIC_SECTION("any_value(" << column << ")")
+    {
+      compare_gpu_vs_cpu(std::string("SELECT any_value(") + column + ") FROM any_v WHERE g = 1");
+      // All-NULL input yields NULL.
+      compare_gpu_vs_cpu(std::string("SELECT any_value(") + column + ") FROM any_v WHERE g = 3");
+    }
+  }
+}
+
+TEST_CASE_METHOD(AnyValueFixture,
+                 "gpu_execution any_value alongside other aggregates (TPC-H Q15 shape)",
+                 "[integration][gpu_execution][aggregate][nulls][any_value]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT g, any_value(s), SUM(d), COUNT(*), MAX(m), any_value(d) FROM any_v GROUP BY g");
+}
+
+TEST_CASE_METHOD(AnyValueFixture,
+                 "gpu_execution any_value over a multi-valued group returns a group member",
+                 "[integration][gpu_execution][aggregate][nulls][any_value]")
+{
+  // Whatever value the GPU picks, it must be a non-NULL member of the group:
+  // the predicate is true for each group with a non-NULL m and NULL otherwise.
+  compare_gpu_vs_cpu(
+    "SELECT g, any_value(m) BETWEEN MIN(m) AND MAX(m), any_value(m) IS NULL "
+    "FROM any_v GROUP BY g");
+  compare_gpu_vs_cpu("SELECT any_value(m) BETWEEN MIN(m) AND MAX(m) FROM any_v");
+}

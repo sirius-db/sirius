@@ -55,10 +55,24 @@ class Fragment;
 /// `make_context_from_config()` and freed when the `UniquePtr` drops. The
 /// constructors can throw (bad config, GPU bring-up failure); the `make_*`
 /// factories are bound as fallible so failures surface as errors.
+///
+/// At most one `Context` may be alive in a process at a time. The engine
+/// installs process-wide state (cuDF's pinned memory resource, telemetry
+/// registries), so every constructor throws `std::logic_error` while another
+/// `Context` exists. A new `Context` may be created once the previous one is
+/// destroyed, including on a different GPU set.
 class SIRIUS_FFI_EXPORT Context {
  public:
   Context();
   explicit Context(const std::string& config_path);
+  /// Engine on exactly `gpu_ids` (CUDA-visible ordinals). Config is loaded from
+  /// `config_path` (built-in defaults when empty); then topology `gpu_ids` is overridden,
+  /// any `num_gpus` key is dropped, and `gpus_per_query` is set so one query may use every
+  /// listed GPU.
+  /// @throws std::invalid_argument on an empty list, a negative or duplicate id, or an id
+  ///         >= the visible device count; std::logic_error if another Context is alive;
+  ///         std::runtime_error on config / GPU bring-up failure.
+  Context(const std::string& config_path, const std::vector<int>& gpu_ids);
   ~Context();
 
   Context(const Context&)            = delete;
@@ -71,6 +85,16 @@ class SIRIUS_FFI_EXPORT Context {
   /// translation or execution failure. The stream keeps the database context alive until
   /// released; its last release can tear down the engine on the releasing thread.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
+
+  /// Same contract as execute_substrait, but `json_plan` is a Substrait `Plan` in protobuf JSON
+  /// (as accepted by JsonStringToMessage; camelCase or snake_case field names).
+  /// @throws std::invalid_argument when the JSON does not parse as a Substrait Plan (message
+  ///         includes the parse error); otherwise as execute_substrait.
+  void execute_substrait_json(const std::string& json_plan, std::uintptr_t out_stream_addr);
+
+  /// GPUs this engine actually brought up, sorted ascending (Sirius sorts and dedups
+  /// active ids in SiriusContext::initialize). Thread-safe (const).
+  [[nodiscard]] std::unique_ptr<std::vector<int>> active_gpu_ids() const;
 
  private:
   struct Impl;
@@ -145,6 +169,30 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// failure.
   void build(const std::string& substrait_plan);
 
+  /// JSON twin of build(); identical declare/rollback/throw contract; parse errors throw
+  /// std::invalid_argument and leave the Fragment unbuilt.
+  void build_json(const std::string& json_plan);
+
+  /// Feed host Arrow data into declared input stream `stream_id`, then close `sender_id`.
+  /// Takes ownership of the ArrowArrayStream at `arrow_array_stream_addr` (the caller's struct
+  /// has release == nullptr on return, success or failure) and releases it before returning.
+  /// Columns match the stream's declared columns by position and count (names not compared).
+  /// Each column is converted to its declared DuckDB type:
+  ///   decimal128(p,s) (any p<=38) -> DECIMAL(P,S) as declared (rescale/narrow; overflow throws)
+  ///   date32 -> DATE; int32 -> INTEGER; int64 -> BIGINT; double -> DOUBLE;
+  ///   utf8 / large_utf8 / string_view -> VARCHAR
+  /// Device memory comes from Sirius's memory reservation manager; P2 places every batch on
+  /// the first active GPU (not promised by the API). Zero-row streams are valid.
+  /// Must be called after build()/build_json() and before run().
+  /// @return number of batches pushed.
+  /// @throws std::logic_error before build or after run; std::invalid_argument on an undeclared
+  ///         stream, a sender outside the declared set, a column-count mismatch, or an
+  ///         unconvertible type (message names stream id, column index, Arrow type, declared
+  ///         type); std::runtime_error when get_next fails or the input already ended.
+  std::size_t push_arrow(std::uint64_t stream_id,
+                         std::uintptr_t arrow_array_stream_addr,
+                         std::uint32_t sender_id);
+
   /// Move every batch on `source`'s output stream `source_stream_id` into this fragment's
   /// input stream `input_stream_id`, then close `sender_id` on it. Must be called after
   /// source.run() and before this->run(). Every check below runs before any data moves, except
@@ -204,6 +252,11 @@ SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context();
 
 /// Create a [`Context`] configured from the YAML file at `config_path`.
 SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(const std::string& config_path);
+
+/// Create a [`Context`] on exactly `gpu_ids`. Factory twin of
+/// `Context(config_path, gpu_ids)`, with the same throws.
+SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_with_gpus(
+  const std::vector<int>& gpu_ids, const std::string& config_path = {});
 
 /// Create a [`Fragment`] on `context`. The context must outlive it.
 SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
