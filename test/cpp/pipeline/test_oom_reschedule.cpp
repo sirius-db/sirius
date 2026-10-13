@@ -580,6 +580,6 @@ TEST_CASE("GPU retry-handler failures preserve their type and runtime classifica
     CHECK_THROWS_WITH(result.get(), "retry factory input: cudaErrorUnknown");
   }
   CHECK(f.lifecycle.runtime_failed() == fatal);
-  f.executor->drain_after_error(sirius::make_query_id(0));
+  sirius::test::retire_scheduler_query(f.lifecycle, *f.executor, sirius::make_query_id(0));
   f.executor->stop();
 }
