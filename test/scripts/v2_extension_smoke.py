@@ -69,17 +69,21 @@ def main():
                 ]
         script = "\n".join(sql) + "\n"
         (output / "queries.sql").write_text(script)
-        result = subprocess.run(
-            [str(args.duckdb.resolve()), "-unsigned", str(scratch / "smoke.db")],
-            input=script,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        (output / "stdout.log").write_text(result.stdout)
-        (output / "stderr.log").write_text(result.stderr)
+        with (output / "stdout.log").open("w") as stdout, (output / "stderr.log").open(
+            "w"
+        ) as stderr:
+            result = subprocess.run(
+                [str(args.duckdb.resolve()), "-unsigned", str(scratch / "smoke.db")],
+                input=script,
+                text=True,
+                stdout=stdout,
+                stderr=stderr,
+                check=False,
+            )
         if result.returncode:
-            raise RuntimeError(f"DuckDB exited {result.returncode}: {result.stderr}")
+            raise RuntimeError(
+                f"DuckDB exited {result.returncode}: {(output / 'stderr.log').read_text()}"
+            )
         for name in cases:
             cpu = json.loads((output / f"{name}-cpu.json").read_text())
             gpu = json.loads((output / f"{name}-gpu.json").read_text())
