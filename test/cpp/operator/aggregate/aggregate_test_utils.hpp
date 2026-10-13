@@ -194,7 +194,7 @@ make_test_data_for_grouped_aggregate(std::size_t num_groups,
 
   // Populate data for each group
   std::size_t offset = 0;
-  for (int group_idx = 0; group_idx < num_groups; ++group_idx) {
+  for (std::size_t group_idx = 0; group_idx < num_groups; ++group_idx) {
     std::size_t num_values = group_sizes[group_idx];
 
     // Set group keys
@@ -222,7 +222,7 @@ make_test_data_for_grouped_aggregate(std::size_t num_groups,
     } else {
       std::iota(value_values.begin() + offset,
                 value_values.begin() + offset + num_values,
-                static_cast<typename Traits::type>(-group_idx) / 2);
+                static_cast<typename Traits::type>(-static_cast<int>(group_idx)) / 2);
     }
 
     // Set expected values

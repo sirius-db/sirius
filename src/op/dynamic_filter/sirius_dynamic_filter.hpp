@@ -44,6 +44,10 @@
 
 namespace sirius::op {
 
+namespace detail {
+class accumulated_bloom_builder;
+}
+
 enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
 
 /**
@@ -381,8 +385,13 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 
  private:
+  friend class detail::accumulated_bloom_builder;
   membership_key_domain _domain{};
   struct impl;
+  sirius_dynamic_bloom_filter(membership_key_domain domain, std::unique_ptr<impl> completed);
+  /// Wraps the replicas `detail::accumulated_bloom_builder` published for keys of @p domain.
+  [[nodiscard]] static std::shared_ptr<sirius_dynamic_bloom_filter> make_accumulated(
+    membership_key_domain domain, std::unique_ptr<impl> completed);
   std::unique_ptr<impl> _impl;
 };
 
@@ -443,9 +452,10 @@ class sirius_dynamic_filter_set {
    *  - The right to append filters (push_filter())
    *  - The responsibility to declare that this producer will not append more filters (finish())
    *
-   * Destruction resolves an unfinished producer as skipped. finish() is allocation-free and
-   * idempotent; subsequent pushes are rejected. Moving or destroying the right requires exclusive
-   * ownership, while push_filter() and finish() may race safely.
+   * Destruction resolves an unfinished producer as skipped. push_filter() and finish() are
+   * allocation-free, and finish() is idempotent; subsequent pushes are rejected. Moving or
+   * destroying the right requires exclusive ownership, while push_filter() and finish() may race
+   * safely.
    */
   class producer final {
    public:
@@ -456,15 +466,16 @@ class sirius_dynamic_filter_set {
     ~producer();
 
     /**
-     * @brief Appends a filter to the producer's channel
+     * @brief Appends a filter to the producer's channel, using room reserved by `register_producer`
      *
      * @param col_idx The column index to append the filter to in the target consumer's output
      *                schema
      * @param filter The filter to append
-     * @return true if the filter was successfully appended, false otherwise
+     * @return true if the filter was appended; false for a null filter, a finished producer, a
+     * channel closed to new filters, an ignored column, or a column without remaining room
      */
-    [[nodiscard]] bool push_filter(std::size_t col_idx,
-                                   std::shared_ptr<sirius_dynamic_filter const> filter) const;
+    [[nodiscard]] bool push_filter(
+      std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> filter) const noexcept;
 
     /**
      * @brief Declares that the producer will not append more filters
@@ -501,15 +512,22 @@ class sirius_dynamic_filter_set {
    */
   void ignore_columns(std::vector<std::size_t> const& cols);
 
+  /// Filters one key binding publishes at most: one zone map and one membership filter.
+  static constexpr std::size_t filters_per_binding = 2;
+
   /**
    * @brief Registers one producer's target output columns
    *
-   * An empty vector is unscoped, so consumers must treat every column as a possible target.
+   * Each entry of `planned_target_columns`, one per key binding, reserves room for
+   * `filters_per_column` pushes to its column, so `producer::push_filter` never allocates. An empty
+   * vector is unscoped: consumers must treat every column as a possible target, and the producer
+   * has no room to push.
    * @return A move-only right to append filters and declare completion for the producer. The
    *         producer handle also holds a shared_ptr to the channel state, so destroying the outer
    *         channel object doesn't invalidate the survivor producer handle.
    */
-  [[nodiscard]] producer register_producer(std::vector<std::size_t> planned_target_columns);
+  [[nodiscard]] producer register_producer(std::vector<std::size_t> planned_target_columns,
+                                           std::size_t filters_per_column = filters_per_binding);
 
   /**
    * @brief Seals the producer set before execution or a manual plan's first observation

@@ -28,8 +28,29 @@
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
 
+#include <algorithm>
+#include <limits>
+
 namespace sirius {
 namespace op {
+
+namespace {
+
+// Target average rows per partition, leaving headroom below cuDF's 2^31 row limit.
+// Hash skew can still put an individual partition over the limit.
+constexpr uint64_t GROUPED_MERGE_TARGET_ROWS_PER_PARTITION = uint64_t{1} << 30;
+
+// max(1, ceil(total_rows / target)), saturating at INT_MAX.
+constexpr int grouped_merge_min_partitions_for_rows(uint64_t total_rows)
+{
+  uint64_t const parts = total_rows / GROUPED_MERGE_TARGET_ROWS_PER_PARTITION +
+                         (total_rows % GROUPED_MERGE_TARGET_ROWS_PER_PARTITION != 0 ? 1 : 0);
+  uint64_t const clamped = std::max<uint64_t>(
+    1, std::min<uint64_t>(parts, static_cast<uint64_t>(std::numeric_limits<int>::max())));
+  return static_cast<int>(clamped);
+}
+
+}  // namespace
 
 // Helpers create_group_chunk_types / copy_expressions were used by the original grouping-sets
 // initialization path (now dead) and by the merge clone-from-parent ctor (which now takes pre-
@@ -79,6 +100,8 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 {
   child_op              = grouped_aggregate;
   _hash_partition_bytes = hash_partition_bytes;
+  num_grouping_set_columns =
+    grouped_aggregate->num_output_group_columns() - grouped_aggregate->group_idx.size();
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
@@ -119,13 +142,13 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 {
 }
 
-// expressions is the list of aggregates to be computed. Each aggregates has a bound_ref expression
-// to a column groups_p is the list of group by columns. Each group by column is a bound_ref
-// expression to a column grouping_sets_p is the list of grouping set. Each grouping set is a set of
-// indexes to the group by columns. Seems like DuckDB group the groupby columns into several sets
-// and for every grouping set there is one radix_table grouping_functions_p is a list of indexes to
-// the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
-// grouping set and the second level is the indexes to the groupby expression for that set.
+// The parameters, as for the sirius_physical_grouped_aggregate constructor:
+// - expressions: the aggregates, each over bound_ref expressions to its input columns
+// - groups_p: the group by keys, each a bound_ref expression
+// - grouping_sets_p: the grouping sets, each a set of positions in groups_p
+// - grouping_functions_p: unused
+// This constructor supports a single grouping set. A merge for several grouping sets is
+// constructed from its sirius_physical_grouped_aggregate.
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
@@ -154,24 +177,37 @@ partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strate
   const partition_sizing_input& in)
 {
   int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, num_gpus());
+  // The merge concatenates its partition's input and a cuDF column holds fewer than 2^31 rows.
+  // Raise the byte-based count to target at most 2^30 rows per partition on average. This is a
+  // sizing safeguard for large byte targets, not a per-partition bound under hash skew.
+  int const count = std::max(natural, grouped_merge_min_partitions_for_rows(in.total_rows));
+  if (count > natural) {
+    SIRIUS_LOG_DEBUG(
+      "merge_group_by raised the partition count from {} to {} for {} estimated rows, targeting "
+      "at most {} rows per partition on average",
+      natural,
+      count,
+      in.total_rows,
+      GROUPED_MERGE_TARGET_ROWS_PER_PARTITION);
+  }
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
   // repository's set_num_partitions contract.
-  if (natural > 1) {
+  if (count > 1) {
     std::lock_guard<std::mutex> lg(lock);
     if (!ports.empty()) {
       auto& repo = ports.begin()->second->repo;
-      if (repo != nullptr && static_cast<std::size_t>(natural) > repo->num_partitions()) {
-        repo->set_num_partitions(static_cast<std::size_t>(natural));
+      if (repo != nullptr && static_cast<std::size_t>(count) > repo->num_partitions()) {
+        repo->set_num_partitions(static_cast<std::size_t>(count));
       }
     }
   }
-  return partition_strategy{natural,
+  return partition_strategy{count,
                             /*broadcast=*/false,
                             /*build_probe=*/false,
-                            natural == 1 ? partition_placement::unpinned(1)
-                                         : partition_placement::round_robin(
-                                             static_cast<std::size_t>(natural), active_gpu_ids())};
+                            count == 1 ? partition_placement::unpinned(1)
+                                       : partition_placement::round_robin(
+                                           static_cast<std::size_t>(count), active_gpu_ids())};
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
@@ -229,7 +265,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
   } else {
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
-                                                     group_idx.size(),
+                                                     static_cast<int>(num_output_group_columns()),
                                                      cudf_aggregates,
                                                      stream,
                                                      *input_batches[0].get_memory_space(),
@@ -250,7 +286,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   auto mr            = space->get_default_allocator();
   auto& gpu_rep      = merged_mut.get_data()->cast<cucascade::gpu_table_representation>();
   auto merged_cols   = gpu_rep.release_table(stream)->release();
-  int num_group_cols = static_cast<int>(group_idx.size());
+  int num_group_cols = static_cast<int>(num_output_group_columns());
 
   std::vector<std::unique_ptr<cudf::column>> output_cols;
 

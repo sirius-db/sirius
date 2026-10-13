@@ -20,6 +20,7 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "log/logging.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/nvtx.hpp"
@@ -32,9 +33,11 @@
 #include <cucascade/data/data_batch.hpp>
 
 #include <format>
+#include <utility>
 
 namespace sirius {
 namespace op {
+sirius_physical_table_scan::~sirius_physical_table_scan() = default;
 
 uint64_t get_chunk_data_byte_size(sirius::logical_type type, std::size_t cardinality)
 {
@@ -54,6 +57,7 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p,
+  std::size_t projected_output_count_p,
   duckdb::vector<duckdb::LogicalType> duckdb_types_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
@@ -63,6 +67,7 @@ sirius_physical_table_scan::sirius_physical_table_scan(
     returned_types(std::move(returned_types_p)),
     column_ids(std::move(column_ids_p)),
     projection_ids(std::move(projection_ids_p)),
+    projected_output_count(projected_output_count_p),
     names(std::move(names_p)),
     table_filters(std::move(table_filters_p)),
     extra_info(std::move(extra_info)),
@@ -243,7 +248,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     referenced_indices.reserve(expected_output_columns);
     for (std::size_t i = 0; i < expected_output_columns; i++) {
       auto const& batch_idx_opt = batch_column_map[projection_ids[i]];
-      if (!batch_idx_opt.has_value() || *batch_idx_opt >= input_view.num_columns()) {
+      if (!batch_idx_opt.has_value() ||
+          std::cmp_greater_equal(*batch_idx_opt, input_view.num_columns())) {
         throw std::runtime_error(
           std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
                       "input_view.num_columns()={}",

@@ -25,7 +25,7 @@
 #include "op/partition_placement.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
-#include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry-bridge/gen/quent.hpp"
 
 #include <cudf/types.hpp>
 
@@ -34,12 +34,14 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <list>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -259,6 +261,15 @@ class pipelineable_operator_data : public operator_data {
   {
   }
 
+  /**
+   * @brief IDs of the non-null input batches in input order, as constructed.
+   *
+   * The IDs survive preparation, which may replace a batch with a cross-GPU clone that has a new
+   * ID, and task retries, which reuse this object. `dynamic_filter_publication_session` uses them
+   * to deduplicate contributions.
+   */
+  [[nodiscard]] std::vector<std::uint64_t> original_batch_ids() const;
+
   [[nodiscard]] operator_data_type get_type() const override
   {
     return operator_data_type::PIPELINEABLE;
@@ -269,6 +280,22 @@ class pipelineable_operator_data : public operator_data {
    */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
     const;
+
+  /**
+   * @brief Task input of the same kind with @p data_batches in place of the batches.
+   *
+   * Late materialization calls it when it restores deferred columns just before an operator's
+   * execute(). Subclasses that carry state besides the batches, such as a cross product task's
+   * slice, override it to copy that state into the new task input.
+   *
+   * @param data_batches The batches of the new task input.
+   * @return A task input of the same type, holding @p data_batches.
+   */
+  [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_data_batches(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches) const
+  {
+    return std::make_unique<pipelineable_operator_data>(std::move(data_batches));
+  }
 
   /**
    * @brief Get read-only accessors for the batches. Returns the pin locks acquired by
@@ -325,6 +352,8 @@ class pipelineable_operator_data : public operator_data {
 
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  /// (position, original ID) of each batch that preparation replaced with a clone; usually empty.
+  std::vector<std::pair<std::size_t, std::uint64_t>> _replaced_batch_ids;
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
@@ -712,7 +741,7 @@ class sirius_physical_operator {
     //! A UUID for a port on an operator at the beginning of a
     // pipeline. This port receives data from a prior pipeline,
     // forming an incoming edge from that pipeline.
-    uuid::UUID source_port_uuid{uuid::now_v7()};
+    quent::Uuid source_port_uuid{quent::now_v7()};
   };
 
   /// Describes a downstream operator's port to which data is pushed
@@ -732,10 +761,12 @@ class sirius_physical_operator {
     // │ └────┘   │ └─ port ──┘     │  │  │  │     └────────┘  │   └────┘ │
     // │          └─────────────────┘  │  │  └─────────────────┘          │
     // └───────────────────────────────┘  └───────────────────────────────┘
-    uuid::UUID pseudo_sink_port_uuid;
+    quent::Uuid pseudo_sink_port_uuid;
   };
 
-  // source pipeline pushed to repo of the ports
+  /**
+   * @brief Pushes @p batch into port @p port_id after `on_input_batch_pushed` observes it.
+   */
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
@@ -792,6 +823,16 @@ class sirius_physical_operator {
   virtual void set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
  protected:
+  /**
+   * @brief Observes a batch pushed into port @p port_id, inside the pushing task, before the batch
+   * becomes poppable.
+   *
+   * An override must not wait for a batch lock or access device data. `sirius_physical_partition`
+   * uses the hook to certify dynamic-filter input. An engine-invariant failure may throw before the
+   * batch is added. The default does nothing.
+   */
+  virtual void on_input_batch_pushed(std::string_view port_id, ::cucascade::data_batch& batch);
+
   std::shared_ptr<pipeline::sirius_pipeline> _pipeline;
   //! Lookup map: port name -> raw pointer into _ports_list (never owns)
   std::unordered_map<std::string, port*> ports;

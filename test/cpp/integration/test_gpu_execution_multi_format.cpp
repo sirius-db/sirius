@@ -23,20 +23,38 @@
  * generic duckdb_scan path) is currently disabled.
  */
 
+#include "io/sirius_datasource.hpp"
+#include "op/scan/iceberg_dv_preparation.hpp"
+#include "op/scan/puffin_reader.hpp"
+#include "scan_manager/preparation_test_support.hpp"
 #include "yyjson.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb.hpp>
+#include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <duckdb/common/string_util.hpp>
 #include <duckdb/common/types/blob.hpp>
+#include <duckdb/parser/sql_statement.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <io/kvikio/kvikio_context.hpp>
+#include <op/scan/iceberg_gpu_ingestible.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
+#include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/table_scan/bound_read_view.hpp>
+#include <op/sirius_physical_table_scan.hpp>
+#include <op/sirius_physical_union.hpp>
+#include <planner/connector_registry.hpp>
+#include <planner/sirius_physical_plan_generator.hpp>
 #include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <transparent/read_view_registry.hpp>
 #include <unistd.h>
 #include <utils/child_process_environment.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
@@ -47,21 +65,112 @@
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
-#include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
+#include <future>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 
 namespace fs = std::filesystem;
+
+namespace {
+template <typename... Values>
+struct scoped_test_reset {
+  std::tuple<Values&...> values;
+  ~scoped_test_reset()
+  {
+    std::apply([](auto&... value) { ((value = {}), ...); }, values);
+  }
+};
+template <typename... Values>
+auto reset_after_test(Values&... values)
+{
+  return scoped_test_reset<Values...>{{values...}};
+}
+
+struct preparation_test_state {
+  using counters_type = sirius::op::scan::physical_check_counters;
+  explicit preparation_test_state(std::shared_ptr<counters_type> counters,
+                                  std::optional<bool> deferred = std::nullopt)
+    : counters(std::move(counters))
+  {
+    if (deferred.has_value()) {
+      provider->grant_bytes                            = 1024 * 1024;
+      provider->return_null                            = !*deferred;
+      this->counters->preparation_provider_for_testing = provider;
+    }
+    this->counters->iceberg_preparation_route_for_testing = [this](auto id, bool route) {
+      routes.emplace_back(id, route);
+    };
+    this->counters->iceberg_statement_route_for_testing = [this](auto reason,
+                                                                 auto const& decision) {
+      admissions.push_back({std::string(reason), decision});
+    };
+    this->counters->iceberg_dv_phase_for_testing = [this](auto const& path, bool start) {
+      if (!start) return;
+      std::lock_guard lock(mutex);
+      reads_started.push_back(path);
+    };
+    std::lock_guard lock(this->counters->units_mutex);
+    for (auto const& [id, value] : this->counters->publications_by_query)
+      previous_queries.insert(id);
+  }
+  ~preparation_test_state()
+  {
+    counters->preparation_provider_for_testing.reset();
+    counters->iceberg_preparation_route_for_testing = {};
+    counters->iceberg_statement_route_for_testing   = {};
+    counters->iceberg_dv_phase_for_testing          = {};
+  }
+  std::vector<std::vector<std::string>> fetch(duckdb::QueryResult& result)
+  {
+    std::vector<std::vector<std::string>> rows;
+    while (auto chunk = result.Fetch()) {
+      for (duckdb::idx_t r = 0; r < chunk->size(); ++r) {
+        std::vector<std::string> row;
+        for (duckdb::idx_t c = 0; c < chunk->ColumnCount(); ++c)
+          row.push_back(chunk->GetValue(c, r).ToString());
+        rows.push_back(std::move(row));
+      }
+    }
+    REQUIRE_FALSE(result.HasError());
+    std::sort(rows.begin(), rows.end());
+    return rows;
+  }
+  sirius::op::scan::scan_publication_observation publication()
+  {
+    std::lock_guard lock(counters->units_mutex);
+    for (auto const& [id, value] : counters->publications_by_query)
+      if (!previous_queries.contains(id)) return value;
+    FAIL("no publication statistics for this query");
+    return {};
+  }
+  std::shared_ptr<counters_type> counters;
+  std::shared_ptr<sirius::scan_manager::test::test_reservation_provider> provider =
+    std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  std::mutex mutex;
+  std::vector<std::string> reads_started;
+  std::vector<std::pair<uint64_t, bool>> routes;
+  struct admission_record {
+    std::string route_reason;
+    sirius::scan_manager::admission_decision decision;
+  };
+  std::vector<admission_record> admissions;
+  std::set<uint64_t> previous_queries;
+};
+}  // namespace
 
 static fs::path get_project_root()
 {
@@ -668,7 +777,6 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   // force-projected into the scan, which is not wired; the gate still sends them to CPU.
   static constexpr gpu_route kPositionalDeleteRoute = gpu_route::gpu;
   static constexpr gpu_route kDeletionVectorRoute   = gpu_route::gpu;
-  static constexpr gpu_route kEqualityDeleteRoute   = gpu_route::plan_fallback;
 
   // Every GPU-route case pins its snapshot; see pinned_scan().
   static constexpr gpu_route kUnpinnedRoute = gpu_route::plan_fallback;
@@ -884,6 +992,56 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     REQUIRE(gpu_rows == expected);
   }
 
+  void expect_equality_rows(std::string const& query,
+                            std::vector<std::vector<std::string>> expected,
+                            uint64_t count = 1)
+  {
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::scoped_recording_log_sink logs;
+    expect_iceberg_rows(query, gpu_route::plan_fallback, std::move(expected));
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    auto reason =
+      static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+    CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
+    CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
+    CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);
+    CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+    CHECK(after.iceberg_inventory_bytes_peak > 0);
+    auto text = "this iceberg table has " + std::to_string(count) +
+                " equality-delete file(s), which the GPU scan path does not apply yet";
+    bool seen = false;
+    for (auto const& record : logs.records())
+      if (record.message.find(text) != std::string::npos) seen = true;
+    CHECK(seen);
+  }
+
+  void expect_iceberg_schema_refusal(std::string const& query,
+                                     sirius::op::scan::verdict_reason reason,
+                                     std::string const& text,
+                                     std::vector<std::vector<std::string>> expected)
+  {
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::scoped_recording_log_sink logs;
+    expect_iceberg_rows(query, gpu_route::runtime_fallback, std::move(expected));
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    auto index = static_cast<std::size_t>(reason);
+    CHECK(after.split_physical_rejections[index] == before.split_physical_rejections[index] + 1);
+    CHECK(after.semantic_declines[index] == before.semantic_declines[index]);
+    bool seen = false;
+    for (auto const& record : logs.records())
+      if (record.message.find(text) != std::string::npos) seen = true;
+    if (!seen)
+      for (auto const& record : logs.records())
+        UNSCOPED_INFO(record.message);
+    CHECK(seen);
+    // G-L protects the metadata terminal error path; a subsequent GPU query must finish.
+    auto before_next = sirius::test::get_transparent_execution_stats(*con);
+    auto next        = con->Query("SELECT count FROM " + pinned_scan(v1_path) + " ORDER BY count");
+    REQUIRE(next);
+    REQUIRE_FALSE(next->HasError());
+    require_route(before_next, sirius::test::get_transparent_execution_stats(*con), gpu_route::gpu);
+  }
+
   /**
    * @brief Assert the user's own session can read this table, which is what Sirius relies on.
    *
@@ -946,41 +1104,26 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
 //
 // `rename_col` and `add_column` were previously NOT wired up here: name resolution failed at
 // runtime, the query took the runtime fallback, and the next GPU query on that connection hung
-// forever. Catch2 has no per-case timeout, so a hang stalls the whole suite rather than failing
-// it, and no tag expresses "expected to hang". They now decline at PLAN time, so they are safe
-// to run in-process and are wired up below.
+// forever. The metadata terminal-error fix now makes runtime fallback safe. Catch2 has no per-case
+// timeout, so a hang stalls the whole suite rather than failing it. These cases now assert
+// metadata-time refusal and a subsequent GPU query.
 //
-// run_conformance.py still covers all four, and still matters: it asserts LIVENESS by issuing a
-// second query on the same connection, which is the observable difference between "declined at
-// plan time" and "fell back at runtime". A route assertion here cannot see that, and a hang here
-// would stall the suite rather than report.
+// The migrated schema cases below also issue a second GPU query on the same connection.
 //===----------------------------------------------------------------------===//
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - delete data is read once per query",
+                 "gpu_execution iceberg - each legacy plan owns its delete payload",
                  "[integration][gpu_execution][iceberg]")
 {
-  // The planner builds the plan TWICE for an iceberg scan -- iceberg_scan is not serializable,
-  // so validation is followed by a replan at execute -- and each build walked the manifest list,
-  // every manifest, and every positional-delete file a row at a time, on the planning thread.
-  //
-  // Asserting on a counter rather than a log line is deliberate: release builds compile
-  // INFO/DEBUG logging out, so there is no observable signal at this level, and a green suite
-  // would only show the memo did not corrupt results -- not that it removed any work. Without
-  // the memo this delta is 2; the memo is what makes it 1. If someone later breaks it, the cost
-  // does not quietly return, this fails.
   require_delete_files(v2_path, 1);
-
-  // Pinned, because an unpinned scan declines before any delete is read and the delta would be
-  // zero -- which would look like the memo working perfectly while it was never consulted.
+  auto before_stats = sirius::test::get_transparent_execution_stats(*con);
   auto const before = sirius::op::scan::iceberg_delete_data_uncached_read_count();
   auto result       = con->Query("SELECT count(*) FROM " + pinned_scan(v2_path) + ";");
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
   auto const after = sirius::op::scan::iceberg_delete_data_uncached_read_count();
-
-  UNSCOPED_INFO("manifest-walking delete reads for one query: " << (after - before));
-  CHECK(after - before == 1);
+  auto after_stats = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after - before == 1 + after_stats.execution_rebuilds - before_stats.execution_rebuilds);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -1087,31 +1230,32 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 //
 // A rename keeps the field id and changes the NAME, so the id space stays contiguous and the
 // field-id gap test cannot see it. The older data file still spells the column `val` where the
-// table now says `value`, so resolving by name finds nothing and throws — at SCAN time, which
-// takes the runtime fallback and then deadlocks the connection. Declining at plan time is what
-// makes this case runnable in-process at all.
+// table now says `value`. Per-file metadata checks refuse the old file before cuDF decoding;
+// DuckDB then resolves the field id during runtime fallback.
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - conformance renamed column declines at plan time",
-                 "[integration][gpu_execution][iceberg]")
+                 "gpu_execution iceberg - conformance renamed column declines at metadata time",
+                 "[integration][gpu_execution][iceberg][verdict]")
 {
   require_session_can_read(conf_rename_col_path);
-  expect_iceberg_rows(
+  expect_iceberg_schema_refusal(
     "SELECT id, value FROM " + pinned_scan(conf_rename_col_path) + " ORDER BY id;",
-    gpu_route::plan_fallback,
+    sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
+    "does not carry the table's current schema (no match for value#2)",
     {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
 }
 
 // An ADD keeps ids contiguous too (1,2,3 over three columns), so the gap test misses it for the
-// same reason. `b` is simply absent from the first data file and must read NULL there. Same
-// runtime-throw-then-deadlock path as the rename before the plan-time decline.
+// same reason. `b` is absent from the first data file and must read NULL there. The metadata
+// check refuses that file, and DuckDB supplies the missing column during runtime fallback.
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - conformance added column declines at plan time",
-                 "[integration][gpu_execution][iceberg]")
+                 "gpu_execution iceberg - conformance added column declines at metadata time",
+                 "[integration][gpu_execution][iceberg][verdict]")
 {
   require_session_can_read(conf_add_column_path);
-  expect_iceberg_rows(
+  expect_iceberg_schema_refusal(
     "SELECT id, a, b FROM " + pinned_scan(conf_add_column_path) + " ORDER BY id;",
-    gpu_route::plan_fallback,
+    sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
+    "does not carry the table's current schema (no match for b#3)",
     {{"1", "10", "NULL"}, {"2", "20", "NULL"}, {"3", "30", "300"}, {"4", "40", "400"}});
 }
 
@@ -1132,7 +1276,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - data file with no field ids declines",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][verdict]")
 {
   // A data file with NO parquet field ids plus the `schema.name-mapping.default` that makes it
   // legible: an `add_files` migration. A probe hole rather than a schema change -- the columns
@@ -1140,28 +1284,32 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   // a name-resolving GPU scan return the SAME rows here, so only the route catches it.
   auto const path =
     (get_project_root() / "test/cpp/integration/data/iceberg_v1_no_field_ids").string();
-  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-                      gpu_route::plan_fallback,
-                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+  expect_iceberg_schema_refusal(
+    "SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+    sirius::op::scan::verdict_reason::iceberg_schema_no_field_ids,
+    "carries no Parquet field ids",
+    {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - promoted column type declines",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][verdict]")
 {
   // `count` stored as INT32 while the table declares it `long`. Promotion keeps both the name and
   // the field id, so a pair comparison reports the file as current, and nothing throws -- the scan
   // just returns the file's narrower type. Only comparing the TYPE catches it.
   auto const path =
     (get_project_root() / "test/cpp/integration/data/iceberg_v1_promoted_type").string();
-  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-                      gpu_route::plan_fallback,
-                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+  expect_iceberg_schema_refusal(
+    "SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+    sirius::op::scan::verdict_reason::iceberg_schema_promoted_type,
+    "as INTEGER while the table declares BIGINT",
+    {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - reordered data file declines",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][verdict]")
 {
   // The same two fields with the same ids and types, stored in the opposite physical order. This
   // is a VALID Iceberg table -- ids identify fields, so order carries no meaning, and DuckDB reads
@@ -1176,9 +1324,11 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   // Declining a valid layout is the gate's fail-closed bias, and DuckDB returns the right rows.
   auto const path =
     (get_project_root() / "test/cpp/integration/data/iceberg_v1_reordered").string();
-  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-                      gpu_route::plan_fallback,
-                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+  expect_iceberg_schema_refusal(
+    "SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+    sirius::op::scan::verdict_reason::iceberg_schema_physical_order,
+    "stores the table's fields in a different physical order",
+    {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -1306,9 +1456,75 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "[integration][gpu_execution][iceberg]")
 {
   require_delete_files(eq_path, 1);
-  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(eq_path) + " ORDER BY count;",
-                      kEqualityDeleteRoute,
-                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(eq_path) + " ORDER BY count;",
+                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
+                 "R2a pre-capture marks Iceberg equality refusal on scan node",
+                 "[integration][gpu_execution][iceberg][verdict]")
+{
+  auto transaction = con->Query("BEGIN TRANSACTION READ ONLY");
+  REQUIRE(transaction);
+  REQUIRE_FALSE(transaction->HasError());
+  auto logical = con->ExtractPlan("SELECT fruit, count FROM " + pinned_scan(eq_path));
+  REQUIRE(logical);
+  auto* current = logical.get();
+  while (current->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
+    REQUIRE_FALSE(current->children.empty());
+    current = current->children.front().get();
+  }
+  struct probe_generator : sirius::planner::sirius_physical_plan_generator {
+    using sirius_physical_plan_generator::create_plan;
+    using sirius_physical_plan_generator::sirius_physical_plan_generator;
+  } generator(*con->context, sirius::planner::scan_contract_provenance{std::nullopt, 17});
+  auto physical = generator.create_plan(current->Cast<duckdb::LogicalGet>());
+  REQUIRE(physical);
+  auto* node = physical.get();
+  while (node->type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+    REQUIRE_FALSE(node->children.empty());
+    node = node->children.front().get();
+  }
+  auto const& scan = node->Cast<sirius::op::sirius_physical_table_scan>();
+  REQUIRE(scan.pre_declined);
+  CHECK(scan.pre_declined->verdict == sirius::op::scan::eligibility_verdict::unsupported);
+  CHECK(scan.pre_declined->reason == sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+  CHECK(scan.bound_view == nullptr);
+  CHECK(scan.contract_id == 0);
+  CHECK(generator.read_views->entries().empty());
+  REQUIRE(generator.contract_provenance.first_pre_decline);
+  CHECK(generator.contract_provenance.first_pre_decline->first ==
+        sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+  auto rollback = con->Query("ROLLBACK");
+  REQUIRE(rollback);
+  REQUIRE_FALSE(rollback->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "R2a pre-capture refusal keeps first planning error",
+                 "[integration][gpu_execution][iceberg][verdict]")
+{
+  auto enabled = con->Query("SET gpu_execution=true");
+  REQUIRE(enabled);
+  REQUIRE_FALSE(enabled->HasError());
+  auto strict = con->Query("SET enable_duckdb_fallback=false");
+  REQUIRE(strict);
+  REQUIRE_FALSE(strict->HasError());
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto result       = con->Query("SELECT sin(count) FROM iceberg_scan('" + v1_path + "')");
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("without 'snapshot_from_id'") != std::string::npos);
+  CHECK(result->GetError().find("Unsupported expression in projection") == std::string::npos);
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  auto const reason =
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_no_snapshot_id);
+  CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
+  auto projection_only = con->Query("SELECT sin(count) FROM " + pinned_scan(v1_path));
+  REQUIRE(projection_only);
+  REQUIRE(projection_only->HasError());
+  CHECK(projection_only->GetError().find("Unsupported expression in projection") !=
+        std::string::npos);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
@@ -1316,8 +1532,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "[integration][gpu_execution][iceberg]")
 {
   require_delete_files(eq_path, 1);
-  expect_iceberg_rows(
-    "SELECT count(*) FROM " + pinned_scan(eq_path) + ";", kEqualityDeleteRoute, {{"3"}});
+  expect_equality_rows("SELECT count(*) FROM " + pinned_scan(eq_path) + ";", {{"3"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
@@ -1325,19 +1540,18 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   require_delete_files(eq_path, 1);
-  expect_iceberg_rows("SELECT fruit, count, filename, file_row_number FROM " +
-                        pinned_scan(eq_path) + " WHERE count > 2 ORDER BY count;",
-                      kEqualityDeleteRoute,
-                      {{"cherry",
-                        "3",
-                        "test/cpp/integration/data/iceberg_v2_equality_delete/data/"
-                        "00000-0-c3d4e5f6-0003-0003-0003-000000000001-00001.parquet",
-                        "2"},
-                       {"elderberry",
-                        "5",
-                        "test/cpp/integration/data/iceberg_v2_equality_delete/data/"
-                        "00000-0-c3d4e5f6-0003-0003-0003-000000000001-00001.parquet",
-                        "4"}});
+  expect_equality_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                         pinned_scan(eq_path) + " WHERE count > 2 ORDER BY count;",
+                       {{"cherry",
+                         "3",
+                         "test/cpp/integration/data/iceberg_v2_equality_delete/data/"
+                         "00000-0-c3d4e5f6-0003-0003-0003-000000000001-00001.parquet",
+                         "2"},
+                        {"elderberry",
+                         "5",
+                         "test/cpp/integration/data/iceberg_v2_equality_delete/data/"
+                         "00000-0-c3d4e5f6-0003-0003-0003-000000000001-00001.parquet",
+                         "4"}});
 }
 
 //===----------------------------------------------------------------------===//
@@ -1371,9 +1585,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
   require_delete_files(single_col_path, 1);
   // The key is the fruit column alone (field_id=1); count is not part of it.
   // Delete entries "banana" and "date" must match on fruit regardless of count.
-  expect_iceberg_rows(
+  expect_equality_rows(
     "SELECT fruit, count FROM " + pinned_scan(single_col_path) + " ORDER BY count;",
-    kEqualityDeleteRoute,
     {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
 }
 
@@ -1383,10 +1596,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
 {
   // Two separate one-row equality-delete files — exercises the concatenate/deduplicate path.
   require_delete_files(multi_del_path, 2);
-  expect_iceberg_rows(
+  expect_equality_rows(
     "SELECT fruit, count FROM " + pinned_scan(multi_del_path) + " ORDER BY count;",
-    kEqualityDeleteRoute,
-    {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+    {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}},
+    2);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
@@ -1396,10 +1609,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
   // The delete file covers every data row — an all-false mask, which is where an
   // A retention-mask implementation that mishandles the empty result shows up.
   require_delete_files(all_del_path, 1);
-  expect_iceberg_rows(
-    "SELECT fruit, count, filename, file_row_number FROM " + pinned_scan(all_del_path) + ";",
-    kEqualityDeleteRoute,
-    {});
+  expect_equality_rows(
+    "SELECT fruit, count, filename, file_row_number FROM " + pinned_scan(all_del_path) + ";", {});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
@@ -1414,13 +1625,12 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
   auto const filename =
     "test/cpp/integration/data/iceberg_v2_eq_pos_combined/data/"
     "00000-0-a7b8c9d0-0007-0007-0007-000000000001-00001.parquet";
-  expect_iceberg_rows("SELECT fruit, count, filename, file_row_number FROM " +
-                        pinned_scan(combined_path) + " ORDER BY count;",
-                      kEqualityDeleteRoute,
-                      {{"banana", "2", filename, "1"},
-                       {"cherry", "3", filename, "2"},
-                       {"date", "4", filename, "3"},
-                       {"elderberry", "5", filename, "4"}});
+  expect_equality_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                         pinned_scan(combined_path) + " ORDER BY count;",
+                       {{"banana", "2", filename, "1"},
+                        {"cherry", "3", filename, "2"},
+                        {"date", "4", filename, "3"},
+                        {"elderberry", "5", filename, "4"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
@@ -1431,9 +1641,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
   // loses elderberry/5. Exercises applying one delete set across per-file boundaries — the
   // same boundary the GPU path's one-file-per-batch coalescing rule exists to protect.
   require_delete_files(multi_data_path, 1);
-  expect_iceberg_rows(
+  expect_equality_rows(
     "SELECT fruit, count FROM " + pinned_scan(multi_data_path) + " ORDER BY count;",
-    kEqualityDeleteRoute,
     {{"apple", "1"}, {"cherry", "3"}, {"date", "4"}, {"fig", "6"}});
 }
 
@@ -1561,17 +1770,15 @@ TEST_CASE_METHOD(
   // position, so record_count passes as well. Only the footer descriptor's `referenced-data-file`
   // disagrees, which is why the spec requires content_offset/content_size_in_bytes to match it.
   //
-  // The route IS the assertion. Delete files are read while the physical plan is built, so the
-  // refusal lands at plan time and no GPU work begins. DuckDB's own reader does not check the
-  // descriptor, so the rows below are the misbound answer it produces once Sirius hands the query
-  // back: each file loses the position the OTHER file's vector names, so 'elderberry' and 'grape'
-  // go instead of the 'banana' and 'jackfruit' the footer actually pairs. Eight rows either way —
-  // the corruption never shows up in a count. Sirius declining is what keeps that answer from
-  // being produced on the GPU and reported as ours.
+  // Qualified DV descriptors are checked on preparation workers. A misbound footer
+  // fails before that file decodes; the existing replay policy hands the query back
+  // to DuckDB, whose reader does not check this descriptor. The rows below are its
+  // misbound answer, which Sirius must not report as successful GPU execution.
   REQUIRE(delete_file_count(dv_misbound_path) == 2);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
   expect_iceberg_rows(
     "SELECT fruit, count FROM " + pinned_scan(dv_misbound_path) + " ORDER BY count;",
-    gpu_route::plan_fallback,
+    gpu_route::runtime_fallback,
     {{"apple", "1"},
      {"banana", "2"},
      {"cherry", "3"},
@@ -1580,6 +1787,14 @@ TEST_CASE_METHOD(
      {"honeydew", "8"},
      {"indian fig", "9"},
      {"jackfruit", "10"}});
+  auto after  = sirius::test::get_transparent_execution_stats(*con);
+  auto cause  = static_cast<size_t>(sirius::transparent::late_failure_cause::physical_input);
+  auto reason = static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_delete_corrupt);
+  CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+  CHECK(after.late_replays[cause] == before.late_replays[cause] + 1);
+  // Both misbound files may fail validation before preparation stops.
+  CHECK(after.split_physical_rejections[reason] >= before.split_physical_rejections[reason] + 1);
+  CHECK(after.split_physical_rejections[reason] <= before.split_physical_rejections[reason] + 2);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1760,8 +1975,13 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   for (auto const* dataset : {"iceberg_snapshot_deletes", "iceberg_v3_deletion_vector"}) {
     auto const table = (get_project_root() / "test/cpp/integration/data" / dataset).string();
     CAPTURE(table);
-    auto data = sirius::op::scan::read_iceberg_delete_data(
-      *con->context, table, &ioctx, current_snapshot_id(table));
+    auto inventory =
+      sirius::op::scan::read_delete_inventory(*con->context, table, current_snapshot_id(table));
+    REQUIRE(inventory.inventory);
+    auto discovery = sirius::op::scan::discover_from_manifests(
+      *con->context, table, std::move(*inventory.inventory));
+    auto data = sirius::op::scan::load_delete_payload(
+      *con->context, table, &ioctx, current_snapshot_id(table), discovery);
     REQUIRE(data);
     REQUIRE_FALSE(data->positional_deletes.empty());
   }
@@ -1874,9 +2094,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   // The re-inserted banana/4 must survive: its data sequence number is above the delete's, and
   // an implementation that matches on key alone would wrongly drop it.
   require_delete_files(path, 1);
-  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-                      kEqualityDeleteRoute,
-                      {{"apple", "1"}, {"cherry", "3"}, {"banana", "4"}, {"date", "5"}});
+  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                       {{"apple", "1"}, {"cherry", "3"}, {"banana", "4"}, {"date", "5"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -2804,4 +3023,1140 @@ TEST_CASE_METHOD(ParquetVirtualMultiRowGroupFixture,
                      " WHERE x IN (0, 2048, 4096, 6143) ORDER BY x");
   compare_gpu_vs_cpu("SELECT x, sentinel, file_row_number FROM " + scan() +
                      " WHERE x >= 4096 ORDER BY x");
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "R2a pre-capture text precedes an earlier L0 refusal",
+                 "[integration][iceberg][verdict]")
+{
+  REQUIRE_FALSE(con->Query("CREATE TEMP TABLE r2a_first_l0(i INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO r2a_first_l0 VALUES (1)")->HasError());
+  REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con->Query("BEGIN TRANSACTION READ ONLY")->HasError());
+  auto logical = con->ExtractPlan("SELECT i FROM r2a_first_l0 UNION ALL SELECT count FROM " +
+                                  ("iceberg_scan('" + v1_path + "')"));
+  sirius::planner::sirius_physical_plan_generator generator(*con->context);
+  bool refused = false;
+  try {
+    generator.create_plan(std::move(logical));
+  } catch (sirius::op::scan::scan_verdict_declined const& decline) {
+    refused = true;
+    CHECK(std::string(decline.what()).find("without 'snapshot_from_id'") != std::string::npos);
+    CHECK(decline.declined.size() == 2);
+  }
+  CHECK(refused);
+  REQUIRE(generator.read_views->entries().size() == 2);
+  CHECK(generator.read_views->entries()[0].eligibility.reason ==
+        sirius::op::scan::verdict_reason::native_block_manager);
+  CHECK(generator.read_views->entries()[1].contract.view == nullptr);
+  CHECK(generator.read_views->entries()[1].eligibility.cost.delete_preparation_time_us == 0);
+  REQUIRE_FALSE(con->Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
+                 "Iceberg equality refusal walks inventory once and reads no payload",
+                 "[integration][iceberg][verdict]")
+{
+  auto scan   = pinned_scan(eq_path);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  expect_iceberg_rows("SELECT fruit, count FROM " + scan,
+                      gpu_route::plan_fallback,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
+  CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+  CHECK(after.iceberg_inventory_bytes_peak > 0);
+  CHECK(after.budget_exceeded == before.budget_exceeded);
+  auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+  CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+  auto inventory =
+    sirius::op::scan::read_delete_inventory(*con->context, eq_path, current_snapshot_id(eq_path));
+  CHECK(inventory.equality_count == 1);
+  CHECK_FALSE(inventory.inventory);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Iceberg inventory query failure and missing result after successful bind",
+                 "[integration][iceberg][verdict]")
+{
+  auto scan = pinned_scan(v1_path);
+  auto mode = GENERATE(std::string("fail"), std::string("missing"));
+  REQUIRE_FALSE(con->Query("SET sirius_test_inject_iceberg_discovery='" + mode + "'")->HasError());
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  expect_iceberg_rows("SELECT fruit, count FROM " + scan,
+                      gpu_route::plan_fallback,
+                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::evidence_missing);
+  CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+  CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks);
+  CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
+  auto result = con->Query("SELECT fruit, count FROM " + scan);
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find(
+          mode == "fail" ? "the iceberg delete probe could not read this table's metadata "
+                           "(injected inventory query failure)"
+                         : "the iceberg delete probe returned no rows") != std::string::npos);
+}
+
+TEST_CASE_METHOD(
+  GPUExecutionIcebergFixture,
+  "Iceberg supplied discovery owns fresh payloads across QueryEnd and transaction boundaries",
+  "[integration][iceberg][verdict]")
+{
+  auto sid       = current_snapshot_id(v2_path);
+  auto before    = sirius::test::get_transparent_execution_stats(*con);
+  auto inventory = sirius::op::scan::read_delete_inventory(*con->context, v2_path, sid);
+  REQUIRE(inventory.inventory);
+  CHECK(inventory.equality_count == 0);
+  duckdb::Connection sibling(*con->context->db);
+  REQUIRE_FALSE(sibling.Query("SELECT 1")->HasError());
+  auto discovery = sirius::op::scan::discover_from_manifests(
+    *con->context, v2_path, std::move(*inventory.inventory));
+  sirius::io::kvikio_context ioctx;
+  auto data = sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
+  REQUIRE(data);
+  REQUIRE(data->positional_deletes.size() == 1);
+  CHECK(data->positional_deletes.begin()->second == std::vector<int64_t>{1, 3});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 1);
+  REQUIRE_FALSE(con->Query("BEGIN TRANSACTION READ ONLY")->HasError());
+  auto cached =
+    sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
+  auto hit = sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
+  CHECK(cached != hit);
+  CHECK(cached->positional_deletes == data->positional_deletes);
+  CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
+        after.iceberg_manifest_walks);
+  REQUIRE_FALSE(con->Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Two directly built Iceberg scans own distinct inventories through lowering",
+                 "[integration][iceberg][verdict]")
+{
+  REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con->Query("BEGIN TRANSACTION READ ONLY")->HasError());
+  auto second = (get_project_root() / "test/cpp/integration/data/iceberg_v3_dv_replaced").string();
+  struct probe_generator : sirius::planner::sirius_physical_plan_generator {
+    using sirius_physical_plan_generator::create_plan;
+    using sirius_physical_plan_generator::sirius_physical_plan_generator;
+  } generator(*con->context, sirius::planner::scan_contract_provenance{std::nullopt, 19});
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> root;
+  for (auto const& table : {v2_path, second}) {
+    auto logical = con->ExtractPlan("SELECT fruit, count FROM " + pinned_scan(table));
+    auto* get    = logical.get();
+    while (get->type != duckdb::LogicalOperatorType::LOGICAL_GET)
+      get = get->children.front().get();
+    auto node  = generator.create_plan(get->Cast<duckdb::LogicalGet>());
+    auto* scan = node.get();
+    while (scan->type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN)
+      scan = scan->children.front().get();
+    auto& source = scan->Cast<sirius::op::sirius_physical_table_scan>();
+    REQUIRE(source.delete_inventory);
+    REQUIRE_FALSE(source.delete_inventory->entries.empty());
+    REQUIRE_FALSE(source.pre_declined);
+    if (!root) root = duckdb::make_uniq<sirius::op::sirius_physical_union>(node->types, 10);
+    root->children.push_back(std::move(node));
+  }
+  CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
+        before.iceberg_manifest_walks + 2);
+  generator.insert_gpu_pipeline_operators(root);
+  std::map<std::string, std::unordered_map<std::string, std::vector<int64_t>>> payloads;
+  std::function<void(sirius::op::sirius_physical_operator&)> visit = [&](auto& node) {
+    if (node.type == sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) {
+      auto const& info = dynamic_cast<sirius::op::scan::iceberg_ingestible_table_info const&>(
+        node.template Cast<sirius::op::scan::sirius_gpu_scan_operator>()
+          .get_ingestible()
+          .table_info());
+      REQUIRE(info.delete_data);
+      payloads.emplace(info.table_path, info.delete_data->positional_deletes);
+    }
+    for (auto& child : node.children)
+      visit(*child);
+  };
+  visit(*root);
+  REQUIRE(payloads.size() == 2);
+  REQUIRE(payloads.at(v2_path).size() == 1);
+  CHECK(payloads.at(v2_path).begin()->second == std::vector<int64_t>{1, 3});
+  REQUIRE(payloads.at(second).size() == 1);
+  CHECK(payloads.at(second).begin()->second == std::vector<int64_t>{1, 3});
+  CHECK(payloads.at(v2_path).begin()->first != payloads.at(second).begin()->first);
+  CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
+        before.iceberg_manifest_walks + 2);
+  root.reset();
+  REQUIRE_FALSE(con->Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Sibling QueryEnd between certify and lowering does not discard node inventory",
+                 "[integration][iceberg][verdict]")
+{
+  auto state    = sirius::test::get_registered_sirius_context(*con);
+  auto counters = state->physical_counters();
+  auto query    = "SELECT fruit, count FROM " + pinned_scan(v2_path);
+  duckdb::Connection sibling(*con->context->db);
+  REQUIRE_FALSE(sibling.Query("SET gpu_execution=false")->HasError());
+  size_t pauses                       = 0;
+  counters->after_certify_for_testing = [&] {
+    ++pauses;
+    REQUIRE_FALSE(sibling.Query("SELECT 1")->HasError());
+  };
+  auto reset  = reset_after_test(counters->after_certify_for_testing);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  expect_iceberg_rows(
+    query, gpu_route::gpu, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(pauses == 1 + after.execution_rebuilds - before.execution_rebuilds);
+  CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + pauses);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Iceberg early checks preserve order without a manifest walk",
+                 "[integration][iceberg][verdict]")
+{
+  REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+  auto which   = GENERATE(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+  auto logical = con->ExtractPlan("SELECT fruit, count FROM " + pinned_scan(v1_path));
+  auto* node   = logical.get();
+  while (node->type != duckdb::LogicalOperatorType::LOGICAL_GET)
+    node = node->children.front().get();
+  auto& get       = node->Cast<duckdb::LogicalGet>();
+  using reason    = sirius::op::scan::verdict_reason;
+  reason expected = reason::none;
+  switch (which) {
+    case 1:
+      get.parameters.clear();
+      expected = reason::iceberg_no_table_path;
+      break;
+    case 2:
+      get.parameters[0] = duckdb::Value::INTEGER(42);
+      expected          = reason::iceberg_table_path_not_string;
+      break;
+    case 3:
+      get.parameters[0] = duckdb::Value("");
+      expected          = reason::iceberg_table_path_empty;
+      break;
+    case 4:
+      get.named_parameters["version"] = duckdb::Value("1");
+      expected                        = reason::iceberg_selector_not_snapshot_id;
+      break;
+    case 5:
+      get.named_parameters["allow_moved_paths"] = duckdb::Value::BOOLEAN(true);
+      expected                                  = reason::iceberg_moved_paths;
+      break;
+    case 6:
+      get.named_parameters.erase("snapshot_from_id");
+      expected = reason::iceberg_no_snapshot_id;
+      break;
+    case 7: {
+      auto& bind    = get.bind_data->Cast<duckdb::MultiFileBindData>();
+      auto& columns = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
+      REQUIRE_FALSE(columns.empty());
+      columns.front().identifier = duckdb::Value::INTEGER(100);
+      expected                   = reason::iceberg_field_id_gap;
+      break;
+    }
+    case 8:
+      get.named_parameters["snapshot_from_id"] = duckdb::Value("not-an-integer");
+      expected                                 = reason::iceberg_snapshot_id_not_integer;
+      break;
+    case 9: expected = reason::interface_unavailable; break;
+    case 10: {
+      auto& bind    = get.bind_data->Cast<duckdb::MultiFileBindData>();
+      auto& columns = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
+      REQUIRE_FALSE(columns.empty());
+      std::function<void(std::vector<duckdb::MultiFileColumnDefinition>&)> clear_ids =
+        [&](auto& fields) {
+          for (auto& field : fields) {
+            field.identifier = duckdb::Value();
+            clear_ids(field.children);
+          }
+        };
+      clear_ids(columns);
+      expected = reason::iceberg_table_schema_no_field_ids;
+      break;
+    }
+  }
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  sirius::planner::scan_contract_provenance provenance;
+  duckdb::DuckDB isolated(nullptr);
+  duckdb::Connection no_state(isolated);
+  // Invalid argument shapes are rejected by DuckDB's binder in SQL; mutate a successfully
+  // bound GET to exercise Sirius's own ordered guards. Check 9 needs a context without Sirius.
+  auto result = sirius::planner::registered_iceberg_decline_reason(
+    get, which == 9 ? *no_state.context : *con->context, provenance);
+  REQUIRE(result.decline);
+  CHECK(result.decline->reason == expected);
+  std::vector<std::string> const texts{"called without a table path",
+                                       "table path is not a string",
+                                       "table path is empty",
+                                       "was given 'version'",
+                                       "was given 'allow_moved_paths'",
+                                       "without 'snapshot_from_id'",
+                                       "gap in its Iceberg field ids",
+                                       "snapshot_from_id is not an integer",
+                                       "could not acquire the Sirius context",
+                                       "table schema has no complete field-id mapping"};
+  CHECK(result.decline->text.find(texts.at(which - 1)) != std::string::npos);
+  CHECK(result.decline->verdict == (which == 9
+                                      ? sirius::op::scan::eligibility_verdict::incomplete
+                                      : sirius::op::scan::eligibility_verdict::unsupported));
+  CHECK_FALSE(result.inventory);
+  CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
+        before.iceberg_manifest_walks);
+  CHECK_FALSE(provenance.budget.time_exceeded());
+  CHECK_FALSE(provenance.budget.bytes_exceeded());
+}
+
+namespace {
+std::string inventory_fixture(char const* name)
+{
+  static sirius::test::scratch_dir generated("iceberg_inventory");
+  auto const* root = std::getenv("SIRIUS_ICEBERG_INVENTORY_FIXTURES");
+  if (!root) {
+    static bool ready = [] {
+      auto quote = [](std::string const& value) {
+        std::string result = "'";
+        for (char c : value)
+          result += c == '\'' ? "'\\''" : std::string(1, c);
+        return result + "'";
+      };
+      auto script = get_project_root() / "test/cpp/integration/data/generate_inventory_fixtures.py";
+      auto command =
+        "python3 -B " + quote(script.string()) + " " + quote(generated.path().string());
+      REQUIRE(std::system(command.c_str()) == 0);
+      return true;
+    }();
+    (void)ready;
+  }
+  auto path = (root ? fs::path(root) : generated.path()) / name;
+  REQUIRE(fs::exists(path / "metadata/v1.metadata.json"));
+  return path.string();
+}
+}  // namespace
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Iceberg equality rejection precedes a malformed live deletion vector",
+                 "[integration][iceberg][verdict]")
+{
+  auto path = inventory_fixture("equality_bad_dv");
+  auto scan = pinned_scan(path);
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT fruit, count FROM " + scan);
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("this iceberg table has 1 equality-delete file(s), which the GPU "
+                                "scan path does not apply yet") != std::string::npos);
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto reason =
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+  CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
+  CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
+  CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Iceberg successful zero-row inventory is supported",
+                 "[integration][iceberg][verdict]")
+{
+  auto path      = inventory_fixture("empty");
+  auto sid       = current_snapshot_id(path);
+  auto before    = sirius::test::get_transparent_execution_stats(*con);
+  auto inventory = sirius::op::scan::read_delete_inventory(*con->context, path, sid);
+  REQUIRE(inventory.inventory);
+  CHECK(inventory.equality_count == 0);
+  CHECK(inventory.inventory->entries.empty());
+  CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
+        before.iceberg_manifest_walks + 1);
+  // Preserve a bound GET instead of letting DuckDB replace the zero-row scan by EMPTY_RESULT.
+  REQUIRE_FALSE(con->Query("PRAGMA disable_optimizer")->HasError());
+  auto logical = con->ExtractPlan("SELECT fruit, count FROM " + pinned_scan(path));
+  auto* get    = logical.get();
+  while (get->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
+    REQUIRE_FALSE(get->children.empty());
+    get = get->children.front().get();
+  }
+  sirius::planner::scan_contract_provenance provenance;
+  before      = sirius::test::get_transparent_execution_stats(*con);
+  auto result = sirius::planner::registered_iceberg_decline_reason(
+    get->Cast<duckdb::LogicalGet>(), *con->context, provenance);
+  CHECK_FALSE(result.decline);
+  REQUIRE(result.inventory);
+  CHECK(result.inventory->entries.empty());
+  CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
+        before.iceberg_manifest_walks + 1);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "SQL multi-Iceberg replan retains the R1 correspondence refusal",
+                 "[integration][iceberg][verdict]")
+{
+  auto query = "SELECT a.count, b.count FROM " + pinned_scan(v1_path) + " a JOIN " +
+               pinned_scan(v2_path) + " b ON a.count=b.count";
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::scoped_recording_log_sink logs;
+  expect_iceberg_rows(query, gpu_route::plan_fallback, {{"1", "1"}, {"3", "3"}});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
+  bool seen = false;
+  for (auto const& record : logs.records())
+    if (record.message.find("no_correspondence") != std::string::npos) seen = true;
+  CHECK(seen);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Iceberg later schema failure follows a successfully decoded file",
+                 "[integration][iceberg][verdict]")
+{
+  auto query = "SELECT id, value FROM " + pinned_scan(inventory_fixture("schema_later"));
+  sirius::test::scoped_setting one_byte_scan_batch(*con, "scan_task_batch_size", 1);
+  auto state    = sirius::test::get_registered_sirius_context(*con);
+  auto counters = state->physical_counters();
+  auto reset    = reset_after_test(counters->parquet_phase_for_testing);
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool held = false, decoded = false, observed = false;
+  counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
+    std::unique_lock lock(mutex);
+    if (footer && file.find("z_bad.parquet") != std::string::npos) {
+      held = true;
+      changed.notify_all();
+      if (!changed.wait_for(lock, std::chrono::seconds(20), [&] { return decoded; }))
+        throw std::runtime_error(
+          "valid Iceberg file did not decode while old-schema footer was held");
+    } else if (!footer && file.find("a_good.parquet") != std::string::npos) {
+      if (!changed.wait_for(lock, std::chrono::seconds(20), [&] { return held; }))
+        throw std::runtime_error("old-schema Iceberg footer was not held");
+      observed = decoded = true;
+      changed.notify_all();
+    }
+  };
+  expect_iceberg_schema_refusal(query,
+                                sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
+                                "does not carry the table's current schema (no match for value#2)",
+                                {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
+  CHECK(observed);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Qualifying DV work starts on workers after lowering and before decode",
+                 "[integration][scan_preparation][iceberg][deferred]")
+{
+  auto table    = inventory_fixture("dv_bounded");
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto owner    = std::this_thread::get_id();
+  bool lowered  = false;
+  std::atomic<bool> dv_finished = false, order_ok = true;
+  std::atomic<size_t> reads = 0, decodes = 0;
+  std::thread::id reader;
+  auto reset = reset_after_test(counters->iceberg_preparation_route_for_testing,
+                                counters->iceberg_dv_phase_for_testing,
+                                counters->parquet_phase_for_testing);
+  counters->iceberg_preparation_route_for_testing = [&](auto, bool deferred) {
+    CHECK(std::this_thread::get_id() == owner);
+    REQUIRE(deferred);
+    CHECK(reads == 0);
+    lowered = true;
+  };
+  counters->iceberg_dv_phase_for_testing = [&](auto const&, bool start) {
+    if (start) {
+      if (!lowered) order_ok = false;
+      ++reads;
+      reader = std::this_thread::get_id();
+    } else
+      dv_finished = true;
+  };
+  counters->parquet_phase_for_testing = [&](auto const&, bool footer) {
+    if (!footer) {
+      if (!dv_finished) order_ok = false;
+      ++decodes;
+    }
+  };
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(table),
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  CHECK(reads == 1);
+  CHECK(order_ok);
+  CHECK(decodes > 0);
+  CHECK(reader != owner);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Unsuccessful HOST admission selects legacy without rejecting the scan",
+                 "[integration][scan_preparation][iceberg][admission]")
+{
+  auto fault            = GENERATE(0, 1, 2);
+  auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  provider->grant_bytes = fault == 1 ? 1 : 1024 * 1024;
+  provider->return_null = fault == 0;
+  provider->seen->fail_allocation = fault == 2;
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto reset    = reset_after_test(counters->preparation_provider_for_testing,
+                                counters->iceberg_preparation_route_for_testing);
+  size_t legacy = 0;
+  counters->preparation_provider_for_testing      = provider;
+  counters->iceberg_preparation_route_for_testing = [&](auto, bool deferred) {
+    CHECK_FALSE(deferred);
+    ++legacy;
+    CHECK(provider->outstanding() == 0);
+  };
+  auto table = inventory_fixture("dv_bounded");
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(table),
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  CHECK(legacy > 0);
+
+  CHECK(provider->seen->requests == legacy);
+  CHECK(provider->outstanding() == 0);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Execution allocation failure keeps its resource cause and existing replay policy",
+                 "[integration][scan_preparation][iceberg][resource]")
+{
+  auto fallback = GENERATE(false, true);
+  sirius::test::scoped_setting fallback_setting(*con, "enable_duckdb_fallback", fallback);
+  auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  provider->grant_bytes = 1024 * 1024;
+  auto counters         = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto reset            = reset_after_test(counters->preparation_provider_for_testing,
+                                counters->iceberg_dv_phase_for_testing);
+  counters->preparation_provider_for_testing = provider;
+  counters->iceberg_dv_phase_for_testing     = [&](auto const&, bool start) {
+    if (start) provider->seen->fail_allocation = true;
+  };
+  auto table  = inventory_fixture("dv_bounded");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table));
+  REQUIRE(result);
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto cause = static_cast<size_t>(sirius::transparent::late_failure_cause::resource);
+  CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+  CHECK(after.late_replays[cause] == before.late_replays[cause] + (fallback ? 1 : 0));
+  if (fallback) {
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->RowCount() == 3);
+  } else {
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("preparation backing allocation failed") != std::string::npos);
+  }
+  CHECK(provider->outstanding() == 0);
+  CHECK(provider->seen->allocated_bytes == 0);
+  provider->seen->fail_allocation        = false;
+  counters->iceberg_dv_phase_for_testing = {};
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(table),
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "First files decode while the third DV is still being prepared",
+                 "[integration][scan_preparation][iceberg][overlap]")
+{
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  sirius::test::scoped_setting one_byte_scan_batch(*con, "scan_task_batch_size", 1);
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::set<std::string> earlier_files;
+  bool overlapped = false;
+  auto reset =
+    reset_after_test(counters->iceberg_dv_phase_for_testing, counters->parquet_phase_for_testing);
+  counters->iceberg_dv_phase_for_testing = [&](std::string const& file, bool start) {
+    if (!start || !file.ends_with("c.puffin")) return;
+    std::unique_lock lock(mutex);
+    if (!changed.wait_for(
+          lock, std::chrono::seconds(20), [&] { return earlier_files.size() >= 2; }))
+      throw std::runtime_error("earlier files did not decode before the third DV resumed");
+    overlapped = true;
+  };
+  counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
+    if (footer || file.ends_with("c.parquet")) return;
+    std::lock_guard lock(mutex);
+    earlier_files.insert(file);
+    changed.notify_all();
+  };
+  std::vector<std::vector<std::string>> expected;
+  for (int i = 0; i < 3; ++i)
+    for (auto row : std::vector<std::vector<std::string>>{
+           {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}})
+      expected.push_back(std::move(row));
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_three")),
+                      gpu_route::gpu,
+                      expected);
+  CHECK(overlapped);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Production residence publishes ready data before a blocked footer resumes",
+                 "[integration][scan_preparation][iceberg][default_residence]")
+{
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  preparation_test_state observed(counters);
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool earlier_decoded = false, overlapped = false;
+  auto reset                          = reset_after_test(counters->parquet_phase_for_testing);
+  counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
+    std::unique_lock lock(mutex);
+    if (footer && file.ends_with("c.parquet")) {
+      if (!changed.wait_for(lock, std::chrono::seconds(20), [&] { return earlier_decoded; }))
+        throw std::runtime_error("ready data did not decode while the later footer was blocked");
+      overlapped = true;
+    } else if (!footer && !file.ends_with("c.parquet")) {
+      earlier_decoded = true;
+      changed.notify_all();
+    }
+  };
+  std::vector<std::vector<std::string>> expected;
+  for (int i = 0; i < 3; ++i)
+    for (auto row : std::vector<std::vector<std::string>>{
+           {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}})
+      expected.push_back(std::move(row));
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_three")),
+                      gpu_route::gpu,
+                      expected);
+  CHECK(overlapped);
+  REQUIRE(observed.routes.size() == 1);
+  CHECK(observed.routes.front().second);
+  auto publication = observed.publication();
+  CHECK(publication.partial_emissions > 0);
+  REQUIRE(sirius::scan_manager::k_underfilled_batch_residence);
+  CHECK(publication.max_residence >= *sirius::scan_manager::k_underfilled_batch_residence);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "A statement admits all DV scans once or keeps all legacy and releases idle plans",
+                 "[integration][scan_preparation][iceberg][statement_admission]")
+{
+  auto limit            = GENERATE(7u, 8u);
+  auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  provider->grant_bytes = 1024 * 1024;
+  auto counters         = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto reset            = reset_after_test(counters->preparation_provider_for_testing,
+                                counters->statement_dv_limit_for_testing);
+  counters->preparation_provider_for_testing = provider;
+  counters->statement_dv_limit_for_testing   = limit;
+  auto first                                 = inventory_fixture("dv_bounded");
+  REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con->Query("BEGIN TRANSACTION READ ONLY")->HasError());
+  auto second = inventory_fixture("dv_three");
+  struct probe_generator : sirius::planner::sirius_physical_plan_generator {
+    using sirius_physical_plan_generator::create_plan;
+    using sirius_physical_plan_generator::sirius_physical_plan_generator;
+  } generator(*con->context, sirius::planner::scan_contract_provenance{std::nullopt, 19});
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> root;
+  for (auto const& table : {first, second}) {
+    auto logical = con->ExtractPlan("SELECT fruit, count FROM " + pinned_scan(table));
+    auto* get    = logical.get();
+    while (get->type != duckdb::LogicalOperatorType::LOGICAL_GET)
+      get = get->children.front().get();
+    auto node  = generator.create_plan(get->Cast<duckdb::LogicalGet>());
+    auto* scan = node.get();
+    while (scan->type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN)
+      scan = scan->children.front().get();
+    auto& source = scan->Cast<sirius::op::sirius_physical_table_scan>();
+    REQUIRE(source.delete_inventory);
+    REQUIRE_FALSE(source.delete_inventory->entries.empty());
+    REQUIRE_FALSE(source.pre_declined);
+    if (!root) root = duckdb::make_uniq<sirius::op::sirius_physical_union>(node->types, 10);
+    root->children.push_back(std::move(node));
+  }
+  CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
+        before.iceberg_manifest_walks + 2);
+  generator.insert_gpu_pipeline_operators(root);
+
+  size_t found = 0;
+  std::shared_ptr<sirius::scan_manager::preparation_admission> admission;
+  std::function<void(sirius::op::sirius_physical_operator&)> visit = [&](auto& node) {
+    if (node.type == sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) {
+      auto const& info = dynamic_cast<sirius::op::scan::iceberg_ingestible_table_info const&>(
+        node.template Cast<sirius::op::scan::sirius_gpu_scan_operator>()
+          .get_ingestible()
+          .table_info());
+      ++found;
+      CHECK(bool(info.deferred) == (limit == 8));
+      if (info.deferred) {
+        if (!admission) admission = info.deferred->admission;
+        CHECK(info.deferred->admission == admission);
+        CHECK(info.deferred->files.front().result.expired());
+      } else {
+        REQUIRE(info.delete_data);
+        CHECK_FALSE(info.delete_data->positional_deletes.empty());
+      }
+    }
+    for (auto& child : node.children)
+      visit(*child);
+  };
+  visit(*root);
+  CHECK(found == 2);
+
+  CHECK(provider->seen->requests == (limit == 8 ? 1 : 0));
+  CHECK(provider->outstanding() == (limit == 8 ? 1 : 0));
+  admission.reset();
+  root.reset();
+  CHECK(provider->outstanding() == 0);
+  CHECK(provider->seen->allocated_bytes == 0);
+  REQUIRE_FALSE(con->Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "DV failure drains queued GPU users before releasing binding inputs",
+                 "[integration][scan_preparation][iceberg][drain]")
+{
+  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
+  sirius::test::scoped_setting small_batch(*con, "scan_task_batch_size", 1);
+  auto state                             = sirius::test::get_registered_sirius_context(*con);
+  auto counters                          = state->physical_counters();
+  auto reset                             = reset_after_test(counters->iceberg_dv_phase_for_testing);
+  counters->iceberg_dv_phase_for_testing = [](std::string const& file, bool start) {
+    if (start && file.ends_with("c.puffin"))
+      throw sirius::transparent::classified_execution_error(
+        sirius::transparent::late_failure_cause::reader_io, "injected DV reader failure");
+  };
+  auto table  = inventory_fixture("dv_three");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  {
+    sirius::test::scoped_recording_log_sink logs;
+    auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("injected DV reader failure") != std::string::npos);
+    for (auto const& entry : logs.records())
+      CHECK(entry.message.find("incomplete or misbound delete set") == std::string::npos);
+  }
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto cause = static_cast<size_t>(sirius::transparent::late_failure_cause::reader_io);
+  CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+  CHECK(after.late_replays[cause] == before.late_replays[cause]);
+  CHECK(state->get_scan_manager().num_active_queries() == 0);
+  counters->iceberg_dv_phase_for_testing = {};
+  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table));
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  CHECK(result->RowCount() == 9);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "GPU prepared statements own and renew deferred reservations",
+                 "[integration][scan_preparation][iceberg][prepared_statement]")
+{
+  // PendingQuery schedules tasks immediately; keep its plan idle until Execute().
+  // Restore through a separate connection because one section releases con first.
+  duckdb::Connection settings(duckdb::DatabaseInstance::GetDatabase(*con->context));
+  sirius::test::scoped_setting single_duckdb_thread(settings, "threads", 1);
+  REQUIRE_FALSE(con->Query("SET gpu_execution=true")->HasError());
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
+  auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  provider->grant_bytes = 1024 * 1024;
+  auto counters         = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  std::atomic<unsigned> dv_reads{0};
+  auto reset = reset_after_test(counters->preparation_provider_for_testing,
+                                counters->iceberg_dv_phase_for_testing);
+  counters->preparation_provider_for_testing = provider;
+  counters->iceberg_dv_phase_for_testing     = [&](auto const&, bool start) {
+    if (start) ++dv_reads;
+  };
+  auto table    = inventory_fixture("dv_bounded");
+  auto sql      = "SELECT fruit, count FROM " + pinned_scan(table);
+  auto before   = sirius::test::get_transparent_execution_stats(*con);
+  auto prepared = con->Prepare(sql);
+  REQUIRE(prepared);
+  INFO((prepared->HasError() ? prepared->GetError() : ""));
+  REQUIRE_FALSE(prepared->HasError());
+  // Iceberg bind data is not copyable; bind through the real pending execution
+  // entry so finalize can re-plan the SQL inside the statement's query context.
+  duckdb::vector<duckdb::Value> parameters;
+  auto pending = prepared->PendingQuery(parameters, false);
+  REQUIRE(pending);
+  INFO((pending->HasError() ? pending->GetError() : ""));
+  REQUIRE_FALSE(pending->HasError());
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 0, 0);
+  REQUIRE(provider->seen->requests == 1);
+  REQUIRE(provider->outstanding() == 1);
+  CHECK(dv_reads == 0);
+
+  SECTION("abandon a pending GPU plan before the next statement")
+  {
+    pending.reset();
+    prepared.reset();
+    // DuckDB keeps an abandoned pending executor until the next statement or context cleanup.
+    REQUIRE_FALSE(con->Query("SET gpu_execution=true")->HasError());
+  }
+  SECTION("rebind and execute repeatedly on GPU")
+  {
+    for (int i = 0; i < 2; ++i) {
+      auto result = i == 0 ? pending->Execute() : prepared->Execute(parameters, false);
+      REQUIRE(result);
+      INFO((result->HasError() ? result->GetError() : ""));
+      REQUIRE_FALSE(result->HasError());
+      require_route(before, sirius::test::get_transparent_execution_stats(*con), gpu_route::gpu);
+      CHECK(collect_rows(result->Cast<duckdb::MaterializedQueryResult>()) ==
+            std::vector<std::vector<std::string>>{
+              {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+      CHECK(provider->seen->requests == i + 1);
+      CHECK(dv_reads == i + 1);
+      CHECK(provider->outstanding() == 0);
+      CHECK(provider->seen->allocated_bytes == 0);
+      before = sirius::test::get_transparent_execution_stats(*con);
+    }
+    prepared.reset();
+  }
+  SECTION("release the final prepared handle after its connection wrapper")
+  {
+    con.reset();
+    pending.reset();
+    prepared.reset();
+  }
+  CHECK(provider->outstanding() == 0);
+  CHECK(provider->seen->allocated_bytes == 0);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Connection interruption preserves cancellation and drains owned DV reads",
+                 "[integration][scan_preparation][iceberg][interrupt]")
+{
+  auto fallback = GENERATE(false, true);
+  auto deferred = GENERATE(false, true);
+  sirius::test::scoped_setting fallback_setting(*con, "enable_duckdb_fallback", fallback);
+  struct exact_provider : sirius::scan_manager::reservation_provider {
+    sirius::scan_manager::test::test_reservation_provider provider;
+    uint64_t allocation_granularity(sirius::scan_manager::memory_space_id) const override
+    {
+      return 1;
+    }
+    std::optional<sirius::scan_manager::reservation_grant> request(
+      sirius::scan_manager::memory_space_id space, uint64_t bytes) override
+    {
+      provider.grant_bytes = bytes;
+      return provider.request(space, bytes);
+    }
+  };
+  auto provider                  = std::make_shared<exact_provider>();
+  provider->provider.return_null = !deferred;
+  auto state                     = sirius::test::get_registered_sirius_context(*con);
+  auto counters                  = state->physical_counters();
+  auto reset                     = reset_after_test(counters->preparation_provider_for_testing,
+                                counters->iceberg_dv_phase_for_testing,
+                                counters->parquet_phase_for_testing,
+                                counters->iceberg_statement_route_for_testing,
+                                counters->iceberg_preparation_route_for_testing);
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool release = false;
+  std::atomic<unsigned> expected_reads{1};
+  std::atomic<unsigned> started{0}, finished{0}, footers{0}, decoded{0};
+  std::atomic<unsigned> routes{0};
+  std::atomic<bool> actual_route_matches{true};
+  counters->iceberg_statement_route_for_testing = [&](auto, auto const& decision) {
+    expected_reads = deferred ? decision.n_permits : 1;
+  };
+  counters->iceberg_preparation_route_for_testing = [&](auto, bool actual) {
+    if (actual != deferred) actual_route_matches = false;
+    ++routes;
+  };
+  counters->preparation_provider_for_testing = provider;
+  counters->iceberg_dv_phase_for_testing     = [&](auto const&, bool start) {
+    if (!start) {
+      ++finished;
+      return;
+    }
+    ++started;
+    std::unique_lock lock(mutex);
+    changed.notify_all();
+    if (!changed.wait_for(lock, std::chrono::seconds(10), [&] { return release; }))
+      throw std::runtime_error("held DV read was not released");
+  };
+  counters->parquet_phase_for_testing = [&](auto const&, bool footer) {
+    if (footer)
+      ++footers;
+    else
+      ++decoded;
+  };
+  auto sql     = "SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_three"));
+  auto before  = sirius::test::get_transparent_execution_stats(*con);
+  auto query   = std::async(std::launch::async, [&] { return con->Query(sql); });
+  auto cleanup = std::shared_ptr<void>(nullptr, [&](void*) {
+    std::lock_guard lock(mutex);
+    release = true;
+    changed.notify_all();
+  });
+  {
+    std::unique_lock lock(mutex);
+    REQUIRE(changed.wait_for(
+      lock, std::chrono::seconds(2), [&] { return started == expected_reads && started > 0; }));
+  }
+  con->Interrupt();
+  CHECK(routes > 0);
+  CHECK(actual_route_matches);
+  if (deferred)
+    CHECK(
+      state->get_scan_manager().wait_for_preparation_error_for_testing(std::chrono::seconds(1)));
+  CHECK(query.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+  CHECK(provider->provider.outstanding() == (deferred ? 1 : 0));
+  CHECK(state->get_scan_manager().num_active_queries() == (deferred ? 1 : 0));
+  CHECK(started == expected_reads);
+  cleanup.reset();
+  REQUIRE(query.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  auto result = query.get();
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(result->GetErrorType() == duckdb::ExceptionType::INTERRUPT);
+  CHECK(started == (deferred ? expected_reads.load() : 3));
+  CHECK(finished == (deferred ? expected_reads.load() : 3));
+  CHECK(footers == (deferred ? expected_reads.load() : 0));
+  CHECK(decoded == 0);
+  CHECK(provider->provider.outstanding() == 0);
+  CHECK(provider->provider.seen->allocated_bytes == 0);
+  CHECK(state->get_scan_manager().num_active_queries() == 0);
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  if (deferred) CHECK(after.executions == before.executions + 1);
+
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  CHECK(after.fallbacks == before.fallbacks);
+  for (size_t cause = 0; cause < before.late_replays.size(); ++cause)
+    CHECK(after.late_replays[cause] == before.late_replays[cause]);
+  counters->iceberg_dv_phase_for_testing = {};
+  counters->parquet_phase_for_testing    = {};
+  expect_iceberg_rows(sql,
+                      gpu_route::gpu,
+                      {{"apple", "1"},
+                       {"cherry", "3"},
+                       {"elderberry", "5"},
+                       {"apple", "1"},
+                       {"cherry", "3"},
+                       {"elderberry", "5"},
+                       {"apple", "1"},
+                       {"cherry", "3"},
+                       {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Corrupt and missing DV inputs preserve diagnostics across preparation routes",
+                 "[integration][scan_preparation][iceberg][route_parity]")
+{
+  auto missing  = GENERATE(false, true);
+  auto fallback = GENERATE(false, true);
+  auto table    = inventory_fixture(missing ? "dv_missing_payload" : "dv_corrupt_crc");
+  auto sidecar  = table + "/data/a.puffin";
+  std::string diagnostic;
+  try {
+    (void)sirius::op::scan::read_deletion_vector({.puffin_path           = sidecar,
+                                                  .content_offset        = 4,
+                                                  .content_size_in_bytes = 44,
+                                                  .referenced_data_file = table + "/data/a.parquet",
+                                                  .record_count         = 2});
+  } catch (std::exception const& error) {
+    diagnostic = error.what();
+  }
+  REQUIRE_FALSE(diagnostic.empty());
+  CHECK(diagnostic.find(missing ? "Cannot open file" : "CRC-32 mismatch") != std::string::npos);
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto sql      = "SELECT fruit, count FROM " + pinned_scan(table);
+  std::optional<std::string> cpu_error;
+  std::vector<std::vector<std::string>> cpu_rows;
+  if (fallback) {
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    auto reference = con->Query(sql);
+    REQUIRE(reference);
+    if (reference->HasError())
+      cpu_error = reference->GetError();
+    else
+      cpu_rows = collect_rows(*reference);
+  }
+  for (bool deferred : {false, true}) {
+    preparation_test_state observed(counters, deferred);
+    sirius::test::scoped_setting fallback_setting(*con, "enable_duckdb_fallback", fallback);
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::scoped_recording_log_sink logs;
+    auto result = con->Query(sql);
+    REQUIRE(result);
+    REQUIRE(observed.routes.size() == 1);
+    CHECK(observed.routes.front().second == deferred);
+    if (!fallback) {
+      REQUIRE(result->HasError());
+      CHECK(result->GetError().find(diagnostic) != std::string::npos);
+    } else {
+      REQUIRE(result->HasError() == bool(cpu_error));
+      if (cpu_error)
+        CHECK(result->GetError().find(*cpu_error) != std::string::npos);
+      else
+        CHECK(observed.fetch(*result) == cpu_rows);
+      bool retained = false;
+      for (auto const& log : logs.records())
+        retained |= log.message.find(diagnostic) != std::string::npos;
+      CHECK(retained);
+    }
+    REQUIRE(observed.reads_started.size() == 1);
+    CHECK(observed.reads_started.front() == sidecar);
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    auto cause =
+      static_cast<size_t>(missing ? sirius::transparent::late_failure_cause::reader_io
+                                  : sirius::transparent::late_failure_cause::physical_input);
+
+    CHECK(after.late_failures[cause] == before.late_failures[cause] + (deferred ? 1 : 0));
+    CHECK(after.late_replays[cause] == before.late_replays[cause] + (deferred && fallback ? 1 : 0));
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks + (deferred && fallback ? 1 : 0));
+    CHECK(after.fallbacks == before.fallbacks + (!deferred && fallback ? 1 : 0));
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Preparation routes preserve rows and delete payload loading",
+                 "[integration][scan_preparation][iceberg][route_parity]")
+{
+  auto three    = GENERATE(false, true);
+  auto empty    = GENERATE(false, true);
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto table    = inventory_fixture(three ? "dv_three" : "dv_bounded");
+  auto sql = "SELECT fruit, count FROM " + pinned_scan(table) + (empty ? " WHERE count%2=0" : "");
+  std::vector<std::vector<std::string>> expected;
+  if (!empty)
+    for (int i = 0; i < (three ? 3 : 1); ++i)
+      for (auto const& row : std::vector<std::vector<std::string>>{
+             {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}})
+        expected.push_back(row);
+  std::sort(expected.begin(), expected.end());
+  for (bool deferred : {false, true}) {
+    preparation_test_state observed(counters, deferred);
+    sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto result = con->SendQuery(sql);
+    REQUIRE(result);
+    INFO((result->HasError() ? result->GetError() : ""));
+    REQUIRE_FALSE(result->HasError());
+    CHECK(observed.fetch(*result) == expected);
+    REQUIRE(observed.routes.size() == 1);
+    CHECK(observed.routes.front().second == deferred);
+    REQUIRE(observed.admissions.size() == 1);
+    CHECK(observed.admissions.front().route_reason == (deferred ? "deferred" : "host_admission"));
+    CHECK(observed.reads_started.size() == (three ? 3 : 1));
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    require_route(before, after, gpu_route::gpu);
+
+    CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
+    CHECK(after.iceberg_dv_manifest_reads > before.iceberg_dv_manifest_reads);
+    CHECK(after.iceberg_delete_payload_loads ==
+          before.iceberg_delete_payload_loads + (three ? 3 : 1));
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Production preparation admission reports its HOST grant and scan route",
+                 "[integration][scan_preparation][iceberg][prepared_admission]")
+{
+  auto scarce   = GENERATE(false, true);
+  auto three    = GENERATE(false, true);
+  auto context  = sirius::test::get_registered_sirius_context(*con);
+  auto counters = context->physical_counters();
+  REQUIRE_FALSE(counters->preparation_provider_for_testing);
+  auto spaces =
+    context->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(spaces.empty());
+  auto* space = context->get_memory_manager().get_memory_space(cucascade::memory::Tier::HOST,
+                                                               spaces.front()->get_id().device_id);
+  auto block  = space->get_memory_resource_of<cucascade::memory::Tier::HOST>()->get_block_size();
+  auto held   = scarce ? space->make_reservation_upto(space->get_max_memory())
+                       : space->make_reservation_or_null(4 * block);
+  REQUIRE(held);
+  REQUIRE(held->size() >= 4 * block);
+  if (!scarce) held.reset();
+  preparation_test_state observed(counters);
+  counters->iceberg_statement_route_for_testing =
+    [&, report = counters->iceberg_statement_route_for_testing](auto reason, auto const& decision) {
+      held.reset();  // Restrict admission, not the subsequent GPU execution.
+      report(reason, decision);
+    };
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT count(*) FROM " +
+                           pinned_scan(inventory_fixture(three ? "dv_three" : "dv_bounded")));
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
+  CHECK(observed.fetch(*result) == std::vector<std::vector<std::string>>{{three ? "9" : "3"}});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  require_route(before, after, gpu_route::gpu);
+  REQUIRE(observed.admissions.size() == 1);
+  auto const& record = observed.admissions.front();
+  auto const& d      = record.decision;
+  CHECK(record.route_reason == (scarce ? "host_admission" : "deferred"));
+  CHECK(d.deferred == !scarce);
+  CHECK(d.allocation_granularity == block);
+  auto const& config    = context->get_config().get_scan_manager_config();
+  auto limits           = config.preparation.resolve(config.thread_pool.num_threads);
+  auto expected_permits = std::min<size_t>({three ? 3u : 1u,
+                                            static_cast<size_t>(config.thread_pool.num_threads),
+                                            limits.max_inflight_jobs,
+                                            limits.max_active_units,
+                                            limits.max_pending_results});
+  CHECK(d.c_requested == d.sigma_retained + (scarce ? 1 : expected_permits) * d.w);
+  CHECK(d.c_requested % d.allocation_granularity == 0);
+  REQUIRE(observed.routes.size() == 1);
+  CHECK(observed.routes.front().second == !scarce);
+
+  if (!scarce) {
+    CHECK(d.n_permits == expected_permits);
+    CHECK(d.c_obtained == d.c_requested);
+    REQUIRE(d.w > 0);
+    CHECK(d.n_permits == (d.c_obtained - d.sigma_retained) / d.w);
+  } else {
+    CHECK(d.reason == sirius::scan_manager::admission_reason::no_grant);
+    CHECK(d.c_obtained == 0);
+    CHECK(d.n_permits == 0);
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Understated DV envelopes fail during parsing after successful admission",
+                 "[integration][scan_preparation][iceberg][understated_envelope]")
+{
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  preparation_test_state observed(counters, true);
+  auto reset      = reset_after_test(counters->preparation_envelope_for_testing);
+  size_t injected = 0;
+  counters->preparation_envelope_for_testing = [&](auto& envelope) {
+    for (auto& unit : envelope.units) {
+      unit.blob          = 1;
+      unit.footer_parser = 1;
+      unit.roaring       = 0;
+      ++injected;
+    }
+  };
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result =
+    con->Query("SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_bounded")));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(injected == 1);
+  REQUIRE(observed.admissions.size() == 1);
+  CHECK(observed.admissions.front().decision.deferred);
+  CHECK(result->GetError().find("preparation allocation exceeds proved envelope") !=
+        std::string::npos);
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto cause = static_cast<size_t>(sirius::transparent::late_failure_cause::resource);
+  CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+  CHECK(after.late_replays[cause] == before.late_replays[cause]);
+
+  REQUIRE(observed.reads_started.size() == 1);
+  CHECK(observed.publication().preparation_publisher == std::thread::id{});
+  CHECK(observed.provider->outstanding() == 0);
+  CHECK(observed.provider->seen->allocated_bytes == 0);
+
+  counters->preparation_envelope_for_testing = {};
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_bounded")),
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
 }

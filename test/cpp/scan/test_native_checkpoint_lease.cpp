@@ -11,17 +11,21 @@
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/schema_catalog_entry.hpp>
 #include <duckdb/main/attached_database.hpp>
+#include <duckdb/main/database_manager.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
+#include <duckdb/transaction/meta_transaction.hpp>
 #include <fcntl.h>
 #include <op/scan/duckdb_native_metadata_cache.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/metadata_walk_parallel.hpp>
+#include <planner/sirius_physical_plan_generator.hpp>
 #include <signal.h>
 #include <sirius_context.hpp>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <transparent/read_view_registry.hpp>
 #include <unistd.h>
 #include <utils/child_process_environment.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -132,16 +136,6 @@ bool wait_for_key_count(duckdb::SiriusContext& context,
   auto const deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     if (context.get_scan_manager().checkpoint_key_count() == expected) { return true; }
-    std::this_thread::sleep_for(5ms);
-  }
-  return false;
-}
-
-bool wait_for_no_key(duckdb::SiriusContext& context, std::chrono::milliseconds timeout)
-{
-  auto const deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (!context.get_scan_manager().holds_any_checkpoint_key()) { return true; }
     std::this_thread::sleep_for(5ms);
   }
   return false;
@@ -412,8 +406,7 @@ TEST_CASE("native checkpoint lease starts at execution preparation and releases 
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
@@ -465,8 +458,7 @@ TEST_CASE("planning and retained prepared native plans hold no checkpoint lease"
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
@@ -502,8 +494,7 @@ TEST_CASE("native walk refusal is an execution failure and releases before repla
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto context      = sirius::test::get_registered_sirius_context(*con);
   auto const before = context->get_transparent_execution_stats();
@@ -597,8 +588,7 @@ TEST_CASE("native checkpoint lease releases on cancellation with a forced checkp
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
@@ -628,8 +618,7 @@ TEST_CASE("native checkpoint lease releases on a decode error-result",
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
@@ -694,8 +683,7 @@ TEST_CASE("a multi-native plan releases every checkpoint key",
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling = sibling_connection(fixture);
   auto context = sirius::test::get_registered_sirius_context(*con);
@@ -722,8 +710,7 @@ TEST_CASE("a waiting forced checkpoint stalls writes but not read-only transacti
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto checkpoint_connection = sibling_connection(fixture);
   auto writer                = sibling_connection(fixture);
@@ -771,8 +758,7 @@ TEST_CASE("native-first planning cannot deadlock a cold Iceberg metadata connect
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto checkpoint_connection = sibling_connection(fixture);
   auto context               = sirius::test::get_registered_sirius_context(*con);
@@ -817,8 +803,7 @@ TEST_CASE("prepared native re-execution reacquires a fresh checkpoint lease",
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling  = sibling_connection(fixture);
   auto context  = sirius::test::get_registered_sirius_context(*con);
@@ -908,8 +893,7 @@ TEST_CASE("epoch-invalidated execution rebuild takes the native checkpoint lease
 {
   if (sirius::test::run_isolated()) { return; }
   NativeLeaseFixture fixture;
-  auto& con                = fixture.con;
-  auto const& attach_alias = fixture.attach_alias;
+  auto& con = fixture.con;
   prepare_native_table(fixture);
   auto sibling      = sibling_connection(fixture);
   auto context      = sirius::test::get_registered_sirius_context(*con);
@@ -1215,4 +1199,234 @@ TEST_CASE("checkpoint leases are released only for their owning query",
   REQUIRE(checkpoint.wait_for(5s) == std::future_status::ready);
   CHECK(checkpoint.get().empty());
   query_ok(*fixture.con, "ROLLBACK");
+}
+
+TEST_CASE("native and Iceberg planning completes under a waiting forced checkpoint",
+          "[scan][native][checkpoint][iceberg][verdict][integration]")
+{
+  if (sirius::test::run_isolated()) return;
+  NativeLeaseFixture fixture;
+  prepare_native_table(fixture);
+  auto& con = fixture.con;
+  query_ok(*con, "LOAD iceberg");
+  auto sibling = sibling_connection(fixture);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  query_ok(*con, "SET gpu_execution=false");
+  query_ok(*con, "BEGIN TRANSACTION READ ONLY");
+  auto& catalog = duckdb::Catalog::GetCatalog(*con->context, fixture.attach_alias);
+  auto& table = catalog.GetEntry<duckdb::TableCatalogEntry>(*con->context, "main", "native_lease_t")
+                  .Cast<duckdb::DuckTableEntry>();
+  std::future<std::string> checkpoint;
+  {
+    duckdb::SiriusContext::StandaloneQueryScope window(
+      *context, *con->context, "iceberg_checkpoint");
+    context->get_scan_manager().acquire_checkpoint_key(window.query_id(),
+                                                       table.GetStorage().GetAttached());
+    checkpoint = std::async(std::launch::async, [&] {
+      auto result = sibling->Query("FORCE CHECKPOINT");
+      return result->HasError() ? result->GetError() : std::string{};
+    });
+    CHECK(checkpoint.wait_for(150ms) == std::future_status::timeout);
+    duckdb::SiriusContext::InternalQueryGuard guard(*con->context);
+    auto before  = context->get_transparent_execution_stats();
+    auto logical = con->ExtractPlan(
+      "SELECT i FROM native_lease_t UNION ALL SELECT count::BIGINT FROM iceberg_scan("
+      "'test/cpp/integration/data/iceberg_v2_delete', snapshot_from_id=2000000000000000001)");
+    sirius::planner::sirius_physical_plan_generator generator(*con->context);
+    auto plan = generator.create_plan(std::move(logical));
+    REQUIRE(plan);
+    REQUIRE(generator.read_views->entries().size() == 2);
+    auto after = context->get_transparent_execution_stats();
+    CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
+    CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 1);
+    CHECK(checkpoint.wait_for(0ms) == std::future_status::timeout);
+    plan.reset();
+    window.finish();
+  }
+  REQUIRE(checkpoint.wait_for(5s) == std::future_status::ready);
+  CHECK(checkpoint.get().empty());
+  query_ok(*con, "ROLLBACK");
+}
+
+namespace {
+
+struct InternalStartFixture : sirius::test::GpuExecutionFixture {
+  InternalStartFixture()
+  {
+    query_ok(*con, "SET gpu_execution = false");
+    query_ok(*con, "CREATE TABLE internal_guard_t AS SELECT 42 AS i");
+    query_ok(*con, "CHECKPOINT");
+    context  = sirius::test::get_registered_sirius_context(*con);
+    database = duckdb::DatabaseManager::Get(*con->context->db).GetDatabase(attach_alias);
+    REQUIRE(database);
+  }
+
+  duckdb::shared_ptr<duckdb::SiriusContext> context;
+  duckdb::shared_ptr<duckdb::AttachedDatabase> database;
+};
+
+void start_guarded_write_transaction(duckdb::ClientContext& outer,
+                                     duckdb::Connection& internal,
+                                     duckdb::AttachedDatabase& database)
+{
+  duckdb::SiriusContext::InternalQueryGuard::before_transaction_start(outer, database, false);
+  query_ok(internal, "BEGIN TRANSACTION");
+  // BEGIN is lazy: force the actual database StartTransaction entry, not merely
+  // construction of DuckDB's MetaTransaction.
+  duckdb::MetaTransaction::Get(*internal.context).GetTransaction(database);
+}
+
+}  // namespace
+
+TEST_CASE("Internal write start rejects the owning window checkpoint key",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
+{
+  InternalStartFixture fixture;
+  query_ok(*fixture.con, "SET sirius_test_internal_start_mode = 'read_write'");
+  auto& outer = *fixture.con->context;
+  duckdb::SiriusContext::StandaloneQueryScope window(*fixture.context, outer, "internal_guard");
+  fixture.context->get_scan_manager().acquire_checkpoint_key(window.query_id(), *fixture.database);
+  // Changes after entry must not change this attempt's latched probe mode.
+  query_ok(*fixture.con, "SET sirius_test_internal_start_mode = 'read_only'");
+  REQUIRE_THROWS_AS(duckdb::SiriusContext::open_internal_connection(outer),
+                    duckdb::NotImplementedException);
+  duckdb::Connection internal(*outer.db);
+  duckdb::SiriusContext::InternalQueryGuard guard(*internal.context);
+  REQUIRE_THROWS_AS(start_guarded_write_transaction(outer, internal, *fixture.database),
+                    duckdb::NotImplementedException);
+  CHECK_FALSE(internal.context->transaction.HasActiveTransaction());
+  try {
+    duckdb::SiriusContext::InternalQueryGuard::before_transaction_start(
+      outer, *fixture.database, false);
+    FAIL("guard accepted a write start while its window holds the database key");
+  } catch (duckdb::NotImplementedException const& error) {
+    std::string const diagnostic = error.what();
+    CHECK(diagnostic.find(fixture.attach_alias) != std::string::npos);
+    CHECK(diagnostic.find(std::to_string(sirius::value_of(window.query_id()))) !=
+          std::string::npos);
+  }
+  window.finish();
+  CHECK(fixture.context->get_scan_manager().checkpoint_key_count() == 0);
+  REQUIRE_NOTHROW(duckdb::SiriusContext::open_internal_connection(outer));
+}
+
+TEST_CASE("Internal read-only helper works while its window holds a checkpoint key",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
+{
+  InternalStartFixture fixture;
+  auto& outer = *fixture.con->context;
+  duckdb::SiriusContext::StandaloneQueryScope window(*fixture.context, outer, "internal_guard");
+  fixture.context->get_scan_manager().acquire_checkpoint_key(window.query_id(), *fixture.database);
+  REQUIRE_NOTHROW(duckdb::SiriusContext::InternalQueryGuard::before_transaction_start(
+    outer, *fixture.database, true));
+  {
+    auto internal = duckdb::SiriusContext::open_internal_connection(outer);
+    auto result   = internal.Query("SELECT i FROM " + fixture.attach_alias + ".internal_guard_t");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    CHECK(scalar_value(*result) == "42");
+    REQUIRE_THROWS_AS(
+      internal.Query("INSERT INTO " + fixture.attach_alias + ".internal_guard_t VALUES (43)"),
+      duckdb::InvalidInputException);
+  }
+  CHECK(fixture.context->get_scan_manager().checkpoint_key_count(window.query_id()) == 1);
+  window.finish();
+  CHECK(fixture.context->get_scan_manager().checkpoint_key_count() == 0);
+}
+
+TEST_CASE("Internal guard allows a database without this window checkpoint key",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
+{
+  InternalStartFixture fixture;
+  auto& outer = *fixture.con->context;
+  duckdb::SiriusContext::StandaloneQueryScope window(*fixture.context, outer, "internal_guard");
+  fixture.context->get_scan_manager().acquire_checkpoint_key(window.query_id(), *fixture.database);
+  auto unkeyed = duckdb::DatabaseManager::Get(*outer.db).GetDatabase("memory");
+  REQUIRE(unkeyed);
+  duckdb::Connection internal(*outer.db);
+  duckdb::SiriusContext::InternalQueryGuard guard(*internal.context);
+  REQUIRE_NOTHROW(start_guarded_write_transaction(outer, internal, *unkeyed));
+  CHECK(internal.context->transaction.HasActiveTransaction());
+  CHECK(duckdb::MetaTransaction::Get(*internal.context).TryGetTransaction(*unkeyed));
+  query_ok(internal, "ROLLBACK");
+  window.finish();
+  REQUIRE_NOTHROW(start_guarded_write_transaction(outer, internal, *fixture.database));
+  query_ok(internal, "ROLLBACK");
+}
+
+TEST_CASE("Internal guard does not borrow another connection window key",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
+{
+  InternalStartFixture fixture;
+  duckdb::Connection other(*fixture.con->context->db);
+  query_ok(other, "SET gpu_execution = false");
+  auto other_context = sirius::test::get_registered_sirius_context(other);
+  REQUIRE(other_context.get() == fixture.context.get());
+  duckdb::SiriusContext::StandaloneQueryScope window(
+    *fixture.context, *fixture.con->context, "internal_guard");
+  fixture.context->get_scan_manager().acquire_checkpoint_key(window.query_id(), *fixture.database);
+  duckdb::Connection internal(*other.context->db);
+  duckdb::SiriusContext::InternalQueryGuard guard(*internal.context);
+  REQUIRE_NOTHROW(start_guarded_write_transaction(*other.context, internal, *fixture.database));
+  query_ok(internal, "ROLLBACK");
+  window.finish();
+}
+
+TEST_CASE("Internal guard consults only the owning query key record",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
+{
+  InternalStartFixture fixture;
+  auto& outer = *fixture.con->context;
+  duckdb::SiriusContext::StandaloneQueryScope window(*fixture.context, outer, "internal_guard");
+  auto& manager          = fixture.context->get_scan_manager();
+  auto const other_query = sirius::make_query_id(sirius::value_of(window.query_id()) + 1);
+  struct other_key_cleanup {
+    sirius::scan_manager::sirius_scan_manager& manager;
+    sirius::query_id_t query;
+    ~other_key_cleanup() { manager.reset(query); }
+  } cleanup{manager, other_query};
+  manager.acquire_checkpoint_key(other_query, *fixture.database);
+  CHECK(manager.holds_checkpoint_key(*fixture.database));
+  CHECK_FALSE(manager.holds_checkpoint_key(window.query_id(), *fixture.database));
+  duckdb::Connection internal(*outer.db);
+  duckdb::SiriusContext::InternalQueryGuard guard(*internal.context);
+  REQUIRE_NOTHROW(start_guarded_write_transaction(outer, internal, *fixture.database));
+  query_ok(internal, "ROLLBACK");
+  window.finish();
+  CHECK(manager.checkpoint_key_count(other_query) == 1);
+}
+
+TEST_CASE("Unfinished window clears its internal transaction guard association",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
+{
+  InternalStartFixture fixture;
+  auto& outer = *fixture.con->context;
+  query_ok(*fixture.con, "SET sirius_test_internal_start_mode = 'read_write'");
+  {
+    duckdb::SiriusContext::StandaloneQueryScope window(*fixture.context, outer, "internal_guard");
+    fixture.context->get_scan_manager().acquire_checkpoint_key(window.query_id(),
+                                                               *fixture.database);
+    REQUIRE_THROWS_AS(duckdb::SiriusContext::open_internal_connection(outer),
+                      duckdb::NotImplementedException);
+    // Leave through the destructor backstop rather than finish().
+  }
+  CHECK(fixture.context->get_scan_manager().checkpoint_key_count() == 0);
+  REQUIRE_NOTHROW(duckdb::SiriusContext::open_internal_connection(outer));
+}
+
+TEST_CASE("Component write probe without a key never exposes a writable helper",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
+{
+  InternalStartFixture fixture;
+  query_ok(*fixture.con, "SET sirius_test_internal_start_mode = 'read_write'");
+  duckdb::SiriusContext::StandaloneQueryScope window(
+    *fixture.context, *fixture.con->context, "internal_guard");
+  try {
+    auto internal = duckdb::SiriusContext::open_internal_connection(*fixture.con->context);
+    FAIL("component probe must not expose a writable internal connection");
+  } catch (duckdb::InvalidInputException const& error) {
+    CHECK(std::string(error.what()).find("read-write probe completed") != std::string::npos);
+  }
+  window.finish();
+  query_ok(*fixture.con, "SELECT * FROM internal_guard_t");
 }

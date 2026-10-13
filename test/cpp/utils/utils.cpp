@@ -19,6 +19,8 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 
+#include <rmm/error.hpp>
+
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -50,7 +52,9 @@ std::unique_ptr<cudf::column> create_numeric_column_with_random_data(
   for (size_t r = 0; r < num_rows; ++r)
     h_data[r] = dist(gen);
 
-  cudaMemcpy(view.data<T>(), h_data.data(), sizeof(T) * num_rows, cudaMemcpyHostToDevice);
+  RMM_CUDA_TRY(cudaMemcpyAsync(
+    view.data<T>(), h_data.data(), sizeof(T) * num_rows, cudaMemcpyHostToDevice, stream.get()));
+  stream.sync();
   return col;
 }
 
@@ -66,7 +70,7 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.reserve(column_types.size());
 
-  for (int c = 0; c < column_types.size(); ++c) {
+  for (std::size_t c = 0; c < column_types.size(); ++c) {
     const auto& dtype = column_types[c];
     switch (dtype.id()) {
       case cudf::type_id::INT32: {

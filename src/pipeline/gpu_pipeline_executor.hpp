@@ -84,7 +84,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   /**
    * @brief Destructor for the gpu_pipeline_executor.
    */
-  ~gpu_pipeline_executor();
+  ~gpu_pipeline_executor() override;
 
   /// Attach the query-event observer, sharing ownership so the handle is
   /// neither null nor dangling.  Propagated by task_scheduler; until then this

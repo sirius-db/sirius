@@ -5,7 +5,7 @@ This directory contains benchmarking, profiling, and performance testing tools f
 ## Prerequisites
 
 - Sirius must be built: `pixi run make -j12` (from project root)
-- Binary: `build/release/duckdb` with Sirius extension at `build/release/extension/sirius/sirius.duckdb_extension`
+- Binary: `sirius-duckdb/build/release/duckdb` with Sirius extension at `sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension`
 - Sirius config: `test/cpp/integration/integration.yaml` (set `SIRIUS_CONFIG_FILE` env var)
 - Parquet data must exist in `test_datasets/tpch_parquet_sf<N>/` (auto-generated if missing)
 
@@ -90,7 +90,7 @@ equivalent — which is sound precisely because the base data is byte-identical 
 
 ```bash
 # From project root - generates parquet files with DuckDB's default row groups (122K rows)
-./build/release/duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=100); EXPORT DATABASE 'test_datasets/tpch_parquet_sf100' (FORMAT PARQUET);"
+./sirius-duckdb/build/release/duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=100); EXPORT DATABASE 'test_datasets/tpch_parquet_sf100' (FORMAT PARQUET);"
 ```
 
 ### Rewriting parquet with GPU-optimized settings
@@ -130,6 +130,11 @@ pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
     --scale-factor 100 \
     --engine both --iterations 2
+
+# Parquet data on S3 (on EC2, attach an IAM role with ListBucket/GetObject access)
+pixi run python test/tpch_performance/performance_test.py \
+    --input s3://my-bucket/tpch_parquet_sf100/ \
+    --engine gpu --iterations 2
 
 # Sirius vs DuckDB result validation, queries 1/3/6 only
 pixi run python test/tpch_performance/performance_test.py \
@@ -251,26 +256,23 @@ is the default in-process benchmark path.
 
 #### Benchmarking over S3
 
-`--input` accepts an `s3://` prefix holding one `<table>/` subdirectory per TPC-H
-table; the views become `read_parquet('s3://…/<table>/*.parquet')` and Sirius's
-`sirius_httpfs` expands the glob with `ListObjectsV2` at bind time.
+`--input` accepts an `s3://bucket/prefix` containing TPC-H Parquet files,
+including per-table subdirectories. Boto3 discovers the exact keys and the
+runner registers views over those keys.
 
-- **GPU only.** S3 has no CPU fallback (`src/sirius_context.cpp`,
-  `throw_if_s3_no_cpu_fallback`), so `--engine cpu|both`, `--validation`, and
-  `--pin` are rejected for an `s3://` input. Validate against a local copy of the
-  same data instead.
-- **Credentials must be in the Sirius YAML.** Sirius does not read the
-  environment, AWS profiles, or IMDS (`docs/super-sirius/scan.md`,
-  "Configuration") — put `endpoint` / `region` / `access_key` / `secret_key`
-  (plus `session_token` for temporary credentials) under
-  `sirius.executor.scan_manager.object_store` and pass the file via `--config`.
-  Endpoint must be the regional form `https://s3.<region>.amazonaws.com`.
-- The harness disables DuckDB's extension autoloading for `s3://` inputs so
-  DuckDB's own `httpfs` cannot claim the scheme ahead of `sirius_httpfs`.
+- Boto3 obtains credentials from the normal AWS chain, including EC2 instance
+  roles. The runner creates a scoped `SIRIUS_S3` secret before GPU view creation
+  and refreshes it between timed queries. No credentials go into YAML or result
+  artifacts.
+- A CPU comparison uses DuckDB's `httpfs` extension and its `S3` secret. This
+  is a benchmark-only requirement, not a Sirius dependency.
+- The GPU connection disables extension autoloading so `httpfs` cannot claim
+  `s3://` ahead of Sirius's filesystem. S3 data has no local OS page cache to
+  evict; the runner skips the OS cache drop for it.
 
 Key flags:
 - `--scale-factor SF` — dataset scale used to render Q11's `0.0001 / SF` threshold. Pass it explicitly; omission defaults to SF1 with a warning for rollout compatibility.
-- `--data-source parquet|duckdb` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works with every runner, and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.)
+- `--data-source parquet|duckdb` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`), and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.)
 - `--engine gpu|cpu|both` — which engine to benchmark.
 - `--iterations N` — per-query iteration count.
 - `--profile cold|lukewarm|hot` (optional) — cache state to measure; see "Profiles" above. When given it overrides `cache.mode` / `cache.eviction` in `--config`; when omitted the config is left alone.

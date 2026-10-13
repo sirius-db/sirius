@@ -5,7 +5,7 @@ as follows:
 
 - Bump submodules
   - `./duckdb` should be set to latest tagged release
-  - Keep related submodules such as `./substrait` and `./vcpkg` aligned when the release requires it
+  - Keep related submodules such as `./substrait` and `./sirius-duckdb/vcpkg` aligned when the release requires it
 - Update the DuckDB package in `pixi.toml` to the matching release for Python users
 - Bump versions in `.github/workflows`
   - `duckdb_version` input in `distribution.yml` should be set to latest tagged release

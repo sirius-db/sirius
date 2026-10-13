@@ -548,9 +548,9 @@ void maybe_upload_large_fixture(s3_endpoint const& http, fs::path const& work)
   fs::path parquet = work / "lineitem_sf10.parquet";
   std::error_code ec;
   if (!(fs::exists(parquet, ec) && fs::file_size(parquet, ec) > 0)) {
-    fs::path duckdb_bin =
-      env_or("SIRIUS_TEST_DUCKDB",
-             (fs::path{SIRIUS_PROJECT_ROOT} / "build" / "release" / "duckdb").string());
+    fs::path duckdb_bin = env_or(
+      "SIRIUS_TEST_DUCKDB",
+      (fs::path{SIRIUS_PROJECT_ROOT} / "sirius-duckdb" / "build" / "release" / "duckdb").string());
     fs::path db = work / "tpch_sf10.duckdb";
     // Generate to a temp file and atomically rename, so an interrupted run never
     // leaves a truncated-but-non-empty file that the cache check would reuse.
@@ -567,7 +567,7 @@ void maybe_upload_large_fixture(s3_endpoint const& http, fs::path const& work)
       fs::remove(parquet_tmp, ec);
       throw std::runtime_error("failed to generate SF10 lineitem via DuckDB CLI (" +
                                duckdb_bin.string() +
-                               "); run `make release` or set SIRIUS_TEST_DUCKDB");
+                               "); build sirius-duckdb or set SIRIUS_TEST_DUCKDB");
     }
     fs::rename(parquet_tmp, parquet, ec);
     if (ec) throw std::runtime_error("failed to finalize SF10 parquet cache: " + ec.message());
@@ -615,9 +615,9 @@ void maybe_upload_tpch_sf1_fixture(s3_endpoint const& http, fs::path const& work
   };
 
   if (!fixture_complete()) {
-    fs::path duckdb_bin =
-      env_or("SIRIUS_TEST_DUCKDB",
-             (fs::path{SIRIUS_PROJECT_ROOT} / "build" / "release" / "duckdb").string());
+    fs::path duckdb_bin = env_or(
+      "SIRIUS_TEST_DUCKDB",
+      (fs::path{SIRIUS_PROJECT_ROOT} / "sirius-duckdb" / "build" / "release" / "duckdb").string());
     fs::path db          = work / "tpch_sf1.duckdb";
     fs::path fixture_tmp = work / "tpch_sf1.tmp";
     std::error_code ec;

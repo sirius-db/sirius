@@ -347,8 +347,8 @@ jobs:
         # is the shared walkthrough (requirements, install, download, unsigned-extensions,
         # load-and-try) used by both modes, with {{PLACEHOLDER}} tokens filled in below;
         # LATEST.md/STABLE.md are short static blurbs explaining what each tag means, appended
-        # above the (script-generated, no template needed) changelog for latest or in place of
-        # one for stable. Editing release copy is then a plain markdown edit, no backtick
+        # above the comparison link for latest or in place of one for stable. Editing release copy
+        # is then a plain markdown edit, no backtick
         # escaping, no touching this workflow file. The install command and example query in
         # GETTING_STARTED.md are taken verbatim from docs/README.md's own quick-start section,
         # not invented here, so they stay correct as that doc evolves.
@@ -391,55 +391,19 @@ jobs:
           else:
               with open(".github/workflows/release/LATEST.md") as f:
                   notes += "\n\n" + f.read().rstrip() + "\n"
-              has_stable = subprocess.run(
-                  ["git", "rev-parse", "-q", "--verify", "refs/tags/stable"],
-                  capture_output=True,
-              ).returncode == 0
-              rev_range = f"stable..{target_sha}" if has_stable else target_sha
-              # When a stable tag exists, show every commit since it, no cap - that's the whole
-              # point of a "what's changed since stable" changelog. Only the no-stable fallback
-              # (the entire repo history up to target_sha) gets capped at 50, so it doesn't
-              # overwhelm the release notes. -n limits git log's own output; no pipe to a
-              # truncating consumer (head/etc.) that could SIGPIPE it under a shell's pipefail,
-              # not a concern here either way since this runs as one subprocess call, not a shell
-              # pipeline.
-              log_args = ["git", "log", rev_range, "--oneline"]
-              if not has_stable:
-                  log_args[2:2] = ["-n", "50"]
-              log = subprocess.run(
-                  log_args,
-                  capture_output=True, text=True, check=True,
-              ).stdout
-              lines = [f"- {line}" for line in log.splitlines()]
-              heading = "## Changes since `stable`" if has_stable else "## Changes (last 50 commits)"
-
-              # GitHub hard-caps a release body at 125,000 characters (HTTP 422 if exceeded) - with
-              # no cap here, a stable tag that's gone stale for a long stretch could blow past that
-              # and fail the publish on the very last step, after staging/verification already
-              # succeeded. Keep a 15,000-char safety margin below the real limit for the rest of
-              # the notes (GETTING_STARTED.md + LATEST.md, already in `notes` above) plus encoding
-              # slop, and truncate the commit list to fit instead of letting the API call fail.
-              # The no-stable fallback is already capped at 50 short lines, well under any
-              # reasonable budget, so this is a no-op there in practice.
-              BODY_LIMIT = 125_000
-              SAFETY_MARGIN = 15_000
-              budget = BODY_LIMIT - SAFETY_MARGIN - len(notes) - len(heading)
-              changes = "\n".join(lines)
-              if len(changes) > budget and has_stable:
-                  kept = []
-                  used = 0
-                  compare_url = f"https://github.com/{repo}/compare/stable...{target_sha}"
-                  reserved = len(compare_url) + 40  # room for the "... and N more" line itself
-                  for line in lines:
-                      if used + len(line) + 1 > budget - reserved:
-                          break
-                      kept.append(line)
-                      used += len(line) + 1
-                  omitted = len(lines) - len(kept)
-                  kept.append(f"- ... and {omitted} more commit(s), see the full history: {compare_url}")
-                  changes = "\n".join(kept)
-
-              notes += f"\n\n{heading}\n\n" + changes + "\n"
+              stable_ref = subprocess.run(
+                  ["git", "rev-parse", "-q", "--verify", "refs/tags/stable^{}"],
+                  capture_output=True, text=True,
+              )
+              if stable_ref.returncode not in (0, 1):
+                  raise RuntimeError(stable_ref.stderr.strip())
+              stable_sha = stable_ref.stdout.strip()
+              if stable_sha:
+                  compare_url = f"https://github.com/{repo}/compare/{stable_sha}...{target_sha}"
+                  notes += f"\n\n## Changes since `stable`\n\n[View changes on GitHub]({compare_url})\n"
+              else:
+                  history_url = f"https://github.com/{repo}/commits/{target_sha}"
+                  notes += f"\n\n## Changes\n\n[View commit history on GitHub]({history_url})\n"
 
           with open("NOTES.md", "w") as f:
               f.write(notes)

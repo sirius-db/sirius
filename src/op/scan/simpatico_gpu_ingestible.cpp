@@ -370,7 +370,8 @@ simpatico_gpu_ingestible::simpatico_gpu_ingestible(
     // Slot k of the decode is _info->column_ids[k], which is exactly the primary index the
     // analysis keyed its ranges by (the plan generator builds column_ids from the same
     // duckdb_column_ids).
-    auto request = sirius::op::build_pushdown_request(analysis, _info->column_ids);
+    auto request =
+      sirius::op::build_pushdown_request(analysis, _info->column_ids, output_prefix_width());
     // Off-gate the request carries nothing this source can use: row dropping is gated, and the
     // equality answers that are not are never asked for here. Dropping it entirely keeps the
     // gate-off path byte-identical to the one before decode-time filtering existed.

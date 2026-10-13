@@ -65,7 +65,11 @@ std::string normalize_contract_runtime_ids(std::string dump)
   static const std::regex kHandle{"(handle=)\\d+"};
   static const std::regex kFinalizeGeneration{"(finalize_generation=)\\d+"};
   dump = std::regex_replace(dump, kHandle, "$1<volatile>");
-  return std::regex_replace(dump, kFinalizeGeneration, "$1<volatile>");
+  dump = std::regex_replace(dump, kFinalizeGeneration, "$1<volatile>");
+  // Measured certification durations vary between attempts; keep byte counts,
+  // verdicts, required checks and the entire schedule in the comparison.
+  static const std::regex kDurations{"((?:added_time_us|delete_preparation_time_us)=)\\d+"};
+  return std::regex_replace(dump, kDurations, "$1<volatile>");
 }
 
 //! Every pipeline must appear after all of its `dependencies` (producers).

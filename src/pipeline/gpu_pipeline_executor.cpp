@@ -21,11 +21,13 @@
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
 #include "log/logging.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <rmm/cuda_device.hpp>
@@ -71,10 +73,19 @@ sirius::exec::invocable<void() noexcept> gpu_pipeline_executor::get_per_thread_i
           thread_prefix     = _config.thread_name_prefix,
           thread_id_counter]() mutable noexcept {
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
-    telemetry::thread_local_executor_thread_telemtry_init(
-      *telemetry_context,
-      std::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
-      telemetry_context->executor_thread_group_id(device_id));
+
+    try {
+      auto& thread_handle = telemetry::executor_thread_telemetry_state.handle;
+      thread_handle.reset();
+      thread_handle = telemetry_context->context().executor_thread_observer()->handle();
+      thread_handle->spawned({
+        .label = std::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
+        .group_id =
+          telemetry_context->gpu_device_telemetry_handles(device_id).executor_threads.id(),
+      });
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_ERROR("get_per_thread_init telemetry failed: {}", e.what());
+    }
 
     // Per-thread init runs on a worker thread just spawned by the
     // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
@@ -94,10 +105,13 @@ sirius::exec::invocable<void() noexcept> gpu_pipeline_executor::get_per_thread_i
 
 void gpu_pipeline_executor::manager_loop()
 {
-  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
-    *_telemetry_context,
-    std::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
-    _telemetry_context->manager_thread_group_id(_memory_space->get_device_id())};
+  quent::Handle<quent::TaskManagerLoopThread> manager_thread_handle =
+    _telemetry_context->context().task_manager_loop_thread_observer()->handle();
+  manager_thread_handle.spawned({
+    .label    = std::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
+    .group_id = _telemetry_context->gpu_device_telemetry_handles(_memory_space->get_device_id())
+                  .manager_threads.id(),
+  });
 
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   sirius::util::enable_log_on_default_stream();
@@ -129,7 +143,7 @@ void gpu_pipeline_executor::manager_loop()
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping publisher loop");
       break;
     }
-    auto* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
+    gpu_pipeline_task* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
     if (!gpu_task) {
       // Only gpu_pipeline_tasks are ever scheduled onto a GPU executor, so this is a
       // programming error rather than a query failure. There is no pipeline here and therefore
@@ -143,13 +157,12 @@ void gpu_pipeline_executor::manager_loop()
     // another device, which prepare clones into this space) are counted in the reservation.
     auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
     auto bytes_needs      = reservation_info.reservation_size;
-    gpu_task->telemetry_handle().reserving({
-      .instance_name              = "",
-      .requested_bytes            = reservation_info.reservation_size,
-      .input_basis                = reservation_info.input_basis,
-      .peak_estimate              = reservation_info.peak_memory_estimate,
-      .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-      .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+    gpu_task->telemetry_fsm().reserving({
+      .requested_bytes      = reservation_info.reservation_size,
+      .input_basis          = reservation_info.input_basis,
+      .peak_estimate        = reservation_info.peak_memory_estimate,
+      .bytes_to_materialize = reservation_info.bytes_to_materialize_input,
+      .manager_thread       = {.target = manager_thread_handle.id(), .data = {}},
     });
     // Clamp the reservation request to what this memory space can actually
     // grant (its reservation limit). The history-based estimate can balloon far
@@ -218,11 +231,10 @@ void gpu_pipeline_executor::manager_loop()
       size_t shortfall    = bytes_needs - reservation->size();
       size_t partial_size = reservation->size();
 
-      gpu_task->telemetry_handle().downgrading({
-        .instance_name              = "",
-        .shortfall_bytes            = shortfall,
-        .partial_bytes              = partial_size,
-        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+      gpu_task->telemetry_fsm().downgrading({
+        .shortfall_bytes = shortfall,
+        .partial_bytes   = partial_size,
+        .manager_thread  = {manager_thread_handle.id()},
       });
 
       SIRIUS_LOG_DEBUG(
@@ -361,6 +373,7 @@ void gpu_pipeline_executor::manager_loop()
        completion = std::move(completion),
        pipeline]() mutable {
         try {
+          if (completion) completion->record_task_started();
           task->execute(::cuda::stream_ref{exc_stream.get()});
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
         } catch (task_reschedule_exception& ex) {
@@ -397,7 +410,9 @@ void gpu_pipeline_executor::manager_loop()
           // too short. With 100 retries × 50 ms backoff (~5 s) the probe
           // tasks get enough patience to clear the contention window while
           // still bailing out on truly wedged queries.
-          static constexpr uint32_t MAX_RETRIES = 100;
+          auto const MAX_RETRIES = completion && completion->injections
+                                     ? completion->injections->gpu_task_retry_limit
+                                     : 100;
           if (next_retry_count > MAX_RETRIES) {
             SIRIUS_LOG_ERROR(
               "GPU Pipeline Executor: task {} (original task {}) exceeded {} retries at "
@@ -408,9 +423,13 @@ void gpu_pipeline_executor::manager_loop()
               ex.get_resume_operator_index(),
               ex.what());
             if (completion) {
-              completion->report_error(std::make_exception_ptr(std::runtime_error(
-                "GPU pipeline task exceeded maximum retry limit (" + std::to_string(MAX_RETRIES) +
-                ") for original task " + std::to_string(orig_task_id) + ": " + ex.what())));
+              completion->report_error(
+                std::make_exception_ptr(std::runtime_error(
+                  "GPU pipeline task exceeded maximum retry limit (" + std::to_string(MAX_RETRIES) +
+                  ") for original task " + std::to_string(orig_task_id) + ": " + ex.what())),
+                dynamic_cast<oom_reschedule_exception*>(&ex)
+                  ? transparent::late_failure_cause::oom_exhausted
+                  : transparent::late_failure_cause::retry_exhausted);
             }
             return;
           }
@@ -458,37 +477,39 @@ void gpu_pipeline_executor::manager_loop()
           // (cross-GPU processing contention, follow-up #17). 50 ms gives
           // typical SF100 probe tasks time to finish their current work
           // without putting the rescheduled task into a tight busy-spin.
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          std::this_thread::sleep_for(std::chrono::milliseconds(
+            completion && completion->injections ? completion->injections->gpu_task_retry_backoff_ms
+                                                 : 50));
 
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
           if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-            pipeline_task->telemetry_handle().finalizing({
-              .instance_name = "",
-              .success       = false,
-            });
-            pipeline_task->telemetry_handle().exit();
             pipeline_task->set_telemetry_finalized();
+            pipeline_task->telemetry_fsm().finalizing({
+              .success = false,
+            });
           }
           this->schedule(std::move(new_task));
           return;
         } catch (const std::exception& e) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
           if (_task_creator) { _task_creator->stop(); }
-          if (completion) { completion->report_error(std::current_exception()); }
+          if (completion) {
+            completion->report_error(std::current_exception(),
+                                     transparent::late_failure_cause::gpu_error);
+          }
           return;
         } catch (...) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error during task execution");
           if (_task_creator) { _task_creator->stop(); }
-          if (completion) { completion->report_error(std::current_exception()); }
+          if (completion) {
+            completion->report_error(std::current_exception(),
+                                     transparent::late_failure_cause::gpu_error);
+          }
           return;
         }
         if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-          pipeline_task->telemetry_handle().finalizing({
-            .instance_name = "",
-            .success       = true,
-          });
-          pipeline_task->telemetry_handle().exit();
+          pipeline_task->telemetry_fsm().finalizing({.success = true});
           pipeline_task->set_telemetry_finalized();
         }
         task.reset();
@@ -518,7 +539,10 @@ void gpu_pipeline_executor::manager_loop()
           } catch (const std::exception& e) {
             SIRIUS_LOG_ERROR("GPU Pipeline Executor: failed to schedule downstream consumers: {}",
                              e.what());
-            if (completion) { completion->report_error(std::current_exception()); }
+            if (completion) {
+              completion->report_error(std::current_exception(),
+                                       transparent::late_failure_cause::gpu_error);
+            }
             return;
           }
         }

@@ -28,6 +28,7 @@
 
 #include <cuda/stream>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <unordered_set>
@@ -68,6 +69,36 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
                                                       std::vector<int> const& candidates,
                                                       ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr);
+
+/// |v| as an unsigned 64-bit magnitude; the most negative value's 2^63 fits.
+constexpr std::uint64_t decimal_magnitude(std::int64_t v)
+{
+  auto const bits = static_cast<std::uint64_t>(v);
+  return v < 0 ? std::uint64_t{0} - bits : bits;
+}
+
+/// Whether a SUM of @p num_rows values of magnitude at most @p max_abs can exceed the storage
+/// width of @p type (2^31-1 for DECIMAL32, 2^63-1 for DECIMAL64). Throws
+/// sirius::internal_exception for any other type.
+bool decimal_sum_may_overflow(cudf::data_type type,
+                              cudf::size_type num_rows,
+                              std::uint64_t max_abs);
+
+/// A decimal SUM input of one batch: its column and, when the planner proved one from base-table
+/// statistics (planner::resolve_decimal_sum_input_bounds), the largest |unscaled value| it holds.
+struct decimal_sum_candidate {
+  int column;
+  std::optional<std::uint64_t> max_abs;
+};
+
+/// The columns among @p candidates (DECIMAL32 or DECIMAL64) whose SUM over this batch could
+/// overflow their storage width. A column whose every candidate carries a bound is decided on the
+/// host from the batch row count; the others are measured with decimal_sums_needing_widening. A
+/// batch without unproven columns therefore costs no device work and no synchronization.
+std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
+                                              std::vector<decimal_sum_candidate> const& candidates,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr);
 
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded

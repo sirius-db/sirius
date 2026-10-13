@@ -47,6 +47,16 @@
 
 namespace sirius::op::scan {
 
+/// Materialized data roles and ordered output slots, resolved when the scan plan is built.
+struct scan_column_layout {
+  enum class data_role : std::uint8_t { OUTPUT, FILTER_ONLY, ROW_COUNT_CARRIER };
+  std::vector<data_role> data_roles;               ///< One role per reader data column, in D order.
+  std::vector<std::size_t> output_data_positions;  ///< M slots, in output order.
+  std::vector<std::size_t> materialized_primary_indices;  ///< M order, including virtuals.
+  std::optional<std::size_t> output_prefix_width;         ///< No promise when unset.
+  bool output_is_identity = false;
+};
+
 /**
  * @brief Canonical plan for a parquet-style scan.
  *
@@ -110,6 +120,7 @@ struct scan_plan {
 
   /// Final output layout. Length equals the scan operator's @c types.size().
   std::vector<output_entry> output_layout;
+  scan_column_layout columns;
 
   /// C → M map; partitions and unmaterialized columns have no entry.
   std::vector<std::optional<std::size_t>> batch_position_by_column_id;
@@ -153,9 +164,10 @@ struct scan_plan {
   /// translator's name resolver.
   [[nodiscard]] std::string batch_column_name(duckdb::idx_t batch_position) const;
 
-  /// D positions absent from output_layout, including pure-filter columns
-  /// and the row-count carrier.
-  [[nodiscard]] std::unordered_set<std::size_t> pure_filter_batch_positions() const;
+  /// D positions read only for pushed-down table filters.
+  [[nodiscard]] std::unordered_set<std::size_t> filter_only_batch_positions() const;
+  /// D positions absent from the output, including a row-count carrier.
+  [[nodiscard]] std::unordered_set<std::size_t> non_output_batch_positions() const;
 };
 
 /// Bound virtual-column metadata, kept separate from the physical schema.
@@ -181,6 +193,18 @@ struct bound_virtual_column {
 ///   2. The plan is a trivial identity: no partitions, and @c output_layout
 ///      covers @c data_columns 1:1 in order.
 [[nodiscard]] bool needs_output_assembly(scan_plan const& plan);
+
+/// How many leading materialized (M-space) columns the output reads: one past the largest @c DATA
+/// index in @c output_layout, whatever the entries' order, duplicates, or virtual columns. Nullopt
+/// when @c output_layout has no @c DATA entry (SELECT count(*), a partition-only output, or a
+/// row-count carrier scan).
+[[nodiscard]] std::optional<std::size_t> output_prefix_width(scan_plan const& plan) noexcept;
+
+/// True when the output is exactly the leading reader data columns in order: no partitions, a
+/// non-empty @c output_layout no longer than @c data_columns (so no synthesized virtual column),
+/// and output column k is @c DATA(k) for every k. Unlike @ref needs_output_assembly, materialized
+/// columns past that prefix (pure-filter columns) may follow.
+[[nodiscard]] bool output_is_leading_prefix(scan_plan const& plan) noexcept;
 
 /// Reshape the materialized M-order batch to the plan's output layout.
 ///
@@ -228,13 +252,13 @@ struct bound_virtual_column {
 ///
 /// @param column_ids          Column ids exposed by the table function.
 /// @param projection_ids      Indices into column_ids that the planner projects
-///                            (first @c output_types_size entries are outputs;
+///                            (first @c projected_output_count entries are outputs;
 ///                             remaining entries are pure-filter columns that
 ///                             must be read for filter evaluation but not emitted).
 ///                            Empty = read everything in column_ids order.
 /// @param names               DuckDB schema column names.
 /// @param returned_types      DuckDB schema column types.
-/// @param output_types_size   The scan operator's types.size() — used to split
+/// @param projected_output_count   The scan operator's types.size() — used to split
 ///                            projection_ids into output vs pure-filter.
 /// @param partition_indices   Hive partition indices advertised by the bind data.
 ///                            TODO: other partition indices may need to be supported for other
@@ -243,7 +267,7 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<duckdb::idx_t> const& projection_ids,
                           duckdb::vector<std::string> const& names,
                           duckdb::vector<sirius::logical_type> const& returned_types,
-                          std::size_t output_types_size,
+                          std::size_t projected_output_count,
                           duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
                           std::vector<bound_virtual_column> const& virtual_columns = {});
 

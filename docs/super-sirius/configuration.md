@@ -105,6 +105,8 @@ sirius:
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
     enable_dynamic_filter: true    # scan and join-edge runtime filters
+    enable_dynamic_filter_multi_partition: true   # Bloom accumulation for multi-partition builds
+    max_dynamic_filter_bloom_bytes_per_gpu: 256Mi  # accumulated Bloom arrays across keys, per GPU
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip all filters for keys meeting known-domain coverage
     dynamic_filter_inlist_max_l2_fraction: 0.125  # hash-IN-list fraction of known probe-GPU L2 (0 = Bloom for non-small keys; 1.0 = full L2)
@@ -112,6 +114,7 @@ sirius:
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     pinned_zone_map_group_rows: 8192  # rows per sub-chunk zone-map group; 0 captures chunk stats only
     enable_runtime_size_estimation: false  # project total port input from upstream ratios
+    enable_decimal_sum_stats_bound: true  # decide decimal SUM widening from statistics at plan time
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -481,6 +484,34 @@ Those two knobs derive the settings below, which are therefore **not** individua
 | `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
 | `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
+### `sirius.executor.scan_manager.preparation`
+
+These settings are loaded at initialization. Count limits must be positive integers. Omitted limits are derived from the scan worker count, N (`scan_manager.num_threads`). Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
+
+| Key | Default | Description |
+|---|---|---|
+| `max_inflight_jobs` | N | Maximum concurrent preparation jobs. |
+| `max_active_units` | 2N | Maximum active preparation units. |
+| `max_pending_results` | 2N | Capacity for result slots and pending output batches. |
+| `max_control_work` | N | Maximum coordinator actions per iteration. |
+| `drain_quantum` | N | Maximum coalescing work per result advancement. |
+| `underfilled_batch_residence` | 10 ms | Time from the first retained input until an underfilled batch becomes due. New arrivals do not reset it. `0` disables timed publication; negative values are rejected. Output backpressure and scheduling can delay publication. |
+| `interrupt_check_interval` | 10 ms | Maximum wait between interruption checks while preparation is idle. Must be positive. Draining an active read can take longer. |
+
+```yaml
+sirius:
+  executor:
+    scan_manager:
+      preparation:
+        max_inflight_jobs: 4
+        max_active_units: 8
+        max_pending_results: 8
+        max_control_work: 4
+        drain_quantum: 4
+        underfilled_batch_residence: 20ms
+        interrupt_check_interval: 5ms
+```
+
 ### `scan_manager.memory_prefetcher` — background host→GPU upload of pinned-cache scan splits (`scan_manager/config.hpp`)
 
 Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
@@ -497,12 +528,16 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
 | `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
 
+### Programmatic S3 credentials
+
+S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` for SQL-managed credentials, or set an in-memory `io::object_store_config` through `sirius_config::set_object_store_config()` before initializing the scan manager. A matching secret takes precedence over this programmatic fallback. YAML containing `sirius.executor.scan_manager.object_store` is rejected.
+
 ## Operator Parameters
 
 **File:** `src/include/sirius_config.hpp` — `operator_params` struct
 
-The four batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
-`concat_batch_bytes`, `sort_sample_bytes`) share one built-in default. Without an
+The five batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
+`concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`) share one built-in default. Without an
 explicit GPU capacity in YAML, it is computed at startup as
 `clamp(smallest visible physical GPU memory / 40, 512 MiB, 5 GiB)` (800 MiB when no
 GPU is visible). When the active YAML memory path explicitly caps GPU capacity, the
@@ -519,6 +554,7 @@ individually.
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
+| `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
@@ -537,6 +573,7 @@ individually.
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
+| `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input must be widened before aggregation. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -562,7 +599,7 @@ sirius:
 |-----|------|---------|-------------|
 | `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
 | `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
-| `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
+| `exporter` | string | `ndjson` | Quent filesystem exporter; only `ndjson` is supported. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
 | `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. Used only when `enable_nvtx` is true. |
@@ -604,8 +641,7 @@ sirius:
 
 Load that config through the normal config resolution path, usually by setting
 `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml`. Any Sirius query run with
-`enable_quent: true` writes Quent ndjson files into `output_directory` by default. Set
-`exporter: postcard` for compact benchmark or CI telemetry.
+`enable_quent: true` writes Quent ndjson files into `output_directory` as NDJSON.
 
 For TPC-H Parquet runs, the helper script runs queries and labels each
 `(query, iteration)` pair before executing it:
@@ -781,9 +817,13 @@ rejected as unknown, and the old `SET` variables no longer exist.
 |----------|---------|-------------|
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
+| `enable_dynamic_filter_multi_partition` | true | Accumulate a Bloom filter for a non-broadcast HASH build with more than one partition. Requires `enable_dynamic_filter`, a build fed through a FULL barrier (an `ORDER BY`-fed build never accumulates), and working peer DMA between every pair of replica GPUs. |
+| `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Cap on the accumulated Bloom arrays of one join on each GPU: the active keys times the array size rounded up to 256 bytes. Must be greater than zero: YAML loading and `SET` reject zero, and `enable_dynamic_filter_multi_partition` is the only switch that disables accumulation. A cap smaller than the required arrays records a size refusal. Whole-build publication is unaffected. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing either a membership filter or zone map, skip the key when the complete build covers at least this fraction of the key's unfiltered base-table row bound. Applies only to build keys proven unique in their base relation, with evidence from DuckDB-native scans. Values above 1.0 disable the gate; exactly 1.0 fires only at full coverage. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
+
+Accumulation holds each GPU's arrays, at most the cap, until safe release after build tasks drain; published filters can remain until query teardown. The arrays are not spillable. Publication also allocates short-lived scratch on the final PARTITION task's allocator: at most two transfer chunks (8 MiB each at most) per contributing non-root GPU. The task's ignore-limit policy may admit that scratch beyond its reservation against global capacity. Initialization admission failure or safely recoverable scratch OOM skips the optional filter. The multi-partition switch and byte cap are YAML settings; like the other switches in this section, their `SET` variables exist only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 
 The direct DuckDB session overrides are registered only when the process
 explicitly enables Sirius test options; they are not part of the normal user

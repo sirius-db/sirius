@@ -3,6 +3,7 @@ PROJECT_BRIEF          = "GPU-native analytics · C++ API reference"
 PROJECT_LOGO           = docs/logo/sirius_light_full.svg
 OUTPUT_DIRECTORY       = build/docs
 INPUT                  = include/sirius docs/api/index.md
+EXCLUDE                = include/sirius/ffi.hpp
 FILE_PATTERNS          = *.hpp *.h *.cuh *.md
 RECURSIVE              = YES
 USE_MDFILE_AS_MAINPAGE  = docs/api/index.md
@@ -19,7 +20,7 @@ VERBATIM_HEADERS       = YES
 ENABLE_PREPROCESSING   = YES
 MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = YES
-PREDEFINED            = SIRIUS_FFI_EXPORT= "__attribute__(x)="
+PREDEFINED            = SIRIUS_EXPORT= "__attribute__(x)="
 SEARCH_INCLUDES        = NO
 GENERATE_HTML          = YES
 GENERATE_LATEX         = NO

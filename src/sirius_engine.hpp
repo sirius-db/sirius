@@ -29,6 +29,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/query.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry-bridge/gen/query.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry/telemetry_context.hpp"
@@ -110,6 +111,8 @@ class sirius_engine {
 
  private:
   void cancel_dynamic_filter_publications() noexcept;
+  void quiesce_plan_users();
+  bool plan_users_quiescent_ = true;
   sirius::query_id_t query_id_;
   /// The planner query for this execution: the pipeline set plus the operator->pipeline and
   /// scan-operator indices built over `sirius_owned_plan`. Owned here because it indexes this
@@ -122,7 +125,7 @@ class sirius_engine {
   /// so a task still unwinding must be able to report without touching freed memory.
   std::shared_ptr<pipeline::completion_handler> completion_handler_;
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
-  rust::Box<quent::query::QueryHandle> query_handle_;
+  quent::DynamicFsmHandle<quent::Query> query_handle_;
 };
 
 }  // namespace sirius

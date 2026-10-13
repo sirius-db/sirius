@@ -56,15 +56,15 @@ Quick start:
 ```bash
 git clone --no-recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
-git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+git submodule update --init --depth=1 --jobs 5 duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run make TEST_BUILD_TARGET=
-./build/release/duckdb
+pixi run duckdb
 ```
 
 Alternatively, load the extension into an existing DuckDB shell:
 
 ```sql
-LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';
 ```
 
 Either way, all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no query rewrites required. Queries with unsupported operators fall back silently to CPU.
@@ -114,7 +114,7 @@ con.execute("""
     SELECT * FROM read_parquet('/path/to/lineitem.parquet')
 """)
 
-con.execute("LOAD 'build/release/extension/sirius/sirius.duckdb_extension'")
+con.execute("LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension'")
 rows = con.execute("""
     SELECT l_returnflag, SUM(l_quantity) AS total_quantity
     FROM lineitem

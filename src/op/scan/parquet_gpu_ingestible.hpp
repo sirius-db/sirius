@@ -22,6 +22,7 @@
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
+#include <op/scan/table_scan/parquet_physical_profile.hpp>
 #include <sirius_config.hpp>
 
 // duckdb
@@ -43,6 +44,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -72,6 +74,10 @@ namespace sirius::op::scan {
  */
 class parquet_ingestible_table_info : public ingestible_table_info {
  public:
+  duckdb::vector<duckdb::LogicalType> bound_types;      // Full nested bind schema, in P-space.
+  std::optional<iceberg_table_schema> physical_schema;  // Populated by the S3 Iceberg lowering.
+  bound_table_scan physical_contract;
+  leaf_set semantic_columns;
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
@@ -92,7 +98,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
   /// the ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-  std::size_t scan_output_arity      = 0;
+  std::size_t projected_output_count = 0;
 
   parquet_ingestible_table_info() = default;
 
@@ -259,6 +265,8 @@ class parquet_file_scan_info : public scan_info {
 
   /// Parsed footer metadata for this file.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::vector<uint8_t> original_schema;
+  std::string arrow_schema;
   /// File path (also the datasource cache key).
   std::string file_path;
   /// Stable position in DuckDB's bound file list.
@@ -366,6 +374,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override;
 
+  [[nodiscard]] std::optional<std::size_t> output_prefix_width() const noexcept override;
+
   [[nodiscard]] bool has_row_filter() const noexcept override
   {
     return _duckdb_filter_expression != nullptr;
@@ -446,6 +456,15 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // partially filtered, so the scan must NOT be reported ROW_FILTERED or the
   // dropped conjuncts would never be applied.
   bool _static_pushdown_is_complete = true;
+
+  // The part of _static_pushdown_expression pushed into the per-task reader:
+  // minus any top-level AND conjunct with an equality on a column whose bloom
+  // filter probe cuDF before 26.12 gets wrong (has_unreliable_bloom_filter_probe).
+  // The reader probes bloom filters, the row-group stats filter does not.
+  std::shared_ptr<duckdb::Expression> _reader_pushdown_expression;
+  // False when the reader filter is a strict subset of _duckdb_filter_expression,
+  // like _static_pushdown_is_complete.
+  bool _reader_pushdown_is_complete = true;
 
   // Only the simple `IS [NOT] NULL` over a bare column reference shape is
   // recorded; anything compound is left to the post-decode filter. Empty when

@@ -24,8 +24,11 @@
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
+#include <expression_evaluator/regex/cudf_regex_pattern.hpp>
 #include <expression_evaluator/regex/regex_playground.hpp>
+#include <expression_evaluator/round_floating_point.hpp>
 #include <helper/logical_type.hpp>
+#include <helper/timestamp_semantics.hpp>
 #include <sirius/exception.hpp>
 
 // duckdb
@@ -40,6 +43,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
+#include <cudf/strings/case.hpp>
 #include <cudf/strings/combine.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/find.hpp>
@@ -295,11 +299,41 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   if (resolved_id == function_id::second) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::SECOND);
   }
-  if (resolved_id == function_id::millisecond) {
-    return execute_datetime_extract_func(cudf::datetime::datetime_component::MILLISECOND);
-  }
-  if (resolved_id == function_id::microsecond) {
-    return execute_datetime_extract_func(cudf::datetime::datetime_component::MICROSECOND);
+  if (resolved_id == function_id::millisecond || resolved_id == function_id::microsecond) {
+    D_ASSERT(args.size() == 1);
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    auto const extract = [&](cudf::datetime::datetime_component component) {
+      return cudf::datetime::extract_datetime_component(
+        input.get_column_view(), component, _stream, _mr);
+    };
+
+    // cuDF returns separate base-1000 components; DuckDB includes the seconds
+    // within the minute. In particular, MICROSECOND excludes whole milliseconds.
+    // cuDF's time-of-day decomposition also handles pre-epoch timestamps without
+    // a signed epoch remainder. Widen before arithmetic: 59999 does not fit INT16.
+    auto const output_type = cudf::data_type{cudf::type_id::INT64};
+    cudf::numeric_scalar<int64_t> thousand(1000, true, _stream, _mr);
+    auto seconds = extract(cudf::datetime::datetime_component::SECOND);
+    auto millis  = extract(cudf::datetime::datetime_component::MILLISECOND);
+    auto scaled  = cudf::binary_operation(
+      seconds->view(), thousand, cudf::binary_operator::MUL, output_type, _stream, _mr);
+    auto result = cudf::binary_operation(
+      scaled->view(), millis->view(), cudf::binary_operator::ADD, output_type, _stream, _mr);
+    if (resolved_id == function_id::microsecond) {
+      auto micros = extract(cudf::datetime::datetime_component::MICROSECOND);
+      scaled      = cudf::binary_operation(
+        result->view(), thousand, cudf::binary_operator::MUL, output_type, _stream, _mr);
+      result = cudf::binary_operation(
+        scaled->view(), micros->view(), cudf::binary_operator::ADD, output_type, _stream, _mr);
+    }
+    auto finite = temporal::finite_mask(input.get_column_view(), _stream, _mr);
+    cudf::numeric_scalar<int64_t> null_result(0, false, _stream, _mr);
+    result = cudf::copy_if_else(result->view(), null_result, finite->view(), _stream, _mr);
+    return evaluate_result(std::move(result));
   }
 
   //----------Date Truncation Function----------//
@@ -377,6 +411,34 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
 
   //----------Unary Functions----------//
+  // TODO: Handle scalar inputs to these column-only string functions when DuckDB
+  // cannot constant-fold them (e.g. when expression rewriting is disabled).
+  if (resolved_id == function_id::upper || resolved_id == function_id::lower) {
+    D_ASSERT(args.size() == 1);
+    auto input         = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto const strings = cudf::strings_column_view(input.get_column_view());
+    // Use cuDF's Unicode mappings, including multi-character expansions. These can
+    // differ from DuckDB's single-code-point mappings (e.g. upper('ß'), lower('İ')).
+    auto result_column = resolved_id == function_id::upper
+                           ? cudf::strings::to_upper(strings, _stream, _mr)
+                           : cudf::strings::to_lower(strings, _stream, _mr);
+    return evaluate_result(std::move(result_column));
+  }
+  if (resolved_id == function_id::round) {
+    // Planning admits FLOAT and DOUBLE inputs with an optional constant INTEGER precision.
+    D_ASSERT(args.size() == 1 || args.size() == 2);
+    int32_t precision = 0;
+    if (args.size() == 2) {
+      D_ASSERT(args[1]->holds<sirius::ast::constant>());
+      precision = std::get<int32_t>(args[1]->get<sirius::ast::constant>().payload);
+    }
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    return evaluate_result(round_floating_point(input.get_column_view(), precision, _stream, _mr));
+  }
   if (resolved_id == function_id::strlen) {
     D_ASSERT(args.size() == 1);
     auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
@@ -402,6 +464,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
     auto const& pattern_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
     auto const& replace_str = std::get<std::string>(args[2]->get<sirius::ast::constant>().payload);
+    // The planner validated the RE2 pattern; give cuDF RE2's end-of-text anchor semantics.
+    auto const cudf_pattern = ::sirius::regex::to_cudf_regex_pattern(pattern_str);
     auto const has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
     if (has_backrefs) {
       if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
@@ -410,19 +474,36 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
             input.get_column_view(), _stream, _mr);
         }
       }
-      auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
+      // replace_with_backrefs has no replacement-count parameter. Anchor a lazy prefix to
+      // the beginning of the input so the program can match only once, at the first original
+      // match. Restore the prefix in the replacement; cuDF preserves the unmatched suffix.
+      // [\s\S] includes newlines without changing the original pattern's dot semantics.
+      // Group 1 is the prefix, group 2 is the whole original match (RE2's \0), and original
+      // capture groups move by two. Braced references avoid treating e.g. \12 as group 12:
+      // DuckDB interprets it as group 1 followed by the literal character '2'.
+      auto const first_pattern      = std::string{"^([\\s\\S]*?)("} + cudf_pattern + ")";
+      auto regex_prog               = cudf::strings::regex_program::create(first_pattern);
+      std::string first_replacement = "${1}";
+      for (std::size_t i = 0; i < replace_str.size(); ++i) {
+        if (replace_str[i] == '\\') {
+          auto const group = replace_str[++i] - '0';
+          first_replacement += "${" + std::to_string(group + 2) + "}";
+        } else {
+          first_replacement += replace_str[i];
+        }
+      }
       return cudf::strings::replace_with_backrefs(
         cudf::strings_column_view(input.get_column_view()),
         *regex_prog,
-        std::string_view(replace_str),
+        first_replacement,
         _stream,
         _mr);
     } else {
-      auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
+      auto regex_prog = cudf::strings::regex_program::create(cudf_pattern);
       return cudf::strings::replace_re(cudf::strings_column_view(input.get_column_view()),
                                        *regex_prog,
                                        cudf::string_scalar(replace_str, true, _stream, _mr),
-                                       std::nullopt,
+                                       1,
                                        _stream,
                                        _mr);
     }

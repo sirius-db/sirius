@@ -54,7 +54,7 @@ SOURCE = "iceberg_v1"
 # the same stale binary, used as an oracle for whether a table needs a setting, will answer for a
 # different iceberg extension build than the tests resolve. Hence require_duckdb() below.
 DUCKDB_CANDIDATES = [
-    pathlib.Path("build/release/duckdb"),
+    pathlib.Path("sirius-duckdb/build/release/duckdb"),
     pathlib.Path("duckdb/build/release/duckdb"),
 ]
 

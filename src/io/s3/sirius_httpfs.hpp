@@ -110,6 +110,9 @@ class sirius_httpfs : public duckdb::FileSystem {
   bool OnDiskFile(duckdb::FileHandle& /*handle*/) override { return false; }
 
   std::string GetName() const override { return "SiriusHttpFS"; }
+  // Keep Sirius's GPU-only S3 gate in front of httpfs, which DuckDB may
+  // autoload after CREATE SECRET and register as another s3:// filesystem.
+  bool IsManuallySet() override { return true; }
 
  protected:
   bool SupportsOpenFileExtended() const override { return true; }

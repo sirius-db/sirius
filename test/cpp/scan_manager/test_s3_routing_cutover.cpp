@@ -24,10 +24,12 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "op/scan/table_scan/parquet_physical_profile.hpp"
 #include "planner/query.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -139,6 +141,16 @@ std::shared_ptr<cudf::io::parquet::FileMetaData const> read_local_parquet_metada
   return std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
 }
 
+sirius::op::scan::parquet_encryption_evidence read_local_parquet_encryption(
+  std::filesystem::path const& path)
+{
+  auto source   = cudf::io::datasource::create(path.string());
+  auto footer   = read_local_parquet_footer(*source);
+  auto evidence = sirius::op::scan::inspect_parquet_encryption({footer->data(), footer->size()});
+  REQUIRE(evidence.complete);
+  return evidence;
+}
+
 std::string strip_file_scheme_for_registry(std::string const& path)
 {
   static constexpr std::string_view kFile = "file://";
@@ -200,7 +212,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_tab
   for (duckdb::idx_t i = 0; i < info->returned_types.size(); ++i) {
     info->column_ids.push_back(duckdb::ColumnIndex(i));
   }
-  info->scan_output_arity = info->returned_types.size();
+  info->projected_output_count = info->returned_types.size();
   return info;
 }
 
@@ -247,7 +259,7 @@ sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager
 sirius::planner::query make_empty_query(sirius::query_id_t query_id = sirius::make_query_id(1))
 {
   auto tctx = sirius::test::make_test_telemetry_context();
-  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
+  sirius::telemetry::query_telemetry_info tinfo{quent::now_v7(), tctx->worker_id().raw(), query_id};
   return sirius::planner::query(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
                                 tctx->context(),
                                 query_id,
@@ -758,20 +770,21 @@ TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independentl
   std::string const s3_uri     = "s3://routing-bucket/nation.parquet";
   std::string const local_path = fixture_path.string();
   auto const metadata          = read_local_parquet_metadata(fixture_path);
+  auto const encryption        = read_local_parquet_encryption(fixture_path);
 
   auto s3_ds = manager.create_datasource(s3_uri);
   REQUIRE(s3_ds != nullptr);
   REQUIRE(s3_ds->io_ctx() != nullptr);
   REQUIRE(s3_ds->io_ctx()->type() == io_context_type::restful);
-  REQUIRE(s3_ds->store_metadata(
-    std::make_shared<sirius::op::scan::parquet_metadata>(metadata, /*footer_byte_len=*/0)));
+  REQUIRE(s3_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
+    metadata, /*footer_byte_len=*/0, encryption)));
 
   auto local_ds = manager.create_datasource(local_path);
   REQUIRE(local_ds != nullptr);
   REQUIRE(local_ds->io_ctx() != nullptr);
   REQUIRE(is_local_backend(local_ds->io_ctx()->type()));
-  REQUIRE(local_ds->store_metadata(
-    std::make_shared<sirius::op::scan::parquet_metadata>(metadata, /*footer_byte_len=*/0)));
+  REQUIRE(local_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
+    metadata, /*footer_byte_len=*/0, encryption)));
 
   auto ingestible = sirius::op::scan::make_ingestible(
     make_nation_table_info(std::vector<std::string>{s3_uri, local_path}));
@@ -798,16 +811,17 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
   std::string const s3_uri     = "s3://routing-bucket/nation.parquet";
   std::string const local_path = fixture_path.string();
   auto const metadata          = read_local_parquet_metadata(fixture_path);
+  auto const encryption        = read_local_parquet_encryption(fixture_path);
 
   auto s3_ds = manager.create_datasource(s3_uri);
   REQUIRE(s3_ds != nullptr);
-  REQUIRE(s3_ds->store_metadata(
-    std::make_shared<sirius::op::scan::parquet_metadata>(metadata, /*footer_byte_len=*/0)));
+  REQUIRE(s3_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
+    metadata, /*footer_byte_len=*/0, encryption)));
 
   auto local_ds = manager.create_datasource(local_path);
   REQUIRE(local_ds != nullptr);
-  REQUIRE(local_ds->store_metadata(
-    std::make_shared<sirius::op::scan::parquet_metadata>(metadata, /*footer_byte_len=*/0)));
+  REQUIRE(local_ds->store_metadata(std::make_shared<sirius::op::scan::parquet_metadata>(
+    metadata, /*footer_byte_len=*/0, encryption)));
 
   auto provider_ingestible = sirius::op::scan::make_ingestible(
     make_nation_table_info(std::vector<std::string>{s3_uri, local_path}));
