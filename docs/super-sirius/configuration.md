@@ -331,7 +331,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer threads. Blocking coalescers run in a separate pool sized from query admission, so they cannot occupy producer capacity. |
+| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer threads. Preparation and coalescing run on each query owner thread, so they cannot occupy producer capacity. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |

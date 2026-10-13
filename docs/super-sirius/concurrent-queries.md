@@ -100,8 +100,8 @@ facts, uniqueness proofs and late-materialization handle. Re-pin builds privatel
 the previous entry usable. Readers hold entry snapshots and query-local visibility masks. SQL pin
 replacement and cache reset remain exclusive maintenance operations.
 
-Metadata producers and blocking scan coalescers have separate pools, so coalescers cannot occupy
-all capacity needed to produce their inputs. I/O readahead shares runtime backend budgets across
+Metadata producers use the shared worker pool; each query owner drives preparation and
+coalescing without occupying the workers needed to produce its inputs. I/O readahead shares runtime backend budgets across
 queries. Demand reads borrow immediately and block further speculation until their debt is repaid.
 Canceling one subscriber releases its interest without invalidating another subscriber's bytes.
 Cache pressure permits a bounded eviction attempt before abandoning speculative work.
