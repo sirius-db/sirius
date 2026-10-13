@@ -26,6 +26,8 @@
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
+#include <cmath>
+
 using GroupingSetsFixture = sirius::test::GpuExecutionFixture;
 
 namespace {
@@ -169,9 +171,29 @@ TEST_CASE_METHOD(GroupingSetsFixture,
     "(0, 1000000000003::DOUBLE), (0, 1000000000003::DOUBLE), "
     "(1, NULL::DOUBLE), (2, 42::DOUBLE), (NULL, 7::DOUBLE)) t(g, v);");
   run_ok("CHECKPOINT;");
+  // DuckDB's sequential Welford updates lose precision for this large-offset, low-spread
+  // group. Its exact sample variance is 4/3, so check GPU accuracy independently of CPU.
+  run_ok("SET gpu_execution = true;");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto result       = con->Query(
+    "SELECT stddev_samp(v), count(DISTINCT v), avg(v), count(v) FROM gs_sd GROUP BY ROLLUP(g) "
+          "HAVING GROUPING(g) = 0 AND g = 0;");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+  REQUIRE(result->RowCount() == 1);
+  REQUIRE_FALSE(result->GetValue(0, 0).IsNull());
+  REQUIRE(result->GetValue(0, 0).GetValue<double>() == Approx(std::sqrt(4.0 / 3.0)).epsilon(1e-12));
+  REQUIRE(result->GetValue(1, 0).GetValue<int64_t>() == 2);
+  REQUIRE(result->GetValue(2, 0).GetValue<double>() == 1000000000002.0);
+  REQUIRE(result->GetValue(3, 0).GetValue<int64_t>() == 4);
+
+  // Compare the remaining leaf groups and grand total against DuckDB, including the
+  // distinction between a genuine NULL key and the rolled-up NULL key.
   compare_gpu_vs_cpu_approx(
     "SELECT g, GROUPING(g), stddev_samp(v), count(DISTINCT v), avg(v), count(v) "
-    "FROM gs_sd GROUP BY ROLLUP(g);",
+    "FROM gs_sd GROUP BY ROLLUP(g) HAVING GROUPING(g) = 1 OR g IS NULL OR g <> 0;",
     {2, 4});
 }
 
