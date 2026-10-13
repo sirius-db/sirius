@@ -448,7 +448,7 @@ class s3_sql_fixture {
                  std::move(endpoint),
                  std::move(ca_bundle),
                  tls_verify),
-      db(nullptr),
+      db(nullptr, &db_config),
       con(db)
   {
     load_sirius_extension(db);
@@ -460,6 +460,8 @@ class s3_sql_fixture {
   }
 
   sirius_config_env_guard config_env;
+  // Avro and Iceberg are built locally against the pinned DuckDB revision.
+  duckdb::DBConfig db_config{{{"allow_unsigned_extensions", duckdb::Value::BOOLEAN(true)}}, false};
   duckdb::DuckDB db;
   duckdb::Connection con;
 };
