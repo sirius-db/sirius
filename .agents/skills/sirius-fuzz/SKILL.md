@@ -12,7 +12,9 @@ Read the checkout's `AGENTS.md` and the [fuzzer guide](../../../test/fuzz/README
 ## Pick the environment
 
 Fuzzing needs a compatible Linux GPU host with the intended source built there (`pixi run make`,
-which produces the `build/release/duckdb` shell the fuzzer drives; no Python module is needed).
+which produces the `sirius-duckdb/build/release/duckdb` shell the fuzzer drives and the matching
+`sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension` it loads automatically;
+no Python module is needed). When selecting another build, pass both `--shell` and `--extension`.
 Prefer the host the user names; otherwise an accessible development GPU with the least setup.
 Inspect `nvidia-smi`, active workloads, Pixi availability and checkout state; a remote connection
 alone does not establish GPU availability. If no compatible GPU is accessible, report execution

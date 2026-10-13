@@ -1,6 +1,7 @@
 """Developer-facing contracts: the shell session, exact replay, recheck and the orchestrator."""
 
 import argparse
+import io
 import json
 import os
 import pathlib
@@ -11,7 +12,7 @@ import threading
 import time
 import unittest
 from dataclasses import asdict
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from . import conftest_path
 from .test_evaluator import FakeSession, gpu_variant_wrong
@@ -22,9 +23,10 @@ from siriusfuzz.cli import (
     cmd_recheck,
     cmd_replay,
     cmd_selftest,
+    main,
     validate_limits,
 )
-from siriusfuzz.config import load_config
+from siriusfuzz.config import FuzzConfig, load_config
 from siriusfuzz.probe import execute_probe
 from siriusfuzz.report import QueryRecord, Report
 from siriusfuzz.runner import Evaluator, Mailbox, Orchestrator, OrchestratorOptions
@@ -32,6 +34,7 @@ from siriusfuzz.session import (
     RunResult,
     Session,
     Shell,
+    ShellResult,
     _normalize_shell_json_nulls,
     _strip_fallback_banners,
     discover_sirius_yaml,
@@ -135,6 +138,81 @@ def startup_dead_worker(args, cfg, out, stop):
 
 
 class ToolTests(unittest.TestCase):
+    def test_default_engine_finds_wrapper_shell_and_loadable_extension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            shell = root / "sirius-duckdb/build/release/duckdb"
+            extension = shell.parent / "extension/sirius/sirius.duckdb_extension"
+            extension.parent.mkdir(parents=True)
+            shell.touch()
+            extension.touch()
+            args = build_parser().parse_args(["doctor"])
+            # Exercise both the shipped TOML and the dataclass defaults, from outside
+            # the checkout, without requiring a GPU or executing a synthetic binary.
+            for cfg in (load_config(None), FuzzConfig()):
+                cfg.sirius.configs = []
+                with self.subTest(config=cfg.source_path), patch.dict(
+                    os.environ, {"SIRIUSFUZZ_SHELL": ""}
+                ), patch("siriusfuzz.session.REPO_ROOT", root), patch(
+                    "siriusfuzz.config.REPO_ROOT", root
+                ), patch(
+                    "siriusfuzz.cli.check_shell"
+                ), patch(
+                    "siriusfuzz.cli.discover_sirius_yaml", return_value=(None, "none")
+                ):
+                    engine = _engine(args, cfg)
+                    self.assertEqual(engine.shell, str(shell))
+                    self.assertEqual(engine.extension, str(extension))
+                    args.cpu_only = True
+                    self.assertIsNone(_engine(args, cfg).extension)
+                    args.cpu_only = False
+
+    def test_loadable_extension_is_loaded_before_sql_and_reloaded_on_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session(
+                "duckdb", "/build/sirius.duckdb_extension", None, pathlib.Path(tmp), 0
+            )
+            statements = []
+
+            def execute(sql, timeout=None):
+                statements.append(sql)
+                if sql == "SET gpu_execution = false" and statements.count(sql) == 1:
+                    return ShellResult(
+                        "error",
+                        error='unrecognized configuration parameter "gpu_execution"',
+                    )
+                return ShellResult("ok")
+
+            session.shell = Mock(alive=True)
+            session.shell.execute.side_effect = execute
+            with patch.object(session, "scalar", return_value="test-version"):
+                for _ in range(2):
+                    statements.clear()
+                    session._start()
+                    self.assertEqual(session.sirius, "loaded")
+                    self.assertEqual(
+                        statements,
+                        [
+                            "SET gpu_execution = false",
+                            "LOAD '/build/sirius.duckdb_extension'",
+                            "SET gpu_execution = false",
+                            "SET enable_duckdb_fallback = false",
+                        ],
+                    )
+
+    def test_missing_shell_returns_setup_exit_code_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"SIRIUSFUZZ_SHELL": ""}
+        ), patch("siriusfuzz.session.REPO_ROOT", pathlib.Path(tmp)), patch(
+            "siriusfuzz.session.shutil.which", return_value=None
+        ), patch(
+            "sys.stderr", new_callable=io.StringIO
+        ) as stderr:
+            self.assertEqual(main(["run", "--queries", "1"]), 2)
+        self.assertIn("ERROR: no DuckDB shell found", stderr.getvalue())
+        self.assertIn("sirius-duckdb/build/release/duckdb", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_cpu_only_session_ignores_sirius_yaml(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ, {"SIRIUS_CONFIG_FILE": "ambient.yaml"}

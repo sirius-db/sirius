@@ -33,7 +33,7 @@ from .config import (
 from .report import Report, default_known_issues_path, load_known_issues
 from .runner import Orchestrator, OrchestratorOptions
 from .schema_gen import DataGenerator
-from .session import check_shell, discover_sirius_yaml, find_shell
+from .session import SessionError, check_shell, discover_sirius_yaml, find_shell
 
 SELFTEST_DEFAULT_OVERRIDES = (
     "data.rows=[8,16]",
@@ -114,8 +114,8 @@ def _mode_arg(p: argparse.ArgumentParser) -> None:
 def _common_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--shell",
-        help="DuckDB shell to drive (default: build/release/duckdb from the configuration, "
-        "then $SIRIUSFUZZ_SHELL, then duckdb on PATH)",
+        help="DuckDB shell to drive (default: $SIRIUSFUZZ_SHELL, then the configuration's "
+        "sirius-duckdb/build/release/duckdb, then duckdb on PATH)",
     )
     p.add_argument(
         "--extension",
@@ -334,7 +334,8 @@ def run_doctor(engine: Engine, work: pathlib.Path, timeout: float) -> dict:
         )
         print(
             f"Check stderr.log, shell.stderr and outcome.json in {work}. Build Sirius "
-            "with pixi run make (it produces build/release/duckdb). Check the GPU and "
+            "with pixi run make (it produces the shell and loadable extension under "
+            "sirius-duckdb/build/release). Check the GPU and "
             "the selected Sirius YAML if initialization failed."
         )
     return result
@@ -734,6 +735,6 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
-    except (ValueError, OSError, ImportError) as exc:
+    except (ValueError, OSError, ImportError, SessionError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

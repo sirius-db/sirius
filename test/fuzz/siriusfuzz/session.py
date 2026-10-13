@@ -4,7 +4,8 @@
 # See the LICENSE file at the repo root for the full text.
 """One DuckDB shell process per session, driven over pipes.
 
-The shell is the one built with the Sirius extension (``build/release/duckdb``).
+The shell is built at ``sirius-duckdb/build/release/duckdb``; the Sirius extension
+is loaded separately.
 Each statement is followed by a marker on stdout and on stderr, written with the
 shell's dot commands so they never pass through SQL; the JSON result and the
 error text are delimited exactly. A timed-out statement gets the shell killed, a
@@ -79,7 +80,7 @@ def find_shell(explicit: str | None, configured: str | None) -> str:
         return on_path
     raise SessionError(
         "no DuckDB shell found (tried " + ", ".join(tried) + " and PATH); "
-        "build Sirius with pixi run make, which produces build/release/duckdb, "
+        "build Sirius with pixi run make, which produces sirius-duckdb/build/release/duckdb, "
         "or pass --shell"
     )
 
@@ -513,9 +514,10 @@ class Session:
                 self.sirius = "loaded"
             else:
                 raise SessionError(
-                    f"{self.shell_path} has no Sirius built in and no --extension was "
-                    "given; use build/release/duckdb from the Sirius build, or pass "
-                    "--extension, or --cpu-only"
+                    f"{self.shell_path} has no Sirius built in and no loadable extension "
+                    "was found; build Sirius with pixi run make, or pass --extension "
+                    "sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension "
+                    "from the same build as the shell, or use --cpu-only"
                 )
             # Strict mode: a fallback surfaces as an error instead of a silent CPU run.
             self.execute("SET enable_duckdb_fallback = false")
@@ -544,7 +546,8 @@ class Session:
             if "built specifically for DuckDB version" in str(exc):
                 hint = (
                     " (the shell and the extension come from different DuckDB "
-                    "versions; use build/release/duckdb from the same build)"
+                    "versions; use --shell pointing to sirius-duckdb/build/release/duckdb "
+                    "from the same build as the extension)"
                 )
             raise SessionError(f"cannot load {self.extension}: {exc}{hint}") from exc
 

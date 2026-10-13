@@ -392,8 +392,9 @@ skips these variants to focus its execution budget on unsupported query shapes.
 Native C++ or CUDA faults terminate the process they run in without raising a
 catchable exception, and a hung GPU call may ignore a normal query interruption.
 The harness therefore never runs Sirius inside the Python process. Each session
-drives the DuckDB shell built with Sirius (`build/release/duckdb`) over pipes, in
-batch JSON mode. Every statement is followed by a marker on each stream, written
+drives the DuckDB shell (`sirius-duckdb/build/release/duckdb`) over pipes, in
+batch JSON mode, and loads the matching Sirius extension. Every statement is
+followed by a marker on each stream, written
 with the shell's own dot commands (`.print`, and `.output /dev/stderr` for the
 stderr one), so results and error text are delimited exactly and the markers can
 never be intercepted by Sirius the way a `SELECT` would be. The banner Sirius

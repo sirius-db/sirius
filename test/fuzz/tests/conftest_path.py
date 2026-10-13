@@ -11,9 +11,10 @@ if str(FUZZ_DIR) not in sys.path:
 
 def available_shell():
     """The DuckDB shell to test against, or None (tests needing one are skipped)."""
+    from siriusfuzz.config import Sirius
     from siriusfuzz.session import SessionError, find_shell
 
     try:
-        return find_shell(None, "build/release/duckdb")
+        return find_shell(None, Sirius().shell)
     except SessionError:
         return None

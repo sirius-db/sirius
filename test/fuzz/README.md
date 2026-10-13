@@ -29,8 +29,9 @@ For the reasoning behind generation, execution, comparison and reduction, read
 
 **Requirements.** A supported Linux GPU host (x86-64 or aarch64) with the repository's CUDA
 environment. The fuzzer drives the DuckDB shell that the Sirius build produces
-(`build/release/duckdb`, with Sirius built in) over pipes; nothing else has to be built or
-installed. For CPU-only use, any DuckDB CLI works (`--shell`, or `SIRIUSFUZZ_SHELL`).
+(`sirius-duckdb/build/release/duckdb`) over pipes and loads the matching
+`sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension` automatically.
+For CPU-only use, any DuckDB CLI works (`--shell`, or `SIRIUSFUZZ_SHELL`).
 
 **1. Build** Sirius:
 
@@ -56,7 +57,8 @@ directory and ends with the command to replay a finding.
 ```bash
 pixi run fuzz run --seed 42 --queries 100 --no-reduce      # quick sample
 pixi run fuzz run --seed 42 --duration 30m --workers 2     # longer campaign
-pixi run fuzz run --shell /path/to/other/build/release/duckdb \
+pixi run fuzz run --shell /path/to/other/sirius-duckdb/build/release/duckdb \
+  --extension /path/to/other/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension \
   --sirius-config /path/to/sirius.yaml --out /path/to/results               # another build or YAML
 pixi run fuzz run --set features.scalar_functions.enabled=substring,like
 ```
@@ -95,10 +97,14 @@ Also: `pixi run fuzz-test` runs the harness unit tests.
 then from the repository root. Paths inside the configuration file resolve from the repository
 root. Outputs default to `test/fuzz/out/`.
 
-**The shell.** `--shell` names the DuckDB binary to drive; the default is the configuration's
-`sirius.shell` (`build/release/duckdb`), then `$SIRIUSFUZZ_SHELL`, then `duckdb` on `PATH`. The
-build's shell has Sirius built in. A plain DuckDB CLI of the same version works with
-`--extension` pointing at the loadable `sirius.duckdb_extension`, or on its own for `--cpu-only`.
+**The shell.** `--shell` names the DuckDB binary to drive; otherwise the fuzzer tries
+`$SIRIUSFUZZ_SHELL`, the configuration's `sirius.shell`
+(`sirius-duckdb/build/release/duckdb`), then `duckdb` on `PATH`. The build's shell loads Sirius
+from `sirius.extension`, which defaults to
+`sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension`.
+When selecting another build, pass both `--shell` and `--extension` to keep them matched.
+A plain DuckDB CLI of the same version also works with `--extension`, or on its own for
+`--cpu-only`. Custom TOML files using the old `build/release/` paths need both paths updated.
 
 **Exit codes.** `0` completed (findings may exist), doctor passed, replay matched, recheck all
 clear. `1` findings with `--fail-on-findings`, a replay that still fails, a recheck with findings
