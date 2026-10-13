@@ -507,6 +507,8 @@ std::unique_ptr<cudf::groupby_aggregation> make_reaggregation(cudf::aggregation:
       return cudf::make_sum_aggregation<cudf::groupby_aggregation>();
     case cudf::aggregation::Kind::COLLECT_SET:
       return cudf::make_merge_sets_aggregation<cudf::groupby_aggregation>();
+    case cudf::aggregation::Kind::M2:
+      return cudf::make_merge_m2_aggregation<cudf::groupby_aggregation>();
     default:
       throw std::runtime_error("Unsupported cudf aggregate kind for grouping sets: " +
                                std::to_string(static_cast<int>(kind)));
@@ -514,7 +516,7 @@ std::unique_ptr<cudf::groupby_aggregation> make_reaggregation(cudf::aggregation:
 }
 
 /// The empty grouping set over an empty input: one row with zero counts and NULL for every
-/// other aggregate.
+/// other finalized aggregate. Compound aggregates retain neutral partial states.
 std::vector<std::unique_ptr<cudf::column>> make_empty_input_row(
   cudf::table_view aggregate_cols,
   const std::vector<cudf::aggregation::Kind>& aggregates,
@@ -541,6 +543,14 @@ std::vector<std::unique_ptr<cudf::column>> make_empty_input_row(
         std::move(child),
         0,
         cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr)));
+    } else if (kind == cudf::aggregation::Kind::M2) {
+      // MERGE_M2 ignores zero-count states. Valid children also let finalization read
+      // count directly and produce NULL, without depending on the STRUCT's parent mask.
+      row.push_back(make_stddev_state(make_constant_column<int64_t>(0, 1, stream, mr),
+                                      make_constant_column<double>(0, 1, stream, mr),
+                                      make_constant_column<double>(0, 1, stream, mr),
+                                      stream,
+                                      mr));
     } else {
       row.push_back(make_null_column(aggregate_cols.column(i), 1, stream, mr));
     }
