@@ -40,7 +40,10 @@ impl TransitionEvent for TaskEvent {
             ),
             Self::Reserving { .. } => matches!(
                 next,
-                Self::Downgrading { .. } | Self::Preparing { .. } | Self::Finalizing { .. }
+                Self::Queued { .. }
+                    | Self::Downgrading { .. }
+                    | Self::Preparing { .. }
+                    | Self::Finalizing { .. }
             ),
             Self::Downgrading { .. } => {
                 matches!(next, Self::Preparing { .. } | Self::Finalizing { .. })
