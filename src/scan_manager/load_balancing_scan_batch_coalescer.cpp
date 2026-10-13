@@ -135,11 +135,9 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
       slot->op_id,
       device,
       op::scan::scan_operator_input::prefetch_start::deferred);
-    auto bytes = input->get_estimated_size_in_bytes();
-    return preparation_coordinator::publication{std::move(input), bytes};
-  };
-  source.prepare_publish = [](preparation_coordinator::publication& publication) {
-    static_cast<op::scan::scan_operator_input&>(*publication.input).initialize_prefetch();
+    auto bytes   = input->get_estimated_size_in_bytes();
+    auto prepare = [raw = input.get()] { raw->initialize_prefetch(); };
+    return preparation_coordinator::publication{std::move(input), bytes, std::move(prepare)};
   };
   source.publish = [slot](preparation_coordinator::publication& publication) {
     slot->connector->push_split_sized(std::move(publication.input), publication.bytes);
@@ -347,16 +345,17 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
   std::size_t operator_id,
   std::shared_ptr<preparation_gate> publication)
 {
-  auto publish = [&](std::unique_ptr<op::operator_data> split) {
-    auto bytes = split->get_estimated_size_in_bytes();
+  auto publish = [&](std::unique_ptr<op::scan::scan_operator_input> input) {
+    auto bytes                               = input->get_estimated_size_in_bytes();
+    auto* typed                              = input.get();
+    std::unique_ptr<op::operator_data> split = std::move(input);
     std::unique_lock<std::mutex> gate;
     if (publication) {
       gate = std::unique_lock(publication->mutex);
       if (publication->closed) return false;
       publication->check_interrupted();
     }
-    auto& input = static_cast<op::scan::scan_operator_input&>(*split);
-    if (input.has_scan_metadata()) input.initialize_prefetch();
+    if (typed->has_scan_metadata()) typed->initialize_prefetch();
     connector.push_split_sized(std::move(split), bytes);
     return true;
   };

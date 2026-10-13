@@ -194,10 +194,12 @@ void attach_delete_set(parquet_file_scan_info& file, std::shared_ptr<iceberg_del
 gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider(
   io::ioctx_resolver resolve)
 {
+  if (_deferred && !_attempt && _next_preparation < _deferred->files().size())
+    throw std::logic_error("DV preparation claimed before the attempt started");
   auto work = parquet_gpu_ingestible::next_split_provider(std::move(resolve));
   if (!work) return {};
   if (_deferred) {
-    if (!_attempt) throw std::logic_error("DV preparation claimed before the attempt started");
+    if (!_attempt) throw std::logic_error("DV preparation claimed after it finished");
     auto index = _next_preparation;
     struct preparation_inputs {
       scan_manager::w_permit permit;

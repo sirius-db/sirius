@@ -231,7 +231,7 @@ struct fixture {
     coordinator.add_source(
       {a,
        std::move(claim),
-       [construction](std::unique_ptr<sirius::op::scan::scan_info> batch) {
+       [construction, out](std::unique_ptr<sirius::op::scan::scan_info> batch) {
          if (construction) construction->wait();
          using sirius::op::scan::scan_operator_input;
          auto input =
@@ -240,7 +240,11 @@ struct fixture {
                                                  0,
                                                  std::nullopt,
                                                  scan_operator_input::prefetch_start::deferred);
-         return preparation_coordinator::publication{std::move(input), 0};
+         auto prepare = [out, raw = input.get()] {
+           raw->initialize_prefetch();
+           ++out->preparations;
+         };
+         return preparation_coordinator::publication{std::move(input), 0, std::move(prepare)};
        },
        [out](preparation_coordinator::publication& p) {
          auto& input = dynamic_cast<sirius::op::scan::scan_operator_input&>(*p.input);
@@ -258,11 +262,7 @@ struct fixture {
          out->cv.notify_all();
        },
        [out](std::function<void()> consume) { out->consumed = std::move(consume); },
-       {},
-       [out](preparation_coordinator::publication& p) {
-         static_cast<sirius::op::scan::scan_operator_input&>(*p.input).initialize_prefetch();
-         ++out->preparations;
-       }});
+       {}});
   }
 };
 }  // namespace
@@ -849,11 +849,11 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
       });
       probe.join();
     };
-    return preparation_coordinator::publication{std::move(input), 0};
-  };
-  source.prepare_publish = [&](preparation_coordinator::publication& p) {
-    static_cast<observed_input&>(*p.input).initialize_prefetch();
-    if (fail_initialize) throw std::runtime_error(expected_error);
+    auto prepare = [&, raw = input.get()] {
+      raw->initialize_prefetch();
+      if (fail_initialize) throw std::runtime_error(expected_error);
+    };
+    return preparation_coordinator::publication{std::move(input), 0, std::move(prepare)};
   };
   source.publish = [&](preparation_coordinator::publication&) {
     ++publications;

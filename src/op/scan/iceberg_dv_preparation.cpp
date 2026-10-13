@@ -22,6 +22,7 @@
 #include <duckdb/common/exception.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -96,10 +97,48 @@ scan_manager::scan_envelope iceberg_dv_preparation::envelope(
   out.qualified = true;
   return out;
 }
+// The retained block from arena_bytes(), carved into the records, the pointer index the DV
+// match sorts, and the NUL-terminated path characters the records view. Only the records it
+// constructed are destroyed.
 struct iceberg_dv_preparation::storage {
-  scan_manager::charged_block arena;
-  size_t count = 0;
-  ~storage() { std::destroy_n(reinterpret_cast<file*>(arena.data()), count); }
+  storage(scan_manager::charged_block block, size_t capacity)
+    : arena_(std::move(block)), capacity_(capacity)
+  {
+    if (!capacity_) return;
+    auto* base = arena_.data();
+    if (!base || reinterpret_cast<std::uintptr_t>(base) % alignof(file) != 0 ||
+        (capacity_ * sizeof(file)) % alignof(file*) != 0)
+      throw std::logic_error("descriptor arena is not aligned for its records");
+    records_   = reinterpret_cast<file*>(base);
+    index_     = reinterpret_cast<file**>(records_ + capacity_);
+    chars_     = reinterpret_cast<char*>(index_ + capacity_);
+    chars_end_ = reinterpret_cast<char*>(base + arena_.size());
+  }
+  ~storage() { std::destroy_n(records_, count_); }
+  storage(storage const&)            = delete;
+  storage& operator=(storage const&) = delete;
+  void emplace(std::string_view path)
+  {
+    if (count_ == capacity_ || static_cast<size_t>(chars_end_ - chars_) < path.size() + 1)
+      throw std::logic_error("descriptor arena is smaller than its paths");
+    std::memcpy(chars_, path.data(), path.size());
+    chars_[path.size()] = '\0';
+    index_[count_]      = std::construct_at(records_ + count_,
+                                       file{std::string_view(chars_, path.size()), nullptr, {}});
+    chars_ += path.size() + 1;
+    ++count_;
+  }
+  std::span<file> records() noexcept { return {records_, count_}; }
+  std::span<file*> index() noexcept { return {index_, count_}; }
+
+ private:
+  scan_manager::charged_block arena_;
+  size_t capacity_;
+  size_t count_    = 0;
+  file* records_   = nullptr;
+  file** index_    = nullptr;
+  char* chars_     = nullptr;
+  char* chars_end_ = nullptr;
 };
 iceberg_dv_preparation::iceberg_dv_preparation(
   scan_contract_id id,
@@ -114,24 +153,14 @@ iceberg_dv_preparation::iceberg_dv_preparation(
   auto permit = owner.acquire_permit({id, 0});
   if (bytes && !permit)
     throw std::logic_error("descriptor arena requires an admitted temporary-memory permit");
-  storage_ = std::make_shared<storage>();
-  if (bytes) storage_->arena = owner.allocator(permit).allocate_retained(bytes);
-  auto* records      = reinterpret_cast<file*>(storage_->arena.data());
-  auto* index        = records ? reinterpret_cast<file**>(records + paths.size()) : nullptr;
-  auto* chars        = index ? reinterpret_cast<char*>(index + paths.size()) : nullptr;
-  size_t constructed = 0;
+  storage_ = std::make_shared<storage>(
+    bytes ? owner.allocator(permit).allocate_retained(bytes) : scan_manager::charged_block{},
+    paths.size());
   try {
-    for (auto const& path : paths) {
-      std::memcpy(chars, path.c_str(), path.size() + 1);
-      std::construct_at(records + constructed,
-                        file{std::string_view(chars, path.size()), nullptr, {}});
-      index[constructed] = records + constructed;
-      chars += path.size() + 1;
-      ++constructed;
-      storage_->count = constructed;
-    }
-    files_ = {records, paths.size()};
-    std::span<file*> sorted(index, paths.size());
+    for (auto const& path : paths)
+      storage_->emplace(path);
+    files_      = storage_->records();
+    auto sorted = storage_->index();
     std::sort(sorted.begin(), sorted.end(), [](auto* a, auto* b) {
       return basename(a->path) < basename(b->path);
     });
@@ -177,6 +206,7 @@ std::shared_ptr<void const> iceberg_dv_preparation::path_owner() const { return 
 void iceberg_dv_preparation::bind_admission(
   std::shared_ptr<scan_manager::preparation_admission> admission)
 {
+  if (!admission) throw std::logic_error("DV preparation requires a statement admission");
   if (admission_) throw std::logic_error("DV preparation already bound to a statement admission");
   admission_ = std::move(admission);
 }
