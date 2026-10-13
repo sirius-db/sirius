@@ -219,8 +219,11 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     }
 
     host_table_chunk_reader chunk_reader(_client_ctx, host_table, result_column_types);
+    duckdb::ColumnDataCollection local_collection(_client_ctx, result_column_types);
+    duckdb::ColumnDataAppendState append_state;
+    local_collection.InitializeAppend(append_state);
 
-    // Push chunks to result collection
+    // Append into a task-local collection so chunk copies do not hold the shared lock.
     while (true) {
       // TODO(amin): it is fishy that append take a mutable reference to the chunk reader and we
       // are passing local variable chunk reader by reference. We should investigate if this can
@@ -230,14 +233,16 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       duckdb::DataChunk chunk;
       if (!chunk_reader.get_next_chunk(chunk)) { break; }
 
-      std::lock_guard<std::mutex> guard(lock);
-      // Initialize result collection if it is null (from a move)
-      if (!result_collection) {
-        result_collection =
-          duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
-      }
-      result_collection->Append(chunk);
+      local_collection.Append(append_state, chunk);
     }
+
+    // Combine moves the local segments into the result collection without copying their rows.
+    std::lock_guard<std::mutex> guard(lock);
+    if (!result_collection) {
+      result_collection =
+        duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
+    }
+    result_collection->Combine(local_collection);
   };
 
   std::for_each(input_batches.begin(), input_batches.end(), sink_single_batch);
