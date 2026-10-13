@@ -76,7 +76,7 @@ jobs:
       runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "arm-xl"]}'
 
   validation-host:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'merge_group'
     runs-on: [self-hosted, ubuntu-22.04, cpu-xl]
     timeout-minutes: 30
     env:
@@ -110,6 +110,7 @@ jobs:
           retention-days: 1
 
   validate-bundled:
+    if: github.event_name == 'merge_group'
     needs: [cuda-12, cuda-13, validation-host]
     strategy:
       fail-fast: false
