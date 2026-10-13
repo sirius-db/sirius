@@ -707,23 +707,21 @@ TEST_CASE("Sirius configuration validates telemetry exporters before initializat
 {
   std::source_location loc = std::source_location::current();
   auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
-  auto const invalid       = data_dir / "invalid_telemetry_exporter.yaml";
-  sirius::sirius_config rejected;
-  auto const default_exporter = rejected.get_telemetry_config().exporter;
-  REQUIRE_THROWS_WITH(rejected.load_from_file(invalid),
-                      Catch::Matchers::ContainsSubstring("telemetry.exporter") &&
-                        Catch::Matchers::ContainsSubstring("ndjson, msgpack, postcard"));
-  REQUIRE(rejected.get_telemetry_config().exporter == default_exporter);
-
-  for (auto const& [exporter, fixture] : std::array<std::pair<const char*, const char*>, 3>{{
-         {"ndjson", "valid_telemetry_exporter_ndjson.yaml"},
-         {"msgpack", "valid_telemetry_exporter_msgpack.yaml"},
-         {"postcard", "valid_telemetry_exporter_postcard.yaml"},
-       }}) {
-    sirius::sirius_config accepted;
-    REQUIRE_NOTHROW(accepted.load_from_file(data_dir / fixture));
-    REQUIRE(accepted.get_telemetry_config().exporter == exporter);
+  // Reject unsupported formats before initialization, even with telemetry disabled.
+  for (auto const* fixture : {"invalid_telemetry_exporter.yaml",
+                              "invalid_telemetry_exporter_msgpack.yaml",
+                              "invalid_telemetry_exporter_postcard.yaml"}) {
+    sirius::sirius_config rejected;
+    auto const default_exporter = rejected.get_telemetry_config().exporter;
+    REQUIRE_THROWS_WITH(rejected.load_from_file(data_dir / fixture),
+                        Catch::Matchers::ContainsSubstring("telemetry.exporter") &&
+                          Catch::Matchers::ContainsSubstring("must be ndjson"));
+    REQUIRE(rejected.get_telemetry_config().exporter == default_exporter);
   }
+
+  sirius::sirius_config accepted;
+  REQUIRE_NOTHROW(accepted.load_from_file(data_dir / "valid_telemetry_exporter_ndjson.yaml"));
+  REQUIRE(accepted.get_telemetry_config().exporter == sirius::QUENT_NDJSON_EXPORTER);
 }
 
 TEST_CASE("Sirius configuration keeps NVTX capture off unless telemetry.enable_nvtx is set",

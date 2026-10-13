@@ -26,7 +26,7 @@ query::query(std::vector<std::shared_ptr<pipeline::sirius_pipeline>> pipelines,
              const quent::Context& context,
              sirius::query_id_t query_id,
              telemetry::query_telemetry_info telemetry_info)
-  : _query_id(query_id), _plan_id(uuid::now_v7()), _pipelines(std::move(pipelines))
+  : _query_id(query_id), _plan_id(quent::now_v7()), _pipelines(std::move(pipelines))
 {
   build_indices();
   telemetry::emit_plan_telemetry(context, _pipelines, _plan_id, telemetry_info);
