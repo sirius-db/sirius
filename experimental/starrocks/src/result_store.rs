@@ -31,6 +31,13 @@ impl FragmentInstanceId {
     pub(crate) fn from_halves(hi: i64, lo: i64) -> Self {
         Self(Uuid::from_u64_pair(hi as u64, lo as u64))
     }
+
+    /// The `hi` half, which a fragment instance shares with its query: the FE derives instance
+    /// ids as `(query.hi, query.lo + n)` (`ExecutionDAG.setInstanceId`). An exchange frame
+    /// carries only its receiver's instance id, so this is how it is matched to its query.
+    pub(crate) fn query_hi(self) -> u64 {
+        self.0.as_u64_pair().0
+    }
 }
 
 impl From<&TUniqueId> for FragmentInstanceId {

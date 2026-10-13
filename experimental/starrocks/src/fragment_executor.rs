@@ -84,6 +84,17 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
         }
         self.execute(run.plan).map(Some)
     }
+
+    /// Drops one destination's claim on parked output, which is freed with the last claim. The
+    /// default parks nothing, so there is nothing to drop.
+    fn drop_parked(&self, _slot: SenderSlot) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Sender fragments still parked, freed or not. The default parks nothing.
+    fn parked_fragments(&self) -> usize {
+        0
+    }
 }
 
 /// Placeholder executor that fabricates one row so the result path works without a GPU.
