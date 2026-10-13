@@ -1259,6 +1259,24 @@ std::size_t prefetching_cache::claimed_bytes() const noexcept
   return _pool ? _pool->total_allocated_bytes() : 0;
 }
 
+std::size_t prefetching_cache::resident_bytes(const io_object& obj,
+                                              std::span<const range> ranges) const
+{
+  auto const generation = generation_for(obj, nullptr);
+  if (!generation) { return 0; }
+  std::size_t total = 0;
+  for (auto const& r : ranges) {
+    for (auto const* c : generation->fetch_chunks(r.offset, r.size, coverage_policy::partial)) {
+      auto const state = c->state.load().state();
+      if (state != chunk_state::cached && state != chunk_state::in_use) { continue; }
+      auto const lo = std::max(c->offset, r.offset);
+      auto const hi = std::min(c->offset + generation->chunk_size, r.end());
+      if (hi > lo) { total += hi - lo; }
+    }
+  }
+  return total;
+}
+
 void prefetching_cache::evict(std::size_t bytes_to_free)
 {
   // Nothing to free, nothing holding memory, or a cache on its way down -- in

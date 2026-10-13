@@ -34,6 +34,7 @@
 #include <compression/compressed_scan.hpp>
 #include <compression/simpatico_file_ingest.hpp>
 #include <helper/logical_type.hpp>
+#include <io/types.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <scan_manager/pinned_chunk_stats.hpp>
@@ -53,6 +54,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -430,6 +432,19 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
   /// handed to two of them would be emitted twice -- which shows up as a plausible row count, not
   /// as a failure.
   std::atomic<std::size_t> _next_chunk{0};
+
+  /// Which @ref _live_chunks entry the claim takes: the unclaimed one whose bytes the prefetching
+  /// cache holds most of, ties in file order. A scan that repeats one an earlier scan made (q17,
+  /// q18 and q21 read lineitem twice) then reads what is still cached before its own misses evict
+  /// it. Plain file order when there is no cache to ask.
+  [[nodiscard]] std::size_t pick_chunk(std::size_t claim);
+  std::mutex _claim_mtx;
+  std::vector<bool> _claimed;
+  /// The current ranking of unclaimed chunks, most cached first, and how far it has been followed.
+  std::vector<std::size_t> _order;
+  std::size_t _order_pos         = 0;
+  std::size_t _claims_since_rank = 0;
+  std::atomic<std::size_t> _cached_first_picks{0};
 
   /// Plans each split's reads so they can be prefetched; null when the scan has no io_context to
   /// prefetch through (a local read) or planning failed, and every split is then simply unhinted.

@@ -403,26 +403,31 @@ class hpln_read_planner {
   hpln_read_planner(hpln_read_planner const&)            = delete;
   hpln_read_planner& operator=(hpln_read_planner const&) = delete;
 
-  /// The sizing buffers this planner fetched, to be passed on as @ref hpln_open_options::sizing.
-  [[nodiscard]] std::shared_ptr<hpln_sizing_cache> const& sizing() const noexcept;
+  /// The sizing buffers fetched so far, to be passed on as @ref hpln_open_options::sizing.
+  [[nodiscard]] std::shared_ptr<hpln_sizing_cache> sizing() const;
 
-  /// Fetch the sizing buffers every narrowed chunk in @p chunk_ids needs, as planned batches.
-  /// Positional like @ref read_hpln_chunks_into_pinned's @c decode_chunks. Call once, before any
-  /// @ref ranges and before the cache is shared; not thread-safe.
+  /// Fetch the sizing buffers the narrowed chunks in @p chunk_ids need and do not have yet, as one
+  /// planned batch. Positional like @ref read_hpln_chunks_into_pinned's @c decode_chunks. Safe to
+  /// call concurrently, e.g. once per chunk from the split jobs: each call publishes what it
+  /// fetched alongside what others published.
   void prefetch_sizing(std::span<const std::size_t> chunk_ids,
                        std::span<const std::vector<std::uint32_t>> decode_chunks);
 
   /// The merged, ascending file ranges the read of @p chunk_id narrowed to @p decode_chunks (empty:
   /// the whole chunk) will fetch. Empty when that cannot be known without a read -- a narrowed
   /// chunk whose sizing buffers are not in @ref sizing -- in which case the scan simply does not
-  /// hint it. Never reads, and safe to call from several threads once @ref prefetch_sizing is done.
+  /// hint it. Never reads; safe to call from several threads.
   [[nodiscard]] std::vector<hpln_file_range> ranges(
     std::size_t chunk_id, std::span<const std::uint32_t> decode_chunks) const;
+
+  /// The file range holding @p chunk_id's payload, straight from the chunk directory: no planning,
+  /// no reads. Empty past the last chunk.
+  [[nodiscard]] hpln_file_range chunk_payload(std::size_t chunk_id) const noexcept;
 
   /// The header and file map a read of @p chunk_id narrowed to @p decode_chunks (empty: the whole
   /// chunk) would stage -- the same narrowing @ref ranges plans -- without reading or allocating.
   /// Nullopt when that cannot be known without a read; the caller then stages the chunk as before.
-  /// Safe to call from several threads once @ref prefetch_sizing is done.
+  /// Safe to call from several threads.
   [[nodiscard]] std::optional<planned_hpln_chunk> plan_chunk(
     std::size_t chunk_id, std::span<const std::uint32_t> decode_chunks) const;
 

@@ -984,6 +984,13 @@ void hpln_read_planner::prefetch_sizing(std::span<const std::size_t> chunk_ids,
     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
+hpln_file_range hpln_read_planner::chunk_payload(std::size_t chunk_id) const noexcept
+{
+  auto const& chunks = _impl->layout->layout.chunks;
+  if (chunk_id >= chunks.size()) { return {}; }
+  return {chunks[chunk_id].payload_offset, chunks[chunk_id].payload_bytes};
+}
+
 std::vector<hpln_file_range> hpln_read_planner::ranges(
   std::size_t chunk_id, std::span<const std::uint32_t> decode_chunks) const
 {

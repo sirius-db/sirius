@@ -209,6 +209,10 @@ class sirius_datasource : public cudf::io::datasource {
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
+  /// Bytes of @p ranges this datasource's prefetching cache already holds; 0 without one. See
+  /// @ref cache::prefetching_cache::resident_bytes.
+  [[nodiscard]] std::size_t resident_bytes(std::span<const range> ranges) const;
+
   /// Whether the backend serving this datasource would rather be handed one
   /// batched request than a stream of small reads.  See @c ioctx::prefers_bulk_io.
   [[nodiscard]] bool prefers_bulk_io() const noexcept;

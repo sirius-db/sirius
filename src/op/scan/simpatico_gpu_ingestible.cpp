@@ -45,6 +45,7 @@
 
 // standard library
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <limits>
 #include <memory>
@@ -661,14 +662,72 @@ bool simpatico_gpu_ingestible::has_processed_all_metadata() const
   return _next_chunk.load(std::memory_order_relaxed) >= _live_chunks.size();
 }
 
+std::size_t simpatico_gpu_ingestible::pick_chunk(std::size_t claim)
+{
+  if (!_planner || !_base_datasource || !_base_datasource->uses_prefetching_cache()) {
+    return claim;
+  }
+  std::lock_guard lock(_claim_mtx);
+  auto const n = _live_chunks.size();
+  if (_claimed.empty()) { _claimed.assign(n, false); }
+  // Re-rank the unclaimed chunks only every few claims; between rankings the order is followed as
+  // is. Ranked by the cached share of each chunk's whole payload, which the chunk directory gives
+  // for free: planning a narrowed chunk's exact ranges costs milliseconds per chunk, on the thread
+  // that publishes splits, and the ranking needs no such precision.
+  constexpr std::size_t rerank_every = 8;
+  if (_order_pos >= _order.size() || _claims_since_rank >= rerank_every) {
+    std::vector<std::pair<std::size_t, std::size_t>> by_cached;  // (cached tenths, chunk)
+    by_cached.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      if (_claimed[i]) { continue; }
+      auto const payload = _planner->chunk_payload(_live_chunks[i].id);
+      std::size_t tenths = 0;
+      if (payload.size > 0) {
+        std::array<sirius::io::range, 1> const extent{
+          {{static_cast<std::size_t>(payload.offset), static_cast<std::size_t>(payload.size)}}};
+        tenths = _base_datasource->resident_bytes(extent) * 10 / payload.size;
+      }
+      by_cached.emplace_back(tenths, i);
+    }
+    // Most cached first. Coarse buckets, ties in file order: chunks cached about equally (all or
+    // nothing, the common cases) are read in file order as before.
+    std::stable_sort(by_cached.begin(), by_cached.end(), [](auto const& a, auto const& b) {
+      return a.first > b.first;
+    });
+    _order.clear();
+    for (auto const& [tenths, i] : by_cached) {
+      _order.push_back(i);
+    }
+    _order_pos         = 0;
+    _claims_since_rank = 0;
+  }
+  while (_order_pos < _order.size() && _claimed[_order[_order_pos]]) {
+    ++_order_pos;
+  }
+  auto const pick = _order_pos < _order.size() ? _order[_order_pos++] : claim;
+  _claimed[pick]  = true;
+  ++_claims_since_rank;
+  if (pick != claim) { _cached_first_picks.fetch_add(1, std::memory_order_relaxed); }
+  if (claim + 1 == n) {
+    SIRIUS_LOG_DEBUG(
+      "[simpatico_gpu_ingestible] '{}': {} of {} chunks taken out of file order for "
+      "being cached",
+      _info->resolved_file_paths.front(),
+      _cached_first_picks.load(std::memory_order_relaxed),
+      n);
+  }
+  return pick;
+}
+
 simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_split_provider(
   io::ioctx_resolver resolve)
 {
   // fetch_add rather than load-then-store: several dispatcher threads may reach here, and two of
   // them reading the same cursor would emit one chunk twice and skip another -- which lands as a
   // wrong answer with a right-looking row count, not as a failure.
-  auto const cursor = _next_chunk.fetch_add(1, std::memory_order_relaxed);
-  if (cursor >= _live_chunks.size()) { return nullptr; }
+  auto const claim = _next_chunk.fetch_add(1, std::memory_order_relaxed);
+  if (claim >= _live_chunks.size()) { return nullptr; }
+  auto const cursor = pick_chunk(claim);
 
   // Resolve the backend HERE, on the walk, the way the parquet source does: the resolver routes
   // by path (`s3://` -> rest, local -> uring/kvikio), and resolving once per split keeps
