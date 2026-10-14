@@ -18,6 +18,7 @@
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -56,8 +57,9 @@ DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader)
   }
   if (version < 12000) {
     throw duckdb::InvalidInputException(
-      "Sirius requires an NVIDIA driver supporting CUDA 12 or newer (reported CUDA version: %d)",
-      version);
+      "Sirius requires an NVIDIA driver supporting CUDA 12 or newer (reported CUDA version: %d.%d)",
+      version / 1000,
+      (version % 1000) / 10);
   }
   auto const* backend = version < 13000 ? "sirius_cuda12" : "sirius_cuda13";
   auto const* other   = version < 13000 ? "sirius_cuda13" : "sirius_cuda12";
@@ -67,15 +69,25 @@ DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader)
     throw duckdb::InvalidInputException(
       "Cannot load %s while %s is already loaded", backend, other);
   }
+  if (db.ExtensionIsLoaded(backend)) { return; }
   try {
-    duckdb::ExtensionHelper::AutoLoadExtension(db, backend);
+    auto& fs = duckdb::FileSystem::GetLocal(db);
+    if (duckdb::Settings::Get<duckdb::AutoinstallKnownExtensionsSetting>(db)) {
+      auto repository = duckdb::ExtensionHelper::GetAutoinstallRepository(db);
+      duckdb::ExtensionInstallOptions options;
+      options.repository = repository;
+      duckdb::ExtensionHelper::InstallExtension(db, fs, backend, options);
+    }
+    // Preserve autoload's core-signature policy without its installation error wrapper.
+    duckdb::ExtensionLoadOptions options(backend);
+    options.core_only = true;
+    duckdb::ExtensionHelper::LoadExternalExtension(db, fs, options);
   } catch (std::exception const& error) {
     auto message = duckdb::StringUtil::Format(
-      "Sirius selected %s for CUDA driver version %d, but loading it failed. ", backend, version);
-    if (!duckdb::Settings::Get<duckdb::AutoinstallKnownExtensionsSetting>(db)) {
-      message += duckdb::StringUtil::Format(
-        "Automatic installation is disabled; run INSTALL %s first. ", backend);
-    }
+      "Sirius selected %s for CUDA driver version %d.%d, but loading it failed. ",
+      backend,
+      version / 1000,
+      (version % 1000) / 10);
     duckdb::ErrorData(error).Throw(message);
   }
 }

@@ -122,9 +122,10 @@ class LoaderTests(unittest.TestCase):
             f"INSTALL {quote(self.backend(12))}; LOAD {quote(self.loader)};"
         )
         self.assert_failure(
-            result, "Sirius selected sirius_cuda13 for CUDA driver version 13000"
+            result, "Sirius selected sirius_cuda13 for CUDA driver version 13.0"
         )
-        self.assertIn("run INSTALL sirius_cuda13 first", result.stderr)
+        self.assertIn("not found", result.stderr)
+        self.assertNotIn("automatically install", result.stderr)
 
     def test_selected_backend_already_loaded(self):
         result = self.query(
@@ -135,15 +136,17 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), [{"backend": 13}])
 
     def test_backend_initialization_error(self):
-        result = self.query(
-            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};",
-            env={"SIRIUS_TEST_BACKEND_FAILURE": "1"},
-        )
-        self.assert_failure(
-            result,
-            "Backend initialization failed for test",
-        )
-        self.assertIn("Sirius selected sirius_cuda13", result.stderr)
+        for autoinstall in [False, True]:
+            with self.subTest(autoinstall=autoinstall):
+                result = self.query(
+                    f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};",
+                    env={"SIRIUS_TEST_BACKEND_FAILURE": "1"},
+                    autoinstall=autoinstall,
+                )
+                self.assert_failure(result, "Backend initialization failed for test")
+                self.assertIn("Sirius selected sirius_cuda13", result.stderr)
+                self.assertNotIn("run INSTALL", result.stderr)
+                self.assertNotIn("automatically install", result.stderr)
 
     def test_conflicting_loaded_backend(self):
         self.assert_failure(
