@@ -105,6 +105,12 @@ std::vector<char> read(const fs::path& path)
   return bytes;
 }
 
+bool uniform_payload(const std::vector<char>& bytes, std::size_t expected_size)
+{
+  return bytes.size() == expected_size &&
+         std::ranges::all_of(bytes, [&](char value) { return value == bytes.front(); });
+}
+
 void publication_and_faults(const fs::path& root)
 {
   const auto path = root / "records" / "test.cubin";
@@ -211,10 +217,7 @@ void concurrent_writers(const fs::path& root)
   start.arrive_and_wait();
   while (remaining) {
     std::vector<char> bytes;
-    if (!cache::read_cubin_file(path, bytes) || bytes.size() != initial.size() ||
-        !std::all_of(
-          bytes.begin(), bytes.end(), [&](char value) { return value == bytes.front(); }))
-      bad = true;
+    if (!cache::read_cubin_file(path, bytes) || !uniform_payload(bytes, initial.size())) bad = true;
   }
   for (auto& thread : threads)
     thread.join();
@@ -233,10 +236,8 @@ void concurrent_writers(const fs::path& root)
       for (int iteration = 0; iteration < 30; ++iteration)
         cache::write_cubin_file_atomic(path, bytes);
       std::vector<char> loaded;
-      const bool valid = cache::read_cubin_file(path, loaded) && loaded.size() == bytes.size() &&
-                         std::all_of(loaded.begin(), loaded.end(), [&](char value) {
-                           return value == loaded.front();
-                         });
+      const bool valid =
+        cache::read_cubin_file(path, loaded) && uniform_payload(loaded, bytes.size());
       ::_exit(valid ? 0 : 1);
     }
     children.push_back(pid);
@@ -445,11 +446,7 @@ void concurrent_pruning(const fs::path& root)
   start.arrive_and_wait();
   while (remaining) {
     std::vector<char> bytes;
-    if (cache::read_cubin_file(path, bytes) &&
-        (bytes.size() != 65536 || !std::all_of(bytes.begin(), bytes.end(), [&](char value) {
-           return value == bytes.front();
-         })))
-      bad = true;
+    if (cache::read_cubin_file(path, bytes) && !uniform_payload(bytes, 65536)) bad = true;
   }
   writer.join();
   pruner.join();

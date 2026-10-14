@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <functional>
 #include <regex>
+#include <span>
 #include <string_view>
 #include <utility>
 
@@ -56,26 +57,24 @@ struct Temporary {
   }
 };
 
-bool read_all(int fd, char* bytes, std::size_t count)
+bool read_all(int fd, std::span<char> bytes)
 {
-  while (count) {
-    const auto size = ::read(fd, bytes, count);
+  while (!bytes.empty()) {
+    const auto size = ::read(fd, bytes.data(), bytes.size());
     if (size < 0 && errno == EINTR) continue;
     if (size <= 0) return false;
-    bytes += size;
-    count -= static_cast<std::size_t>(size);
+    bytes = bytes.subspan(static_cast<std::size_t>(size));
   }
   return true;
 }
 
-bool write_all(int fd, const char* bytes, std::size_t count)
+bool write_all(int fd, std::span<const char> bytes)
 {
-  while (count) {
-    const auto size = ::write(fd, bytes, count);
+  while (!bytes.empty()) {
+    const auto size = ::write(fd, bytes.data(), bytes.size());
     if (size < 0 && errno == EINTR) continue;
     if (size <= 0) return false;
-    bytes += size;
-    count -= static_cast<std::size_t>(size);
+    bytes = bytes.subspan(static_cast<std::size_t>(size));
   }
   return true;
 }
@@ -115,29 +114,30 @@ bool is_environment(const std::filesystem::directory_entry& entry)
 {
   if (!is_directory_no_follow(entry.path())) return false;
   const auto name = entry.path().filename().string();
-  return name.size() == Digest{}.size() * 2 &&
-         std::all_of(name.begin(), name.end(), [](char value) {
+  return name.size() == Digest{}.size() * 2 && std::ranges::all_of(name, [](char value) {
            return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
          });
+}
+
+void remove_matching_files(const std::filesystem::path& path, const std::regex& pattern)
+{
+  visit_directory(path, [&](const auto& entry) {
+    if (is_regular(entry) && std::regex_match(entry.path().filename().string(), pattern))
+      remove_entry(entry.path());
+  });
 }
 
 void clear_legacy_files(const std::filesystem::path& root)
 {
   const std::regex legacy("[0-9a-f]{16}_a[0-9]+_c[0-9]+_d[0-9]+\\.cubin(\\.tmp\\.[0-9]+)?");
-  visit_directory(root, [&](const auto& entry) {
-    if (is_regular(entry) && std::regex_match(entry.path().filename().string(), legacy))
-      remove_entry(entry.path());
-  });
+  remove_matching_files(root, legacy);
 }
 
 void clear_environment(const std::filesystem::path& path)
 {
   const auto hex = "[0-9a-f]{" + std::to_string(Digest{}.size() * 2) + "}";
   const std::regex request(hex + "\\.cubin(\\.tmp\\.[A-Za-z0-9]{6})?");
-  visit_directory(path, [&](const auto& file) {
-    if (is_regular(file) && std::regex_match(file.path().filename().string(), request))
-      remove_entry(file.path());
-  });
+  remove_matching_files(path, request);
   if (is_directory_no_follow(path)) remove_entry(path);
 }
 
@@ -154,15 +154,14 @@ bool read_cubin_file(const std::string& path, std::vector<char>& bytes) noexcept
         static_cast<uint64_t>(metadata.st_size) > max_cubin_bytes + header_size)
       return false;
     std::array<char, header_size> header{};
-    if (!read_all(file.get(), header.data(), header.size()) ||
-        !std::equal(magic.begin(), magic.end(), header.begin()))
+    if (!read_all(file.get(), header) || !std::equal(magic.begin(), magic.end(), header.begin()))
       return false;
     uint64_t size = 0;
     for (std::size_t i = length_offset; i < digest_offset; ++i)
       size = (size << 8) | static_cast<unsigned char>(header[i]);
     if (size != static_cast<uint64_t>(metadata.st_size) - header.size()) return false;
     std::vector<char> payload(static_cast<std::size_t>(size));
-    if (!read_all(file.get(), payload.data(), payload.size()) || !file.close()) return false;
+    if (!read_all(file.get(), payload) || !file.close()) return false;
     const auto digest = content_identity({payload.data(), payload.size()});
     if (!std::equal(digest.begin(),
                     digest.end(),
@@ -180,14 +179,14 @@ void write_cubin_file_atomic(const std::string& path, const std::vector<char>& b
   try {
     if (bytes.empty() || bytes.size() > max_cubin_bytes) return;
     std::array<char, header_size> header{};
-    std::copy(magic.begin(), magic.end(), header.begin());
+    std::ranges::copy(magic, header.begin());
     auto size = static_cast<uint64_t>(bytes.size());
     for (std::size_t i = digest_offset; i > length_offset; --i) {
       header[i - 1] = static_cast<char>(size & 255);
       size >>= 8;
     }
     const auto digest = content_identity({bytes.data(), bytes.size()});
-    std::copy(digest.begin(), digest.end(), header.begin() + digest_offset);
+    std::ranges::copy(digest, header.begin() + digest_offset);
     std::error_code error;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), error);
     if (error) return;
@@ -197,9 +196,7 @@ void write_cubin_file_atomic(const std::string& path, const std::vector<char>& b
       temporary.path.clear();
       return;
     }
-    if (!write_all(file.get(), header.data(), header.size()) ||
-        !write_all(file.get(), bytes.data(), bytes.size()) || !file.close())
-      return;
+    if (!write_all(file.get(), header) || !write_all(file.get(), bytes) || !file.close()) return;
     // No fsync: this is a recoverable cache, not durable user data. Rename
     // publishes a complete record; crash/torn-write damage becomes a miss.
     if (::rename(temporary.path.c_str(), path.c_str()) == 0) temporary.path.clear();
@@ -235,7 +232,7 @@ void prune_disk_cache(const std::string& root, const Digest& current_environment
           if (!error) others.emplace_back(modified, entry.path());
         }))
       return;
-    std::sort(others.begin(), others.end(), std::greater<>{});
+    std::ranges::sort(others, std::greater<>{});
     const auto cutoff = now - environment_grace;
     for (std::size_t index = kept_environments - 1; index < others.size(); ++index) {
       const auto& [modified, path] = others[index];
