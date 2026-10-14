@@ -18,8 +18,7 @@ use crate::fragment_executor::{
     DrainHandoff, FilterKeys, FilterRun, FragmentExecutor, FragmentRun, KeySource, SenderSlot,
 };
 use crate::local_exchange::{
-    ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, RemoteBatch, RemoteFrame,
-    SenderSource,
+    ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, RemoteBatch, SenderSource,
 };
 use crate::nixl_chunk::{self, NixlEndpoint, NixlEnvelope, StreamHop};
 use crate::proto::starrocks::{
