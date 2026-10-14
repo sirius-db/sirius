@@ -69,6 +69,8 @@ DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader)
     throw duckdb::InvalidInputException(
       "Cannot load %s while %s is already loaded", backend, other);
   }
+  // Mirrors ExtensionHelper::AutoLoadExtension without its error wrapper; recheck on DuckDB
+  // upgrades.
   if (db.ExtensionIsLoaded(backend)) { return; }
   try {
     auto& fs = duckdb::FileSystem::GetLocal(db);
@@ -78,7 +80,6 @@ DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader)
       options.repository = repository;
       duckdb::ExtensionHelper::InstallExtension(db, fs, backend, options);
     }
-    // Preserve autoload's core-signature policy without its installation error wrapper.
     duckdb::ExtensionLoadOptions options(backend);
     options.core_only = true;
     duckdb::ExtensionHelper::LoadExternalExtension(db, fs, options);
