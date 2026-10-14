@@ -68,8 +68,11 @@ class iceberg_dv_preparation {
 };
 
 /// One execution of a prepared scan: owns the attempt ledger handed over when the statement
-/// admission is consumed and the write side of the plan's result slots. stop() drops the ledger
-/// once metadata work has drained; finish() additionally retires the plan's descriptors.
+/// admission is consumed and the write side of the plan's result slots. A prepared scan must
+/// have only one active attempt — two would share those slots and either finish() would retire
+/// the descriptors under the other — so begin_preparation() rejects a second installation on the
+/// ingestible. stop() drops the ledger once metadata work has drained; finish() additionally
+/// retires the plan's descriptors.
 class iceberg_dv_attempt {
  public:
   iceberg_dv_attempt(std::shared_ptr<iceberg_dv_preparation>,

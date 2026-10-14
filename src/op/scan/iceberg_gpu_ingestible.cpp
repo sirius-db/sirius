@@ -421,7 +421,7 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
       auto files = _deferred->files();
       if (slice.file_index < files.size()) {
         auto const& f = files[slice.file_index];
-        if (f.path == slice.file_path) expected = f.result.lock();
+        if (f.path == slice.file_path && _attempt) expected = _attempt->result(slice.file_index);
       }
     } else {
       auto entry = _delete_sets->find(slice.file_path);
