@@ -21,6 +21,7 @@
 #include "core_functions_extension.hpp"                  // duckdb::CoreFunctionsExtension
 #include "data/data_batch_utils.hpp"                     // sirius::make_data_batch
 #include "data/sirius_converter_registry.hpp"            // sirius::converter_registry
+#include "downgrade/downgrade_executor.hpp"              // sirius::parallel::downgrade_executor
 #include "duckdb/catalog/catalog.hpp"                    // duckdb::Catalog
 #include "duckdb/catalog/catalog_transaction.hpp"        // duckdb::CatalogTransaction
 #include "duckdb/common/enums/optimizer_type.hpp"        // duckdb::OptimizerType
@@ -33,12 +34,11 @@
 #include "duckdb/main/query_result.hpp"                  // duckdb::QueryResult
 #include "duckdb/main/relation.hpp"                      // duckdb::Relation
 #include "duckdb/main/settings.hpp"
-#include "downgrade/downgrade_executor.hpp"                // sirius::parallel::downgrade_executor
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
 #include "exec/arrow_result_stream.hpp"
-#include "exec/batch_stream.hpp"  // sirius::exec::batch_stream
+#include "exec/batch_stream.hpp"              // sirius::exec::batch_stream
 #include "exec/exchange_direct.hpp"           // sirius::exec::direct_exchange
 #include "exec/stream_bind_catalog.hpp"       // sirius::exec::stream_bind_catalog
 #include "exec/stream_plan_bindings.hpp"      // sirius::exec::register_stream_source_function
