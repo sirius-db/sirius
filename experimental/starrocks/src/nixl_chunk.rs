@@ -205,7 +205,7 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
 
     /// Writes every batch parked under `slot` into `peer`'s pool, announcing each, then EOS.
     /// Blocks until the hop ends. On error the peer gets no EOS, and a WRITE that failed or timed
-    /// out leaves its sender and receiver batches held.
+    /// out is held with its sender and receiver batches until it reports success.
     fn send(
         &self,
         peer: SocketAddr,
