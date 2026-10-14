@@ -10,7 +10,7 @@
 //! it reads the cached metadata or calls the [`DirectExchange`] on the brpc thread.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -210,6 +210,10 @@ struct Transport {
     xfer_timeout: Duration,
     /// WRITEs that failed or timed out, held until the NIC is done with them.
     quarantine: RefCell<Vec<Quarantined>>,
+    /// Agent name per peer whose metadata a failed hop dropped while the quarantine still held a
+    /// WRITE in progress to it, which can only report success while that metadata stays loaded.
+    /// It is invalidated once no such WRITE remains.
+    stale_peers: HashMap<SocketAddr, String>,
 }
 
 /// A WRITE that failed or timed out while the NIC may still be writing. Dropping its request
@@ -312,6 +316,7 @@ impl Transport {
             window,
             xfer_timeout,
             quarantine: RefCell::new(Vec::new()),
+            stale_peers: HashMap::new(),
         })
     }
 
@@ -545,15 +550,43 @@ impl Transport {
             .agent
             .load_remote_md(&peer_md)
             .map_err(|err| format!("failed to load the nixl metadata of {peer}: {err}"))?;
+        // NIXL took the metadata over the copy still loaded, so the peer did not restart: there is
+        // nothing stale left to invalidate.
+        self.stale_peers.remove(&peer);
         self.peers.insert(peer, name.clone());
         Ok(name)
     }
 
-    /// Drops `peer`'s cached metadata, so the next hop to it loads it again.
+    /// Drops `peer`'s cached metadata, so the next hop to it loads it again, and invalidates it in
+    /// NIXL. While the quarantine holds a WRITE still in progress to `peer`, the invalidation waits
+    /// for [`reap_quarantine`](Self::reap_quarantine): NIXL fails the status of a WRITE whose peer
+    /// was invalidated, so it could never be reclaimed. Reloading meanwhile is harmless: NIXL takes
+    /// the same peer's metadata again and refuses a restarted one's until the old is invalidated.
     fn forget_peer(&mut self, peer: SocketAddr, remote: &str) {
-        if self.peers.remove(&peer).is_some()
-            && let Err(err) = self.agent.invalidate_remote_md(remote)
-        {
+        if self.peers.remove(&peer).is_none() {
+            return;
+        }
+        if self.writing_to(peer) {
+            info!(%peer, remote, "invalidating a peer's nixl metadata once its quarantined WRITEs end");
+            self.stale_peers.insert(peer, remote.to_string());
+        } else {
+            self.invalidate_peer(peer, remote);
+        }
+    }
+
+    /// Whether the quarantine holds a WRITE to `peer` that NIXL still reports in progress.
+    fn writing_to(&self, peer: SocketAddr) -> bool {
+        self.quarantine.borrow().iter().any(|held| {
+            held.peer == peer
+                && matches!(
+                    self.agent.get_xfer_status(&held.request),
+                    Ok(XferStatus::InProgress)
+                )
+        })
+    }
+
+    fn invalidate_peer(&self, peer: SocketAddr, remote: &str) {
+        if let Err(err) = self.agent.invalidate_remote_md(remote) {
             warn!(%peer, remote, error = %err, "failed to invalidate a peer's nixl metadata");
         }
     }
@@ -584,10 +617,14 @@ impl Transport {
     }
 
     /// Frees every quarantined WRITE that has since succeeded: the request, the sender's batch,
-    /// and the receiver's buffers on the peer. Any other status keeps it held.
-    fn reap_quarantine(&self) {
+    /// and the receiver's buffers on the peer. Any other status keeps it held. Then invalidates
+    /// each stale peer that no held WRITE is still in progress to.
+    fn reap_quarantine(&mut self) {
         let mut quarantine = self.quarantine.borrow_mut();
         let held = quarantine.len();
+        // Peers that did not answer a Release this pass: each further one would wait out
+        // `RPC_TIMEOUT`.
+        let mut down = HashSet::new();
         quarantine.retain(|held| {
             if !matches!(
                 self.agent.get_xfer_status(&held.request),
@@ -596,11 +633,9 @@ impl Transport {
                 return true;
             }
             self.release(held.local);
-            let _ = call(
-                held.peer,
-                control_params(),
-                &NixlEnvelope::Release(held.remote),
-            );
+            if !down.contains(&held.peer) && !release_remote(held.peer, held.remote) {
+                down.insert(held.peer);
+            }
             false
         });
         if quarantine.len() < held {
@@ -610,6 +645,19 @@ impl Transport {
                 oldest_s = quarantine.iter().map(|q| q.since.elapsed().as_secs()).max(),
                 "reclaimed quarantined nixl WRITEs"
             );
+        }
+        drop(quarantine);
+        let stale: Vec<_> = self
+            .stale_peers
+            .iter()
+            .filter(|&(&peer, _)| !self.writing_to(peer))
+            .map(|(&peer, remote)| (peer, remote.clone()))
+            .collect();
+        for (peer, remote) in stale {
+            self.stale_peers.remove(&peer);
+            // A hop may have reloaded it meanwhile; the next one loads it again.
+            self.peers.remove(&peer);
+            self.invalidate_peer(peer, &remote);
         }
     }
 }
