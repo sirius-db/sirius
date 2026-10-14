@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/group_key_labels.hpp"
+#include "op/aggregate/low_cardinality_groupby.hpp"
 #include "op/aggregate/stddev.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -145,6 +146,17 @@ bool sorted_groupby_enabled()
   return enabled;
 }
 
+/// Whether batches with a handful of groups use the low-cardinality kernel
+/// (SIRIUS_EXP_LOWCARD_GROUPBY=1).
+bool lowcard_groupby_enabled()
+{
+  static bool const enabled = [] {
+    char const* value = std::getenv("SIRIUS_EXP_LOWCARD_GROUPBY");
+    return value != nullptr && std::string_view{value} == "1";
+  }();
+  return enabled;
+}
+
 /// Aggregate @p input_table grouped by the `group_idx` columns. Returns the table
 /// `[keys..., aggregates...]`. See `gpu_aggregate_impl::local_grouped_aggregate()` for the
 /// parameters.
@@ -168,6 +180,23 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
 
   auto mr = memory_space.get_default_allocator();
+
+  // Experimental (SIRIUS_EXP_LOWCARD_GROUPBY=1): batches with a handful of groups, such as TPC-H
+  // Q1, use a dedicated kernel instead of cuDF's hash group-by. It returns nullptr when the batch
+  // does not qualify, and the general path below runs unchanged.
+  bool const any_struct_aggregate =
+    std::any_of(aggregate_struct_col_indices.begin(),
+                aggregate_struct_col_indices.end(),
+                [](std::vector<int> const& struct_cols) { return !struct_cols.empty(); });
+  if (lowcard_groupby_enabled() && !any_struct_aggregate) {
+    if (auto result = try_low_cardinality_groupby(
+          input_table, group_idx, aggregates, aggregate_idx, stream, mr)) {
+      SIRIUS_LOG_DEBUG("local_grouped_agg: low-cardinality path rows={} groups={}",
+                       input_table.num_rows(),
+                       result->num_rows());
+      return result;
+    }
+  }
 
   // COLLECT_SET uses cuDF's sorted groupby. Dense INT32 labels let that sort take its
   // single-column radix path while preserving the original keys' lexicographic order. A
