@@ -232,6 +232,9 @@ TEST_CASE_METHOD(DistinctFixture,
                  "[integration][gpu_execution][distinct][aggregate]")
 {
   compare_gpu_vs_cpu("SELECT DISTINCT k, sum(x) FROM dist_sum GROUP BY k");
+  // Reorder projection above the narrowed aggregate, over keys of different types.
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT ON (s, k) k, s FROM (SELECT k, sum(x) AS s FROM dist_sum GROUP BY k)");
 }
 
 TEST_CASE_METHOD(DistinctFixture,

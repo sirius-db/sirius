@@ -1080,9 +1080,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("plain DISTINCT with ORDER BY still lowers to the GPU")
   {
-    // LogicalDistinct::order_by is populated only for DISTINCT ON, so this query reaches the
-    // builder with order_by == nullptr and its ORDER BY becomes a separate LOGICAL_ORDER above the
-    // distinct. Turning that guard into a distinct_type check would fail here.
+    // LogicalDistinct::order_by is populated only for DISTINCT ON under an ORDER BY. This query
+    // reaches the builder with order_by == nullptr and its ORDER BY becomes a separate
+    // LOGICAL_ORDER above the distinct, so the DISTINCT ON + ORDER BY guard must not fire.
     auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id, val FROM big_left ORDER BY id");
     INFO(tree_to_string(plan.get()));
 
