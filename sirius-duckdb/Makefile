@@ -1,7 +1,9 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-OVERRIDE_GIT_DESCRIBE ?= v1.5.6
 DISABLE_SANITIZER ?= 1
+
+# Match DuckDB's linker flags to the extension's BFD requirement.
+override EXT_FLAGS += -DDUCKDB_LINKER=bfd
 
 SIRIUS_DUCKDB_LINKAGE ?= $(if $(VCPKG_TOOLCHAIN_PATH),static,shared)
 # Scan verification resolves the DuckDB host's exported factories.

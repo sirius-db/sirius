@@ -68,6 +68,7 @@
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <sirius/exception.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 #include <array>
 #include <atomic>
@@ -3793,9 +3794,9 @@ TEST_CASE("ordinary Parquet residual retirement protects source without a consum
   info->projected_output_count = 1;
   info->table_filters          = duckdb::make_uniq<duckdb::TableFilterSet>();
   info->table_filters->PushFilter(
-    duckdb::ColumnIndex(1),
-    duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
-                                              duckdb::Value::BIGINT(40)));
+    duckdb::ProjectionIndex(1),
+    sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                  duckdb::Value::BIGINT(40)));
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
   std::weak_ptr<cudf::table const> source_lifetime;
   {

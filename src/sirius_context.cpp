@@ -23,12 +23,12 @@
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "exec/stream_bind_catalog.hpp"
+#include "helper/transaction_utils.hpp"
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
 #include "log/noop_sink.hpp"
@@ -60,6 +60,8 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
+#include <duckdb/execution/operator/helper/physical_execute.hpp>
+#include <duckdb/execution/operator/helper/physical_prepare.hpp>
 #include <duckdb/execution/operator/persistent/physical_insert.hpp>
 #include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
 #include <duckdb/execution/operator/persistent/physical_update.hpp>
@@ -132,8 +134,10 @@ std::optional<std::string> pinned_name_for_table(
                                                table.GetStorage().GetRowGroupCollection()};
   std::optional<std::string> result;
   scan_manager.visit_pinned_entries([&](std::string_view name, auto const& entry) {
-    if (!entry.cache_info.matches_duckdb_table(
-          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name, identity)) {
+    if (!entry.cache_info.matches_duckdb_table(table.ParentCatalog().GetName().GetIdentifierName(),
+                                               table.ParentSchema().name.GetIdentifierName(),
+                                               table.name.GetIdentifierName(),
+                                               identity)) {
       return true;
     }
     result = name;
@@ -149,7 +153,8 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
   switch (prepared.statement_type) {
     case StatementType::UPDATE_STATEMENT:
     case StatementType::INSERT_STATEMENT:
-    case StatementType::MERGE_INTO_STATEMENT: break;
+    case StatementType::MERGE_INTO_STATEMENT:
+    case StatementType::EXECUTE_STATEMENT: break;
     default: return;
   }
   if (!prepared.physical_plan) { return; }
@@ -172,7 +177,7 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
       throw InvalidInputException(
         "Sirius does not support UPDATE on pinned DuckDB table '%s'. Run CALL "
         "unpin_table('%s') before updating it",
-        target->name,
+        target->name.GetIdentifierName(),
         *pinned_name);
     }
   }
@@ -447,7 +452,7 @@ struct SiriusContext::internal_connection::implementation {
         !MetaTransaction::Get(context).IsReadOnly()) {
       throw InvalidInputException("Sirius internal connection lost its read-only transaction");
     }
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(sql);
     if (parser.statements.size() != 1 ||
         (parser.statements[0]->type != StatementType::SELECT_STATEMENT &&
@@ -472,16 +477,16 @@ SiriusContext::internal_connection& SiriusContext::internal_connection::operator
   internal_connection&&) noexcept                                   = default;
 SiriusContext::internal_connection::~internal_connection() noexcept = default;
 
-unique_ptr<MaterializedQueryResult> SiriusContext::internal_connection::Query(const string& sql)
+unique_ptr<QueryResult> SiriusContext::internal_connection::Query(const string& sql)
 {
   return impl_->connection.Query(impl_->parse(sql));
 }
 
-unique_ptr<QueryResult> SiriusContext::internal_connection::SendQuery(const string& sql)
+unique_ptr<QueryResult> SiriusContext::internal_connection::Submit(const string& sql)
 {
   // Keep the same read-only transaction and statement restrictions while the
   // caller drains chunks under this connection's InternalQueryGuard.
-  return impl_->connection.SendQuery(impl_->parse(sql));
+  return impl_->connection.Submit(impl_->parse(sql));
 }
 
 SiriusContext::internal_connection SiriusContext::open_internal_connection(ClientContext& outer)
@@ -495,8 +500,7 @@ SiriusContext::internal_connection SiriusContext::open_internal_connection(Clien
   }
   // These lookups inspect the committed database map and search path only; using
   // GetDatabase(outer, name) here could start a transaction before the gate.
-  auto database =
-    DatabaseManager::Get(*outer.db).GetDatabase(DatabaseManager::GetDefaultDatabase(outer));
+  auto database = sirius::helper::find_default_global_database(outer);
   if (!database) {
     throw InvalidInputException("Sirius internal connection target database is unavailable");
   }
@@ -1703,9 +1707,16 @@ void print_cpu_fallback_banner()
 }
 
 RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
-                                                 PreparedStatementData& prepared,
+                                                 PreparedStatementData& statement,
                                                  PreparedStatementMode mode)
 {
+  auto* target = &statement;
+  if (statement.statement_type == StatementType::PREPARE_STATEMENT && statement.physical_plan &&
+      statement.physical_plan->Root().type == PhysicalOperatorType::PREPARE) {
+    auto& inner = statement.physical_plan->Root().Cast<PhysicalPrepare>().prepared;
+    if (inner->physical_plan) target = inner.get();
+  }
+  auto& prepared = *target;
   if (!is_internal_query_active(context)) {
     reject_update_to_pinned_table(*this, context, prepared);
   }
@@ -1748,10 +1759,14 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   if (!is_initialized_) { return RebindQueryInfo::DO_NOT_REBIND; }
 
-  // Only intercept SELECT statements.
-  if (prepared.statement_type != StatementType::SELECT_STATEMENT) {
-    return RebindQueryInfo::DO_NOT_REBIND;
+  // In v2, SQL and C++ prepared executions both have an EXECUTE wrapper.
+  auto statement_type = prepared.statement_type;
+  if (statement_type == StatementType::EXECUTE_STATEMENT && prepared.physical_plan &&
+      prepared.physical_plan->Root().type == PhysicalOperatorType::EXECUTE) {
+    statement_type =
+      prepared.physical_plan->Root().Cast<PhysicalExecute>().prepared->statement_type;
   }
+  if (statement_type != StatementType::SELECT_STATEMENT) { return RebindQueryInfo::DO_NOT_REBIND; }
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).
@@ -1790,7 +1805,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
         }
         std::filesystem::copy_file(*source, destination);
       }
-      Parser parser(context.GetParserOptions());
+      Parser parser(context);
       parser.ParseQuery(current_query_sql);
       if (parser.statements.size() != 1) { return RebindQueryInfo::DO_NOT_REBIND; }
       Planner planner(context);
@@ -1997,20 +2012,28 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   return RebindQueryInfo::DO_NOT_REBIND;
 }
 
-RebindQueryInfo SiriusContext::OnExecutePrepared(ClientContext& context,
-                                                 PreparedStatementCallbackInfo& info,
-                                                 RebindQueryInfo current_rebind)
+RebindQueryInfo SiriusContext::OnRebindPreparedStatement(ClientContext& context,
+                                                         BindPreparedStatementCallbackInfo& info,
+                                                         RebindQueryInfo current_rebind)
 {
+  if (is_internal_query_active(context)) { return current_rebind; }
   auto& prepared = info.prepared_statement;
-  reject_update_to_pinned_table(*this, context, prepared);
+  // A rebind can change the target table. Finalize validates the new physical plan.
+  if (current_rebind == RebindQueryInfo::DO_NOT_REBIND) {
+    reject_update_to_pinned_table(*this, context, prepared);
+  }
 
-  // GPU eligibility can drift with data alone (e.g. an insert pushes a varchar past
-  // the overflow-string limit) and data changes never trigger DuckDB's own rebind.
-  // By execute time the CPU plan has been discarded, so a stale
-  // PhysicalSiriusExecution would error with no fallback. Rebind instead:
-  // OnFinalizePrepare re-decides against current stats and keeps the fresh CPU plan
-  // when create_plan now refuses.
-  if (!prepared.unbound_statement || !prepared.physical_plan) { return current_rebind; }
+  // Bind parameter values before GPU planning, including values whose types match
+  // the cached CPU plan and therefore do not trigger DuckDB's own rebind.
+  Value enabled;
+  if (prepared.statement_type == StatementType::SELECT_STATEMENT && !prepared.value_map.empty() &&
+      is_initialized_ && context.TryGetCurrentSetting("gpu_execution", enabled) &&
+      !enabled.IsNull() && enabled.GetValue<bool>()) {
+    return RebindQueryInfo::ATTEMPT_TO_REBIND;
+  }
+  // Only Sirius-backed statements need an extra rebind to recheck GPU eligibility
+  // after data changes. Retain DuckDB's normal caching for CPU and table-function plans.
+  if (!prepared.unbound_statement || !prepared.physical_plan) return current_rebind;
   auto& root = prepared.physical_plan->Root();
   if (root.type == sirius::transparent::PhysicalSiriusExecution::TYPE &&
       dynamic_cast<sirius::transparent::PhysicalSiriusExecution*>(&root) != nullptr) {

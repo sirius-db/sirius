@@ -53,7 +53,7 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
     std::vector<sirius::op::scan::bound_read_view> physical_original_views,
     std::string query_sql,
     duckdb::vector<duckdb::LogicalType> types,
-    duckdb::vector<std::string> names,
+    duckdb::vector<duckdb::Identifier> names,
     duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
     plan_source_policy source_policy,
     duckdb::idx_t estimated_cardinality,
@@ -103,7 +103,7 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   std::string query_sql_;
 
   /// Output column names (needed for result construction).
-  duckdb::vector<std::string> result_names_;
+  duckdb::vector<duckdb::Identifier> result_names_;
 
   /// DuckDB's CPU physical plan, wrapped in a minimal PreparedStatementData and
   /// stashed at OnFinalizePrepare before this operator replaced it. On a GPU

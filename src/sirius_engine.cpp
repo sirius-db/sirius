@@ -55,13 +55,16 @@ namespace sirius {
 
 namespace {
 
-void finish_deferred_preparation(planner::query const* query) noexcept
+// Walks the live plan rather than the query index: on a failed start the engine never receives
+// the index, while the plan still names every scan whose descriptors must be retired.
+void finish_deferred_preparation(op::sirius_physical_operator const* plan) noexcept
 {
-  if (!query) return;
-  for (auto* source : query->get_scan_operators())
-    if (auto* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator*>(source))
+  if (!plan) return;
+  planner::for_each_gpu_scan(*plan, [](op::sirius_physical_operator const& source) {
+    if (auto const* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&source))
       if (auto* ice = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&scan->get_ingestible()))
         ice->finish_preparation();
+  });
 }
 
 /// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
@@ -149,7 +152,7 @@ sirius_engine::~sirius_engine()
     try {
       runtime->retire_query_work(query_id_,
                                  duckdb::SiriusContext::query_retirement_mode::cancelled);
-      finish_deferred_preparation(query_.get());
+      finish_deferred_preparation(sirius_physical_plan.get());
     } catch (...) {
       // The registry retains the plan if retirement fails. Do not free resources whose
       // borrowers cannot be proved idle; the shutdown path retires them after worker joins.
@@ -169,7 +172,7 @@ void sirius_engine::quiesce_plan_users()
   if (auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     ctx->retire_query_work(query_id_, duckdb::SiriusContext::query_retirement_mode::cancelled);
   }
-  finish_deferred_preparation(query_.get());
+  finish_deferred_preparation(sirius_physical_plan.get());
   plan_users_quiescent_ = true;
 }
 
@@ -291,7 +294,7 @@ void sirius_engine::execute()
     future.get();
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
-    finish_deferred_preparation(query_.get());
+    finish_deferred_preparation(sirius_physical_plan.get());
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());

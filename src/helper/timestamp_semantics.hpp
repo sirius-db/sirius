@@ -44,7 +44,7 @@ namespace sirius::temporal {
 
 /**
  * Converts second, millisecond, or nanosecond timestamps to microseconds.
- * Preserves infinity and NULL; truncates nanoseconds toward zero; throws
+ * Preserves infinity and NULL; rounds nanoseconds to nearest with ties away from the epoch; throws
  * sirius::invalid_input_exception on finite overflow or unsupported input type.
  * The overflow check synchronizes the supplied stream to read its result.
  */

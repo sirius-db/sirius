@@ -76,6 +76,7 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <scan_manager/split_connector.hpp>
 #include <sirius/exception.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -1172,9 +1173,9 @@ std::unique_ptr<scan::parquet_ingestible_table_info> resident_parquet_info(
   if (positive_filter) {
     info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
     info->table_filters->PushFilter(
-      duckdb::ColumnIndex(*positive_filter),
-      duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_GREATERTHAN,
-                                                duckdb::Value::BIGINT(0)));
+      duckdb::ProjectionIndex(*positive_filter),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                    duckdb::Value::BIGINT(0)));
   }
   return info;
 }

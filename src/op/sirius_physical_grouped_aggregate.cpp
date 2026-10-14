@@ -56,7 +56,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
   duckdb::vector<std::unique_ptr<sirius::ast::node>> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
-  duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions_p,
+  duckdb::vector<duckdb::unsafe_vector<duckdb::ProjectionIndex>> grouping_functions_p,
   std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType /*group_validity*/,
   duckdb::TupleDataValidityType /*distinct_validity*/,

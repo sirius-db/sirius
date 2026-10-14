@@ -135,6 +135,7 @@ namespace {
 std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   iceberg_dv_preparation const& prepared,
   iceberg_dv_preparation::file const& descriptor,
+  scan_manager::preparation_ledger* ledger,
   scan_manager::w_permit const& permit,
   std::shared_ptr<physical_check_counters> const& counters)
 {
@@ -142,9 +143,10 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   if (!dv)
     return std::make_shared<iceberg_delete_set const>(
       descriptor.path, scan_manager::charged_block{}, 0, 0, prepared.path_owner());
+  if (!ledger) throw std::logic_error("DV preparation unit was not registered before its read");
 
   std::shared_ptr<iceberg_delete_set const> set;
-  auto allocator = prepared.ledger->allocator(permit);
+  auto allocator = ledger->allocator(permit);
   if (counters) {
     ++counters->iceberg_delete_payload_loads;
     if (counters->track_units && counters->iceberg_dv_phase_for_testing)
@@ -160,7 +162,7 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
                                        allocator,
                                        descriptor.path,
                                        prepared.path_owner(),
-                                       prepared.contract);
+                                       prepared.contract());
   } catch (unsupported_physical_input const& error) {
     if (counters) counters->record(error.reason);
     throw;
@@ -192,9 +194,12 @@ void attach_delete_set(parquet_file_scan_info& file, std::shared_ptr<iceberg_del
 gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider(
   io::ioctx_resolver resolve)
 {
+  if (_deferred && !_attempt && _next_preparation < _deferred->files().size())
+    throw std::logic_error("DV preparation claimed before the attempt started");
   auto work = parquet_gpu_ingestible::next_split_provider(std::move(resolve));
   if (!work) return {};
   if (_deferred) {
+    if (!_attempt) throw std::logic_error("DV preparation claimed after it finished");
     auto index = _next_preparation;
     struct preparation_inputs {
       scan_manager::w_permit permit;
@@ -208,22 +213,23 @@ gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider
     };
     auto held    = std::make_shared<preparation_inputs>();
     held->permit = std::move(_next_permit);
-    held->key    = {_deferred->contract, index + 1};
-    if (_next_registered) held->ledger = _deferred->ledger;
+    held->key    = {_deferred->contract(), index + 1};
+    if (_next_registered && _attempt) held->ledger = _attempt->ledger();
     _next_registered = false;
     ++_next_preparation;
     auto const& profiles = static_cast<iceberg_ingestible_table_info const&>(table_info()).profiles;
     auto counters        = profiles ? profiles->counters : nullptr;
-    return
-      [work = std::move(work), prepared = _deferred, held = std::move(held), index, counters]() {
-        auto metadata     = work();
-        auto& file        = dynamic_cast<parquet_file_scan_info&>(*metadata);
-        auto& descriptor  = prepared->files[index];
-        auto set          = read_prepared_delete_set(*prepared, descriptor, held->permit, counters);
-        descriptor.result = set;
-        attach_delete_set(file, std::move(set));
-        return metadata;
-      };
+    return [work = std::move(work), attempt = _attempt, held = std::move(held), index, counters]() {
+      auto metadata          = work();
+      auto& file             = dynamic_cast<parquet_file_scan_info&>(*metadata);
+      auto const& prepared   = attempt->plan();
+      auto const& descriptor = prepared.files()[index];
+      auto set =
+        read_prepared_delete_set(prepared, descriptor, held->ledger.get(), held->permit, counters);
+      attempt->record(index, set);
+      attach_delete_set(file, std::move(set));
+      return metadata;
+    };
   }
   return [work = std::move(work), sets = _delete_sets]() {
     auto metadata = work();
@@ -233,37 +239,51 @@ gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider
   };
 }
 
+void iceberg_gpu_ingestible::begin_preparation(std::shared_ptr<iceberg_dv_attempt> attempt)
+{
+  if (!_deferred) throw std::logic_error("scan has no deferred DV preparation");
+  if (_attempt) throw std::logic_error("DV preparation attempt already started");
+  if (!attempt || &attempt->plan() != _deferred.get())
+    throw std::logic_error("DV attempt does not belong to this scan's preparation");
+  _attempt = std::move(attempt);
+}
 scan_manager::unit_key iceberg_gpu_ingestible::next_preparation_unit() const
 {
-  return {_deferred->contract, _next_preparation + 1};
+  return {_deferred->contract(), _next_preparation + 1};
 }
 bool iceberg_gpu_ingestible::can_claim_preparation()
 {
-  if (!_deferred || _next_preparation >= _deferred->files.size()) return true;
-  if (!_deferred->files[_next_preparation].dv) return true;
-  if (!_deferred->ledger) throw std::logic_error("DV preparation has no attempt ledger");
+  if (!_deferred || _next_preparation >= _deferred->files().size()) return true;
+  auto const* dv = _deferred->files()[_next_preparation].dv;
+  if (!dv) return true;
+  if (!_attempt || !_attempt->ledger())
+    throw std::logic_error("DV preparation has no attempt ledger");
+  auto& ledger = *_attempt->ledger();
+  scan_manager::unit_key key{_deferred->contract(), _next_preparation + 1};
   if (!_next_registered) {
-    _deferred->ledger->register_unit(
-      {_deferred->contract, _next_preparation + 1},
-      _deferred->files[_next_preparation].dv->record_count * sizeof(int64_t));
+    ledger.register_unit(key, dv->record_count * sizeof(int64_t));
     _next_registered = true;
   }
-  if (!_next_permit)
-    _next_permit = _deferred->ledger->acquire_permit({_deferred->contract, _next_preparation + 1});
+  if (!_next_permit) _next_permit = ledger.acquire_permit(key);
   return bool(_next_permit);
 }
 void iceberg_gpu_ingestible::stop_preparation() noexcept
 {
   _next_permit.release();
-  if (_next_registered && _deferred && _deferred->ledger)
-    _deferred->ledger->retire_unit({_deferred->contract, _next_preparation + 1});
+  if (_next_registered && _attempt && _attempt->ledger())
+    _attempt->ledger()->retire_unit({_deferred->contract(), _next_preparation + 1});
   _next_registered = false;
-  if (_deferred) _deferred->ledger.reset();
+  if (_attempt) _attempt->stop();
 }
 void iceberg_gpu_ingestible::finish_preparation() noexcept
 {
   stop_preparation();
-  if (_deferred) _deferred->finish();
+  if (_attempt) {
+    _attempt->finish();
+    _attempt.reset();
+  } else if (_deferred) {
+    _deferred->release();
+  }
 }
 
 void iceberg_gpu_ingestible::build_delete_key_map(
@@ -398,9 +418,10 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
     auto const& set   = split.dependencies()[i].delete_set;
     std::shared_ptr<iceberg_delete_set const> expected;
     if (_deferred) {
-      if (slice.file_index < _deferred->files.size()) {
-        auto const& f = _deferred->files[slice.file_index];
-        if (f.path == slice.file_path) expected = f.result.lock();
+      auto files = _deferred->files();
+      if (slice.file_index < files.size()) {
+        auto const& f = files[slice.file_index];
+        if (f.path == slice.file_path && _attempt) expected = _attempt->result(slice.file_index);
       }
     } else {
       auto entry = _delete_sets->find(slice.file_path);

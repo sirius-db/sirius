@@ -53,10 +53,11 @@ std::unique_ptr<sirius_physical_grouped_aggregate> make_mixed_stddev_aggregate(b
   defs.aggregates.insert(defs.aggregates.begin() + 1, std::move(distinct.aggregates[0]));
   defs.output_types.insert(defs.output_types.begin() + 2, distinct.output_types[1]);
   duckdb::vector<duckdb::GroupingSet> sets;
-  duckdb::vector<duckdb::unsafe_vector<std::size_t>> functions;
+  duckdb::vector<duckdb::unsafe_vector<duckdb::ProjectionIndex>> functions;
   if (grouping_sets) {
-    sets = {{0}, {0}, {}};  // Duplicate leaf sets must remain separate through merge.
-    functions.push_back({0});
+    // Duplicate leaf sets must remain separate through merge.
+    sets = {{duckdb::ProjectionIndex(0)}, {duckdb::ProjectionIndex(0)}, {}};
+    functions.push_back({duckdb::ProjectionIndex(0)});
     defs.output_types.insert(defs.output_types.begin() + 1,
                              sirius::logical_type::make(sirius::type_id::INTEGER));
     defs.output_types.insert(defs.output_types.begin() + 2,

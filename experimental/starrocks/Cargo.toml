@@ -22,7 +22,7 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 # Keep the generated protobuf stack on ProtoX and Prost 0.14.
 prost = "0.14"
 prost-build = "0.14"
-protox = "0.9"
+protox = "0.10"
 parquet = { version = "60", default-features = false, features = ["arrow", "async"] }
 heck = "0.5"
 prettyplease = "0.3.0"

@@ -171,15 +171,15 @@ std::string dump_pipeline_shapes(const std::vector<std::shared_ptr<sirius_pipeli
 }
 
 //! Collect rows, sorting them unless emission order is significant.
-std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
-                                                   bool ordered)
+std::vector<std::vector<std::string>> collect_rows(duckdb::QueryResult& result, bool ordered)
 {
   std::vector<std::vector<std::string>> rows;
-  for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
+  auto result_rows = result.Collection().GetRows();
+  for (duckdb::idx_t r = 0; r < result_rows.size(); r++) {
     std::vector<std::string> row;
     row.reserve(result.ColumnCount());
     for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-      row.push_back(result.GetValue(c, r).ToString());
+      row.push_back(result_rows.GetValue(c, r).ToString());
     }
     rows.push_back(std::move(row));
   }
@@ -217,8 +217,8 @@ void require_fusion_results_match(duckdb::Connection& con,
   REQUIRE(fused->ColumnCount() == unfused->ColumnCount());
   REQUIRE(fused->RowCount() == unfused->RowCount());
 
-  auto& fused_mat   = fused->Cast<duckdb::MaterializedQueryResult>();
-  auto& unfused_mat = unfused->Cast<duckdb::MaterializedQueryResult>();
+  auto& fused_mat   = *fused;
+  auto& unfused_mat = *unfused;
   auto fused_rows   = collect_rows(fused_mat, ordered);
   auto unfused_rows = collect_rows(unfused_mat, ordered);
 

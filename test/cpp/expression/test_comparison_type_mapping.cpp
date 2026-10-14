@@ -62,11 +62,7 @@ duckdb::JoinCondition make_cond(duckdb::unique_ptr<duckdb::Expression> left,
                                 duckdb::unique_ptr<duckdb::Expression> right,
                                 duckdb::ExpressionType comparison)
 {
-  duckdb::JoinCondition c;
-  c.left       = std::move(left);
-  c.right      = std::move(right);
-  c.comparison = comparison;
-  return c;
+  return duckdb::JoinCondition(std::move(left), std::move(right), comparison);
 }
 
 // Assert the AST node is an INTEGER constant equal to `expected`.

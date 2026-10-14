@@ -396,7 +396,7 @@ bool preparation_coordinator::state::publish_batch(lock_type& lock)
       std::lock_guard commit(gate->mutex);
       gate->check_interrupted();
       if (!gate->closed && !completion->has_error()) {
-        if (source.hooks.prepare_publish) source.hooks.prepare_publish(publication);
+        if (publication.prepare) publication.prepare();
         source.hooks.publish(publication);
         stats.publisher  = std::this_thread::get_id();
         ticket.published = true;

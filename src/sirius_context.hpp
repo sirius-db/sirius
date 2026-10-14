@@ -80,7 +80,7 @@ class sirius_engine;
 namespace duckdb {
 
 class Connection;
-class MaterializedQueryResult;
+class QueryResult;
 
 /// \brief Per-connection Sirius state, registered on every ClientContext under
 /// its own key ("sirius_connection_state").
@@ -417,9 +417,9 @@ class SiriusContext : public ClientContextState {
   /// \brief Called on each execute of a reusable prepared statement. Requests a
   /// rebind for Sirius-backed plans so GPU eligibility is re-decided with current
   /// stats.
-  RebindQueryInfo OnExecutePrepared(ClientContext& context,
-                                    PreparedStatementCallbackInfo& info,
-                                    RebindQueryInfo current_rebind) final;
+  RebindQueryInfo OnRebindPreparedStatement(ClientContext& context,
+                                            BindPreparedStatementCallbackInfo& info,
+                                            RebindQueryInfo current_rebind) final;
 
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::parsed_sirius_config& config);
@@ -466,8 +466,8 @@ class SiriusContext : public ClientContextState {
     internal_connection(const internal_connection&)            = delete;
     internal_connection& operator=(const internal_connection&) = delete;
 
-    unique_ptr<MaterializedQueryResult> Query(const string& sql);
-    unique_ptr<QueryResult> SendQuery(const string& sql);
+    unique_ptr<QueryResult> Query(const string& sql);
+    unique_ptr<QueryResult> Submit(const string& sql);
 
    private:
     struct implementation;

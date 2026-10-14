@@ -27,7 +27,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
-#include <duckdb/main/materialized_query_result.hpp>
+#include <duckdb/main/query_result.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
@@ -172,7 +172,7 @@ TEST_CASE_METHOD(fragment_fixture,
 {
   auto expected = con->Query(std::string("SELECT count(*) FROM (") + kLeafQuery + ") t");
   REQUIRE_FALSE(expected->HasError());
-  auto const expected_rows = expected->GetValue(0, 0).GetValue<std::int64_t>();
+  auto const expected_rows = expected->Collection().GetValue(0, 0).GetValue<std::int64_t>();
 
   con->BeginTransaction();
   try {
@@ -297,10 +297,7 @@ TEST_CASE_METHOD(fragment_fixture,
         auto result = engine.get_result();
         REQUIRE(result != nullptr);
         REQUIRE_FALSE(result->HasError());
-        auto materialized =
-          duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
-            std::move(result));
-        rows = materialized->RowCount();
+        rows = result->RowCount();
       },
       window.query_id());
     window.finish();
@@ -340,7 +337,7 @@ TEST_CASE_METHOD(fragment_fixture,
   auto expected = con->Query("SELECT count(*) FROM (" + leaf + ") t");
   REQUIRE_FALSE(expected->HasError());
   auto const expected_rows =
-    static_cast<std::size_t>(expected->GetValue(0, 0).GetValue<std::int64_t>());
+    static_cast<std::size_t>(expected->Collection().GetValue(0, 0).GetValue<std::int64_t>());
   REQUIRE(expected_rows > 0);
 
   con->BeginTransaction();
@@ -501,16 +498,13 @@ TEST_CASE_METHOD(fragment_fixture,
     auto result = fragment.take_result();
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
-    auto materialized =
-      duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
-        std::move(result));
-    REQUIRE(materialized->RowCount() == kLeafRows);
-    REQUIRE(materialized->names == duckdb::vector<std::string>{"col_0"});
-    REQUIRE(materialized->types ==
+    REQUIRE(result->RowCount() == kLeafRows);
+    REQUIRE(result->GetNames() == duckdb::vector<duckdb::Identifier>{duckdb::Identifier("col_0")});
+    REQUIRE(result->GetTypes() ==
             duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
     std::vector<std::int32_t> values;
-    for (duckdb::idx_t row = 0; row < materialized->RowCount(); ++row) {
-      values.push_back(materialized->GetValue(0, row).GetValue<std::int32_t>());
+    for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+      values.push_back(result->Collection().GetValue(0, row).GetValue<std::int32_t>());
     }
     std::sort(values.begin(), values.end());
     REQUIRE(values == std::vector<std::int32_t>{1, 2, 3, 4, 5});
@@ -755,20 +749,20 @@ TEST_CASE_METHOD(fragment_fixture,
           auto bound     = leaf(context);
           bound.prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
             duckdb::StatementType::SELECT_STATEMENT);
-          bound.prepared->names = {"a"};
+          bound.prepared->names = {duckdb::Identifier("a")};
           bound.prepared->types = {duckdb::LogicalType::HUGEINT};
           return bound;
         };
       streaming_fragment fragment(*con->context, std::move(spec));
       fragment.build();
       fragment.run();
-      auto result = duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
-        fragment.take_result());
-      REQUIRE(result->types == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::HUGEINT});
+      auto result = fragment.take_result();
+      REQUIRE(result->GetTypes() ==
+              duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::HUGEINT});
       REQUIRE(result->RowCount() == 2);
       // A sign-dropping widen would turn -7 into a value no int64 holds.
-      REQUIRE(result->GetValue(0, 0).GetValue<std::int64_t>() +
-                result->GetValue(0, 1).GetValue<std::int64_t>() ==
+      REQUIRE(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() +
+                result->Collection().GetValue(0, 1).GetValue<std::int64_t>() ==
               -5);
     }
 
@@ -1005,7 +999,7 @@ TEST_CASE_METHOD(fragment_fixture,
   auto expected = con->Query("SELECT count(*) FROM (" + scan + ") t");
   REQUIRE_FALSE(expected->HasError());
   auto const expected_rows =
-    static_cast<std::size_t>(expected->GetValue(0, 0).GetValue<std::int64_t>());
+    static_cast<std::size_t>(expected->Collection().GetValue(0, 0).GetValue<std::int64_t>());
   REQUIRE(expected_rows > 0);
 
   con->BeginTransaction();

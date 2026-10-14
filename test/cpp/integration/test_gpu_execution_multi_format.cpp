@@ -49,9 +49,11 @@
 #include <op/scan/table_scan/bound_read_view.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <op/sirius_physical_union.hpp>
+#include <pipeline/sirius_pipeline.hpp>
 #include <planner/connector_registry.hpp>
 #include <planner/sirius_physical_plan_generator.hpp>
 #include <signal.h>
+#include <sirius_engine.hpp>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <transparent/read_view_registry.hpp>
@@ -219,7 +221,7 @@ class MultiFormatFixtureBase {
       auto cfg_path = sirius::test::integration_config_path();
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
-      db           = std::make_unique<duckdb::DuckDB>(nullptr);
+      db           = sirius::test::open_sirius_db(nullptr, cfg_path);
       con          = std::make_unique<duckdb::Connection>(*db);
     }
   }
@@ -229,15 +231,16 @@ class MultiFormatFixtureBase {
     return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE;
   }
 
-  /// Collect all rows from a MaterializedQueryResult as sorted vectors of stringified values.
-  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+  /// Collect all rows from a retained QueryResult as sorted vectors of stringified values.
+  static std::vector<std::vector<std::string>> collect_rows(duckdb::QueryResult& result)
   {
     std::vector<std::vector<std::string>> rows;
-    for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
+    auto result_rows = result.Collection().GetRows();
+    for (duckdb::idx_t r = 0; r < result_rows.size(); r++) {
       std::vector<std::string> row;
       row.reserve(result.ColumnCount());
       for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-        row.push_back(result.GetValue(c, r).ToString());
+        row.push_back(result_rows.GetValue(c, r).ToString());
       }
       rows.push_back(std::move(row));
     }
@@ -295,21 +298,21 @@ class MultiFormatFixtureBase {
 
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-    REQUIRE(gpu_result->names == cpu_result->names);
-    REQUIRE(gpu_result->types.size() == cpu_result->types.size());
-    for (duckdb::idx_t c = 0; c < gpu_result->types.size(); ++c) {
-      CHECK(gpu_result->types[c] == cpu_result->types[c]);
+    REQUIRE(gpu_result->GetNames() == cpu_result->GetNames());
+    REQUIRE(gpu_result->GetTypes().size() == cpu_result->GetTypes().size());
+    for (duckdb::idx_t c = 0; c < gpu_result->GetTypes().size(); ++c) {
+      CHECK(gpu_result->GetTypes()[c] == cpu_result->GetTypes()[c]);
     }
 
     // Build a per-column flag for which columns are floating-point.
     std::vector<bool> col_is_float(gpu_result->ColumnCount());
     for (duckdb::idx_t c = 0; c < gpu_result->ColumnCount(); c++) {
-      col_is_float[c] = is_floating_point(gpu_result->types[c].id());
+      col_is_float[c] = is_floating_point(gpu_result->GetTypes()[c].id());
     }
 
     // Collect and sort rows from already-materialized results for deterministic comparison.
-    auto& gpu_mat = gpu_result->Cast<duckdb::MaterializedQueryResult>();
-    auto& cpu_mat = cpu_result->Cast<duckdb::MaterializedQueryResult>();
+    auto& gpu_mat = *gpu_result;
+    auto& cpu_mat = *cpu_result;
     auto gpu_rows = collect_rows(gpu_mat);
     auto cpu_rows = collect_rows(cpu_mat);
 
@@ -764,10 +767,10 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   //
   // What the pin is really protecting is the CPU oracle for EQUALITY deletes: the 1.4.4-era
   // build ignored them silently, so an oracle on that build would agree with a GPU path that
-  // dropped them too. 890b78a9c (the build INSTALL resolves for DuckDB v1.5.6) was checked
+  // dropped them too. 5b9ff899a1 (the build INSTALL resolves for DuckDB v1.5.6) was checked
   // against test/cpp/integration/data/iceberg_v2_equality_delete and returns the 3 surviving
   // rows, not all 5. Re-run that check when bumping this.
-  static constexpr const char* kVerifiedIcebergVersion = "890b78a9c";
+  static constexpr const char* kVerifiedIcebergVersion = "5b9ff899a1";
 
   // Which delete kinds the GPU scan path applies itself. Positional deletes and V3 deletion
   // vectors are applied by iceberg_gpu_ingestible (they share one per-file position map), so
@@ -837,7 +840,7 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     REQUIRE(version);
     REQUIRE_FALSE(version->HasError());
     REQUIRE(version->RowCount() == 1);
-    auto const installed = version->GetValue(0, 0).ToString();
+    auto const installed = version->Collection().GetValue(0, 0).ToString();
     if (installed != kVerifiedIcebergVersion) {
       WARN("iceberg extension version " << installed << " differs from the verified "
                                         << kVerifiedIcebergVersion
@@ -868,12 +871,12 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   int64_t delete_file_count(const std::string& table_path, const std::string& extra_args = "")
   {
     auto result = con->Query("SELECT count(*) FROM iceberg_metadata('" + table_path + "'" +
-                             extra_args + ") WHERE content <> 'EXISTING';");
+                             extra_args + ") WHERE content <> 'DATA';");
     REQUIRE(result);
     if (result->HasError()) { UNSCOPED_INFO("iceberg_metadata error: " << result->GetError()); }
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 1);
-    return result->GetValue(0, 0).GetValue<int64_t>();
+    return result->Collection().GetValue(0, 0).GetValue<int64_t>();
   }
 
   /**
@@ -984,8 +987,8 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     sirius::test::require_transparent_execution_delta(
       before_cpu, sirius::test::get_transparent_execution_stats(*con), 0, 0, 0);
 
-    auto gpu_rows = collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>());
-    auto cpu_rows = collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
+    auto gpu_rows = collect_rows(*gpu_result);
+    auto cpu_rows = collect_rows(*cpu_result);
     std::sort(expected.begin(), expected.end());
 
     REQUIRE(gpu_rows == cpu_rows);
@@ -1072,15 +1075,17 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
       auto flag = con->Query("SELECT current_setting('unsafe_enable_version_guessing');");
       auto ver  = con->Query(
         "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'iceberg';");
-      FAIL("this session cannot read conformance table '"
-           << table_path << "': " << r->GetError() << "\nunsafe_enable_version_guessing is "
-           << (flag && !flag->HasError() ? flag->GetValue(0, 0).ToString() : "unreadable")
-           << ", iceberg extension_version is "
-           << (ver && !ver->HasError() && ver->RowCount() == 1 ? ver->GetValue(0, 0).ToString()
-                                                               : "unreadable")
-           << " (verified: " << kVerifiedIcebergVersion
-           << "). Both are reported together because neither predicts the other: the shipped "
-              "binary's version string does not identify the tree it was built from.");
+      FAIL(
+        "this session cannot read conformance table '"
+        << table_path << "': " << r->GetError() << "\nunsafe_enable_version_guessing is "
+        << (flag && !flag->HasError() ? flag->Collection().GetValue(0, 0).ToString() : "unreadable")
+        << ", iceberg extension_version is "
+        << (ver && !ver->HasError() && ver->RowCount() == 1
+              ? ver->Collection().GetValue(0, 0).ToString()
+              : "unreadable")
+        << " (verified: " << kVerifiedIcebergVersion
+        << "). Both are reported together because neither predicts the other: the shipped "
+           "binary's version string does not identify the tree it was built from.");
     }
   }
 
@@ -1905,7 +1910,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                                                  {"date", "4", "brown"},
                                                  {"elderberry", "5", "purple"}};
   std::sort(expected.begin(), expected.end());
-  REQUIRE(collect_rows(result->Cast<duckdb::MaterializedQueryResult>()) == expected);
+  REQUIRE(collect_rows(*result) == expected);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -1959,7 +1964,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     {
       con.Query(std::string("SET GLOBAL gpu_execution=") + (previous ? "true" : "false"));
     }
-  } reset{*con, previous->GetValue(0, 0).GetValue<bool>()};
+  } reset{*con, previous->Collection().GetValue(0, 0).GetValue<bool>()};
   REQUIRE_FALSE(con->Query("SET GLOBAL gpu_execution=true")->HasError());
   auto const before = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::scoped_recording_log_sink logs;
@@ -1967,7 +1972,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     sirius::op::scan::iceberg_metadata_connection internal(*con->context);
     auto enabled = internal.Query("SELECT current_setting('gpu_execution')");
     REQUIRE_FALSE(enabled->HasError());
-    REQUIRE(enabled->GetValue(0, 0).GetValue<bool>());
+    REQUIRE(enabled->Collection().GetValue(0, 0).GetValue<bool>());
   }
   sirius::io::kvikio_context ioctx;
   auto const reads_before = sirius::op::scan::iceberg_delete_data_uncached_read_count();
@@ -2066,7 +2071,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     sirius::test::require_transparent_execution_delta(before, after, 0, fallback ? 1 : 0, 0);
     if (fallback) {
       REQUIRE_FALSE(result->HasError());
-      auto rows = collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
+      auto rows = collect_rows(*result);
       std::vector<std::vector<std::string>> first{
         {"apple", "1"}, {"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}};
       std::sort(first.begin(), first.end());
@@ -2078,7 +2083,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE_FALSE(con->Query("SET SESSION gpu_execution=false")->HasError());
     auto binds = con->Query("SELECT currval('read_view_selector')");
     REQUIRE_FALSE(binds->HasError());
-    CHECK(binds->GetValue(0, 0).GetValue<int64_t>() == 2);
+    CHECK(binds->Collection().GetValue(0, 0).GetValue<int64_t>() == 2);
     REQUIRE_FALSE(con->Query("SET SESSION gpu_execution=true")->HasError());
   }
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback = true")->HasError());
@@ -2422,7 +2427,7 @@ TEST_CASE("gpu_execution hive partition watchdog child runner",
       } else {
         out.row_count      = result->RowCount();
         out.column_count   = result->ColumnCount();
-        auto& materialized = result->Cast<duckdb::MaterializedQueryResult>();
+        auto& materialized = *result;
         out.rows           = MultiFormatFixtureBase::collect_rows(materialized);
       }
     }
@@ -2853,7 +2858,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 {
   for (auto const& [option, expected_error] : std::vector<std::pair<std::string, std::string>>{
          {"filename=true", "Option filename adds column \"filename\""},
-         {"file_row_number=true", "Using file_row_number option on file with column named"}}) {
+         {"file_row_number=true", "Option file_row_number adds column"}}) {
     auto const query = "SELECT * FROM read_parquet(" +
                        scratch.file_literal("physical_names.parquet") +
                        ", hive_partitioning=false, " + option + ");";
@@ -2970,11 +2975,11 @@ TEST_CASE_METHOD(MultiFormatFixtureBase,
         sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
       }
       REQUIRE(result->RowCount() == 1);
-      CHECK(result->GetValue(0, 0).ToString() == second_path);
-      CHECK(result->GetValue(1, 0).GetValue<uint64_t>() == (gpu || !pushdown ? 1 : 0));
-      CHECK(result->GetValue(2, 0).GetValue<int64_t>() == 10000);
-      CHECK(result->GetValue(3, 0).GetValue<int32_t>() == 0);
-      CHECK(result->GetValue(4, 0).GetValue<int32_t>() == 9999);
+      CHECK(result->Collection().GetValue(0, 0).ToString() == second_path);
+      CHECK(result->Collection().GetValue(1, 0).GetValue<uint64_t>() == (gpu || !pushdown ? 1 : 0));
+      CHECK(result->Collection().GetValue(2, 0).GetValue<int64_t>() == 10000);
+      CHECK(result->Collection().GetValue(3, 0).GetValue<int32_t>() == 0);
+      CHECK(result->Collection().GetValue(4, 0).GetValue<int32_t>() == 9999);
     }
   }
 }
@@ -3000,7 +3005,7 @@ class ParquetVirtualMultiRowGroupFixture : public MultiFormatFixtureBase {
     REQUIRE_FALSE(layout->HasError());
     REQUIRE(layout->RowCount() == 3);
     for (duckdb::idx_t i = 0; i < layout->RowCount(); ++i) {
-      REQUIRE(layout->GetValue(1, i).GetValue<std::int64_t>() == 2048);
+      REQUIRE(layout->Collection().GetValue(1, i).GetValue<std::int64_t>() == 2048);
     }
   }
 
@@ -3250,10 +3255,13 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       get.named_parameters["allow_moved_paths"] = duckdb::Value::BOOLEAN(true);
       expected                                  = reason::iceberg_moved_paths;
       break;
-    case 6:
-      get.named_parameters.erase("snapshot_from_id");
+    case 6: {
+      auto entry = get.named_parameters.find("snapshot_from_id");
+      REQUIRE(entry != get.named_parameters.end());
+      get.named_parameters.erase(entry);
       expected = reason::iceberg_no_snapshot_id;
       break;
+    }
     case 7: {
       auto& bind    = get.bind_data->Cast<duckdb::MultiFileBindData>();
       auto& columns = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
@@ -3687,9 +3695,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       ++found;
       CHECK(bool(info.deferred) == (limit == 8));
       if (info.deferred) {
-        if (!admission) admission = info.deferred->admission;
-        CHECK(info.deferred->admission == admission);
-        CHECK(info.deferred->files.front().result.expired());
+        if (!admission) admission = info.deferred->admission();
+        CHECK(info.deferred->admission() == admission);
+        CHECK(info.deferred->files().front().result.expired());
       } else {
         REQUIRE(info.delete_data);
         CHECK_FALSE(info.delete_data->positional_deletes.empty());
@@ -3708,6 +3716,76 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(provider->outstanding() == 0);
   CHECK(provider->seen->allocated_bytes == 0);
   REQUIRE_FALSE(con->Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE_METHOD(
+  GPUExecutionIcebergFixture,
+  "A later DV attempt installation failure releases the consumed statement admission",
+  "[integration][scan_preparation][iceberg]")
+{
+  using namespace sirius::op::scan;
+  using namespace sirius::scan_manager;
+  auto first  = inventory_fixture("dv_bounded");
+  auto second = inventory_fixture("dv_three");
+  sirius::test::scoped_setting disable_gpu(*con, "gpu_execution", false);
+  auto state = sirius::test::get_registered_sirius_context(*con);
+  preparation_test_state observed(state->physical_counters(), true);
+  sirius::scan_manager::test::test_reservation_provider installed_provider;
+  installed_provider.grant_bytes = 64 * 1024;
+  auto const sql                 = "SELECT fruit,count FROM " + pinned_scan(first) +
+                   " UNION ALL SELECT fruit,count FROM " + pinned_scan(second);
+  {
+    duckdb::SiriusContext::StandaloneQueryScope window(
+      *state, *con->context, "dv_partial_installation");
+    sirius::test::with_initialized_engine(
+      *con,
+      sql,
+      [&](sirius::sirius_engine& engine) {
+        std::vector<iceberg_gpu_ingestible*> scans;
+        for (auto const& pipeline : engine.new_scheduled) {
+          auto* scan = dynamic_cast<sirius_gpu_scan_operator*>(pipeline->get_source().get());
+          if (!scan) continue;
+          if (auto* iceberg = dynamic_cast<iceberg_gpu_ingestible*>(&scan->get_ingestible()))
+            scans.push_back(iceberg);
+        }
+        REQUIRE(scans.size() == 2);
+        REQUIRE(scans.front() != scans.back());
+        auto first_plan =
+          dynamic_cast<iceberg_ingestible_table_info const&>(scans.front()->table_info()).deferred;
+        auto second_plan =
+          dynamic_cast<iceberg_ingestible_table_info const&>(scans.back()->table_info()).deferred;
+        REQUIRE(first_plan);
+        REQUIRE(second_plan);
+        REQUIRE_FALSE(first_plan->files().empty());
+        REQUIRE_FALSE(second_plan->files().empty());
+        REQUIRE(first_plan->admission() == second_plan->admission());
+        auto admission = first_plan->admission();
+        REQUIRE(admission);
+        REQUIRE(observed.provider->seen->requests == 1);
+        REQUIRE(observed.provider->outstanding() == 1);
+        auto installed_ledger = std::make_shared<preparation_ledger>(installed_provider);
+        auto envelope         = scan_envelope{{{8, 8, 16, 20}}, 0, 0, true};
+        REQUIRE(installed_ledger
+                  ->admit(std::array{envelope}, memory_space_id(cucascade::memory::Tier::HOST, 0))
+                  .deferred);
+        auto installed = std::make_shared<iceberg_dv_attempt>(second_plan, installed_ledger);
+        REQUIRE_NOTHROW(scans.back()->begin_preparation(installed));
+        CHECK_THROWS_WITH(engine.execute(), "DV preparation attempt already started");
+        CHECK_THROWS_AS(admission->consume(), std::logic_error);
+        CHECK_FALSE(installed->ledger());
+        CHECK(observed.reads_started.empty());
+        CHECK(first_plan->files().empty());
+        CHECK(second_plan->files().empty());
+        CHECK(observed.provider->seen->allocated_bytes == 0);
+        CHECK(observed.provider->outstanding() == 0);
+      },
+      window.query_id());
+    window.finish();
+  }
+  CHECK(state->get_scan_manager().num_active_queries() == 0);
+  CHECK(observed.provider->seen->allocated_bytes == 0);
+  CHECK(observed.provider->outstanding() == 0);
+  CHECK(installed_provider.outstanding() == 0);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -3751,7 +3829,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "GPU prepared statements own and renew deferred reservations",
                  "[integration][scan_preparation][iceberg][prepared_statement]")
 {
-  // PendingQuery schedules tasks immediately; keep its plan idle until Execute().
+  // Submit schedules tasks immediately; keep its plan idle until Complete().
   // Restore through a separate connection because one section releases con first.
   duckdb::Connection settings(duckdb::DatabaseInstance::GetDatabase(*con->context));
   sirius::test::scoped_setting single_duckdb_thread(settings, "threads", 1);
@@ -3777,7 +3855,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   // Iceberg bind data is not copyable; bind through the real pending execution
   // entry so finalize can re-plan the SQL inside the statement's query context.
   duckdb::vector<duckdb::Value> parameters;
-  auto pending = prepared->PendingQuery(parameters, false);
+  auto pending = prepared->Submit(parameters);
   REQUIRE(pending);
   INFO((pending->HasError() ? pending->GetError() : ""));
   REQUIRE_FALSE(pending->HasError());
@@ -3791,20 +3869,20 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   {
     pending.reset();
     prepared.reset();
-    // DuckDB keeps an abandoned pending executor until the next statement or context cleanup.
+    // Closing the pending result must leave the connection ready for another statement.
     REQUIRE_FALSE(con->Query("SET gpu_execution=true")->HasError());
   }
   SECTION("rebind and execute repeatedly on GPU")
   {
     for (int i = 0; i < 2; ++i) {
-      auto result = i == 0 ? pending->Execute() : prepared->Execute(parameters, false);
+      auto result = i == 0 ? std::move(pending) : prepared->Execute(parameters);
       REQUIRE(result);
+      result->Complete();
       INFO((result->HasError() ? result->GetError() : ""));
       REQUIRE_FALSE(result->HasError());
       require_route(before, sirius::test::get_transparent_execution_stats(*con), gpu_route::gpu);
-      CHECK(collect_rows(result->Cast<duckdb::MaterializedQueryResult>()) ==
-            std::vector<std::vector<std::string>>{
-              {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+      CHECK(collect_rows(*result) == std::vector<std::vector<std::string>>{
+                                       {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
       CHECK(provider->seen->requests == i + 1);
       CHECK(dv_reads == i + 1);
       CHECK(provider->outstanding() == 0);
@@ -3989,9 +4067,12 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       CHECK(result->GetError().find(diagnostic) != std::string::npos);
     } else {
       REQUIRE(result->HasError() == bool(cpu_error));
-      if (cpu_error)
-        CHECK(result->GetError().find(*cpu_error) != std::string::npos);
-      else
+      if (cpu_error) {
+        CAPTURE(missing, fallback, deferred, result->GetError(), *cpu_error);
+        // Deferred fallback can report Interrupted before the CPU reader error (#2145).
+        CHECK((result->GetError().find(*cpu_error) != std::string::npos ||
+               (deferred && result->GetErrorType() == duckdb::ExceptionType::INTERRUPT)));
+      } else
         CHECK(observed.fetch(*result) == cpu_rows);
       bool retained = false;
       for (auto const& log : logs.records())
@@ -4032,7 +4113,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     preparation_test_state observed(counters, deferred);
     sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
     auto before = sirius::test::get_transparent_execution_stats(*con);
-    auto result = con->SendQuery(sql);
+    auto result = con->Submit(sql);
     REQUIRE(result);
     INFO((result->HasError() ? result->GetError() : ""));
     REQUIRE_FALSE(result->HasError());

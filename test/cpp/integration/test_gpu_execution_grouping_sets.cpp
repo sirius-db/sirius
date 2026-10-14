@@ -183,11 +183,12 @@ TEST_CASE_METHOD(GroupingSetsFixture,
   auto const after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
   REQUIRE(result->RowCount() == 1);
-  REQUIRE_FALSE(result->GetValue(0, 0).IsNull());
-  REQUIRE(result->GetValue(0, 0).GetValue<double>() == Approx(std::sqrt(4.0 / 3.0)).epsilon(1e-12));
-  REQUIRE(result->GetValue(1, 0).GetValue<int64_t>() == 2);
-  REQUIRE(result->GetValue(2, 0).GetValue<double>() == 1000000000002.0);
-  REQUIRE(result->GetValue(3, 0).GetValue<int64_t>() == 4);
+  REQUIRE_FALSE(result->Collection().GetValue(0, 0).IsNull());
+  REQUIRE(result->Collection().GetValue(0, 0).GetValue<double>() ==
+          Approx(std::sqrt(4.0 / 3.0)).epsilon(1e-12));
+  REQUIRE(result->Collection().GetValue(1, 0).GetValue<int64_t>() == 2);
+  REQUIRE(result->Collection().GetValue(2, 0).GetValue<double>() == 1000000000002.0);
+  REQUIRE(result->Collection().GetValue(3, 0).GetValue<int64_t>() == 4);
 
   // Compare the remaining leaf groups and grand total against DuckDB, including the
   // distinction between a genuine NULL key and the rolled-up NULL key.
@@ -222,11 +223,11 @@ TEST_CASE_METHOD(GroupingSetsFixture,
 }
 
 TEST_CASE_METHOD(GroupingSetsFixture,
-                 "grouping sets - grouping sets without keys fall back",
+                 "grouping sets - empty grouping sets preserve duplicate grand totals",
                  "[integration][gpu_execution][grouping_sets]")
 {
   create_grouping_table(*this);
-  expect_plan_fallback_matches_cpu("SELECT count(*) n FROM gs_t GROUP BY GROUPING SETS ((), ());");
+  compare_gpu_vs_cpu("SELECT count(*) n FROM gs_t GROUP BY GROUPING SETS ((), ());");
 }
 
 TEST_CASE_METHOD(GroupingSetsFixture,

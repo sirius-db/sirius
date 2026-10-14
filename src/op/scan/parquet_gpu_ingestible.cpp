@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/scan/parquet_gpu_ingestible.hpp"
+
 // sirius
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
@@ -32,7 +34,6 @@
 #include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_batch_layout.hpp>
-#include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_materialize.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/scan_utils.hpp>
@@ -76,6 +77,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/expression_iterator.hpp>
 #include <duckdb/planner/filter/conjunction_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/filter/null_filter.hpp>
 
 // uring_reactor MUST be included last among sirius headers: liburing.h,
@@ -192,7 +194,7 @@ bool has_unreliable_bloom_filter_probe(duckdb::LogicalType const& type)
 bool references_unreliable_bloom_filter_column(duckdb::Expression const& expr)
 {
   if (expr.GetExpressionType() == duckdb::ExpressionType::BOUND_REF) {
-    return has_unreliable_bloom_filter_probe(expr.return_type);
+    return has_unreliable_bloom_filter_probe(expr.GetReturnType());
   }
   bool found = false;
   duckdb::ExpressionIterator::EnumerateChildren(expr, [&found](duckdb::Expression const& child) {
@@ -238,7 +240,7 @@ duckdb::unique_ptr<duckdb::Expression> conjuncts_without(duckdb::Expression cons
 
   auto const& conjunction = expr.Cast<duckdb::BoundConjunctionExpression>();
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> kept;
-  for (auto const& child : conjunction.children) {
+  for (auto const& child : conjunction.GetChildren()) {
     if (!is_dropped(*child)) { kept.push_back(child->Copy()); }
   }
   if (kept.empty()) { return nullptr; }
@@ -247,7 +249,7 @@ duckdb::unique_ptr<duckdb::Expression> conjuncts_without(duckdb::Expression cons
   auto out =
     duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
   for (auto& child : kept) {
-    out->children.push_back(std::move(child));
+    out->GetChildrenMutable().push_back(std::move(child));
   }
   return out;
 }
@@ -270,34 +272,40 @@ std::vector<null_prune_predicate> collect_null_prune_predicates(
 {
   std::vector<null_prune_predicate> out;
 
-  auto classify = [](duckdb::TableFilterType type) -> std::optional<bool> {
-    if (type == duckdb::TableFilterType::IS_NULL) { return true; }
-    if (type == duckdb::TableFilterType::IS_NOT_NULL) { return false; }
-    return std::nullopt;
-  };
-
-  for (auto const& [column_index, filter] : filters.filters) {
+  for (auto const& entry : filters) {
+    auto const column_index = entry.GetIndex().GetIndex();
     if (column_index >= column_ids.size() || column_ids[column_index].IsVirtualColumn()) {
       continue;
     }
-    // A partition column has no statistics in the file to prune on, and a
-    // column that is not in the batch cannot be pruned by — both are simply
-    // skipped here, unlike a conjunct that has to be evaluated.
     auto const column = sirius::op::resolve_filtered_column(
       column_index, column_ids, batch_position_by_column_id, skip_primary_indices);
     if (column.status != sirius::op::filter_column_status::usable) { continue; }
-    auto const index = static_cast<duckdb::idx_t>(column.batch_position);
-
-    if (auto expects_null = classify(filter->filter_type)) {
-      out.push_back(null_prune_predicate{index, *expects_null});
-    } else if (filter->filter_type == duckdb::TableFilterType::CONJUNCTION_AND) {
-      for (auto const& child : filter->Cast<duckdb::ConjunctionAndFilter>().child_filters) {
-        if (auto nested = classify(child->filter_type)) {
-          out.push_back(null_prune_predicate{index, *nested});
+    auto const& filter =
+      duckdb::ExpressionFilter::GetExpressionFilter(entry.Filter(), "parquet null pruning");
+    std::function<void(duckdb::Expression const&)> collect = [&](duckdb::Expression const& expr) {
+      if (expr.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND &&
+          expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONJUNCTION) {
+        for (auto const& child : expr.Cast<duckdb::BoundConjunctionExpression>().GetChildren()) {
+          collect(*child);
         }
+        return;
       }
-    }
+      if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_OPERATOR ||
+          (expr.GetExpressionType() != duckdb::ExpressionType::OPERATOR_IS_NULL &&
+           expr.GetExpressionType() != duckdb::ExpressionType::OPERATOR_IS_NOT_NULL)) {
+        return;
+      }
+      auto const& args = expr.Cast<duckdb::BoundOperatorExpression>().GetChildren();
+      if (args.size() != 1 || args[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
+          args[0]->Cast<duckdb::BoundReferenceExpression>().Index() != 0) {
+        return;
+      }
+      out.push_back({static_cast<duckdb::idx_t>(column.batch_position),
+                     expr.GetExpressionType() == duckdb::ExpressionType::OPERATOR_IS_NULL});
+    };
+    collect(*filter.expr);
   }
+
   return out;
 }
 
@@ -727,7 +735,8 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // column_ids with empty projection_ids, the no-pushdown sirius_read_parquet
   // case), filter pushdown, or hive-partition injection — needs column names.
   bool const needs_names = !bind.projection_ids.empty() ||
-                           (bind.table_filters && !bind.table_filters->filters.empty()) ||
+                           (bind.table_filters && (bind.table_filters->HasFilters() ||
+                                                   bind.table_filters->HasMultiColumnFilters())) ||
                            !bind.partition_indices.empty() ||
                            column_ids_need_reader_projection(bind.column_ids, bind.names.size());
   if (needs_names && bind.names.empty()) {
@@ -750,11 +759,23 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // AST translation deferred to materialize_table so a task-local stream is used.
   // Filters on hive-partition columns are dropped — those columns aren't in the
   // parquet file (DuckDB prunes them at the file-list level already).
-  if (bind.table_filters && !bind.table_filters->filters.empty()) {
-    for (auto const& [column_index, filter] : bind.table_filters->filters) {
+  if (bind.table_filters &&
+      (bind.table_filters->HasFilters() || bind.table_filters->HasMultiColumnFilters())) {
+    for (auto const& entry : *bind.table_filters) {
+      auto const column_index = entry.GetIndex().GetIndex();
       if (column_index < bind.column_ids.size() &&
           _virtual_types.contains(bind.column_ids[column_index].GetPrimaryIndex())) {
         _has_virtual_filter = true;
+      }
+    }
+    for (auto const& filter : bind.table_filters->GetMultiColumnFilters()) {
+      auto const& expr_filter =
+        duckdb::ExpressionFilter::GetExpressionFilter(*filter, "parquet virtual filter");
+      for (auto index : expr_filter.column_indexes) {
+        if (index.GetIndex() < bind.column_ids.size() &&
+            _virtual_types.contains(bind.column_ids[index.GetIndex()].GetPrimaryIndex())) {
+          _has_virtual_filter = true;
+        }
       }
     }
     // Collected from the filters themselves, not the expression built below --
@@ -785,12 +806,16 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
       std::shared_ptr<duckdb::Expression> stats_candidate = _duckdb_filter_expression;
       if (_has_virtual_filter) {
         duckdb::TableFilterSet physical_filters;
-        for (auto const& [column_index, filter] : bind.table_filters->filters) {
+        for (auto const& entry : *bind.table_filters) {
+          auto const column_index = entry.GetIndex().GetIndex();
           if (column_index >= bind.column_ids.size() ||
               _virtual_types.contains(bind.column_ids[column_index].GetPrimaryIndex())) {
             continue;
           }
-          physical_filters.filters.emplace(column_index, filter->Copy());
+          physical_filters.PushFilter(entry.GetIndex(),
+                                      duckdb::ExpressionFilter::GetExpressionFilter(
+                                        entry.Filter(), "parquet physical pruning")
+                                        .Copy());
         }
         stats_candidate =
           sirius::op::convert_table_filters_to_expression(physical_filters,
@@ -1138,8 +1163,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // a mismatched predicate incorrectly prune the very group that must refuse.
   std::set<std::size_t> pruning_columns;
   std::function<void(duckdb::Expression const&)> collect = [&](auto const& expression) {
-    if (expression.expression_class == duckdb::ExpressionClass::BOUND_REF) {
-      pruning_columns.insert(expression.template Cast<duckdb::BoundReferenceExpression>().index);
+    if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      pruning_columns.insert(expression.template Cast<duckdb::BoundReferenceExpression>().Index());
     }
     duckdb::ExpressionIterator::EnumerateChildren(expression, collect);
   };

@@ -18,7 +18,7 @@ The explicit `CALL gpu_execution('...')` function is also still supported.
 
 DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
 
-1. **Optimizer mask (at extension load, not per query)**: `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION` and `LATE_MATERIALIZATION` are unioned into `disabled_optimizers` once when the extension loads, because those can produce DuckDB-internal plan shapes the transparent rebind path cannot yet execute. `STATISTICS_PROPAGATION` remains enabled; its folded `EXPRESSION_GET`/`COLUMN_DATA_SCAN` and `DUMMY_SCAN` sources are translated to `GPU_VALUES`.
+1. **Optimizer mask (at extension load, not per query)**: `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, `LATE_MATERIALIZATION`, and the [shared aggregate and scan exclusions](../../src/planner/unsupported_optimizers.hpp) are unioned into `disabled_optimizers` once when the extension loads, because those can produce DuckDB-internal plan shapes the transparent rebind path cannot yet execute. `STATISTICS_PROPAGATION` remains enabled; its folded `EXPRESSION_GET`/`COLUMN_DATA_SCAN` and `DUMMY_SCAN` sources are translated to `GPU_VALUES`.
 
 2. **Post-optimization** (`sirius_optimizer_hook`): Copies the optimized logical plan via `LogicalOperator::Copy()` and stores it on the connection's per-connection state, stamped with the connection's current planning generation.
 

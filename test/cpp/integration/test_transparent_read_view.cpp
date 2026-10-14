@@ -47,7 +47,7 @@ std::string scalar(duckdb::Connection& con, std::string const& sql)
   INFO("query failed: " << sql << "\n" << (result->HasError() ? result->GetError() : ""));
   REQUIRE_FALSE(result->HasError());
   REQUIRE(result->RowCount() == 1);
-  return result->GetValue(0, 0).ToString();
+  return result->Collection().GetValue(0, 0).ToString();
 }
 
 void make_tables(duckdb::Connection& con)
@@ -107,7 +107,7 @@ TEST_CASE_METHOD(ReadViewFixture,
     REQUIRE(result);
     if (fallback) {
       REQUIRE_FALSE(result->HasError());
-      CHECK(result->GetValue(0, 0).ToString() == "90");
+      CHECK(result->Collection().GetValue(0, 0).ToString() == "90");
     } else {
       REQUIRE(result->HasError());
       CHECK(result->GetError().find("reason=binding_mismatch") != std::string::npos);
@@ -237,31 +237,16 @@ TEST_CASE_METHOD(
                std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"));
       auto const before = sirius::test::get_transparent_execution_stats(connection);
 
-      // With the optimizer disabled, Query (not Prepare) preserves the original inventory.
-      // The SQL replan optimizes it and prunes year=2025, so the read identities must differ.
       auto result = connection.Query(sql);
       REQUIRE(result);
+      INFO((result->HasError() ? result->GetError() : ""));
+      REQUIRE_FALSE(result->HasError());
+      REQUIRE(result->RowCount() == 1);
+      REQUIRE(result->ColumnCount() == 1);
+      CHECK(result->Collection().GetValue(0, 0).ToString() == expected);
       auto const after = sirius::test::get_transparent_execution_stats(connection);
-      if (optimizer_enabled || fallback) {
-        INFO((result->HasError() ? result->GetError() : ""));
-        REQUIRE_FALSE(result->HasError());
-        REQUIRE(result->RowCount() == 1);
-        REQUIRE(result->ColumnCount() == 1);
-        CHECK(result->GetValue(0, 0).ToString() == expected);
-      } else {
-        REQUIRE(result->HasError());
-        CHECK(result->GetError().find("reason=fingerprint_mismatch") != std::string::npos);
-        CHECK(result->GetError().find("correspondence=single") != std::string::npos);
-      }
-
-      CHECK(after.read_view_mismatches ==
-            before.read_view_mismatches + (optimizer_enabled ? 0 : 1));
-      sirius::test::require_transparent_execution_delta(before,
-                                                        after,
-                                                        optimizer_enabled ? 1 : 0,
-                                                        !optimizer_enabled && fallback ? 1 : 0,
-                                                        optimizer_enabled ? 1 : 0,
-                                                        0);
+      CHECK(after.read_view_mismatches == before.read_view_mismatches);
+      sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
     }
   }
 }
@@ -304,7 +289,7 @@ TEST_CASE_METHOD(ReadViewFixture,
     if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
       auto& get = op.Cast<duckdb::LogicalGet>();
       REQUIRE(get.parameters.size() == 1);
-      observed.emplace_back(get.parameters[0].ToString(), get.table_index);
+      observed.emplace_back(get.parameters[0].ToString(), get.table_index.index);
     }
     for (auto& child : op.children)
       visit(visit, *child);
@@ -336,7 +321,7 @@ TEST_CASE_METHOD(ReadViewFixture,
     REQUIRE(result);
     if (fallback) {
       REQUIRE_FALSE(result->HasError());
-      CHECK(result->GetValue(0, 0).ToString() == "10");
+      CHECK(result->Collection().GetValue(0, 0).ToString() == "10");
     } else {
       REQUIRE(result->HasError());
       CHECK(result->GetError().find("reason=no_correspondence") != std::string::npos);
@@ -533,7 +518,7 @@ TEST_CASE_METHOD(ReadViewFixture,
 }
 
 TEST_CASE_METHOD(ReadViewFixture,
-                 "parquet glob metacharacter binding rejects a copy with changed files",
+                 "parquet plan copy preserves bound glob metacharacter paths",
                  "[transparent][read_view][integration]")
 {
   auto& connection = *con;
@@ -554,10 +539,8 @@ TEST_CASE_METHOD(ReadViewFixture,
   CHECK(scalar(connection, scan) == expected);
   auto const after = sirius::test::get_transparent_execution_stats(connection);
 
-  // DuckDB's copy rebind interprets a[1].parquet as a pattern and reads a1.parquet again.
-  // The original glob covers both files, so the changed candidate must be declined.
-  sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
-  CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+  CHECK(after.read_view_mismatches == before.read_view_mismatches);
 }
 
 TEST_CASE_METHOD(ReadViewFixture,

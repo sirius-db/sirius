@@ -69,7 +69,7 @@ std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const 
 
   auto const after = sirius::test::get_transparent_execution_stats(con);
   sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-  return sirius::test::collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
+  return sirius::test::collect_rows(*result);
 }
 
 // Dynamic-filter counter deltas for one query execution.

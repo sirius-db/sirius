@@ -82,7 +82,7 @@ TEST_CASE_METHOD(TpcdsNullFixture,
     REQUIRE(result);
     if (result->HasError()) { UNSCOPED_INFO("precondition query error: " << result->GetError()); }
     REQUIRE_FALSE(result->HasError());
-    auto const n = result->GetValue(0, 0).GetValue<int64_t>();
+    auto const n = result->Collection().GetValue(0, 0).GetValue<int64_t>();
     UNSCOPED_INFO("expected NULLs from: " << sql << " (got " << n << ")");
     REQUIRE(n > 0);
   };

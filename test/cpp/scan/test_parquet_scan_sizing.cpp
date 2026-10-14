@@ -59,13 +59,13 @@ std::unique_ptr<scan::parquet_ingestible_table_info> make_nation_info(bool pure_
   info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::VARCHAR));
   if (zero_output) {
     info->column_ids.push_back(duckdb::ColumnIndex(3));
-    info->projection_ids = {0};
+    info->projection_ids = {duckdb::ProjectionIndex(0)};
   } else {
     info->column_ids.push_back(duckdb::ColumnIndex(0));
   }
   if (pure_filter && !zero_output) {
     info->column_ids.push_back(duckdb::ColumnIndex(3));
-    info->projection_ids = {0, 1};
+    info->projection_ids = {duckdb::ProjectionIndex(0), duckdb::ProjectionIndex(1)};
   }
   info->projected_output_count = zero_output ? 0 : 1;
   info->approximate_batch_size = std::size_t{1} << 30;
@@ -76,7 +76,7 @@ std::unique_ptr<scan::parquet_ingestible_table_info> make_partition_only_nation_
 {
   auto info               = make_nation_info(true);
   info->column_ids        = {duckdb::ColumnIndex(2), duckdb::ColumnIndex(3)};
-  info->projection_ids    = {0, 1};
+  info->projection_ids    = {duckdb::ProjectionIndex(0), duckdb::ProjectionIndex(1)};
   info->partition_indices = {duckdb::HivePartitioningIndex("1", 2)};
   return info;
 }

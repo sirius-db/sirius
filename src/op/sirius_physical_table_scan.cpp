@@ -46,7 +46,7 @@ uint64_t get_chunk_data_byte_size(sirius::logical_type type, std::size_t cardina
 
 sirius_physical_table_scan::sirius_physical_table_scan(
   duckdb::vector<sirius::logical_type> types,
-  duckdb::TableFunction function_p,
+  duckdb::BoundTableFunction function_p,
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
   duckdb::vector<sirius::logical_type> returned_types_p,
   duckdb::vector<duckdb::ColumnIndex> column_ids_p,

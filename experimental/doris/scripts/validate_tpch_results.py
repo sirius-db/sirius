@@ -8,8 +8,7 @@ one row per tuple, `NULL` for nulls, decimals with their scale) and one comparis
                                              dataset and write the expected results
   consume   --plans DIR --expected DIR       run the translator's Substrait plans (qNN.substrait,
             [--extension PATH] [--out DIR]   from `dump-fragments --stitch --write-plan`) through
-                                             DuckDB's substrait consumer — the reader Sirius
-                                             compiles into libsirius — and compare them with the
+                                             DuckDB's pinned pre-v2 Substrait consumer and compare them with the
                                              expected results (the CPU differential, single-plan execution prep)
   validate  --actual DIR --expected DIR      compare a run-tpch.sh output tree (<actual>/qNN/
                                              result.tsv, the mysql client's tab-separated output)

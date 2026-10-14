@@ -133,12 +133,10 @@ struct claim_fixture {
       sirius::op::SiriusPhysicalOperatorType::PROJECTION, sirius::from_duckdb_vec(output_types), 0);
 
     duckdb::vector<duckdb::JoinCondition> conditions;
-    duckdb::JoinCondition condition;
-    condition.left =
-      duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0);
-    condition.right =
-      duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0);
-    condition.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+    duckdb::JoinCondition condition(
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0),
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0),
+      duckdb::ExpressionType::COMPARE_EQUAL);
     conditions.push_back(std::move(condition));
 
     hash_join = duckdb::make_uniq<sirius_physical_hash_join>(
