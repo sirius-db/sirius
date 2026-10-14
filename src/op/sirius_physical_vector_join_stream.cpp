@@ -938,7 +938,19 @@ bool sirius_physical_vector_join_stream::build_side_ready_locked()
 //===----------------------------------------------------------------------===//
 void sirius_physical_vector_join_stream::ensure_initialized_locked()
 {
-  if (_initialized) { return; }
+  if (_initialized || _init_error) { return; }
+  // The callers are the scheduler's hooks, which run where an exception ends the process (a
+  // task's destructor re-evaluates the pipeline through them). A failure is kept instead, and the
+  // one task scheduled for it throws it, which fails the query the way any task's error does.
+  try {
+    initialize_locked();
+  } catch (...) {
+    _init_error = std::current_exception();
+  }
+}
+
+void sirius_physical_vector_join_stream::initialize_locked()
+{
   if (!build_side_ready_locked()) { return; }
   if (_scan_manager == nullptr) {
     throw std::runtime_error("[sirius_physical_vector_join_stream] no scan manager set");
@@ -1105,6 +1117,10 @@ std::optional<task_creation_hint> sirius_physical_vector_join_stream::get_next_t
   // wait on; the per-probe-chunk schedule below only starts once it says READY.
   if (!build_side_ready_locked()) { return sirius_physical_operator::get_next_task_hint(); }
   ensure_initialized_locked();
+  if (_init_error) {
+    if (_init_error_task_issued) { return std::nullopt; }
+    return task_creation_hint{TaskCreationHint::READY, this};
+  }
   if (_num_left == 0 || _next_left >= _num_left || _hint_returned) { return std::nullopt; }
   _hint_returned = true;
   return task_creation_hint{TaskCreationHint::READY, this};
@@ -1116,6 +1132,8 @@ bool sirius_physical_vector_join_stream::all_ports_empty()
   // Work is still to come, it just cannot be scheduled yet.
   if (!build_side_ready_locked()) { return false; }
   ensure_initialized_locked();
+  // Not empty until the task carrying the error has failed the query.
+  if (_init_error) { return false; }
   return _next_left >= _num_left;
 }
 
@@ -1124,6 +1142,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::get_next_task
   std::lock_guard<std::mutex> lg(_op_mutex);
   if (!build_side_ready_locked()) { return nullptr; }
   ensure_initialized_locked();
+  if (_init_error) {
+    if (_init_error_task_issued) { return nullptr; }
+    _init_error_task_issued = true;
+    return std::make_unique<vector_join_stream_input>(0, 0);
+  }
   if (_next_left >= _num_left) { return nullptr; }
 
   // The probe batch is deliberately NOT carried in the task input as a pipelineable batch: a
@@ -1453,6 +1476,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 {
   rmm::cuda_stream_view stream{stream_ref};
   nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_stream::execute"};
+  {
+    std::lock_guard<std::mutex> lg(_op_mutex);
+    if (_init_error) { std::rethrow_exception(_init_error); }
+  }
 
   auto const* join_in = dynamic_cast<const vector_join_stream_input*>(&input_data);
   if (join_in == nullptr) {

@@ -3145,6 +3145,22 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   }
   req.dim = left_dim;
 
+  // Lists remember the pin they were built from; after the corpus is pinned again they answer in
+  // a row space that is gone. The join would find out only while the scheduler asks it for work,
+  // where nothing turns the error into a query error, so it is checked here.
+  if (!req.clustering.empty() && req.build_cluster_column.empty() && !req.build_from_scan) {
+    const auto* lists = sirius::vss::find_cluster_lists(*sirius_ctx, req.clustering);
+    auto const pin    = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+      req.right.catalog, req.right.schema, req.right.table);
+    if (lists != nullptr &&
+        (pin == nullptr || lists->pin != pin.get() || lists->column != req.right.column ||
+         lists->n_rows != static_cast<std::int64_t>(pin->num_rows))) {
+      throw BinderException("sirius_knn_join: clustering '" + req.clustering +
+                            "' has no lists over the current pin of '" + req.right.table + "." +
+                            req.right.column + "'; run sirius_kmeans_build_lists after pinning");
+    }
+  }
+
   if (req.key_is_rowid) {
     // Row positions order one table's rows; between two tables they mean nothing.
     if (req.left.catalog != req.right.catalog || req.left.schema != req.right.schema ||

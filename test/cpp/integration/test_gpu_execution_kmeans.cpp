@@ -1929,3 +1929,32 @@ TEST_CASE_METHOD(KMeansFixture,
   CHECK(sirius::vss::gather_host_pinned_rows(
           *with_null, "vec", 0, 32, 0, 1, 10, stream.view(), mr) == nullptr);
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a join over lists built before the corpus was pinned again is refused",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  create_two_group_table(*this, "klr_corpus");
+  run_ok("CREATE TABLE klr_probe AS SELECT * FROM klr_corpus WHERE id % 50 = 0;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'klr_probe', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_kmeans_fit('klr_corpus','vec', name => 'klr_c', n_clusters => 2);");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('klr_corpus','vec','klr_c');");
+  auto const join =
+    "SELECT left_id, distance FROM sirius_knn_join('klr_probe','vec','klr_corpus','vec', "
+    "search_mode => 'approx', metric => 'l2', k => 3, clustering => 'klr_c', n_probes => 2);";
+  CHECK(distance_multiset(*con, join).size() == 24);
+
+  // The lists still name the pin they were built from. This used to be noticed only while the
+  // scheduler asked the join for work, where the exception ended the process. A row more, so the
+  // new pin cannot pass for the old one.
+  run_ok("SELECT * FROM unpin_table('klr_corpus');");
+  run_ok("INSERT INTO klr_corpus VALUES (400, [50.0, 50.0, 50.0]);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'klr_corpus', tier => 'gpu', format => 'duckdb');");
+  expect_error(*con, join, "has no lists over the current pin");
+  CHECK(scalar_i64(*con, "SELECT count(*) FROM klr_probe;") == 8);
+
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('klr_corpus','vec','klr_c');");
+  CHECK(distance_multiset(*con, join).size() == 24);
+}

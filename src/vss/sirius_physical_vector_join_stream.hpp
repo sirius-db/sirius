@@ -33,6 +33,7 @@
 #include <cuvs/distance/distance.hpp>
 
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -284,6 +285,7 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// offsets. Idempotent; caller holds _op_mutex. On the build path this is a no-op until
   /// @ref build_side_ready_locked, so callers must check that first.
   void ensure_initialized_locked();
+  void initialize_locked();
 
   /// Build @c _chunk_cluster_runs and @c _cluster_rows on first use. Deferred out of init
   /// because reading the cluster column needs a memory space, which only a running task
@@ -374,6 +376,9 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   bool _cluster_index_built{false};
   std::mutex _op_mutex;
   bool _initialized{false};
+  //! Why initialization failed; thrown by the one task scheduled for it.
+  std::exception_ptr _init_error;
+  bool _init_error_task_issued{false};
   bool _hint_returned{false};
   std::unique_ptr<vector_chunk_source> _probe;
   //! Streamed side, behind the tier-agnostic seam.
