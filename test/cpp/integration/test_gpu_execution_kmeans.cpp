@@ -28,8 +28,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <map>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1803,4 +1806,45 @@ TEST_CASE_METHOD(KMeansFixture,
       CHECK(oracle.count({r.at(0), r.at(1)}) == 1);
     }
   }
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "vector functions read a GPU pin made with compression requested",
+                 "[integration][gpu_execution][array][vss][kmeans]")
+{
+  // Such a pin keeps its chunks apart from an ordinary GPU pin's, even where none of them ended
+  // up compressed, and a vector column never does: no plan step takes a LIST.
+  create_two_group_table(*this, "gpc_plain");
+  run_ok("CREATE TABLE gpc_corpus AS SELECT * FROM gpc_plain;");
+  run_ok("CREATE TABLE gpc_probe AS SELECT * FROM gpc_plain WHERE id % 40 = 0;");
+  run_ok("CHECKPOINT;");
+
+  // A random suffix, so concurrent runs of the suite do not share a plan directory.
+  std::random_device entropy;
+  auto const plan_dir =
+    std::filesystem::temp_directory_path() /
+    ("sirius-gpc-plan-" + std::to_string(entropy()) + "-" + std::to_string(entropy()));
+  std::filesystem::create_directories(plan_dir);
+  {
+    std::ofstream plan(plan_dir / "gpc_corpus.txt");
+    plan << "input -> identity\n---\ninput -> identity\n";
+  }
+  run_ok("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';");
+  run_ok("SET pin_table_compression_min_batch_size_bytes = 0;");
+  run_ok("SELECT * FROM pin_table(name => 'gpc_corpus', tier => 'gpu', format => 'duckdb', "
+         "compression => true);");
+  run_ok("SELECT * FROM pin_table(name => 'gpc_probe', tier => 'gpu', format => 'duckdb');");
+  std::filesystem::remove_all(plan_dir);
+
+  CHECK(scalar_i64(*con,
+                   "SELECT n_rows FROM sirius_kmeans_fit('gpc_corpus','vec', name => 'gpc_c', "
+                   "n_clusters => 2);") == 400);
+  auto const join = [&](const std::string& corpus) {
+    return distance_multiset(*con,
+                             "SELECT left_id, distance FROM sirius_knn_join('gpc_probe','vec','" +
+                               corpus + "','vec', metric => 'l2', k => 3);");
+  };
+  auto const answer = join("gpc_corpus");
+  CHECK(answer.size() == 30);
+  CHECK(answer == join("gpc_plain"));
 }

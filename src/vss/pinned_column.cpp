@@ -22,6 +22,8 @@
 #include "sirius/exception.hpp"
 #include "vss/staging_shortfall.hpp"
 
+#include "duckdb/common/exception.hpp"
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table_view.hpp>
@@ -39,10 +41,50 @@
 
 namespace sirius::vss {
 
+namespace {
+
+/// A GPU-tier pin made with compression requested keeps its chunks in @c device_chunks instead,
+/// each one compressed or, where compression did not pay or failed, the plain columns.
+std::vector<cudf::column_view> device_chunk_views(const scan_manager::pinned_entry& pin,
+                                                  const std::string& column_name,
+                                                  cucascade::memory::memory_space& space)
+{
+  auto const& names = pin.cache_info.column_names();
+  auto const it     = std::find(names.begin(), names.end(), column_name);
+  if (it == names.end()) {
+    throw internal_exception("VSS: pinned table missing column '" + column_name + "'");
+  }
+  auto const col = static_cast<std::size_t>(std::distance(names.begin(), it));
+
+  std::vector<cudf::column_view> views;
+  views.reserve(pin.device_chunks.size());
+  for (auto const& chunk : pin.device_chunks) {
+    if (chunk.compressed) {
+      throw duckdb::InvalidInputException(
+        "column '%s' is pinned with GPU compression, which the vector functions cannot read; pin "
+        "it with compression => false",
+        column_name);
+    }
+    if (chunk.memory_space != nullptr &&
+        chunk.memory_space->get_device_id() != space.get_device_id()) {
+      throw internal_exception(
+        "VSS: pinned table spans multiple GPUs (multi-GPU not supported yet)");
+    }
+    if (col >= chunk.columns.size() || !chunk.columns[col]) {
+      throw internal_exception("VSS: pinned chunk missing column '" + column_name + "'");
+    }
+    views.push_back(chunk.columns[col]->view());
+  }
+  return views;
+}
+
+}  // namespace
+
 std::vector<cudf::column_view> pinned_column_chunk_views(const scan_manager::pinned_entry& pin,
                                                          const std::string& column_name,
                                                          cucascade::memory::memory_space& space)
 {
+  if (!pin.device_chunks.empty()) { return device_chunk_views(pin, column_name, space); }
   auto it = pin.data_batches_by_column.find(column_name);
   if (it == pin.data_batches_by_column.end() || it->second.empty()) {
     throw internal_exception("VSS: pinned table missing column '" + column_name + "'");
@@ -66,6 +108,7 @@ std::size_t pinned_column_chunk_count(const scan_manager::pinned_entry& pin,
                                       const std::string& column_name)
 {
   if (pin.tier == cucascade::memory::Tier::HOST) { return pin.host_chunks.size(); }
+  if (!pin.device_chunks.empty()) { return pin.device_chunks.size(); }
   auto it = pin.data_batches_by_column.find(column_name);
   if (it == pin.data_batches_by_column.end()) {
     throw internal_exception("VSS: pinned table missing column '" + column_name + "'");
@@ -173,6 +216,9 @@ cucascade::memory::memory_space& pinned_entry_gpu_space(const scan_manager::pinn
 {
   for (auto* space : pin.chunk_memory_spaces) {
     if (space != nullptr) { return *space; }
+  }
+  for (auto const& chunk : pin.device_chunks) {
+    if (chunk.memory_space != nullptr) { return *chunk.memory_space; }
   }
   throw internal_exception("VSS: pinned table has no GPU-resident chunk (host-tier pin?)");
 }
