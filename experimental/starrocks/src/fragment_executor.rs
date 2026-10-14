@@ -100,7 +100,8 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
         self.execute(run.plan).map(Some)
     }
 
-    /// Exports the next batch parked under `slot` for a direct exchange; `None` once drained.
+    /// Exports the next batch parked under `slot` for a direct exchange; `None` once drained. The
+    /// caller owns the returned token and must release it on this CN's direct exchange.
     fn export_direct_next(&self, slot: SenderSlot) -> Result<Option<ExportedBatch>, String> {
         Err(format!(
             "this executor cannot export the output parked under {slot:?}"
