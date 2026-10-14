@@ -197,7 +197,7 @@ class Evaluator:
             rec.detail = f"compare={mode}: {outcome.detail}"
             rec.diffs = outcome.diffs
             return rec
-        self._run_variants(rec, sql, gpu.result, mode)
+        self._run_variants(rec, sql, cpu.result, gpu.result, mode)
         return rec
 
     # -- helpers -------------------------------------------------------------
@@ -246,7 +246,12 @@ class Evaluator:
         ).equal
 
     def _run_variants(
-        self, rec: QueryRecord, sql: str, baseline: ResultSet, mode: str
+        self,
+        rec: QueryRecord,
+        sql: str,
+        cpu_result: ResultSet,
+        baseline: ResultSet,
+        mode: str,
     ) -> None:
         if self.forced_variant:
             choices = list(self.forced_variant.items())
@@ -285,8 +290,9 @@ class Evaluator:
             outcome = compare_results(baseline, res.result, mode == "ordered", self.tol)
             if not outcome.equal:
                 rec.variant = {name: value}
+                # Against the CPU result, as the reducer does: tolerance is not transitive.
                 if self.cfg.oracle.ambiguity_filter and self._is_ambiguous(
-                    sql, baseline, mode
+                    sql, cpu_result, mode
                 ):
                     # The setting changed execution order of an order-dependent query.
                     rec.verdict = Verdict.AMBIGUOUS.value
