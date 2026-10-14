@@ -38,11 +38,11 @@
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
 #include "exec/arrow_result_stream.hpp"
-#include "exec/batch_stream.hpp"              // sirius::exec::batch_stream
-#include "exec/exchange_direct.hpp"           // sirius::exec::direct_exchange
-#include "exec/stream_bind_catalog.hpp"       // sirius::exec::stream_bind_catalog
-#include "exec/stream_plan_bindings.hpp"      // sirius::exec::register_stream_source_function
-#include "exec/streaming_fragment.hpp"        // sirius::exec::streaming_fragment, fragment_spec
+#include "exec/batch_stream.hpp"          // sirius::exec::batch_stream
+#include "exec/exchange_direct.hpp"       // sirius::exec::direct_exchange
+#include "exec/stream_bind_catalog.hpp"   // sirius::exec::stream_bind_catalog
+#include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
+#include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "expression/decimal_divide_function.hpp"  // sirius::register_decimal_divide_function
 #include "from_substrait.hpp"                 // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"        // sirius::from_duckdb
