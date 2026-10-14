@@ -25,13 +25,16 @@
 
 #include "core_functions_extension.hpp"
 #include "duckdb.hpp"
+#include "duckdb/main/valid_checker.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "parquet_extension.hpp"
 #include "substrait_extension.hpp"
 #include "yyjson.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -159,6 +162,9 @@ std::string pretty_json(const std::string& json)
   return out + "\n";
 }
 
+// The result-types.json "physical_types" name of a result column: the Arrow
+// layout DuckDB exports the type as, matched by arrow_matches_physical_type in
+// test/cpp/exec/test_sirius_ffi_embedder.cpp.
 std::string physical_type(const duckdb::LogicalType& type)
 {
   using duckdb::LogicalTypeId;
@@ -171,8 +177,7 @@ std::string physical_type(const duckdb::LogicalType& type)
     case LogicalTypeId::DOUBLE: return "fp64";
     case LogicalTypeId::FLOAT: return "fp32";
     case LogicalTypeId::DATE: return "date";
-    // DuckDB exports HUGEINT to Arrow as decimal128(38,0) (16-byte int128);
-    // the runner formats decimal(p>18,0) as an integer.
+    // DuckDB exports HUGEINT to Arrow as decimal128(38,0) (16-byte int128).
     case LogicalTypeId::HUGEINT: return "decimal(38,0)";
     case LogicalTypeId::DECIMAL:
       return "decimal(" + std::to_string(duckdb::DecimalType::GetWidth(type)) + "," +
@@ -181,13 +186,18 @@ std::string physical_type(const duckdb::LogicalType& type)
   }
 }
 
-// One cell normalized for order-insensitive comparison: numerics (integers,
-// decimals, floats) compare as doubles within a tolerance, everything else by
-// its string form, so DECIMAL vs DOUBLE result types still match.
+bool is_float(const duckdb::LogicalType& type)
+{
+  return type.id() == duckdb::LogicalTypeId::FLOAT || type.id() == duckdb::LogicalTypeId::DOUBLE;
+}
+
+// One cell: FLOAT/DOUBLE columns compare as doubles within a relative
+// tolerance (aggregation order changes the last bits), every other column
+// exactly by its string form.
 struct Cell {
-  bool is_null    = false;
-  bool is_numeric = false;
-  double number   = 0;
+  bool is_null  = false;
+  bool is_float = false;
+  double number = 0;
   std::string text;
 };
 
@@ -196,21 +206,21 @@ using Row = std::vector<Cell>;
 bool cell_less(const Cell& a, const Cell& b)
 {
   if (a.is_null != b.is_null) { return a.is_null < b.is_null; }
-  if (a.is_numeric != b.is_numeric) { return a.is_numeric < b.is_numeric; }
-  if (a.is_numeric) { return a.number < b.number; }
+  if (a.is_float) { return a.number < b.number; }
   return a.text < b.text;
 }
 
-bool cell_close(const Cell& a, const Cell& b)
+bool cell_equal(const Cell& a, const Cell& b)
 {
   if (a.is_null || b.is_null) { return a.is_null == b.is_null; }
-  if (a.is_numeric != b.is_numeric) { return false; }
-  if (!a.is_numeric) { return a.text == b.text; }
+  if (!a.is_float) { return a.text == b.text; }
   double scale = std::max({1.0, std::fabs(a.number), std::fabs(b.number)});
   return std::fabs(a.number - b.number) <= 1e-6 * scale;
 }
 
-std::vector<Row> collect_rows(duckdb::MaterializedQueryResult& result)
+// The result's rows in result order, or sorted when the query does not order
+// them.
+std::vector<Row> collect_rows(duckdb::MaterializedQueryResult& result, bool ordered)
 {
   std::vector<Row> rows;
   rows.reserve(result.RowCount());
@@ -221,9 +231,9 @@ std::vector<Row> collect_rows(duckdb::MaterializedQueryResult& result)
       Cell cell;
       if (v.IsNull()) {
         cell.is_null = true;
-      } else if (v.type().IsNumeric()) {
-        cell.is_numeric = true;
-        cell.number     = v.GetValue<double>();
+      } else if (is_float(result.types[c])) {
+        cell.is_float = true;
+        cell.number   = v.GetValue<double>();
       } else {
         cell.text = v.ToString();
       }
@@ -231,11 +241,30 @@ std::vector<Row> collect_rows(duckdb::MaterializedQueryResult& result)
     }
     rows.push_back(std::move(row));
   }
-  auto row_less = [](const Row& a, const Row& b) {
-    return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(), cell_less);
-  };
-  std::sort(rows.begin(), rows.end(), row_less);
+  if (!ordered) {
+    auto row_less = [](const Row& a, const Row& b) {
+      return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(), cell_less);
+    };
+    std::sort(rows.begin(), rows.end(), row_less);
+  }
   return rows;
+}
+
+// Whether the query's top-level SELECT (or set operation) has an ORDER BY, so
+// the plan must reproduce the row order too.
+bool has_top_level_order_by(const std::string& sql)
+{
+  duckdb::Parser parser;
+  parser.ParseQuery(sql);
+  if (parser.statements.size() != 1 ||
+      parser.statements[0]->type != duckdb::StatementType::SELECT_STATEMENT) {
+    return false;
+  }
+  auto& select = parser.statements[0]->Cast<duckdb::SelectStatement>();
+  for (auto& modifier : select.node->modifiers) {
+    if (modifier->type == duckdb::ResultModifierType::ORDER_MODIFIER) { return true; }
+  }
+  return false;
 }
 
 std::unique_ptr<duckdb::MaterializedQueryResult> run(duckdb::Connection& con,
@@ -247,12 +276,9 @@ std::unique_ptr<duckdb::MaterializedQueryResult> run(duckdb::Connection& con,
   return result;
 }
 
-std::string get_plan(duckdb::Connection& con, const std::string& sql, bool enable_optimizer)
+std::string get_plan(duckdb::Connection& con, const std::string& sql)
 {
-  auto result = run(con,
-                    "CALL get_substrait_json(" + sql_literal(sql) +
-                      (enable_optimizer ? ")" : ", enable_optimizer = false)"),
-                    "get_substrait_json");
+  auto result = run(con, "CALL get_substrait_json(" + sql_literal(sql) + ")", "get_substrait_json");
   if (result->RowCount() != 1 || result->ColumnCount() != 1) {
     throw QueryFailure("get_substrait_json returned an unexpected shape");
   }
@@ -260,27 +286,35 @@ std::string get_plan(duckdb::Connection& con, const std::string& sql, bool enabl
 }
 
 void compare_results(duckdb::MaterializedQueryResult& from_plan,
-                     duckdb::MaterializedQueryResult& from_sql)
+                     duckdb::MaterializedQueryResult& from_sql,
+                     bool ordered)
 {
   if (from_plan.ColumnCount() != from_sql.ColumnCount()) {
     throw QueryFailure("column count " + std::to_string(from_plan.ColumnCount()) + " != SQL " +
                        std::to_string(from_sql.ColumnCount()));
   }
+  for (duckdb::idx_t c = 0; c < from_sql.ColumnCount(); ++c) {
+    if (from_plan.types[c] != from_sql.types[c]) {
+      throw QueryFailure("result types differ between the plan and the SQL: column " +
+                         std::to_string(c) + " (" + from_sql.names[c] + ") is " +
+                         from_plan.types[c].ToString() + " vs SQL " + from_sql.types[c].ToString());
+    }
+  }
   if (from_plan.RowCount() != from_sql.RowCount()) {
     throw QueryFailure("row count " + std::to_string(from_plan.RowCount()) + " != SQL " +
                        std::to_string(from_sql.RowCount()));
   }
-  auto a = collect_rows(from_plan);
-  auto b = collect_rows(from_sql);
+  auto a = collect_rows(from_plan, ordered);
+  auto b = collect_rows(from_sql, ordered);
   for (size_t r = 0; r < a.size(); ++r) {
     for (size_t c = 0; c < a[r].size(); ++c) {
-      if (!cell_close(a[r][c], b[r][c])) {
+      if (!cell_equal(a[r][c], b[r][c])) {
         auto show = [](const Cell& x) {
-          return x.is_null ? std::string("NULL") : x.is_numeric ? std::to_string(x.number) : x.text;
+          return x.is_null ? std::string("NULL") : x.is_float ? std::to_string(x.number) : x.text;
         };
-        throw QueryFailure("value mismatch at sorted row " + std::to_string(r) + " column " +
-                           std::to_string(c) + ": plan " + show(a[r][c]) + " vs SQL " +
-                           show(b[r][c]));
+        throw QueryFailure("value mismatch at " + std::string(ordered ? "" : "sorted ") + "row " +
+                           std::to_string(r) + " column " + std::to_string(c) + ": plan " +
+                           show(a[r][c]) + " vs SQL " + show(b[r][c]));
       }
     }
   }
@@ -471,62 +505,83 @@ int main(int argc, char** argv)
     return kExitIoError;
   }
 
+  // Writes the manifest for the queries completed so far; false on error.
+  auto save_manifest = [&]() {
+    try {
+      write_manifest(manifest_path, manifest);
+      return true;
+    } catch (const std::exception& e) {
+      std::cerr << "error: " << e.what() << "\n";
+      return false;
+    }
+  };
+
   std::vector<std::string> failed;
   for (auto& name : requested) {
     const std::string plan_name = name + ".substrait.json";
     const fs::path plan_path    = opts.out / plan_name;
+    std::string plan;
+    ManifestEntry entry;
+    duckdb::idx_t row_count = 0;
+    bool ok                 = false;
     try {
       std::string sql = strip_sql(read_file(sql_files[name]));
 
-      std::string plan = get_plan(*con, sql, true);
+      plan = get_plan(*con, sql);
 
       auto from_plan =
         run(*con, "CALL from_substrait_json(" + sql_literal(plan) + ")", "from_substrait_json");
       auto from_sql = run(*con, sql, "SQL");
-      compare_results(*from_plan, *from_sql);
+      compare_results(*from_plan, *from_sql, has_top_level_order_by(sql));
 
-      ManifestEntry entry;
       entry.plan = plan_name;
-      for (auto& type : from_sql->types) {
+      for (auto& type : from_plan->types) {
         entry.logical_types.push_back(type.ToString());
         entry.physical_types.push_back(physical_type(type));
       }
-
-      write_file(plan_path, plan);
-      manifest[name] = std::move(entry);
-      std::cout << name << ": ok (" << from_sql->RowCount() << " rows)" << std::endl;
+      row_count = from_sql->RowCount();
+      ok        = true;
     } catch (const QueryFailure& e) {
       std::cout << name << ": ROUND-TRIP FAIL: " << first_line(e.what()) << std::endl;
-      failed.push_back(name);
     } catch (const std::exception& e) {
       // DuckDB throws its own exceptions from inside the substrait functions.
       duckdb::ErrorData error(e);
       std::cout << name << ": ROUND-TRIP FAIL: " << first_line(error.Message()) << std::endl;
-      failed.push_back(name);
     }
-    if (!failed.empty() && failed.back() == name) {
-      // Never leave a stale plan from an earlier run next to a failing query.
-      manifest.erase(name);
-      fs::remove(plan_path, ec);
-      // An internal error invalidates the whole database; start the next
-      // query from a fresh one.
+    if (ok) {
+      try {
+        write_file(plan_path, plan);
+      } catch (const std::exception& e) {
+        std::cerr << "error: " << e.what() << "\n";
+        manifest.erase(name);
+        fs::remove(plan_path, ec);
+        save_manifest();
+        return kExitIoError;
+      }
+      manifest[name] = std::move(entry);
+      std::cout << name << ": ok (" << row_count << " rows)" << std::endl;
+      continue;
+    }
+    failed.push_back(name);
+    // Never leave a stale plan from an earlier run next to a failing query.
+    manifest.erase(name);
+    fs::remove(plan_path, ec);
+    // A fatal (e.g. internal) error invalidates the whole database; only then
+    // start the next query from a fresh one.
+    if (duckdb::ValidChecker::IsInvalidated(*db->instance)) {
       try {
         con.reset();
         db.reset();
         std::tie(db, con) = open_database(opts.input);
       } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
+        save_manifest();
         return kExitIoError;
       }
     }
   }
 
-  try {
-    write_manifest(manifest_path, manifest);
-  } catch (const std::exception& e) {
-    std::cerr << "error: " << e.what() << "\n";
-    return kExitIoError;
-  }
+  if (!save_manifest()) { return kExitIoError; }
 
   std::string failed_list;
   for (size_t i = 0; i < failed.size(); ++i) {

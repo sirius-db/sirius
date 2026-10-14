@@ -680,6 +680,10 @@ class SiriusContext : public ClientContextState {
     return config_.get_hw_topology();
   }
 
+  /// \brief GPU ids the memory manager brought up (one GPU memory space each), sorted
+  ///        ascending and deduplicated. Empty before initialize() and after terminate().
+  [[nodiscard]] const std::vector<int>& active_gpu_ids() const noexcept { return active_gpu_ids_; }
+
   /// \brief Get the memory reservation manager.
   [[nodiscard]] sirius::memory::sirius_memory_reservation_manager& get_memory_manager();
   [[nodiscard]] const sirius::memory::sirius_memory_reservation_manager& get_memory_manager() const;
@@ -923,6 +927,8 @@ class SiriusContext : public ClientContextState {
   // terminate(); RAII restores the variable's prior state on destruction.
   std::optional<sirius::util::env_guard> hw_decompression_env_guard_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
+  // GPU ids of memory_manager_'s GPU spaces; see active_gpu_ids().
+  std::vector<int> active_gpu_ids_;
   // Session-lifetime cache of GPU-resident, pinned cuVS ANN indexes. Declared
   // after memory_manager_ so it is destroyed before it: each entry holds a
   // reservation into the manager's GPU spaces, so the manager must outlive the

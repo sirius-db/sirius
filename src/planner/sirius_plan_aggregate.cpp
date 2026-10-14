@@ -783,11 +783,20 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       "Grouping sets without GROUP BY keys are not supported in GPU aggregates");
   }
 
-  // The GPU aggregates do not apply FILTER clauses, and support DISTINCT only in COUNT.
+  // The GPU aggregates do not apply FILTER clauses or ORDER BY modifiers, and support DISTINCT
+  // only in COUNT.
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
     if (aggregate.GetFilter()) {
       throw duckdb::NotImplementedException("Aggregates with a FILTER clause not supported in GPU");
+    }
+    // DuckDB's expression rewriter turns an ordered first/any_value into arg_min/arg_max, which
+    // from_duckdb declines; without it the ORDER BY survives to here, and
+    // extract_aggregate_expressions would wrap the aggregate in a sorted aggregate that keeps its
+    // name, so any_value(x ORDER BY y) would run as MIN(x).
+    if (aggregate.order_bys) {
+      throw duckdb::NotImplementedException(
+        "Aggregates with an ORDER BY clause not supported in GPU");
     }
     if (!aggregate.IsDistinct()) { continue; }
     if (sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName()) !=

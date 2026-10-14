@@ -115,12 +115,18 @@ class streaming_fragment {
   /// Move every parked batch on `source`'s output `source_stream_id` into this fragment's
   /// input `input_stream_id`, then close `sender_id` on it. Checks schema, shared context,
   /// sender, and phase (source ran, this fragment built but not run) before any data moves.
+  /// When this closes the last open sender of an input that never received a batch, one
+  /// zero-row batch of the declared types is pushed first, so an ungrouped aggregate over the
+  /// empty input still emits its row.
   /// @return number of batches moved.
   std::size_t relay_from(streaming_fragment& source,
                          stream_id_t source_stream_id,
                          stream_id_t input_stream_id,
                          sender_id_t sender_id);
 
+  /// Close `sender` on input `id`. When this closes the last open sender of an input that never
+  /// received a batch, one zero-row batch of the declared types is pushed first, so an ungrouped
+  /// aggregate over the empty input still emits its row.
   /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
@@ -134,10 +140,19 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before build() or on an unknown id.
   [[nodiscard]] bool input_sender_closed(stream_id_t id, sender_id_t sender) const;
 
-  /// Push one externally produced batch into input stream `id`. The caller checks the batch
-  /// against find_input(id)->types. @return false when the input already ended.
+  /// Push one externally produced GPU batch into input stream `id`. @return false when the input
+  /// already ended.
   /// @throws sirius::invalid_input_exception unless accepts_input(), or on an unknown id.
+  /// @throws std::invalid_argument when the batch is not a GPU table, or its column count or a
+  ///         column's cuDF type differs from find_input(id)->types (message names the stream and
+  ///         column).
   bool push_input(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch);
+
+  /// The GPU memory space externally produced input batches are built in: the lowest active GPU.
+  /// Every input batch built outside the plan (push_input callers, the zero-row placeholder of
+  /// close_input) uses it.
+  /// @throws sirius::internal_exception when the engine has no active GPU.
+  [[nodiscard]] cucascade::memory::memory_space& input_memory_space() const;
 
   /// nullopt means no batch is parked now, not EOS; use drained(id) for EOS.
   /// @throws sirius::invalid_input_exception before run() or on an unknown id.

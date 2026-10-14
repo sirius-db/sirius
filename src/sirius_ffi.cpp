@@ -22,6 +22,7 @@
 #include "cudf/cudf_utils.hpp"                           // sirius::get_cudf_type
 #include "data/data_batch_utils.hpp"                     // sirius::make_data_batch
 #include "data/sirius_converter_registry.hpp"            // sirius::converter_registry
+#include "duckdb/common/arrow/arrow.hpp"                 // ArrowArray, ArrowSchema, ArrowArrayStream
 #include "duckdb/common/enums/optimizer_type.hpp"        // duckdb::OptimizerType
 #include "duckdb/execution/column_binding_resolver.hpp"  // duckdb::ColumnBindingResolver
 #include "duckdb/main/client_context.hpp"                // duckdb::ClientContext
@@ -48,9 +49,9 @@
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
 
-#include <cudf/copying.hpp>
 #include <cudf/interop.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
 
@@ -59,7 +60,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <arrow/c/abi.h>  // ArrowDeviceArray (DuckDB's arrow.hpp has the other C interface structs)
 #include <google/protobuf/util/json_util.h>  // DuckDB-vendored: duckdb::google::protobuf
 #include <substrait/plan.pb.h>
 #include <yaml-cpp/yaml.h>
@@ -75,6 +75,66 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+
+// ArrowDeviceArray, from the Arrow C device data interface
+// (https://arrow.apache.org/docs/format/CDeviceDataInterface.html). The interface is ABI-stable
+// and its spec asks consumers to copy these definitions rather than depend on libarrow, which
+// Sirius does not link; cuDF only forward-declares the struct. The guard skips the copy when
+// Arrow's own abi.h was included first.
+#ifndef ARROW_C_DEVICE_DATA_INTERFACE
+#define ARROW_C_DEVICE_DATA_INTERFACE
+
+// Spec and Documentation: https://arrow.apache.org/docs/format/CDeviceDataInterface.html
+
+// DeviceType for the allocated memory
+typedef int32_t ArrowDeviceType;  // NOLINT(modernize-use-using)
+
+// CPU device, same as using ArrowArray directly
+#define ARROW_DEVICE_CPU 1
+// CUDA GPU Device
+#define ARROW_DEVICE_CUDA 2
+// Pinned CUDA CPU memory by cudaMallocHost
+#define ARROW_DEVICE_CUDA_HOST 3
+// OpenCL Device
+#define ARROW_DEVICE_OPENCL 4
+// Vulkan buffer for next-gen graphics
+#define ARROW_DEVICE_VULKAN 7
+// Metal for Apple GPU
+#define ARROW_DEVICE_METAL 8
+// Verilog simulator buffer
+#define ARROW_DEVICE_VPI 9
+// ROCm GPUs for AMD GPUs
+#define ARROW_DEVICE_ROCM 10
+// Pinned ROCm CPU memory allocated by hipMallocHost
+#define ARROW_DEVICE_ROCM_HOST 11
+// Reserved for extension
+#define ARROW_DEVICE_EXT_DEV 12
+// CUDA managed/unified memory allocated by cudaMallocManaged
+#define ARROW_DEVICE_CUDA_MANAGED 13
+// unified shared memory allocated on a oneAPI non-partitioned device.
+#define ARROW_DEVICE_ONEAPI 14
+// GPU support for next-gen WebGPU standard
+#define ARROW_DEVICE_WEBGPU 15
+// Qualcomm Hexagon DSP
+#define ARROW_DEVICE_HEXAGON 16
+
+struct ArrowDeviceArray {
+  // the Allocated Array
+  //
+  // the buffers in the array (along with the buffers of any
+  // children) are what is allocated on the device.
+  struct ArrowArray array;
+  // The device id to identify a specific device
+  int64_t device_id;
+  // The type of device which can access this memory.
+  ArrowDeviceType device_type;
+  // An event-like object to synchronize on if needed.
+  void* sync_event;
+  // Reserved bytes for future expansion.
+  int64_t reserved[3];
+};
+
+#endif  // ARROW_C_DEVICE_DATA_INTERFACE
 
 namespace sirius::ffi {
 
@@ -367,8 +427,9 @@ bool arrow_converts_to(const arrow_column_type& from, const sirius::logical_type
   }
 }
 
-// Upper bound on the host bytes of one Arrow column of `length` rows past `offset`; the device
-// copy is about the same size.
+// Upper bound on the host bytes of one Arrow column: it sizes rows 0..offset+length, not just the
+// `length` rows past `offset`, so a sliced column is over-counted. The device copy is about the
+// same size.
 std::size_t arrow_column_bytes(const arrow_column_type& type, const ArrowArray& column)
 {
   auto const rows            = static_cast<std::size_t>(column.offset + column.length);
@@ -404,6 +465,16 @@ std::size_t arrow_column_bytes(const arrow_column_type& type, const ArrowArray& 
   }
 }
 
+// Whether converting `from` to `to` holds a second device copy of the column at its peak: a
+// decimal rescale, rounding or narrowing cast, or cuDF's rebuild of a string_view column.
+bool takes_second_copy(const arrow_column_type& from, const sirius::logical_type& to)
+{
+  if (from.kind == arrow_kind::utf8_view) { return true; }
+  if (to.id() != sirius::type_id::DECIMAL) { return false; }
+  return from.scale != static_cast<int>(to.decimal_scale()) ||
+         sirius::get_cudf_type(to).id() != cudf::type_id::DECIMAL128;
+}
+
 // 10^precision - 1, the largest unscaled value of DECIMAL(precision, s).
 __int128 decimal_unscaled_limit(int precision)
 {
@@ -434,39 +505,64 @@ std::unique_ptr<cudf::column> arrow_column_to_declared(const ArrowSchema& schema
                                                        rmm::cuda_stream_view stream,
                                                        rmm::device_async_resource_ref mr)
 {
+  // A child of a sliced struct batch spans the parent's rows: narrow the borrowed child to them
+  // (cuDF honours ArrowArray::offset). Its null count may not hold for the narrower range, so it
+  // becomes unknown (-1, cuDF counts the bitmap) unless the child has no nulls at all.
+  if (parent_offset < 0 || parent_length < 0 || column.length < parent_offset + parent_length) {
+    throw std::invalid_argument(context + ": the column has " + std::to_string(column.length) +
+                                " rows, fewer than the batch's offset plus length");
+  }
   ArrowDeviceArray host{};
-  host.array       = column;  // borrowed: cuDF does not release its input
+  host.array = column;  // borrowed: cuDF does not release its input
+  if (parent_offset != 0 || parent_length != column.length) {
+    host.array.offset += parent_offset;
+    host.array.length = parent_length;
+    if (host.array.null_count != 0) { host.array.null_count = -1; }
+  }
   host.device_id   = -1;
   host.device_type = ARROW_DEVICE_CPU;
   auto converted   = cudf::from_arrow_host_column(&schema, &host, stream, mr);
 
-  // A child of a sliced struct batch spans the parent's offset too.
-  if (parent_offset != 0 || converted->size() != parent_length) {
-    auto const begin = static_cast<cudf::size_type>(parent_offset);
-    auto const end   = static_cast<cudf::size_type>(parent_offset + parent_length);
-    auto sliced      = cudf::slice(converted->view(), {begin, end}).front();
-    converted        = std::make_unique<cudf::column>(sliced, stream, mr);
-  }
-
   auto const target = sirius::get_cudf_type(to);
   if (to.id() == sirius::type_id::DECIMAL) {
-    // Rescale in 128 bits, check the declared precision, then narrow to the declared carrier
-    // (decimal64 for DECIMAL(15,2), as the parquet scan produces).
-    cudf::data_type const wide{cudf::type_id::DECIMAL128, target.scale()};
-    if (converted->type() != wide) { converted = cudf::cast(converted->view(), wide, stream, mr); }
-    // Integer digits of the source plus the declared fraction digits bound the result.
-    bool const always_fits = (from.precision - from.scale) + to.decimal_scale() <=
-                             static_cast<int>(to.decimal_precision());
+    // Round or check at the source scale, rescale in 128 bits, then narrow to the declared
+    // carrier (decimal64 for DECIMAL(15,2), as the parquet scan produces). The check compares
+    // unscaled values against 10^digits - 1 at the column's scale after rounding.
+    auto const precision = static_cast<int>(to.decimal_precision());
+    auto const scale     = static_cast<int>(to.decimal_scale());
+    if (converted->type().id() != cudf::type_id::DECIMAL128) {
+      converted = cudf::cast(converted->view(),
+                             cudf::data_type{cudf::type_id::DECIMAL128, converted->type().scale()},
+                             stream,
+                             mr);
+    }
+    int digits       = precision;
+    bool always_fits = false;
+    if (from.scale > scale) {
+      // Round half away from zero, as a DuckDB CAST does (1.2350 -> 1.24). Rounding can carry
+      // into a new integer digit (9.995 -> 10.00), so the check runs after it: a source below
+      // 10^(p-s) in magnitude rounds to at most 10^(p-s).
+      converted =
+        cudf::round_decimal(converted->view(), scale, cudf::rounding_method::HALF_UP, stream, mr);
+      always_fits = (from.precision - from.scale) + scale < precision;
+    } else {
+      // DECIMAL(P,S) holds |x| < 10^(P-S), i.e. |unscaled| < 10^(P-S+s) at the source scale s.
+      // Checked before the upscale, whose multiply by 10^(S-s) is unchecked and could wrap.
+      digits      = precision - scale + from.scale;
+      always_fits = from.precision <= digits;
+    }
     if (!always_fits && converted->size() > converted->null_count()) {
       auto const [lo, hi]  = cudf::minmax(converted->view(), stream, mr);
       using decimal_scalar = cudf::fixed_point_scalar<numeric::decimal128>;
-      auto const limit     = decimal_unscaled_limit(static_cast<int>(to.decimal_precision()));
+      auto const limit     = decimal_unscaled_limit(digits);
       auto const min_value = static_cast<decimal_scalar&>(*lo).value(stream);
       auto const max_value = static_cast<decimal_scalar&>(*hi).value(stream);
       if (min_value < -limit || max_value > limit) {
         throw std::invalid_argument(context + ": a value overflows the declared precision");
       }
     }
+    cudf::data_type const wide{cudf::type_id::DECIMAL128, target.scale()};
+    if (converted->type() != wide) { converted = cudf::cast(converted->view(), wide, stream, mr); }
     if (converted->type() != target) {
       converted = cudf::cast(converted->view(), target, stream, mr);
     }
@@ -487,8 +583,6 @@ struct Context::Impl {
   // First member: claimed before anything is brought up, released after everything is torn down.
   live_context_claim claim;
   duckdb::shared_ptr<duckdb::SiriusContext> context;
-  // GPU ids the memory manager brought up, sorted and deduplicated. Set once by bring_up().
-  std::vector<int> active_gpu_ids;
   duckdb::unique_ptr<duckdb::DuckDB> db;
   duckdb::unique_ptr<duckdb::Connection> conn;
   // Serializes transactions on `conn`; see in_transaction().
@@ -497,8 +591,8 @@ struct Context::Impl {
   // Context::execute_substrait / execute_substrait_json.
   void execute(const std::string& plan, bool json, std::uintptr_t out_stream_addr);
 
-  // Fragment::push_arrow uploads, one at a time per Context: each binds its GPU reservation to
-  // the upload stream for the duration of the call.
+  // Serializes use of upload_stream: a Fragment::push_arrow batch binds its GPU reservation to
+  // the stream from attach to reset, so two batches cannot convert on it at once.
   std::mutex upload_mutex;
   // Long-lived because the uploaded columns free their memory on the stream they were allocated
   // on. Every Fragment (and so every pushed batch) is gone before the Context is destroyed.
@@ -509,14 +603,6 @@ struct Context::Impl {
     install_log_sink_from_env();
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
-    // The same derivation SiriusContext::initialize uses for its active GPU set.
-    for (auto const* gpu_space :
-         context->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-      if (gpu_space != nullptr) { active_gpu_ids.push_back(gpu_space->get_device_id()); }
-    }
-    std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
-    active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
-                         active_gpu_ids.end());
 
     // Substrait lowering uses core functions and resolves local_files reads to parquet_scan.
     db = duckdb::make_uniq<duckdb::DuckDB>(nullptr);
@@ -651,7 +737,7 @@ std::unique_ptr<Context> make_context_with_gpus(const std::vector<int>& gpu_ids,
 
 std::unique_ptr<std::vector<int>> Context::active_gpu_ids() const
 {
-  return std::make_unique<std::vector<int>>(impl_->active_gpu_ids);
+  return std::make_unique<std::vector<int>>(impl_->context->active_gpu_ids());
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +772,27 @@ struct Fragment::Impl {
 
   // Fragment::push_arrow, after the caller's stream is taken over.
   std::size_t push_arrow(std::uint64_t stream_id, ArrowArrayStream& input, std::uint32_t sender_id);
+
+  // Set when a push_arrow() failed after pushing at least one batch: that input holds a partial
+  // stream and its sender is still open, so closing or running would silently compute over part
+  // of the input, and a retry would duplicate batches. Guarded by push_failure_mutex.
+  mutable std::mutex push_failure_mutex;
+  std::string push_failure;
+
+  void record_push_failure(std::string failure)
+  {
+    std::lock_guard<std::mutex> lock(push_failure_mutex);
+    if (push_failure.empty()) { push_failure = std::move(failure); }
+  }
+
+  void require_no_failed_push(const char* what) const
+  {
+    std::lock_guard<std::mutex> lock(push_failure_mutex);
+    if (!push_failure.empty()) {
+      throw std::logic_error(std::string("Fragment: ") + what + " after an earlier failure (" +
+                             push_failure + "); discard this Fragment");
+    }
+  }
 
   void require_not_built(const char* what) const
   {
@@ -842,6 +949,7 @@ std::size_t Fragment::Impl::push_arrow(std::uint64_t stream_id,
   if (!fragment->accepts_input()) {
     throw std::logic_error("Fragment: push_arrow() must be called before run()");
   }
+  require_no_failed_push("push_arrow()");
   auto const* declared = fragment->find_input(stream_id);
   if (declared == nullptr) {
     throw std::invalid_argument("push_arrow: input stream " + std::to_string(stream_id) +
@@ -886,88 +994,99 @@ std::size_t Fragment::Impl::push_arrow(std::uint64_t stream_id,
                              " already ended for sender " + std::to_string(sender_id));
   }
 
-  // P2 places every batch on the first active GPU.
-  auto const device_id                   = ctx.active_gpu_ids.front();
-  cucascade::memory::memory_space* space = nullptr;
-  for (auto const* gpu_space :
-       ctx.context->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    if (gpu_space != nullptr && gpu_space->get_device_id() == device_id) {
-      // The manager owns its spaces mutably and only exposes them as const.
-      space = const_cast<cucascade::memory::memory_space*>(gpu_space);
-    }
+  if (ctx.context->active_gpu_ids().empty()) {
+    throw std::runtime_error("push_arrow: the engine has no active GPU");
   }
-  if (space == nullptr) {
-    throw std::runtime_error("push_arrow: no memory space for GPU " + std::to_string(device_id));
-  }
-
-  std::lock_guard<std::mutex> upload_lock(ctx.upload_mutex);
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
-  if (!ctx.upload_stream) { ctx.upload_stream = std::make_unique<rmm::cuda_stream>(); }
-  auto const stream = ctx.upload_stream->view();
-  auto const mr     = space->get_default_allocator();
+  auto& space = fragment->input_memory_space();
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space.get_device_id()}};
+  auto const mr = space.get_default_allocator();
 
   std::size_t pushed = 0;
-  for (;;) {
-    owned_arrow<ArrowArray> batch;
-    if (input.get_next(&input, &batch.value) != 0) {
-      throw std::runtime_error("push_arrow: get_next failed: " + last_error());
-    }
-    if (batch.value.release == nullptr) { break; }
-    if (static_cast<std::size_t>(batch.value.n_children) != types.size()) {
-      throw std::invalid_argument("push_arrow: stream " + std::to_string(stream_id) +
-                                  " batch has " + std::to_string(batch.value.n_children) +
-                                  " columns, the schema " + std::to_string(types.size()));
-    }
-
-    // Charge the upload to a reservation on the target GPU: about twice the host bytes, for the
-    // copy plus a cast's temporary.
-    std::size_t bytes = 0;
-    for (std::size_t i = 0; i < types.size(); ++i) {
-      bytes += 2 * arrow_column_bytes(columns[i], *batch.value.children[i]);
-    }
-    auto reservation = space->make_reservation(std::max<std::size_t>(bytes, 1));
-    auto* allocator  = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
-    if (allocator == nullptr ||
-        !allocator->attach_reservation_to_tracker(stream, std::move(reservation))) {
-      throw std::runtime_error("push_arrow: failed to bind the upload to its GPU reservation");
-    }
-    std::shared_ptr<cucascade::data_batch> data;
-    try {
-      std::vector<std::unique_ptr<cudf::column>> converted;
-      converted.reserve(types.size());
-      for (std::size_t i = 0; i < types.size(); ++i) {
-        converted.push_back(arrow_column_to_declared(*schema.value.children[i],
-                                                     *batch.value.children[i],
-                                                     batch.value.offset,
-                                                     batch.value.length,
-                                                     columns[i],
-                                                     types[i],
-                                                     contexts[i],
-                                                     stream,
-                                                     mr));
+  try {
+    for (;;) {
+      owned_arrow<ArrowArray> batch;
+      if (input.get_next(&input, &batch.value) != 0) {
+        throw std::runtime_error("push_arrow: get_next failed: " + last_error());
       }
-      data = sirius::make_data_batch(cudf::table(std::move(converted)),
-                                     *space,
-                                     stream,
-                                     sirius::telemetry::batch_telemetry_info{});
-      // Publish only finished data. Same-GPU consumers read a batch already in their memory
-      // space without waiting on its writer event; Sirius relies on producers syncing before
-      // they publish (as gpu_pipeline_task does). The casts and slice copies above are only
-      // enqueued on the upload stream.
-      stream.synchronize();
-    } catch (...) {
-      allocator->reset_stream_reservation(stream);
-      throw;
-    }
-    allocator->reset_stream_reservation(stream);
+      if (batch.value.release == nullptr) { break; }
+      if (static_cast<std::size_t>(batch.value.n_children) != types.size()) {
+        throw std::invalid_argument("push_arrow: stream " + std::to_string(stream_id) +
+                                    " batch has " + std::to_string(batch.value.n_children) +
+                                    " columns, the schema " + std::to_string(types.size()));
+      }
 
-    if (!fragment->push_input(stream_id, std::move(data))) {
-      throw std::runtime_error("push_arrow: input stream " + std::to_string(stream_id) +
-                               " refused a batch; it had already ended");
+      // Charge the upload to a reservation on the target GPU: the host bytes for the copy, twice
+      // for a column whose conversion holds a second copy (see takes_second_copy).
+      std::size_t bytes = 0;
+      for (std::size_t i = 0; i < types.size(); ++i) {
+        auto const column_bytes = arrow_column_bytes(columns[i], *batch.value.children[i]);
+        bytes += takes_second_copy(columns[i], types[i]) ? 2 * column_bytes : column_bytes;
+      }
+      // Reserved before taking the upload lock, which only guards the shared upload stream.
+      auto reservation = space.make_reservation(std::max<std::size_t>(bytes, 1));
+
+      std::shared_ptr<cucascade::data_batch> data;
+      {
+        std::lock_guard<std::mutex> upload_lock(ctx.upload_mutex);
+        if (!ctx.upload_stream) { ctx.upload_stream = std::make_unique<rmm::cuda_stream>(); }
+        auto const stream = ctx.upload_stream->view();
+        auto* allocator   = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+        if (allocator == nullptr ||
+            !allocator->attach_reservation_to_tracker(stream, std::move(reservation))) {
+          throw std::runtime_error("push_arrow: failed to bind the upload to its GPU reservation");
+        }
+        try {
+          std::vector<std::unique_ptr<cudf::column>> converted;
+          converted.reserve(types.size());
+          for (std::size_t i = 0; i < types.size(); ++i) {
+            converted.push_back(arrow_column_to_declared(*schema.value.children[i],
+                                                         *batch.value.children[i],
+                                                         batch.value.offset,
+                                                         batch.value.length,
+                                                         columns[i],
+                                                         types[i],
+                                                         contexts[i],
+                                                         stream,
+                                                         mr));
+          }
+          data = sirius::make_data_batch(cudf::table(std::move(converted)),
+                                         space,
+                                         stream,
+                                         sirius::telemetry::batch_telemetry_info{});
+          // Publish only finished data. Same-GPU consumers read a batch already in their memory
+          // space without waiting on its writer event; Sirius relies on producers syncing before
+          // they publish (as gpu_pipeline_task does). The conversions above are only enqueued on
+          // the upload stream.
+          stream.synchronize();
+        } catch (...) {
+          allocator->reset_stream_reservation(stream);
+          throw;
+        }
+        allocator->reset_stream_reservation(stream);
+      }
+
+      if (!fragment->push_input(stream_id, std::move(data))) {
+        throw std::runtime_error("push_arrow: input stream " + std::to_string(stream_id) +
+                                 " refused a batch; it had already ended");
+      }
+      ++pushed;
     }
-    ++pushed;
+    fragment->close_input(stream_id, sender_id);
+  } catch (const std::exception& e) {
+    if (pushed > 0) {
+      record_push_failure("push_arrow into input stream " + std::to_string(stream_id) +
+                          " (sender " + std::to_string(sender_id) + ") failed after " +
+                          std::to_string(pushed) + " batch(es): " + e.what());
+    }
+    throw;
+  } catch (...) {
+    if (pushed > 0) {
+      record_push_failure("push_arrow into input stream " + std::to_string(stream_id) +
+                          " (sender " + std::to_string(sender_id) + ") failed after " +
+                          std::to_string(pushed) + " batch(es)");
+    }
+    throw;
   }
-  fragment->close_input(stream_id, sender_id);
   return pushed;
 }
 
@@ -989,6 +1108,7 @@ std::size_t Fragment::relay_from(Fragment& source,
                                  std::uint32_t sender_id)
 {
   impl_->require_built("relay_from()");
+  impl_->require_no_failed_push("relay_from()");
   if (!source.impl_->fragment) {
     throw sirius::invalid_input_exception(
       "Fragment: relay_from() requires the source fragment to have been built");
@@ -1000,12 +1120,14 @@ std::size_t Fragment::relay_from(Fragment& source,
 void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)
 {
   impl_->require_built("close_input()");
+  impl_->require_no_failed_push("close_input()");
   impl_->fragment->close_input(stream_id, sender_id);
 }
 
 void Fragment::run()
 {
   impl_->require_built("run()");
+  impl_->require_no_failed_push("run()");
   // Scans read DuckDB MVCC state through the active transaction.
   in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] { impl_->fragment->run(); });
 }

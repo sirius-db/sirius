@@ -178,17 +178,28 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// has release == nullptr on return, success or failure) and releases it before returning.
   /// Columns match the stream's declared columns by position and count (names not compared).
   /// Each column is converted to its declared DuckDB type:
-  ///   decimal128(p,s) (any p<=38) -> DECIMAL(P,S) as declared (rescale/narrow; overflow throws)
+  ///   decimal128(p,s) (any p<=38) -> DECIMAL(P,S), 5 <= P <= 38 (DuckDB stores P <= 4 as INT16,
+  ///     which has no cuDF type). A larger Arrow scale rounds half away from zero, as a DuckDB
+  ///     CAST does (1.2350 -> 1.24 for DECIMAL(15,2)); a smaller one rescales exactly. A value
+  ///     that does not fit DECIMAL(P,S) (after rounding) throws.
   ///   date32 -> DATE; int32 -> INTEGER; int64 -> BIGINT; double -> DOUBLE;
   ///   utf8 / large_utf8 / string_view -> VARCHAR
-  /// Device memory comes from Sirius's memory reservation manager; P2 places every batch on
-  /// the first active GPU (not promised by the API). Zero-row streams are valid.
+  /// Device memory comes from Sirius's memory reservation manager; currently every batch goes on
+  /// the first active GPU. Pushed batches stay there until run(), outside any query's memory
+  /// accounting and not spillable, so the pushed input must fit in that GPU's memory budget.
+  /// Zero-row streams are valid.
   /// Must be called after build()/build_json() and before run().
+  /// A failure after at least one batch was pushed leaves a partial input with `sender_id` still
+  /// open: every later push_arrow, relay_from, close_input and run() on this Fragment then throws
+  /// std::logic_error naming that failure, and the Fragment must be discarded. A failure before
+  /// the first batch pushes nothing and leaves the sender open.
   /// @return number of batches pushed.
-  /// @throws std::logic_error before build or after run; std::invalid_argument on an undeclared
-  ///         stream, a sender outside the declared set, a column-count mismatch, or an
-  ///         unconvertible type (message names stream id, column index, Arrow type, declared
-  ///         type); std::runtime_error when get_next fails or the input already ended.
+  /// @throws std::logic_error before build, after run, or after an earlier push_arrow failed
+  ///         mid-stream; std::invalid_argument on an undeclared stream, a sender outside the
+  ///         declared set, a column-count mismatch, an unconvertible type (message names stream
+  ///         id, column index, Arrow type, declared type), or a decimal value that overflows its
+  ///         declared precision; std::runtime_error when get_next fails, the input already ended,
+  ///         or the engine has no active GPU.
   std::size_t push_arrow(std::uint64_t stream_id,
                          std::uintptr_t arrow_array_stream_addr,
                          std::uint32_t sender_id);
@@ -197,26 +208,32 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// input stream `input_stream_id`, then close `sender_id` on it. Must be called after
   /// source.run() and before this->run(). Every check below runs before any data moves, except
   /// an input that already ended: that throws on the first batch, which is lost.
+  /// When this closes the last open sender of an input that never received a batch, one zero-row
+  /// batch of the declared types is pushed first, so an ungrouped aggregate still emits its row.
   /// @return number of batches moved.
   /// @throws before either fragment's build(), when the source has not run or its run() failed,
   /// after this->run(), when the source is a result fragment or on another Context, on an
   /// undeclared input or unknown stream id, on a sender outside the declared set, on a schema
-  /// mismatch, or when the input already ended.
+  /// mismatch, when the input already ended, or (std::logic_error) after a push_arrow into this
+  /// fragment failed mid-stream.
   std::size_t relay_from(Fragment& source,
                          std::uint64_t source_stream_id,
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
 
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
-  /// (relay_from closes its own sender). Idempotent per sender.
-  /// @throws before build() or on unknown stream/sender.
+  /// (relay_from closes its own sender). Idempotent per sender. Closing the last open sender of
+  /// an input that never received a batch pushes one zero-row batch of the declared types, so an
+  /// ungrouped aggregate over the empty input still emits its row.
+  /// @throws before build(), on unknown stream/sender, or (std::logic_error) after a push_arrow
+  /// into this fragment failed mid-stream.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
   /// Execute the fragment and block until pipelines finish. Every input must be closed first
   /// (relay_from and close_input close their sender). Runs once; after a failure, build a new
   /// fragment.
   /// @throws before build(), while an input is open (the fragment stays runnable), on a second
-  /// call, or on execution failure.
+  /// call, on execution failure, or (std::logic_error) after a push_arrow failed mid-stream.
   void run();
 
   /// Write this result fragment's rows into the caller-owned ArrowArrayStream at

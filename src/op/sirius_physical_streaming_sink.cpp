@@ -28,6 +28,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius::op {
 
@@ -138,19 +139,18 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
     // Output 0 gets the original handle (zero-copy); outputs 1..N-1 each get an independent
     // deep copy in the batch's current memory space so destinations cannot race over one handle's
     // residency. Clones first so output 0's push does not advance the stream's terminal state
-    // before the copies are made.
+    // before the copies are made. The task's reservation on `stream` covers the copies (see
+    // no_history_peak_memory_estimate).
     const auto& batches  = input.get_data_batches();
     const auto read_only = input.get_read_only_batches();
+    const std::vector<telemetry::batch_telemetry_info> copy_telemetry(_outputs.size() - 1,
+                                                                      batch_telemetry());
     for (std::size_t b = 0; b < batches.size(); ++b) {
+      auto copies = clone_for_fanout(read_only[b], stream, copy_telemetry);
       for (std::size_t i = 1; i < _outputs.size(); ++i) {
-        // clone()'s probe argument defaults to a no-op, so an omitted probe silently drops the
-        // clone from quent. Bind the id and the probe together, as PARTITION does.
-        const auto clone_batch_id = sirius::get_next_batch_id();
-        auto copy                 = read_only[b].clone(
-          clone_batch_id,
-          stream,
-          telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
-        if (!_outputs[i]->push(std::move(copy))) { poison_refused_output(*_outputs[i], i); }
+        if (!_outputs[i]->push(std::move(copies[i - 1]))) {
+          poison_refused_output(*_outputs[i], i);
+        }
       }
       if (!_outputs[0]->push(batches[b])) { poison_refused_output(*_outputs[0], 0); }
     }

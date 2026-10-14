@@ -27,6 +27,10 @@ static unique_ptr<BaseStatistics> SiriusSubstraitGenStatistics(ClientContext &co
 // plan-level relation holding its (shared) duplicate-eliminated input and the
 // join that owns the duplicate_eliminated_columns. DELIM_GETs resolve to the
 // innermost one, as in DuckDB's decorrelation.
+//
+// This state and sirius_substrait_gen_next_shared_index below are
+// process-global and unsynchronized: valid only because the generator converts
+// one plan at a time on a single thread.
 struct SiriusSubstraitGenDelimScope {
 	int32_t shared_ordinal;
 	const LogicalComparisonJoin *join;

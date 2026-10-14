@@ -25,6 +25,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <string>
@@ -251,8 +252,9 @@ WHERE a.month = 1 AND b.month = 2
 namespace {
 
 // `g` has a NULL key group and an all-NULL group (g = 3). Within each group,
-// i/b/d/f/s/dt each carry one distinct value (or NULL), and NULLs sit before
-// the value in insertion order so a "first row" answer would be wrong. `m` is
+// i/b/d/f/s/dt each carry one distinct value (or NULL), and in every group
+// with a value a NULL row comes first in insertion order, so a "first row"
+// answer would be wrong. `m` is
 // multi-valued per group. (No DECIMAL(38,x) column: the native DuckDB-table
 // scan does not put DECIMAL128 on the GPU at all, even for a plain projection,
 // so it would fall back for reasons unrelated to any_value.)
@@ -275,10 +277,10 @@ class AnyValueFixture : public sirius::test::GpuExecutionFixture {
       "(1,    NULL, NULL, NULL,   NULL, NULL,    NULL,         7),"
       "(1,    10,   100,  12.34,  1.5,  'one',   '1998-09-02', 3),"
       "(1,    10,   100,  12.34,  1.5,  'one',   '1998-09-02', 9),"
-      "(2,    -5,   -50,  -7.25,  -0.25,'two',   '1992-01-01', 4),"
       "(2,    NULL, NULL, NULL,   NULL, NULL,    NULL,         NULL),"
-      "(NULL, 42,   420,  0.01,   2.0,  'null',  '2000-02-29', 1),"
+      "(2,    -5,   -50,  -7.25,  -0.25,'two',   '1992-01-01', 4),"
       "(NULL, NULL, NULL, NULL,   NULL, NULL,    NULL,         2),"
+      "(NULL, 42,   420,  0.01,   2.0,  'null',  '2000-02-29', 1),"
       "(3,    NULL, NULL, NULL,   NULL, NULL,    NULL,         NULL);");
     run_ok("CHECKPOINT;");
   }
@@ -332,4 +334,30 @@ TEST_CASE_METHOD(AnyValueFixture,
     "SELECT g, any_value(m) BETWEEN MIN(m) AND MAX(m), any_value(m) IS NULL "
     "FROM any_v GROUP BY g");
   compare_gpu_vs_cpu("SELECT any_value(m) BETWEEN MIN(m) AND MAX(m) FROM any_v");
+}
+
+TEST_CASE_METHOD(AnyValueFixture,
+                 "gpu_execution any_value with ORDER BY falls back to CPU",
+                 "[integration][gpu_execution][aggregate][nulls][any_value]")
+{
+  // any_value(x ORDER BY y) is the first non-NULL x in y order, which MIN(x) is not: ungrouped,
+  // i ORDER BY m DESC is 10 (m = 9) where MIN(i) is -5; grouped, m ORDER BY m DESC is each
+  // group's largest m (9 for g = 1) where MIN(m) is the smallest (3).
+  auto const ungrouped = std::string("SELECT any_value(i ORDER BY m DESC) FROM any_v");
+  auto const grouped = std::string("SELECT g, any_value(m ORDER BY m DESC) FROM any_v GROUP BY g");
+
+  SECTION("rewritten to arg_min by DuckDB's expression rewriter")
+  {
+    expect_plan_fallback_matches_cpu(ungrouped);
+    expect_plan_fallback_matches_cpu(grouped);
+  }
+  SECTION("ORDER BY kept on the aggregate")
+  {
+    // Without the rewriter the aggregate reaches the Sirius planner still named any_value.
+    sirius::test::disabled_optimizers_guard guard(*con, "expression_rewriter");
+    // The unordered form still runs on the GPU, so the fallbacks below are the ORDER BY's.
+    compare_gpu_vs_cpu("SELECT g, any_value(i) FROM any_v GROUP BY g");
+    expect_plan_fallback_matches_cpu(ungrouped);
+    expect_plan_fallback_matches_cpu(grouped);
+  }
 }

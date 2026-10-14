@@ -15,6 +15,7 @@
  */
 
 #include "../operator/operator_test_utils.hpp"
+#include "utils/test_validation_utility.hpp"
 
 #include <catch.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -507,7 +508,7 @@ TEST_CASE("stream_session SESS-12: a fan-out input reaches every leaf with its o
   REQUIRE(c.repo->total_size() == 1);
 
   // Leaf 0 gets the pushed handle; the others get independent copies with their own ids and the
-  // same rows.
+  // same contents.
   auto from_a = a.source->stream().try_pull();
   auto from_b = b.source->stream().try_pull();
   auto from_c = c.source->stream().try_pull();
@@ -519,11 +520,13 @@ TEST_CASE("stream_session SESS-12: a fan-out input reaches every leaf with its o
   REQUIRE(from_b->get_batch_id() != original);
   REQUIRE(from_c->get_batch_id() != original);
   REQUIRE(from_b->get_batch_id() != from_c->get_batch_id());
-  for (auto const& copy : {from_b, from_c}) {
-    auto read_only = copy->to_read_only();
-    REQUIRE(read_only.get_memory_space() == gpu_space);
-    auto const& table = sirius::get_cudf_table_view(read_only);
-    REQUIRE(table.num_rows() == 3);
+  {
+    auto const pushed = batch->to_read_only();
+    auto const view   = sirius::get_cudf_table_view(pushed);
+    for (auto const& copy : {from_b, from_c}) {
+      REQUIRE(copy->to_read_only().get_memory_space() == gpu_space);
+      REQUIRE(sirius::test::expect_data_batch_equivalent_to_table(copy, view));
+    }
   }
 
   // Closing a sender closes it on every leaf; the input ends once every leaf has ended.

@@ -20,21 +20,20 @@
 # (get_substrait_json / from_substrait_json, to_substrait, from_substrait and
 # the vendored protobuf) on its own and does NOT link libsirius, so the
 # from-substrait and protobuf symbols libsirius carries are never duplicated.
-set(SIRIUS_SUBSTRAIT_DIR "${PROJECT_SOURCE_DIR}/substrait")
-file(GLOB_RECURSE _substrait_gen_protobuf_sources
-     "${SIRIUS_SUBSTRAIT_DIR}/third_party/google/protobuf/*.cc")
-# The generator needs the to-substrait direction, which libsirius never compiles
-# and which has drifted from DuckDB 1.5. Two TUs are compiled from patched
-# copies written into the build tree at configure time; the substrait submodule
-# itself stays untouched, and libsirius's from-substrait reader is compiled from
-# the unmodified sources (here and in libsirius).
+# SIRIUS_SUBSTRAIT_DIR and SIRIUS_SUBSTRAIT_SOURCES (the reader plus protobuf)
+# come from cmake/sirius-substrait.cmake. The generator needs the to-substrait
+# direction, which libsirius never compiles and which has drifted from DuckDB
+# 1.5. Two TUs are compiled from patched copies written into the build tree at
+# configure time; the substrait submodule itself stays untouched, and
+# libsirius's from-substrait reader is compiled from the unmodified sources
+# (here and in libsirius).
 #
-# sirius_substrait_gen_patch(<src> <out> <prefix> <find> <replace>
-#                            [<find> <replace> ...]) copies <src> to <out> with
-# every <find> replaced by its <replace> (fatal if a <find> is gone, i.e. the
-# patch is obsolete), prepends <prefix>, and maps diagnostics back to <src> via
-# #line. <out> is only rewritten when its content changes. Arguments are read
-# as ARGV<n> because C++ text contains ';'.
+# sirius_substrait_gen_patch(<src> <out> <prefix> <find> <replace> [<find>
+# <replace> ...]) copies <src> to <out> with every <find> replaced by its
+# <replace> (fatal if a <find> is gone, i.e. the patch is obsolete), prepends
+# <prefix>, and maps diagnostics back to <src> via #line. <out> is only
+# rewritten when its content changes. Arguments are read as ARGV<n> because C++
+# text contains ';'.
 function(sirius_substrait_gen_patch src out prefix)
   set_property(
     DIRECTORY
@@ -42,13 +41,16 @@ function(sirius_substrait_gen_patch src out prefix)
     PROPERTY CMAKE_CONFIGURE_DEPENDS "${src}")
   file(READ "${src}" text)
   math(EXPR last "${ARGC} - 1")
-  if(last LESS 4)
-    message(FATAL_ERROR "sirius_substrait_gen_patch: no <find> <replace> pair")
+  math(EXPR odd "(${ARGC} - 3) % 2")
+  if(last LESS 4 OR odd)
+    message(
+      FATAL_ERROR
+        "sirius_substrait_gen_patch: needs one or more <find> <replace> pairs")
   endif()
-  foreach(i RANGE 3 ${last} 2)
-    math(EXPR j "${i} + 1")
-    set(find "${ARGV${i}}")
-    set(replace "${ARGV${j}}")
+  foreach(find_idx RANGE 3 ${last} 2)
+    math(EXPR replace_idx "${find_idx} + 1")
+    set(find "${ARGV${find_idx}}")
+    set(replace "${ARGV${replace_idx}}")
     string(FIND "${text}" "${find}" pos)
     if(pos EQUAL -1)
       message(
@@ -73,16 +75,20 @@ endfunction()
 
 # to_substrait.cpp, with the helpers of to_substrait_prelude.inc prepended:
 #
-# 1. It calls TableFunction::statistics, which DuckDB 1.5's table_scan no longer
-#   sets (only statistics_extended), so get_substrait_json would call a null
-#   function pointer. Route it through SiriusSubstraitGenStatistics.
-# 2. TransformOp throws "Not implemented Error: DELIM_JOIN" / "CTE" for
-#   correlated subqueries (q04, q17, q20, q21, q22) and for CTEs that DuckDB's
-#   common_subplan optimizer creates below the root (q02, q11), and neither
-#   direction handles ANTI joins. to_substrait_transform_op.inc replaces the
-#   COMPARISON_JOIN case with DELIM_JOIN, DELIM_GET, nested CTE and ANTI
-#   translations into relations libsirius's unpatched reader accepts (see that
-#   file).
+# Patch 1: it calls TableFunction::statistics, which DuckDB 1.5's table_scan no
+# longer sets (only statistics_extended), so get_substrait_json would call a
+# null function pointer. Route it through SiriusSubstraitGenStatistics.
+#
+# Patch 2: TransformOp throws "Not implemented Error: DELIM_JOIN" / "CTE" for
+# correlated subqueries (q04, q17, q20, q21, q22) and for CTEs that DuckDB's
+# common_subplan optimizer creates below the root (q02, q11), and neither
+# direction handles ANTI joins. to_substrait_transform_op.inc replaces the
+# COMPARISON_JOIN case with DELIM_JOIN, DELIM_GET, nested CTE and ANTI
+# translations into relations libsirius's unpatched reader accepts (see that
+# file). ANTI becomes an outer join plus an IS NULL filter, which fans out and
+# is pessimistic for Q21/Q22 on the GPU; once libsirius's reader handles
+# JOIN_TYPE_LEFT_ANTI (upstream duckdb-substrait's reader already does), emit
+# LEFT_ANTI directly instead.
 sirius_substrait_gen_patch(
   "${SIRIUS_SUBSTRAIT_DIR}/src/to_substrait.cpp"
   "${CMAKE_CURRENT_BINARY_DIR}/to_substrait.cpp"
@@ -97,12 +103,12 @@ sirius_substrait_gen_patch(
   "#include \"${CMAKE_CURRENT_SOURCE_DIR}/to_substrait_transform_op.inc\"
 
 "
-  # 3. ReferenceRel ordinals are positions in plan.relations, and the reader
-  #   takes the LAST relation as the root. TransformPlan/TransformCTE call
-  #   plan.add_relations() and only then transform the subtree (unspecified
-  #   order in C++11; GCC adds first), so a subtree that adds relations itself
-  #   (shared delim inputs, nested CTEs) would land after the root and shift
-  #   every ordinal. Transform first, then add (and register the CTE index).
+  # Patch 3: ReferenceRel ordinals are positions in plan.relations, and the
+  # reader takes the LAST relation as the root. TransformPlan/TransformCTE call
+  # plan.add_relations() and only then transform the subtree (unspecified order
+  # in C++11; GCC adds first), so a subtree that adds relations itself (shared
+  # delim inputs, nested CTEs) would land after the root and shift every
+  # ordinal. Transform first, then add (and register the CTE index).
   "\tcte_indices.push_back(dop.table_index);\n"
   "\t/* cte_indices.push_back: after the transform below */\n"
   "plan.add_relations()->set_allocated_rel(TransformOp(*cte));"
@@ -110,13 +116,14 @@ sirius_substrait_gen_patch(
   "plan.add_relations()->set_allocated_root(TransformRootOp(*root));"
   "auto *root_rel = TransformRootOp(*root); plan.add_relations()->set_allocated_root(root_rel);"
   "plan.add_relations()->set_allocated_root(TransformRootOp(dop));"
-  "auto *root_rel = TransformRootOp(dop); plan.add_relations()->set_allocated_root(root_rel);")
-# 4. get_substrait_json's ExtractPlan runs ColumnBindingResolver before
-#   ResolveOperatorTypes. DuckDB 1.5 resolves types first
-#   (PhysicalPlanGenerator::ResolveAndPlan); otherwise the resolver sees the
-#   pre-optimizer types of reordered joins and throws "Failed to bind column
-#   reference ...: inequal types". Resolve types first (same line, so the #line
-#   mapping stays exact).
+  "auto *root_rel = TransformRootOp(dop); plan.add_relations()->set_allocated_root(root_rel);"
+)
+# Patch 4: get_substrait_json's ExtractPlan runs ColumnBindingResolver before
+# ResolveOperatorTypes. DuckDB 1.5 resolves types first
+# (PhysicalPlanGenerator::ResolveAndPlan); otherwise the resolver sees the
+# pre-optimizer types of reordered joins and throws "Failed to bind column
+# reference ...: inequal types". Resolve types first (same line, so the #line
+# mapping stays exact).
 sirius_substrait_gen_patch(
   "${SIRIUS_SUBSTRAIT_DIR}/src/substrait_extension.cpp"
   "${CMAKE_CURRENT_BINARY_DIR}/substrait_extension.cpp"
@@ -126,16 +133,7 @@ sirius_substrait_gen_patch(
 
 set(_substrait_gen_extension_sources
     ${CMAKE_CURRENT_BINARY_DIR}/substrait_extension.cpp
-    ${CMAKE_CURRENT_BINARY_DIR}/to_substrait.cpp
-    ${SIRIUS_SUBSTRAIT_DIR}/src/from_substrait.cpp
-    ${SIRIUS_SUBSTRAIT_DIR}/src/custom_extensions.cpp
-    ${SIRIUS_SUBSTRAIT_DIR}/src/custom_extensions_generated.cpp
-    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/algebra.pb.cc
-    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/extended_expression.pb.cc
-    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/plan.pb.cc
-    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/type.pb.cc
-    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/extensions/extensions.pb.cc
-    ${_substrait_gen_protobuf_sources})
+    ${CMAKE_CURRENT_BINARY_DIR}/to_substrait.cpp ${SIRIUS_SUBSTRAIT_SOURCES})
 # The extension TUs build as C++11 exactly like DuckDB itself: DuckDB's C++11
 # objects define static constexpr members (LogicalType::VARCHAR,
 # TableCatalogEntry::Name, ...) out of line, and the same headers compiled as

@@ -22,18 +22,61 @@
 
 #include <cudf/utilities/default_stream.hpp>
 
-#include <rmm/cuda_device.hpp>
-
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <utility>
 
 namespace sirius::exec {
+
+namespace {
+
+/// Fan-out copies of a GPU batch, made on a stream from @p space's pool under a reservation for
+/// all of them, so the copies are admitted like any other allocation and do not serialize against
+/// every pipeline stream as the legacy default stream would.
+std::vector<std::shared_ptr<cucascade::data_batch>> clone_on_reserved_stream(
+  const cucascade::read_only_data_batch& batch,
+  cucascade::memory::memory_space& space,
+  std::span<const telemetry::batch_telemetry_info> copy_telemetry)
+{
+  const auto* data = batch.get_data();
+  const std::size_t bytes =
+    (data == nullptr ? 0 : data->get_size_in_bytes()) * copy_telemetry.size();
+
+  // The pool is shared, and a stream already carrying another caller's reservation refuses a
+  // second one; move on to the next stream in that case.
+  constexpr int kMaxStreamAttempts = 16;
+  for (int attempt = 0; attempt < kMaxStreamAttempts; ++attempt) {
+    const auto stream = space.acquire_stream();
+    auto reservation  = space.make_reservation(std::max<std::size_t>(bytes, 1));
+    auto* allocator   = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+    if (allocator == nullptr) {
+      throw sirius::internal_exception(
+        "stream_session: GPU memory space has no reservation-aware allocator");
+    }
+    if (!allocator->attach_reservation_to_tracker(stream, std::move(reservation))) { continue; }
+    try {
+      auto copies = clone_for_fanout(batch, stream, copy_telemetry);
+      allocator->reset_stream_reservation(stream);
+      return copies;
+    } catch (...) {
+      allocator->reset_stream_reservation(stream);
+      throw;
+    }
+  }
+  throw sirius::internal_exception(
+    "stream_session: no pooled stream accepted the fan-out reservation");
+}
+
+}  // namespace
 
 void stream_session::add_source(stream_id_t id, op::sirius_physical_streaming_source& source)
 {
@@ -142,23 +185,19 @@ bool stream_session::push(stream_id_t id, std::shared_ptr<cucascade::data_batch>
   // cannot touch the batch while the copies are read.
   std::vector<std::shared_ptr<cucascade::data_batch>> copies;
   if (batch != nullptr) {
-    copies.reserve(sources.size() - 1);
+    std::vector<telemetry::batch_telemetry_info> copy_telemetry;
+    copy_telemetry.reserve(sources.size() - 1);
+    for (std::size_t i = 1; i < sources.size(); ++i) {
+      copy_telemetry.push_back(sources[i]->batch_telemetry());
+    }
     auto read_only = batch->to_read_only();
     auto* space    = read_only.get_memory_space();
-    std::optional<rmm::cuda_set_device_raii> device_guard;
-    if (space != nullptr && space->get_tier() == cucascade::memory::Tier::GPU) {
-      device_guard.emplace(rmm::cuda_device_id{space->get_device_id()});
+    if (space == nullptr || space->get_tier() != cucascade::memory::Tier::GPU) {
+      // Off-GPU copies allocate no device memory; the stream only orders the copy.
+      copies = clone_for_fanout(read_only, cudf::get_default_stream(), copy_telemetry);
+    } else {
+      copies = clone_on_reserved_stream(read_only, *space, copy_telemetry);
     }
-    auto stream = cudf::get_default_stream();
-    for (std::size_t i = 1; i < sources.size(); ++i) {
-      const auto clone_batch_id = sirius::get_next_batch_id();
-      copies.push_back(read_only.clone(
-        clone_batch_id,
-        stream,
-        telemetry::quent_data_batch_probe::create(sources[i]->batch_telemetry(), clone_batch_id)));
-    }
-    // The leaves run on their own streams; the copies must be complete before any reads them.
-    stream.synchronize();
   }
   bool accepted = true;
   for (std::size_t i = 1; i < sources.size(); ++i) {

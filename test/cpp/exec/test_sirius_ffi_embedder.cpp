@@ -20,18 +20,22 @@
 // and on two threads), build() and run()/drop on different threads, drop after build(), a build()
 // that fails after setup, execute_substrait, make_context_with_gpus / active_gpu_ids, and the
 // single-live-Context guard, the JSON plan entry points (execute_substrait_json, build_json),
-// push_arrow, and TPC-H Q1/Q6 over a Substrait corpus. Spec errors and failed-build rollback
-// live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
+// push_arrow (including fan-out to a shared relation), any_value, and TPC-H Q1-Q22 over a
+// Substrait corpus. Spec errors and failed-build rollback live in test_streaming_fragment.cpp
+// and test_sirius_ffi_fragment.cpp.
 
 #include "sirius/exception.hpp"
 #include "sirius/ffi.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/sirius_test_env.hpp"
+#include "yyjson.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/arrow/arrow.hpp>
 #include <duckdb/common/arrow/result_arrow_wrapper.hpp>
+#include <duckdb/common/types/date.hpp>
+#include <duckdb/common/types/decimal.hpp>
 #include <google/protobuf/util/json_util.h>  // DuckDB-vendored: duckdb::google::protobuf
 #include <substrait/plan.pb.h>
 
@@ -54,6 +58,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -729,34 +734,6 @@ std::string arrow_format_of(ArrowArrayStream& stream)
 using cell  = std::optional<std::string>;
 using table = std::vector<std::vector<cell>>;
 
-std::string int128_to_string(__int128 value)
-{
-  if (value == 0) { return "0"; }
-  bool const negative = value < 0;
-  unsigned __int128 magnitude =
-    negative ? -static_cast<unsigned __int128>(value) : static_cast<unsigned __int128>(value);
-  std::string digits;
-  while (magnitude != 0) {
-    digits.push_back(static_cast<char>('0' + static_cast<int>(magnitude % 10)));
-    magnitude /= 10;
-  }
-  if (negative) { digits.push_back('-'); }
-  std::reverse(digits.begin(), digits.end());
-  return digits;
-}
-
-std::string render_decimal(__int128 unscaled, int scale)
-{
-  if (scale <= 0) { return int128_to_string(unscaled); }
-  bool const negative = unscaled < 0;
-  auto digits         = int128_to_string(negative ? -unscaled : unscaled);
-  if (static_cast<int>(digits.size()) <= scale) {
-    digits.insert(0, static_cast<std::size_t>(scale) + 1 - digits.size(), '0');
-  }
-  digits.insert(digits.size() - static_cast<std::size_t>(scale), ".");
-  return negative ? "-" + digits : digits;
-}
-
 cell render_cell(ArrowSchema const& schema, ArrowArray const& array, std::int64_t row)
 {
   auto const i = row + array.offset;
@@ -778,9 +755,11 @@ cell render_cell(ArrowSchema const& schema, ArrowArray const& array, std::int64_
   if (format.rfind("d:", 0) == 0) {
     int precision = 0, scale = 0;
     REQUIRE(std::sscanf(format.c_str(), "d:%d,%d", &precision, &scale) == 2);
-    __int128 unscaled;
-    std::memcpy(&unscaled, static_cast<char const*>(values) + 16 * i, sizeof(unscaled));
-    return render_decimal(unscaled, scale);
+    std::uint64_t words[2];  // little-endian decimal128: low word first
+    std::memcpy(words, static_cast<char const*>(values) + 16 * i, sizeof(words));
+    duckdb::hugeint_t const unscaled(static_cast<std::int64_t>(words[1]), words[0]);
+    return duckdb::Decimal::ToString(
+      unscaled, static_cast<std::uint8_t>(precision), static_cast<std::uint8_t>(scale));
   }
   if (format == "u") {
     auto const* offsets = static_cast<std::int32_t const*>(values);
@@ -969,12 +948,13 @@ TEST_CASE("FFI push_arrow round-trips each supported type with nulls",
      {std::nullopt, "-3.50", "1.25", "9999999999999.99"},
      "",
      "d:15,2,128"},
-    // Rescale (scale 4 -> 2, truncating) and narrow (precision 38 -> 15).
+    // Rescale (scale 4 -> 2, rounding half away from zero like DuckDB CAST) and narrow
+    // (precision 38 -> 15).
     {"DECIMAL(15,2)",
      decimal_15_2,
-     "SELECT * FROM (VALUES (12.3400::DECIMAL(38,4)), (NULL)) t(a)",
-     "SELECT * FROM (VALUES (-0.0700::DECIMAL(38,4))) t(a)",
-     {std::nullopt, "-0.07", "12.34"},
+     "SELECT * FROM (VALUES (1.2350::DECIMAL(38,4)), (NULL), (12.3456::DECIMAL(38,4))) t(a)",
+     "SELECT * FROM (VALUES (-1.2350::DECIMAL(38,4))) t(a)",
+     {std::nullopt, "-1.24", "1.24", "12.35"},
      "",
      "d:38,4,128"},
     {"DATE",
@@ -1190,8 +1170,29 @@ TEST_CASE("FFI push_arrow rejects a decimal that overflows the declared precisio
   REQUIRE(s.release == nullptr);
 }
 
+TEST_CASE("FFI push_arrow rejects a decimal upscale that overflows before it wraps",
+          "[isolated_context][sirius_ffi]")
+{
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  arrow_source source;
+  auto fragment = sirius::ffi::make_fragment(*ctx);
+  fragment->declare_input_column(0, "a", "DECIMAL(38,4)");
+  fragment->build_json(stream_read_json(0, [](substrait::Type& t) {
+    auto* d = t.mutable_decimal();
+    d->set_precision(38);
+    d->set_scale(4);
+    d->set_nullability(kNullable);
+  }));
+  // 10^37 * 10^4 = 10^41 is past the int128 range: the check must run before the rescale wraps.
+  auto const ten_to_37 = "1" + std::string(37, '0');
+  auto s               = source.stream("SELECT '" + ten_to_37 + "'::DECIMAL(38,0) AS a");
+  REQUIRE(arrow_format_of(s) == "d:38,0,128");
+  REQUIRE_THROWS_AS(push(*fragment, 0, s), std::invalid_argument);
+  REQUIRE(s.release == nullptr);
+}
+
 // ---------------------------------------------------------------------------
-// TPC-H Q1 / Q6 from a Substrait corpus, on the GPU through execute_substrait_json
+// TPC-H from a Substrait corpus (Q1/Q6 on one GPU, all 22 on two) through execute_substrait_json
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1286,37 +1287,24 @@ bool corpus_plan_is_ordered(fs::path const& plan_path)
   }
 }
 
-// RFC 4180 rows (quoted fields may hold commas and doubled quotes; no embedded newlines).
-table read_csv(fs::path const& path)
+// The rows of an expected-results CSV (comma-separated, no header, '"' quoting, as DuckDB's
+// COPY writes them) as text. An unquoted empty field is NULL; a quoted one ("") is ''.
+table read_expected_csv(arrow_source& source, fs::path const& path)
 {
+  sirius::test::scoped_sirius_disable disable;
+  auto result =
+    source.con->Query("SELECT * FROM read_csv(" + sirius::test::sql_literal(path.string()) +
+                      ", header = false, delim = ',', quote = '\"', escape = '\"', "
+                      "all_varchar = true, allow_quoted_nulls = false)");
+  INFO(path.string());
+  REQUIRE_FALSE(result->HasError());
   table rows;
-  std::ifstream in(path);
-  for (std::string line; std::getline(in, line);) {
-    if (line.empty()) { continue; }
+  for (duckdb::idx_t r = 0; r < result->RowCount(); ++r) {
     std::vector<cell> row;
-    std::string field;
-    bool quoted = false;
-    for (std::size_t i = 0; i < line.size(); ++i) {
-      char const ch = line[i];
-      if (quoted) {
-        if (ch != '"') {
-          field.push_back(ch);
-        } else if (i + 1 < line.size() && line[i + 1] == '"') {
-          field.push_back('"');
-          ++i;
-        } else {
-          quoted = false;
-        }
-      } else if (ch == '"') {
-        quoted = true;
-      } else if (ch == ',') {
-        row.emplace_back(std::move(field));
-        field.clear();
-      } else {
-        field.push_back(ch);
-      }
+    for (duckdb::idx_t c = 0; c < result->ColumnCount(); ++c) {
+      auto const value = result->GetValue(c, r);
+      row.push_back(value.IsNull() ? cell{} : cell{value.ToString()});
     }
-    row.emplace_back(std::move(field));
     rows.push_back(std::move(row));
   }
   return rows;
@@ -1326,21 +1314,23 @@ table read_csv(fs::path const& path)
 std::vector<std::string> corpus_physical_types(fs::path const& result_types,
                                                std::string const& name)
 {
-  auto const text  = read_file(result_types);
-  auto const entry = text.find("\"" + name + "\"");
-  REQUIRE(entry != std::string::npos);
-  auto const key = text.find("\"physical_types\"", entry);
-  REQUIRE(key != std::string::npos);
-  auto const open  = text.find('[', key);
-  auto const close = text.find(']', open);
-  REQUIRE(close != std::string::npos);
-  std::vector<std::string> types;
-  for (auto q = text.find('"', open); q < close; q = text.find('"', q + 1)) {
-    auto const end = text.find('"', q + 1);
-    types.push_back(text.substr(q + 1, end - q - 1));
-    q = end;
+  namespace yy       = duckdb_yyjson;
+  auto const text    = read_file(result_types);
+  auto const release = [](yy::yyjson_doc* doc) { yy::yyjson_doc_free(doc); };
+  std::unique_ptr<yy::yyjson_doc, decltype(release)> doc(
+    yy::yyjson_read(text.data(), text.size(), 0), release);
+  INFO(result_types.string() << ", query " << name);
+  REQUIRE(doc != nullptr);
+  auto* queries = yy::yyjson_obj_get(yy::yyjson_doc_get_root(doc.get()), "queries");
+  auto* types   = yy::yyjson_obj_get(yy::yyjson_obj_get(queries, name.c_str()), "physical_types");
+  REQUIRE(yy::yyjson_is_arr(types));
+  std::vector<std::string> out;
+  for (std::size_t i = 0; i < yy::yyjson_arr_size(types); ++i) {
+    auto* type = yy::yyjson_arr_get(types, i);
+    REQUIRE(yy::yyjson_is_str(type));
+    out.emplace_back(yy::yyjson_get_str(type));
   }
-  return types;
+  return out;
 }
 
 // Whether Arrow format `format` has the layout of result-types.json physical type `type`.
@@ -1361,24 +1351,7 @@ bool arrow_matches_physical_type(std::string const& format, std::string const& t
 
 std::string days_to_iso_date(std::int64_t days)
 {
-  // Howard Hinnant's civil_from_days.
-  days += 719468;
-  auto const era = (days >= 0 ? days : days - 146096) / 146097;
-  auto const doe = days - era * 146097;
-  auto const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-  auto const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-  auto const mp  = (5 * doy + 2) / 153;
-  auto const day = doy - (153 * mp + 2) / 5 + 1;
-  auto const mon = mp < 10 ? mp + 3 : mp - 9;
-  auto const yr  = yoe + era * 400 + (mon <= 2 ? 1 : 0);
-  char buffer[32];
-  std::snprintf(buffer,
-                sizeof(buffer),
-                "%04lld-%02lld-%02lld",
-                static_cast<long long>(yr),
-                static_cast<long long>(mon),
-                static_cast<long long>(day));
-  return buffer;
+  return duckdb::Date::ToString(duckdb::date_t(static_cast<std::int32_t>(days)));
 }
 
 // collect_table with the column Arrow formats, DATE cells rendered as YYYY-MM-DD.
@@ -1400,47 +1373,49 @@ table collect_tpch_table(ArrowArrayStream& stream, std::vector<std::string>& for
   return rows;
 }
 
-bool parse_double(std::string const& text, double& out)
+double parse_double(std::string const& text)
 {
-  char* end = nullptr;
-  out       = std::strtod(text.c_str(), &end);
-  return !text.empty() && end == text.c_str() + text.size();
+  char* end          = nullptr;
+  double const value = std::strtod(text.c_str(), &end);
+  INFO("not a number: '" << text << "'");
+  REQUIRE((!text.empty() && end == text.c_str() + text.size()));
+  return value;
 }
 
-void require_matches(table const& actual, table const& expected)
+// Floating-point columns (Arrow `formats` g / f) match within a 1e-6 relative tolerance; every
+// other cell, integers and decimals included, must match exactly, NULL only NULL.
+void require_matches(table const& actual,
+                     table const& expected,
+                     std::vector<std::string> const& formats)
 {
   REQUIRE(actual.size() == expected.size());
   for (std::size_t r = 0; r < expected.size(); ++r) {
-    REQUIRE(actual[r].size() == expected[r].size());
-    for (std::size_t c = 0; c < expected[r].size(); ++c) {
-      INFO("row " << r << " column " << c);
-      if (!actual[r][c].has_value()) {
-        REQUIRE(expected[r][c]->empty());  // the CSV writes NULL as an empty field
+    REQUIRE(actual[r].size() == formats.size());
+    REQUIRE(expected[r].size() == formats.size());
+    for (std::size_t c = 0; c < formats.size(); ++c) {
+      INFO("row " << r << " column " << c << " (Arrow " << formats[c] << "): got "
+                  << actual[r][c].value_or("NULL") << ", expected "
+                  << expected[r][c].value_or("NULL"));
+      bool const floating = formats[c] == "g" || formats[c] == "f";
+      if (!floating || !actual[r][c] || !expected[r][c]) {
+        REQUIRE(actual[r][c] == expected[r][c]);
         continue;
       }
-      auto const& got  = *actual[r][c];
-      auto const& want = *expected[r][c];
-      double got_value = 0, want_value = 0;
-      if (parse_double(want, want_value) && parse_double(got, got_value)) {
-        INFO("got " << got << ", expected " << want);
-        REQUIRE(std::abs(got_value - want_value) <= 1e-6 * std::max(1.0, std::abs(want_value)));
-      } else {
-        REQUIRE(got == want);
-      }
+      auto const got  = parse_double(*actual[r][c]);
+      auto const want = parse_double(*expected[r][c]);
+      REQUIRE(std::abs(got - want) <= 1e-6 * std::max(1.0, std::abs(want)));
     }
   }
 }
 
-// GPU and host budgets large enough for TPC-H SF1 lineitem.
-std::string write_tpch_config(sirius::test::scratch_dir& scratch)
+// GPU and host budgets for TPC-H SF1 on each GPU of the Context.
+std::string write_tpch_config(sirius::test::scratch_dir& scratch,
+                              std::uint64_t gpu_bytes,
+                              std::uint64_t host_bytes)
 {
   auto const path = scratch.file("tpch.yaml");
-  std::ofstream(path) << "sirius:\n"
-                         "  memory:\n"
-                         "    gpu:\n"
-                         "      usage_limit_bytes: 17179869184\n"
-                         "    host:\n"
-                         "      capacity_bytes: 8589934592\n";
+  std::ofstream(path) << "sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: " << gpu_bytes
+                      << "\n    host:\n      capacity_bytes: " << host_bytes << "\n";
   return path;
 }
 
@@ -1450,13 +1425,21 @@ namespace {
 
 // Runs `queries` (all 22 when empty, or SIRIUS_TPCH_QUERIES=q15,q21 while debugging) from the
 // corpus on `gpus` and checks rows and Arrow types against the expected results. The corpus
-// directory (SIRIUS_TPCH_SUBSTRAIT_DIR) holds qNN.substrait.json and result-types.json; the data
-// directory (SIRIUS_TPCH_DATA_DIR) holds input/ (TPC-H SF1 Parquet) and expected_results/ (qNN.csv).
-// The test skips when either is unset or incomplete.
-void run_tpch_corpus(std::vector<int> const& gpus, std::vector<std::string> queries)
+// directory (SIRIUS_TPCH_SUBSTRAIT_DIR) is the --out directory of tools/substrait_gen's
+// sirius_substrait_gen, holding qNN.substrait.json and result-types.json; the data directory
+// (SIRIUS_TPCH_DATA_DIR) holds input/ (TPC-H SF1 Parquet) and expected_results/ (qNN.csv).
+// The test skips when either variable is unset; once both are set, every file it needs must
+// exist.
+void run_tpch_corpus(std::vector<int> const& gpus,
+                     std::vector<std::string> queries,
+                     std::uint64_t gpu_bytes,
+                     std::uint64_t host_bytes)
 {
-  auto const corpus       = env_dir("SIRIUS_TPCH_SUBSTRAIT_DIR");
-  auto const data         = env_dir("SIRIUS_TPCH_DATA_DIR");
+  auto const corpus = env_dir("SIRIUS_TPCH_SUBSTRAIT_DIR");
+  auto const data   = env_dir("SIRIUS_TPCH_DATA_DIR");
+  if (corpus.empty() || data.empty()) {
+    SKIP("set SIRIUS_TPCH_SUBSTRAIT_DIR and SIRIUS_TPCH_DATA_DIR to a TPC-H SF1 corpus and data");
+  }
   auto const result_types = corpus / "result-types.json";
 
   if (queries.empty()) {
@@ -1473,15 +1456,22 @@ void run_tpch_corpus(std::vector<int> const& gpus, std::vector<std::string> quer
       }
     }
   }
-  bool present = !corpus.empty() && !data.empty() && fs::exists(result_types) && fs::exists(data / "input" / "lineitem.parquet");
+  // A missing file is an incomplete corpus or a misspelled query name (q1 for q01): fail.
+  auto const require_file = [](fs::path const& path) {
+    INFO("missing " << path.string());
+    REQUIRE(fs::is_regular_file(path));
+  };
+  require_file(result_types);
+  require_file(data / "input" / "lineitem.parquet");
   for (auto const& q : queries) {
-    present = present && fs::exists(corpus / (q + ".substrait.json")) &&
-              fs::exists(data / "expected_results" / (q + ".csv"));
+    require_file(corpus / (q + ".substrait.json"));
+    require_file(data / "expected_results" / (q + ".csv"));
   }
-  if (!present) { SKIP("set SIRIUS_TPCH_SUBSTRAIT_DIR and SIRIUS_TPCH_DATA_DIR to a TPC-H SF1 corpus and data"); }
 
+  arrow_source csv_reader;
   sirius::test::scratch_dir scratch("ffi_embedder_tpch");
-  auto ctx = sirius::ffi::make_context_with_gpus(gpus, write_tpch_config(scratch));
+  auto ctx =
+    sirius::ffi::make_context_with_gpus(gpus, write_tpch_config(scratch, gpu_bytes, host_bytes));
   for (auto const& q : queries) {
     INFO(q << " on " << gpus.size() << " GPU(s)");
     auto const plan_path = corpus / (q + ".substrait.json");
@@ -1502,12 +1492,12 @@ void run_tpch_corpus(std::vector<int> const& gpus, std::vector<std::string> quer
       REQUIRE(arrow_matches_physical_type(formats[c], types[c]));
     }
 
-    auto expected = read_csv(data / "expected_results" / (q + ".csv"));
+    auto expected = read_expected_csv(csv_reader, data / "expected_results" / (q + ".csv"));
     if (!corpus_plan_is_ordered(plan_path)) {
       actual   = sorted_rows(std::move(actual));
       expected = sorted_rows(std::move(expected));
     }
-    require_matches(actual, expected);
+    require_matches(actual, expected, formats);
     std::printf("[tpch] %s on %zu GPU(s): PASS, %zu rows, %lld ms\n",
                 q.c_str(),
                 gpus.size(),
@@ -1518,17 +1508,19 @@ void run_tpch_corpus(std::vector<int> const& gpus, std::vector<std::string> quer
 
 }  // namespace
 
+// Not [multi_gpu], so scripts/run_unit_tests.py runs it in a shard: two per GPU, each sized for
+// a fifth of a 15 GiB card (integration-shard.yaml). SF1 Q1/Q6 fit in that 3 GiB.
 TEST_CASE("FFI execute_substrait_json runs TPC-H Q1 and Q6 from a corpus on one GPU",
           "[isolated_context][sirius_ffi][tpch]")
 {
-  run_tpch_corpus({0}, {"q01", "q06"});
+  run_tpch_corpus({0}, {"q01", "q06"}, 3ull << 30, 4ull << 30);
 }
 
 TEST_CASE("FFI execute_substrait_json runs all 22 TPC-H queries from a corpus on two GPUs",
           "[isolated_context][sirius_ffi][tpch][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { SKIP("needs 2 GPUs"); }
-  run_tpch_corpus({0, 1}, {});
+  run_tpch_corpus({0, 1}, {}, 16ull << 30, 8ull << 30);
 }
 
 // ---------------------------------------------------------------------------
@@ -1807,6 +1799,10 @@ TEST_CASE("FFI push_arrow decimal overflow checks only non-null values at the bo
                       Catch::Matchers::ContainsSubstring("overflow") &&
                         Catch::Matchers::ContainsSubstring("column 0"));
   REQUIRE(s.release == nullptr);
+
+  // The first batch already went in, so the input is incomplete: the Fragment cannot finish.
+  REQUIRE_THROWS(fragment->close_input(0, 0));
+  REQUIRE_THROWS(fragment->run());
 }
 
 TEST_CASE("FFI push_arrow rejects declared types outside the supported set",
@@ -1891,6 +1887,120 @@ TEST_CASE("FFI push_arrow works on a two-GPU Context", "[isolated_context][siriu
   REQUIRE(push(*fragment, 0, second, 1) == 1);
   fragment->run();
   REQUIRE(result_table(*fragment) == table{{"1010", "5"}});
+}
+
+TEST_CASE("FFI push_arrow closes an input whose two senders both end empty",
+          "[isolated_context][sirius_ffi]")
+{
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  arrow_source source;
+  auto empty = concat_streams({source.stream("SELECT 1::BIGINT AS a")}, /*schema_only=*/true);
+
+  auto fragment = sirius::ffi::make_fragment(*ctx);
+  fragment->declare_input_column(0, "a", "BIGINT");
+  fragment->declare_input_sender(0, 0);
+  fragment->declare_input_sender(0, 1);
+  fragment->build_json(aggregate_json(0, {{"a", kBigint}}, {{"count", std::nullopt}, {"max", 0}}));
+  REQUIRE(push(*fragment, 0, empty, 0) == 0);
+  fragment->close_input(0, 1);  // a remote sender that sent no batches
+  fragment->run();
+  REQUIRE(result_table(*fragment) == table{{"0", std::nullopt}});
+}
+
+namespace {
+
+// Wraps `inner` and turns its k-th batch into a slice of it: the parent struct gets
+// slices[k] = {offset, length} while its children keep their full, longer length.
+struct slice_state {
+  ArrowArrayStream inner;
+  std::vector<std::pair<std::int64_t, std::int64_t>> slices;
+  std::size_t next{0};
+  std::string error;
+};
+
+int slice_get_schema(ArrowArrayStream* self, ArrowSchema* out)
+{
+  auto* state = static_cast<slice_state*>(self->private_data);
+  return state->inner.get_schema(&state->inner, out);
+}
+
+int slice_get_next(ArrowArrayStream* self, ArrowArray* out)
+{
+  auto* state = static_cast<slice_state*>(self->private_data);
+  if (int rc = state->inner.get_next(&state->inner, out); rc != 0) {
+    state->error = state->inner.get_last_error(&state->inner);
+    return rc;
+  }
+  if (out->release == nullptr) { return 0; }
+  if (state->next == state->slices.size() ||
+      state->slices[state->next].first + state->slices[state->next].second > out->length) {
+    out->release(out);
+    state->error = "slice_get_next: no slice for this batch";
+    return EINVAL;
+  }
+  auto const [offset, length] = state->slices[state->next++];
+  out->offset += offset;
+  out->length = length;
+  return 0;
+}
+
+const char* slice_last_error(ArrowArrayStream* self)
+{
+  return static_cast<slice_state*>(self->private_data)->error.c_str();
+}
+
+void slice_release(ArrowArrayStream* self)
+{
+  auto* state = static_cast<slice_state*>(self->private_data);
+  release_if(state->inner);
+  delete state;
+  self->release = nullptr;
+}
+
+ArrowArrayStream sliced_stream(ArrowArrayStream inner,
+                               std::vector<std::pair<std::int64_t, std::int64_t>> slices)
+{
+  ArrowArrayStream out = {};
+  out.get_schema       = slice_get_schema;
+  out.get_next         = slice_get_next;
+  out.get_last_error   = slice_last_error;
+  out.release          = slice_release;
+  out.private_data     = new slice_state{inner, std::move(slices), 0, {}};
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("FFI push_arrow reads only the rows of a sliced batch", "[isolated_context][sirius_ffi]")
+{
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  arrow_source source;
+  std::vector<stream_column> const columns = {{"a", kBigint}, {"b", kString}};
+
+  auto fragment = sirius::ffi::make_fragment(*ctx);
+  fragment->declare_input_column(0, "a", "BIGINT");
+  fragment->declare_input_column(0, "b", "VARCHAR");
+  fragment->build_json(multi_column_read_json(0, columns));
+
+  // Batch 1 keeps rows 2..4 of 0..5, batch 2 rows 1..2 of 10..13; NULLs fall on both sides of
+  // each slice edge, so validity bits are read at the parent's offset too.
+  auto batch_1 = source.stream(
+    "SELECT * FROM (VALUES (0::BIGINT, 'zero'), (1, NULL), (2, 'two'), (NULL, 'three'), "
+    "(4, NULL), (5, 'five')) t(a, b)");
+  auto batch_2 = source.stream(
+    "SELECT * FROM (VALUES (10::BIGINT, NULL), (11, 'a string longer than twelve bytes'), "
+    "(NULL, 'twelve'), (13, 'thirteen')) t(a, b)");
+  auto input = sliced_stream(concat_streams({batch_1, batch_2}), {{2, 3}, {1, 2}});
+  REQUIRE(push(*fragment, 0, input) == 2);
+  REQUIRE(input.release == nullptr);
+  fragment->run();
+
+  table const expected = {{std::nullopt, "three"},
+                          {std::nullopt, "twelve"},
+                          {"11", "a string longer than twelve bytes"},
+                          {"2", "two"},
+                          {"4", std::nullopt}};
+  REQUIRE(sorted_rows(result_table(*fragment)) == expected);
 }
 
 namespace {
@@ -2208,8 +2318,8 @@ TEST_CASE("FFI any_value merges across two GPUs", "[isolated_context][sirius_ffi
 namespace {
 
 // Columns: g BIGINT (i % 3), n INTEGER, dt DATE, d DECIMAL(15,2), w DECIMAL(38,4). Each value
-// column is functionally dependent on g (one value per group), NULL on every other row, and
-// leads with NULL in each group; group 2 is all NULL.
+// column is functionally dependent on g (one value per group) and NULL on every other row;
+// group 0 leads with NULL, group 2 is all NULL.
 void write_any_value_types_parquet(std::string const& path)
 {
   sirius::test::scoped_sirius_disable disable;

@@ -15,6 +15,7 @@
  */
 
 #include "../operator/operator_test_utils.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "exec/streaming_fragment.hpp"
 #include "helper/logical_type.hpp"
@@ -24,6 +25,8 @@
 #include "sirius_engine.hpp"
 
 #include <cudf/unary.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 #include <catch.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -41,6 +44,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -1507,5 +1511,66 @@ TEST_CASE_METHOD(fragment_fixture,
       con->Rollback();
       throw;
     }
+  }
+}
+
+// ============================================================================
+// FRAG-17: push_input checks a batch against the declared input before queueing it
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-17: push_input rejects a batch that does not match the declared input",
+                 "[integration][streaming_fragment]")
+{
+  auto types_of = [](std::initializer_list<duckdb::LogicalType> types) {
+    return sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(types));
+  };
+
+  con->BeginTransaction();
+  try {
+    fragment_spec sender_spec;
+    sender_spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+    sender_spec.outputs     = {0};
+    streaming_fragment sender(*con->context, std::move(sender_spec));
+    sender.build();
+    sender.run();
+
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
+    spec.inputs[0]   = stream_input_spec{{"a"}, types_of({duckdb::LogicalType::INTEGER}), {0}};
+    spec.outputs     = {1};
+    streaming_fragment receiver(*con->context, std::move(spec));
+    receiver.build();
+
+    auto& space = receiver.input_memory_space();
+    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{space.get_device_id()}};
+    auto empty_batch = [&](std::initializer_list<duckdb::LogicalType> types) {
+      return sirius::make_data_batch(std::move(*sirius::make_empty_table(types_of(types))),
+                                     space,
+                                     cudf::get_default_stream(),
+                                     sirius::telemetry::batch_telemetry_info{});
+    };
+
+    REQUIRE_THROWS_AS(receiver.push_input(0, empty_batch({duckdb::LogicalType::BIGINT})),
+                      std::invalid_argument);
+    REQUIRE_THROWS_WITH(receiver.push_input(0, empty_batch({duckdb::LogicalType::BIGINT})),
+                        ContainsSubstring("stream 0 column 0"));
+    REQUIRE_THROWS_AS(
+      receiver.push_input(
+        0, empty_batch({duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER})),
+      std::invalid_argument);
+    REQUIRE_THROWS_AS(receiver.push_input(9, empty_batch({duckdb::LogicalType::INTEGER})),
+                      sirius::invalid_input_exception);
+
+    // The rejected batches never reached the input: it still takes a matching batch and data.
+    REQUIRE(receiver.push_input(0, empty_batch({duckdb::LogicalType::INTEGER})));
+    REQUIRE(receiver.relay_from(sender, 0, 0, 0) > 0);
+    receiver.run();
+    REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
   }
 }

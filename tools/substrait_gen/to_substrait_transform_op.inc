@@ -4,6 +4,13 @@
 // from-substrait reader in libsirius already accepts: ReferenceRel to a
 // plan-level relation, AggregateRel without measures, and INNER / LEFT / RIGHT
 // / SEMI / SINGLE joins with is_not_distinct_from conditions.
+//
+// ANTI / RIGHT_ANTI become an outer join against the other side plus an
+// IS NULL filter on a marker column. That join fans out (every kept row meets
+// all its matches before the filter drops them), which is pessimistic for
+// anti-join heavy queries such as Q21/Q22 on the GPU. Follow-up: once
+// libsirius's reader handles JOIN_TYPE_LEFT_ANTI (upstream duckdb-substrait's
+// reader already does), emit LEFT_ANTI directly.
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
 		// A CTE below the root (DuckDB's common_subplan optimizer creates
 		// these): its definition becomes a plan-level relation, read through
@@ -80,7 +87,6 @@
 		const idx_t keep = djoin.join_type == JoinType::RIGHT_ANTI ? 1 : 0;
 		const idx_t other = 1 - keep;
 		auto saved_type = djoin.join_type;
-		auto saved_left_map = djoin.left_projection_map;
 		auto saved_right_map = djoin.right_projection_map;
 		if (djoin.left_projection_map.empty()) {
 			for (idx_t i = 0; i < dop.children[0]->types.size(); i++) {
@@ -108,6 +114,15 @@
 		dop.children[other] = std::move(marker);
 		(keep == 0 ? djoin.right_projection_map : djoin.left_projection_map) = vector<idx_t> {marker_idx};
 		djoin.join_type = keep == 0 ? JoinType::LEFT : JoinType::RIGHT;
+		// Restore the children and join type, but leave the projection maps
+		// describing the rewritten node's real output (the kept columns), as
+		// TransformComparisonJoin leaves its maps filled: a parent
+		// COMPARISON_JOIN derives this node's column count from them
+		// (left_projection_map.size() for ANTI, the sum of both maps for
+		// RIGHT_ANTI), so ANTI keeps left = kept, and RIGHT_ANTI keeps
+		// right = kept with an empty left map. A DELIM_JOIN child is counted by
+		// its types instead, which never change. Either way, a second transform
+		// of this node rewrites it identically.
 		auto restore_anti = SiriusSubstraitGenOnExit([&]() {
 			if (dop.children[other] && dop.children[other]->type == LogicalOperatorType::LOGICAL_PROJECTION &&
 			    !dop.children[other]->children.empty()) {
@@ -115,8 +130,13 @@
 				dop.children[other] = std::move(original);
 			}
 			djoin.join_type = saved_type;
-			djoin.left_projection_map = saved_left_map;
-			djoin.right_projection_map = saved_right_map;
+			if (keep == 0) {
+				djoin.left_projection_map = kept;
+				djoin.right_projection_map = saved_right_map;
+			} else {
+				djoin.left_projection_map.clear();
+				djoin.right_projection_map = kept;
+			}
 		});
 
 		auto joined = TransformComparisonJoin(dop);
@@ -137,6 +157,7 @@
 		vector<int32_t> output_mapping;
 		for (idx_t i = 0; i < kept.size(); i++) {
 			CreateFieldRef(sproj->add_expressions(), first_kept + i);
+			// Project expressions are numbered after the joined_count input fields.
 			output_mapping.push_back(static_cast<int32_t>(joined_count + i));
 		}
 		sproj->set_allocated_common(CreateOutputMapping(output_mapping));

@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -478,27 +479,27 @@ void streaming_fragment::close_sender(stream_id_t id, sender_id_t sender)
 void streaming_fragment::push_empty_batch(stream_id_t id,
                                           const duckdb::vector<sirius::logical_type>& types)
 {
-  cucascade::memory::memory_space* space = nullptr;
-  for (auto const* gpu_space :
-       sirius_context_of(_context).get_memory_manager().get_memory_spaces_for_tier(
-         cucascade::memory::Tier::GPU)) {
-    if (gpu_space != nullptr) {
-      // The manager owns its spaces mutably and only exposes them as const.
-      space = const_cast<cucascade::memory::memory_space*>(gpu_space);
-      break;
-    }
-  }
-  if (space == nullptr) {
-    throw sirius::internal_exception("streaming_fragment: no GPU memory space for input stream " +
-                                     std::to_string(id));
-  }
-  rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{space->get_device_id()}};
+  auto& space = input_memory_space();
+  rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{space.get_device_id()}};
   auto batch = sirius::make_data_batch(std::move(*sirius::make_empty_table(types)),
-                                       *space,
+                                       space,
                                        cudf::get_default_stream(),
                                        sirius::telemetry::batch_telemetry_info{});
   // An ended input refuses it; close_input() then reports that sender as usual.
   (void)_session.push(id, std::move(batch));
+}
+
+cucascade::memory::memory_space& streaming_fragment::input_memory_space() const
+{
+  auto& sirius_ctx  = sirius_context_of(_context);
+  auto const& gpus  = sirius_ctx.active_gpu_ids();
+  auto* const space = gpus.empty() ? nullptr
+                                   : sirius_ctx.get_memory_manager().get_memory_space(
+                                       cucascade::memory::Tier::GPU, gpus.front());
+  if (space == nullptr) {
+    throw sirius::internal_exception("streaming_fragment: the engine has no active GPU");
+  }
+  return *space;
 }
 
 const stream_input_spec* streaming_fragment::find_input(stream_id_t id) const
@@ -518,6 +519,41 @@ bool streaming_fragment::push_input(stream_id_t id, std::shared_ptr<cucascade::d
   if (!accepts_input()) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: push_input() must run after build() and before run()");
+  }
+  auto const declared = _spec.inputs.find(id);
+  if (declared == _spec.inputs.end()) {
+    throw sirius::invalid_input_exception("streaming_fragment: input stream " + std::to_string(id) +
+                                          " was never declared on this fragment");
+  }
+  if (batch == nullptr) {
+    throw std::invalid_argument("streaming_fragment: push_input() into stream " +
+                                std::to_string(id) + " got a null batch");
+  }
+  {
+    auto const& types = declared->second.types;
+    auto read_only    = batch->to_read_only();
+    auto const* gpu =
+      dynamic_cast<const cucascade::gpu_table_representation*>(read_only.get_data());
+    if (gpu == nullptr) {
+      throw std::invalid_argument("streaming_fragment: push_input() into stream " +
+                                  std::to_string(id) + " needs a GPU table batch");
+    }
+    auto const view = gpu->get_table_view();
+    if (static_cast<std::size_t>(view.num_columns()) != types.size()) {
+      throw std::invalid_argument(
+        "streaming_fragment: push_input() into stream " + std::to_string(id) + " got " +
+        std::to_string(view.num_columns()) + " columns, declared " + std::to_string(types.size()));
+    }
+    for (std::size_t i = 0; i < types.size(); ++i) {
+      auto const expected = sirius::get_cudf_type(types[i]);
+      auto const actual   = view.column(static_cast<cudf::size_type>(i)).type();
+      if (actual != expected) {
+        throw std::invalid_argument(
+          "streaming_fragment: push_input() into stream " + std::to_string(id) + " column " +
+          std::to_string(i) + " has cuDF type " + std::to_string(static_cast<int>(actual.id())) +
+          " (scale " + std::to_string(actual.scale()) + "), declared " + types[i].to_string());
+      }
+    }
   }
   if (!_session.push(id, std::move(batch))) { return false; }
   note_input_data(id);

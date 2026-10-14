@@ -920,15 +920,16 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   // nest under its device instead of piling up flat under the engine. The GPU
   // memory manager already reflects the configured topology.num_gpus / topology.gpu_ids
   // selection, unlike the raw hardware topology.
-  std::vector<int> active_gpu_ids;
+  active_gpu_ids_.clear();
   for (auto const* gpu_space :
        memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    if (gpu_space != nullptr) { active_gpu_ids.push_back(gpu_space->get_device_id()); }
+    if (gpu_space != nullptr) { active_gpu_ids_.push_back(gpu_space->get_device_id()); }
   }
-  std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
-  active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
-                       active_gpu_ids.end());
-  telemetry_context_ = sirius::telemetry::telemetry_context::create(
+  std::sort(active_gpu_ids_.begin(), active_gpu_ids_.end());
+  active_gpu_ids_.erase(std::unique(active_gpu_ids_.begin(), active_gpu_ids_.end()),
+                        active_gpu_ids_.end());
+  auto const& active_gpu_ids = active_gpu_ids_;
+  telemetry_context_         = sirius::telemetry::telemetry_context::create(
     std::move(quent_context), config_.get_telemetry_config(), memory_manager_.get());
 
   {
@@ -1248,6 +1249,7 @@ void SiriusContext::terminate()
   small_pinned_allocator_.reset();
 
   memory_manager_->shutdown();
+  active_gpu_ids_.clear();
   memory_manager_.reset();
 
   // Owns only a topology copy (no device resources); drop after the components
