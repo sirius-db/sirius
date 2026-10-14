@@ -762,6 +762,15 @@ void test_decimal128_bitpack_roundtrip()
   memory_roundtrip("decimal128_bitpack_memory", t->view(), "input -> bitpack\n");
 }
 
+// An identity leaf keeps its column's type, so a decimal read back must be rebuilt
+// as a fixed-width column; make_numeric_column rejects decimal and chrono types.
+void test_decimal128_identity_roundtrip()
+{
+  auto t = make_decimal128_table(1, 4096, 23);
+  io_roundtrip("decimal128_identity", t->view(), "input -> identity\n");
+  memory_roundtrip("decimal128_identity_memory", t->view(), "input -> identity\n");
+}
+
 // The same column under the plan the spill path actually emits, which names the
 // four original channels and leaves `chunk_divisors` to ride along as a trailing
 // one. A channel that is written but not named is exactly where a width bug
@@ -813,6 +822,7 @@ int main()
     {"validity_sidecar", test_validity_sidecar_roundtrip},
     {"validity_header_integrity", test_validity_header_integrity},
     {"decimal128_bitpack", test_decimal128_bitpack_roundtrip},
+    {"decimal128_identity", test_decimal128_identity_roundtrip},
     {"decimal128_bitpack_named_channels", test_decimal128_bitpack_named_channels},
   };
 
