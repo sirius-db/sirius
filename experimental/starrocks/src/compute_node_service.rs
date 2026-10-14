@@ -1161,11 +1161,15 @@ impl SiriusComputeNodeService {
         remote: &[(SenderSlot, SocketAddr)],
         names: &[String],
     ) -> std::result::Result<(), String> {
-        let mut shipped = Ok(());
+        let mut shipped: std::result::Result<(), String> = Ok(());
         for &(slot, peer) in remote {
             shipped = match shipped {
-                // The query is failing: shipping the rest would only write into peers' pools.
+                // The query is failing: shipping the rest would only write into peers' pools. The
+                // receiver of a hop that never ran still gets a failure frame in place of its EOS.
                 Err(err) => {
+                    if let Some(nixl) = &self.nixl {
+                        nixl.fail(peer, slot, &err);
+                    }
                     let _ = self.executor.drop_parked(slot);
                     Err(err)
                 }
@@ -1883,7 +1887,10 @@ mod tests {
         ) -> Result<(), String> {
             self.sent.lock().unwrap().push((peer, slot));
             if self.fail_sends {
-                return Err(format!("{peer} refused transmit_chunk"));
+                // As the transport does: the failed hop ends with a failure frame.
+                let err = format!("{peer} refused transmit_chunk");
+                self.fail(peer, slot, &err);
+                return Err(err);
             }
             Ok(())
         }
@@ -2191,7 +2198,8 @@ mod tests {
     }
 
     /// The first of two remote hops fails: the second output isn't shipped into a peer's pool for
-    /// a query that is failing, and both claims are still released.
+    /// a query that is failing, both claims are still released, and both receivers get a failure
+    /// frame.
     #[test]
     fn a_failed_hop_stops_the_remaining_hops_and_releases_every_claim() {
         let executor = Arc::new(RecordingExecutor::default());
@@ -2235,6 +2243,15 @@ mod tests {
                 dropped.iter().any(|slot| slot.fragment_instance_id
                     == FragmentInstanceId::from_halves(23, instance)),
                 "the claim on instance {instance} was released: {dropped:?}"
+            );
+        }
+        // The failed hop and the one that never ran both end with a failure frame.
+        let failed = nixl.failed_slots();
+        for instance in [10, 11] {
+            assert!(
+                failed.iter().any(|slot| slot.fragment_instance_id
+                    == FragmentInstanceId::from_halves(23, instance)),
+                "instance {instance}'s receiver got a failure frame: {failed:?}"
             );
         }
     }

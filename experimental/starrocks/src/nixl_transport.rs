@@ -467,11 +467,12 @@ impl Transport {
             .map(|hop| hop.peer)
             .zip(remotes.iter().cloned())
             .collect();
+        let ends: Vec<_> = hops.iter().map(|hop| (hop.peer, hop.slot)).collect();
         let window = self.window;
         let shipped = std::thread::scope(|scope| {
             let mut lanes = Vec::with_capacity(hops.len());
             let mut announcers = Vec::with_capacity(hops.len());
-            for (hop, remote) in hops.into_iter().zip(remotes) {
+            for (i, (hop, remote)) in hops.into_iter().zip(remotes).enumerate() {
                 let (announce, frames) = channel::<Announce>();
                 let (peer, slot, names) = (hop.peer, hop.slot, hop.names);
                 let refused = Arc::new(OnceLock::new());
@@ -488,7 +489,13 @@ impl Transport {
                             |err| send_failed(vec![(peer, slot)], err),
                         )
                     })
-                    .map_err(|err| format!("failed to spawn a nixl announce thread: {err}"))?;
+                    .map_err(|err| {
+                        let err = format!("failed to spawn a nixl announce thread: {err}");
+                        // This hop and the ones after it have no announcer to end them. The ones
+                        // before end with a failure frame when their announce queues close.
+                        send_failed(ends[i..].to_vec(), &err);
+                        err
+                    })?;
                 announcers.push(announcer);
                 lanes.push(Lane {
                     peer,
@@ -875,9 +882,11 @@ impl Transport {
 
 /// Announces batches in order with `send`, then EOS (token 0). The first error, a refused or
 /// failed announce or EOS, is recorded in `refused` so the transport stops pulling the hop's
-/// output; the batches still to come are released instead of announced. A hop that fails, here
-/// or on the transport thread, or that the transport drops without ending, ends with `fail` in
-/// place of its EOS: a hop never just stops.
+/// output; the failed batch and those still to come are released instead of announced, until the
+/// peer stops answering a Release. A hop that fails, here or on the transport thread, or that the
+/// transport drops without ending, ends with `fail` in place of its EOS: a hop never just stops.
+/// That includes a peer that stopped answering, since `fail` waits on neither this thread nor the
+/// transport's.
 fn announce_all(
     slot: SenderSlot,
     names: &[String],
@@ -896,6 +905,18 @@ fn announce_all(
             let _ = refused.set(err.clone());
         })
     };
+    // Frees a frame's receive buffers on the peer, logging a failure. Once the peer doesn't
+    // answer, further Releases would each wait out the RPC timeout for nothing.
+    let mut peer_up = true;
+    let mut release = |token: u64| {
+        if peer_up && token != 0 {
+            peer_up = send(control_params(), &NixlEnvelope::Release(token))
+                .inspect_err(|error| {
+                    warn!(?slot, token, %error, "failed to release receive buffers on a peer");
+                })
+                .is_ok();
+        }
+    };
     let mut result = Ok(());
     let mut seq = 0;
     let mut frames = frames.into_iter();
@@ -903,11 +924,15 @@ fn announce_all(
         match frames.next() {
             None => break Err("the nixl transport dropped the hop before it ended".to_string()),
             Some(Announce::End(ended)) => break result.clone().and(ended),
-            Some(Announce::Batch { token, .. }) if result.is_err() => {
-                let _ = send(control_params(), &NixlEnvelope::Release(token));
-            }
+            Some(Announce::Batch { token, .. }) if result.is_err() => release(token),
             Some(Announce::Batch { token, rows }) => {
                 result = announce(packed_params(Some(slot), seq, false), &packed(token, rows));
+                if result.is_err() {
+                    // The peer may never have taken this frame. Releasing it is a no-op if it did
+                    // (tokens are never reused), and the hop ends with a failure frame, so its
+                    // receiver never consumes it.
+                    release(token);
+                }
                 seq += 1;
             }
         }
@@ -1220,14 +1245,18 @@ mod tests {
         assert_eq!(failed.as_deref(), Some("WRITE failed"));
         assert_eq!(refused, None);
 
-        // The peer refuses an announce: the transport is told to stop, and the batches after it
-        // are released, not announced.
+        // The peer refuses an announce: the transport is told to stop, and that batch and the ones
+        // after it are released, not announced.
         let (result, (sent, failed, refused)) =
             announce(vec![batch(5), batch(6), Announce::End(Ok(()))], Some(5));
         assert_eq!(result, Err("busy".to_string()));
         assert_eq!(
             sent,
-            vec![(false, packed(5)), (false, NixlEnvelope::Release(6))]
+            vec![
+                (false, packed(5)),
+                (false, NixlEnvelope::Release(5)),
+                (false, NixlEnvelope::Release(6))
+            ]
         );
         assert_eq!(failed.as_deref(), Some("busy"));
         assert_eq!(refused.as_deref(), Some("busy"));
@@ -1245,6 +1274,42 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(sent, vec![(false, packed(5))]);
         assert!(failed.unwrap().contains("dropped the hop"));
+    }
+
+    #[test]
+    fn releases_stop_once_the_peer_stops_answering() {
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(1, 2),
+            node_id: 3,
+            sender_id: 0,
+        };
+        let (announce, received) = channel();
+        for frame in [batch(5), batch(6), batch(7), Announce::End(Ok(()))] {
+            announce.send(frame).unwrap();
+        }
+        drop(announce);
+        // The peer is gone: every call fails, and each would wait out the RPC timeout.
+        let sent = Mutex::new(Vec::new());
+        let mut failed = None;
+        let result = announce_all(
+            slot,
+            &["id".to_string()],
+            received,
+            &OnceLock::new(),
+            |_, envelope| {
+                sent.lock().unwrap().push(envelope.clone());
+                Err("connection refused".to_string())
+            },
+            |err| failed = Some(err.to_string()),
+        );
+        assert_eq!(result, Err("connection refused".to_string()));
+        assert_eq!(
+            sent.into_inner().unwrap(),
+            vec![packed(5), NixlEnvelope::Release(5)],
+            "no Release after the first one went unanswered"
+        );
+        // The hop still ends with a failure frame.
+        assert_eq!(failed.as_deref(), Some("connection refused"));
     }
 
     #[test]
