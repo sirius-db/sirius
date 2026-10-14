@@ -99,7 +99,8 @@ jobs:
         run: |
           cmake -S sirius-duckdb/duckdb -B build/loader -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=OFF -DBUILD_SHELL=OFF \
-            -DEXTENSION_STATIC_BUILD=OFF -DDUCKDB_LINKER=bfd \
+            -DEXTENSION_STATIC_BUILD=ON -DDUCKDB_LINKER=bfd \
+            -DPREBUILT_BINARY="$PWD/sirius-duckdb/build/release/src/libduckdb_static.a" \
             -DDUCKDB_EXTENSION_CONFIGS="$PWD/sirius-duckdb/config/loader.cmake" \
             -DSIRIUS_LOADER_TESTS=ON
           cmake --build build/loader --target sirius_loadable_extension sirius_loader_test_fixtures -j$(nproc)

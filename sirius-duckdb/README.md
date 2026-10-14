@@ -36,6 +36,10 @@ After changing Sirius, rerun `pixi run make`, then restart DuckDB. Use
 `pixi run make release` to build only Sirius and its tests. No Conda package build
 is needed.
 
+Explicit shared mode disables vcpkg manifest installation, even when a vcpkg
+toolchain is set. Supply dependencies through Conda or an existing installation;
+this also applies to dependencies of extra DuckDB extensions in that build.
+
 ## Static distribution build
 
 The local vcpkg overlay port builds and installs Sirius from this checkout,
@@ -92,14 +96,21 @@ The core-extension layout has three artifacts:
 `INSTALL sirius; LOAD sirius;` opens `libcuda.so.1` and queries `cuDriverGetVersion`.
 Driver support below CUDA 12, a missing driver, or an unsuccessful version query
 produces an error. Versions 12000–12999 select `sirius_cuda12`; 13000 and newer
-select `sirius_cuda13`. The loader uses DuckDB's `AutoLoadExtension`, including
-its configured core repository and auto-install policy. Backend load failures
-retain their message inside DuckDB's autoload error; the loader does not retry
-with the other CUDA version.
+select `sirius_cuda13`. This layout is for DuckDB core distribution:
+`AutoLoadExtension` trusts core signatures and uses DuckDB's configured
+auto-install repository, not the repository the loader came from. Community
+signatures are not supported. Backend errors include the selected backend and
+driver version; the loader does not retry with the other CUDA version.
 
 These are Linux glibc amd64/arm64 builds. The existing Makefile and distribution
 workflows still build the direct `sirius` backend for development and existing
-consumers. Use a separate build directory for each core configuration:
+consumers. Before publishing the loader, stop publishing the direct backend as
+`sirius` for the same DuckDB version and platform. Publish the loader and both
+backends from the same Sirius commit. Existing direct-extension installations
+must use `FORCE INSTALL sirius FROM core` when switching to the core loader.
+Use separate extension directories when testing both layouts.
+
+Use a separate build directory for each core configuration:
 
 | DuckDB extension config | Artifacts |
 | --- | --- |
@@ -117,13 +128,33 @@ For shared development testing, override `-DSIRIUS_DUCKDB_LINKAGE=shared` and
 pass `-Dsirius_DIR=/path/to/install/lib/cmake/sirius`.
 The loader-only config needs no engine submodules. Upstream DuckDB's extension
 metadata and CI dependency provisioning remain separate integration work.
+DuckDB's manifest merger must preserve our `dlpack` and `flatbuffers` overrides;
+the pinned DuckDB version still requires the upstream override-merging fix.
+Its CMake manifest merger finds the manifest in the extension source directory.
+The newer `sync_out_of_tree_extensions.py` path also needs subdirectory-aware
+manifest discovery before it can provision this layout.
+
+The build job supplies GPU architectures. CUDA 12 builds include Blackwell's
+`100-real` and `120-real` targets and require a toolkit of at least 12.8.
+Core CI must supply those targets too; selecting a backend by driver version
+does not check GPU architecture. The 12000/13000 thresholds select a CUDA major
+version, not a tested minimum driver for every backend feature. Before core
+publication, qualify the oldest supported drivers against the packaged CUDA
+libraries and their JIT paths. Simpatico compiles cubins rather than relying on
+the driver's PTX compiler; other dependency paths need separate qualification.
+
+The conflict checks reject sequential loads of different backends in one
+database. They do not enforce process-wide exclusion across databases or
+concurrent loads. Applications should load `sirius`, rather than select backends
+manually.
 
 The loader tests build fake drivers and backend extensions, so they need no GPU:
 
 ```sh
 pixi run cmake -S sirius-duckdb/duckdb -B build/loader -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=OFF -DBUILD_SHELL=OFF \
-  -DEXTENSION_STATIC_BUILD=OFF -DDUCKDB_LINKER=bfd \
+  -DEXTENSION_STATIC_BUILD=ON -DDUCKDB_LINKER=bfd \
+  -DPREBUILT_BINARY="$PWD/sirius-duckdb/build/release/src/libduckdb_static.a" \
   -DDUCKDB_EXTENSION_CONFIGS="$PWD/sirius-duckdb/config/loader.cmake" \
   -DSIRIUS_LOADER_TESTS=ON
 pixi run cmake --build build/loader \
@@ -132,7 +163,8 @@ pixi run python sirius-duckdb/loader/test/test_loader.py \
   --duckdb sirius-duckdb/build/release/duckdb --build-dir build/loader
 ```
 
-The test host must use the matching DuckDB revision and export its C++ API;
-`pixi run make` produces that host. Tests cover version boundaries, driver and
+The test host and prebuilt archive must use the same DuckDB revision and build
+settings; `pixi run make` produces both. Reusing the archive tests the loader's production
+linkage without rebuilding DuckDB. Tests cover version boundaries, driver and
 backend failures, repeated loading, and automatic installation from a local
-repository. Production loaders use DuckDB's normal extension linkage defaults.
+repository.

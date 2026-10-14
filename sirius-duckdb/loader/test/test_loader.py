@@ -3,7 +3,6 @@
 """Exercise the real loader with CUDA-free backend and driver fixtures."""
 
 import argparse
-import gzip
 import json
 import os
 from pathlib import Path
@@ -63,6 +62,7 @@ class LoaderTests(unittest.TestCase):
     def assert_failure(self, result, message):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(message, result.stderr)
+        self.assertNotIn('"exception_type"', result.stderr)
 
     def test_driver_boundaries_and_repeated_load(self):
         for version, backend in [
@@ -118,21 +118,32 @@ class LoaderTests(unittest.TestCase):
         )
 
     def test_does_not_fall_back_to_cuda12(self):
-        self.assert_failure(
-            self.query(
-                f"INSTALL {quote(self.backend(12))}; LOAD {quote(self.loader)};"
-            ),
-            "sirius_cuda13",
+        result = self.query(
+            f"INSTALL {quote(self.backend(12))}; LOAD {quote(self.loader)};"
         )
+        self.assert_failure(
+            result, "Sirius selected sirius_cuda13 for CUDA driver version 13000"
+        )
+        self.assertIn("run INSTALL sirius_cuda13 first", result.stderr)
+
+    def test_selected_backend_already_loaded(self):
+        result = self.query(
+            f"LOAD {quote(self.backend(13))}; LOAD {quote(self.loader)};"
+            "SELECT sirius_test_backend() AS backend;"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [{"backend": 13}])
 
     def test_backend_initialization_error(self):
+        result = self.query(
+            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};",
+            env={"SIRIUS_TEST_BACKEND_FAILURE": "1"},
+        )
         self.assert_failure(
-            self.query(
-                f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};",
-                env={"SIRIUS_TEST_BACKEND_FAILURE": "1"},
-            ),
+            result,
             "Backend initialization failed for test",
         )
+        self.assertIn("Sirius selected sirius_cuda13", result.stderr)
 
     def test_conflicting_loaded_backend(self):
         self.assert_failure(
@@ -155,10 +166,6 @@ class LoaderTests(unittest.TestCase):
         destination = repository / version / host["platform"] / self.backend(13).name
         destination.parent.mkdir(parents=True)
         shutil.copyfile(self.backend(13), destination)
-        with self.backend(13).open("rb") as source, gzip.open(
-            str(destination) + ".gz", "wb"
-        ) as target:
-            shutil.copyfileobj(source, target)
         result = self.query(
             f"SET autoinstall_extension_repository={quote(repository)};"
             f"LOAD {quote(self.loader)}; SELECT sirius_test_backend() AS backend;",

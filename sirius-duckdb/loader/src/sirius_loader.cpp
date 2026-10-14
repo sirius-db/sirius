@@ -16,13 +16,17 @@
 
 #define DUCKDB_EXTENSION_MAIN
 
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/settings.hpp"
 
 #include <dlfcn.h>
 
+#include <exception>
 #include <memory>
 
 extern "C" {
@@ -58,10 +62,21 @@ DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader)
   auto const* backend = version < 13000 ? "sirius_cuda12" : "sirius_cuda13";
   auto const* other   = version < 13000 ? "sirius_cuda13" : "sirius_cuda12";
   auto& db            = loader.GetDatabaseInstance();
+  // This guards sequential loads in this database, not process-wide use.
   if (db.ExtensionIsLoaded(other)) {
     throw duckdb::InvalidInputException(
       "Cannot load %s while %s is already loaded", backend, other);
   }
-  duckdb::ExtensionHelper::AutoLoadExtension(db, backend);
+  try {
+    duckdb::ExtensionHelper::AutoLoadExtension(db, backend);
+  } catch (std::exception const& error) {
+    auto message = duckdb::StringUtil::Format(
+      "Sirius selected %s for CUDA driver version %d, but loading it failed. ", backend, version);
+    if (!duckdb::Settings::Get<duckdb::AutoinstallKnownExtensionsSetting>(db)) {
+      message += duckdb::StringUtil::Format(
+        "Automatic installation is disabled; run INSTALL %s first. ", backend);
+    }
+    duckdb::ErrorData(error).Throw(message);
+  }
 }
 }
