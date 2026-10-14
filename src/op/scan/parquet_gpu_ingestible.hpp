@@ -104,7 +104,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// chunk has single-file provenance and a scan over a subset of the pinned files
   /// can be served by selecting whole chunks. The query read path keeps fused
   /// batches (false).
-  bool batch_within_file_boundaries   = false;
+  bool batch_within_file_boundaries  = false;
   std::size_t projected_output_count = 0;
 
   parquet_ingestible_table_info() = default;
