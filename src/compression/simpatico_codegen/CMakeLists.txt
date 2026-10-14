@@ -13,6 +13,7 @@ if(NOT TARGET nvcomp::nvcomp)
 endif()
 
 include(cmake/jit_header_manifest.cmake)
+include(cmake/cache_identity.cmake)
 
 # Embed the project headers the runtime NVRTC JIT #includes as raw-string
 # literals, so a binary distribution needs no simpatico source tree on disk.
@@ -168,13 +169,9 @@ else()
 endif()
 target_link_libraries(
   simpatico
-  PUBLIC cudf::cudf
-         rmm::rmm
-         nvcomp::nvcomp
-         ${SIMPATICO_CUDART_LIB}
-         ${SIMPATICO_NVRTC_LIB}
-         CUDA::cuda_driver
-         ${CMAKE_DL_LIBS})
+  PUBLIC cudf::cudf rmm::rmm nvcomp::nvcomp ${SIMPATICO_CUDART_LIB}
+         ${SIMPATICO_NVRTC_LIB} CUDA::cuda_driver
+  PRIVATE simpatico_cache_identity)
 
 function(add_codegen_host_test name)
   add_executable(${name} tests/${name}.cpp)
