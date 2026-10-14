@@ -108,6 +108,7 @@ struct physical_check_counters;
 namespace sirius::scan_manager {
 class preparation_ledger;
 class load_balancing_scan_batch_coalescer;
+class host_chunk_placement;
 }  // namespace sirius::scan_manager
 
 namespace sirius::planner {
@@ -443,7 +444,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::vector<cudf::data_type> normalization_targets                     = {},
   bool has_physical_overrides                                            = false,
   sirius::pushdown_request pushdown_req                                  = {},
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr);
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr,
+  std::shared_ptr<host_chunk_placement> placement                        = nullptr);
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
@@ -946,6 +948,15 @@ class sirius_scan_manager {
     uint64_t query_token = 0;
     std::shared_ptr<preparation_ledger> ledger;
     std::shared_ptr<op::scan::physical_check_counters> physical_counters;
+
+    //! The GPUs this query was admitted onto, in admission order. The memory prefetcher
+    //! converts only into these: the task creator confines every task to the same set.
+    std::vector<int> allocated_gpu_ids;
+
+    //! Where each host-resident cached split runs, decided when it is queued and stamped on it.
+    //! Shared by this query's cached providers (which stamp) and its memory prefetcher (which
+    //! follows the stamp), so the upload and the task always pick the same GPU.
+    std::shared_ptr<host_chunk_placement> placement;
 
     //! A disk-backed scan owns the provider that feeds file metadata into the coalescer.
     //! Construction rejects a null provider so the alternative always represents a runnable
