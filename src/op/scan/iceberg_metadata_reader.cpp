@@ -180,6 +180,34 @@ bool IcebergDeleteFileEntry::has_decodable_record_count() const
   return record_count >= 0 && record_count <= kMaxDeletionVectorPositions;
 }
 
+std::unordered_set<std::string> iceberg_files_without_partition_values(
+  duckdb::ClientContext& context, iceberg_delete_inventory const& inventory)
+{
+  iceberg_metadata_connection connection(context);
+  std::unordered_map<std::string, bool> manifests;
+  std::unordered_set<std::string> files, unproved;
+  for (auto const& entry : inventory.entries) {
+    if (entry.content != "EXISTING") continue;
+    auto [it, fresh] = manifests.emplace(entry.manifest_path, false);
+    if (fresh) {
+      auto result = connection.Query("SELECT data_file.partition FROM read_avro('" +
+                                     escape_sql_string(entry.manifest_path) + "') LIMIT 0");
+      // The pinned Avro reader represents an empty record as INTEGER. Nonempty
+      // partition records are STRUCTs. Unknown/unavailable schemas grant no proof.
+      it->second = result && !result->HasError() && result->types.size() == 1 &&
+                   result->types[0] == duckdb::LogicalType::INTEGER;
+    }
+    auto const path = sirius::io::strip_file_scheme(entry.file_path);
+    if (it->second)
+      files.insert(path);
+    else
+      unproved.insert(path);
+  }
+  for (auto const& path : unproved)
+    files.erase(path);
+  return files;
+}
+
 inventory_result read_delete_inventory(duckdb::ClientContext& context,
                                        std::string const& table_path,
                                        std::optional<int64_t> snapshot_id,

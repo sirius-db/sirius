@@ -114,6 +114,15 @@ std::unique_ptr<cudf::scalar> default_scalar(duckdb::Value const& value,
 }
 }  // namespace
 
+std::optional<cudf::data_type> field_mapping_type(duckdb::LogicalType const& type)
+{
+  try {
+    return flat_type(type);
+  } catch (std::invalid_argument const&) {
+    return std::nullopt;
+  }
+}
+
 field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata const> metadata,
                                            std::string const& opened_identity,
                                            materialization_program program,
@@ -152,7 +161,9 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
       op.physical_type = flat_type(schema.types.at(ordinal));
       if (op.physical_type != target &&
           !(op.field.allow_int32_to_int64 && op.physical_type.id() == cudf::type_id::INT32 &&
-            target.id() == cudf::type_id::INT64))
+            target.id() == cudf::type_id::INT64) &&
+          !(op.field.allow_float_to_double && op.physical_type.id() == cudf::type_id::FLOAT32 &&
+            target.id() == cudf::type_id::FLOAT64))
         throw std::invalid_argument("unqualified field conversion");
       auto [it, inserted] = read_slots.emplace(ordinal, result.read_names_.size());
       if (inserted) {
@@ -163,6 +174,19 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
       op.physical_slot = it->second;
     }
     result.operations_.push_back(std::move(op));
+  }
+  if (result.read_names_.empty()) {
+    // All requested fields may be absent. Read one approved physical column as
+    // a row-count carrier rather than decoding the entire file for its cardinality.
+    for (std::size_t i = 0; i < schema.names.size(); ++i) {
+      if (!field_mapping_type(schema.types[i])) continue;
+      result.read_names_.push_back(schema.names[i]);
+      result.read_types_.push_back(schema.types[i]);
+      result.read_indices_.push_back(static_cast<cudf::size_type>(i));
+      break;
+    }
+    if (result.read_names_.empty())
+      throw std::invalid_argument("field mapping has no qualified row-count carrier");
   }
   std::vector<cudf::data_type> targets;
   for (auto const& op : result.operations_)

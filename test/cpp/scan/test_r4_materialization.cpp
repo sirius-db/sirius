@@ -1,6 +1,8 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
+#include "io/kvikio/kvikio_context.hpp"
 #include "op/scan/arrow_materializer.hpp"
 #include "op/scan/field_id_mapping.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/positional_visibility.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
@@ -510,4 +512,56 @@ TEST_CASE("R4 finish refuses unproved visibility and predicate reports", "[r4][s
     REQUIRE_THROWS(finish_materialization(std::move(batch), program, {}));
   }
   stream.synchronize();
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "R4 empty evolved file preserves its schema and completion split",
+                 "[r4][scan][integration]")
+{
+  sirius::test::scratch_dir directory("r4_empty_evolved");
+  auto path    = directory.file("empty.parquet");
+  auto written = con->Query("COPY (SELECT 1::INTEGER old_id WHERE false) TO " +
+                            directory.file_literal("empty.parquet") +
+                            " (FORMAT PARQUET, FIELD_IDS {old_id: 1})");
+  REQUIRE(written);
+  REQUIRE_FALSE(written->HasError());
+  auto info                    = std::make_unique<parquet_ingestible_table_info>();
+  info->contract_id            = 91;
+  info->resolved_file_paths    = {path};
+  info->names                  = {"renamed"};
+  info->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT)};
+  info->column_ids             = {duckdb::ColumnIndex(0)};
+  info->projected_output_count = 1;
+  info->physical_schema        = iceberg_table_schema{{{"renamed", 1, "BIGINT"}}};
+  info->field_mapping_requirements =
+    std::vector<field_requirement>{{1, duckdb::LogicalType::BIGINT, {}, true}};
+  auto ingestible = make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto prepare    = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto prepared    = prepare();
+  auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
+  REQUIRE(file.field_mapping);
+  REQUIRE(file.row_groups.empty());
+  auto coalescer = ingestible->create_batch_coalescer();
+  REQUIRE(coalescer->push(std::move(prepared)).empty());
+  auto splits = coalescer->flush();
+  REQUIRE(splits.size() == 1);
+  auto const& split = dynamic_cast<parquet_split_info const&>(*splits[0]);
+  REQUIRE(split.field_mapping);
+  REQUIRE(split.rg_slices.size() == 1);
+  auto const& slice = split.rg_slices[0];
+  bound_table_scan contract;
+  contract.contract_id = 91;
+  contract.profiles    = std::make_shared<physical_profile_table>();
+  rmm::cuda_stream stream;
+  auto batch = materialize_mapped_parquet({slice.datasource, slice.file_metadata, {}},
+                                          *split.field_mapping,
+                                          contract,
+                                          {},
+                                          stream.view(),
+                                          cudf::get_current_device_resource_ref());
+  REQUIRE(batch.rows == 0);
+  REQUIRE(batch.table.view().num_columns() == 1);
+  CHECK(batch.table.view().column(0).type().id() == cudf::type_id::INT64);
 }
