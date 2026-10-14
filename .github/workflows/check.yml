@@ -218,7 +218,7 @@ jobs:
         run: |
           set -o pipefail
           pixi run --locked -e vcpkg sirius-duckdb/vcpkg/vcpkg install \
-            --x-manifest-root=sirius-duckdb --x-feature=static \
+            --x-manifest-root=sirius-duckdb \
             --x-install-root=build/static-dependencies --clean-buildtrees-after-build \
             2>&1 | tee /tmp/vcpkg.log
 

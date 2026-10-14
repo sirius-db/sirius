@@ -36,7 +36,7 @@ jobs:
       exclude_archs: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
       extra_toolchains: "cuda;rust;libclang;lld"
       vcpkg_url: "https://github.com/microsoft/vcpkg.git"
-      vcpkg_commit: "ffc071e0c08432c60c9b64f00334c0227667931b"
+      vcpkg_commit: "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3"
       vcpkg_binary_cache_enabled: true
       skip_tests: true
       save_cache: ${{ github.ref == 'refs/heads/main' }}
@@ -61,7 +61,7 @@ jobs:
       exclude_archs: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
       extra_toolchains: "cuda;rust;libclang;lld"
       vcpkg_url: "https://github.com/microsoft/vcpkg.git"
-      vcpkg_commit: "ffc071e0c08432c60c9b64f00334c0227667931b"
+      vcpkg_commit: "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3"
       vcpkg_binary_cache_enabled: true
       skip_tests: true
       save_cache: ${{ github.ref == 'refs/heads/main' }}
@@ -70,7 +70,7 @@ jobs:
       build_duckdb_shell: false
       vcpkg_overlay_ports: "sirius-duckdb/vcpkg_ports"
       vcpkg_overlay_triplets: "sirius-duckdb/vcpkg_triplets"
-      cuda_archs: "75-real;80-real;86-real;89-real;90a-real"
+      cuda_archs: "75-real;80-real;86-real;89-real;90a-real;100-real;120-real"
       cuda_version: "12"
       artifact_postfix: "-cuda12"
       runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "arm-xl"]}'

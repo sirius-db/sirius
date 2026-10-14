@@ -95,6 +95,18 @@ jobs:
           set -o pipefail
           make -j$(nproc) EXTRA_EXTENSION_CONFIGS="$PWD/sirius-duckdb/test/extension_config.cmake" 2>&1 | tee /tmp/build.log
 
+      - name: Test CUDA extension loader without a GPU
+        run: |
+          cmake -S sirius-duckdb/duckdb -B build/loader -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=OFF -DBUILD_SHELL=OFF \
+            -DEXTENSION_STATIC_BUILD=ON -DDUCKDB_LINKER=bfd \
+            -DPREBUILT_BINARY="$PWD/sirius-duckdb/build/release/src/libduckdb_static.a" \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/sirius-duckdb/config/loader.cmake" \
+            -DSIRIUS_LOADER_TESTS=ON
+          cmake --build build/loader --target sirius_loadable_extension sirius_loader_test_fixtures -j$(nproc)
+          python sirius-duckdb/loader/test/test_loader.py \
+            --duckdb sirius-duckdb/build/release/duckdb --build-dir build/loader
+
       - name: Build shared DuckDB scan host tests
         run: |
           cmake --build build/release --target libduckdb.so
