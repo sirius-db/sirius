@@ -164,16 +164,18 @@ struct backend_readahead_policy {
  *        (see scan_manager/memory_prefetcher.hpp).
  *
  * Set via the yaml block sirius.executor.scan_manager.memory_prefetcher.
- * Disabled by default; single-GPU configurations only (the prefetcher logs a
- * warning and disables itself when more than one GPU space is configured).
+ * Disabled by default. On a multi-GPU host each batch is converted into the
+ * GPU the scan manager stamped on its split (NUMA-local to the host chunk,
+ * within the query's admitted GPU set), where its scan task will run.
  */
 struct memory_prefetcher_config {
   /// Master switch; when false the prefetcher is never constructed.
   bool enable{false};
-  /// Number of prefetch worker threads. Each drives one in-flight batch
-  /// conversion on its own stream, so this bounds conversion concurrency.
+  /// Prefetch worker threads PER ADMITTED GPU (the pool is this times the
+  /// query's GPU count). Each drives one in-flight batch conversion on its own
+  /// stream, so this bounds conversion concurrency per GPU.
   std::size_t num_threads{2};
-  /// Keep at least this fraction of the GPU space free after each prefetch;
+  /// Keep at least this fraction of each GPU space free after each prefetch;
   /// the reservation for a batch is only attempted above this floor, so the
   /// prefetcher backs off well before competing with pipeline reservations.
   double min_free_fraction{0.4};
