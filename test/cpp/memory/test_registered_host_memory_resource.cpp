@@ -43,6 +43,9 @@ void check_pool(void* pool)
   cudaPointerAttributes attributes{};
   REQUIRE(cudaPointerGetAttributes(&attributes, pool) == cudaSuccess);
   CHECK(attributes.type == cudaMemoryTypeHost);
+  unsigned int flags = 0;
+  REQUIRE(cudaHostGetFlags(&flags, pool) == cudaSuccess);
+  CHECK(flags == (cudaHostAllocPortable | cudaHostAllocMapped));
   void* device_view = nullptr;
   REQUIRE(cudaHostGetDevicePointer(&device_view, pool, 0) == cudaSuccess);
   CHECK(device_view != nullptr);

@@ -706,6 +706,11 @@ TEST_CASE("Sirius host pools can come from registered pages", "[sirius][context]
     cudaPointerAttributes attributes{};
     REQUIRE(cudaPointerGetAttributes(&attributes, host) == cudaSuccess);
     CHECK(attributes.type == cudaMemoryTypeHost);
+    // The default upstream allocates non-portable pools, so this flag is what tells the
+    // registered upstream apart from it.
+    unsigned int flags = 0;
+    REQUIRE(cudaHostGetFlags(&flags, host) == cudaSuccess);
+    CHECK((flags & cudaHostAllocPortable) != 0);
     void* device_view = nullptr;
     REQUIRE(cudaHostGetDevicePointer(&device_view, host, 0) == cudaSuccess);
 
