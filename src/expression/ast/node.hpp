@@ -195,10 +195,10 @@ struct node {
 };
 
 // Match the already-bound signature.
-inline date_arithmetic_operation function_call::date_operation() const
+inline std::optional<date_arithmetic_operation> function_call::date_operation() const
 {
   using enum date_arithmetic_operation;
-  if (arguments().size() != 2) { return none; }
+  if (arguments().size() != 2) { return std::nullopt; }
   auto const left   = arguments()[0]->return_type().id();
   auto const right  = arguments()[1]->return_type().id();
   auto const output = return_type().id();
@@ -210,7 +210,7 @@ inline date_arithmetic_operation function_call::date_operation() const
     if (right == type_id::INTEGER && output == type_id::DATE) { return date_sub_days; }
     if (right == type_id::DATE && output == type_id::BIGINT) { return date_difference; }
   }
-  return none;
+  return std::nullopt;
 }
 
 /// Strict accessors for operator boundaries: return the held alternative or throw
