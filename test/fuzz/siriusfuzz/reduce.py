@@ -218,6 +218,10 @@ def _locate(new_root: Node, old_root: Node, old_node: Node) -> Node | None:
     return cur
 
 
+def _is_true(expr: Node) -> bool:
+    return isinstance(expr, Literal) and expr.value is True
+
+
 def _first_table(node: Node) -> TableRef | None:
     if isinstance(node, TableRef):
         return node
@@ -290,6 +294,8 @@ def candidates(root: Query) -> Iterator[Query]:
         if parent is None or not isinstance(node, Expr) or isinstance(node, Alias):
             continue
         for replacement in expr_replacements(node):
+            if isinstance(parent, Join) and fname == "cond" and _is_true(replacement):
+                continue  # ON TRUE is a cross product; let the join edits drop tables
             new_root, (new_parent,) = _copy_and_locate(root, parent)
             if new_parent is not None:
                 set_child(new_parent, fname, idx, copy.deepcopy(replacement))  # type: ignore[arg-type]

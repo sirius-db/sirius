@@ -44,7 +44,7 @@ from .schema_gen import DataGenerator, Dataset
 from .session import TEARDOWN_SECONDS, RunResult, Session
 from .sqlast import Query, labels
 
-HANG_GRACE_SECONDS = 60.0  # beyond the worker's own timeout handling and shell restart
+HANG_GRACE_SECONDS = 60.0  # beyond the budget the worker declares for its current step
 
 
 class Mailbox:
@@ -589,9 +589,9 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                         session.stage = "reduction"
                         evaluator.reduce(rec, query)
                         send({"type": "reduction", "record": asdict(rec)})
-                except (
-                    Exception
-                ) as e:  # noqa: BLE001 - harness bug, report and continue
+                except Exception as e:  # noqa: BLE001
+                    # Harness bug or a shell that would not restart: the orchestrator
+                    # respawns this worker within the restart budget.
                     log("harness exception: " + traceback.format_exc()[-800:])
                     send({"type": "done", "reason": f"harness error: {e}"})
                     return
@@ -665,7 +665,7 @@ def extract_crash_reason(stderr_tail: str, exitcode: int | None) -> str:
         offsets = [offset for _, offset in frames_found]
         names = symbolize(frames_found[0][0] if frames_found else None, offsets)
         frames = [n for n in names if not any(h in n for h in _HANDLER_NAMES)]
-        if frames and frames == names and len(frames) > 1:
+        if len(frames) > 1 and all(n.startswith("+0x") for n in frames):
             frames = frames[
                 1:
             ]  # unsymbolized: the first extension frame is the handler
@@ -773,7 +773,7 @@ class Orchestrator:
         if not self.opts.quiet:
             print(text, file=sys.stderr, flush=True)
 
-    def _kill_worker(self, w: int, p: Any, wait: bool = True) -> None:
+    def _kill_worker(self, w: int, p: Any, wait: bool = True) -> bool:
         """SIGKILL the worker's process group: the worker and the DuckDB shell it started.
 
         Killing only the Python process would orphan a shell that may be hung in GPU
@@ -781,15 +781,22 @@ class Orchestrator:
         which can take a while after SIGKILL (see Shell._reap); the next shell must not
         start before that.
         """
+        if not p.is_alive():
+            return False  # reaped earlier; the pid may belong to someone else by now
+        self._kill_group(p)
+        p.join(timeout=5)
+        if wait:
+            self._wait_shell_gone(w, p, time.time() + TEARDOWN_SECONDS)
+        return True
+
+    @staticmethod
+    def _kill_group(p: Any) -> None:
         try:
             os.killpg(p.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass  # already gone, or killed before it led its own group
         if p.is_alive():
             p.kill()
-        p.join(timeout=5)
-        if wait:
-            self._wait_shell_gone(w, p, time.time() + TEARDOWN_SECONDS)
 
     def _wait_shell_gone(self, w: int, p: Any, deadline: float) -> None:
         while True:
@@ -813,10 +820,13 @@ class Orchestrator:
             self.report.stop_reason = f"orchestrator error: {exc}"
         finally:
             self.stop.set()
-            for w, p in self.procs.items():
-                self._kill_worker(w, p, wait=False)
+            killed = [
+                (w, p)
+                for w, p in self.procs.items()
+                if self._kill_worker(w, p, wait=False)
+            ]
             deadline = time.time() + TEARDOWN_SECONDS
-            for w, p in self.procs.items():
+            for w, p in killed:
                 self._wait_shell_gone(w, p, deadline)
             # Workers already completed these records before cancellation/deadline.
             # Do not spawn or attribute deliberately stopped work as a hang.
@@ -836,7 +846,6 @@ class Orchestrator:
             self._spawn(w)
         last_progress = start
         finished: set[int] = set()
-        timeout = self.cfg.oracle.query_timeout_seconds + HANG_GRACE_SECONDS
         while True:
             try:
                 msg = self.queue.get(timeout=0.5)
@@ -873,12 +882,7 @@ class Orchestrator:
                         self._worker_died(w, p, finished)
                     continue
                 sql_info = self.inflight.get(w)
-                active_path = self.active_paths.get(w)
-                since = sql_info[2] if sql_info else self.last_seen[w]
-                if sql_info and active_path and active_path.exists():
-                    active = json.loads(active_path.read_text())
-                    since = max(since, active.get("started_at", since))
-                if sql_info is not None and now - since > timeout:
+                if sql_info is not None and self._overdue(w, sql_info[2], now):
                     self._worker_hung(w, p, sql_info, finished)
                 elif (
                     sql_info is None
@@ -901,6 +905,19 @@ class Orchestrator:
             p.join(timeout=5)
             if p.is_alive():
                 self._kill_worker(w, p)
+
+    def _overdue(self, w: int, began: float, now: float) -> bool:
+        """A worker inside a query is hung once its current step outlives the budget
+        it declared in the active file (run timeout plus shell teardown, or a shell
+        restart) by HANG_GRACE_SECONDS. Without a budget, the run's own applies."""
+        since = began
+        budget = self.cfg.oracle.query_timeout_seconds + TEARDOWN_SECONDS
+        active_path = self.active_paths.get(w)
+        if active_path and active_path.exists():
+            active = json.loads(active_path.read_text())
+            since = max(since, active.get("started_at", since))
+            budget = active.get("budget", budget)
+        return now - since > budget + HANG_GRACE_SECONDS
 
     def _handle(self, msg: dict[str, Any], finished: set[int]) -> None:
         w = msg.get("worker", -1)
@@ -938,10 +955,16 @@ class Orchestrator:
         elif t == "done":
             finished.add(w)
             self.inflight.pop(w, None)
-            if msg.get("reason") != "finished":
+            reason = msg.get("reason", "worker stopped")
+            if reason.startswith("harness error"):
+                # A failed shell restart or a harness bug mid-query: a fresh worker
+                # carries on, within the same restart budget as a dead one.
+                self._say(f"[w{w}] stopped: {reason}")
+                self._maybe_respawn(w, finished)
+            elif reason != "finished":
                 self.report.status = "incomplete"
-                self.report.stop_reason = msg.get("reason", "worker stopped")
-                self._say(f"[w{w}] stopped: {msg.get('reason')}")
+                self.report.stop_reason = reason
+                self._say(f"[w{w}] stopped: {reason}")
 
     def _drain(self, finished: set[int]) -> None:
         while True:
@@ -964,6 +987,9 @@ class Orchestrator:
     def _worker_died(self, w: int, p: Any, finished: set[int]) -> None:
         info = self.inflight.pop(w, None)
         finished.add(w)
+        # Only the Python process died; its shell is in the same group and may still run.
+        self._kill_group(p)
+        self._wait_shell_gone(w, p, time.time() + TEARDOWN_SECONDS)
         tail = self._stderr_tail(w)
         reason = extract_crash_reason(tail, p.exitcode)
         if info is not None:

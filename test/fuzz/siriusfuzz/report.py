@@ -67,6 +67,17 @@ class KnownIssue:
             )
         return True
 
+    def check(self) -> None:
+        """Raise ValueError for a pattern that would fail at the first finding."""
+        for field_name in ("pattern", "sql_pattern"):
+            pattern = getattr(self, field_name)
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f"known issue {self.issue}: invalid {field_name} {pattern!r}: {exc}"
+                ) from None
+
 
 def load_known_issues(path: pathlib.Path | None) -> list[KnownIssue]:
     if path is None or not path.exists():
@@ -77,24 +88,28 @@ def load_known_issues(path: pathlib.Path | None) -> list[KnownIssue]:
     for item in data.get("issue", []):
         if "pattern" not in item or "issue" not in item:
             raise ValueError(f"known issue entry needs pattern and issue: {item}")
-        out.append(
-            KnownIssue(
-                item["pattern"],
-                item["issue"],
-                item.get("note", ""),
-                list(item.get("verdicts", [])),
-                item.get("sql_pattern", ""),
-            )
+        known = KnownIssue(
+            item["pattern"],
+            item["issue"],
+            item.get("note", ""),
+            list(item.get("verdicts", [])),
+            item.get("sql_pattern", ""),
         )
+        known.check()
+        out.append(known)
     return out
 
 
 EXTRA_REPRODUCERS = 5  # further query/dataset pairs kept under more/ per finding
 
 
-def signature(rec: QueryRecord) -> str:
-    """Group errors by reason; keep each distinct mismatch or timeout input apart."""
-    v = rec.verdict
+def signature(rec: QueryRecord, verdict: str | None = None) -> str:
+    """Group errors by reason; keep each distinct mismatch or timeout input apart.
+
+    ``verdict`` is the observed one when a known issue has claimed the record, so
+    distinct issues or reasons with the same feature labels stay apart.
+    """
+    v = verdict or rec.verdict
     if v in (Verdict.MISMATCH, Verdict.VARIANT_MISMATCH, Verdict.TIMEOUT):
         variant = json.dumps(rec.variant, sort_keys=True) if rec.variant else ""
         key = f"{v}|{rec.dataset}|{rec.comparison}|{variant}|{rec.sql}"
@@ -172,7 +187,7 @@ class Report:
         self._log.flush()
         if not verdict.is_finding() and verdict != Verdict.KNOWN_ISSUE:
             return None
-        sig = signature(rec)
+        sig = signature(rec, observed.value)
         self.record_signatures[(rec.dataset, rec.sql)] = sig
         if sig in self.findings:
             entry = self.findings[sig]

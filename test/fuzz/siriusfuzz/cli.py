@@ -541,7 +541,12 @@ def cmd_recheck(args: argparse.Namespace) -> int:
             else "?"
         )
         attempt = argparse.Namespace(**vars(args))
-        result = replay(attempt, bundle, work / bundle.name)
+        try:
+            result = replay(attempt, bundle, work / bundle.name)
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 - one bad bundle must not end the recheck
+            result = {"status": "error", "error": str(exc)}
         after = replay_verdict(result)
         reason = result.get("record", {}).get("reason") or result.get("error") or ""
         rows.append(

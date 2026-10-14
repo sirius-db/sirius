@@ -124,7 +124,8 @@ def classify_gpu_error(message: str) -> tuple[Verdict, str]:
         if idx >= 0
         else body
     )
-    body_lower = text.lower()
+    # The error line only: later stderr lines are logs and must not flip the verdict.
+    body_lower = text.split("\n", 1)[0].lower()
     if any(m in body_lower for m in _OOM_MARKERS):
         return Verdict.GPU_OOM, body
     if _UNSUPPORTED_RE.search(body_lower):

@@ -474,7 +474,9 @@ class ReportTests(unittest.TestCase):
             runner.active_paths[0] = active
             runner.inflight[0] = ("SELECT current", "w0-d0", time.time(), [])
             process = SimpleNamespace(exitcode=-11)
-            with patch.object(runner, "_maybe_respawn"):
+            with patch.object(runner, "_maybe_respawn"), patch.object(
+                runner, "_kill_group"
+            ), patch.object(runner, "_wait_shell_gone"):
                 runner._worker_died(0, process, set())
             record = json.loads(report.log_path.read_text().splitlines()[0])
             self.assertEqual(record["verdict"], "crash")
@@ -573,7 +575,11 @@ class ReportTests(unittest.TestCase):
                     process = SimpleNamespace(exitcode=-11)
                     with patch.object(
                         runner, "_maybe_respawn"
-                    ) as respawn, patch.object(runner, "_kill_worker"):
+                    ) as respawn, patch.object(runner, "_kill_worker"), patch.object(
+                        runner, "_kill_group"
+                    ), patch.object(
+                        runner, "_wait_shell_gone"
+                    ):
                         if failure == "crash":
                             runner._worker_died(0, process, set())
                         else:

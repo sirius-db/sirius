@@ -39,6 +39,9 @@ from .schema_gen import Dataset
 CANARY_SETTING = "sirius_test_inject_transparent_gpu_error"
 SHELL_ENV = "SIRIUSFUZZ_SHELL"
 TEARDOWN_SECONDS = 90.0  # a killed shell can take a while to release a large GPU pool
+START_TIMEOUT_SECONDS = (
+    300.0  # first statement of a new shell, including GPU initialisation
+)
 UNKNOWN_TYPE = st.SqlType("UNKNOWN", "varchar")  # until DESCRIBE supplies the real one
 _SENTINEL = "siriusfuzz"
 _ERROR_LINE = re.compile(r"^[A-Za-z ]+ Error: ")
@@ -192,7 +195,9 @@ class Shell:
             ).start()
         # Drain startup output with a statement Sirius never intercepts; a SELECT
         # would run on the GPU with fallback still enabled.
-        first = self.execute("SET enable_progress_bar = false", timeout=300)
+        first = self.execute(
+            "SET enable_progress_bar = false", timeout=START_TIMEOUT_SECONDS
+        )
         if first.status != "ok":
             raise SessionError(
                 f"the DuckDB shell {self.binary} did not start: "
@@ -565,9 +570,21 @@ class Session:
 
     # -- statements -------------------------------------------------------------
 
-    def _ensure_alive(self) -> None:
+    def _ensure_alive(self, state: dict[str, Any] | None = None) -> None:
         if not self.shell.alive:
             self.restarts += 1
+            if self.evidence_path:
+                # The supervisor reads how long this step may legitimately take.
+                write_json(
+                    self.evidence_path,
+                    {
+                        **(state or {"stage": self.stage}),
+                        "operation": "shell restart",
+                        "status": "restarting",
+                        "started_at": time.time(),
+                        "budget": START_TIMEOUT_SECONDS + TEARDOWN_SECONDS,
+                    },
+                )
             self._start()
 
     def execute(self, sql: str, timeout: float = 600.0) -> ShellResult:
@@ -671,11 +688,13 @@ class Session:
             "settings": dict(self.active_settings),
             "status": "running",
             "started_at": time.time(),
+            "budget": timeout + TEARDOWN_SECONDS,  # the run, then a killed shell's exit
             "dataset": self.current_alias,
         }
+        self._ensure_alive(state)
+        state["started_at"] = time.time()  # the run's budget starts after any restart
         if self.evidence_path:
             write_json(self.evidence_path, state)
-        self._ensure_alive()
         self.set_gpu(gpu)
         res = self.shell.execute(sql, timeout)
         if res.status == "ok":

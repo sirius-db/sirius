@@ -175,7 +175,10 @@ class DataGenerator:
     # -- schema ------------------------------------------------------------
 
     def generate(self, seed: int) -> Dataset:
-        rng = self.rng
+        """The dataset is a function of ``seed`` alone, so replay can rebuild it;
+        the value pools it builds stay for the queries generated over it."""
+        self.rng = rng = random.Random(seed)
+        self._build_pools()
         lo, hi = self.cfg.data.tables
         n_tables = rng.randint(lo, hi)
         tables: list[Table] = []
