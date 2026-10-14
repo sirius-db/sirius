@@ -519,7 +519,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
   }
   for (auto& c : scans) {
     if (c.info->deferred) {
-      c.info->deferred->admission = admission;
+      c.info->deferred->bind_admission(admission);
     } else {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
       auto started = std::chrono::steady_clock::now();

@@ -1968,16 +1968,20 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
 {
   std::shared_ptr<preparation_admission> admission;
   for (auto const& entry : state.scans) {
-    auto const* info = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(
-      &entry.op->get_ingestible().table_info());
+    auto& ingestible = entry.op->get_ingestible();
+    auto const* info =
+      dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&ingestible.table_info());
     if (!info || !info->deferred) continue;
     if (!admission) {
-      admission    = info->deferred->admission;
+      admission    = info->deferred->admission();
       state.ledger = admission->consume();
-    } else if (admission != info->deferred->admission) {
+    } else if (admission != info->deferred->admission()) {
       throw std::logic_error("Iceberg scans must share the statement admission");
     }
-    info->deferred->ledger = state.ledger;
+    auto* iceberg = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&ingestible);
+    if (!iceberg) throw std::logic_error("deferred DV preparation requires an Iceberg ingestible");
+    iceberg->begin_preparation(
+      std::make_shared<op::scan::iceberg_dv_attempt>(info->deferred, state.ledger));
   }
   state.coordinator = std::make_unique<preparation_coordinator>(
     *state.completion, *state.dispatcher, state.preparation);

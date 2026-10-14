@@ -49,9 +49,11 @@
 #include <op/scan/table_scan/bound_read_view.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <op/sirius_physical_union.hpp>
+#include <pipeline/sirius_pipeline.hpp>
 #include <planner/connector_registry.hpp>
 #include <planner/sirius_physical_plan_generator.hpp>
 #include <signal.h>
+#include <sirius_engine.hpp>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <transparent/read_view_registry.hpp>
@@ -3693,9 +3695,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       ++found;
       CHECK(bool(info.deferred) == (limit == 8));
       if (info.deferred) {
-        if (!admission) admission = info.deferred->admission;
-        CHECK(info.deferred->admission == admission);
-        CHECK(info.deferred->files.front().result.expired());
+        if (!admission) admission = info.deferred->admission();
+        CHECK(info.deferred->admission() == admission);
+        CHECK(info.deferred->files().front().result.expired());
       } else {
         REQUIRE(info.delete_data);
         CHECK_FALSE(info.delete_data->positional_deletes.empty());
@@ -3714,6 +3716,76 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(provider->outstanding() == 0);
   CHECK(provider->seen->allocated_bytes == 0);
   REQUIRE_FALSE(con->Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE_METHOD(
+  GPUExecutionIcebergFixture,
+  "A later DV attempt installation failure releases the consumed statement admission",
+  "[integration][scan_preparation][iceberg]")
+{
+  using namespace sirius::op::scan;
+  using namespace sirius::scan_manager;
+  auto first  = inventory_fixture("dv_bounded");
+  auto second = inventory_fixture("dv_three");
+  sirius::test::scoped_setting disable_gpu(*con, "gpu_execution", false);
+  auto state = sirius::test::get_registered_sirius_context(*con);
+  preparation_test_state observed(state->physical_counters(), true);
+  sirius::scan_manager::test::test_reservation_provider installed_provider;
+  installed_provider.grant_bytes = 64 * 1024;
+  auto const sql                 = "SELECT fruit,count FROM " + pinned_scan(first) +
+                   " UNION ALL SELECT fruit,count FROM " + pinned_scan(second);
+  {
+    duckdb::SiriusContext::StandaloneQueryScope window(
+      *state, *con->context, "dv_partial_installation");
+    sirius::test::with_initialized_engine(
+      *con,
+      sql,
+      [&](sirius::sirius_engine& engine) {
+        std::vector<iceberg_gpu_ingestible*> scans;
+        for (auto const& pipeline : engine.new_scheduled) {
+          auto* scan = dynamic_cast<sirius_gpu_scan_operator*>(pipeline->get_source().get());
+          if (!scan) continue;
+          if (auto* iceberg = dynamic_cast<iceberg_gpu_ingestible*>(&scan->get_ingestible()))
+            scans.push_back(iceberg);
+        }
+        REQUIRE(scans.size() == 2);
+        REQUIRE(scans.front() != scans.back());
+        auto first_plan =
+          dynamic_cast<iceberg_ingestible_table_info const&>(scans.front()->table_info()).deferred;
+        auto second_plan =
+          dynamic_cast<iceberg_ingestible_table_info const&>(scans.back()->table_info()).deferred;
+        REQUIRE(first_plan);
+        REQUIRE(second_plan);
+        REQUIRE_FALSE(first_plan->files().empty());
+        REQUIRE_FALSE(second_plan->files().empty());
+        REQUIRE(first_plan->admission() == second_plan->admission());
+        auto admission = first_plan->admission();
+        REQUIRE(admission);
+        REQUIRE(observed.provider->seen->requests == 1);
+        REQUIRE(observed.provider->outstanding() == 1);
+        auto installed_ledger = std::make_shared<preparation_ledger>(installed_provider);
+        auto envelope         = scan_envelope{{{8, 8, 16, 20}}, 0, 0, true};
+        REQUIRE(installed_ledger
+                  ->admit(std::array{envelope}, memory_space_id(cucascade::memory::Tier::HOST, 0))
+                  .deferred);
+        auto installed = std::make_shared<iceberg_dv_attempt>(second_plan, installed_ledger);
+        REQUIRE_NOTHROW(scans.back()->begin_preparation(installed));
+        CHECK_THROWS_WITH(engine.execute(), "DV preparation attempt already started");
+        CHECK_THROWS_AS(admission->consume(), std::logic_error);
+        CHECK_FALSE(installed->ledger());
+        CHECK(observed.reads_started.empty());
+        CHECK(first_plan->files().empty());
+        CHECK(second_plan->files().empty());
+        CHECK(observed.provider->seen->allocated_bytes == 0);
+        CHECK(observed.provider->outstanding() == 0);
+      },
+      window.query_id());
+    window.finish();
+  }
+  CHECK(state->get_scan_manager().num_active_queries() == 0);
+  CHECK(observed.provider->seen->allocated_bytes == 0);
+  CHECK(observed.provider->outstanding() == 0);
+  CHECK(installed_provider.outstanding() == 0);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,

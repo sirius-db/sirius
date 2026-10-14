@@ -27,6 +27,7 @@
 #include <vector>
 
 namespace sirius::op::scan {
+class iceberg_dv_attempt;
 class iceberg_dv_preparation;
 
 /**
@@ -72,6 +73,9 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
   explicit iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestible_table_info> info);
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
+  /// Installs the execution's attempt (ledger + result slots) once the statement admission has
+  /// been consumed; preparation work cannot be claimed before this.
+  void begin_preparation(std::shared_ptr<iceberg_dv_attempt> attempt);
   bool can_claim_preparation();
   scan_manager::unit_key next_preparation_unit() const;
   void stop_preparation() noexcept;
@@ -96,6 +100,7 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
 
   std::shared_ptr<iceberg_delete_sets const> _delete_sets;
   std::shared_ptr<iceberg_dv_preparation> _deferred;
+  std::shared_ptr<iceberg_dv_attempt> _attempt;
   scan_manager::w_permit _next_permit;
   size_t _next_preparation = 0;
   bool _next_registered    = false;
