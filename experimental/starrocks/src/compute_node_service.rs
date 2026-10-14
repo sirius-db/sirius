@@ -462,36 +462,48 @@ impl PInternalService for SiriusComputeNodeService {
         request: PTransmitChunkParams,
         attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PTransmitChunkResult>, crate::prpc::Error> {
-        let handled = match NixlEnvelope::decode(&attachment) {
-            Ok(NixlEnvelope::Alloc(layout)) => self
-                .allocate_waiting(&request, layout)
-                .await
-                .map(|reply| (reply, None)),
-            _ => self.handle_nixl_chunk(&request, &attachment),
-        };
-        let (status, reply) = match handled {
-            Ok((reply, ready)) => {
-                if let Some(ready) = ready {
-                    self.drain_ready_async(ready);
+        // Alloc and Release take the direct exchange's mutex, which the engine thread can hold
+        // while it synchronizes a stream; on the brpc runtime that would stall every other RPC.
+        // An Alloc may also wait for a purge's frees, and a refusal's leak counters read the same
+        // exchange, so all of it runs on a blocking thread.
+        let service = self.clone();
+        let (status, reply) = tokio::task::spawn_blocking(move || {
+            let handled = match NixlEnvelope::decode(&attachment) {
+                Ok(NixlEnvelope::Alloc(layout)) => service
+                    .allocate_waiting(&request, layout)
+                    .map(|reply| (reply, None)),
+                _ => service.handle_nixl_chunk(&request, &attachment),
+            };
+            match handled {
+                Ok((reply, ready)) => {
+                    if let Some(ready) = ready {
+                        service.drain_ready_async(ready);
+                    }
+                    (Self::ok_status(), reply)
                 }
-                (Self::ok_status(), reply)
+                // A frame of a query that already failed here is refused with that failure's
+                // cause, as CANCELLED, so the sender fails with the cause rather than with this
+                // refusal.
+                Err(err) => match request
+                    .finst_id
+                    .as_ref()
+                    .and_then(|id| service.exchanges.failure(FragmentInstanceId::from(id)))
+                {
+                    Some(cause) => {
+                        // The refused frame's buffers were just freed, after its query's purge
+                        // last logged what this CN holds.
+                        service.log_leak_counters("refused frame");
+                        (Self::cancelled(cause), Vec::new())
+                    }
+                    None => (Self::internal_error(err), Vec::new()),
+                },
             }
-            // A frame of a query that already failed here is refused with that failure's cause,
-            // as CANCELLED, so the sender fails with the cause rather than with this refusal.
-            Err(err) => match request
-                .finst_id
-                .as_ref()
-                .and_then(|id| self.exchanges.failure(FragmentInstanceId::from(id)))
-            {
-                Some(cause) => {
-                    // The refused frame's buffers were just freed, after its query's purge last
-                    // logged what this CN holds.
-                    self.log_leak_counters("refused frame");
-                    (Self::cancelled(cause), Vec::new())
-                }
-                None => (Self::internal_error(err), Vec::new()),
-            },
-        };
+        })
+        .await
+        .unwrap_or_else(|join_err| {
+            let err = format!("transmit_chunk task panicked: {join_err}");
+            (Self::internal_error(err), Vec::new())
+        });
         let result = PTransmitChunkResult {
             status: Some(status),
             receive_timestamp: None,
@@ -964,10 +976,10 @@ impl SiriusComputeNodeService {
     }
 
     /// [`allocate`](Self::allocate), and when the pool is full while a purge's frees are pending
-    /// (or one finished meanwhile), waits for them off the brpc runtime, bounded by
-    /// `alloc_wait`, and tries once more. A late free then delays the next query instead of
-    /// failing it. Any other failure, a refused query's included, answers at once.
-    async fn allocate_waiting(
+    /// (or one finished meanwhile), waits for them, bounded by `alloc_wait`, and tries once more.
+    /// A late free then delays the next query instead of failing it. Any other failure, a refused
+    /// query's included, answers at once. Runs on `transmit_chunk`'s blocking thread.
+    fn allocate_waiting(
         &self,
         request: &PTransmitChunkParams,
         layout: Vec<u8>,
@@ -983,20 +995,15 @@ impl SiriusComputeNodeService {
         else {
             return Err(err);
         };
-        let (service, request) = (self.clone(), request.clone());
-        tokio::task::spawn_blocking(move || {
-            let started = std::time::Instant::now();
-            let freed = frees.wait_for_none(service.alloc_wait);
-            info!(
-                freed,
-                waited_ms = started.elapsed().as_millis() as u64,
-                error = err,
-                "a receive allocation waited for a purge's frees"
-            );
-            service.allocate(&request, &layout).map_err(String::from)
-        })
-        .await
-        .unwrap_or_else(|join_err| Err(format!("the allocation task panicked: {join_err}")))
+        let started = std::time::Instant::now();
+        let freed = frees.wait_for_none(self.alloc_wait);
+        info!(
+            freed,
+            waited_ms = started.elapsed().as_millis() as u64,
+            error = err,
+            "a receive allocation waited for a purge's frees"
+        );
+        self.allocate(request, &layout).map_err(String::from)
     }
 
     /// A remote sender failed in place of its EOS: fails its receiver's query on this CN with the
