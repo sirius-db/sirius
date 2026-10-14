@@ -22,7 +22,7 @@ endif()
 set(EXTENSION_SOURCES src/sirius/sirius_extension.cpp)
 
 build_static_extension(sirius ${EXTENSION_SOURCES})
-build_loadable_extension(sirius CPP ${EXTENSION_SOURCES})
+build_loadable_extension(sirius " " ${EXTENSION_SOURCES})
 # Preserve RMM's shared device-resource registry across library boundaries.
 set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 

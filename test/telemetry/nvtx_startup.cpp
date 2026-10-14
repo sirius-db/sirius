@@ -28,10 +28,10 @@ int main(int argc, char** argv)
       "SELECT k, sum(v)::BIGINT FROM (VALUES (1, 10), (1, 20), (2, 5)) t(k, v) "
       "GROUP BY k ORDER BY k");
     if (result->HasError()) { throw std::runtime_error(result->GetError()); }
-    if (result->RowCount() != 2 || result->GetValue(0, 0).GetValue<int32_t>() != 1 ||
-        result->GetValue(1, 0).GetValue<int64_t>() != 30 ||
-        result->GetValue(0, 1).GetValue<int32_t>() != 2 ||
-        result->GetValue(1, 1).GetValue<int64_t>() != 5) {
+    if (result->RowCount() != 2 || result->Collection().GetValue(0, 0).GetValue<int32_t>() != 1 ||
+        result->Collection().GetValue(1, 0).GetValue<int64_t>() != 30 ||
+        result->Collection().GetValue(0, 1).GetValue<int32_t>() != 2 ||
+        result->Collection().GetValue(1, 1).GetValue<int64_t>() != 5) {
       throw std::runtime_error("unexpected GPU result");
     }
   } catch (const std::exception& error) {

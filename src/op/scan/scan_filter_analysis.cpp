@@ -22,11 +22,10 @@
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include <duckdb/planner/filter/conjunction_filter.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
-#include <duckdb/planner/filter/in_filter.hpp>
 #include <expression/ast/constant_range.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/utils.hpp>
@@ -64,48 +63,57 @@ bool append_string_constant(duckdb::Value const& value, std::vector<std::string>
 /// Collect the value set @p filter tests for equality against, or false if it is
 /// any other shape. Recursive so `x = 'a' OR x = 'b'` and an ANDed IS NOT NULL
 /// both resolve.
-bool collect_equality_values(duckdb::TableFilter const& filter, std::vector<std::string>& out)
+bool is_filter_reference(duckdb::Expression const& expr)
 {
-  switch (filter.filter_type) {
-    case duckdb::TableFilterType::CONSTANT_COMPARISON: {
-      auto const& cmp = filter.Cast<duckdb::ConstantFilter>();
-      if (cmp.comparison_type != duckdb::ExpressionType::COMPARE_EQUAL) { return false; }
-      return append_string_constant(cmp.constant, out);
-    }
-    case duckdb::TableFilterType::IN_FILTER: {
-      auto const& in = filter.Cast<duckdb::InFilter>();
-      if (in.values.empty()) { return false; }
-      for (auto const& value : in.values) {
-        if (!append_string_constant(value, out)) { return false; }
-      }
-      return true;
-    }
-    case duckdb::TableFilterType::CONJUNCTION_OR: {
-      // Every branch must contribute, or the union would under-approximate.
-      auto const& disjunction = filter.Cast<duckdb::ConjunctionOrFilter>();
-      if (disjunction.child_filters.empty()) { return false; }
-      for (auto const& child : disjunction.child_filters) {
-        if (!collect_equality_values(*child, out)) { return false; }
-      }
-      return true;
-    }
-    case duckdb::TableFilterType::CONJUNCTION_AND: {
-      // Only the redundant IS NOT NULL may accompany the equality: an equality
-      // against a non-null constant is already false/null for a null row, so
-      // absorbing it does not change which rows survive. Any other conjunct
-      // would narrow the result further than the value set describes.
-      auto const& conjunction = filter.Cast<duckdb::ConjunctionAndFilter>();
-      bool found              = false;
-      for (auto const& child : conjunction.child_filters) {
-        if (child->filter_type == duckdb::TableFilterType::IS_NOT_NULL) { continue; }
-        if (found) { return false; }  // two value-bearing conjuncts: not a plain equality
-        if (!collect_equality_values(*child, out)) { return false; }
-        found = true;
-      }
-      return found;
-    }
-    default: return false;
+  return expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
+         expr.Cast<duckdb::BoundReferenceExpression>().Index() == 0;
+}
+
+bool collect_equality_values(duckdb::Expression const& expr, std::vector<std::string>& out)
+{
+  using duckdb::ExpressionType;
+  if (duckdb::BoundComparisonExpression::IsComparison(expr)) {
+    auto const& cmp = expr.Cast<duckdb::BoundFunctionExpression>();
+    if (expr.GetExpressionType() != ExpressionType::COMPARE_EQUAL) { return false; }
+    auto const* ref   = &duckdb::BoundComparisonExpression::Left(cmp);
+    auto const* value = &duckdb::BoundComparisonExpression::Right(cmp);
+    if (!is_filter_reference(*ref)) { std::swap(ref, value); }
+    return is_filter_reference(*ref) &&
+           value->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT &&
+           append_string_constant(value->Cast<duckdb::BoundConstantExpression>().GetValue(), out);
   }
+  if (expr.GetExpressionType() == ExpressionType::COMPARE_IN &&
+      expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_OPERATOR) {
+    auto const& children = expr.Cast<duckdb::BoundOperatorExpression>().GetChildren();
+    if (children.size() < 2 || !is_filter_reference(*children[0])) { return false; }
+    for (std::size_t i = 1; i < children.size(); ++i) {
+      if (children[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT ||
+          !append_string_constant(children[i]->Cast<duckdb::BoundConstantExpression>().GetValue(),
+                                  out)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONJUNCTION) {
+    auto const& children = expr.Cast<duckdb::BoundConjunctionExpression>().GetChildren();
+    if (children.empty()) { return false; }
+    bool found = false;
+    for (auto const& child : children) {
+      if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+        if (child->GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL &&
+            child->GetExpressionClass() == duckdb::ExpressionClass::BOUND_OPERATOR) {
+          auto const& args = child->Cast<duckdb::BoundOperatorExpression>().GetChildren();
+          if (args.size() == 1 && is_filter_reference(*args[0])) { continue; }
+        }
+        if (found) { return false; }
+      }
+      if (!collect_equality_values(*child, out)) { return false; }
+      found = true;
+    }
+    return found;
+  }
+  return false;
 }
 
 //===----------------------------------------------------------------------===//
@@ -148,12 +156,10 @@ int128 pow10_128(int e)
 ///
 ///  3. Finite day d whose midnight does not fit the target (roughly beyond
 ///     +/-292,000 years for TIMESTAMP/_MS/_S, +/-292 years for TIMESTAMP_NS):
-///     DuckDB raises a ConversionException for the whole query. A decode-time
-///     range cannot raise, and neither does the residual GPU cast it replaces
-///     (cudf::cast wraps silently), so the range treats the mapping as if the
-///     tick domain were unbounded: such a row is kept or dropped exactly as the
-///     instant it denotes would be. That is the only divergence from DuckDB,
-///     and it exists only on queries DuckDB refuses to answer at all.
+///     A day-domain range alone cannot reproduce the conversion error. V2 keeps
+///     potentially throwing casts above the scan and supplies optional scan
+///     bounds, which this analysis ignores. The residual GPU cast preserves
+///     DuckDB's overflow semantics.
 std::optional<sirius::numeric_range> lower_timestamp_to_days(duckdb::Value const& value)
 {
   std::int64_t ticks;
@@ -338,119 +344,59 @@ bool fold_comparison_bound(duckdb::ExpressionType comparison,
   }
 }
 
-/// Fold an EXPRESSION_FILTER conjunct into @p acc. The only recognized
-/// restricting shape is `CAST(<column> AS TIMESTAMP[_S|_MS|_NS]) CMP
-/// <timestamp constant>`, either operand order, on a DATE column (see
-/// to_decoded_bound). AND conjunctions recurse; every other shape clears
-/// @p fully_covered.
+/// Intersect constant comparisons over the scan column, including the supported
+/// DATE-to-timestamp cast. Unsupported conjuncts retain the residual filter.
 bool fold_expression_conjunct(duckdb::Expression const& expr,
                               sirius::logical_type const& col_type,
                               sirius::numeric_range& acc,
                               bool& fully_covered)
 {
+  if (duckdb::ExpressionFilter::IsOptionalExpression(expr)) { return false; }
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONJUNCTION &&
-      expr.type == duckdb::ExpressionType::CONJUNCTION_AND) {
-    auto const& conjunction = expr.Cast<duckdb::BoundConjunctionExpression>();
-    bool any_bound          = false;
-    for (auto const& child : conjunction.children) {
+      expr.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
+    bool any_bound = false;
+    for (auto const& child : expr.Cast<duckdb::BoundConjunctionExpression>().GetChildren()) {
       any_bound |= fold_expression_conjunct(*child, col_type, acc, fully_covered);
     }
     return any_bound;
   }
-  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COMPARISON) {
+  if (!duckdb::BoundComparisonExpression::IsComparison(expr)) {
     fully_covered = false;
     return false;
   }
-  auto const& cmp = expr.Cast<duckdb::BoundComparisonExpression>();
-  auto comparison = cmp.type;
-  switch (comparison) {
-    case duckdb::ExpressionType::COMPARE_EQUAL:
-    case duckdb::ExpressionType::COMPARE_LESSTHAN:
-    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
-    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
-    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: break;
-    default: fully_covered = false; return false;
-  }
-  auto const* cast_side  = cmp.left.get();
-  auto const* value_side = cmp.right.get();
-  if (cast_side->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CAST) {
-    std::swap(cast_side, value_side);  // constant-on-the-left: swap operands ⇒ flip
+  auto const& cmp     = expr.Cast<duckdb::BoundFunctionExpression>();
+  auto comparison     = cmp.GetExpressionType();
+  auto const* subject = &duckdb::BoundComparisonExpression::Left(cmp);
+  auto const* value   = &duckdb::BoundComparisonExpression::Right(cmp);
+  if (subject->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
+    std::swap(subject, value);
     comparison = duckdb::FlipComparisonExpression(comparison);
   }
-  if (cast_side->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CAST ||
-      value_side->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+  if (value->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
     fully_covered = false;
     return false;
   }
-  auto const& cast = cast_side->Cast<duckdb::BoundCastExpression>();
-  // TRY_CAST yields NULL where plain CAST errors, for dates whose midnight
-  // overflows the timestamp domain — a >-side range would wrongly keep them.
-  if (cast.try_cast) {
+  bool supported_subject =
+    is_filter_reference(*subject) && subject->GetReturnType() == sirius::to_duckdb(col_type);
+  if (duckdb::BoundCastExpression::IsCast(*subject)) {
+    auto const& cast  = subject->Cast<duckdb::BoundFunctionExpression>();
+    auto const& child = duckdb::BoundCastExpression::Child(cast);
+    supported_subject = !duckdb::BoundCastExpression::IsTryCast(cast) &&
+                        col_type.id() == sirius::type_id::DATE && is_filter_reference(child) &&
+                        child.GetReturnType().id() == duckdb::LogicalTypeId::DATE &&
+                        cast.GetReturnType() == value->GetReturnType();
+  }
+  if (!supported_subject) {
     fully_covered = false;
     return false;
   }
-  // The BOUND_REF is the filter's placeholder for the filtered column, so its
-  // type must be the column's; only DATE → TIMESTAMP* lowers.
-  if (col_type.id() != sirius::type_id::DATE || !cast.child ||
-      cast.child->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
-      cast.child->return_type.id() != duckdb::LogicalTypeId::DATE ||
-      cast.return_type != value_side->return_type) {
-    fully_covered = false;
-    return false;
-  }
-  auto const& constant = value_side->Cast<duckdb::BoundConstantExpression>().value;
-  auto const bound     = to_decoded_bound(constant, col_type);
+  auto const bound =
+    to_decoded_bound(value->Cast<duckdb::BoundConstantExpression>().GetValue(), col_type);
   if (!bound.has_value()) {
     fully_covered = false;
     return false;
   }
   return fold_comparison_bound(comparison, *bound, acc, fully_covered);
-}
-
-/// Fold @p filter into @p acc, returning true iff at least one bound was
-/// contributed. @p fully_covered is cleared whenever some restricting part of
-/// the filter could NOT be expressed in the range — the resulting range is then
-/// a sound over-approximation (the conjuncts intersect, so skipping one only
-/// under-filters), usable to drop rows during decode but never as grounds to
-/// skip the scan's own filter.
-///
-/// IS_NOT_NULL has no numeric bound and must retain the residual predicate.
-/// Unconvertible AND children are skipped
-/// (coverage lost, bounds kept). OR/IN and other shapes contribute no bounds at
-/// all — decomposing them soundly needs a hull, not an intersection.
-bool fold_numeric_conjunct(duckdb::TableFilter const& filter,
-                           sirius::logical_type const& col_type,
-                           sirius::numeric_range& acc,
-                           bool& fully_covered)
-{
-  switch (filter.filter_type) {
-    case duckdb::TableFilterType::CONSTANT_COMPARISON: {
-      auto const& cmp  = filter.Cast<duckdb::ConstantFilter>();
-      auto const bound = to_decoded_bound(cmp.constant, col_type);
-      if (!bound.has_value()) {
-        fully_covered = false;
-        return false;
-      }
-      return fold_comparison_bound(cmp.comparison_type, *bound, acc, fully_covered);
-    }
-    case duckdb::TableFilterType::EXPRESSION_FILTER: {
-      auto const& expression_filter = filter.Cast<duckdb::ExpressionFilter>();
-      if (!expression_filter.expr) {
-        fully_covered = false;
-        return false;
-      }
-      return fold_expression_conjunct(*expression_filter.expr, col_type, acc, fully_covered);
-    }
-    case duckdb::TableFilterType::CONJUNCTION_AND: {
-      auto const& conjunction = filter.Cast<duckdb::ConjunctionAndFilter>();
-      bool any_bound          = false;
-      for (auto const& child : conjunction.child_filters) {
-        any_bound |= fold_numeric_conjunct(*child, col_type, acc, fully_covered);
-      }
-      return any_bound;
-    }
-    default: fully_covered = false; return false;
-  }
 }
 
 /// Clamp the int128 intersection back into an inclusive int64 range. A range
@@ -478,7 +424,7 @@ scan_filter_analysis analyze_scan_filters(
   const std::unordered_set<std::size_t>& filter_only_primary_indices)
 {
   scan_filter_analysis result;
-  result.ranges_cover_whole_filter = true;
+  result.ranges_cover_whole_filter = !filters.HasMultiColumnFilters();
 
   // An unsupported restricting conjunct does not discard the other columns'
   // ranges: what was extracted remains a sound conjunctive over-approximation,
@@ -494,11 +440,11 @@ scan_filter_analysis analyze_scan_filters(
     result.ranges_cover_whole_filter = false;
   };
 
-  for (auto const& [column_index, filter] : filters.filters) {
-    if (!filter) { continue; }
-    // Advisory filters do not affect coverage. Required IS_NOT_NULL predicates
-    // are not numeric ranges and clear coverage below, retaining the residual.
-    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER) { continue; }
+  for (auto const& entry : filters) {
+    auto const column_index = entry.GetIndex().GetIndex();
+    auto const& filter =
+      duckdb::ExpressionFilter::GetExpressionFilter(entry.Filter(), "scan filter analysis");
+    if (duckdb::ExpressionFilter::IsOptionalFilter(filter)) { continue; }
     if (column_index >= column_ids.size()) {
       not_covered(column_index, "references no scan column");
       continue;
@@ -526,14 +472,14 @@ scan_filter_analysis analyze_scan_filters(
     if (filter_only_primary_indices.count(primary_idx) &&
         sirius::to_duckdb(col_type).id() == duckdb::LogicalTypeId::VARCHAR) {
       std::vector<std::string> values;
-      if (collect_equality_values(*filter, values) && !values.empty()) {
+      if (collect_equality_values(*filter.expr, values) && !values.empty()) {
         result.equality_sets.emplace(primary_idx, std::move(values));
       }
     }
 
     auto acc             = full_decoded_domain();
     bool fully_covered   = true;
-    bool const any_bound = fold_numeric_conjunct(*filter, col_type, acc, fully_covered);
+    bool const any_bound = fold_expression_conjunct(*filter.expr, col_type, acc, fully_covered);
     if (!fully_covered) {
       not_covered(column_index, "is not fully an AND-tree of numeric constant comparisons");
     }
@@ -626,7 +572,7 @@ residual_filter::residual_filter(std::vector<table_filter_conjunct> conjuncts,
         source.expr->ToString());
     }
     std::optional<std::size_t> answered_at;
-    if (answerable_batch_positions.count(source.batch_position)) {
+    if (source.batch_position && answerable_batch_positions.count(*source.batch_position)) {
       answered_at = source.batch_position;
     }
     _conjuncts.push_back({std::move(lowered), answered_at});

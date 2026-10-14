@@ -32,7 +32,7 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   duckdb::ClientContext& context,
   duckdb::TableFunctionBindInput& input,
   duckdb::vector<duckdb::LogicalType>& return_types,
-  duckdb::vector<std::string>& names)
+  duckdb::vector<duckdb::Identifier>& names)
 {
   if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
     throw sirius::invalid_input_exception(
@@ -51,7 +51,10 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   // Undeclared id = bind error (not a silent empty scan).
   auto const& binding = catalog_for(context)->get(stream_id);
 
-  names        = duckdb::vector<std::string>(binding.names.begin(), binding.names.end());
+  names.clear();
+  for (auto const& name : binding.names) {
+    names.emplace_back(name);
+  }
   return_types = sirius::to_duckdb_vec(binding.types);
   return duckdb::make_uniq<stream_source_bind_data>(stream_id);
 }

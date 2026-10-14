@@ -40,6 +40,7 @@
 #include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/main/client_config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
 
@@ -151,7 +152,7 @@ TEST_CASE("Sirius settings are registered", "[sirius][config][isolated_context]"
       con.Query("SELECT count(*) FROM duckdb_settings() WHERE name = '" + std::string(name) + "'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 1);
+    REQUIRE(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
   }
 }
 
@@ -199,7 +200,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     auto result = con.Query("SELECT count(*) FROM duckdb_settings() WHERE name = '" + name + "'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
-    return result->GetValue(0, 0).GetValue<int64_t>();
+    return result->Collection().GetValue(0, 0).GetValue<int64_t>();
   };
 
   setenv("SIRIUS_DISABLE", "1", 1);
@@ -459,7 +460,7 @@ TEST_CASE("DuckDB setting preserves the Sirius log backend when sink constructio
   auto after_invalid = con.Query("SELECT current_setting('sirius_log_backend')::VARCHAR");
   REQUIRE(after_invalid != nullptr);
   REQUIRE_FALSE(after_invalid->HasError());
-  REQUIRE(after_invalid->GetValue(0, 0).GetValue<std::string>() == "noop");
+  REQUIRE(after_invalid->Collection().GetValue(0, 0).GetValue<std::string>() == "noop");
   REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
   REQUIRE(sirius::log::get_sink() == noop_sink);
 
@@ -536,7 +537,7 @@ TEST_CASE("DuckDB setting rejects unknown Sirius log levels without mutation",
   auto after_invalid = con.Query("SELECT current_setting('sirius_log_level')::VARCHAR");
   REQUIRE(after_invalid != nullptr);
   REQUIRE_FALSE(after_invalid->HasError());
-  REQUIRE(after_invalid->GetValue(0, 0).GetValue<std::string>() == "warn");
+  REQUIRE(after_invalid->Collection().GetValue(0, 0).GetValue<std::string>() == "warn");
   REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
   REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::info));
   REQUIRE(sirius::log::get_sink()->should_log(sirius::log::level::warn));
@@ -1113,11 +1114,11 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
-  REQUIRE(settings->GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
-  REQUIRE(settings->GetValue(1, 0).GetValue<uint64_t>() == expected_batch);
-  REQUIRE(settings->GetValue(2, 0).GetValue<uint64_t>() == expected_batch);
-  REQUIRE(settings->GetValue(3, 0).GetValue<uint64_t>() == expected_batch);
-  REQUIRE(settings->GetValue(4, 0).GetValue<uint64_t>() == 2 * expected_batch);
+  REQUIRE(settings->Collection().GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->Collection().GetValue(1, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->Collection().GetValue(2, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->Collection().GetValue(3, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->Collection().GetValue(4, 0).GetValue<uint64_t>() == 2 * expected_batch);
 
   auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
@@ -1129,7 +1130,7 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   auto set_readback = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
   REQUIRE(set_readback != nullptr);
   REQUIRE_FALSE(set_readback->HasError());
-  REQUIRE(set_readback->GetValue(0, 0).GetValue<uint64_t>() == 99);
+  REQUIRE(set_readback->Collection().GetValue(0, 0).GetValue<uint64_t>() == 99);
   REQUIRE(sirius_ctx->get_config().get_operator_params().scan_task_batch_size == 99);
 
   auto reset_setting = con.Query("RESET scan_task_batch_size");
@@ -1138,7 +1139,7 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   auto reset = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
   REQUIRE(reset != nullptr);
   REQUIRE_FALSE(reset->HasError());
-  REQUIRE(reset->GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(reset->Collection().GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(sirius_ctx->get_config().get_operator_params().scan_task_batch_size == expected_batch);
 }
 
@@ -1314,7 +1315,7 @@ TEST_CASE("DuckDB setting rejects zero scan task batch bytes without a Sirius co
   auto before = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
   REQUIRE(before != nullptr);
   REQUIRE_FALSE(before->HasError());
-  auto const expected = before->GetValue(0, 0).GetValue<uint64_t>();
+  auto const expected = before->Collection().GetValue(0, 0).GetValue<uint64_t>();
 
   auto zero = con.Query("SET scan_task_batch_size = 0");
   REQUIRE(zero != nullptr);
@@ -1326,7 +1327,7 @@ TEST_CASE("DuckDB setting rejects zero scan task batch bytes without a Sirius co
   auto after = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
   REQUIRE(after != nullptr);
   REQUIRE_FALSE(after->HasError());
-  REQUIRE(after->GetValue(0, 0).GetValue<uint64_t>() == expected);
+  REQUIRE(after->Collection().GetValue(0, 0).GetValue<uint64_t>() == expected);
 }
 
 TEST_CASE("DuckDB setting rejects negative byte values without mutation",
@@ -1341,7 +1342,7 @@ TEST_CASE("DuckDB setting rejects negative byte values without mutation",
   auto before = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
   REQUIRE(before != nullptr);
   REQUIRE_FALSE(before->HasError());
-  auto const expected = before->GetValue(0, 0).GetValue<uint64_t>();
+  auto const expected = before->Collection().GetValue(0, 0).GetValue<uint64_t>();
 
   auto negative = con.Query("SET scan_task_batch_size = -1");
   REQUIRE(negative != nullptr);
@@ -1350,7 +1351,7 @@ TEST_CASE("DuckDB setting rejects negative byte values without mutation",
   auto after = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
   REQUIRE(after != nullptr);
   REQUIRE_FALSE(after->HasError());
-  REQUIRE(after->GetValue(0, 0).GetValue<uint64_t>() == expected);
+  REQUIRE(after->Collection().GetValue(0, 0).GetValue<uint64_t>() == expected);
 }
 
 TEST_CASE("DuckDB setting rejects invalid compression retention fractions without a Sirius context",
@@ -1432,28 +1433,29 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE_FALSE(settings->HasError());
 
   constexpr uint64_t mib = 1024ULL * 1024;
-  REQUIRE(settings->GetValue(0, 0).GetValue<uint64_t>() == 1 * mib);
-  REQUIRE(settings->GetValue(1, 0).GetValue<uint64_t>() == 2 * mib);
-  REQUIRE(settings->GetValue(2, 0).GetValue<double>() == Approx(0.25));
-  REQUIRE(settings->GetValue(3, 0).GetValue<uint64_t>() == 3 * mib);
-  REQUIRE(settings->GetValue(4, 0).GetValue<uint64_t>() == 4 * mib);
-  REQUIRE(settings->GetValue(5, 0).GetValue<uint64_t>() == 5 * mib);
-  REQUIRE(settings->GetValue(6, 0).GetValue<uint64_t>() == 6 * mib);
-  REQUIRE(settings->GetValue(7, 0).GetValue<uint64_t>() == 7 * mib);
-  REQUIRE(settings->GetValue(8, 0).GetValue<double>() == Approx(3.0));
-  REQUIRE_FALSE(settings->GetValue(9, 0).GetValue<bool>());
-  REQUIRE(settings->GetValue(10, 0).GetValue<bool>());
-  REQUIRE(settings->GetValue(11, 0).GetValue<double>() == Approx(0.8));
-  REQUIRE(settings->GetValue(12, 0).GetValue<double>() == Approx(0.7));
-  REQUIRE_FALSE(settings->GetValue(13, 0).GetValue<bool>());
-  REQUIRE_FALSE(settings->GetValue(14, 0).GetValue<bool>());
-  REQUIRE(settings->GetValue(15, 0).GetValue<bool>());
-  REQUIRE(settings->GetValue(16, 0).GetValue<std::string>() == "/tmp/sirius-compression-plans");
-  REQUIRE(settings->GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
-  REQUIRE(settings->GetValue(18, 0).GetValue<double>() == Approx(0.6));
-  REQUIRE(settings->GetValue(19, 0).GetValue<double>() == Approx(0.4));
-  REQUIRE(settings->GetValue(20, 0).GetValue<bool>());
-  REQUIRE(settings->GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
+  REQUIRE(settings->Collection().GetValue(0, 0).GetValue<uint64_t>() == 1 * mib);
+  REQUIRE(settings->Collection().GetValue(1, 0).GetValue<uint64_t>() == 2 * mib);
+  REQUIRE(settings->Collection().GetValue(2, 0).GetValue<double>() == Approx(0.25));
+  REQUIRE(settings->Collection().GetValue(3, 0).GetValue<uint64_t>() == 3 * mib);
+  REQUIRE(settings->Collection().GetValue(4, 0).GetValue<uint64_t>() == 4 * mib);
+  REQUIRE(settings->Collection().GetValue(5, 0).GetValue<uint64_t>() == 5 * mib);
+  REQUIRE(settings->Collection().GetValue(6, 0).GetValue<uint64_t>() == 6 * mib);
+  REQUIRE(settings->Collection().GetValue(7, 0).GetValue<uint64_t>() == 7 * mib);
+  REQUIRE(settings->Collection().GetValue(8, 0).GetValue<double>() == Approx(3.0));
+  REQUIRE_FALSE(settings->Collection().GetValue(9, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(10, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(11, 0).GetValue<double>() == Approx(0.8));
+  REQUIRE(settings->Collection().GetValue(12, 0).GetValue<double>() == Approx(0.7));
+  REQUIRE_FALSE(settings->Collection().GetValue(13, 0).GetValue<bool>());
+  REQUIRE_FALSE(settings->Collection().GetValue(14, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(15, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(16, 0).GetValue<std::string>() ==
+          "/tmp/sirius-compression-plans");
+  REQUIRE(settings->Collection().GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
+  REQUIRE(settings->Collection().GetValue(18, 0).GetValue<double>() == Approx(0.6));
+  REQUIRE(settings->Collection().GetValue(19, 0).GetValue<double>() == Approx(0.4));
+  REQUIRE(settings->Collection().GetValue(20, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =
@@ -1547,7 +1549,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       con.Query("SELECT current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE");
     REQUIRE(retained != nullptr);
     REQUIRE_FALSE(retained->HasError());
-    REQUIRE(retained->GetValue(0, 0).GetValue<double>() == Approx(0.6));
+    REQUIRE(retained->Collection().GetValue(0, 0).GetValue<double>() == Approx(0.6));
     REQUIRE(sirius_ctx->get_config().get_compression_config().max_compressed_fraction ==
             Approx(0.6));
   }
@@ -1580,8 +1582,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
     "current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT");
   REQUIRE(multi_reset != nullptr);
   REQUIRE_FALSE(multi_reset->HasError());
-  REQUIRE(multi_reset->GetValue(0, 0).GetValue<bool>());
-  REQUIRE(multi_reset->GetValue(1, 0).GetValue<uint64_t>() == 17 * mib);
+  REQUIRE(multi_reset->Collection().GetValue(0, 0).GetValue<bool>());
+  REQUIRE(multi_reset->Collection().GetValue(1, 0).GetValue<uint64_t>() == 17 * mib);
   require_ok("SET dynamic_filter_domain_coverage_threshold = 1.5");
   require_ok("RESET dynamic_filter_domain_coverage_threshold");
   require_ok("SET dynamic_filter_keep_threshold = 0.0");
@@ -1612,11 +1614,11 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   )");
   REQUIRE(reset != nullptr);
   REQUIRE_FALSE(reset->HasError());
-  REQUIRE(reset->GetValue(0, 0).GetValue<uint64_t>() == 1 * mib);
-  REQUIRE(reset->GetValue(1, 0).GetValue<double>() == Approx(0.25));
-  REQUIRE_FALSE(reset->GetValue(2, 0).GetValue<bool>());
-  REQUIRE(reset->GetValue(3, 0).GetValue<bool>());
-  REQUIRE(reset->GetValue(4, 0).GetValue<double>() == Approx(0.6));
+  REQUIRE(reset->Collection().GetValue(0, 0).GetValue<uint64_t>() == 1 * mib);
+  REQUIRE(reset->Collection().GetValue(1, 0).GetValue<double>() == Approx(0.25));
+  REQUIRE_FALSE(reset->Collection().GetValue(2, 0).GetValue<bool>());
+  REQUIRE(reset->Collection().GetValue(3, 0).GetValue<bool>());
+  REQUIRE(reset->Collection().GetValue(4, 0).GetValue<double>() == Approx(0.6));
 
   auto const& params = sirius_ctx->get_config().get_operator_params();
   REQUIRE(params.scan_task_batch_size == 1 * mib);
@@ -1669,7 +1671,7 @@ TEST_CASE("DuckDB setting preserves the Sirius log directory when sink construct
   auto after_invalid = con.Query("SELECT current_setting('sirius_log_dir')::VARCHAR");
   REQUIRE(after_invalid != nullptr);
   REQUIRE_FALSE(after_invalid->HasError());
-  REQUIRE(after_invalid->GetValue(0, 0).GetValue<std::string>() == valid_dir.string());
+  REQUIRE(after_invalid->Collection().GetValue(0, 0).GetValue<std::string>() == valid_dir.string());
   REQUIRE(duckdb::Config::LOG_DIR == valid_dir.string());
   REQUIRE(sirius::log::get_sink() == valid_sink);
 }
@@ -1778,7 +1780,7 @@ TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mu
   auto after_negative = con.Query("SELECT current_setting('sirius_log_flush_seconds')::INTEGER");
   REQUIRE(after_negative != nullptr);
   REQUIRE_FALSE(after_negative->HasError());
-  REQUIRE(after_negative->GetValue(0, 0).GetValue<int32_t>() == 7);
+  REQUIRE(after_negative->Collection().GetValue(0, 0).GetValue<int32_t>() == 7);
   REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 7);
 
   auto disabled = con.Query("SET sirius_log_flush_seconds = 0");
@@ -1789,7 +1791,7 @@ TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mu
   auto after_disabled = con.Query("SELECT current_setting('sirius_log_flush_seconds')::INTEGER");
   REQUIRE(after_disabled != nullptr);
   REQUIRE_FALSE(after_disabled->HasError());
-  REQUIRE(after_disabled->GetValue(0, 0).GetValue<int32_t>() == 0);
+  REQUIRE(after_disabled->Collection().GetValue(0, 0).GetValue<int32_t>() == 0);
 }
 
 TEST_CASE("DuckDB setting preserves the Sirius log flush interval when sink construction fails",
@@ -1845,7 +1847,7 @@ TEST_CASE("DuckDB setting preserves the Sirius log flush interval when sink cons
   auto after_invalid = con.Query("SELECT current_setting('sirius_log_flush_seconds')::INTEGER");
   REQUIRE(after_invalid != nullptr);
   REQUIRE_FALSE(after_invalid->HasError());
-  REQUIRE(after_invalid->GetValue(0, 0).GetValue<int32_t>() == 7);
+  REQUIRE(after_invalid->Collection().GetValue(0, 0).GetValue<int32_t>() == 7);
   REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 7);
   REQUIRE(sirius::log::get_sink() == valid_sink);
 }
@@ -2366,11 +2368,12 @@ TEST_CASE("Per-connection state isolates and expires the transparent capture",
   conn_state->set_captured_plan(std::move(plan));
   conn_state->set_captured_original_views(original_views->views);
 
-  auto const before_prepare      = sirius_ctx->get_transparent_execution_stats();
-  auto& client_config            = duckdb::ClientConfig::GetConfig(client_ctx);
-  client_config.enable_optimizer = false;
-  auto prepared                  = con.Prepare(capture_sql);  // SAME SQL as the capture
-  client_config.enable_optimizer = true;
+  auto const before_prepare = sirius_ctx->get_transparent_execution_stats();
+  duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+    client_ctx, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(false));
+  auto prepared = con.Prepare(capture_sql);  // SAME SQL as the capture
+  duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+    client_ctx, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(true));
   REQUIRE_FALSE(prepared->HasError());
   auto const after_prepare = sirius_ctx->get_transparent_execution_stats();
 

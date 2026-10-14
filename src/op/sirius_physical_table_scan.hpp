@@ -73,7 +73,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Table scan that immediately projects out filter columns that are unused in the remainder of
   //! the query plan
   sirius_physical_table_scan(duckdb::vector<sirius::logical_type> types,
-                             duckdb::TableFunction function,
+                             duckdb::BoundTableFunction function,
                              duckdb::unique_ptr<duckdb::FunctionData> bind_data,
                              duckdb::vector<sirius::logical_type> returned_types,
                              duckdb::vector<duckdb::ColumnIndex> column_ids,
@@ -92,7 +92,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   std::unique_ptr<scan::iceberg_ingestible_table_info> prepared_iceberg_info;
 
   //! The table function
-  duckdb::TableFunction function;
+  duckdb::BoundTableFunction function;
   //! Exact DuckDB output types, including nested child metadata, for the scan contract.
   duckdb::vector<duckdb::LogicalType> duckdb_types;
   //! Bind data of the function
@@ -116,7 +116,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Parameters
   duckdb::vector<duckdb::Value> parameters;
   //! Named parameters of the table function
-  duckdb::named_parameter_map_t named_parameters;
+  duckdb::named_argument_map_t named_parameters;
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   //! Virtual columns
   duckdb::virtual_column_map_t virtual_columns;

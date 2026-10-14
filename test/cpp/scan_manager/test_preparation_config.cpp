@@ -105,6 +105,7 @@ TEST_CASE("Manager construction validates preparation before creating worker or 
   cucascade::memory::memory_reservation_manager memory({host_config});
   sirius::scan_manager::scan_manager_config config;
   config.preparation.max_inflight_jobs = 0;
-  CHECK_THROWS_WITH(sirius::scan_manager::sirius_scan_manager(config, memory, nullptr),
+  sirius::exec::query_lifecycle_registry lifecycle;
+  CHECK_THROWS_WITH(sirius::scan_manager::sirius_scan_manager(lifecycle, config, memory, nullptr),
                     "preparation limits and configured residence must be positive");
 }

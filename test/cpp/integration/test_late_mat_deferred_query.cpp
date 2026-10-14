@@ -126,10 +126,11 @@ std::vector<std::string> cpu_answer(fs::path const& customer,
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
   std::vector<std::string> rows;
-  for (duckdb::idx_t i = 0; i < r->RowCount(); ++i) {
+  auto r_rows = r->Collection().GetRows();
+  for (duckdb::idx_t i = 0; i < r_rows.size(); ++i) {
     std::string row;
     for (duckdb::idx_t c = 0; c < r->ColumnCount(); ++c) {
-      row += r->GetValue(c, i).ToString() + "|";
+      row += r_rows.GetValue(c, i).ToString() + "|";
     }
     rows.push_back(std::move(row));
   }
@@ -223,10 +224,11 @@ TEST_CASE("a deferred payload rides a real plan and comes back right", "[late_ma
   REQUIRE_FALSE(res->HasError());
 
   std::vector<std::string> got;
-  for (duckdb::idx_t i = 0; i < res->RowCount(); ++i) {
+  auto res_rows = res->Collection().GetRows();
+  for (duckdb::idx_t i = 0; i < res_rows.size(); ++i) {
     std::string row;
     for (duckdb::idx_t c = 0; c < res->ColumnCount(); ++c) {
-      row += res->GetValue(c, i).ToString() + "|";
+      row += res_rows.GetValue(c, i).ToString() + "|";
     }
     got.push_back(std::move(row));
   }

@@ -50,11 +50,12 @@ std::string plan_source_policy::reason() const
 }
 
 namespace {
-scan_source_policy classify(duckdb::TableFunction const& function,
+scan_source_policy classify(duckdb::BoundTableFunction const& function,
                             duckdb::FunctionData const* bind,
                             duckdb::ClientContext& context)
 {
-  scan_source_policy result{function.name, byte_source_class::unclassified, true, ""};
+  scan_source_policy result{
+    function.GetName().GetIdentifierName(), byte_source_class::unclassified, true, ""};
   auto const* entry = planner::lookup_connector(function, bind, context);
   if (entry) {
     result.source             = entry->byte_source;

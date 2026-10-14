@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
   PRIVATE aggregate/aggregate_op_util.cpp
+          aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
           aggregate/gpu_aggregate_impl.cpp
           merge/gpu_merge_impl.cpp

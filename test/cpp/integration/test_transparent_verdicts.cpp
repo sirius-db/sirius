@@ -40,7 +40,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto before = sirius::test::get_transparent_execution_stats(*con);
   auto result = con->Query("SELECT sum(i) FROM r2a_routing");
   REQUIRE_FALSE(result->HasError());
-  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 3);
+  CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 3);
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.fallbacks == before.fallbacks + 1);
   CHECK(after.semantic_verdicts[1] == before.semantic_verdicts[1] + 1);
@@ -84,8 +84,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("CHECKPOINT");
   run_ok("SET gpu_execution=true");
   run_ok("SET sirius_test_inject_pin_registry_change=true");
-  auto before  = sirius::test::get_transparent_execution_stats(*con);
-  auto pending = con->PendingQuery("SELECT sum(i) FROM r2a_rebuild");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  run_ok("SET threads=1");
+  auto pending = con->Submit("SELECT sum(i) FROM r2a_rebuild");
   REQUIRE_FALSE(pending->HasError());
   // Planning is complete and no execution task is running. Change only the local
   // option via DuckDB's pinned API so the active pending statement is not replaced.
@@ -94,7 +95,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto index = config.TryGetSettingIndex("sirius_test_inject_scan_verdict", option);
   REQUIRE(index.IsValid());
   con->context->config.user_settings.SetUserSetting(index.GetIndex(), duckdb::Value("unsupported"));
-  auto result = pending->Execute();
+  pending->Complete();
+  auto result = std::move(pending);
   REQUIRE_FALSE(result->HasError());
   auto chunk = result->Fetch();
   REQUIRE(chunk);
@@ -123,7 +125,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto before = sirius::test::get_transparent_execution_stats(*con);
   auto result = con->Query("SELECT sum(i) FROM r2a_measured");
   REQUIRE_FALSE(result->HasError());
-  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 3);
+  CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 3);
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.budget_exceeded[0] == before.budget_exceeded[0] + 1);
   CHECK(after.budget_exceeded[1] == before.budget_exceeded[1] + 1);
@@ -168,7 +170,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto before = sirius::test::get_transparent_execution_stats(*con);
   auto result = con->Query("SELECT i FROM r2a_encrypted.t");
   REQUIRE_FALSE(result->HasError());
-  CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 7);
+  CHECK(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 7);
   auto after  = sirius::test::get_transparent_execution_stats(*con);
   auto reason = static_cast<std::size_t>(verdict_reason::native_encrypted);
   CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);

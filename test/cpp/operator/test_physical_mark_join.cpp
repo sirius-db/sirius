@@ -113,10 +113,10 @@ mark_join_fixture create_mark_join(
     0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition cond;
-  cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.comparison = comparison;
+  duckdb::JoinCondition cond(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    comparison);
   conditions.push_back(std::move(cond));
 
   f.hash_join = duckdb::make_uniq<sirius_physical_hash_join>(
@@ -180,10 +180,10 @@ nlj_projection_fixture create_projected_nlj(duckdb::JoinType join_type,
     0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition cond;
-  cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.comparison = comparison;
+  duckdb::JoinCondition cond(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    comparison);
   conditions.push_back(std::move(cond));
 
   f.nlj = duckdb::make_uniq<sirius_physical_nested_loop_join>(
@@ -223,15 +223,15 @@ nlj_projection_fixture create_projected_nlj_two_cond(duckdb::ExpressionType comp
     0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition cond0;
-  cond0.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond0.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond0.comparison = comparison0;
+  duckdb::JoinCondition cond0(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    comparison0);
   conditions.push_back(std::move(cond0));
-  duckdb::JoinCondition cond1;
-  cond1.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 2);
-  cond1.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1);
-  cond1.comparison = comparison1;
+  duckdb::JoinCondition cond1(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 2),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1),
+    comparison1);
   conditions.push_back(std::move(cond1));
 
   f.nlj = duckdb::make_uniq<sirius_physical_nested_loop_join>(
@@ -664,15 +664,15 @@ TEST_CASE("sirius_physical_hash_join mark join - mixed conditions are unsupporte
 
   // Equality (left.col0 = right.col0) + inequality (left.col1 < right.col0) => mixed shape.
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition eq;
-  eq.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  eq.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  eq.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::JoinCondition eq(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_EQUAL);
   conditions.push_back(std::move(eq));
-  duckdb::JoinCondition lt;
-  lt.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1);
-  lt.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  lt.comparison = duckdb::ExpressionType::COMPARE_LESSTHAN;
+  duckdb::JoinCondition lt(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_LESSTHAN);
   conditions.push_back(std::move(lt));
 
   REQUIRE_THROWS_AS(duckdb::make_uniq<sirius_physical_hash_join>(
@@ -1052,10 +1052,10 @@ TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
   // A plain equality condition the hash join would otherwise accept.
   auto make_conditions = [](duckdb::ExpressionType comparison) {
     duckdb::vector<duckdb::JoinCondition> conditions;
-    duckdb::JoinCondition cond;
-    cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-    cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-    cond.comparison = comparison;
+    duckdb::JoinCondition cond(
+      duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+      duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+      comparison);
     conditions.push_back(std::move(cond));
     return sirius::wrap_join_conditions(std::move(conditions));
   };
@@ -1075,11 +1075,11 @@ TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
   duckdb::vector<duckdb::JoinCondition> mixed;
   for (auto comparison :
        {duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM}) {
-    duckdb::JoinCondition cond;
     auto const idx = static_cast<duckdb::idx_t>(mixed.size());
-    cond.left      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx);
-    cond.right     = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx);
-    cond.comparison = comparison;
+    duckdb::JoinCondition cond(
+      duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx),
+      duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx),
+      comparison);
     mixed.push_back(std::move(cond));
   }
   auto mixed_conditions = sirius::wrap_join_conditions(std::move(mixed));
