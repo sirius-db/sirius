@@ -434,6 +434,12 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     // Membership channel for the decode-time snapshot (join builds publish
     // during execution — only a snapshot taken at prepare/decode can see them).
     scan_input->dynamic_filters = _dynamic_filters_channel;
+    // A compacted decode may write a column directly in the type this scan would restore it to,
+    // which saves the scan's widening cast. Slot i of the decode is output column i only when the
+    // output assembly is a leading identity, so the targets are passed on only then.
+    if (_ingestible->output_assembly_is_leading_identity()) {
+      scan_input->decode_restore_types = normalization_targets();
+    }
     scan_input->update(io::cache::scan_stage::queued);
   }
   return std::move(*next);

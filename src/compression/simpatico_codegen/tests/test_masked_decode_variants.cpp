@@ -29,6 +29,8 @@
 //      chunks among packed ones and a partial tail.
 //   6. the index walk across its operating selectivities (0.1% .. 50%) on a
 //      chunk count that leaves the last block's warps partially past the batch.
+//   7. a compacted decode into a wider element type (out_dtype) writes the
+//      sign-extended values, through both the mask walk and the index walk.
 //
 // GPU required (encode/decode kernels + NVRTC). Same standalone-main harness
 // as the other tests in this directory.
@@ -1259,6 +1261,119 @@ bool render_checks()
 
 }  // namespace
 
+// Widened output (out_dtype): a compacted decode of a narrow column writes its survivors straight
+// in a wider element type, which is how a scan restores a narrow pinned carrier (e.g. DECIMAL32
+// stored as int32 restored to DECIMAL64) without a separate cast. Checks the render contract
+// (entry symbol, declared `out` type, rejected requests) and that the mask walk and the index walk
+// write the same values as decoding at the narrow width and widening on the host.
+bool run_widened_output(int arch)
+{
+  using Narrow = std::int32_t;
+  using Wide   = std::int64_t;
+  auto bp      = jit::FusedTree::make(OpKind::Bitpack);
+
+  const cdj::DecodeKernelSpec narrow = cdj::render(*bp, "int32_t", 8, cdj::kShapeMaskConsume);
+  const cdj::DecodeKernelSpec wide =
+    cdj::render(*bp, "int32_t", 8, cdj::kShapeMaskConsume, "int64_t");
+  REQUIRE_MSG(wide.entry_symbol == narrow.entry_symbol + "_to_int64_t",
+              "widened entry symbol wrong: %s",
+              wide.entry_symbol.c_str());
+  REQUIRE_MSG(wide.source.find("int64_t* __restrict__ out") != std::string::npos &&
+                narrow.source.find("int32_t* __restrict__ out") != std::string::npos,
+              "widened render does not declare `out` as int64_t");
+  REQUIRE_MSG(wide.buffers.size() == narrow.buffers.size() && wide.trailing == narrow.trailing,
+              "widening changed the kernel's input channels or trailing parameters");
+  auto rejects = [&](const std::string& element, cdj::DecodeShape shape, const std::string& out) {
+    try {
+      (void)cdj::render(*bp, element, 8, shape, out);
+    } catch (const cdj::RenderError&) {
+      return true;
+    }
+    return false;
+  };
+  REQUIRE_MSG(rejects("int64_t", cdj::kShapeMaskConsume, "int32_t"),
+              "narrowing out_dtype accepted");
+  REQUIRE_MSG(rejects("int32_t", cdj::kShapeMaskConsume, "int32_t"),
+              "same-width out_dtype accepted");
+  REQUIRE_MSG(rejects("int32_t", cdj::kShapeMaskOut, "int64_t"),
+              "out_dtype accepted for a consumer that writes no column");
+
+  // GPU roundtrip: negative values prove the store sign-extends.
+  const std::int64_t n  = 5 * kChunk + 700;
+  const std::int64_t nc = codegen::num_chunks_for(n);
+  const ::cuda::stream_ref stream{cudaStream_t{}};
+  const std::vector<Narrow> data = gen_data<Narrow>(n, -40'000, 90'000);
+  const range_predicate pred{-20'000, 30'000};
+  GpuEncoded enc = codegen_test::gpu_encode_tree<Narrow>(*bp, "int32_t", data.data(), n, arch);
+  if (!compact_packed_on_host(enc, nc)) return false;
+
+  const std::vector<std::uint32_t> mask_ref = host_mask(data, nc, pred);
+  const std::size_t nwords                  = static_cast<std::size_t>(nc) * kWordsPerChunk;
+  CUdeviceptr d_mask                        = enc.upload_bytes(mask_ref.data(), nwords * 4);
+  std::vector<std::uint32_t> chunk_offsets(static_cast<std::size_t>(nc) + 1, 0u);
+  std::uint32_t survivors = 0;
+  for (std::int64_t chunk_idx = 0; chunk_idx < nc; ++chunk_idx) {
+    chunk_offsets[static_cast<std::size_t>(chunk_idx)] = survivors;
+    for (int word_idx = 0; word_idx < kWordsPerChunk; ++word_idx)
+      survivors += static_cast<std::uint32_t>(__builtin_popcount(
+        mask_ref[static_cast<std::size_t>(chunk_idx) * kWordsPerChunk + word_idx]));
+  }
+  chunk_offsets[static_cast<std::size_t>(nc)] = survivors;
+  REQUIRE_MSG(survivors > 0, "internal: widened test selects nothing");
+
+  selection_mask sm;
+  sm.words         = reinterpret_cast<std::uint32_t*>(d_mask);
+  sm.num_rows      = n;
+  sm.chunk_offsets = reinterpret_cast<std::uint32_t*>(
+    enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
+  sm.survivor_count = survivors;
+
+  std::vector<Wide> expect;
+  std::vector<std::int32_t> row_indices;
+  for (std::int64_t row_idx = 0; row_idx < n; ++row_idx) {
+    const Narrow value = data[static_cast<std::size_t>(row_idx)];
+    if (value >= pred.lo && value <= pred.hi) {
+      expect.push_back(static_cast<Wide>(value));
+      row_indices.push_back(static_cast<std::int32_t>(row_idx));
+    }
+  }
+  CUdeviceptr d_idx =
+    enc.upload_bytes(row_indices.data(), row_indices.size() * sizeof(std::int32_t));
+
+  const simpatico::row_enumeration walks[] = {
+    simpatico::row_enumeration{},
+    simpatico::row_enumeration{reinterpret_cast<const std::int32_t*>(d_idx), nullptr}};
+  const char* walk_names[] = {"mask walk", "index walk"};
+  for (int walk_idx = 0; walk_idx < 2; ++walk_idx) {
+    CUdeviceptr d_out = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(Wide));
+    // 0xAB in every byte: a kernel that wrote only the low 32 bits would leave the high half set.
+    cudaMemset(reinterpret_cast<void*>(d_out), 0xAB, survivors * sizeof(Wide));
+    REQUIRE_MSG(simpatico::launch_decode_fused_tree_compacted(*bp,
+                                                              enc.buffers,
+                                                              "int32_t",
+                                                              n,
+                                                              sm,
+                                                              walks[walk_idx],
+                                                              reinterpret_cast<void*>(d_out),
+                                                              stream,
+                                                              "int64_t"),
+                "[widened/%s] compacted launch failed",
+                walk_names[walk_idx]);
+    std::vector<Wide> got(survivors);
+    cudaMemcpy(got.data(),
+               reinterpret_cast<const void*>(d_out),
+               got.size() * sizeof(Wide),
+               cudaMemcpyDeviceToHost);
+    REQUIRE_MSG(got == expect,
+                "[widened/%s] int64 output != narrow decode widened on the host (%u survivors)",
+                walk_names[walk_idx],
+                survivors);
+  }
+  std::printf(
+    "PASS: widened int32->int64 (survivors=%u of %lld)\n", survivors, static_cast<long long>(n));
+  return true;
+}
+
 int main()
 {
   int device_count = 0;
@@ -1319,6 +1434,8 @@ int main()
     // The str_split gather (shallow and deep offsets chains).
     run_str_split_masked(/*deep=*/false, arch);
     run_str_split_masked(/*deep=*/true, arch);
+    // Compacted decode straight into a wider element type (restoring a narrow carrier).
+    run_widened_output(arch);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL: unhandled exception: %s\n", e.what());
     return 1;

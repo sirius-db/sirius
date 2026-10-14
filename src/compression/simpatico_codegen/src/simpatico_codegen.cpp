@@ -942,6 +942,21 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       // decode_selection contract); the dispatch silently keeps the mask walk
       // on any anomaly, delta roots ignore it, a dictionary gather is
       // unchanged.
+      // Forward the caller's restore type only for a lossless widening of the stored type: same
+      // DECIMAL scale, a wider signed integer, or TIMESTAMP_DAYS for a narrowed DATE.
+      if (i < request.output_types.size() && request.output_types[i].has_value()) {
+        auto const stored = col.dtype;
+        auto const target = *request.output_types[i];
+        bool const decimal_widening =
+          cudf::is_fixed_point(stored) && cudf::is_fixed_point(target) &&
+          stored.scale() == target.scale() && cudf::size_of(target) > cudf::size_of(stored);
+        bool const integer_widening =
+          cudf::is_integral_not_bool(stored) && !cudf::is_unsigned(stored) &&
+          ((cudf::is_integral_not_bool(target) && !cudf::is_unsigned(target)) ||
+           target.id() == cudf::type_id::TIMESTAMP_DAYS) &&
+          cudf::size_of(target) > cudf::size_of(stored);
+        if (decimal_widening || integer_widening) { dsel.output_type = target; }
+      }
       dsel.enumerate_by_index = index_walk_pick &&
                                 result.routes[i] == sc::decode_route::bitpack_mask &&
                                 sel.survivor_count > 0;
