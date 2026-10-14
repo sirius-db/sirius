@@ -1121,10 +1121,18 @@ class Orchestrator:
 
     def _respawn_ready(self, finished: set[int], now: float) -> None:
         for w, (pid, deadline) in list(self.respawn_pending.items()):
-            if self._group_alive(pid) and now < deadline:
+            if self._group_alive(pid):
+                if now < deadline:
+                    continue
+                # The old shell still holds the GPU; a replacement would overlap it.
+                del self.respawn_pending[w]
+                self.report.status = "incomplete"
+                self.report.stop_reason = (
+                    f"worker {w}'s shell still running {TEARDOWN_SECONDS:.0f}s after "
+                    "SIGKILL; not respawned"
+                )
+                self._say(f"[w{w}] {self.report.stop_reason}")
                 continue
-            if now >= deadline:
-                self._say(f"[w{w}] shell still exiting after {TEARDOWN_SECONDS:.0f}s")
             del self.respawn_pending[w]
             finished.discard(w)
             self._spawn(w)
