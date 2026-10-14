@@ -27,7 +27,7 @@
 
 namespace sirius::test {
 
-/** Temporarily overrides a Sirius or DuckDB setting; destruction silently attempts restoration. */
+/** Temporarily overrides a Sirius or DuckDB setting; destruction restores it or warns. */
 class scoped_sirius_setting final {
  public:
   template <std::same_as<bool> Bool>
@@ -54,7 +54,10 @@ class scoped_sirius_setting final {
   ~scoped_sirius_setting() noexcept
   {
     try {
-      con_.Query("SET " + name_ + " = " + original_.ToSQLString() + ";");
+      auto restored = con_.Query("SET " + name_ + " = " + original_.ToSQLString() + ";");
+      if (restored && restored->HasError()) {
+        WARN("scoped_sirius_setting: failed to restore " << name_ << ": " << restored->GetError());
+      }
     } catch (...) {
       // Destructors must not mask the failure that caused scope unwinding.
     }
