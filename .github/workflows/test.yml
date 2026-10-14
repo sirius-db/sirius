@@ -185,6 +185,15 @@ jobs:
           ./build/release/scan-host/scan_host_pic
           ./build/release/scan-host/scan_host_nonpie
 
+      - name: Smoke-test shared GPU execution
+        if: github.event_name == 'merge_group'
+        env:
+          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
+        run: |
+          timeout --kill-after=10s 180s python3 test/scripts/v2_extension_smoke.py \
+            --duckdb sirius-duckdb/build/release/duckdb \
+            --extension sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+
       - name: Install matching test extensions
         run: |
           ./sirius-duckdb/build/release/duckdb -unsigned -c "

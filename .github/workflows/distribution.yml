@@ -75,14 +75,70 @@ jobs:
       artifact_postfix: "-cuda12"
       runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "arm-xl"]}'
 
+  validation-host:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: git submodule update --init --depth=1 duckdb
+      - name: Build matching DuckDB host
+        run: |
+          cmake -S duckdb -B build/validation-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=OFF \
+            -DBUILD_EXTENSIONS="core_functions;parquet" \
+            -DEXPORT_DYNAMIC_SYMBOLS=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+          cmake --build build/validation-host --target shell -j$(nproc)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: v2-validation-host
+          path: build/validation-host/duckdb
+          if-no-files-found: error
+          retention-days: 1
+
+  validate-bundled:
+    if: github.event_name == 'merge_group'
+    needs: [cuda-12, cuda-13, validation-host]
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda:
+          - version: "12"
+            runner: ubuntu-22.04
+          - version: "13"
+            runner: ubuntu-24.04
+    # TODO(mbrobbel): use gpu-t4 once its runner images expose libnvidia-ml.so.1.
+    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xt4"]', matrix.cuda.runner)) }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: v2-validation-host
+          path: build/validation-host
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: sirius-*-extension-linux_amd64-cuda${{ matrix.cuda.version }}
+          merge-multiple: true
+          path: build/bundled
+      - name: Smoke-test bundled GPU execution
+        env:
+          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
+        run: |
+          chmod +x build/validation-host/duckdb
+          timeout --kill-after=10s 180s python3 test/scripts/v2_extension_smoke.py \
+            --duckdb build/validation-host/duckdb \
+            --extension build/bundled/sirius.duckdb_extension
+
   distribution:
     runs-on: ubuntu-slim
-    needs: [cuda-12, cuda-13]
+    needs: [cuda-12, cuda-13, validation-host, validate-bundled]
     if: always()
     steps:
       - name: Check
         run: |
-          for r in "${{ needs.cuda-12.result }}" "${{ needs.cuda-13.result }}"; do
+          for r in "${{ needs.cuda-12.result }}" "${{ needs.cuda-13.result }}" "${{ needs.validation-host.result }}" "${{ needs.validate-bundled.result }}"; do
             case "$r" in failure|cancelled) echo "distribution build $r"; exit 1 ;; esac
           done
           echo "ok (cuda-12=${{ needs.cuda-12.result }}, cuda-13=${{ needs.cuda-13.result }})"
