@@ -91,14 +91,20 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
 
   [[nodiscard]] bool has_more_splits() const;
 
-  /// \brief Snapshot the data batches of pending RESIDENT splits (pinned-cache hits),
-  ///        in queue (consumption) order, without popping anything.
+  /// A pending resident split: its batch and the device its producer stamped on it, if any.
+  struct resident_split {
+    std::shared_ptr<::cucascade::data_batch> batch;
+    std::optional<int> preferred_device;
+  };
+
+  /// \brief Snapshot the pending RESIDENT splits (pinned-cache hits), in queue
+  ///        (consumption) order, without popping anything.
   ///
   /// Used by the memory prefetcher to upgrade queued host-resident batches to GPU
   /// tier ahead of task creation. Fresh-read splits (scan metadata) are skipped.
   /// The returned shared_ptrs are copies; the batch state machine arbitrates any
   /// race with a consumer that pops the split concurrently.
-  [[nodiscard]] std::vector<std::shared_ptr<::cucascade::data_batch>> peek_resident_batches() const;
+  [[nodiscard]] std::vector<resident_split> peek_resident_batches() const;
 
   /// \brief True while the connector counts as actively draining: a consumer
   ///        popped a split within the last @p quiet_ms milliseconds.

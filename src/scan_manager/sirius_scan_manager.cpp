@@ -48,6 +48,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/host_chunk_placement.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "sirius_context.hpp"
 
@@ -204,7 +205,8 @@ struct cached_databatch_provider : public databatch_provider {
                             std::vector<cudf::data_type> normalization_targets,
                             bool has_physical_overrides,
                             sirius::pushdown_request pushdown_req,
-                            std::shared_ptr<op::scan::dynamic_filter_consumer> consumer)
+                            std::shared_ptr<op::scan::dynamic_filter_consumer> consumer,
+                            std::shared_ptr<host_chunk_placement> placement)
     : _plan(std::move(plan)),
       _entry_owner(std::move(entry)),
       _entry(deref_or_throw(_entry_owner)),
@@ -214,7 +216,8 @@ struct cached_databatch_provider : public databatch_provider {
       _normalization_targets(std::move(normalization_targets)),
       _has_physical_overrides(has_physical_overrides),
       _pushdown_req(std::move(pushdown_req)),
-      _consumer(std::move(consumer))
+      _consumer(std::move(consumer)),
+      _placement(std::move(placement))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -322,6 +325,12 @@ struct cached_databatch_provider : public databatch_provider {
     databatch_provider::batch out{std::move(data), std::move(mask), converts, dest_bytes};
     out.origin          = origin_for(index);
     out.decode_attached = std::move(decode_attached);
+    // A host chunk's GPU is fixed here, once: the task creator and the memory prefetcher both
+    // read it off the split. A GPU-tier chunk already says where it lives.
+    if (_entry.tier == cucascade::memory::Tier::HOST && _placement) {
+      // Fresh per-query wrapper, nobody else holds it yet: the shared lock is uncontended.
+      out.preferred_device = _placement->choose(out.data->to_read_only().get_memory_space());
+    }
     return out;
   }
 
@@ -330,6 +339,8 @@ struct cached_databatch_provider : public databatch_provider {
   /// output column j is (*_origin_columns)[j]. Null when the scan is not
   /// stamped, which is what every consumer checks.
   std::shared_ptr<std::vector<late_mat::column_origin> const> _origin_columns;
+  /// The query's placement for host-resident chunks; null leaves splits unstamped.
+  std::shared_ptr<host_chunk_placement> _placement;
   /// Exclusive scan of per-chunk rows over ALL the entry's chunks.
   std::vector<std::int64_t> _chunk_row_start;
 
@@ -1508,6 +1519,15 @@ void sirius_scan_manager::prepare_for_query(
   if (!completion) completion = std::make_shared<pipeline::completion_handler>();
   state->completion = completion;
   state->active_gpu_ids.assign(allocated_gpu_ids.begin(), allocated_gpu_ids.end());
+  if (state->active_gpu_ids.empty()) {
+    // No admission set (direct callers): every configured GPU. Resolved here, once, so the
+    // providers' stamps and the prefetcher's spaces come from the same list.
+    for (auto const* space :
+         _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      state->active_gpu_ids.push_back(space->get_device_id());
+    }
+  }
+  state->placement = std::make_shared<host_chunk_placement>(state->active_gpu_ids, _topology_index);
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
   // whole pool. Dispatchers yield between tasks; each shared pool selects older queries
   // first and preserves FIFO order within each query's priority.
@@ -1969,7 +1989,8 @@ void sirius_scan_manager::prepare_for_query(
                                                    assignment.op->normalization_targets(),
                                                    assignment.op->has_physical_overrides(),
                                                    std::move(inputs.pushdown_req),
-                                                   std::move(consumer));
+                                                   std::move(consumer),
+                                                   state->placement);
     provider->contract_id         = assignment.op->contract_id();
     provider->validation.identity = assignment.entry->identity_evidence;
     provider->validation.layout   = assignment.entry->layout_evidence;
@@ -2085,33 +2106,20 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
   const auto& cfg = _config.memory_prefetcher;
   if (!cfg.enable) { return; }
 
+  // Convert only into the query's admitted GPUs (resolved in prepare_for_query): the task
+  // creator confines every task to that set, so a batch landed anywhere else would be re-homed
+  // at task start. Which of them a batch goes to was stamped on its split when it was queued.
   std::vector<cucascade::memory::memory_space*> gpu_spaces;
-  for (auto* space :
-       _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    if (state.active_gpu_ids.empty() ||
-        std::find(state.active_gpu_ids.begin(),
-                  state.active_gpu_ids.end(),
-                  space->get_device_id()) != state.active_gpu_ids.end()) {
-      if (auto* mutable_space = _reservation_manager.get_memory_space(cucascade::memory::Tier::GPU,
-                                                                      space->get_device_id())) {
-        gpu_spaces.push_back(mutable_space);
-      } else {
-        SIRIUS_LOG_WARN("[memory_prefetcher] GPU {} has no mutable memory space; skipping",
-                        space->get_device_id());
-      }
+  for (int const device_id : state.active_gpu_ids) {
+    if (auto* space =
+          _reservation_manager.get_memory_space(cucascade::memory::Tier::GPU, device_id)) {
+      gpu_spaces.push_back(space);
+    } else {
+      SIRIUS_LOG_WARN("[memory_prefetcher] GPU {} has no mutable memory space; skipping",
+                      device_id);
     }
   }
-  // Admission determines the allowed devices, not each scan task's placement.
-  // A task can latch its device while a batch is still on the host; prefetching
-  // it onto another allowed GPU would leave that task with a foreign-device table.
-  // Keep background conversion on a single eligible GPU until placement is shared.
-  if (gpu_spaces.size() != 1) {
-    SIRIUS_LOG_WARN(
-      "[memory_prefetcher] enabled but skipped: query has {} eligible GPUs; exactly one is "
-      "required",
-      gpu_spaces.size());
-    return;
-  }
+  if (gpu_spaces.empty()) { return; }
 
   std::vector<std::shared_ptr<split_connector>> connectors;
   connectors.reserve(state.scans.size());
@@ -2120,7 +2128,7 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
   }
 
   state.prefetcher = std::make_unique<memory_prefetcher>(
-    cfg, std::move(connectors), std::move(gpu_spaces), _query_lifecycle);
+    cfg, std::move(connectors), std::move(gpu_spaces), _query_lifecycle, state.placement);
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
@@ -3632,7 +3640,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::vector<cudf::data_type> normalization_targets,
   bool has_physical_overrides,
   sirius::pushdown_request pushdown_req,
-  std::shared_ptr<op::scan::dynamic_filter_consumer> consumer)
+  std::shared_ptr<op::scan::dynamic_filter_consumer> consumer,
+  std::shared_ptr<host_chunk_placement> placement)
 {
   return std::make_unique<cached_databatch_provider>(std::move(entry),
                                                      selected_columns,
@@ -3643,7 +3652,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
                                                      std::move(normalization_targets),
                                                      has_physical_overrides,
                                                      std::move(pushdown_req),
-                                                     std::move(consumer));
+                                                     std::move(consumer),
+                                                     std::move(placement));
 }
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,

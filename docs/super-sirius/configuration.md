@@ -538,19 +538,25 @@ sirius:
 Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
 worker threads walk the pending splits in scan execution order and convert
 resident batches to GPU tier ahead of task execution, gated on GPU memory
-headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default. Background memory
-prefetch runs only when the query has exactly one eligible GPU after admission filtering.
-Workers use that device's reservations and exclusive stream leases, releasing leases before
-parking. With multiple eligible GPUs, scan tasks perform their own uploads on their assigned
-devices; independent background placement could conflict with a task's already selected device.
+headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default.
+On a multi-GPU host each batch is converted into the GPU the scan manager
+stamped on its split when it queued it (a GPU on the host chunk's NUMA node,
+round-robin across that node's admitted GPUs, or across every admitted GPU
+when none is local), which is also where the task creator sends the batch's
+scan task. The headroom floor is checked per target GPU; a GPU that refuses
+is skipped for the rest of the sweep while the others keep prefetching. The
+worker pool, the per-connector drain claims and the head margin all scale
+with the query's GPU count, so the prefetcher keeps pace with scans that
+pop from every GPU at once. Workers use each target GPU's reservations and
+exclusive stream leases, releasing leases before parking.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enable` | bool | false | Master switch for the prefetcher. |
-| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each acquires an exclusive stream lease for a sweep and returns it before parking. |
-| `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
+| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads per admitted GPU (the pool is this times the query's GPU count); each acquires an exclusive stream lease on its target GPU for a sweep and returns it before parking. |
+| `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of each GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
 | `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
-| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining until this long passes since its last pop. One worker may prefetch it tail-first, leaving four batches at the head for scan tasks; other workers skip it. Must exceed the scan's inter-pop interval. |
+| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining until this long passes since its last pop. One worker per admitted GPU may prefetch it tail-first, leaving four batches per GPU at the head for scan tasks; other workers skip it. Must exceed the scan's inter-pop interval. |
 
 ### Programmatic S3 credentials
 

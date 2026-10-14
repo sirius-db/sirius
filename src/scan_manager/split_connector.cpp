@@ -117,18 +117,18 @@ bool split_connector::is_closed() const
   return !_splits.empty();
 }
 
-std::vector<std::shared_ptr<::cucascade::data_batch>> split_connector::peek_resident_batches() const
+std::vector<split_connector::resident_split> split_connector::peek_resident_batches() const
 {
-  std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+  std::vector<resident_split> splits;
   std::lock_guard<std::mutex> lock(_mutex);
-  batches.reserve(_splits.size());
+  splits.reserve(_splits.size());
   for (const auto& split : _splits) {
     auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(split.input.get());
     if (scan_input != nullptr && scan_input->is_resident()) {
-      batches.push_back(scan_input->get_cached_batch());
+      splits.push_back({scan_input->get_cached_batch(), scan_input->get_preferred_device_id()});
     }
   }
-  return batches;
+  return splits;
 }
 
 bool split_connector::is_discovery_complete() const
