@@ -10,7 +10,17 @@
 
 namespace duckdb {
 
-static void LoadInternal(ExtensionLoader& loader) { sirius::register_duckdb_extension(loader); }
+static void LoadInternal(ExtensionLoader& loader)
+{
+  std::string const name = SIRIUS_STRINGIFY(SIRIUS_EXTENSION_NAME);
+  if (name == "sirius_cuda12" || name == "sirius_cuda13") {
+    auto const* other = name == "sirius_cuda12" ? "sirius_cuda13" : "sirius_cuda12";
+    if (loader.GetDatabaseInstance().ExtensionIsLoaded(other)) {
+      throw InvalidInputException("Cannot load %s while %s is already loaded", name, other);
+    }
+  }
+  sirius::register_duckdb_extension(loader);
+}
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }
 std::string SiriusExtension::Name() { return SIRIUS_STRINGIFY(SIRIUS_EXTENSION_NAME); }
