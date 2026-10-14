@@ -271,21 +271,26 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] std::vector<std::uint64_t> original_batch_ids() const;
 
   /**
-   * @brief Builds a payload of the same dynamic type that carries @p batches in place of this
-   * payload's batches.
+   * @brief Returns a new task input of the same type that holds @p batches in place of this one's
+   * batches.
    *
-   * Use this when each replacement holds the same rows in the same order, as when
-   * `materialize_deferred_input` restores late-materialized columns. Rows are unchanged, so the
-   * result keeps everything this payload knows about them: its per-position original batch IDs (the
-   * first original ID wins, so a relocated and then restored batch keeps the producer's ID), its
-   * preferred device, and the metadata of a subtype, such as a partition index or a scan receipt.
-   * An operator that changes rows or columns must build a new plain payload instead.
+   * Late materialization calls this just before an operator runs, to swap each input batch for one
+   * with its deferred columns filled in. The rows and their order stay the same, so everything this
+   * task input records about those rows still holds, and the new task input keeps it:
+   * - its subtype and the subtype's fields, such as a partition index, a scan receipt, or a cross
+   *   join slice;
+   * - the original batch ID at each position, which dynamic-filter publication uses to drop
+   *   duplicate contributions (a batch replaced twice keeps the first ID);
+   * - the preferred device.
    *
-   * @throws std::invalid_argument if @p batches does not pair one batch with each of this payload's
-   * batches, null exactly where this payload's batch is null
+   * Call it only when each new batch holds the same rows, in the same order, as the batch it
+   * replaces. An operator that adds, drops, or reorders rows must build a new plain task input.
+   * Subtypes with fields of their own override it to carry those fields over.
    *
-   * @param batches The replacement for each batch of this payload, in the same positions
-   * @return The new payload; this payload is unchanged
+   * @param batches One replacement per current batch, at the same position: null exactly where the
+   *                current batch is null
+   * @return The new task input; this one is unchanged
+   * @throws std::invalid_argument if @p batches does not line up with the current batches
    */
   [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
     std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const;
@@ -300,22 +305,6 @@ class pipelineable_operator_data : public operator_data {
    */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
     const;
-
-  /**
-   * @brief Task input of the same kind with @p data_batches in place of the batches.
-   *
-   * Late materialization calls it when it restores deferred columns just before an operator's
-   * execute(). Subclasses that carry state besides the batches, such as a cross product task's
-   * slice, override it to copy that state into the new task input.
-   *
-   * @param data_batches The batches of the new task input.
-   * @return A task input of the same type, holding @p data_batches.
-   */
-  [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_data_batches(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches) const
-  {
-    return std::make_unique<pipelineable_operator_data>(std::move(data_batches));
-  }
 
   /**
    * @brief Get read-only accessors for the batches. Returns the pin locks acquired by
