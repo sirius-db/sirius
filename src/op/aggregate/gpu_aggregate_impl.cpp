@@ -293,6 +293,19 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   }
   if (use_label_keys) { group_cols.push_back(label_col->view()); }
 
+  // When a batch's single fixed-width, null-free key column is already in ascending order, as for
+  // lineitem grouped by l_orderkey from a table pinned in key order, let cuDF use its sorted-keys
+  // path. That replaces hashing and global atomics with run detection and segmented reductions.
+  // The order is verified per batch, so unsorted batches keep the hash path.
+  bool keys_sorted = false;
+  if (!has_collect_set && group_cols.size() == 1 && key_is_radix_sortable(group_cols[0]) &&
+      !cudf::is_dictionary(group_cols[0].type())) {
+    keys_sorted = cudf::is_sorted(
+      cudf::table_view(group_cols), {cudf::order::ASCENDING}, {cudf::null_order::AFTER}, stream);
+    SIRIUS_LOG_DEBUG(
+      "local_grouped_agg: sorted-key check rows={} sorted={}", input_table.num_rows(), keys_sorted);
+  }
+
   // Make aggregation requests, group aggregations on the same column in the single request.
   // For multi-column COLLECT_SET, a synthetic negative key -(i+1) is used so that each such
   // aggregate gets its own request with a freshly synthesized struct column.
@@ -404,7 +417,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   std::unique_ptr<cudf::table> sorted_input;
   std::vector<cudf::order> key_order(group_cols.size(), cudf::order::ASCENDING);
   std::vector<cudf::null_order> key_null_order(group_cols.size(), cudf::null_order::AFTER);
-  if (stable_m2) {
+  // Keys already verified ascending need no sort for the stable M2 path either.
+  if (stable_m2 && !keys_sorted) {
     auto columns = group_cols;
     for (auto const& request : requests) {
       columns.push_back(request.values);
@@ -422,11 +436,12 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
       requests[i].values = sorted_input->get_column(group_cols.size() + i).view();
     }
   }
-  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols),
-                                   cudf::null_policy::INCLUDE,
-                                   stable_m2 ? cudf::sorted::YES : cudf::sorted::NO,
-                                   key_order,
-                                   key_null_order);
+  cudf::groupby::groupby grpby_obj(
+    cudf::table_view(group_cols),
+    cudf::null_policy::INCLUDE,
+    (stable_m2 || keys_sorted) ? cudf::sorted::YES : cudf::sorted::NO,
+    key_order,
+    key_null_order);
 
   // Call cudf groupby and populate output columns
   auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
