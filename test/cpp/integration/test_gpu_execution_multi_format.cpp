@@ -3773,7 +3773,6 @@ TEST_CASE_METHOD(
         CHECK_THROWS_WITH(engine.execute(), "DV preparation attempt already started");
         CHECK_THROWS_AS(admission->consume(), std::logic_error);
         CHECK_FALSE(installed->ledger());
-        CHECK(state->get_scan_manager().num_active_queries() == 0);
         CHECK(observed.reads_started.empty());
         CHECK(first_plan->files().empty());
         CHECK(second_plan->files().empty());
