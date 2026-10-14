@@ -137,3 +137,30 @@ TEST_CASE("residual_filter leaves unanswerable columns alone", "[scan]")
   REQUIRE(predicate != nullptr);
   REQUIRE(predicate->holds<sirius::ast::comparison>());
 }
+
+TEST_CASE("R4 residual combines exact coverage with an unevaluated answer", "[scan][r4]")
+{
+  residual_filter const residual{two_conjuncts(), {1, 2}};
+  std::vector<predicate_progress> progress{{0, predicate_stage::enforced, {}},
+                                           {1, predicate_stage::answer, 2}};
+  auto result = residual.against_progress(progress);
+  REQUIRE(result->holds<sirius::ast::reference>());
+  REQUIRE(result->get<sirius::ast::reference>().column_index == 2);
+  progress[1] = {1, predicate_stage::pruning_only, {}};
+  REQUIRE(residual.against_progress(progress)->holds<sirius::ast::comparison>());
+  progress.push_back({1, predicate_stage::enforced, {}});
+  REQUIRE_THROWS(residual.against_progress(progress));
+  progress = {{2, predicate_stage::enforced, {}}};
+  REQUIRE_THROWS(residual.against_progress(progress));
+  progress = {{0, predicate_stage::answer, 2}};
+  REQUIRE_THROWS(residual.against_progress(progress));
+}
+
+TEST_CASE("R4 residual refuses a lost value needed by another conjunct", "[scan][r4]")
+{
+  auto conjuncts = two_conjuncts();
+  conjuncts.push_back(string_equality(7, 1));
+  residual_filter const residual{std::move(conjuncts), {1, 2}};
+  std::vector<predicate_progress> progress{{0, predicate_stage::answer, 1}};
+  REQUIRE_THROWS(residual.against_progress(progress));
+}

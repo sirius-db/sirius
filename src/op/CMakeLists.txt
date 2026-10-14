@@ -31,6 +31,10 @@ target_sources(
           scan/sirius_gpu_scan_operator_data.cpp
           scan/gpu_ingestible.cpp
           scan/parquet_gpu_ingestible.cpp
+          scan/materialization_contract.cpp
+          scan/positional_visibility.cpp
+          scan/field_id_mapping.cpp
+          scan/arrow_materializer.cpp
           scan/parquet_materialize.cpp
           scan/duckdb_native_gpu_ingestible.cpp
           scan/table_scan/bound_read_view.cpp
