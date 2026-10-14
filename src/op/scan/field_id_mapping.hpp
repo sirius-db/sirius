@@ -13,11 +13,15 @@ namespace sirius::op::scan {
 std::unordered_map<int32_t, std::size_t> index_parquet_field_ids(
   cudf::io::parquet::FileMetaData const&);
 
+// The qualified flat scalar mapping profile; nested transformations remain separate.
+std::optional<cudf::data_type> field_mapping_type(duckdb::LogicalType const&);
+
 struct field_requirement {
   int32_t id;
   duckdb::LogicalType type;
   std::optional<duckdb::Value> missing_value;
-  bool allow_int32_to_int64 = false;
+  bool allow_int32_to_int64  = false;
+  bool allow_float_to_double = false;
 };
 
 // Immutable, scan-local approval. Only compile() can mint its operations; callers cannot

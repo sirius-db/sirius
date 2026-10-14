@@ -113,7 +113,9 @@ void collect_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& col
 std::optional<std::string> iceberg_retired_field_id_decline_reason(duckdb::LogicalGet& op)
 {
   auto const* bind_data = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
-  if (bind_data == nullptr) { return std::nullopt; }
+  if (bind_data == nullptr || iceberg_flat_mapping_supported(op.bind_data.get())) {
+    return std::nullopt;
+  }
 
   // `reader_bind.schema` is the Iceberg schema and the only one carrying field ids; the generic
   // `columns` list may leave `identifier` null, so it is a fallback only.

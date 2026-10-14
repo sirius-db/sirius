@@ -390,6 +390,28 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
       info->physical_schema = std::move(schema);
   }
 
+  if (iceberg_flat_mapping_supported(scan_op.bind_data.get())) {
+    auto const& bind    = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+    auto const& columns = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
+    std::vector<sirius::op::scan::field_requirement> requirements;
+    for (std::size_t p = 0; p < info->names.size(); ++p) {
+      auto found = std::find_if(columns.begin(), columns.end(), [&](auto const& column) {
+        return column.name == info->names[p] &&
+               column.type == sirius::to_duckdb(info->returned_types.at(p));
+      });
+      if (found == columns.end()) {
+        requirements.clear();
+        break;
+      }
+      std::optional<duckdb::Value> missing;
+      if (found->default_expression) missing = found->GetDefaultValue();
+      requirements.push_back(
+        {found->GetIdentifierFieldId(), found->type, std::move(missing), true, true});
+    }
+    if (requirements.size() == info->names.size())
+      info->field_mapping_requirements = std::move(requirements);
+  }
+
   if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
     throw duckdb::NotImplementedException("iceberg_scan has no table path parameter");
   }
@@ -425,6 +447,9 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   }
   auto inventory = std::move(*scan_op.delete_inventory);
   scan_op.delete_inventory.reset();
+  if (info->field_mapping_requirements)
+    info->files_without_partition_values =
+      sirius::op::scan::iceberg_files_without_partition_values(context, inventory);
   auto discovery =
     sirius::op::scan::discover_from_manifests(context, info->table_path, std::move(inventory));
   if (supplied_discovery)

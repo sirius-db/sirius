@@ -19,6 +19,7 @@
 // sirius
 #include <helper/logical_type.hpp>
 #include <memory/size_arithmetic.hpp>
+#include <op/scan/field_id_mapping.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
@@ -50,6 +51,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -78,6 +80,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
  public:
   duckdb::vector<duckdb::LogicalType> bound_types;      // Full nested bind schema, in P-space.
   std::optional<iceberg_table_schema> physical_schema;  // Populated by the S3 Iceberg lowering.
+  // iceberg_flat_v1 rules exported from trusted DuckDB binding, in P-space.
+  std::optional<std::vector<field_requirement>> field_mapping_requirements;
+  std::unordered_set<std::string> files_without_partition_values;
   bound_table_scan physical_contract;
   leaf_set semantic_columns;
   duckdb::vector<sirius::logical_type> returned_types;
@@ -212,6 +217,7 @@ class parquet_split_info : public scan_info {
   /// when AST translation succeeded). Shared across every split emitted
   /// by the same batch.
   std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
+  std::shared_ptr<field_id_mapping const> field_mapping;
   /// Canonical scan_plan for the table, shared across every split of
   /// this ingestible.
   std::shared_ptr<scan_plan const> plan;
@@ -308,6 +314,7 @@ class parquet_file_scan_info : public scan_info {
   /// Per-file reader options. These differ from the plan defaults when the
   /// row-count carrier column is unavailable in a schema-evolved file.
   std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
+  std::shared_ptr<field_id_mapping const> field_mapping;
   /// Hive partition values for this file, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns.
   std::vector<std::string> partition_values;

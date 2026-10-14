@@ -27,6 +27,7 @@
 #include <io/io_errors.hpp>
 #include <io/parquet_helpers.hpp>
 #include <io/sirius_datasource.hpp>
+#include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
@@ -391,6 +392,7 @@ class parquet_batch_coalescer : public batch_coalescer {
         file->partition_values,
         file->disable_filter_pushdown,
         file->reader_options,
+        file->field_mapping,
         file->file_index,
         std::vector<split_materializer_certificate>(file->certificates().begin(),
                                                     file->certificates().end()),
@@ -416,6 +418,7 @@ class parquet_batch_coalescer : public batch_coalescer {
       _run_arrow_schema    = file->arrow_schema;
     }
     _run_reader_options = file->reader_options;
+    _run_mapping        = file->field_mapping;
     _partition_values   = file->partition_values;
     _disable_pushdown   = file->disable_filter_pushdown;
 
@@ -530,6 +533,7 @@ class parquet_batch_coalescer : public batch_coalescer {
       _partition_values   = _empty_split_fallback->partition_values;
       _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
       _run_reader_options = _empty_split_fallback->reader_options;
+      _run_mapping        = _empty_split_fallback->field_mapping;
       _certificates       = _empty_split_fallback->certificates;
       _dependencies       = _empty_split_fallback->dependencies;
       for (auto& certificate : _certificates) {
@@ -550,6 +554,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     auto split            = std::make_unique<parquet_split_info>(std::move(hints));
     split->rg_slices      = std::move(_slices);
     split->reader_options = std::move(reader_options);
+    split->field_mapping  = _run_mapping;
     split->set_column_chunk_byte_ranges(std::move(per_slice_ranges));
     split->plan                    = _plan;
     split->disable_filter_pushdown = _disable_pushdown;
@@ -587,6 +592,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   /// Reader options of the current run. Projected and natural reads cannot share
   /// a split.
   std::shared_ptr<cudf::io::parquet_reader_options> _run_reader_options;
+  std::shared_ptr<field_id_mapping const> _run_mapping;
   column_chunk_range_cache _ranges_cache;
 
   /// First fully-pruned file, kept as the source for flush()'s empty-split
@@ -598,6 +604,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     std::vector<std::string> partition_values;
     bool disable_filter_pushdown;
     std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
+    std::shared_ptr<field_id_mapping const> field_mapping;
     std::size_t file_index;
     std::vector<split_materializer_certificate> certificates;
     std::vector<split_dependencies> dependencies;
@@ -1096,11 +1103,54 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     return found == leaves_by_name.end() ? empty : found->second;
   };
   validation_set schema_validation;
+  std::shared_ptr<field_id_mapping const> mapping;
   if (_info->physical_schema) {
     auto checked = check_iceberg_file_schema(metadata,
                                              *_info->physical_schema,
                                              file_path,
                                              resolved_metadata->original_logical_annotations);
+    if (!checked.approved && _info->field_mapping_requirements &&
+        checked.reason != verdict_reason::iceberg_schema_no_field_ids &&
+        checked.reason != verdict_reason::iceberg_schema_no_rows) {
+      try {
+        // A missing ID is not a missing field: untagged files require name-mapping
+        // semantics, which iceberg_flat_v1 deliberately does not claim.
+        for (std::size_t i = 1; i < metadata.schema.size(); ++i)
+          if (!metadata.schema[i].field_id)
+            throw std::invalid_argument("iceberg_flat_v1 requires IDs on every physical field");
+        auto requirements = *_info->field_mapping_requirements;
+        if (!_info->files_without_partition_values.contains(
+              sirius::io::strip_file_scheme(file_path)))
+          for (auto& field : requirements)
+            field.missing_value.reset();
+        materialization_program program;
+        program.contract   = _info->contract_id;
+        program.generation = 1;
+        program.input_types.emplace();
+        for (auto const& field : requirements)
+          program.input_types->push_back(*field_mapping_type(field.type));
+        // Validate the entire bound schema, even if the query projects a subset.
+        field_id_mapping::compile(
+          resolved_metadata, resolved_metadata->built_for_identity, program, requirements);
+        std::vector<field_requirement> fields;
+        program.input_types->clear();
+        for (auto const& column : _plan->data_columns) {
+          fields.push_back(requirements.at(column.primary_idx));
+          program.input_types->push_back(*field_mapping_type(fields.back().type));
+        }
+        mapping = std::make_shared<field_id_mapping const>(
+          field_id_mapping::compile(resolved_metadata,
+                                    resolved_metadata->built_for_identity,
+                                    std::move(program),
+                                    std::move(fields)));
+        opts = *_natural_reader_options;
+        if (!mapping->read_indices().empty()) opts.set_column_indices(mapping->read_indices());
+        checked.approved   = true;
+        checked.validation = check_bit(later_check::schema_per_file);
+      } catch (std::invalid_argument const& error) {
+        checked.text += "; iceberg_flat_v1: " + std::string(error.what());
+      }
+    }
     if (!checked.approved) {
       if (_info->profiles->counters) _info->profiles->counters->record(checked.reason);
       throw unsupported_physical_input(_info->contract_id, file_path, checked.reason, checked.text);
@@ -1129,10 +1179,11 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   // evolution) or has no row groups to resolve it against reads its natural
   // batch.
   bool const carrier_unavailable =
-    _plan->carrier_batch_index.has_value() &&
+    !mapping && _plan->carrier_batch_index.has_value() &&
     leaves_for(_plan->data_columns[*_plan->carrier_batch_index].name).empty();
   if (carrier_unavailable) { opts = *_natural_reader_options; }
-  bool const file_projected = _plan->is_projected() && !carrier_unavailable;
+  bool const file_projected =
+    mapping ? !mapping->read_names().empty() : _plan->is_projected() && !carrier_unavailable;
 
   effective_reader_projection effective;
   effective.natural_read = !file_projected;
@@ -1143,6 +1194,14 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
       _info->bound_types.empty() ? sirius::to_duckdb(_info->returned_types.at(column.primary_idx))
                                  : _info->bound_types.at(column.primary_idx));
     effective.projected.push_back(static_cast<uint32_t>(d));
+  }
+  if (mapping) {
+    effective              = {};
+    effective.names        = mapping->read_names();
+    effective.bound_types  = mapping->read_types();
+    effective.natural_read = effective.names.empty();
+    for (std::size_t i = 0; i < effective.names.size(); ++i)
+      effective.projected.push_back(i);
   }
   auto physical_contract        = _info->physical_contract;
   physical_contract.contract_id = _info->contract_id;
@@ -1161,7 +1220,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   if (_static_pushdown_expression) collect(*_static_pushdown_expression);
   for (auto const& predicate : _null_prune_predicates)
     pruning_columns.insert(predicate.batch_index);
-  if (!pruning_columns.empty() && !metadata.row_groups.empty()) {
+  if (!mapping && !pruning_columns.empty() && !metadata.row_groups.empty()) {
     auto schema = sirius::io::parquet_helpers::extract_schema(
       metadata, true, resolved_metadata->original_logical_annotations);
     for (auto d : pruning_columns) {
@@ -1190,7 +1249,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     auto const names = _plan->data_column_names();
     scanned_column_names.insert(names.begin(), names.end());
   }
-  bool stats_filter_unsafe = false;
+  bool stats_filter_unsafe = bool(mapping);
   for (auto const& elem : metadata.schema) {
     if (restrict_to_scanned && !scanned_column_names.contains(elem.name)) { continue; }
     bool const is_decimal = (elem.converted_type.has_value() &&
@@ -1230,7 +1289,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   // Used below to estimate the decoded (GPU-resident) byte size of each projected
   // column when partitioning row groups into batches — see rg_contribution.
   auto const& returned_types   = _info->returned_types;
-  auto const data_column_names = _plan->data_column_names();
+  auto const data_column_names = mapping ? mapping->read_names() : _plan->data_column_names();
   // A file read without its carrier keeps every file column. rg_contribution
   // uses bind-type widths for known, non-partition top-level columns and
   // metadata estimates for the rest; a partition name's bind type is the
@@ -1248,7 +1307,8 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   // (which fall back to the parquet encoded-uncompressed size in rg_contribution).
   std::vector<std::size_t> selected_chunk_decoded_width;
   std::unordered_set<std::size_t> pure_filter_chunk_indices;
-  if (file_projected) {
+  // Empty evolved files have a footer schema but no column chunks to account.
+  if (file_projected && (!mapping || !metadata.row_groups.empty())) {
     auto const filter_only_positions = _plan->filter_only_batch_positions();
     bool const has_data_output = std::ranges::any_of(_plan->columns.data_roles, [](auto role) {
       return role == scan_column_layout::data_role::OUTPUT;
@@ -1272,7 +1332,10 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
       // types (which throw) get 0, signalling rg_contribution to fall back to
       // the encoded-uncompressed byte size.
       std::size_t decoded_width = 0;
-      if (k < _plan->data_columns.size()) {
+      if (mapping) {
+        auto type = field_mapping_type(mapping->read_types()[k]);
+        if (type && type->id() != cudf::type_id::STRING) decoded_width = cudf::size_of(*type);
+      } else if (k < _plan->data_columns.size()) {
         auto const primary_idx = _plan->data_columns[k].primary_idx;
         if (primary_idx < returned_types.size()) {
           try {
@@ -1284,7 +1347,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
       }
       // When no data column is projected, use the decoded columns as a nonzero
       // history basis. This covers count-style and partition-only outputs.
-      bool const is_pure_filter = has_data_output && filter_only_positions.count(k);
+      bool const is_pure_filter = !mapping && has_data_output && filter_only_positions.count(k);
       for (auto const leaf : leaves) {
         selected_chunk_indices.push_back(leaf);
         selected_chunk_decoded_width.push_back(decoded_width);
@@ -1338,7 +1401,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   //
   // null_count is optional in the parquet spec — an absent value means unknown,
   // never zero, so the row group is kept.
-  if (!_null_prune_predicates.empty() && !row_group_indices.empty()) {
+  if (!mapping && !_null_prune_predicates.empty() && !row_group_indices.empty()) {
     struct resolved_predicate {
       std::size_t chunk_index;
       bool expects_null;
@@ -1417,7 +1480,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
                                              physical_contract,
                                              effective,
                                              retained,
-                                             _info->semantic_columns,
+                                             mapping ? leaf_set{} : _info->semantic_columns,
                                              resolved_metadata->original_logical_annotations);
   if (_info->profiles->counters)
     _info->profiles->counters->record(profile.reason, profile.type_mismatches);
@@ -1488,7 +1551,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
                   pure_filter_chunk_indices.contains(chunk_idx),
                   selected_chunk_decoded_width[i]);
       }
-    } else if (carrier_unavailable) {
+    } else if (carrier_unavailable || mapping) {
       for (auto const& chunk : row_group.columns) {
         std::size_t decoded_width = 0;
         auto const& path          = chunk.meta_data.path_in_schema;
@@ -1529,6 +1592,11 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
           static_cast<std::size_t>(chunk.meta_data.total_compressed_size);
       }
     }
+    if (mapping) {
+      auto extra                    = mapping->additional_bytes(row_count);
+      estimate.output_bytes         = memory::saturating_add(estimate.output_bytes, extra);
+      estimate.decode_working_bytes = memory::saturating_add(estimate.decode_working_bytes, extra);
+    }
     auto const partition_bytes = row_count * partition_row_bytes;
     estimate.output_bytes += partition_bytes;
     estimate.decode_working_bytes += partition_bytes;
@@ -1557,14 +1625,16 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     return estimate;
   };
 
-  auto out                     = std::make_unique<parquet_file_scan_info>();
-  out->file_metadata           = file_metadata;
-  out->original_schema         = resolved_metadata->original_schema;
-  out->arrow_schema            = resolved_metadata->arrow_schema;
-  out->file_path               = file_path;
-  out->file_index              = file_index;
-  out->datasource              = std::move(sirius_ds);
-  out->reader_options          = carrier_unavailable ? _natural_reader_options : _reader_options;
+  auto out             = std::make_unique<parquet_file_scan_info>();
+  out->file_metadata   = file_metadata;
+  out->original_schema = resolved_metadata->original_schema;
+  out->arrow_schema    = resolved_metadata->arrow_schema;
+  out->file_path       = file_path;
+  out->file_index      = file_index;
+  out->datasource      = std::move(sirius_ds);
+  out->reader_options  = carrier_unavailable ? _natural_reader_options : _reader_options;
+  if (mapping) out->reader_options = std::make_shared<cudf::io::parquet_reader_options>(opts);
+  out->field_mapping           = mapping;
   out->carrier_unavailable     = carrier_unavailable;
   out->disable_filter_pushdown = disable_filter_pushdown;
   out->row_groups.reserve(row_group_indices.size());
@@ -1677,6 +1747,15 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
   std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
+  if (split.field_mapping) {
+    auto const& mapping = *split.field_mapping;
+    if (mapping.program().contract != _info->contract_id)
+      throw std::invalid_argument("mapped split belongs to another scan");
+    for (auto const& slice : split.rg_slices)
+      if (slice.file_metadata != mapping.metadata()->file_metadata() || !slice.datasource ||
+          slice.datasource->get_io_object().identity_cache_key() != mapping.identity())
+        throw std::invalid_argument("mapped split does not match its approved file");
+  }
   // All-pruned fallback split (parquet_batch_coalescer::flush): every slice
   // carries zero row groups.
   // Don't express that via set_row_groups — the meaning of an empty per-source
@@ -1768,6 +1847,12 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
           throw sirius::internal_exception(
             "parquet virtual scan: decoded row count does not match footer");
         }
+        if (split.field_mapping) {
+          auto rows = decoded->num_rows();
+          decoded =
+            split.field_mapping->apply(owning_table_view(std::move(decoded)), rows, stream, mr_ref)
+              .table.release(stream, mr_ref);
+        }
         pieces.push_back(append_virtual_columns(std::move(decoded),
                                                 *split.reader_options,
                                                 run.data_file_path,
@@ -1835,6 +1920,11 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
       table = std::move(
         cudf::io::read_parquet(std::move(cudf_sources), std::move(metadatas), opts, stream, mr_ref)
           .tbl);
+    }
+    if (split.field_mapping) {
+      auto rows = table->num_rows();
+      table = split.field_mapping->apply(owning_table_view(std::move(table)), rows, stream, mr_ref)
+                .table.release(stream, mr_ref);
     }
     if (_plan->has_user_virtual_columns()) {
       auto const& slice = split.rg_slices.front();

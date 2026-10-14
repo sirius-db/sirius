@@ -21,6 +21,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
+#include "op/scan/field_id_mapping.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/duckdb_host.hpp"
@@ -603,6 +604,19 @@ class scan_source_extension_callback final : public duckdb::ExtensionCallback {
 }  // namespace
 
 std::span<connector const> registered_connectors() { return entries; }
+
+bool iceberg_flat_mapping_supported(duckdb::FunctionData const* bind_data)
+{
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
+  if (!bind) return false;
+  auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
+  if (!collect_iceberg_field_ids(columns)) return false;
+  return std::all_of(columns.begin(), columns.end(), [](auto const& column) {
+    return column.children.empty() && op::scan::field_mapping_type(column.type).has_value() &&
+           (!column.default_expression ||
+            column.default_expression->type == duckdb::ExpressionType::VALUE_CONSTANT);
+  });
+}
 
 bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data)
 {
