@@ -61,8 +61,8 @@ impl fmt::Display for FragmentInstanceId {
 /// One buffered fragment result and where the FE `fetch_data` poll is in draining it.
 #[derive(Debug)]
 enum FragmentState {
-    /// A result fragment accepted before its exchange inputs arrived. `query` lets a failure
-    /// anywhere in the query fail this slot.
+    /// A result fragment accepted before its exchange inputs arrived. `query` is the FE query
+    /// id, so a failure anywhere in the query fails this slot.
     Waiting { query: FragmentInstanceId },
     /// Rows produced, not yet delivered.
     Pending(TResultBatch),
@@ -105,9 +105,14 @@ impl ResultStore {
             .or_insert(FragmentState::Waiting { query });
     }
 
-    /// Buffers an executed fragment's result for later `fetch_data` collection.
+    /// Buffers an executed fragment's result for later `fetch_data` collection. A failure is
+    /// sticky: a fragment that finishes after its query failed delivers no rows.
     pub(crate) fn insert(&self, id: FragmentInstanceId, batch: TResultBatch) {
-        self.lock().insert(id, FragmentState::Pending(batch));
+        let mut results = self.lock();
+        if !matches!(results.get(&id), Some(FragmentState::Failed(_))) {
+            results.insert(id, FragmentState::Pending(batch));
+        }
+        drop(results);
         self.ready.notify_all();
     }
 
@@ -242,6 +247,8 @@ mod tests {
         store.reserve(id, FragmentInstanceId::from_halves(3, 0));
         let waiting = store.clone();
         let poll = std::thread::spawn(move || waiting.take_next(id, Duration::from_secs(5)));
+        // Let the poller block first, so the Condvar wait is what delivers the rows.
+        std::thread::sleep(Duration::from_millis(50));
         store.insert(id, batch(&["x"]));
         let outcome = poll.join().unwrap().expect("rows arrived");
         assert_eq!(outcome.batch.unwrap().rows.len(), 1);
@@ -277,5 +284,42 @@ mod tests {
         assert!(err.contains("merge exploded"), "{err}");
         let err = store.take_next(other_id, Duration::ZERO).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn a_failure_wakes_a_blocked_poller_at_once() {
+        let store = std::sync::Arc::new(ResultStore::default());
+        let (query, id) = (
+            FragmentInstanceId::from_halves(8, 0),
+            FragmentInstanceId::from_halves(8, 1),
+        );
+        store.reserve(id, query);
+        let waiting = store.clone();
+        let poll = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            (
+                waiting.take_next(id, Duration::from_secs(5)),
+                started.elapsed(),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        store.fail_query(query, "sender exploded");
+        let (outcome, waited) = poll.join().unwrap();
+        assert!(outcome.unwrap_err().contains("sender exploded"));
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+    }
+
+    #[test]
+    fn rows_after_a_failure_are_not_delivered() {
+        let store = ResultStore::default();
+        let (query, id) = (
+            FragmentInstanceId::from_halves(9, 0),
+            FragmentInstanceId::from_halves(9, 1),
+        );
+        store.reserve(id, query);
+        store.fail_query(query, "merge exploded");
+        store.insert(id, batch(&["late"]));
+        let err = store.take_next(id, Duration::ZERO).unwrap_err();
+        assert!(err.contains("merge exploded"), "{err}");
     }
 }

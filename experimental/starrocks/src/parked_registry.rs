@@ -2,7 +2,7 @@
 //!
 //! One sender fragment parks once; output stream i belongs to `outputs[i]`. Each destination
 //! claims that stream and releases when done. The fragment — and the GPU batches it still holds —
-//! drops with the last claim.
+//! drops with the last release.
 
 use std::collections::HashMap;
 
@@ -16,6 +16,7 @@ struct Parked<F> {
 /// Parked sender outputs. Generic so the engine thread can hold `sirius::Fragment<'ctx>`.
 pub(crate) struct ParkedRegistry<F> {
     parked: HashMap<u64, Parked<F>>,
+    /// Destination slot -> (parked id, output stream index of that fragment).
     slots: HashMap<SenderSlot, (u64, u64)>,
     next_id: u64,
 }
@@ -128,5 +129,10 @@ mod tests {
         let err = registry.park(&[a, a], "frag").unwrap_err();
         assert!(err.contains("duplicate"), "{err}");
         assert!(registry.claim(&a, "relay").is_err());
+        // A slot already parked by another fragment is refused too, not overwritten.
+        registry.park(&[a], "first").unwrap();
+        let err = registry.park(&[a], "second").unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+        assert_eq!(*registry.claim(&a, "relay").unwrap().0, "first");
     }
 }

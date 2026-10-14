@@ -330,7 +330,8 @@ fn sender_id_of(slot: &SenderSlot) -> Result<u32, String> {
     u32::try_from(slot.sender_id).map_err(|_| format!("negative sender id {}", slot.sender_id))
 }
 
-/// `SIRIUS_CN_TIMING` set to anything but `0` logs one `fragment timing` line per fragment.
+/// `SIRIUS_CN_TIMING` set to anything but empty or `0` logs one `fragment timing` line per
+/// fragment.
 fn timing_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -764,5 +765,52 @@ mod tests {
             })
             .expect_err("an overflowing hash key fails the receiver");
         park().expect("the failed receiver released its input");
+
+        // Fan-out to two receivers: broadcast copies every row to each, a hash on `id` splits
+        // the rows between them without overlap.
+        let fan_out = |instance: i64, broadcast: bool, hash_keys: Vec<usize>| {
+            let slots = [0, 1].map(|sender_id| SenderSlot {
+                fragment_instance_id: crate::result_store::FragmentInstanceId::from_halves(
+                    instance, sender_id,
+                ),
+                node_id: 7,
+                sender_id: 0,
+            });
+            engine
+                .run_fragment(FragmentRun {
+                    plan: &plan,
+                    inputs: Vec::new(),
+                    outputs: slots.to_vec(),
+                    broadcast,
+                    hash_keys,
+                })
+                .expect("park the fan-out");
+            slots.map(|slot| {
+                let rows = engine
+                    .run_fragment(FragmentRun {
+                        plan: &receiver,
+                        inputs: vec![(7, vec![slot])],
+                        outputs: Vec::new(),
+                        broadcast: false,
+                        hash_keys: Vec::new(),
+                    })
+                    .expect("relay one destination")
+                    .expect("the receiver returns rows");
+                rows.batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+            })
+        };
+        // The earlier slot is still parked from `park()` above.
+        assert_eq!(engine.parked_fragments(), 1);
+        assert_eq!(fan_out(3, true, Vec::new()), [3, 3]);
+        let [left, right] = fan_out(4, false, vec![0]);
+        assert_eq!(left + right, 3);
+        assert_eq!(
+            engine.parked_fragments(),
+            1,
+            "both fan-outs were fully relayed"
+        );
     }
 }
