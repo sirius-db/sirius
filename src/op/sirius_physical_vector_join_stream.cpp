@@ -2259,6 +2259,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                exact_source,
                                dim,
                                stream,
+                               mr,
                                certain_limit ? certain_limit->data() : nullptr,
                                radius_bound);
           kept = vss::take_pairs(kept.rows.data(),
@@ -2324,7 +2325,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                  n,
                                  exact_source,
                                  dim,
-                                 stream);
+                                 stream,
+                                 mr);
             fold_best(taken.rows.data(),
                       taken.ids.data(),
                       taken.distances.data(),
@@ -2351,6 +2353,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                              exact_source,
                              dim,
                              stream,
+                             mr,
                              certain_limit ? certain_limit->data() : nullptr,
                              radius_bound);
       }
@@ -2728,7 +2731,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                n_left * k_join,
                                exact_source,
                                dim,
-                               stream);
+                               stream,
+                               mr);
           vss::row_max_bound(
             acc_distances->view().data<float>(), n_left, k_join, bound->data(), stream);
           vss::fill_misses(acc_distances->mutable_view().data<float>(),

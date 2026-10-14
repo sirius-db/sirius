@@ -232,6 +232,7 @@ exact_rows pinned_rows_map::view(std::int64_t const* row_map) const
   out.chunk_offset = static_cast<std::int64_t const*>(chunk_offset->data());
   out.pin_blocks   = static_cast<std::byte const* const*>(blocks->data());
   out.n_chunks     = n_chunks;
+  out.n_rows       = n_rows();
   out.block_shift  = block_shift;
   return out;
 }

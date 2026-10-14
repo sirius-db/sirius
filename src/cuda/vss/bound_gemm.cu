@@ -29,6 +29,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -673,11 +674,13 @@ __global__ void exact_distances_kernel(float const* __restrict__ probe,
                                        exact_rows const src,
                                        int d,
                                        float const* __restrict__ certain_below,
-                                       float certain_value)
+                                       float certain_value,
+                                       int64_t const* __restrict__ order)
 {
   int const lane = threadIdx.x % 32;
-  for (int64_t i = (blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x) / 32; i < n_pairs;
-       i += static_cast<int64_t>(gridDim.x) * blockDim.x / 32) {
+  for (int64_t j = (blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x) / 32; j < n_pairs;
+       j += static_cast<int64_t>(gridDim.x) * blockDim.x / 32) {
+    auto const i  = order != nullptr ? order[j] : j;
     auto const id = ids[i];
     if (id < 0) { continue; }
     auto const row = rows != nullptr ? static_cast<int64_t>(rows[i]) : i / k;
@@ -699,10 +702,20 @@ __global__ void exact_distances_kernel(float const* __restrict__ probe,
         s             = fmaf(t, t, s);
       }
     } else {
-      auto const x = locate_pinned_row(src, id, d);
-      for (int c = lane; c < d; c += 32) {
-        float const t = q[c] - pinned_value(x, c, src.block_shift);
-        s             = fmaf(t, t, s);
+      // A pinned row need not start on a 128-byte line (a host chunk's floats follow its other
+      // columns), and a warp reading 32 floats from an unaligned start makes two read requests
+      // where one would do. So the warp reads the aligned lines covering the row and each lane
+      // pairs the float it got with the probe's: 10-15 % of the re-score from host memory.
+      auto const x     = locate_pinned_row(src, id, d);
+      auto const end   = x.offset + static_cast<int64_t>(d) * static_cast<int64_t>(sizeof(float));
+      auto const first = x.offset & ~int64_t{127};
+      for (auto line = first; line < end; line += 128) {
+        auto const at = line + lane * static_cast<int64_t>(sizeof(float));
+        auto const c  = (at - x.offset) / static_cast<int64_t>(sizeof(float));
+        if (at >= x.offset && c < d) {
+          float const t = q[c] - pinned_value(pinned_row{x.blocks, at}, 0, src.block_shift);
+          s             = fmaf(t, t, s);
+        }
       }
     }
 #pragma unroll
@@ -710,6 +723,22 @@ __global__ void exact_distances_kernel(float const* __restrict__ probe,
       s += __shfl_xor_sync(0xffffffffu, s, o);
     }
     if (lane == 0) { distances[i] = s; }
+  }
+}
+
+// The pin row of pair i's layout row, the key the pairs are walked in; past every row for a miss.
+__global__ void pin_row_keys_kernel(int64_t const* __restrict__ ids,
+                                    int64_t const* __restrict__ row_map,
+                                    int64_t n_pairs,
+                                    int64_t n_rows,
+                                    int64_t* __restrict__ keys,
+                                    int64_t* __restrict__ order)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n_pairs;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const id = ids[i];
+    keys[i]       = id < 0 ? n_rows : (row_map != nullptr ? row_map[id] : id);
+    order[i]      = i;
   }
 }
 
@@ -1143,10 +1172,50 @@ void exact_distances(float const* probe,
                      exact_rows const& source,
                      int64_t dim,
                      rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr,
                      float const* certain_below,
                      float certain_value)
 {
   if (n_pairs == 0) { return; }
+  // From the pin, the pairs are taken in pin-row order. A copy in layout order kept each
+  // cluster's rows together, so the pairs, which arrive by cluster, read it a region at a time;
+  // their pin rows lie anywhere in the column, and read in arrival order they took twice as long
+  // (Deep100M in host memory: 37 ms against the copy's 16; sorted, 19).
+  std::optional<rmm::device_uvector<int64_t>> order;
+  if (source.pin_blocks != nullptr && n_pairs > 1) {
+    rmm::device_uvector<int64_t> keys(n_pairs, stream, mr), keys_sorted(n_pairs, stream, mr);
+    rmm::device_uvector<int64_t> unsorted(n_pairs, stream, mr);
+    order.emplace(n_pairs, stream, mr);
+    pin_row_keys_kernel<<<grid_for(n_pairs), 256, 0, stream.value()>>>(
+      ids, source.row_map, n_pairs, source.n_rows, keys.data(), unsorted.data());
+    CUDF_CUDA_TRY(cudaGetLastError());
+    int bits = 1;
+    while ((int64_t{1} << bits) <= source.n_rows) {
+      ++bits;
+    }
+    std::size_t temp_bytes = 0;
+    CUDF_CUDA_TRY(cub::DeviceRadixSort::SortPairs(nullptr,
+                                                  temp_bytes,
+                                                  keys.data(),
+                                                  keys_sorted.data(),
+                                                  unsorted.data(),
+                                                  order->data(),
+                                                  n_pairs,
+                                                  0,
+                                                  bits,
+                                                  stream.value()));
+    rmm::device_buffer temp(temp_bytes, stream, mr);
+    CUDF_CUDA_TRY(cub::DeviceRadixSort::SortPairs(temp.data(),
+                                                  temp_bytes,
+                                                  keys.data(),
+                                                  keys_sorted.data(),
+                                                  unsorted.data(),
+                                                  order->data(),
+                                                  n_pairs,
+                                                  0,
+                                                  bits,
+                                                  stream.value()));
+  }
   auto const warps_per_block = 8;
   auto const grid            = static_cast<int>(
     std::clamp<int64_t>((n_pairs + warps_per_block - 1) / warps_per_block, 1, 65535));
@@ -1159,7 +1228,9 @@ void exact_distances(float const* probe,
                                                                             source,
                                                                             static_cast<int>(dim),
                                                                             certain_below,
-                                                                            certain_value);
+                                                                            certain_value,
+                                                                            order ? order->data()
+                                                                                  : nullptr);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

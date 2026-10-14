@@ -147,6 +147,7 @@ void exact_distances(float const* probe,
                      exact_rows const& source,
                      int64_t dim,
                      rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr,
                      float const* certain_below = nullptr,
                      float certain_value        = 0.f);
 

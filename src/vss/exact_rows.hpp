@@ -40,6 +40,7 @@ struct exact_rows {
   std::int64_t const* chunk_offset{nullptr};
   std::byte const* const* pin_blocks{nullptr};
   std::int64_t n_chunks{0};
+  std::int64_t n_rows{0};  ///< rows in the pin
   int block_shift{0};
 
   [[nodiscard]] bool valid() const noexcept
