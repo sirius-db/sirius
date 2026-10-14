@@ -474,7 +474,8 @@ struct VariantLaunchArgs {
   // to the TOUCHED chunk count, which is the whole point of that enumerator. The per-chunk metadata
   // bounds check still uses the batch's full chunk count, since a listed chunk may be any of them.
   std::int32_t grid_blocks = 0;
-  CUdeviceptr len_out      = 0;  // str_split_meta: per-survivor byte lengths (output)
+  CUdeviceptr len_out      = 0;        // str_split_meta: per-survivor byte lengths (output)
+  const char* out_dtype    = nullptr;  // write_column: wider output element type (see render)
 };
 
 // Per-variant launch preconditions, checked in ONE place with ONE diagnostic.
@@ -782,7 +783,8 @@ int run_rendered_decode(const jit::FusedTree& tree,
 
   cdj::DecodeKernelSpec spec;
   try {
-    spec = cdj::render(tree, cxx_dtype, num_chunks, va.shape);
+    spec = cdj::render(
+      tree, cxx_dtype, num_chunks, va.shape, va.out_dtype != nullptr ? va.out_dtype : "");
   } catch (const cdj::RenderError& e) {
     std::fprintf(
       stderr, "simpatico::codegen: rendered decode: render rejected shape: %s\n", e.what());
@@ -1047,11 +1049,13 @@ bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
                                         ::sirius::codegen::selection_mask const& mask,
                                         row_enumeration rows,
                                         void* out,
-                                        ::cuda::stream_ref stream)
+                                        ::cuda::stream_ref stream,
+                                        char const* out_dtype)
 {
   VariantLaunchArgs va;
   bind_enumeration(
     va, cdj::kShapeMaskConsume, cdj::kShapeIndexConsume, cdj::kShapeSparseConsume, mask, rows);
+  va.out_dtype         = out_dtype;
   auto const survivors = rows.by_row_set() ? rows.rows->num_survivors : mask.survivor_count;
   report_enumeration("value decode", va, num_rows, survivors);
   // A row set carries its own geometry, so there is no mask to check it against

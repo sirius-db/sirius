@@ -53,10 +53,12 @@
 // standard library
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -420,6 +422,21 @@ std::optional<std::size_t> sirius_gpu_scan_operator::total_source_output_bytes()
   return pipeline::project_source_output_bytes(estimated_cardinality, rows, bytes);
 }
 
+namespace {
+
+/// Whether compacted decodes write restored columns directly in their restore type
+/// (SIRIUS_EXP_DECODE_TO_TARGET=1).
+bool decode_to_target_enabled()
+{
+  static bool const enabled = [] {
+    char const* value = std::getenv("SIRIUS_EXP_DECODE_TO_TARGET");
+    return value != nullptr && std::string_view{value} == "1";
+  }();
+  return enabled;
+}
+
+}  // namespace
+
 std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input_data()
 {
   auto next = _split_connector->get_next_split();
@@ -434,6 +451,12 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     // Membership channel for the decode-time snapshot (join builds publish
     // during execution — only a snapshot taken at prepare/decode can see them).
     scan_input->dynamic_filters = _dynamic_filters_channel;
+    // Experimental (SIRIUS_EXP_DECODE_TO_TARGET=1): a compacted decode may write a column directly
+    // in the type this scan would restore it to. Slot i of the decode is output column i only when
+    // the output assembly is a leading identity, so the targets are passed on only then.
+    if (decode_to_target_enabled() && _ingestible->output_assembly_is_leading_identity()) {
+      scan_input->decode_restore_types = normalization_targets();
+    }
     scan_input->update(io::cache::scan_stage::queued);
   }
   return std::move(*next);
