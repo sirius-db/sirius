@@ -19,9 +19,9 @@
 #include "helper/decimal_divide.hpp"
 
 // duckdb
-#include <duckdb/common/optional.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/common/exception.hpp>
+#include <duckdb/common/optional.hpp>
 #include <duckdb/common/types/decimal.hpp>
 #include <duckdb/common/vector_operations/binary_executor.hpp>
 #include <duckdb/execution/expression_executor.hpp>
@@ -79,8 +79,8 @@ int fractional_digits(LogicalType const& type)
   return type.id() == LogicalTypeId::DECIMAL ? duckdb::DecimalType::GetScale(type) : 0;
 }
 
-// DuckDB v2 settles argument and return types in the resolve_types callback; a bind callback may not
-// change them.
+// DuckDB v2 settles argument and return types in the resolve_types callback; a bind callback may
+// not change them.
 void resolve_decimal_divide_types(duckdb::ResolveScalarFunctionTypesInput& input)
 {
   auto& context              = input.GetClientContext();
@@ -107,7 +107,7 @@ void resolve_decimal_divide_types(duckdb::ResolveScalarFunctionTypesInput& input
                                   result_scale);
   }
 
-  auto& bound_function           = input.GetBoundFunction();
+  auto& bound_function             = input.GetBoundFunction();
   bound_function.GetArguments()[0] = operand_type(input.GetArgumentType(0), "dividend");
   bound_function.GetArguments()[1] = operand_type(input.GetArgumentType(1), "divisor");
   // The scale stays a constant argument, so a plan copy (serialize, deserialize) binds the call
