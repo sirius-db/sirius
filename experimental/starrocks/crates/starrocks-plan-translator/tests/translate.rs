@@ -3604,6 +3604,70 @@ fn common_slot_read_above_its_project_is_carried() {
     assert_eq!(struct_field(argument), 1);
 }
 
+/// A carried column stays inside the fragment: the sink row the receiver reads is the
+/// descriptor row only.
+#[test]
+fn carried_common_slot_is_dropped_from_a_stream_sink_row() {
+    let bigint = scalar_type(TPrimitiveType::BIGINT);
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(
+        5,
+        arithmetic(
+            TExprOpcode::ADD,
+            slot_ref(1, 0, bigint.clone()),
+            int_literal(1),
+        ),
+    );
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(4, slot_ref(1, 0, bigint.clone()));
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![2]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let mut select = base_plan_node(3, TPlanNodeType::SELECT_NODE, 1, vec![2]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(5, 2, bigint.clone()),
+        int_literal(0),
+    )]);
+    let mut common = slot(5, 2, "", bigint.clone());
+    common.is_materialized = Some(false);
+    let desc = desc_table(
+        vec![(0, Some(100)), (2, None)],
+        vec![
+            slot(1, 0, "a", bigint.clone()),
+            slot(4, 2, "a", bigint.clone()),
+            common,
+        ],
+    );
+    let sender = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![select, project, scan_node(0, 0)]),
+        desc.clone(),
+        TDataPartition::new(
+            TPartitionType::HASH_PARTITIONED,
+            Some(vec![slot_ref(4, 2, bigint.clone())]),
+            None,
+            None,
+        ),
+    ))
+    .unwrap();
+    assert_eq!(sender.output_names, ["a"]);
+    assert_eq!(sender.output_partition_columns, Some(vec![0]));
+
+    let mut exchange = base_plan_node(7, TPlanNodeType::EXCHANGE_NODE, 0, vec![2]);
+    exchange.exchange_node = Some(TExchangeNode::new(vec![2], None, None, None, None, None));
+    let input = ExchangeInput {
+        node_id: 7,
+        stream_view: "sirius_stream_7".into(),
+        names: sender.output_names.clone(),
+    };
+    PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(Some(TPlan::new(vec![exchange])), Some(desc), None),
+            &[input],
+        )
+        .unwrap();
+}
+
 /// A carried column feeding a join would shift the right side's fields, so it is refused.
 #[test]
 fn carried_common_slot_into_a_join_is_rejected() {

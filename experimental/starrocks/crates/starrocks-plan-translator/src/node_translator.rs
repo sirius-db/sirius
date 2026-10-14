@@ -362,6 +362,20 @@ pub(crate) fn translate_plan(
 ) -> Result<TranslatedFragment> {
     let mut ctx = PlanContext::new(desc, scan_paths, exchange_inputs, registry);
     let root = plan.translate(&mut ctx)?;
+    // Carried common-expr columns are internal to the fragment; the sink row is the descriptor
+    // row the receiver's `input_row_tuples` describes.
+    let keep: Vec<i32> = root
+        .layout
+        .columns()
+        .enumerate()
+        .filter(|(_, key)| !key.is_some_and(|key| ctx.carried.contains(&key)))
+        .map(|(index, _)| index as i32)
+        .collect();
+    let root = if keep.len() == root.layout.len() {
+        root
+    } else {
+        emit_columns(root, keep)?
+    };
     Ok(TranslatedFragment {
         root,
         stream_inputs: ctx.stream_inputs,
