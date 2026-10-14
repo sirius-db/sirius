@@ -1558,11 +1558,11 @@ TEST_CASE_METHOD(fragment_fixture,
 }
 
 // ============================================================================
-// FRAG-16: an interrupt from another thread stops a run retrying out-of-memory
+// FRAG-17: an interrupt from another thread stops a run retrying out-of-memory
 // ============================================================================
 
 TEST_CASE_METHOD(fragment_fixture,
-                 "FRAG-16: an interrupt stops a run retrying out-of-memory, and the next run works",
+                 "FRAG-17: an interrupt stops a run retrying out-of-memory, and the next run works",
                  "[integration][streaming_fragment][interrupt]")
 {
   auto set = [&](const std::string& sql) {
