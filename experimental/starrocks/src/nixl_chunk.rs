@@ -24,7 +24,8 @@ use crate::ring_wire::{Reader, put_strings};
 const MAGIC: [u8; 4] = *b"SRNX";
 const MD: u8 = 1;
 const PACKED: u8 = 3;
-const FAILED: u8 = 5;
+// 5 and 6 are the runtime filters' TOPOLOGY and SHARE_ABANDONED frames.
+const FAILED: u8 = 7;
 const RING_OPEN: u8 = 8;
 const RING_CLOSE: u8 = 9;
 
