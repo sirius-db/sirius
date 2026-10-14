@@ -99,6 +99,7 @@ class WorkerArgs:
     cpu_only: bool = False
     spawn_id: int = 0
     mode: str = "correctness"
+    extension_explicit: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -283,6 +284,14 @@ class Evaluator:
             res.result.columns = baseline.columns
             outcome = compare_results(baseline, res.result, mode == "ordered", self.tol)
             if not outcome.equal:
+                rec.variant = {name: value}
+                if self.cfg.oracle.ambiguity_filter and self._is_ambiguous(
+                    sql, baseline, mode
+                ):
+                    # The setting changed execution order of an order-dependent query.
+                    rec.verdict = Verdict.AMBIGUOUS.value
+                    rec.detail = f"variant {name}={value}: {outcome.detail}"
+                    return
                 rec.verdict = Verdict.VARIANT_MISMATCH.value
                 rec.reason = f"{name}={value}: {outcome.detail}"
                 rec.detail = f"compare={mode}: {outcome.detail}"
@@ -499,6 +508,7 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
         cpu_only=args.cpu_only,
         evidence_path=evidence_path,
         log_path=pathlib.Path(args.stderr_path) if args.stderr_path else None,
+        extension_explicit=args.extension_explicit,
     )
     try:
         session.open()
@@ -687,6 +697,7 @@ class OrchestratorOptions:
     max_queries: int | None = None  # total
     shell: str = ""
     extension: str | None = None
+    extension_explicit: bool = False
     cpu_only: bool = False
     sirius_configs: list[str] = dataclasses.field(default_factory=list)
     reduce: bool = True
@@ -752,6 +763,7 @@ class Orchestrator:
             self.opts.cpu_only,
             self.spawn_count,
             mode=self.opts.mode,
+            extension_explicit=self.opts.extension_explicit,
         )
         self.stderr_paths[worker_id] = stderr_path
         self.active_paths[worker_id] = pathlib.Path(stderr_path).with_suffix(

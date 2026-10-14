@@ -451,9 +451,11 @@ class Session:
         cpu_only: bool = False,
         evidence_path: pathlib.Path | None = None,
         log_path: pathlib.Path | None = None,
+        extension_explicit: bool = False,
     ):
         self.shell_path = shell
         self.extension = extension
+        self.extension_explicit = extension_explicit
         self.sirius_config = sirius_config
         self.sirius_config_mode: str | None = None
         self.db_dir = db_dir
@@ -512,6 +514,15 @@ class Session:
         present = self._disable_gpu()
         if self.gpu_available:
             if present:
+                if self.extension and self.extension_explicit:
+                    raise SessionError(
+                        f"{self.shell_path} has Sirius built in and cannot load "
+                        f"{self.extension}; use the plain shell from the same build "
+                        "as the extension, or drop --extension"
+                    )
+                self.extension = (
+                    None  # nothing was loaded; provenance must not claim it
+                )
                 self.sirius = "built-in"
             elif self.extension:
                 self._load_extension()

@@ -143,6 +143,7 @@ class Engine:
     extension: str | None  # LOADed only when the shell has no Sirius built in
     cpu_only: bool
     configs: list[str]
+    extension_explicit: bool = False  # --extension given: a built-in Sirius is an error
 
 
 def _load(args: argparse.Namespace) -> FuzzConfig:
@@ -162,6 +163,7 @@ def _engine(args: argparse.Namespace, cfg: FuzzConfig) -> Engine:
     if args.cpu_only:
         return Engine(shell, None, True, [])
     extension: str | None = None
+    explicit_extension = bool(args.extension)
     if args.extension:
         extension = str(cli_path(args.extension, "extension"))
     elif resolve_repo_path(cfg.sirius.extension).is_file():
@@ -183,7 +185,7 @@ def _engine(args: argparse.Namespace, cfg: FuzzConfig) -> Engine:
                     file=sys.stderr,
                 )
                 resolved = [ambient]
-    return Engine(shell, extension, False, resolved)
+    return Engine(shell, extension, False, resolved, explicit_extension)
 
 
 def _make_run_dir(out: str | None, seed: int) -> pathlib.Path:
@@ -231,6 +233,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_queries=args.queries,
         shell=engine.shell,
         extension=engine.extension,
+        extension_explicit=engine.extension_explicit,
         cpu_only=engine.cpu_only,
         sirius_configs=engine.configs,
         reduce=not args.no_reduce,
@@ -314,6 +317,7 @@ def run_doctor(engine: Engine, work: pathlib.Path, timeout: float) -> dict:
             "operation": "doctor",
             "shell": engine.shell,
             "extension": engine.extension,
+            "extension_explicit": engine.extension_explicit,
             "cpu_only": engine.cpu_only,
             "sirius_config": configs[0] if configs else None,
             "timeout": timeout,
@@ -460,6 +464,7 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
             "operation": "replay",
             "shell": engine.shell,
             "extension": engine.extension,
+            "extension_explicit": engine.extension_explicit,
             "cpu_only": engine.cpu_only,
             "sirius_config": configs[0] if configs else None,
             "query": str(work / "query.sql"),

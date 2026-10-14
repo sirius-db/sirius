@@ -49,6 +49,7 @@ def execute_probe(payload: dict[str, Any], work: pathlib.Path) -> dict[str, Any]
         cpu_only=payload.get("cpu_only", False),
         evidence_path=work / "active.json",
         log_path=work / "shell.stderr",
+        extension_explicit=payload.get("extension_explicit", False),
     )
     result: dict[str, Any] = {"status": "setup_error"}
     try:
