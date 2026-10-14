@@ -95,6 +95,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
+#include "helper/natural_sort.hpp"
 #include "helper/type_conversions.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
@@ -1187,6 +1188,16 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     }
     if (file_paths.empty()) {
       throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
+    }
+    // Experimental (SIRIUS_EXP_SORTED_PIN_FILES=1): GlobFiles returns local files in directory
+    // order, and pinned chunks pack several files each, so a table stored sorted across numbered
+    // files (part.0, part.1, ...) pins into chunks whose rows are not in order. A natural sort,
+    // comparing digit runs numerically, keeps such tables sorted within and across chunks.
+    if (char const* sorted_env = std::getenv("SIRIUS_EXP_SORTED_PIN_FILES");
+        sorted_env != nullptr && std::string_view{sorted_env} == "1") {
+      std::sort(file_paths.begin(), file_paths.end(), [](auto const& lhs, auto const& rhs) {
+        return sirius::natural_less(lhs, rhs);
+      });
     }
 
     // tier='parquet' pins the undecoded bytes and stops there: there is no
