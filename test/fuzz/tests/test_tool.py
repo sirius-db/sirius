@@ -7,6 +7,7 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -135,6 +136,30 @@ def restarting_worker(args, cfg, out, stop):
 
 def startup_dead_worker(args, cfg, out, stop):
     os._exit(9)
+
+
+def worker_with_shell(args, cfg, out, stop):
+    """Starts a stand-in for the shell, reports its pid, then ignores the stop event."""
+    shell = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    (pathlib.Path(args.run_dir) / "shell.pid").write_text(str(shell.pid))
+    time.sleep(600)
+
+
+def process_gone(pid, timeout=10.0):
+    """True once ``pid`` no longer exists, or is a zombie waiting for its new parent."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout.strip()
+        if not state or state.startswith("Z"):
+            return True
+        time.sleep(0.1)
+    return False
 
 
 class ToolTests(unittest.TestCase):
@@ -406,6 +431,30 @@ class ToolTests(unittest.TestCase):
             (pathlib.Path(tmp) / "partial.json.tmp").write_text('{"unfinished":')
             box.put({"type": "result", "record": "complete"})
             self.assertEqual(box.get_nowait()["record"], "complete")
+
+    def test_cancellation_kills_the_workers_shell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            cfg = load_config(None)
+            report = Report(root, cfg, [], 1)
+            runner = Orchestrator(cfg, report, 1, OrchestratorOptions(quiet=True))
+            pid_file = root / "shell.pid"
+
+            def interrupted_run():
+                runner._spawn(0)
+                deadline = time.time() + 30
+                while not pid_file.exists() and time.time() < deadline:
+                    time.sleep(0.05)
+                raise KeyboardInterrupt
+
+            with patch(
+                "siriusfuzz.runner.worker_main", worker_with_shell
+            ), patch.object(runner, "_run", side_effect=interrupted_run):
+                summary = runner.run()
+            self.assertEqual(summary["status"], "cancelled")
+            shell_pid = int(pid_file.read_text())
+            self.assertFalse(runner.procs[0].is_alive())
+            self.assertTrue(process_gone(shell_pid), "the worker's shell outlived it")
 
     def test_cancellation_preserves_report(self):
         with tempfile.TemporaryDirectory() as tmp:

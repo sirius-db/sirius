@@ -41,7 +41,7 @@ from .query_gen import QueryGenerator
 from .reduce import reduce_query
 from .report import QueryRecord, Report, signature
 from .schema_gen import DataGenerator, Dataset
-from .session import RunResult, Session
+from .session import TEARDOWN_SECONDS, RunResult, Session
 from .sqlast import Query, labels
 
 HANG_GRACE_SECONDS = 60.0  # beyond the worker's own timeout handling and shell restart
@@ -162,15 +162,7 @@ class Evaluator:
             rec.reason = cpu.error.split("\n", 1)[0][:200]
             return rec
         assert cpu.result is not None
-        cols = self.s.describe(sql)
-        # The shell's JSON carries names only (and none for an empty result); the
-        # exact types come from DESCRIBE.
-        if (
-            cols is not None
-            and len(cols) in (len(cpu.result.columns), 0)
-            or (cols is not None and not cpu.result.rows)
-        ):
-            cpu.result.columns = cols
+        self._type_columns(sql, cpu.result)
         if not self.s.gpu_available:
             # cpu-only harness check: a second CPU run must agree with the first.
             gpu = self.s.run(sql, gpu=False, timeout=self.timeout)
@@ -208,6 +200,18 @@ class Evaluator:
         return rec
 
     # -- helpers -------------------------------------------------------------
+
+    def _type_columns(self, sql: str, result: ResultSet) -> None:
+        """Replace the shell's name-only columns with DESCRIBE's exact types.
+
+        The shell's JSON carries names only (and none for an empty result); the
+        types select the floating-point tolerances, so every comparison needs them.
+        """
+        cols = self.s.describe(sql)
+        if cols is not None and (
+            len(cols) in (len(result.columns), 0) or not result.rows
+        ):
+            result.columns = cols
 
     @staticmethod
     def _crashed(rec: QueryRecord, res: RunResult, prefix: str) -> QueryRecord:
@@ -306,6 +310,8 @@ class Evaluator:
         if result.sql != rec.sql:
             rec.reduced_sql = result.sql
             rec.reduction_steps = result.steps + result.sqlsmith_steps
+            # The mode the check accepted the final candidate under; replay reuses it.
+            rec.reduced_comparison = compare_mode(result.query)
             if result.query is not None:
                 rec.reduced_labels = labels(result.query)
 
@@ -334,7 +340,10 @@ class Evaluator:
 
         def cpu_ok(sql: str) -> RunResult | None:
             res = self.s.run(sql, gpu=False, timeout=self.timeout)
-            return res if res.status == "ok" and res.result is not None else None
+            if res.status != "ok" or res.result is None:
+                return None
+            self._type_columns(sql, res.result)
+            return res
 
         if verdict == Verdict.MISMATCH:
 
@@ -446,6 +455,13 @@ def wants_reduction(rec: QueryRecord, mode: str, seen: set[str]) -> bool:
         return False
     seen.add(sig)
     return True
+
+
+def worker_entry(main: Callable[..., None], *args: Any) -> None:
+    """Process target: a worker leads its own process group, so the orchestrator
+    can kill it together with the shell it started."""
+    os.setpgrp()
+    main(*args)
 
 
 def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
@@ -744,8 +760,8 @@ class Orchestrator:
             "cpu_only": self.opts.cpu_only,
         }
         p = self.ctx.Process(
-            target=worker_main,
-            args=(args, self.cfg, self.queue, self.stop),
+            target=worker_entry,
+            args=(worker_main, args, self.cfg, self.queue, self.stop),
             daemon=True,
         )
         p.start()
@@ -756,6 +772,35 @@ class Orchestrator:
     def _say(self, text: str) -> None:
         if not self.opts.quiet:
             print(text, file=sys.stderr, flush=True)
+
+    def _kill_worker(self, w: int, p: Any, wait: bool = True) -> None:
+        """SIGKILL the worker's process group: the worker and the DuckDB shell it started.
+
+        Killing only the Python process would orphan a shell that may be hung in GPU
+        execution and still hold the GPU. The group lives on until the shell is gone,
+        which can take a while after SIGKILL (see Shell._reap); the next shell must not
+        start before that.
+        """
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass  # already gone, or killed before it led its own group
+        if p.is_alive():
+            p.kill()
+        p.join(timeout=5)
+        if wait:
+            self._wait_shell_gone(w, p, time.time() + TEARDOWN_SECONDS)
+
+    def _wait_shell_gone(self, w: int, p: Any, deadline: float) -> None:
+        while True:
+            try:
+                os.killpg(p.pid, 0)
+            except ProcessLookupError:
+                return
+            if time.time() >= deadline:
+                self._say(f"[w{w}] shell still exiting after {TEARDOWN_SECONDS:.0f}s")
+                return
+            time.sleep(0.1)
 
     def run(self) -> dict[str, Any]:
         try:
@@ -768,10 +813,11 @@ class Orchestrator:
             self.report.stop_reason = f"orchestrator error: {exc}"
         finally:
             self.stop.set()
-            for p in self.procs.values():
-                if p.is_alive():
-                    p.kill()
-                p.join(timeout=5)
+            for w, p in self.procs.items():
+                self._kill_worker(w, p, wait=False)
+            deadline = time.time() + TEARDOWN_SECONDS
+            for w, p in self.procs.items():
+                self._wait_shell_gone(w, p, deadline)
             # Workers already completed these records before cancellation/deadline.
             # Do not spawn or attribute deliberately stopped work as a hang.
             while True:
@@ -842,7 +888,7 @@ class Orchestrator:
                     self.report.stop_reason = (
                         "worker stalled outside a query (startup/dataset/cleanup)"
                     )
-                    p.kill()
+                    self._kill_worker(w, p)
                     finished.add(w)
             if now - last_progress >= self.opts.progress_every:
                 last_progress = now
@@ -851,10 +897,10 @@ class Orchestrator:
                 w in finished for w in self.procs
             ):
                 break
-        for p in self.procs.values():
+        for w, p in self.procs.items():
             p.join(timeout=5)
             if p.is_alive():
-                p.terminate()
+                self._kill_worker(w, p)
 
     def _handle(self, msg: dict[str, Any], finished: set[int]) -> None:
         w = msg.get("worker", -1)
@@ -966,8 +1012,7 @@ class Orchestrator:
     ) -> None:
         sql, stem, since, query_labels = info
         self.inflight.pop(w, None)
-        p.kill()
-        p.join(timeout=5)
+        self._kill_worker(w, p)
         finished.add(w)
         tail = self._stderr_tail(w)
         rec = QueryRecord(

@@ -29,7 +29,8 @@ from siriusfuzz.runner import (
     OrchestratorOptions,
     wants_reduction,
 )
-from siriusfuzz.session import RunResult, Session
+from siriusfuzz.reduce import ReductionResult
+from siriusfuzz.session import UNKNOWN_TYPE, RunResult, Session
 from siriusfuzz.sqlast import Alias, ColumnRef, OrderItem, Select, SelectItem, TableRef
 
 
@@ -385,6 +386,51 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(check(unordered.sql(), unordered))
         self.assertFalse(check(ORDERED_QUERY.sql(), None))
 
+    def test_reduction_resolves_column_types_before_comparing(self):
+        class ShellTyped(FakeSession):
+            """Like the real shell: result columns carry names only; DESCRIBE has the types."""
+
+            def run(self, sql, gpu, timeout):
+                res = super().run(sql, gpu, timeout)
+                res.result.columns = [
+                    ColumnInfo(c.name, UNKNOWN_TYPE) for c in res.result.columns
+                ]
+                return res
+
+        cfg = load_config(None, ["oracle.ambiguity_filter=false"])
+        ev = Evaluator(cfg, ShellTyped(gpu_float_noise), lambda m: None)
+        sql = "SELECT 1 AS c0, 1.5 AS c1"
+        self.assertEqual(ev.evaluate(None, sql, 0, "d", 0).verdict, "ok")
+        # A candidate within the DOUBLE tolerance is not a mismatch for the reducer either.
+        check = ev._make_still_fails(QueryRecord(0, "d", 0, sql, "mismatch"))
+        self.assertFalse(check(sql, None))
+
+    def test_reduction_records_the_comparison_mode_it_accepted(self):
+        for accepted, expected in (
+            (ReductionResult(ORDERED_QUERY, "SELECT ordered", steps=1), "ordered"),
+            (
+                ReductionResult(None, "SELECT string-level", sqlsmith_steps=1),
+                "multiset",
+            ),
+        ):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                cfg = load_config(None, ["oracle.ambiguity_filter=false"])
+                ev = Evaluator(cfg, FakeSession(gpu_reversed), lambda m: None)
+                rec = ev.evaluate(ORDERED_QUERY, ORDERED_QUERY.sql(), 0, "d", 0)
+                self.assertEqual((rec.verdict, rec.comparison), ("mismatch", "ordered"))
+                with patch("siriusfuzz.runner.reduce_query", return_value=accepted):
+                    ev.reduce(rec, ORDERED_QUERY)
+                self.assertEqual(rec.reduced_comparison, expected)
+                report = Report(pathlib.Path(tmp), cfg, [], 0)
+                report.dataset_path(rec.dataset).write_text(
+                    "CREATE TABLE t(c0 INT, c1 DOUBLE);\n"
+                )
+                bundle = pathlib.Path(tmp) / "findings" / report.add(rec)
+                report.add_reduction(rec)
+                reduction = json.loads((bundle / "reduction.json").read_text())
+                self.assertEqual(reduction["comparison"], expected)
+                report.finish()
+
     def test_reduction_rejects_candidates_that_depend_on_input_order(self):
         class PermutationSensitive(FakeSession):
             def run(self, sql, gpu, timeout):
@@ -524,10 +570,10 @@ class ReportTests(unittest.TestCase):
                         [],
                     )
                     runner._say = lambda message: None
-                    process = SimpleNamespace(
-                        exitcode=-11, kill=lambda: None, join=lambda timeout: None
-                    )
-                    with patch.object(runner, "_maybe_respawn") as respawn:
+                    process = SimpleNamespace(exitcode=-11)
+                    with patch.object(
+                        runner, "_maybe_respawn"
+                    ) as respawn, patch.object(runner, "_kill_worker"):
                         if failure == "crash":
                             runner._worker_died(0, process, set())
                         else:

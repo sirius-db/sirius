@@ -41,6 +41,7 @@ class QueryRecord:
     diffs: list[str] = field(default_factory=list)
     reduction_steps: int = 0
     comparison: str = "multiset"
+    reduced_comparison: str = "multiset"  # mode the reducer accepted reduced_sql under
     evidence: dict[str, Any] = field(default_factory=dict)
     context: dict[str, Any] = field(default_factory=dict)
 
@@ -296,6 +297,8 @@ class Report:
             ]
             if rec.reduced_reason and rec.reduced_reason != rec.reason:
                 lines.append(f"\nReduced query's reason: {rec.reduced_reason}")
+            if rec.reduced_comparison != rec.comparison:
+                lines.append(f"\nReduced query compares as {rec.reduced_comparison}.")
         else:
             lines += [
                 "",
@@ -344,7 +347,7 @@ class Report:
                 "sql": rec.reduced_sql,
                 "reason": rec.reduced_reason,
                 "steps": rec.reduction_steps,
-                "comparison": "multiset",
+                "comparison": rec.reduced_comparison,
                 "variant": rec.variant,
                 "note": "Original evidence retained in meta.json; reduced SQL requires a fresh replay.",
             },

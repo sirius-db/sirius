@@ -420,7 +420,10 @@ Campaign workers remain separate `spawn` processes so that several shells run in
 parallel and a Python-level failure in one worker cannot stop the run. The
 orchestrator tracks active queries, persists results, and respawns a worker whose
 Python process dies or stalls, within a configured budget; with the shell
-handling query faults, that path is a backstop. The active-operation file still
+handling query faults, that path is a backstop. Each worker leads its own process
+group, so a stalled or cancelled worker is killed together with its shell, and the
+orchestrator waits for that shell to exit before another one starts, since a shell
+hung in GPU execution otherwise keeps the GPU. The active-operation file still
 records SQL, phase, settings and stage before each operation, so a worker death
 can be attributed to a query, and worker messages still use atomic JSON files in
 an on-disk mailbox so a writer dying mid-message cannot corrupt the queue.
@@ -527,12 +530,14 @@ The default budget is 150 candidate checks.
 If an available SQLSmith extension supplies `reduce_sql_statement`, a subsequent
 string-level pass can propose additional simplifications. Once a string candidate
 is accepted, it no longer has a corresponding AST. String-only candidates use
-multiset comparison.
+multiset comparison. `reduction.json` records the comparison mode the accepted
+query was checked under, and replaying `reduced.sql` uses that mode.
 
 The preservation checks depend on the finding:
 
 - A mismatch requires CPU and GPU executions to succeed and still disagree,
-  with comparison mode recomputed and the ambiguity filter applied.
+  with the candidate's column types from `DESCRIBE` (so the floating-point
+  tolerances apply), comparison mode recomputed and the ambiguity filter applied.
 - A variant mismatch also requires the baseline GPU result to keep matching CPU
   before the saved setting change causes a disagreement.
 - An error requires CPU success and the same verdict and compatible reason.

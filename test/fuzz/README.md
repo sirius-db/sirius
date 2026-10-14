@@ -131,7 +131,7 @@ in-memory tables never reach the GPU native scan. A GPU fault or a query that ov
 timeout kills the shell process; the worker records the crash or timeout with the shell's
 stderr, starts a fresh shell, re-attaches the dataset files and carries on. The orchestrator
 respawns a worker only if the Python process itself dies or stalls (`--max-respawns`, default
-200). With both `--queries` and `--duration`, whichever is reached first stops the run; Ctrl-C
+200); a stalled or cancelled worker is killed together with its shell. With both `--queries` and `--duration`, whichever is reached first stops the run; Ctrl-C
 keeps completed findings and the summary; a worker that fails at startup or exhausts its
 respawns marks the run `incomplete`.
 
