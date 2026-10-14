@@ -147,8 +147,8 @@ std::unique_ptr<cudf::column> date_arithmetic_checked(cudf::column_view const& l
   auto const difference = operation == recipe::date_difference;
   auto date             = reversed ? right : left;
   auto days             = reversed ? left : right;
-  if (operation == recipe::none || date.type() != date_type ||
-      days.type() != (difference ? date_type : int32_type) || left.size() != right.size()) {
+  if (date.type() != date_type || days.type() != (difference ? date_type : int32_type) ||
+      left.size() != right.size()) {
     throw internal_exception("[date_arithmetic] source type or shape mismatch");
   }
   auto date_ticks = cudf::bit_cast(date, int32_type);

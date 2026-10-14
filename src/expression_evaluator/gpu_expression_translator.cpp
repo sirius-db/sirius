@@ -754,7 +754,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
 {
   // Standalone ASTs cannot implement DATE infinity and overflow checks.
-  if (alt.date_operation() != date_arithmetic_operation::none) { return std::nullopt; }
+  if (alt.date_operation().has_value()) { return std::nullopt; }
 
   // cuDF AST only supports numeric binary functions. We must also disable any
   // operation that propagates decimal types up the expression tree, pending the
