@@ -78,6 +78,9 @@ struct mgpu_env_params {
   int pipeline_num_threads     = 4;
   int task_creator_num_threads = 4;
   int duckdb_scan_num_threads  = 2;
+  // Emit a scan_manager.memory_prefetcher block that enables the background host->GPU upload
+  // of pinned-cache splits, with a floor low enough that this env's fixtures clear it.
+  bool memory_prefetcher = false;
 };
 
 /**
@@ -107,8 +110,13 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
        "      block_size: 1048576\n"
        "  executor:\n"
        "    scan_manager:\n"
-       "      backend: sirius\n"
-       "    pipeline:\n"
+       "      backend: sirius\n";
+  if (params.memory_prefetcher) {
+    f << "      memory_prefetcher:\n"
+         "        enable: true\n"
+         "        min_free_fraction: 0.05\n";
+  }
+  f << "    pipeline:\n"
        "      num_threads: "
     << params.pipeline_num_threads
     << "\n"

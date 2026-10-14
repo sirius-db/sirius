@@ -338,7 +338,14 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
 
     auto ro          = batch->to_read_only();
     auto const* data = ro.get_data();
-    if (!data || ro.get_current_tier() == cucascade::memory::Tier::GPU) { return 0; }
+    if (!data) { return 0; }
+    // GPU-resident on this device: nothing to materialize. On another device the prepare step
+    // clones it here, which costs the same as an upload.
+    if (ro.get_current_tier() == cucascade::memory::Tier::GPU &&
+        (target_space == nullptr || ro.get_memory_space() == nullptr ||
+         ro.get_memory_space()->get_id() == target_space->get_id())) {
+      return 0;
+    }
     return peak_materialization_bytes(data);
   }
 

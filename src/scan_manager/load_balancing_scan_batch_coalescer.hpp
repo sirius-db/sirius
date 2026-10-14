@@ -58,7 +58,9 @@ struct databatch_provider {
     /// memory estimate then falls back to its conservative maximum-expansion bound.
     std::size_t conversion_destination_bytes{0};
     std::unique_ptr<op::scan::scan_info> scan_info;
-    int preferred_device{-1};  ///< placement for scan_info splits (-1 = none)
+    /// Device this split's task should run on (-1 = none): the round-robin GPU of an
+    /// insert-delta split, or the NUMA-local placement of a host-resident chunk.
+    int preferred_device{-1};
     /// Where this batch's rows came from, for late materialization: the pinned
     /// entry and the contiguous span of pin-order rows this chunk covers. Null
     /// unless the late-mat gate is on and the scan is one whose batches are a

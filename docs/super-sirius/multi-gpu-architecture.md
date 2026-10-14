@@ -136,11 +136,13 @@ The two tiers record placement differently. A GPU-tier entry fills `chunk_memory
 
 When a query selects from a pinned table, `cached_databatch_provider` walks `pinned_entry`'s chunks. For each chunk:
 
-1. **Attach the chunk's recorded memory space** to the emitted batch: `chunk_memory_spaces[i]` on the GPU tier, the chunk's host representation on the HOST tier. The provider sets no device id.
-2. **`task_creator` derives `preferred_device_id`** from that memory space. A GPU-tier space yields its own device id. A HOST-tier space yields a NUMA-local GPU, round-robin across the GPUs on that node.
+1. **Attach the chunk's recorded memory space** to the emitted batch: `chunk_memory_spaces[i]` on the GPU tier, the chunk's host representation on the HOST tier. For a HOST-tier chunk the provider also stamps the GPU it will run on, chosen once by the query's `host_chunk_placement` (`src/scan_manager/host_chunk_placement.hpp`): round-robin over the admitted GPUs on the chunk's NUMA node, or over every admitted GPU when none is local. GPU-tier chunks carry no stamp.
+2. **`task_creator` derives `preferred_device_id`**: a stamped split uses its stamp; otherwise a GPU-tier space yields its own device id and a HOST-tier space yields a NUMA-local GPU, round-robin across the GPUs on that node.
 3. **The scheduler routes the task** to that GPU's worker thread.
 
 GPU-tier chunks run on their owning GPU without a peer copy. HOST-tier chunks are copied to a NUMA-local GPU when the task starts. `task_creator` applies this rule last, after upstream-split, partition-pin, and byte-locality preferences.
+
+With `scan_manager.memory_prefetcher` enabled, the per-query `memory_prefetcher` (`src/scan_manager/memory_prefetcher.{hpp,cpp}`) makes that HOST→GPU copy ahead of task creation for queued pinned-cache splits, into the space of the GPU stamped on the split. The stamp is what makes the early upload safe: the task creator may have created the split's task before the upload lands, and both sides read the same device off the split, so the task never finds its batch on another GPU. Headroom is gated per GPU space: a GPU that refuses admission is skipped for the rest of the sweep while the others keep receiving batches, and a stamped split whose GPU refuses waits for its own task to upload it.
 
 ## Task Scheduling: Ready Devices and Locality
 

@@ -21,6 +21,7 @@
 
 #include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
@@ -227,13 +228,16 @@ void scan_operator_input::prepare_for_processing(
     {
       auto ro          = batch->to_read_only();
       auto const* data = ro.get_data();
-      // Convert when the data is not on the GPU tier, OR when it is on the GPU
+      // Convert when the data is not on the GPU tier, when it is on the GPU
       // tier but not already a plain gpu_table_representation (e.g. a
-      // compressed_device_representation, which must be decompressed in place).
+      // compressed_device_representation, which must be decompressed in place),
+      // or when it is a plain table on a different GPU than this task's.
       const bool is_gpu_table =
         dynamic_cast<const ::cucascade::gpu_table_representation*>(data) != nullptr;
       needs_upload = data != nullptr &&
-                     (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !is_gpu_table);
+                     (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !is_gpu_table ||
+                      (ro.get_memory_space() != nullptr &&
+                       ro.get_memory_space()->get_id() != requested_memory_space->get_id()));
       // Another converter (the memory prefetcher, say) may already have decoded this batch; its
       // outcome binds this split all the same.
       if (!needs_upload) { record_decode_outcome(data); }
@@ -241,6 +245,27 @@ void scan_operator_input::prepare_for_processing(
     if (needs_upload) {
       auto& registry = ::sirius::converter_registry::get();
       auto mut       = batch->to_mutable();
+      // Re-check under the exclusive lock: the memory prefetcher may have uploaded the batch
+      // since the probe. A plain GPU table on this task's device needs nothing more. One on
+      // another device (a task re-homed by admission, or a placement bug) is cloned here rather
+      // than read remotely; the shared batch stays where it is for other readers.
+      if (auto* current = mut.get_memory_space();
+          current != nullptr && current->get_tier() == ::cucascade::memory::Tier::GPU &&
+          dynamic_cast<const ::cucascade::gpu_table_representation*>(mut.get_data()) != nullptr) {
+        record_decode_outcome(mut.get_data());
+        if (current->get_id() != requested_memory_space->get_id()) {
+          SIRIUS_LOG_DEBUG(
+            "[scan] cached batch {} is resident on GPU {} but its task runs on GPU {}; cloning",
+            mut.get_batch_id(),
+            current->get_device_id(),
+            requested_memory_space->get_device_id());
+          std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info) =
+            mut.clone_to<::cucascade::gpu_table_representation>(
+              registry, ::sirius::get_next_batch_id(), requested_memory_space, stream);
+        }
+        gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
+        return;
+      }
       if (pushdown_selection_unprofitable &&
           pushdown_selection_unprofitable->load(std::memory_order_relaxed)) {
         // An earlier batch of this scan reported that compacting during decode

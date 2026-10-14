@@ -412,6 +412,9 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
         split->conversion_destination_bytes = next.conversion_destination_bytes;
         split->row_filter_pending           = row_filter_pending;
         split->origin                       = std::move(next.origin);
+        // The provider's placement for a host-resident chunk; the task creator and the memory
+        // prefetcher both follow it, so the upload and the task land on the same GPU.
+        if (next.preferred_device >= 0) { split->set_preferred_device_id(next.preferred_device); }
         if (!publish(std::move(split))) break;
         continue;
       }

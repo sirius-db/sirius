@@ -15,6 +15,7 @@
  */
 
 #include "utils/log_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -22,6 +23,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
@@ -33,9 +35,11 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <memory/topology_index.hpp>
 #include <scan_manager/load_balancing_scan_batch_coalescer.hpp>
 #include <scan_manager/memory_prefetcher.hpp>
 #include <scan_manager/split_connector.hpp>
@@ -44,6 +48,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <regex>
 #include <stop_token>
@@ -52,6 +57,7 @@
 #include <vector>
 
 using sirius::scan_manager::databatch_provider;
+using sirius::scan_manager::host_chunk_placement;
 using sirius::scan_manager::load_balancing_scan_batch_coalescer;
 using sirius::scan_manager::memory_prefetcher;
 using sirius::scan_manager::memory_prefetcher_config;
@@ -61,21 +67,25 @@ namespace {
 
 constexpr std::size_t MiB = 1ull << 20;
 
+/// One GPU space per device requested, each paired (use_gpu_id_as_host_id) with a host space
+/// of the same id -- the key the prefetcher's placement resolves through the topology.
 struct prefetcher_env {
   static constexpr std::size_t gpu_capacity = 512 * MiB;
   static constexpr double limit_ratio       = 0.75;
 
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mgr;
-  cucascade::memory::memory_space* gpu_space;
-  cucascade::memory::memory_space* host_space;
-  rmm::cuda_stream conv_stream;  // converters need a non-default stream
+  std::vector<cucascade::memory::memory_space*> gpu_spaces;
+  std::vector<cucascade::memory::memory_space*> host_spaces;
+  cucascade::memory::memory_space* gpu_space{nullptr};   // gpu_spaces[0]
+  cucascade::memory::memory_space* host_space{nullptr};  // host_spaces[0]
+  std::vector<rmm::cuda_stream> conv_streams;  // one per GPU; converters need a non-default stream
 
-  prefetcher_env()
+  explicit prefetcher_env(int n_gpus = 1)
   {
     sirius::converter_registry::reset_for_testing();
 
     cucascade::memory::reservation_manager_configurator builder;
-    builder.set_number_of_gpus(1)
+    builder.set_number_of_gpus(static_cast<std::size_t>(n_gpus))
       .set_gpu_usage_limit(gpu_capacity)
       .set_reservation_fraction_per_gpu(limit_ratio)
       .set_per_numa_region_capacity(1ull << 30)
@@ -90,21 +100,32 @@ struct prefetcher_env {
       std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
     sirius::converter_registry::initialize();
 
-    gpu_space  = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
-    host_space = mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+    for (int gpu = 0; gpu < n_gpus; ++gpu) {
+      gpu_spaces.push_back(mgr->get_memory_space(cucascade::memory::Tier::GPU, gpu));
+      host_spaces.push_back(mgr->get_memory_space(cucascade::memory::Tier::HOST, gpu));
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu}};
+      conv_streams.emplace_back();
+    }
+    gpu_space  = gpu_spaces.front();
+    host_space = host_spaces.front();
   }
 
-  ::cuda::stream_ref stream() { return conv_stream; }
+  ::cuda::stream_ref stream(std::size_t gpu = 0) { return conv_streams.at(gpu); }
 };
 
-/// Host-resident INT32 batch with pattern seed + 7*i. The GPU staging is fully
-/// released before returning so it does not perturb availability arithmetic.
+/// Host-resident INT32 batch with pattern seed + 7*i, staged through GPU @p gpu and landed on
+/// that GPU's host space. The GPU staging is fully released before returning so it does not
+/// perturb availability arithmetic.
 std::shared_ptr<cucascade::data_batch> make_host_batch(prefetcher_env& e,
                                                        std::size_t n_rows,
-                                                       int32_t seed)
+                                                       int32_t seed,
+                                                       std::size_t gpu = 0)
 {
-  auto mr     = e.gpu_space->get_default_allocator();
-  auto stream = e.stream();
+  auto* gpu_space  = e.gpu_spaces.at(gpu);
+  auto* host_space = e.host_spaces.at(gpu);
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_space->get_device_id()}};
+  auto mr     = gpu_space->get_default_allocator();
+  auto stream = e.stream(gpu);
 
   std::vector<int32_t> values(n_rows);
   for (std::size_t i = 0; i < n_rows; ++i) {
@@ -126,9 +147,9 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(prefetcher_env& e,
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
   cucascade::gpu_table_representation gpu_repr(
-    std::make_unique<cudf::table>(std::move(cols)), *e.gpu_space, stream);
+    std::make_unique<cudf::table>(std::move(cols)), *gpu_space, stream);
   auto host_repr = sirius::converter_registry::get().convert<cucascade::host_data_representation>(
-    gpu_repr, e.host_space, stream);
+    gpu_repr, host_space, stream);
   stream.sync();
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(host_repr));
 }
@@ -139,12 +160,18 @@ struct scripted_provider final : databatch_provider {
     validation.identity = validation.layout = validation.structure = {true, true};
   }
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  /// Producer device stamps, parallel to batches; shorter leaves the rest unstamped.
+  std::vector<int> devices;
   std::size_t served{0};
 
   databatch_provider::batch get_next_batch() override
   {
     databatch_provider::batch out;
-    if (served < batches.size()) { out.data = batches[served++]; }
+    if (served < batches.size()) {
+      out.data = batches[served];
+      if (served < devices.size()) { out.preferred_device = devices[served]; }
+      ++served;
+    }
     return out;
   }
 };
@@ -152,11 +179,12 @@ struct scripted_provider final : databatch_provider {
 /// Pre-loaded and closed — still sweepable: the prefetcher only exits once a
 /// connector is closed AND drained.
 std::shared_ptr<split_connector> make_loaded_connector(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& batches, std::vector<int> devices = {})
 {
   auto connector = std::make_shared<split_connector>();
   scripted_provider provider;
   provider.batches = batches;
+  provider.devices = std::move(devices);
   std::stop_source stop;
   load_balancing_scan_batch_coalescer::drain_cached_provider(
     provider, *connector, stop.get_token(), /*row_filter_pending=*/false);
@@ -176,6 +204,41 @@ cucascade::memory::Tier batch_tier(cucascade::data_batch& batch)
   auto ro = batch.try_to_read_only();
   REQUIRE(ro);
   return ro->get_current_tier();
+}
+
+int batch_device(cucascade::data_batch& batch)
+{
+  auto ro = batch.try_to_read_only();
+  REQUIRE(ro);
+  REQUIRE(ro->get_memory_space() != nullptr);
+  return ro->get_memory_space()->get_device_id();
+}
+
+/// GPU i on NUMA node numa_of[i]. Host space i (use_gpu_id_as_host_id) is keyed by node i, so
+/// {0, 1} gives each GPU its own local host space and {0, 0} makes both local to host space 0.
+std::shared_ptr<const sirius::memory::topology_index> synthetic_topology(std::vector<int> numa_of)
+{
+  cucascade::memory::system_topology_info topology;
+  topology.num_gpus = static_cast<unsigned int>(numa_of.size());
+  std::vector<int> device_ids;
+  for (std::size_t i = 0; i < numa_of.size(); ++i) {
+    cucascade::memory::gpu_topology_info gpu;
+    gpu.id        = static_cast<unsigned int>(i);
+    gpu.numa_node = numa_of[i];
+    topology.gpus.push_back(std::move(gpu));
+    device_ids.push_back(static_cast<int>(i));
+  }
+  return std::make_shared<sirius::memory::topology_index>(std::move(topology),
+                                                          std::move(device_ids));
+}
+
+/// The query-level placement the scan manager would build: @p admitted GPUs over the synthetic
+/// topology @p numa_of.
+std::shared_ptr<host_chunk_placement> placement_for(std::vector<int> admitted,
+                                                    std::vector<int> numa_of)
+{
+  return std::make_shared<host_chunk_placement>(std::move(admitted),
+                                                synthetic_topology(std::move(numa_of)));
 }
 
 template <class Pred>
@@ -250,7 +313,7 @@ TEST_CASE("prefetcher admission floor holds against concurrent workers",
   stop_counters counters;
   {
     sirius::exec::query_lifecycle_registry lifecycle;
-    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space, lifecycle);
+    memory_prefetcher prefetcher(cfg, {connector}, {e.gpu_space}, lifecycle);
     REQUIRE(
       wait_until([&] { return prefetcher.batches_prefetched() >= 1; }, std::chrono::seconds(60)));
     // Give the other two workers every chance to (incorrectly) admit on the
@@ -316,7 +379,7 @@ TEST_CASE("prefetcher conversion draws down its reservation instead of double-co
 
   {
     sirius::exec::query_lifecycle_registry lifecycle;
-    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space, lifecycle);
+    memory_prefetcher prefetcher(cfg, {connector}, {e.gpu_space}, lifecycle);
     REQUIRE(
       wait_until([&] { return prefetcher.batches_prefetched() >= 1; }, std::chrono::seconds(60)));
     prefetcher.stop();
@@ -357,7 +420,7 @@ TEST_CASE("prefetched batch converts to GPU tier bit-exactly and reads back on a
 
   {
     sirius::exec::query_lifecycle_registry lifecycle;
-    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space, lifecycle);
+    memory_prefetcher prefetcher(cfg, {connector}, {e.gpu_space}, lifecycle);
     REQUIRE(
       wait_until([&] { return prefetcher.batches_prefetched() >= 1; }, std::chrono::seconds(60)));
     prefetcher.stop();
@@ -419,7 +482,7 @@ TEST_CASE("prefetcher backs off cleanly when the peak reservation cannot be admi
   stop_counters counters;
   {
     sirius::exec::query_lifecycle_registry lifecycle;
-    memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space, lifecycle);
+    memory_prefetcher prefetcher(cfg, {connector}, {e.gpu_space}, lifecycle);
     // Let it sweep (and be refused) repeatedly.
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     prefetcher.stop();
@@ -452,7 +515,7 @@ TEST_CASE("Resident certificate refusal is invisible to an active memory prefetc
   cfg.poll_interval_ms  = 1;
   sirius::exec::query_lifecycle_registry lifecycle;
   memory_prefetcher prefetcher(
-    cfg, {rejected_connector, control_connector}, e.gpu_space, lifecycle);
+    cfg, {rejected_connector, control_connector}, {e.gpu_space}, lifecycle);
   scripted_provider invalid;
   invalid.contract_id            = 81;
   invalid.validation.query_token = 17;
@@ -475,4 +538,295 @@ TEST_CASE("Resident certificate refusal is invisible to an active memory prefetc
   CHECK(batch_tier(*control) == cucascade::memory::Tier::GPU);
   CHECK(batch_tier(*refused) == cucascade::memory::Tier::HOST);
   CHECK(rejected_connector->peek_resident_batches().empty());
+}
+
+//===----------------------------------------------------------------------===//
+// Multi-GPU placement. GPU i is paired with host space i, and the synthetic
+// topology decides which GPUs count as local to that host space.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("prefetcher converts each host batch onto a GPU local to its NUMA node",
+          "[memory_prefetcher][scan_manager][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  prefetcher_env e{2};
+
+  // Interleave the two nodes' batches on one connector: a placement that ignored the source
+  // (plain round-robin over the set) would send half of each node's batches across.
+  constexpr std::size_t n_rows = 1u << 20;  // 4MB of int32
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  std::vector<int> home;
+  for (int i = 0; i < 4; ++i) {
+    auto const gpu = static_cast<std::size_t>(i % 2);
+    batches.push_back(make_host_batch(e, n_rows, 100 + i, gpu));
+    home.push_back(e.gpu_spaces[gpu]->get_device_id());
+  }
+  auto connector = make_loaded_connector(batches);
+
+  memory_prefetcher_config cfg;
+  cfg.enable            = true;
+  cfg.num_threads       = 2;
+  cfg.min_free_fraction = 0.05;
+  cfg.poll_interval_ms  = 1;
+  cfg.drain_quiet_ms    = 50;
+  {
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(
+      cfg, {connector}, e.gpu_spaces, lifecycle, placement_for({0, 1}, {0, 1}));
+    REQUIRE(wait_until([&] { return prefetcher.batches_prefetched() >= batches.size(); },
+                       std::chrono::seconds(60)));
+    prefetcher.stop();
+    REQUIRE(prefetcher.batches_prefetched() == batches.size());
+  }
+
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    INFO("batch " << i);
+    REQUIRE(batch_tier(*batches[i]) == cucascade::memory::Tier::GPU);
+    REQUIRE(batch_device(*batches[i]) == home[i]);
+  }
+}
+
+TEST_CASE("prefetcher round-robins one NUMA node's batches across its GPUs",
+          "[memory_prefetcher][scan_manager][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  prefetcher_env e{2};
+
+  constexpr std::size_t n_rows = 1u << 20;
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (int i = 0; i < 4; ++i) {
+    batches.push_back(make_host_batch(e, n_rows, 200 + i, /*gpu=*/0));
+  }
+  auto connector = make_loaded_connector(batches);
+
+  memory_prefetcher_config cfg;
+  cfg.enable            = true;
+  cfg.num_threads       = 1;  // one worker: the cursor alone decides placement
+  cfg.min_free_fraction = 0.05;
+  cfg.poll_interval_ms  = 1;
+  cfg.drain_quiet_ms    = 50;
+  {
+    // Both GPUs sit on host space 0's node.
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(
+      cfg, {connector}, e.gpu_spaces, lifecycle, placement_for({0, 1}, {0, 0}));
+    REQUIRE(wait_until([&] { return prefetcher.batches_prefetched() >= batches.size(); },
+                       std::chrono::seconds(60)));
+    prefetcher.stop();
+    REQUIRE(prefetcher.batches_prefetched() == batches.size());
+  }
+
+  std::map<int, std::size_t> per_device;
+  for (auto const& batch : batches) {
+    REQUIRE(batch_tier(*batch) == cucascade::memory::Tier::GPU);
+    ++per_device[batch_device(*batch)];
+  }
+  REQUIRE(per_device.size() == 2);
+  REQUIRE(per_device[e.gpu_spaces[0]->get_device_id()] == 2);
+  REQUIRE(per_device[e.gpu_spaces[1]->get_device_id()] == 2);
+}
+
+TEST_CASE("prefetcher keeps placement inside the query's admitted GPU set",
+          "[memory_prefetcher][scan_manager][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  prefetcher_env e{2};
+
+  constexpr std::size_t n_rows = 1u << 20;
+  // One batch whose local GPU (0) is not admitted, one whose local GPU (1) is.
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches{
+    make_host_batch(e, n_rows, 300, /*gpu=*/0), make_host_batch(e, n_rows, 301, /*gpu=*/1)};
+  auto connector = make_loaded_connector(batches);
+
+  memory_prefetcher_config cfg;
+  cfg.enable            = true;
+  cfg.num_threads       = 2;
+  cfg.min_free_fraction = 0.05;
+  cfg.poll_interval_ms  = 1;
+  cfg.drain_quiet_ms    = 50;
+  {
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(
+      cfg, {connector}, {e.gpu_spaces[1]}, lifecycle, placement_for({1}, {0, 1}));
+    REQUIRE(wait_until([&] { return prefetcher.batches_prefetched() >= batches.size(); },
+                       std::chrono::seconds(60)));
+    prefetcher.stop();
+    REQUIRE(prefetcher.batches_prefetched() == batches.size());
+  }
+
+  for (auto const& batch : batches) {
+    REQUIRE(batch_tier(*batch) == cucascade::memory::Tier::GPU);
+    REQUIRE(batch_device(*batch) == e.gpu_spaces[1]->get_device_id());
+  }
+}
+
+TEST_CASE("a GPU that refuses admission does not stall prefetching onto its NUMA sibling",
+          "[memory_prefetcher][scan_manager][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  prefetcher_env e{2};
+  sirius::test::scoped_recording_log_sink log{"info"};
+
+  // 360MB of ballast against GPU 0's 384MB reservation limit: a 32MB peak can never be
+  // admitted there, so each batch must fall through to GPU 1 (same node) rather than the
+  // refusal ending the sweep the way a lone GPU's would.
+  constexpr std::size_t batch_rows   = 8ull << 20;  // 32MB of int32
+  constexpr std::size_t ballast_size = 360 * MiB;
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches{
+    make_host_batch(e, batch_rows, 400, /*gpu=*/0), make_host_batch(e, batch_rows, 401, /*gpu=*/0)};
+  auto connector = make_loaded_connector(batches);
+
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{e.gpu_spaces[0]->get_device_id()}};
+  rmm::device_buffer ballast(ballast_size, e.stream(0), e.gpu_spaces[0]->get_default_allocator());
+  e.stream(0).sync();
+  auto const avail0_before = e.gpu_spaces[0]->get_available_memory();
+
+  memory_prefetcher_config cfg;
+  cfg.enable            = true;
+  cfg.num_threads       = 1;
+  cfg.min_free_fraction = 0.05;
+  cfg.poll_interval_ms  = 1;
+  cfg.drain_quiet_ms    = 50;
+
+  stop_counters counters;
+  {
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(
+      cfg, {connector}, e.gpu_spaces, lifecycle, placement_for({0, 1}, {0, 0}));
+    REQUIRE(wait_until([&] { return prefetcher.batches_prefetched() >= batches.size(); },
+                       std::chrono::seconds(60)));
+    prefetcher.stop();
+    REQUIRE(prefetcher.batches_prefetched() == batches.size());
+    counters = parse_stop_counters(log.records());
+  }
+
+  REQUIRE(counters.found);
+  REQUIRE(counters.reservation >= 1);
+  for (auto const& batch : batches) {
+    REQUIRE(batch_tier(*batch) == cucascade::memory::Tier::GPU);
+    REQUIRE(batch_device(*batch) == e.gpu_spaces[1]->get_device_id());
+  }
+  REQUIRE(e.gpu_spaces[0]->get_available_memory() == avail0_before);
+  REQUIRE(e.gpu_spaces[0]->get_active_reservation_count() == 0);
+  REQUIRE(e.gpu_spaces[1]->get_active_reservation_count() == 0);
+}
+
+TEST_CASE("prefetcher uploads a stamped split to its stamped GPU",
+          "[memory_prefetcher][scan_manager][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  prefetcher_env e{2};
+
+  // Both batches live on host space 0, whose only local GPU is 0, but the producer stamped
+  // GPU 1 on their splits: that is where the task creator will put their tasks, so that is
+  // where the upload has to go.
+  constexpr std::size_t n_rows = 1u << 20;
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches{
+    make_host_batch(e, n_rows, 500, /*gpu=*/0), make_host_batch(e, n_rows, 501, /*gpu=*/0)};
+  auto connector    = make_loaded_connector(batches, /*devices=*/{1, 1});
+  auto const peeked = connector->peek_resident_batches();
+  REQUIRE(peeked.size() == 2);
+  REQUIRE(peeked[0].preferred_device == 1);
+  REQUIRE(peeked[1].preferred_device == 1);
+
+  memory_prefetcher_config cfg;
+  cfg.enable            = true;
+  cfg.num_threads       = 2;
+  cfg.min_free_fraction = 0.05;
+  cfg.poll_interval_ms  = 1;
+  cfg.drain_quiet_ms    = 50;
+  {
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(
+      cfg, {connector}, e.gpu_spaces, lifecycle, placement_for({0, 1}, {0, 1}));
+    REQUIRE(wait_until([&] { return prefetcher.batches_prefetched() >= batches.size(); },
+                       std::chrono::seconds(60)));
+    prefetcher.stop();
+    REQUIRE(prefetcher.batches_prefetched() == batches.size());
+  }
+
+  for (auto const& batch : batches) {
+    REQUIRE(batch_tier(*batch) == cucascade::memory::Tier::GPU);
+    REQUIRE(batch_device(*batch) == e.gpu_spaces[1]->get_device_id());
+  }
+}
+
+TEST_CASE("prefetcher leaves a stamped split alone when its GPU refuses admission",
+          "[memory_prefetcher][scan_manager][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  prefetcher_env e{2};
+  sirius::test::scoped_recording_log_sink log{"info"};
+
+  // GPU 0 is ballasted past admission and GPU 1, its NUMA sibling, has room. The splits are
+  // stamped for GPU 0, so the prefetcher must skip them rather than upload them to GPU 1 and
+  // leave their tasks reading another device's memory.
+  constexpr std::size_t batch_rows   = 8ull << 20;  // 32MB of int32
+  constexpr std::size_t ballast_size = 360 * MiB;
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches{
+    make_host_batch(e, batch_rows, 600, /*gpu=*/0), make_host_batch(e, batch_rows, 601, /*gpu=*/0)};
+  auto connector = make_loaded_connector(batches, /*devices=*/{0, 0});
+
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{e.gpu_spaces[0]->get_device_id()}};
+  rmm::device_buffer ballast(ballast_size, e.stream(0), e.gpu_spaces[0]->get_default_allocator());
+  e.stream(0).sync();
+
+  memory_prefetcher_config cfg;
+  cfg.enable            = true;
+  cfg.num_threads       = 1;
+  cfg.min_free_fraction = 0.05;
+  cfg.poll_interval_ms  = 1;
+  cfg.drain_quiet_ms    = 50;
+
+  stop_counters counters;
+  {
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(
+      cfg, {connector}, e.gpu_spaces, lifecycle, placement_for({0, 1}, {0, 0}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    prefetcher.stop();
+    REQUIRE(prefetcher.batches_prefetched() == 0);
+    counters = parse_stop_counters(log.records());
+  }
+
+  REQUIRE(counters.found);
+  REQUIRE(counters.reservation >= 1);
+  for (auto const& batch : batches) {
+    REQUIRE(batch_tier(*batch) == cucascade::memory::Tier::HOST);
+  }
+  REQUIRE(e.gpu_spaces[0]->get_active_reservation_count() == 0);
+  REQUIRE(e.gpu_spaces[1]->get_active_reservation_count() == 0);
+}
+
+TEST_CASE("prefetcher with an empty admitted set falls back to its own GPU spaces",
+          "[memory_prefetcher][scan_manager]")
+{
+  prefetcher_env e;
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches{make_host_batch(e, 4096, 71)};
+  auto connector = make_loaded_connector(batches);
+
+  memory_prefetcher_config cfg;
+  cfg.enable            = true;
+  cfg.num_threads       = 1;
+  cfg.min_free_fraction = 0.05;
+  cfg.poll_interval_ms  = 1;
+  cfg.drain_quiet_ms    = 50;
+  {
+    // A caller with no admission set hands over a placement that admits nothing; the
+    // prefetcher must treat it like no placement rather than skip every batch.
+    sirius::exec::query_lifecycle_registry lifecycle;
+    memory_prefetcher prefetcher(
+      cfg,
+      {connector},
+      {e.gpu_space},
+      lifecycle,
+      std::make_shared<host_chunk_placement>(std::vector<int>{}, nullptr));
+    REQUIRE(
+      wait_until([&] { return prefetcher.batches_prefetched() >= 1; }, std::chrono::seconds(60)));
+    prefetcher.stop();
+    REQUIRE(prefetcher.batches_prefetched() == 1);
+  }
+  REQUIRE(batch_tier(*batches[0]) == cucascade::memory::Tier::GPU);
 }
