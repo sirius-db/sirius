@@ -18,12 +18,24 @@
 
 #include <catch.hpp>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <link.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
 
-// C linkage: the `.symtab` name needs no demangling.
+// Probes with C names so their `.symtab` entries need no demangling. GLOBAL and LOCAL.
 extern "C" int sirius_test_host_static_symbol_probe(int value) { return value + 1; }
+extern "C" {
+static __attribute__((noinline, used)) int sirius_test_host_static_symbol_local_probe(int value)
+{ return value + 2; }
+}
 
 namespace {
 
@@ -37,9 +49,38 @@ link_map const* main_program_module()
   return module;
 }
 
+/// Copies the running executable to a temp file, optionally flipping one byte of the GLOBAL
+/// probe's code (program headers unchanged). Returns an open fd, or -1.
+int copy_of_self(bool corrupt_probe)
+{
+  std::vector<unsigned char> image;
+  int src = ::open("/proc/self/exe", O_RDONLY);
+  if (src < 0) return -1;
+  unsigned char buf[1 << 16];
+  for (ssize_t n; (n = ::read(src, buf, sizeof(buf))) > 0;)
+    image.insert(image.end(), buf, buf + n);
+  ::close(src);
+  if (corrupt_probe) {
+    auto const* code =
+      reinterpret_cast<unsigned char const*>(&sirius_test_host_static_symbol_probe);
+    auto it = std::search(image.begin(), image.end(), code, code + 32);
+    if (it == image.end()) return -1;
+    *(it + 8) ^= 0xFF;
+  }
+  char path[] = "/tmp/sirius-host-image-XXXXXX";
+  int fd      = ::mkstemp(path);
+  if (fd < 0) return -1;
+  ::unlink(path);
+  if (::write(fd, image.data(), image.size()) != static_cast<ssize_t>(image.size())) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
+
 }  // namespace
 
-TEST_CASE("host_static_symbol resolves a function from the executable's static symbol table",
+TEST_CASE("host_static_symbol resolves a GLOBAL function from the mapped image",
           "[planner][duckdb_host]")
 {
   auto const* module = main_program_module();
@@ -47,18 +88,22 @@ TEST_CASE("host_static_symbol resolves a function from the executable's static s
 
   void* resolved =
     sirius::planner::detail::host_static_symbol(module, "sirius_test_host_static_symbol_probe");
-  REQUIRE(resolved != nullptr);
   REQUIRE(resolved == reinterpret_cast<void*>(&sirius_test_host_static_symbol_probe));
-
-  auto* probe = reinterpret_cast<int (*)(int)>(resolved);
-  REQUIRE(probe(41) == 42);
-  Dl_info info{};
-  void* owner{};
-  REQUIRE(::dladdr1(resolved, &info, &owner, RTLD_DL_LINKMAP) != 0);
-  REQUIRE(owner == static_cast<void const*>(module));
+  REQUIRE(reinterpret_cast<int (*)(int)>(resolved)(41) == 42);
 }
 
-TEST_CASE("host_static_symbol declines unknown symbols and foreign modules",
+TEST_CASE("host_static_symbol resolves a unique LOCAL function", "[planner][duckdb_host]")
+{
+  auto const* module = main_program_module();
+  REQUIRE(module != nullptr);
+
+  void* resolved = sirius::planner::detail::host_static_symbol(
+    module, "sirius_test_host_static_symbol_local_probe");
+  REQUIRE(resolved == reinterpret_cast<void*>(&sirius_test_host_static_symbol_local_probe));
+  REQUIRE(reinterpret_cast<int (*)(int)>(resolved)(40) == 42);
+}
+
+TEST_CASE("host_static_symbol declines unknown symbols, null and foreign modules",
           "[planner][duckdb_host]")
 {
   auto const* module = main_program_module();
@@ -76,4 +121,26 @@ TEST_CASE("host_static_symbol declines unknown symbols and foreign modules",
     REQUIRE(sirius::planner::detail::host_static_symbol(
               libc_module, "sirius_test_host_static_symbol_probe") == nullptr);
   }
+}
+
+TEST_CASE("host_static_symbol_in_image rejects a replacement file with the same program headers",
+          "[planner][duckdb_host]")
+{
+  auto const* module = main_program_module();
+  REQUIRE(module != nullptr);
+
+  int intact = copy_of_self(false);
+  REQUIRE(intact >= 0);
+  // An exact copy still names the right function: the byte comparison passes.
+  REQUIRE(sirius::planner::detail::host_static_symbol_in_image(
+            module, "sirius_test_host_static_symbol_probe", intact) ==
+          reinterpret_cast<void*>(&sirius_test_host_static_symbol_probe));
+  ::close(intact);
+
+  int corrupt = copy_of_self(true);
+  REQUIRE(corrupt >= 0);
+  // Same program headers, same symbol table, different code at the symbol: rejected.
+  REQUIRE(sirius::planner::detail::host_static_symbol_in_image(
+            module, "sirius_test_host_static_symbol_probe", corrupt) == nullptr);
+  ::close(corrupt);
 }
