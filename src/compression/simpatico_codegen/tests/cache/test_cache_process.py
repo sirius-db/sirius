@@ -238,7 +238,8 @@ class CacheProcesses(unittest.TestCase):
             self.assertEqual(self.worker(), (0, 1, 1))
 
     def test_simultaneous_processes_and_threads(self):
-        with ThreadPoolExecutor(max_workers=4) as workers:
+        # Each process starts six test threads; cap simultaneous workers at twelve.
+        with ThreadPoolExecutor(max_workers=2) as workers:
             results = list(workers.map(lambda _: self.worker(mode="threads"), range(4)))
         self.assertGreaterEqual(sum(compiles for compiles, _, _ in results), 1)
         self.assertEqual(self.worker(), (0, 1, 1))

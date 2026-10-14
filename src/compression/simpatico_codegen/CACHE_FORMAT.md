@@ -178,9 +178,9 @@ Host tests need no CUDA driver and exercise the production embedders, relocation
 include ordering, and incremental content/shadowing changes:
 
 ```sh
-pixi run cmake -S src/compression/simpatico_codegen/tests/cache -B build/cache-host -G Ninja
-pixi run cmake --build build/cache-host
-pixi run ctest --test-dir build/cache-host -L cache_host --output-on-failure --no-tests=error
+pixi run env CMAKE_BUILD_PARALLEL_LEVEL=16 cmake -S src/compression/simpatico_codegen/tests/cache -B build/cache-host -G Ninja
+pixi run cmake --build build/cache-host --parallel 16
+pixi run env CMAKE_BUILD_PARALLEL_LEVEL=16 ctest --test-dir build/cache-host -L cache_host --parallel 1 --output-on-failure --no-tests=error
 ```
 
 For GPU coverage, build `simpatico_cache_gpu_tests` and run CTest with
