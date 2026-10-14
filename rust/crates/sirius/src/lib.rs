@@ -185,7 +185,9 @@ impl Fragment<'_> {
             .declare_input_cardinality(stream_id, rows)
     }
 
-    /// Declare an output stream. A fragment with no output stream is a result fragment.
+    /// Declare an output stream. A fragment with no output stream is a result fragment; one with
+    /// two or more needs [`declare_output_broadcast`](Fragment::declare_output_broadcast) or
+    /// [`declare_output_hash_key`](Fragment::declare_output_hash_key), or `build` fails.
     pub fn declare_output(&mut self, stream_id: u64) -> Result<(), Exception> {
         self.inner.pin_mut().declare_output(stream_id)
     }
@@ -195,8 +197,8 @@ impl Fragment<'_> {
         self.inner.pin_mut().declare_output_broadcast()
     }
 
-    /// Declare one hash-partition key column; output stream `i` takes partition `i`. Call once
-    /// per key, in partition-expression order.
+    /// Declare one hash-partition key column; the `i`-th declared output stream takes partition
+    /// `i`. Call once per key, in partition-expression order.
     pub fn declare_output_hash_key(&mut self, column_index: u32) -> Result<(), Exception> {
         self.inner.pin_mut().declare_output_hash_key(column_index)
     }
@@ -236,9 +238,9 @@ impl Fragment<'_> {
         self.inner.pin_mut().run()
     }
 
-    /// Collect a result fragment's rows over the Arrow C Data Interface. Callable once, after
-    /// [`run`](Fragment::run).
-    pub fn result_to_arrow(&mut self) -> Result<SubstraitResult, SiriusError> {
+    /// Collect a result fragment's rows over the Arrow C Data Interface, after
+    /// [`run`](Fragment::run). Consumes the fragment: the rows can be collected only once.
+    pub fn result_to_arrow(mut self) -> Result<SubstraitResult, SiriusError> {
         let mut stream = FFI_ArrowArrayStream::empty();
         let out_stream_addr = std::ptr::addr_of_mut!(stream) as usize;
         // SAFETY: `out_stream_addr` is the address of `stream`, a live, writable
@@ -262,7 +264,8 @@ impl Fragment<'_> {
         self.inner.output_row_count(stream_id)
     }
 
-    /// DuckDB type names of this built fragment's output columns, in the form
+    /// DuckDB type names of this built intermediate fragment's output columns (an error on a
+    /// result fragment), in the form
     /// [`declare_input_column`](Fragment::declare_input_column) accepts.
     pub fn output_types(&self) -> Result<Vec<String>, Exception> {
         Ok(self
@@ -532,6 +535,11 @@ mod tests {
                 .relay_from(&mut sender, stream, 0, stream as u32)
                 .unwrap();
             assert_eq!(moved, parked, "stream {stream}");
+            assert_eq!(
+                sender.output_batch_count(stream).unwrap(),
+                0,
+                "stream {stream} drained"
+            );
         }
         receiver.close_input(0, 2).unwrap();
         receiver.run().unwrap();
