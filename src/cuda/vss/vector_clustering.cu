@@ -67,23 +67,33 @@ namespace {
 
 }  // namespace
 
+strided_rows strided_row_sample(std::int64_t rows, std::int64_t take, std::uint64_t seed)
+{
+  if (take <= 0) { throw std::invalid_argument("sample_vector_rows: take must be >= 1"); }
+  if (take >= rows) { return strided_rows{0, 1, rows}; }
+  auto const stride = rows / take;
+  return strided_rows{
+    static_cast<std::int64_t>(seed % static_cast<std::uint64_t>(stride)), stride, take};
+}
+
 std::unique_ptr<cudf::column> sample_vector_rows(cudf::column_view const& vectors,
                                                  std::int64_t take,
                                                  std::uint64_t seed,
                                                  rmm::cuda_stream_view stream,
                                                  rmm::device_async_resource_ref mr)
 {
-  auto const rows = chunk_row_count(vectors);
-  if (take <= 0) { throw std::invalid_argument("sample_vector_rows: take must be >= 1"); }
-  if (take >= rows) { return std::make_unique<cudf::column>(vectors, stream, mr); }
+  auto const rows   = chunk_row_count(vectors);
+  auto const sample = strided_row_sample(rows, take, seed);
+  if (sample.count == rows) { return std::make_unique<cudf::column>(vectors, stream, mr); }
 
   // The stride walk is what keeps this allocation-light: no shuffle, no random index buffer,
   // just an arithmetic sequence used as a gather map.
-  auto const stride = rows / take;
-  auto const start  = static_cast<std::int32_t>(seed % static_cast<std::uint64_t>(stride));
-  cudf::numeric_scalar<std::int32_t> const init(start, true, stream);
-  cudf::numeric_scalar<std::int32_t> const step(static_cast<std::int32_t>(stride), true, stream);
-  auto const map = cudf::sequence(static_cast<cudf::size_type>(take), init, step, stream, mr);
+  cudf::numeric_scalar<std::int32_t> const init(static_cast<std::int32_t>(sample.start), true,
+                                                stream);
+  cudf::numeric_scalar<std::int32_t> const step(static_cast<std::int32_t>(sample.stride), true,
+                                                stream);
+  auto const map =
+    cudf::sequence(static_cast<cudf::size_type>(sample.count), init, step, stream, mr);
 
   auto gathered = cudf::gather(
     cudf::table_view{{vectors}}, map->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);

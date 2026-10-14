@@ -105,6 +105,18 @@ struct cluster_assignment {
                                               std::int64_t n_rows,
                                               std::int64_t n_clusters);
 
+/// Rows @c start, @c start + @c stride, ... (@c count of them): the rows @ref sample_vector_rows
+/// takes from a @p rows-row column.
+struct strided_rows {
+  std::int64_t start;
+  std::int64_t stride;
+  std::int64_t count;
+};
+
+[[nodiscard]] strided_rows strided_row_sample(std::int64_t rows,
+                                              std::int64_t take,
+                                              std::uint64_t seed);
+
 /**
  * @brief A @p take-row sample of a fixed-width FLOAT32 LIST vector column.
  *

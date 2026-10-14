@@ -23,7 +23,20 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <scan_manager/sirius_scan_manager.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/transparent_execution_test_utils.hpp>
+#include <vss/pinned_column.hpp>
+#include <vss/vector_clustering.hpp>
+
+#include <cudf/lists/lists_column_view.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <cmath>
@@ -1847,4 +1860,74 @@ TEST_CASE_METHOD(KMeansFixture,
   auto const answer = join("gpc_corpus");
   CHECK(answer.size() == 30);
   CHECK(answer == join("gpc_plain"));
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "the fit's sample of a host-tier pin is read in place, row for row",
+                 "[integration][gpu_execution][array][vss][kmeans]")
+{
+  // Three chunks, as in the keyed self-join case.
+  run_ok(
+    "CREATE TABLE khs AS SELECT i::BIGINT AS id, list_transform(range(32), lambda d: "
+    "((hash(i * 1000 + d) % 1000)::FLOAT / 1000.0))::FLOAT[32] AS vec FROM range(260000) t(i);");
+  run_ok(
+    "CREATE TABLE khs_null AS SELECT * FROM khs WHERE id < 1000 UNION ALL "
+    "SELECT 1000, NULL::FLOAT[32];");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'khs', tier => 'host', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'khs_null', tier => 'host', format => 'duckdb');");
+
+  auto ctx = sirius::test::get_registered_sirius_context(*con);
+  REQUIRE(ctx);
+  auto const gpu_spaces =
+    ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE_FALSE(gpu_spaces.empty());
+  auto& space = *const_cast<cucascade::memory::memory_space*>(gpu_spaces.front());
+  auto const mr = space.get_default_allocator();
+  rmm::cuda_stream stream;
+  sirius::telemetry::batch_telemetry_info const telemetry{};
+  auto const values = [&](cudf::column const& vectors) {
+    auto const child = cudf::lists_column_view{vectors.view()}.get_sliced_child(stream.view());
+    std::vector<float> out(static_cast<std::size_t>(child.size()));
+    REQUIRE(cudaMemcpy(out.data(),
+                       child.data<float>(),
+                       out.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    return out;
+  };
+
+  auto const* pin = ctx->get_scan_manager().find_pinned_entry("khs");
+  REQUIRE(pin != nullptr);
+  auto const n_chunks = sirius::vss::pinned_column_chunk_count(*pin, "vec");
+  REQUIRE(n_chunks >= 2);
+  std::int64_t total = 0;
+  for (std::size_t i = 0; i < n_chunks; ++i) {
+    auto const rows = sirius::vss::pinned_host_chunk_rows(*pin, "vec", i);
+    REQUIRE(rows > 0);
+    total += rows;
+    for (auto const take : {rows / 37, rows - 1, rows}) {
+      auto const pick     = sirius::vss::strided_row_sample(rows, take, 7);
+      auto const in_place = sirius::vss::gather_host_pinned_rows(
+        *pin, "vec", i, 32, pick.start, pick.stride, pick.count, stream.view(), mr);
+      REQUIRE(in_place != nullptr);
+      auto staged = sirius::vss::stage_pinned_column_chunk(
+        *pin, "vec", i, space, stream.view(), telemetry);
+      auto const expected =
+        sirius::vss::sample_vector_rows(staged.view, take, 7, stream.view(), mr);
+      CHECK(in_place->size() == expected->size());
+      CHECK(values(*in_place) == values(*expected));
+    }
+  }
+  CHECK(total == 260000);
+
+  // A null row leaves the chunk to staging.
+  auto const* with_null = ctx->get_scan_manager().find_pinned_entry("khs_null");
+  REQUIRE(with_null != nullptr);
+  REQUIRE(sirius::vss::pinned_column_chunk_count(*with_null, "vec") == 1);
+  CHECK(sirius::vss::gather_host_pinned_rows(
+          *with_null, "vec", 0, 32, 0, 1, 10, stream.view(), mr) == nullptr);
+  // And the fit still takes its sample from such a chunk.
+  CHECK(scalar_i64(*con,
+                   "SELECT train_rows FROM sirius_kmeans_fit('khs_null','vec', name => 'khs_c', "
+                   "n_clusters => 4);") == 1001);
 }

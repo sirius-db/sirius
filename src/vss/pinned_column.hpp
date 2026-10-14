@@ -16,15 +16,19 @@
 
 #pragma once
 
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -108,6 +112,65 @@ enum class staging_charge {
   rmm::cuda_stream_view stream,
   const telemetry::batch_telemetry_info& telemetry_info,
   staging_charge charge = staging_charge::own_reservation);
+
+/// Rows chunk @p chunk_index of a HOST-tier pinned column holds, read without staging it; -1 for a
+/// GPU-tier pin or a chunk whose layout only staging can tell.
+[[nodiscard]] std::int64_t pinned_host_chunk_rows(const scan_manager::pinned_entry& pin,
+                                                  const std::string& column_name,
+                                                  std::size_t chunk_index);
+
+/// Rows @p start, @p start + @p stride, ... (@p count of them) of HOST-tier chunk @p chunk_index
+/// of a FLOAT32 LIST column @p dim wide, copied from host memory into a device LIST column: what
+/// staging the chunk and gathering those rows gives, without moving the rest of the chunk. Null
+/// for a GPU-tier pin or a chunk that is not plain fixed-width rows (nulls, or offsets other than
+/// 0, dim, 2 dim, ...), which the caller stages instead.
+[[nodiscard]] std::unique_ptr<cudf::column> gather_host_pinned_rows(
+  const scan_manager::pinned_entry& pin,
+  const std::string& column_name,
+  std::size_t chunk_index,
+  std::int64_t dim,
+  std::int64_t start,
+  std::int64_t stride,
+  std::int64_t count,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/// Walks a pinned column a chunk at a time, copying the next HOST-tier chunk to the device while
+/// the caller works on the current one.
+///
+/// The copy runs on a stream of its own; @ref take hands a chunk out bound to the caller's stream,
+/// so its memory is freed behind the caller's work on it. A space that cannot grant a second
+/// chunk's reservation gets the next chunk staged after the current one is released, as an
+/// unprefetched walk would. GPU-tier chunks are aliased, so there is nothing to prefetch.
+class pinned_chunk_walk {
+ public:
+  pinned_chunk_walk(const scan_manager::pinned_entry& pin,
+                    std::string column_name,
+                    ::cucascade::memory::memory_space& gpu_space,
+                    rmm::cuda_stream_view stream,
+                    const telemetry::batch_telemetry_info& telemetry_info);
+
+  [[nodiscard]] std::size_t size() const noexcept { return _n_chunks; }
+
+  /// Chunk @p chunk_index: the prefetched copy when there is one, else staged now on the caller's
+  /// stream.
+  [[nodiscard]] staged_pinned_chunk take(std::size_t chunk_index);
+
+  /// Copies the chunk after @p chunk_index; call once the work on @p chunk_index is enqueued and
+  /// before waiting for it. Returns when the copy is done.
+  void prefetch_after(std::size_t chunk_index);
+
+ private:
+  const scan_manager::pinned_entry& _pin;
+  std::string _column_name;
+  ::cucascade::memory::memory_space& _gpu_space;
+  rmm::cuda_stream_view _stream;
+  const telemetry::batch_telemetry_info& _telemetry_info;
+  std::size_t _n_chunks;
+  rmm::cuda_stream _copy_stream;
+  std::optional<staged_pinned_chunk> _ahead;
+  std::size_t _ahead_index{0};
+};
 
 /**
  * @brief Tier-agnostic replacement for @ref pinned_column_chunk_views.

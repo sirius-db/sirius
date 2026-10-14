@@ -187,14 +187,30 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
     // Each chunk is staged, reduced to its share of the sample, and released before the next
     // is staged, so a corpus larger than device memory can still be clustered.
     std::vector<std::unique_ptr<cudf::column>> samples;
+    auto const share = [&](std::int64_t rows) {
+      auto const take = std::min<std::int64_t>(rows, ((train_rows * rows) + n_rows - 1) / n_rows);
+      return std::min<std::int64_t>(take, train_rows - sampled);
+    };
     for (std::size_t i = 0; i < n_chunks; ++i) {
+      // A host-tier chunk gives up its share of the sample from host memory: the share is a few
+      // percent of its rows, and staging the whole chunk to take them cost the fit most of its time.
+      if (auto const rows = pinned_host_chunk_rows(*c.pin, req.column, i); rows > 0) {
+        auto const take = share(rows);
+        if (take <= 0) { break; }
+        auto const pick = strided_row_sample(rows, take, req.spec.seed);
+        if (auto sample = gather_host_pinned_rows(
+              *c.pin, req.column, i, req.dim, pick.start, pick.stride, pick.count, stream, mr)) {
+          samples.push_back(std::move(sample));
+          sampled += take;
+          continue;
+        }
+      }
       auto staged =
         stage_pinned_column_chunk(*c.pin, req.column, i, *c.space, stream, telemetry_info);
       auto const rows = static_cast<std::int64_t>(staged.view.size());
       if (rows == 0) { continue; }
 
-      auto take = std::min<std::int64_t>(rows, ((train_rows * rows) + n_rows - 1) / n_rows);
-      take      = std::min<std::int64_t>(take, train_rows - sampled);
+      auto const take = share(rows);
       if (take <= 0) { break; }
       samples.push_back(sample_vector_rows(staged.view, take, req.spec.seed, stream, mr));
       // The sample borrows the staged chunk, which this iteration is about to release.
@@ -482,10 +498,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   }
   {
     centroid_labeler labeler{res, centroids->view(), dim, entry->meta.metric, mr};
+    pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
-      auto staged =
-        stage_pinned_column_chunk(*c.pin, req.column, i, *c.space, stream, telemetry_info);
+      auto staged     = walk.take(i);
       auto const rows = static_cast<std::int64_t>(staged.view.size());
       if (rows == 0) { continue; }
       if (base + rows > n_rows) {
@@ -507,6 +523,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                        col_max->data(),
                        stream);
       }
+      // Before the copy below, which waits for the labels: into pageable memory it is synchronous.
+      walk.prefetch_after(i);
       CUDF_CUDA_TRY(cudaMemcpyAsync(labels.data() + base,
                                     chunk_labels.data(),
                                     static_cast<std::size_t>(rows) * sizeof(std::int32_t),
@@ -899,10 +917,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
 
     std::vector<std::int64_t> order, grouped_dest;
     std::vector<std::int64_t> count(static_cast<std::size_t>(n_clusters));
+    pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0, turn = 0; i < n_chunks; ++i) {
-      auto staged =
-        stage_pinned_column_chunk(*c.pin, req.column, i, *c.space, stream, telemetry_info);
+      auto staged     = walk.take(i);
       auto const rows = static_cast<std::int64_t>(staged.view.size());
       if (rows == 0) { continue; }
       auto const vectors       = list_column_as_dataset_view(staged.view, dim);
@@ -1036,6 +1054,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       } else {
         download(row_stage, grouped_bytes, static_cast<std::size_t>(rows) * row_bytes_v);
       }
+      walk.prefetch_after(i);
       // The staged chunk, the grouped rows and the pageable sources of the copies above are
       // released or reused once this iteration ends.
       stream.synchronize();
