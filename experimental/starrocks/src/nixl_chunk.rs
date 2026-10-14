@@ -25,7 +25,8 @@ const MD: u8 = 1;
 const ALLOC: u8 = 2;
 const PACKED: u8 = 3;
 const RELEASE: u8 = 4;
-const FAILED: u8 = 5;
+// 5 and 6 are the runtime filters' TOPOLOGY and SHARE_ABANDONED frames.
+const FAILED: u8 = 7;
 
 /// Request attachment after `SRNX`.
 #[derive(Clone, Debug, PartialEq, Eq)]
