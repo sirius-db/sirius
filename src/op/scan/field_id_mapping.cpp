@@ -9,6 +9,7 @@
 #include <cudf/unary.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <stdexcept>
 #include <unordered_set>
@@ -47,6 +48,20 @@ cudf::data_type flat_type(duckdb::LogicalType const& type)
     case D::VARCHAR: return cudf::data_type{C::STRING};
     default: throw std::invalid_argument("field_id_core_v1: unsupported logical type");
   }
+}
+
+bool same_default(duckdb::Value const& a, duckdb::Value const& b)
+{
+  if (a.IsNull() || b.IsNull()) return a.IsNull() && b.IsNull();
+  // SQL equality merges +0 and -0, whose sign remains observable (e.g. 1/x).
+  // A coalesced run must preserve the actual default, including NaN payloads.
+  if (a.type().id() == duckdb::LogicalTypeId::FLOAT)
+    return std::bit_cast<uint32_t>(a.GetValue<float>()) ==
+           std::bit_cast<uint32_t>(b.GetValue<float>());
+  if (a.type().id() == duckdb::LogicalTypeId::DOUBLE)
+    return std::bit_cast<uint64_t>(a.GetValue<double>()) ==
+           std::bit_cast<uint64_t>(b.GetValue<double>());
+  return duckdb::Value::NotDistinctFrom(a, b);
 }
 
 std::unique_ptr<cudf::scalar> default_scalar(duckdb::Value const& value,
@@ -180,8 +195,7 @@ bool field_id_mapping::compatible_with(field_id_mapping const& other) const
         a.target_type != b.target_type ||
         a.field.missing_value.has_value() != b.field.missing_value.has_value())
       return false;
-    if (a.field.missing_value &&
-        !duckdb::Value::NotDistinctFrom(*a.field.missing_value, *b.field.missing_value))
+    if (a.field.missing_value && !same_default(*a.field.missing_value, *b.field.missing_value))
       return false;
   }
   return true;
