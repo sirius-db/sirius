@@ -108,6 +108,8 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
+constexpr bool DEFAULT_ENABLE_ORDER_PRESERVING_PARTITION = true;
+
 /// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
@@ -252,6 +254,12 @@ struct operator_params {
 
   /// Share of GPU tier capacity for the histogram when the budget above is 0.
   double dense_count_join_memory_fraction = config::DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION;
+
+  /// Hash partitions keep their input order within each partition, and a grouped-aggregate merge
+  /// whose partials arrive sorted uses cuDF's sorted-keys group-by (verified per merge). Applies to
+  /// every hash partition of a query together, so all producers feeding one consumer agree on each
+  /// key's partition. Off: hash partitions use cudf::hash_partition and the merge always hashes.
+  bool enable_order_preserving_partition = config::DEFAULT_ENABLE_ORDER_PRESERVING_PARTITION;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's

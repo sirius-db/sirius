@@ -22,11 +22,17 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/merge.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+
+#include <algorithm>
+#include <utility>
 
 namespace sirius {
 namespace op {
@@ -168,6 +174,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   const std::vector<cucascade::read_only_data_batch>& input,
   int num_group_cols,
   const std::vector<cudf::aggregation::Kind>& aggregates,
+  bool try_sorted_keys,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
@@ -188,6 +195,36 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
       num_group_cols + static_cast<int>(aggregates.size())) {
     throw std::runtime_error(
       "`num columns = num_group_cols + num aggregates` not true in `merge_grouped_aggregate()`");
+  }
+  // Partials of sorted input batches are themselves sorted, and with a table pinned in key order
+  // they cover consecutive key ranges. When the hash partitions upstream kept their input order,
+  // ordering the partials by their first key then makes the concatenation sorted, so the merge
+  // can use cuDF's sorted-keys path. The order is verified after concatenation, so any other
+  // input keeps the hash path.
+  auto const first_key_type = input_cudf_table_views[0].column(0).type();
+  bool const try_sorted_merge =
+    try_sorted_keys && num_group_cols == 1 && first_key_type.id() == cudf::type_id::INT64;
+  if (try_sorted_merge) {
+    std::vector<std::pair<int64_t, cudf::table_view>> keyed_views;
+    bool orderable = true;
+    for (auto const& view : input_cudf_table_views) {
+      if (view.num_rows() == 0 || view.column(0).has_nulls()) {
+        orderable = false;
+        break;
+      }
+      auto const first =
+        cudf::get_element(view.column(0), 0, stream, memory_space.get_default_allocator());
+      keyed_views.emplace_back(
+        static_cast<cudf::numeric_scalar<int64_t> const&>(*first).value(stream), view);
+    }
+    if (orderable) {
+      std::stable_sort(keyed_views.begin(),
+                       keyed_views.end(),
+                       [](auto const& lhs, auto const& rhs) { return lhs.first < rhs.first; });
+      for (std::size_t view_idx = 0; view_idx < keyed_views.size(); ++view_idx) {
+        input_cudf_table_views[view_idx] = keyed_views[view_idx].second;
+      }
+    }
   }
   auto concatenated =
     cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
@@ -252,7 +289,22 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
       group_cols.push_back(col);
     }
   }
-  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
+  bool const keys_sorted =
+    try_sorted_merge && group_cols.size() == 1 && !group_cols[0].has_nulls() &&
+    cudf::is_sorted(
+      cudf::table_view(group_cols), {cudf::order::ASCENDING}, {cudf::null_order::AFTER}, stream);
+  SIRIUS_LOG_DEBUG("merge_grouped_agg: sorted-key check tried={} rows={} batches={} sorted={}",
+                   try_sorted_merge,
+                   concatenated->num_rows(),
+                   input.size(),
+                   keys_sorted);
+  cudf::groupby::groupby grpby_obj =
+    keys_sorted ? cudf::groupby::groupby(cudf::table_view(group_cols),
+                                         cudf::null_policy::INCLUDE,
+                                         cudf::sorted::YES,
+                                         {cudf::order::ASCENDING},
+                                         {cudf::null_order::AFTER})
+                : cudf::groupby::groupby(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
   std::vector<cudf::groupby::aggregation_request> requests;
   for (size_t i = 0; i < aggregates.size(); ++i) {
     int aggregate_col_id = num_group_cols + static_cast<int>(i);
