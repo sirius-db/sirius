@@ -242,7 +242,8 @@ std::string out_param_decl(Consumer c, const std::string& dtype)
 // ---------------------------------------------------------------------
 class Walker {
  public:
-  Walker(std::string root_dtype, DecodeShape shape) : dtype_(std::move(root_dtype)), shape_(shape)
+  Walker(std::string root_dtype, DecodeShape shape, std::string out_dtype = {})
+    : dtype_(std::move(root_dtype)), out_dtype_(std::move(out_dtype)), shape_(shape)
   {
   }
 
@@ -287,6 +288,7 @@ class Walker {
 
  private:
   std::string dtype_;
+  std::string out_dtype_;  // empty: `out` holds dtype_ (see render)
   DecodeShape shape_        = kShapePlain;
   static constexpr int tbs_ = ::codegen::kTBSize;
   std::ostringstream params_;
@@ -413,13 +415,14 @@ class Walker {
     DecodeKernelSpec spec;
     spec.entry_symbol = make_entry_symbol(tree, dtype_, "simpatico_decode_");
     spec.entry_symbol += shape_symbol_suffix(shape_);
+    if (!out_dtype_.empty()) { spec.entry_symbol += "_to_" + out_dtype_; }
 
     // The `out` slot's type and meaning vary by variant; everything after
     // (out, n) comes from ONE table that yields both the declaration text and
     // spec.trailing, so what the kernel declares and what the launcher pushes
     // are the same list (see TrailingParam).
     std::vector<std::string> decls;
-    decls.push_back(out_param_decl(shape_.consumer, dtype_));
+    decls.push_back(out_param_decl(shape_.consumer, out_dtype_.empty() ? dtype_ : out_dtype_));
     decls.emplace_back("int64_t n");
     for (const auto& tp : shape_trailing_params(shape_)) {
       spec.trailing.push_back(tp.tag);
@@ -1812,8 +1815,14 @@ extern "C" __global__ void simpatico_masked_char_copy(
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,
-                        DecodeShape shape)
+                        DecodeShape shape,
+                        const std::string& out_dtype)
 {
+  if (!out_dtype.empty() && (shape.consumer != Consumer::write_column ||
+                             dtype_elem_size(out_dtype) <= dtype_elem_size(element_dtype))) {
+    throw RenderError("decode render: out_dtype '" + out_dtype +
+                      "' must be a wider element type for a write_column consumer");
+  }
   if (element_dtype.empty()) {
     throw std::invalid_argument("decode render: element_dtype is empty");
   }
@@ -1825,7 +1834,7 @@ DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
     throw RenderError("decode render: unsupported element_dtype '" + element_dtype +
                       "'. Supported: int32_t, int64_t");
   }
-  Walker w(element_dtype, shape);
+  Walker w(element_dtype, shape, out_dtype);
   return w.build(tree);
 }
 

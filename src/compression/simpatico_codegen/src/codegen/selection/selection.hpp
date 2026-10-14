@@ -199,6 +199,9 @@ struct scan_filter_request {
   // outcome (refused, declined_unselective, failed, or an assembly refusal) returns every selected
   // column.
   std::optional<std::size_t> delivered_prefix;
+  // Optional per-column output types, parallel to `selected`: the type the caller will restore a
+  // column to. Applied only where the decode can widen to it directly (see decode_selection).
+  std::vector<std::optional<cudf::data_type>> output_types;
 };
 
 // Outcome of a decompress_scan_filter call. `declined_unselective` is worth remembering

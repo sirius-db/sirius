@@ -82,7 +82,8 @@ bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
                                         ::sirius::codegen::selection_mask const& mask,
                                         row_enumeration rows,
                                         void* out,
-                                        ::cuda::stream_ref stream);
+                                        ::cuda::stream_ref stream,
+                                        char const* out_dtype = nullptr);
 
 /// Dictionary gather: for dictionary->bitpack string columns with
 /// CONSTANT-WIDTH, null-free keys.  ``tree`` is the codes
