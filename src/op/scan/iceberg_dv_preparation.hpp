@@ -74,12 +74,14 @@ class iceberg_dv_attempt {
  public:
   iceberg_dv_attempt(std::shared_ptr<iceberg_dv_preparation>,
                      std::shared_ptr<scan_manager::preparation_ledger>);
+  iceberg_dv_attempt(iceberg_dv_attempt const&)            = delete;
+  iceberg_dv_attempt& operator=(iceberg_dv_attempt const&) = delete;
   iceberg_dv_preparation const& plan() const noexcept { return *plan_; }
   std::shared_ptr<scan_manager::preparation_ledger> const& ledger() const noexcept
   {
     return ledger_;
   }
-  void record(size_t index, std::shared_ptr<iceberg_delete_set const> const&) noexcept;
+  void record(size_t index, std::shared_ptr<iceberg_delete_set const> const&);
   std::shared_ptr<iceberg_delete_set const> result(size_t index) const noexcept;
   void stop() noexcept { ledger_.reset(); }
   void finish() noexcept;

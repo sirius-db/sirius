@@ -76,7 +76,6 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
   /// Installs the execution's attempt (ledger + result slots) once the statement admission has
   /// been consumed; preparation work cannot be claimed before this.
   void begin_preparation(std::shared_ptr<iceberg_dv_attempt> attempt);
-  [[nodiscard]] bool preparation_started() const noexcept { return bool(_attempt); }
   bool can_claim_preparation();
   scan_manager::unit_key next_preparation_unit() const;
   void stop_preparation() noexcept;

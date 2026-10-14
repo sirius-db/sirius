@@ -55,13 +55,16 @@ namespace sirius {
 
 namespace {
 
-void finish_deferred_preparation(planner::query const* query) noexcept
+// Walks the live plan rather than the query index: on a failed start the engine never receives
+// the index, while the plan still names every scan whose descriptors must be retired.
+void finish_deferred_preparation(op::sirius_physical_operator const* plan) noexcept
 {
-  if (!query) return;
-  for (auto* source : query->get_scan_operators())
-    if (auto* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator*>(source))
+  if (!plan) return;
+  planner::for_each_gpu_scan(*plan, [](op::sirius_physical_operator const& source) {
+    if (auto const* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&source))
       if (auto* ice = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&scan->get_ingestible()))
         ice->finish_preparation();
+  });
 }
 
 /// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
@@ -165,7 +168,7 @@ void sirius_engine::quiesce_plan_users()
     ctx->get_task_scheduler().drain_after_error(query_id_);
     ctx->get_task_creator().reset(query_id_);
   }
-  finish_deferred_preparation(query_.get());
+  finish_deferred_preparation(sirius_physical_plan.get());
   plan_users_quiescent_ = true;
 }
 
@@ -282,7 +285,7 @@ void sirius_engine::execute()
     sirius_ctx->get_scan_manager().drain_query(query_id_);
     sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
     sirius_ctx->get_task_creator().reset(query_id_);
-    finish_deferred_preparation(query_.get());
+    finish_deferred_preparation(sirius_physical_plan.get());
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());

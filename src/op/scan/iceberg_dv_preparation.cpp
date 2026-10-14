@@ -222,11 +222,12 @@ iceberg_dv_attempt::iceberg_dv_attempt(std::shared_ptr<iceberg_dv_preparation> p
 {
   if (!plan_ || !ledger_) throw std::logic_error("DV attempt requires a plan and a ledger");
 }
-void iceberg_dv_attempt::record(size_t index,
-                                std::shared_ptr<iceberg_delete_set const> const& set) noexcept
+void iceberg_dv_attempt::record(size_t index, std::shared_ptr<iceberg_delete_set const> const& set)
 {
   auto slots = plan_->slots();
-  if (index < slots.size()) slots[index].result = set;
+  if (index >= slots.size())
+    throw std::logic_error("DV result recorded outside the attempt's descriptors");
+  slots[index].result = set;
 }
 std::shared_ptr<iceberg_delete_set const> iceberg_dv_attempt::result(size_t index) const noexcept
 {
