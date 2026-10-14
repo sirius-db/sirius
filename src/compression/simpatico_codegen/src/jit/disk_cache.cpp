@@ -214,7 +214,7 @@ void prune_disk_cache(const std::string& root, const Digest& current_environment
   try {
     namespace fs        = std::filesystem;
     const fs::path base = root;
-    const auto spaces   = base / "v2";
+    const auto spaces   = base / kCacheFormatVersion;
     const auto current  = spaces / hex_digest(current_environment);
     std::error_code error;
     // Check each level separately so a root, v2, or environment symlink is
@@ -256,7 +256,7 @@ void clear_disk_cache(const std::string& root) noexcept
   try {
     if (!is_directory_no_follow(root)) return;
     clear_legacy_files(root);
-    const auto spaces = std::filesystem::path(root) / "v2";
+    const auto spaces = std::filesystem::path(root) / kCacheFormatVersion;
     visit_directory(spaces, [&](const auto& entry) {
       if (is_environment(entry)) clear_environment(entry.path());
     });
