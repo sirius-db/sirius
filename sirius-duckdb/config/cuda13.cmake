@@ -1,6 +1,10 @@
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  return()
+endif()
+
+# Build the CUDA-free loader once per platform, alongside the CUDA 13 backend.
 include("${CMAKE_CURRENT_LIST_DIR}/loader.cmake")
 
-set(SIRIUS_DUCKDB_EXTENSION_NAME sirius_cuda13)
 set(SIRIUS_DUCKDB_LINKAGE
     static
     CACHE STRING "Sirius library linkage")

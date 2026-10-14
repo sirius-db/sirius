@@ -70,7 +70,7 @@ jobs:
       build_duckdb_shell: false
       vcpkg_overlay_ports: "sirius-duckdb/vcpkg_ports"
       vcpkg_overlay_triplets: "sirius-duckdb/vcpkg_triplets"
-      cuda_archs: "75-real;80-real;86-real;89-real;90a-real"
+      cuda_archs: "75-real;80-real;86-real;89-real;90a-real;100-real;120-real"
       cuda_version: "12"
       artifact_postfix: "-cuda12"
       runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "arm-xl"]}'

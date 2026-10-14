@@ -1,4 +1,7 @@
-set(SIRIUS_DUCKDB_EXTENSION_NAME sirius_cuda12)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  return()
+endif()
+
 set(SIRIUS_DUCKDB_LINKAGE
     static
     CACHE STRING "Sirius library linkage")

@@ -2,14 +2,14 @@ cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
 project(sirius-duckdb)
 
-set(SIRIUS_DUCKDB_EXTENSION_NAME
-    sirius
-    CACHE STRING "DuckDB extension name")
-if(NOT SIRIUS_DUCKDB_EXTENSION_NAME MATCHES "^sirius(_cuda(12|13))?$")
-  message(FATAL_ERROR "Expected sirius, sirius_cuda12, or sirius_cuda13")
+set(extension_name ${EXTENSION_NAME})
+if(NOT extension_name MATCHES "^sirius(_cuda(12|13))?$")
+  message(
+    FATAL_ERROR "EXTENSION_NAME must be sirius, sirius_cuda12, or sirius_cuda13"
+  )
 endif()
-set(extension_name ${SIRIUS_DUCKDB_EXTENSION_NAME})
 string(TOUPPER "${extension_name}" extension_name_upper)
+set_extension_version_sources(${extension_name})
 
 set(SIRIUS_DUCKDB_LINKAGE
     shared
@@ -30,14 +30,16 @@ endif()
 
 set(EXTENSION_SOURCES src/sirius/sirius_extension.cpp)
 
-# DuckDB's mold options are directory-wide; this backend uses BFD. Keep the
+# DuckDB's linker options are directory-wide; this backend uses BFD. Keep the
 # override local so the host and sibling extensions retain their linker.
-if(DUCKDB_LINKER STREQUAL "mold")
-  string(REPLACE "${DUCKDB_LINKER_FLAG}" "" CMAKE_SHARED_LINKER_FLAGS
-                 "${CMAKE_SHARED_LINKER_FLAGS}")
-  string(REPLACE "${DUCKDB_MOLD_FLAGS}" "" CMAKE_SHARED_LINKER_FLAGS
-                 "${CMAKE_SHARED_LINKER_FLAGS}")
-endif()
+foreach(flags IN ITEMS CMAKE_SHARED_LINKER_FLAGS CMAKE_MODULE_LINKER_FLAGS)
+  if(DUCKDB_LINKER_FLAG)
+    string(REPLACE "${DUCKDB_LINKER_FLAG}" "" ${flags} "${${flags}}")
+  endif()
+  if(DUCKDB_MOLD_FLAGS)
+    string(REPLACE "${DUCKDB_MOLD_FLAGS}" "" ${flags} "${${flags}}")
+  endif()
+endforeach()
 
 build_static_extension(${extension_name} ${EXTENSION_SOURCES})
 build_loadable_extension(${extension_name} " " ${EXTENSION_SOURCES})

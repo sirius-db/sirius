@@ -4,20 +4,13 @@ Date: Tue, 13 Oct 2026 12:17:57 +0000
 Subject: [PATCH] Fix host refinement template calls for Clang
 
 ---
- cpp/src/neighbors/refine/refine_host.hpp | 7 ++++---
- 1 file changed, 4 insertions(+), 3 deletions(-)
+ cpp/src/neighbors/refine/refine_host.hpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
 
 diff --git a/cpp/src/neighbors/refine/refine_host.hpp b/cpp/src/neighbors/refine/refine_host.hpp
 index d8e9d577..2d7c5232 100644
 --- a/cpp/src/neighbors/refine/refine_host.hpp
 +++ b/cpp/src/neighbors/refine/refine_host.hpp
-@@ -1,5 +1,5 @@
- /*
-- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
-+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-  * SPDX-License-Identifier: Apache-2.0
-  */
- 
 @@ -415,7 +415,7 @@ template <typename DC, typename IdxT, typename DataT, typename DistanceT, typena
        for (size_t j = 0; j < refined_k; j++) {
          indices(i, j) = std::get<1>(refined_pairs[i][j]);
@@ -39,4 +32,3 @@ index d8e9d577..2d7c5232 100644
        }
 -- 
 2.53.0
-
