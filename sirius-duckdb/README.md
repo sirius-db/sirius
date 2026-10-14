@@ -112,6 +112,16 @@ backends from the same Sirius commit. Existing direct-extension installations
 must use `FORCE INSTALL sirius FROM core` when switching to the core loader.
 Use separate extension directories when testing both layouts.
 
+`LOAD sirius` reuses an installed backend; it does not update it or require its
+Sirius version to match the loader. Updating only the loader can therefore leave
+an older backend installed. The loader only selects and loads the backend; it
+does not link against the engine API.
+
+Run `UPDATE EXTENSIONS;` to update the installed loader and backend(s) from their
+repositories, then restart DuckDB to load the updated binaries. This updates
+only installed extensions and is not atomic. For locally installed artifacts,
+use `FORCE INSTALL` to replace the loader and backend from the same release.
+
 Use a separate build directory for each core configuration:
 
 | DuckDB extension config | Artifacts |
