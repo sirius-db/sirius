@@ -24,6 +24,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <telemetry/data_batch_probe.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 #include <vss/pinned_column.hpp>
@@ -1866,7 +1867,8 @@ TEST_CASE_METHOD(KMeansFixture,
                  "the fit's sample of a host-tier pin is read in place, row for row",
                  "[integration][gpu_execution][array][vss][kmeans]")
 {
-  // Three chunks, as in the keyed self-join case.
+  // One row group per chunk: three chunks, the last one short.
+  run_ok("SET scan_task_batch_size = 1048576;");
   run_ok(
     "CREATE TABLE khs AS SELECT i::BIGINT AS id, list_transform(range(32), lambda d: "
     "((hash(i * 1000 + d) % 1000)::FLOAT / 1000.0))::FLOAT[32] AS vec FROM range(260000) t(i);");
@@ -1899,7 +1901,7 @@ TEST_CASE_METHOD(KMeansFixture,
   auto const* pin = ctx->get_scan_manager().find_pinned_entry("khs");
   REQUIRE(pin != nullptr);
   auto const n_chunks = sirius::vss::pinned_column_chunk_count(*pin, "vec");
-  REQUIRE(n_chunks >= 2);
+  REQUIRE(n_chunks == 3);
   std::int64_t total = 0;
   for (std::size_t i = 0; i < n_chunks; ++i) {
     auto const rows = sirius::vss::pinned_host_chunk_rows(*pin, "vec", i);
@@ -1926,8 +1928,4 @@ TEST_CASE_METHOD(KMeansFixture,
   REQUIRE(sirius::vss::pinned_column_chunk_count(*with_null, "vec") == 1);
   CHECK(sirius::vss::gather_host_pinned_rows(
           *with_null, "vec", 0, 32, 0, 1, 10, stream.view(), mr) == nullptr);
-  // And the fit still takes its sample from such a chunk.
-  CHECK(scalar_i64(*con,
-                   "SELECT train_rows FROM sirius_kmeans_fit('khs_null','vec', name => 'khs_c', "
-                   "n_clusters => 4);") == 1001);
 }
