@@ -23,12 +23,14 @@
 #include <cudf/reduction/unique_count.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -120,16 +122,31 @@ std::vector<bool> pin_unique_probe_selection(std::span<std::string const> column
   return selected;
 }
 
-std::size_t exact_uniqueness_row_cap()
+bool pin_unique_join_enabled()
 {
-  static std::size_t const value = []() -> std::size_t {
-    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS");
-    if (v == nullptr || v[0] == '\0') { return 300'000'000; }
-    char* end         = nullptr;
-    auto const parsed = std::strtoull(v, &end, 10);
-    return (end == v || parsed == 0) ? 300'000'000 : static_cast<std::size_t>(parsed);
-  }();
-  return value;
+  char const* value = std::getenv("SIRIUS_EXP_PIN_UNIQUE_JOIN");
+  return value != nullptr && std::string_view{value} == "1";
+}
+
+std::vector<bool> pin_unique_automatic_selection(std::vector<bool> const& explicitly_selected)
+{
+  std::vector<bool> automatic(explicitly_selected.size(), false);
+  if (!pin_unique_join_enabled()) { return automatic; }
+  for (std::size_t i = 0; i < explicitly_selected.size(); ++i) {
+    automatic[i] = !explicitly_selected[i];
+  }
+  return automatic;
+}
+
+std::size_t exact_uniqueness_row_cap(bool automatic)
+{
+  std::size_t const default_cap =
+    automatic ? static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()) : 300'000'000;
+  char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS");
+  if (v == nullptr || v[0] == '\0') { return default_cap; }
+  char* end         = nullptr;
+  auto const parsed = std::strtoull(v, &end, 10);
+  return (end == v || parsed == 0) ? default_cap : static_cast<std::size_t>(parsed);
 }
 
 std::optional<bool> exact_distinct_over_chunks(std::span<cudf::column_view const> chunks,
@@ -166,12 +183,13 @@ std::optional<bool> exact_distinct_over_chunks(std::span<cudf::column_view const
   return static_cast<std::int64_t>(distinct) == total_rows;
 }
 
-unique_probe::unique_probe(std::vector<bool> selected)
+unique_probe::unique_probe(std::vector<bool> selected, std::vector<bool> const& automatic)
 {
   _columns.resize(selected.size());
   for (std::size_t i = 0; i < selected.size(); ++i) {
     _columns[i].observed  = selected[i];
     _columns[i].candidate = selected[i];
+    _columns[i].automatic = selected[i] && i < automatic.size() && automatic[i];
     if (selected[i]) { ++_live_candidates; }
   }
 }
@@ -220,7 +238,11 @@ void unique_probe::observe(cudf::table_view const& chunk, ::cuda::stream_ref str
     }
     if (!cudf::is_integral_not_bool(col.type())) {
       // Out of the cheap stage's reach, not out of the running: the exact check
-      // sorts whatever cuDF can sort.
+      // sorts whatever cuDF can sort. An automatic column is not worth that sort.
+      if (_columns[i].automatic) {
+        drop(i, "observed automatically and not an integer");
+        continue;
+      }
       _columns[i].cheap_undecidable = true;
       continue;
     }
@@ -231,13 +253,24 @@ void unique_probe::observe(cudf::table_view const& chunk, ::cuda::stream_ref str
     // maximum representable value" and takes the whole pin down with it. Over
     // sorted values, counting consecutive runs IS the exact distinct count and
     // costs one pass.
+    std::unique_ptr<cudf::table> sorted_copy;
+    cudf::column_view sorted_col = col;
     if (!cudf::is_sorted(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream)) {
-      // Unsorted says nothing either way — leave it to the exact stage.
-      _columns[i].cheap_undecidable = true;
-      continue;
+      // Unsorted says nothing either way — leave it to the exact stage, unless
+      // the column was observed automatically. Most columns of a fact table are
+      // unsorted and repeat values, so an automatic column sorts this one chunk
+      // instead: a repeat refuses it here, before the exact stage retains any of
+      // its values.
+      if (!_columns[i].automatic) {
+        _columns[i].cheap_undecidable = true;
+        continue;
+      }
+      sorted_copy = cudf::sort(cudf::table_view{{col}}, {cudf::order::ASCENDING}, {}, stream);
+      sorted_col  = sorted_copy->view().column(0);
     }
-    auto const distinct =
-      cudf::unique_count(col, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
+    auto const distinct = cudf::unique_count(
+      sorted_col, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
+    sorted_copy.reset();
     if (distinct != col.size()) {
       drop(i, "a chunk repeats a value");
       continue;

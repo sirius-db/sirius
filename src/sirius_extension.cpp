@@ -1313,6 +1313,12 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   // names outlive cache_info, which every insert path moves from.
   auto const pinned_column_names = cache_info.column_names();
   auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
+  // With SIRIUS_EXP_PIN_UNIQUE_JOIN, every other column is observed too, as a join-key candidate.
+  auto const probe_unique_automatic =
+    sirius::late_mat::pin_unique_automatic_selection(probe_unique_columns);
+  for (std::size_t i = 0; i < probe_unique_columns.size(); ++i) {
+    if (probe_unique_automatic[i]) { probe_unique_columns[i] = true; }
+  }
 
   // Record what the probe proved, by name (see attach_proven_unique_columns on
   // why not by position). A no-op when the probe was off.
@@ -1379,7 +1385,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                       pin_comp,
                                       {.capture_chunk_stats               = capture_chunk_stats,
                                        .enable_compressed_materialization = compressed_pin,
-                                       .probe_unique_columns              = probe_unique_columns});
+                                       .probe_unique_columns              = probe_unique_columns,
+                                       .probe_unique_automatic = probe_unique_automatic});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(host_result.column_storage));
@@ -1412,7 +1419,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       pin_comp,
       {.capture_chunk_stats               = false,
        .enable_compressed_materialization = compressed_pin,
-       .probe_unique_columns              = probe_unique_columns});
+       .probe_unique_columns              = probe_unique_columns,
+       .probe_unique_automatic            = probe_unique_automatic});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(dev_result.column_storage));
@@ -1434,7 +1442,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                                pinned_column_types,
                                                {.capture_chunk_stats = capture_chunk_stats,
                                                 .enable_compressed_materialization = compressed_pin,
-                                                .probe_unique_columns = probe_unique_columns});
+                                                .probe_unique_columns   = probe_unique_columns,
+                                                .probe_unique_automatic = probe_unique_automatic});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(mat.column_storage));
