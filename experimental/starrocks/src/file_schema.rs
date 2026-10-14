@@ -68,11 +68,18 @@ async fn read_schemas_concurrently(paths: &[String]) -> Result<Vec<Vec<PSlotDesc
             (idx, parquet_file_schema(&path).await)
         });
     }
-    let mut schemas = vec![Vec::new(); paths.len()];
+    // Reads finish in any order; settle them in path order so the reported error is the
+    // first failing path, not whichever read lost the race.
+    let mut settled: Vec<Option<Result<Vec<PSlotDescriptor>, String>>> =
+        (0..paths.len()).map(|_| None).collect();
+    let mut schemas = Vec::with_capacity(paths.len());
     while let Some(joined) = reads.join_next().await {
         let (idx, schema) =
             joined.map_err(|err| format!("parquet footer read task failed: {err}"))?;
-        schemas[idx] = schema?;
+        settled[idx] = Some(schema);
+        while let Some(result) = settled.get_mut(schemas.len()).and_then(Option::take) {
+            schemas.push(result?);
+        }
     }
     Ok(schemas)
 }
@@ -482,6 +489,15 @@ mod tests {
         let slots = files_schema(&[&first, &second]).await.unwrap();
         // The first file wins the spelling, matching StarRocks case-insensitive resolution.
         assert_eq!(slots[0].col_name, "L_ORDERKEY");
+    }
+
+    #[tokio::test]
+    async fn multi_file_reports_the_first_failing_path() {
+        let paths: Vec<String> = (0..32)
+            .map(|idx| format!("/nonexistent/sr_cn_missing_{idx}.parquet"))
+            .collect();
+        let err = parquet_files_schema(&paths).await.unwrap_err();
+        assert!(err.contains("sr_cn_missing_0.parquet"), "{err}");
     }
 
     #[tokio::test]
