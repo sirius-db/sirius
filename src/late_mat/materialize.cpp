@@ -297,7 +297,7 @@ using retired_buffers = std::vector<std::shared_ptr<void>>;
 /// handed to the peer copies, the gathered column's buffers.
 ///
 /// The owner's stream reads the consumer's selection indices; the consumer's
-/// stream reads the owner's gathered buffers; rmm frees each buffer on the
+/// stream reads the owner's gathered buffers; each buffer is freed on the
 /// stream it was allocated on. So before anything is freed, on every exit path
 /// including a throw mid-way, each stream is ordered behind the other's queued
 /// reads. All no-throw; if an event fails, the stream waited for is
@@ -389,6 +389,7 @@ std::unique_ptr<Buffer> peer_copy(std::unique_ptr<Buffer> source,
   {
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{source_device}};
     retained = source.get();
+    // Retire first so a later failure leaves the source alive until its readers are ordered.
     try {
       if (source) { retire.emplace_back(std::move(source)); }
     } catch (...) {
