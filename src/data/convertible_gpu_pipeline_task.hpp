@@ -20,10 +20,12 @@
 #include "data/convertible_data_batch.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/task_submission.hpp"
 
 #include <cuda/stream>
 
@@ -65,8 +67,9 @@ class convertible_gpu_pipeline_task : public convertible_data {
    */
   convertible_gpu_pipeline_task(
     std::unique_ptr<sirius::parallel::itask> task,
-    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue)
-    : _task(std::move(task)), _queue(queue)
+    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue,
+    sirius::exec::query_lifecycle_registry& query_lifecycle)
+    : _task(std::move(task)), _queue(queue), _query_lifecycle(query_lifecycle)
   {
   }
 
@@ -82,10 +85,28 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * If the task has been moved-from (nullptr), does nothing.
    * Pushes the task back to the queue; if the queue is closed (shutdown),
    * the task is destroyed -- this is expected during query teardown.
+   *
+   * TIER-2 spilling holds an extracted task across pool reservation and conversion. Register
+   * the return as a publisher, so cleanup either refuses it or waits for its insertion before
+   * draining. The task's work lease keeps its plan/repositories alive through conversion and
+   * destruction; the submission guard prevents reinsertion behind a completed drain.
    */
   ~convertible_gpu_pipeline_task() override
   {
-    if (_task) { (void)_queue.push(std::move(_task)); }
+    if (!_task) { return; }
+    sirius::exec::query_lifecycle_registry::submission_guard submission;
+    // Destroy a refused/unsubmitted task before releasing an admitted publisher on unwind.
+    auto task = std::move(_task);
+
+    submission = sirius::pipeline::begin_submission(
+      _query_lifecycle,
+      *task,
+      "convertible_gpu_pipeline_task: query lifecycle registration is missing");
+    if (!submission) {
+      return;  // query is tearing down or has already closed; do not resurrect its task
+    }
+
+    (void)_queue.push(std::move(task));
   }
 
   /**
@@ -210,6 +231,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
   std::unique_ptr<sirius::parallel::itask> _task;
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& _queue;
+  /// Non-owning; the runtime or test fixture must outlive this wrapper.
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
 };
 
 /**
@@ -228,8 +251,9 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    * @param queue The task queue to search (non-owning reference).
    */
   explicit convertible_gpu_pipeline_task_provider(
-    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue)
-    : _queue(queue)
+    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue,
+    sirius::exec::query_lifecycle_registry& query_lifecycle)
+    : _queue(queue), _query_lifecycle(query_lifecycle)
   {
   }
 
@@ -254,7 +278,8 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
       [space](sirius::parallel::itask& t) { return has_matching_batches(t, space); },
       front_to_back);
     if (!task) { return nullptr; }
-    return std::make_unique<convertible_gpu_pipeline_task>(std::move(*task), _queue);
+    return std::make_unique<convertible_gpu_pipeline_task>(
+      std::move(*task), _queue, _query_lifecycle);
   }
 
   /**
@@ -283,7 +308,8 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
         [space](sirius::parallel::itask& t) { return has_matching_batches(t, space); },
         front_to_back);
       if (!task) { break; }
-      results.push_back(std::make_unique<convertible_gpu_pipeline_task>(std::move(*task), _queue));
+      results.push_back(std::make_unique<convertible_gpu_pipeline_task>(
+        std::move(*task), _queue, _query_lifecycle));
     }
     return results;
   }
@@ -318,6 +344,9 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
   }
 
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& _queue;
+  /// Non-owning; owned by SiriusContext. Forwarded to each wrapper so its RAII re-push is
+  /// refused once the owning query starts tearing down.
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
 };
 
 }  // namespace sirius

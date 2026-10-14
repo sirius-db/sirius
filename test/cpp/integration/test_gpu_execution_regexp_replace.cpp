@@ -16,13 +16,33 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 
 #include <string>
 
 using RegexpReplaceFixture = sirius::test::GpuExecutionFixture;
 
 namespace {
+
+void expect_regex_fallback_error_matches_cpu(RegexpReplaceFixture& fx, std::string const& query)
+{
+  fx.run_ok("SET gpu_execution = true;");
+  auto const before = sirius::test::get_transparent_execution_stats(*fx.con);
+  auto gpu_result   = fx.con->Query(query);
+  auto const after  = sirius::test::get_transparent_execution_stats(*fx.con);
+  REQUIRE(gpu_result);
+  REQUIRE(gpu_result->HasError());
+  REQUIRE(gpu_result->GetError().find("Invalid replacement string") != std::string::npos);
+  sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
+  sirius::test::scoped_sirius_setting cpu_only(*fx.con, "gpu_execution", false);
+  auto cpu_result = fx.con->Query(query);
+  REQUIRE(cpu_result);
+  REQUIRE(cpu_result->HasError());
+  REQUIRE(gpu_result->GetErrorType() == cpu_result->GetErrorType());
+  REQUIRE(gpu_result->GetError() == cpu_result->GetError());
+}
 
 void create_regexp_replace_table(RegexpReplaceFixture& fx)
 {
@@ -103,6 +123,8 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
                  "regexp_replace backreferences replace only the first match on GPU",
                  "[integration][gpu_execution][regexp_replace]")
 {
+  // Exercise regexp_replace before the unsupported v2 rewrite to regexp_extract (#2146).
+  sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
   create_regexp_replace_table(*this);
   for (auto const* expression : {
          R"(regexp_replace(s, '(a)', '<\1>'))",
@@ -130,6 +152,8 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
                  "regexp_replace dollar anchors match only the end of text on GPU",
                  "[integration][gpu_execution][regexp_replace][regexp_replace_anchors]")
 {
+  // Exercise regexp_replace before the unsupported v2 rewrite to regexp_extract (#2146).
+  sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
   create_regexp_replace_table(*this);
   // cuDF's $ also matches before a trailing newline; the evaluator rewrites it to \Z.
   // Rows ending in a newline must therefore stay unchanged, exactly as in DuckDB.
@@ -158,9 +182,11 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
 }
 
 TEST_CASE_METHOD(RegexpReplaceFixture,
-                 "regexp_replace keeps ClickBench Q28 on GPU",
+                 "regexp_replace Q28 implementation stays on GPU before rewrites",
                  "[integration][gpu_execution][aggregate][regexp_replace][regexp_replace_anchors]")
 {
+  // Exercise regexp_replace before the unsupported v2 rewrite to regexp_extract (#2146).
+  sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
   create_regexp_replace_table(*this);
   // Q28's shape, with and without the dedicated JIT transform for its pattern.
   for (auto const* jit : {"true", "false"}) {
@@ -289,7 +315,7 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
 }
 
 TEST_CASE_METHOD(RegexpReplaceFixture,
-                 "regexp_replace out-of-range backreferences fall back during planning",
+                 "regexp_replace out-of-range backreferences preserve CPU errors",
                  "[integration][gpu_execution][regexp_replace]")
 {
   create_regexp_replace_table(*this);
@@ -304,8 +330,9 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
          R"(regexp_replace(s, 'a', '\12'))",
        }) {
     INFO(expression);
-    // Use a column to prevent constant folding, and assert fallback occurs before GPU execution.
-    expect_plan_fallback_matches_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+    // Sirius declines GPU planning; DuckDB v2 reports the invalid rewrite on CPU.
+    expect_regex_fallback_error_matches_cpu(
+      *this, std::string{"SELECT id, "} + expression + " FROM regex_t");
   }
 }
 
@@ -320,9 +347,14 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
     INFO(options);
     expect_plan_fallback_matches_cpu(std::string{"SELECT id, regexp_replace(s, 'a.', 'X', '"} +
                                      options + "') FROM regex_t");
-    expect_plan_fallback_matches_cpu(
-      std::string{R"(SELECT id, regexp_replace(s, '(a)', '<\1>', ')"} + options +
-      "') FROM regex_t");
+    auto const backreference_query =
+      std::string{R"(SELECT id, regexp_replace(s, '(a)', '<\1>', ')"} + options + "') FROM regex_t";
+    if (std::string{options} == "l") {
+      // Literal mode removes the capture group, making this rewrite invalid in v2.
+      expect_regex_fallback_error_matches_cpu(*this, backreference_query);
+    } else {
+      expect_plan_fallback_matches_cpu(backreference_query);
+    }
   }
   for (auto const* expression : {
          R"(regexp_replace(s, '(a)', '\\1'))",

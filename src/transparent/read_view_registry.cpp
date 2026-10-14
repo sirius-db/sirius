@@ -470,7 +470,7 @@ bool read_view_registry::record_declined_lookup(duckdb::LogicalGet const& get,
     case L::none: return false;
   }
   return declined_lookups_
-    .emplace(get.table_index,
+    .emplace(get.table_index.index,
              declined_lookup_record{op::scan::eligibility_verdict::unsupported, reason})
     .second;
 }

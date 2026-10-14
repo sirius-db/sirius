@@ -101,7 +101,7 @@ std::unique_ptr<cudf::column> cast_to_microseconds_checked(cudf::column_view con
                                     source_type == cudf::type_id::TIMESTAMP_SECONDS ? "S" : "MS");
     }
   }
-  cudf::numeric_scalar<int64_t> factor(scale, true, stream, mr);
+  cudf::numeric_scalar<int64_t> factor(nanos ? scale / 2 : scale, true, stream, mr);
   auto micros =
     cudf::binary_operation(finite_ticks->view(),
                            factor,
@@ -109,6 +109,20 @@ std::unique_ptr<cudf::column> cast_to_microseconds_checked(cudf::column_view con
                            int_type,
                            stream,
                            mr);
+  if (nanos) {
+    // Round to the nearest microsecond, with ties away from the epoch. Scale
+    // before adding the half-unit so the full finite int64 domain stays safe.
+    auto negative = cudf::binary_operation(
+      micros->view(), zero, cudf::binary_operator::LESS, bool_type, stream, mr);
+    cudf::numeric_scalar<int64_t> plus_one(1, true, stream, mr);
+    cudf::numeric_scalar<int64_t> minus_one(-1, true, stream, mr);
+    auto increment = cudf::copy_if_else(minus_one, plus_one, negative->view(), stream, mr);
+    auto rounded   = cudf::binary_operation(
+      micros->view(), increment->view(), cudf::binary_operator::ADD, int_type, stream, mr);
+    cudf::numeric_scalar<int64_t> two(2, true, stream, mr);
+    micros = cudf::binary_operation(
+      rounded->view(), two, cudf::binary_operator::DIV, int_type, stream, mr);
+  }
   return cudf::copy_if_else(cudf::bit_cast(micros->view(), return_type),
                             cudf::bit_cast(ticks, return_type),
                             finite->view(),

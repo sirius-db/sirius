@@ -118,17 +118,26 @@ scan_operator_input::scan_operator_input(
   std::shared_ptr<scan_info> metadata,
   std::shared_ptr<scan_manager::readahead_scan_manager> readahead,
   std::size_t operator_id,
-  std::optional<int> preferred_device)
+  std::optional<int> preferred_device,
+  prefetch_start start)
   : materialization_info(std::move(metadata)),
     _readahead(std::move(readahead)),
     _operator_id(operator_id)
 {
-  auto const& stored = std::get<std::shared_ptr<scan_info>>(materialization_info);
-  if (!stored) { return; }
-
   if (preferred_device.has_value() && *preferred_device >= 0) {
     set_preferred_device_id(*preferred_device);
   }
+  if (start == prefetch_start::immediate) initialize_prefetch();
+}
+
+void scan_operator_input::initialize_prefetch()
+{
+  if (std::exchange(_prefetch_started, true)) {
+    throw std::logic_error("scan input prefetch initialization already attempted");
+  }
+  if (!has_scan_metadata()) return;
+  auto const& stored    = std::get<std::shared_ptr<scan_info>>(materialization_info);
+  auto preferred_device = get_preferred_device_id();
 
   // Hint BEFORE publishing.  Registration below is what makes this split
   // eligible for prefetching, and the readahead worker can act on it the moment
@@ -145,7 +154,7 @@ scan_operator_input::scan_operator_input(
   // demand reads can claim and fill even when there is no readahead worker.
   // A readahead worker can prepare again later: already-prepared requests return
   // immediately, and allocation failures remain queued for its eviction retry.
-  // Never wait for synchronous eviction while constructing a scan input.
+  // Never wait for synchronous eviction while initializing a scan input.
   static_cast<void>(stored->prepare_for_prefetching(false));
 
   // The publication barrier.  register_scan_task takes the readahead's mutex,

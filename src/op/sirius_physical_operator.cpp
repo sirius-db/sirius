@@ -23,7 +23,6 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
-#include "telemetry/batch_telemetry.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cucascade/data/data_batch.hpp>
@@ -308,16 +307,13 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
   auto* p = get_port(port_id);
   if (p && p->repo) {
     if (batch) { on_input_batch_pushed(port_id, *batch); }
-    // Emit before the batch becomes poppable so `queued` precedes `packaged`.
-    telemetry::batch_telemetry_registry::instance().on_published(
-      batch, p->repo, telemetry::batch_origin::operator_output);
     p->repo->add_data_batch(std::move(batch));
   }
 }
 
 void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)
 {
-  port_info.pseudo_sink_port_uuid = uuid::now_v7();
+  port_info.pseudo_sink_port_uuid = quent::now_v7();
   next_port_after_sink.push_back(port_info);
 }
 
@@ -436,7 +432,7 @@ std::shared_ptr<like_multiliteral_cache const> sirius_physical_operator::like_ca
 
 telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const
 {
-  if (not _pipeline) { return {nullptr, uuid::UUID{}}; }
+  if (not _pipeline) { return {nullptr, quent::Uuid{}}; }
   return {_pipeline->get_telemetry_context(), _pipeline->pipeline_uuid()};
 }
 

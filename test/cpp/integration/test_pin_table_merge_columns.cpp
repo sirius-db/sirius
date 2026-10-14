@@ -221,7 +221,7 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
     REQUIRE(sum_w);
     if (sum_w->HasError()) { UNSCOPED_INFO("sum(w) error: " << sum_w->GetError()); }
     REQUIRE_FALSE(sum_w->HasError());
-    REQUIRE(sum_w->GetValue(0, 0).ToString() == std::to_string(expected_w_sum));
+    REQUIRE(sum_w->Collection().GetValue(0, 0).ToString() == std::to_string(expected_w_sum));
 
     // A re-pin whose chunk shape disagrees with the existing entry must report the merge
     // mismatch itself. A host pin holds no chunk_memory_spaces, so re-pinning the same name on

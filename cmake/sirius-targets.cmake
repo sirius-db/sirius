@@ -174,9 +174,6 @@ target_compile_features(sirius_shared INTERFACE cxx_std_23)
 # Installed static consumers use the public headers too. Keep this requirement
 # out of DuckDB's in-tree build graph.
 target_compile_features(sirius_core INTERFACE "$<INSTALL_INTERFACE:cxx_std_23>")
-target_link_libraries(
-  sirius_shared
-  PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
 set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
 
 # Keep the embedded DuckDB private when the host exposes another DuckDB
@@ -223,13 +220,8 @@ if(SIRIUS_BUILD_STATIC)
   set_target_properties(sirius_core PROPERTIES OUTPUT_NAME sirius EXPORT_NAME
                                                                   sirius_static)
   target_link_libraries(
-    sirius_core
-    PRIVATE
-      duckdb_static
-      core_functions_extension
-      parquet_extension
-      "$<LINK_LIBRARY:WHOLE_ARCHIVE,$<TARGET_NAME:dummy_static_extension_loader>>"
-  )
+    sirius_core PRIVATE duckdb_static core_functions_extension
+                        parquet_extension)
   target_link_options(
     sirius_core INTERFACE "LINKER:--undefined=InitializeInjectionNvtx2"
     "LINKER:--allow-multiple-definition")

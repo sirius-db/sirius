@@ -397,6 +397,8 @@ inline void require_gpu_matches_cpu(duckdb::Connection& con,
   auto const nrows = gpu_result->RowCount();
   std::vector<std::vector<std::string>> gpu_rows;
   std::vector<std::vector<std::string>> cpu_rows;
+  auto gpu_values = gpu_result->Collection().GetRows();
+  auto cpu_values = cpu_result->Collection().GetRows();
   gpu_rows.reserve(nrows);
   cpu_rows.reserve(nrows);
   for (duckdb::idx_t r = 0; r < nrows; ++r) {
@@ -405,8 +407,8 @@ inline void require_gpu_matches_cpu(duckdb::Connection& con,
     g_row.reserve(ncols);
     c_row.reserve(ncols);
     for (duckdb::idx_t c = 0; c < ncols; ++c) {
-      g_row.push_back(gpu_result->GetValue(c, r).ToString());
-      c_row.push_back(cpu_result->GetValue(c, r).ToString());
+      g_row.push_back(gpu_values.GetValue(c, r).ToString());
+      c_row.push_back(cpu_values.GetValue(c, r).ToString());
     }
     gpu_rows.push_back(std::move(g_row));
     cpu_rows.push_back(std::move(c_row));

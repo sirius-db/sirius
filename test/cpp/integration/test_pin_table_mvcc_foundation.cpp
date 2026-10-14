@@ -174,8 +174,9 @@ TEST_CASE_METHOD(PinMvccFixture,
   // default in-memory catalog's — each AttachedDatabase counts independently).
   run_ok("BEGIN TRANSACTION;");
   run_ok("CALL pin_table(format='duckdb', name='mvcc_vbase_t', tier='gpu');");
-  auto& pinned_catalog = duckdb::Catalog::GetCatalog(*con->context, attach_alias);
-  auto const expected  = duckdb::DuckTransaction::Get(*con->context, pinned_catalog).start_time;
+  auto& pinned_catalog =
+    duckdb::Catalog::GetCatalog(*con->context, duckdb::Identifier(attach_alias));
+  auto const expected = duckdb::DuckTransaction::Get(*con->context, pinned_catalog).start_time;
   run_ok("COMMIT;");
 
   auto probe = probe_entry(*con, "mvcc_vbase_t");

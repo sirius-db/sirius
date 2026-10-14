@@ -6,7 +6,6 @@
 #include <parquet_extension.hpp>
 
 // Preserve automatic registration in engine tests without building the wrapper.
-// These definitions precede DuckDB in the link; duplicate definitions are allowed.
 namespace duckdb {
 
 ExtensionLoadResult ExtensionHelper::LoadExtension(DuckDB& db, const std::string& extension)
@@ -31,7 +30,5 @@ void ExtensionHelper::LoadAllExtensions(DuckDB& db)
     LoadExtension(db, name);
   }
 }
-
-vector<string> ExtensionHelper::LoadedExtensionTestPaths() { return {}; }
 
 }  // namespace duckdb

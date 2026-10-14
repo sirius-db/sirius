@@ -12,9 +12,6 @@ endif()
 
 function(sirius_add_duckdb_source)
   # Keep DuckDB options scoped to its dependency build.
-  if(NOT DEFINED OVERRIDE_GIT_DESCRIBE)
-    set(OVERRIDE_GIT_DESCRIBE "v1.5.6")
-  endif()
   set(DUCKDB_EXTENSION_CONFIGS "")
   set(BUILD_EXTENSIONS "core_functions;parquet")
   set(BUILD_SHELL OFF)
@@ -60,3 +57,9 @@ endif()
 target_link_libraries(
   sirius_duckdb_dependency INTERFACE duckdb_static core_functions_extension
                                      parquet_extension)
+
+function(sirius_link_duckdb_extensions target)
+  set(DUCKDB_MODULE_BASE_DIR "${SIRIUS_DUCKDB_SOURCE_DIR}")
+  duckdb_link_extensions(${target} ${ARGN} httplib loadable_extensions
+                         core_functions parquet)
+endfunction()

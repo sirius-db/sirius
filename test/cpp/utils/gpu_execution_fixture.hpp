@@ -52,15 +52,16 @@ namespace sirius::test {
 
 /// Collects stringified result rows, sorted by default for order-insensitive comparison;
 /// pass `sort = false` to preserve emitted order (e.g. to verify ORDER BY).
-inline std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
+inline std::vector<std::vector<std::string>> collect_rows(duckdb::QueryResult& result,
                                                           bool sort = true)
 {
   std::vector<std::vector<std::string>> rows;
+  auto values = result.Collection().GetRows();
   for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
     std::vector<std::string> row;
     row.reserve(result.ColumnCount());
     for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-      row.push_back(result.GetValue(c, r).ToString());
+      row.push_back(values.GetValue(c, r).ToString());
     }
     rows.push_back(std::move(row));
   }
@@ -145,7 +146,7 @@ class GpuExecutionFixture {
   }
 
   /// @copydoc sirius::test::collect_rows
-  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
+  static std::vector<std::vector<std::string>> collect_rows(duckdb::QueryResult& result,
                                                             bool sort = true)
   {
     return sirius::test::collect_rows(result, sort);
@@ -261,8 +262,8 @@ class GpuExecutionFixture {
 
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-    auto gpu_rows = collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>(), true);
-    auto cpu_rows = collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>(), true);
+    auto gpu_rows = collect_rows(*gpu_result, true);
+    auto cpu_rows = collect_rows(*cpu_result, true);
     REQUIRE(gpu_rows == cpu_rows);
   }
 
@@ -297,8 +298,8 @@ class GpuExecutionFixture {
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
-    auto& gpu_mat = gpu_result->Cast<duckdb::MaterializedQueryResult>();
-    auto& cpu_mat = cpu_result->Cast<duckdb::MaterializedQueryResult>();
+    auto& gpu_mat = *gpu_result;
+    auto& cpu_mat = *cpu_result;
     // For ordered queries, keep emitted order so NULLS FIRST|LAST is verified;
     // otherwise sort both sides for an order-insensitive multiset comparison.
     auto gpu_rows = collect_rows(gpu_mat, !ordered);

@@ -67,7 +67,8 @@ bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::Log
 /// \brief Copy a logical plan for Sirius's transparent execution path.
 ///
 /// Wraps \c duckdb::LogicalOperator::Copy and then copies the cardinality estimates, which
-/// serialization omits, with \c copy_cardinality_estimates. Serialization also omits DuckDB
+/// serialization omits, with \c copy_cardinality_estimates. Verified Parquet bind data is copied
+/// directly to preserve its pruned file inventory. Serialization also omits DuckDB
 /// join-filter metadata, but Sirius discovers targets from plan structure and does not consume
 /// that metadata. The original plan remains unchanged for CPU fallback.
 ///

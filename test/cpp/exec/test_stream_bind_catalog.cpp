@@ -189,7 +189,7 @@ TEST_CASE("stream_bind_catalog CAT-7: sirius_stream_source binds a declared stre
   auto prepared = con.Prepare("SELECT * FROM sirius_stream_source(0)");
   REQUIRE_FALSE(prepared->HasError());
 
-  REQUIRE(prepared->GetNames() == duckdb::vector<std::string>{"l_orderkey", "l_comment"});
+  REQUIRE(prepared->GetNames() == duckdb::vector<duckdb::Identifier>{"l_orderkey", "l_comment"});
   REQUIRE(prepared->GetTypes() == duckdb::vector<duckdb::LogicalType>{
                                     duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR});
 

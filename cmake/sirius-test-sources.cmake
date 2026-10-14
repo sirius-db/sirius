@@ -1,9 +1,15 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/scan_manager/test_preparation_readiness.cpp
+    test/cpp/scan_manager/test_preparation.cpp
+    test/cpp/scan_manager/test_preparation_unit.cpp
+    test/cpp/scan_manager/test_preparation_ledger.cpp
+    test/cpp/scan_manager/test_preparation_config.cpp
     test/cpp/scan/test_native_physical_matrix.cpp
     test/cpp/scan/test_parquet_physical_profile.cpp
     test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp
+    test/cpp/transparent/test_read_view_scaling.cpp
     test/cpp/integration/test_transparent_read_view.cpp
     test/cpp/scan/test_split_certificates.cpp
     test/cpp/transparent/test_late_failure.cpp
@@ -30,8 +36,10 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/downgrade/test_spill_policy.cpp
+    test/cpp/exec/test_arrow_result_stream.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_query_lifecycle_registry.cpp
     test/cpp/exec/test_scoped_dispatcher.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
@@ -225,6 +233,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
     test/cpp/planner/test_scan_column_origin.cpp
+    test/cpp/planner/test_scan_filter_projection.cpp
     test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
     test/cpp/planner/test_dynamic_filter_target_discovery.cpp
