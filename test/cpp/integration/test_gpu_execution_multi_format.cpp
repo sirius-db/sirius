@@ -4069,9 +4069,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       REQUIRE(result->HasError() == bool(cpu_error));
       if (cpu_error) {
         CAPTURE(missing, fallback, deferred, result->GetError(), *cpu_error);
-        // Deferred fallback can report Interrupted before the CPU reader error (#2145).
-        CHECK((result->GetError().find(*cpu_error) != std::string::npos ||
-               (deferred && result->GetErrorType() == duckdb::ExceptionType::INTERRUPT)));
+        // The CPU reader error, not the interrupt the failed replay raised (#2145).
+        CHECK(result->GetError().find(*cpu_error) != std::string::npos);
       } else
         CHECK(observed.fetch(*result) == cpu_rows);
       bool retained = false;
