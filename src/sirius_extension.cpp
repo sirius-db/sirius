@@ -2690,7 +2690,9 @@ static unique_ptr<FunctionData> SiriusKMeansBuildListsBind(ClientContext& contex
                   LogicalType::BIGINT,
                   LogicalType::VARCHAR};
   return_types.push_back(LogicalType::VARCHAR);
-  names = {"n_rows", "n_clusters", "min_list", "max_list", "empty_lists", "tier", "encoding"};
+  return_types.push_back(LogicalType::VARCHAR);
+  names = {
+    "n_rows", "n_clusters", "min_list", "max_list", "empty_lists", "tier", "encoding", "exact_rows"};
   return std::move(result);
 }
 
@@ -2718,6 +2720,7 @@ static void SiriusKMeansBuildListsFunction(ClientContext& context,
   output.SetValue(4, 0, Value::BIGINT(built.empty_lists));
   output.SetValue(5, 0, Value(built.tier));
   output.SetValue(6, 0, Value(built.encoding));
+  output.SetValue(7, 0, Value(built.exact_rows));
   data.finished = true;
 }
 

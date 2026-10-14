@@ -2021,7 +2021,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // re-scores what passes in FP32; decoded on their own they would give approximate distances.
     bool const codes_int8 = _lists != nullptr && _lists->encoding == vss::list_encoding::int8;
     if (codes_int8 &&
-        !(gemm_search_enabled() && bound_gemm_enabled && l2 && _lists->exact_vectors != nullptr &&
+        !(gemm_search_enabled() && bound_gemm_enabled && l2 && _lists->has_exact_rows() &&
           _lists->row_sq != nullptr && vss::bound_filter_int8_supports(dim))) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] int8 cluster lists answer only l2 joins through the "
@@ -2112,7 +2112,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // stay layout rows until the end, where the re-scoring needs them.
     bool const f16_bounded = !int8_search && gemm_search_enabled() && _lists != nullptr &&
                              _lists->encoding == vss::list_encoding::float16 &&
-                             _lists->exact_vectors != nullptr &&
+                             _lists->has_exact_rows() &&
                              (search_metric == cuvs::distance::DistanceType::L2Expanded ||
                               search_metric == cuvs::distance::DistanceType::L2SqrtExpanded) &&
                              vss::bound_filter_f16_supports(dim) && bound_gemm_enabled;
@@ -2198,8 +2198,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                            nullptr,
                            stream);
     }
-    auto const* exact_blocks =
-      rescore ? static_cast<float const* const*>(_lists->exact_blocks->data()) : nullptr;
+    auto const exact_source = rescore ? _lists->exact_source() : vss::exact_rows{};
     std::optional<rmm::device_uvector<float>> bound;
     std::optional<vss::bound_candidates> candidates;
     std::int64_t pending = 0, bounded_emitted = 0, bounded_merges = 0, bounded_launches = 0,
@@ -2257,8 +2256,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                kept.ids.data(),
                                kept.distances.data(),
                                n,
-                               exact_blocks,
-                               _lists->exact_rows_per_block,
+                               exact_source,
                                dim,
                                stream,
                                certain_limit ? certain_limit->data() : nullptr,
@@ -2324,8 +2322,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                  taken.ids.data(),
                                  taken.distances.data(),
                                  n,
-                                 exact_blocks,
-                                 _lists->exact_rows_per_block,
+                                 exact_source,
                                  dim,
                                  stream);
             fold_best(taken.rows.data(),
@@ -2351,8 +2348,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                              candidates->ids.data(),
                              candidates->distances.data(),
                              pending,
-                             exact_blocks,
-                             _lists->exact_rows_per_block,
+                             exact_source,
                              dim,
                              stream,
                              certain_limit ? certain_limit->data() : nullptr,
@@ -2730,8 +2726,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                acc_neighbors->view().data<std::int64_t>(),
                                acc_distances->mutable_view().data<float>(),
                                n_left * k_join,
-                               exact_blocks,
-                               _lists->exact_rows_per_block,
+                               exact_source,
                                dim,
                                stream);
           vss::row_max_bound(

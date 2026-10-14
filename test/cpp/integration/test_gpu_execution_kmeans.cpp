@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -1864,7 +1865,7 @@ TEST_CASE_METHOD(KMeansFixture,
 }
 
 TEST_CASE_METHOD(KMeansFixture,
-                 "the fit's sample of a host-tier pin is read in place, row for row",
+                 "a host-tier pin is read in place, row for row",
                  "[integration][gpu_execution][array][vss][kmeans]")
 {
   // One row group per chunk: three chunks, the last one short.
@@ -1902,16 +1903,19 @@ TEST_CASE_METHOD(KMeansFixture,
   REQUIRE(pin != nullptr);
   auto const n_chunks = sirius::vss::pinned_column_chunk_count(*pin, "vec");
   REQUIRE(n_chunks == 3);
-  std::int64_t total = 0;
+  auto const map = sirius::vss::map_pinned_rows(*pin, "vec", 32, space, stream.view(), mr);
+  REQUIRE(map.has_value());
+  REQUIRE(map->chunk_first_row.size() == n_chunks + 1);
+  CHECK(map->n_rows() == 260000);
   for (std::size_t i = 0; i < n_chunks; ++i) {
-    auto const rows = sirius::vss::pinned_host_chunk_rows(*pin, "vec", i);
+    auto const first = map->chunk_first_row[i];
+    auto const rows  = map->chunk_first_row[i + 1] - first;
     REQUIRE(rows > 0);
-    total += rows;
+    // Rows of a chunk cross block boundaries, and the last chunk is short.
     for (auto const take : {rows / 37, rows - 1, rows}) {
       auto const pick     = sirius::vss::strided_row_sample(rows, take, 7);
-      auto const in_place = sirius::vss::gather_host_pinned_rows(
-        *pin, "vec", i, 32, pick.start, pick.stride, pick.count, stream.view(), mr);
-      REQUIRE(in_place != nullptr);
+      auto const in_place = sirius::vss::gather_pinned_rows(
+        map->view(), first + pick.start, pick.stride, pick.count, 32, stream.view(), mr);
       auto staged = sirius::vss::stage_pinned_column_chunk(
         *pin, "vec", i, space, stream.view(), telemetry);
       auto const expected =
@@ -1920,14 +1924,12 @@ TEST_CASE_METHOD(KMeansFixture,
       CHECK(values(*in_place) == values(*expected));
     }
   }
-  CHECK(total == 260000);
 
-  // A null row leaves the chunk to staging.
+  // A null row leaves the column to staging.
   auto const* with_null = ctx->get_scan_manager().find_pinned_entry("khs_null");
   REQUIRE(with_null != nullptr);
-  REQUIRE(sirius::vss::pinned_column_chunk_count(*with_null, "vec") == 1);
-  CHECK(sirius::vss::gather_host_pinned_rows(
-          *with_null, "vec", 0, 32, 0, 1, 10, stream.view(), mr) == nullptr);
+  CHECK_FALSE(
+    sirius::vss::map_pinned_rows(*with_null, "vec", 32, space, stream.view(), mr).has_value());
 }
 
 TEST_CASE_METHOD(KMeansFixture,
@@ -1957,4 +1959,60 @@ TEST_CASE_METHOD(KMeansFixture,
 
   run_ok("SELECT * FROM sirius_kmeans_build_lists('klr_corpus','vec','klr_c');");
   CHECK(distance_multiset(*con, join).size() == 24);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "lists re-scoring from the pin answer as lists keeping a copy do",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Two chunks of 1 MiB blocks, so rows the re-score reads cross block and chunk boundaries.
+  run_ok("SET scan_task_batch_size = 1048576;");
+  run_ok(
+    "CREATE TABLE kxp_corpus AS SELECT i::BIGINT AS id, list_transform(range(32), lambda d: "
+    "((hash(i * 1000 + d) % 1000)::FLOAT / 100.0))::FLOAT[32] AS vec FROM range(200000) t(i);");
+  run_ok("CREATE TABLE kxp_probe AS SELECT id, vec FROM kxp_corpus WHERE id % 997 = 0;");
+  run_ok("CHECKPOINT;");
+  for (auto const* tier : {"host", "gpu"}) {
+    run_ok(std::string("SELECT * FROM pin_table(name => 'kxp_corpus', tier => '") + tier +
+           "', format => 'duckdb');");
+    run_ok("SELECT * FROM pin_table(name => 'kxp_probe', tier => 'gpu', format => 'duckdb');");
+    auto const pairs = [&](std::string const& sql) {
+      std::set<std::pair<std::string, std::string>> out;
+      for (auto const& r : ok_rows(*con, sql)) {
+        out.emplace(r.at(0), r.at(1));
+      }
+      return out;
+    };
+    auto const join = "FROM sirius_knn_join('kxp_probe','vec','kxp_corpus','vec', metric => 'l2', "
+                      "k => 5, ";
+    auto const exact = pairs(std::string("SELECT left_id, right_id ") + join +
+                             "search_mode => 'exact-gemm');");
+    REQUIRE(exact.size() == 1005);
+    for (auto const* storage : {"int8", "float16"}) {
+      std::map<std::string, std::vector<std::vector<std::string>>> answers;
+      for (auto const* copy : {"0", "1"}) {
+        setenv("SIRIUS_VSS_EXACT_COPY", copy, 1);
+        auto const name = std::string("kxp_") + storage + "_" + copy;
+        run_ok("SELECT * FROM sirius_kmeans_fit('kxp_corpus','vec', name => '" + name +
+               "', n_clusters => 16, seed => 3);");
+        auto const built = ok_rows(*con,
+                                   "SELECT exact_rows FROM sirius_kmeans_build_lists('kxp_corpus',"
+                                   "'vec','" + name + "', storage => '" + storage + "');");
+        unsetenv("SIRIUS_VSS_EXACT_COPY");
+        REQUIRE(built.size() == 1);
+        CHECK(built[0][0] == (std::string(copy) == "1" ? "copy" : "pin"));
+        // Every cluster probed: the exact answer, whichever clustering.
+        auto const sql = std::string("SELECT left_id, right_id, distance ") + join +
+                         "search_mode => 'approx', clustering => '" + name + "', n_probes => 16);";
+        answers[copy] = ok_rows(*con, sql);
+        INFO("tier " << tier << ", storage " << storage << ", copy " << copy);
+        CHECK(pairs(sql) == exact);
+      }
+      // The same FP32 rows, re-scored by the same kernel: the same distances to the bit.
+      INFO("tier " << tier << ", storage " << storage);
+      CHECK(answers["0"] == answers["1"]);
+    }
+    run_ok("SELECT * FROM unpin_table('kxp_corpus');");
+    run_ok("SELECT * FROM unpin_table('kxp_probe');");
+  }
 }

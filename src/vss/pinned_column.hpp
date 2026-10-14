@@ -16,11 +16,14 @@
 
 #pragma once
 
+#include "vss/exact_rows.hpp"
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
@@ -113,27 +116,42 @@ enum class staging_charge {
   const telemetry::batch_telemetry_info& telemetry_info,
   staging_charge charge = staging_charge::own_reservation);
 
-/// Rows chunk @p chunk_index of a HOST-tier pinned column holds, read without staging it; -1 for a
-/// GPU-tier pin or a chunk whose layout only staging can tell.
-[[nodiscard]] std::int64_t pinned_host_chunk_rows(const scan_manager::pinned_entry& pin,
-                                                  const std::string& column_name,
-                                                  std::size_t chunk_index);
+/// A pinned FP32 vector column mapped for the device to read single rows in place: the tables
+/// behind @ref exact_rows' pin form, and owning references to the chunks, so the rows stay readable
+/// for as long as the map is held, whatever then happens to the pin.
+struct pinned_rows_map {
+  std::unique_ptr<rmm::device_buffer> chunk_rows, chunk_block, chunk_offset, blocks;
+  /// The first row of each chunk, and the total after the last.
+  std::vector<std::int64_t> chunk_first_row;
+  std::int64_t n_chunks{0};
+  int block_shift{0};
+  std::vector<std::shared_ptr<void const>> owners;
 
-/// Rows @p start, @p start + @p stride, ... (@p count of them) of HOST-tier chunk @p chunk_index
-/// of a FLOAT32 LIST column @p dim wide, copied from host memory into a device LIST column: what
-/// staging the chunk and gathering those rows gives, without moving the rest of the chunk. Null
-/// for a GPU-tier pin or a chunk that is not plain fixed-width rows (nulls, or offsets other than
-/// 0, dim, 2 dim, ...), which the caller stages instead.
-[[nodiscard]] std::unique_ptr<cudf::column> gather_host_pinned_rows(
+  [[nodiscard]] std::int64_t n_rows() const noexcept { return chunk_first_row.back(); }
+  /// Rows read through @p row_map (pin row of each row asked for), or by pin row when it is null.
+  [[nodiscard]] exact_rows view(std::int64_t const* row_map = nullptr) const;
+};
+
+/// Maps the FP32 vector column @p column_name, @p dim wide, of either tier. nullopt when a chunk is
+/// compressed, holds nulls, is not plain rows @p dim floats apart, or the host blocks are not a
+/// power of two in size; such a column is staged instead.
+[[nodiscard]] std::optional<pinned_rows_map> map_pinned_rows(
   const scan_manager::pinned_entry& pin,
   const std::string& column_name,
-  std::size_t chunk_index,
   std::int64_t dim,
-  std::int64_t start,
-  std::int64_t stride,
-  std::int64_t count,
+  ::cucascade::memory::memory_space& gpu_space,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
+
+/// Rows start, start + stride, ... (count of them) of the column @p source reads, as a device LIST
+/// column @p dim wide: a strided sample taken without staging the rest.
+[[nodiscard]] std::unique_ptr<cudf::column> gather_pinned_rows(exact_rows const& source,
+                                                               std::int64_t start,
+                                                               std::int64_t stride,
+                                                               std::int64_t count,
+                                                               std::int64_t dim,
+                                                               rmm::cuda_stream_view stream,
+                                                               rmm::device_async_resource_ref mr);
 
 /// Walks a pinned column a chunk at a time, copying the next HOST-tier chunk to the device while
 /// the caller works on the current one.

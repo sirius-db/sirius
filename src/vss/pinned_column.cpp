@@ -16,10 +16,12 @@
 
 #include "vss/pinned_column.hpp"
 
+#include "cuda/vss/cudf_raft_interop.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius/exception.hpp"
+#include "vss/bound_gemm.hpp"
 #include "vss/staging_shortfall.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -43,6 +45,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -164,46 +167,38 @@ void read_host_bytes(cucascade::memory::host_table_allocation const& table,
   }
 }
 
-}  // namespace
+/// The floats of a HOST-tier chunk laid out as plain rows `dim` floats apart: no nulls, and the
+/// list offsets 0, dim, 2 dim, ..., which with no null rows the first and last decide.
+struct plain_host_rows {
+  cucascade::memory::host_table_allocation const* table;
+  std::size_t values_offset;
+  std::int64_t rows;
+};
 
-std::int64_t pinned_host_chunk_rows(const scan_manager::pinned_entry& pin,
-                                    const std::string& column_name,
-                                    std::size_t chunk_index)
+std::optional<plain_host_rows> find_plain_host_rows(const scan_manager::pinned_entry& pin,
+                                                    const std::string& column_name,
+                                                    std::size_t chunk_index,
+                                                    std::int64_t dim)
 {
   auto const column = find_host_column(pin, column_name, chunk_index);
-  return column ? static_cast<std::int64_t>(column->meta->num_rows) : -1;
-}
-
-std::unique_ptr<cudf::column> gather_host_pinned_rows(const scan_manager::pinned_entry& pin,
-                                                      const std::string& column_name,
-                                                      std::size_t chunk_index,
-                                                      std::int64_t dim,
-                                                      std::int64_t start,
-                                                      std::int64_t stride,
-                                                      std::int64_t count,
-                                                      rmm::cuda_stream_view stream,
-                                                      rmm::device_async_resource_ref mr)
-{
-  auto const column = find_host_column(pin, column_name, chunk_index);
-  if (!column || dim <= 0 || count <= 0) { return nullptr; }
+  if (!column || dim <= 0) { return std::nullopt; }
   auto const& meta  = *column->meta;
   auto const& table = *column->table;
   auto const n      = static_cast<std::int64_t>(meta.num_rows);
   // null_count may also be the "unknown" sentinel, which is as good as a null here.
   if (meta.type_id != static_cast<std::int32_t>(cudf::type_id::LIST) || meta.null_count != 0 ||
-      meta.children.size() != 2 || start < 0 || stride < 1 || start + (count - 1) * stride >= n) {
-    return nullptr;
+      meta.children.size() != 2) {
+    return std::nullopt;
   }
   auto const& offsets = meta.children[0];
   auto const& values  = meta.children[1];
   if (offsets.type_id != static_cast<std::int32_t>(cudf::type_id::INT32) || !offsets.has_data ||
       offsets.num_rows != n + 1 ||
       values.type_id != static_cast<std::int32_t>(cudf::type_id::FLOAT32) || !values.has_data ||
-      values.null_count != 0 || static_cast<std::int64_t>(values.num_rows) != n * dim) {
-    return nullptr;
+      values.null_count != 0 || static_cast<std::int64_t>(values.num_rows) != n * dim ||
+      values.data_offset % sizeof(float) != 0) {
+    return std::nullopt;
   }
-  // Row r is values[r * dim, (r + 1) * dim) only if the offsets start at 0 and end at n * dim;
-  // with no null rows and every row dim wide, nothing in between can differ.
   std::int32_t first = -1;
   std::int32_t last  = -1;
   read_host_bytes(table, offsets.data_offset, sizeof(first), reinterpret_cast<std::byte*>(&first));
@@ -211,21 +206,119 @@ std::unique_ptr<cudf::column> gather_host_pinned_rows(const scan_manager::pinned
                   offsets.data_offset + static_cast<std::size_t>(n) * sizeof(last),
                   sizeof(last),
                   reinterpret_cast<std::byte*>(&last));
-  if (first != 0 || static_cast<std::int64_t>(last) != n * dim) { return nullptr; }
+  if (first != 0 || static_cast<std::int64_t>(last) != n * dim) { return std::nullopt; }
+  return plain_host_rows{&table, values.data_offset, n};
+}
 
-  auto const row_bytes = static_cast<std::size_t>(dim) * sizeof(float);
-  std::vector<std::byte> rows(static_cast<std::size_t>(count) * row_bytes);
-  for (std::int64_t j = 0; j < count; ++j) {
-    read_host_bytes(table,
-                    values.data_offset + static_cast<std::size_t>(start + j * stride) * row_bytes,
-                    row_bytes,
-                    rows.data() + static_cast<std::size_t>(j) * row_bytes);
+template <typename T>
+std::unique_ptr<rmm::device_buffer> to_device(std::vector<T> const& host,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  auto buf = std::make_unique<rmm::device_buffer>(host.size() * sizeof(T), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    buf->data(), host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice, stream.value()));
+  return buf;
+}
+
+}  // namespace
+
+exact_rows pinned_rows_map::view(std::int64_t const* row_map) const
+{
+  exact_rows out;
+  out.row_map      = row_map;
+  out.chunk_rows   = static_cast<std::int64_t const*>(chunk_rows->data());
+  out.chunk_block  = static_cast<std::int64_t const*>(chunk_block->data());
+  out.chunk_offset = static_cast<std::int64_t const*>(chunk_offset->data());
+  out.pin_blocks   = static_cast<std::byte const* const*>(blocks->data());
+  out.n_chunks     = n_chunks;
+  out.block_shift  = block_shift;
+  return out;
+}
+
+std::optional<pinned_rows_map> map_pinned_rows(const scan_manager::pinned_entry& pin,
+                                               const std::string& column_name,
+                                               std::int64_t dim,
+                                               cucascade::memory::memory_space& gpu_space,
+                                               rmm::cuda_stream_view stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  pinned_rows_map out;
+  std::vector<std::int64_t> chunk_block, chunk_offset;
+  std::vector<std::byte const*> blocks;
+  out.chunk_first_row.push_back(0);
+  if (pin.tier == cucascade::memory::Tier::HOST) {
+    std::size_t block_bytes = 0;
+    for (std::size_t c = 0; c < pin.host_chunks.size(); ++c) {
+      auto const rows = find_plain_host_rows(pin, column_name, c, dim);
+      if (!rows) { return std::nullopt; }
+      auto const& allocation = *rows->table->allocation;
+      if (block_bytes == 0) { block_bytes = allocation.block_size(); }
+      if (allocation.block_size() != block_bytes) { return std::nullopt; }
+      chunk_block.push_back(static_cast<std::int64_t>(blocks.size()));
+      chunk_offset.push_back(static_cast<std::int64_t>(rows->values_offset));
+      for (std::size_t b = 0; b < allocation.size(); ++b) {
+        void* device = nullptr;
+        if (cudaHostGetDevicePointer(&device, allocation.at(b).data(), 0) != cudaSuccess) {
+          cudaGetLastError();
+          return std::nullopt;
+        }
+        blocks.push_back(static_cast<std::byte const*>(device));
+      }
+      out.chunk_first_row.push_back(out.chunk_first_row.back() + rows->rows);
+      out.owners.emplace_back(pin.host_chunks[c]);
+    }
+    if (block_bytes == 0 || (block_bytes & (block_bytes - 1)) != 0) { return std::nullopt; }
+    out.block_shift = std::countr_zero(block_bytes);
+  } else {
+    // A device chunk is one contiguous run of rows: one "block" that no offset leaves.
+    std::vector<cudf::column_view> views;
+    try {
+      views = pinned_column_chunk_views(pin, column_name, gpu_space);
+      for (auto const& v : views) {
+        blocks.push_back(
+          reinterpret_cast<std::byte const*>(list_column_as_dataset_view(v, dim).data_handle()));
+        chunk_block.push_back(static_cast<std::int64_t>(chunk_block.size()));
+        chunk_offset.push_back(0);
+        out.chunk_first_row.push_back(out.chunk_first_row.back() +
+                                      static_cast<std::int64_t>(v.size()));
+      }
+    } catch (std::exception const&) {
+      return std::nullopt;
+    }
+    if (!pin.device_chunks.empty()) {
+      for (auto const& chunk : pin.device_chunks) {
+        for (auto const& col : chunk.columns) {
+          out.owners.emplace_back(col);
+        }
+      }
+    } else if (auto it = pin.data_batches_by_column.find(column_name);
+               it != pin.data_batches_by_column.end()) {
+      for (auto const& col : it->second) {
+        out.owners.emplace_back(col);
+      }
+    }
+    out.block_shift = 62;
   }
-  rmm::device_buffer data(rows.size(), stream, mr);
-  CUDF_CUDA_TRY(
-    cudaMemcpyAsync(data.data(), rows.data(), rows.size(), cudaMemcpyHostToDevice, stream.value()));
-  // `rows` is pageable and dropped on return.
+  out.n_chunks     = static_cast<std::int64_t>(chunk_block.size());
+  out.chunk_rows   = to_device(out.chunk_first_row, stream, mr);
+  out.chunk_block  = to_device(chunk_block, stream, mr);
+  out.chunk_offset = to_device(chunk_offset, stream, mr);
+  out.blocks       = to_device(blocks, stream, mr);
   stream.synchronize();
+  return out;
+}
+
+std::unique_ptr<cudf::column> gather_pinned_rows(exact_rows const& source,
+                                                 std::int64_t start,
+                                                 std::int64_t stride,
+                                                 std::int64_t count,
+                                                 std::int64_t dim,
+                                                 rmm::cuda_stream_view stream,
+                                                 rmm::device_async_resource_ref mr)
+{
+  rmm::device_buffer data(static_cast<std::size_t>(count * dim) * sizeof(float), stream, mr);
+  gather_exact_rows(source, start, stride, count, dim, static_cast<float*>(data.data()), stream);
   auto child = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::FLOAT32},
                                               static_cast<cudf::size_type>(count * dim),
                                               std::move(data),
@@ -233,10 +326,9 @@ std::unique_ptr<cudf::column> gather_host_pinned_rows(const scan_manager::pinned
                                               0);
   cudf::numeric_scalar<std::int32_t> const zero(0, true, stream);
   cudf::numeric_scalar<std::int32_t> const width(static_cast<std::int32_t>(dim), true, stream);
-  auto list_offsets =
-    cudf::sequence(static_cast<cudf::size_type>(count + 1), zero, width, stream, mr);
+  auto offsets = cudf::sequence(static_cast<cudf::size_type>(count + 1), zero, width, stream, mr);
   return cudf::make_lists_column(static_cast<cudf::size_type>(count),
-                                 std::move(list_offsets),
+                                 std::move(offsets),
                                  std::move(child),
                                  0,
                                  rmm::device_buffer{});

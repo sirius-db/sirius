@@ -16,7 +16,9 @@
 
 #pragma once
 
+#include "vss/exact_rows.hpp"
 #include "vss/kmeans_functions.hpp"
+#include "vss/pinned_column.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -84,6 +86,19 @@ enum class list_encoding : std::uint8_t {
 }
 
 struct cluster_lists {
+  /// Where FLOAT16 and INT8 lists re-score from, if they can.
+  [[nodiscard]] bool has_exact_rows() const noexcept { return exact_vectors || exact_pin; }
+  [[nodiscard]] exact_rows exact_source() const
+  {
+    if (exact_pin) { return exact_pin->view(static_cast<std::int64_t const*>(row_ids->data())); }
+    exact_rows out;
+    if (exact_vectors) {
+      out.copy_blocks    = static_cast<float const* const*>(exact_blocks->data());
+      out.rows_per_block = exact_rows_per_block;
+    }
+    return out;
+  }
+
   const scan_manager::pinned_entry* pin{nullptr};  ///< The pin the lists were built from.
   std::string table;
   std::string column;
@@ -120,6 +135,9 @@ struct cluster_lists {
   ::cucascade::memory::fixed_multiple_blocks_allocation exact_vectors;
   std::int64_t exact_rows_per_block{0};
   std::unique_ptr<rmm::device_buffer> exact_blocks;
+  /// In place of exact_vectors: the pinned column the lists were built from, read row by row
+  /// through row_ids. The map holds the pin's chunks, so they outlive an unpin as the copy would.
+  std::optional<pinned_rows_map> exact_pin;
   std::unique_ptr<rmm::device_buffer> row_sq_f32;
   float max_row_norm{0};
   /// FLOAT16 lists: the largest |x - half(x)| over all rows (row_sq_f32 then holds |half(x)|^2
@@ -177,6 +195,8 @@ struct cluster_lists_result {
   std::int64_t empty_lists{0};
   std::string tier;
   std::string encoding;
+  /// Where FLOAT16 and INT8 lists re-score from: "pin", "copy", or "none" for the others.
+  std::string exact_rows;
 };
 
 /// `storage =>` of the build: FLOAT32 always, UINT8 or fail, or the tightest lossless one.

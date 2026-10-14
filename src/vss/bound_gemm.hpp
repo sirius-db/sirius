@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "vss/exact_rows.hpp"
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
@@ -131,8 +133,7 @@ void bound_filter_f16(std::uint16_t const* x,
 
 /**
  * @brief distances[i] = |probe[r] - x[ids[i]]|^2 in FP32, r = rows[i] (or i / k when @p rows is
- * null), with x read from pinned host blocks of @p rows_per_block rows (device pointers in
- * @p blocks). Pairs with ids[i] < 0 are left alone.
+ * null), with x read where @p source says. Pairs with ids[i] < 0 are left alone.
  * With @p certain_below, a pair whose current distance is <= certain_below[its row] -- a filter
  * distance already proven to be within the caller's limit -- is not re-scored but set to
  * @p certain_value.
@@ -143,12 +144,21 @@ void exact_distances(float const* probe,
                      int64_t const* ids,
                      float* distances,
                      int64_t n_pairs,
-                     float const* const* blocks,
-                     int64_t rows_per_block,
+                     exact_rows const& source,
                      int64_t dim,
                      rmm::cuda_stream_view stream,
                      float const* certain_below = nullptr,
                      float certain_value        = 0.f);
+
+/// out = rows start, start + stride, ... (count of them) of the column @p source reads, FP32
+/// [count x dim] on the device: a strided sample taken without moving the rest of the column.
+void gather_exact_rows(exact_rows const& source,
+                       int64_t start,
+                       int64_t stride,
+                       int64_t count,
+                       int64_t dim,
+                       float* out,
+                       rmm::cuda_stream_view stream);
 
 /// bound[r] = the largest of row r's k distances (+inf when any is a miss).
 void row_max_bound(float const* acc_distances,

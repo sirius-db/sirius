@@ -631,16 +631,46 @@ bool launch_small(T const* x,
   return true;
 }
 
+// A row of the pinned column as exact_rows describes it: the blocks of its chunk and the byte
+// offset of its first float in them.
+struct pinned_row {
+  std::byte const* const* blocks;
+  int64_t offset;
+};
+
+__device__ inline pinned_row locate_pinned_row(exact_rows const& src, int64_t row, int d)
+{
+  auto const p = src.row_map != nullptr ? src.row_map[row] : row;
+  // The last chunk starting at or before p: chunk_rows[lo] <= p < chunk_rows[hi].
+  int64_t lo = 0, hi = src.n_chunks;
+  while (hi - lo > 1) {
+    auto const mid = (lo + hi) / 2;
+    if (src.chunk_rows[mid] <= p) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return {src.pin_blocks + src.chunk_block[lo],
+          src.chunk_offset[lo] + (p - src.chunk_rows[lo]) * d * static_cast<int64_t>(sizeof(float))};
+}
+
+__device__ inline float pinned_value(pinned_row const& r, int c, int block_shift)
+{
+  auto const off  = r.offset + static_cast<int64_t>(c) * static_cast<int64_t>(sizeof(float));
+  auto const mask = (int64_t{1} << block_shift) - 1;
+  return *reinterpret_cast<float const*>(r.blocks[off >> block_shift] + (off & mask));
+}
+
 // One warp per pair: the exact FP32 squared distance between probe row rows[i] (or i / k when
-// rows is null) and layout row ids[i], read from pinned host blocks through their device mapping.
+// rows is null) and layout row ids[i], read where src says.
 __global__ void exact_distances_kernel(float const* __restrict__ probe,
                                        int32_t const* __restrict__ rows,
                                        int64_t k,
                                        int64_t const* __restrict__ ids,
                                        float* __restrict__ distances,
                                        int64_t n_pairs,
-                                       float const* const* __restrict__ blocks,
-                                       int64_t rows_per_block,
+                                       exact_rows const src,
                                        int d,
                                        float const* __restrict__ certain_below,
                                        float certain_value)
@@ -661,17 +691,48 @@ __global__ void exact_distances_kernel(float const* __restrict__ probe,
       }
     }
     float const* q = probe + row * d;
-    float const* x = blocks[id / rows_per_block] + (id % rows_per_block) * d;
     float s        = 0.f;
-    for (int c = lane; c < d; c += 32) {
-      float const t = q[c] - x[c];
-      s             = fmaf(t, t, s);
+    if (src.copy_blocks != nullptr) {
+      float const* x = src.copy_blocks[id / src.rows_per_block] + (id % src.rows_per_block) * d;
+      for (int c = lane; c < d; c += 32) {
+        float const t = q[c] - x[c];
+        s             = fmaf(t, t, s);
+      }
+    } else {
+      auto const x = locate_pinned_row(src, id, d);
+      for (int c = lane; c < d; c += 32) {
+        float const t = q[c] - pinned_value(x, c, src.block_shift);
+        s             = fmaf(t, t, s);
+      }
     }
 #pragma unroll
     for (int o = 16; o > 0; o /= 2) {
       s += __shfl_xor_sync(0xffffffffu, s, o);
     }
     if (lane == 0) { distances[i] = s; }
+  }
+}
+
+// One warp per sampled row.
+__global__ void gather_exact_rows_kernel(
+  exact_rows const src, int64_t start, int64_t stride, int64_t count, int d, float* __restrict__ out)
+{
+  int const lane = threadIdx.x % 32;
+  for (int64_t j = (blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x) / 32; j < count;
+       j += static_cast<int64_t>(gridDim.x) * blockDim.x / 32) {
+    auto const row = start + j * stride;
+    auto* o        = out + j * d;
+    if (src.copy_blocks != nullptr) {
+      float const* x = src.copy_blocks[row / src.rows_per_block] + (row % src.rows_per_block) * d;
+      for (int c = lane; c < d; c += 32) {
+        o[c] = x[c];
+      }
+    } else {
+      auto const x = locate_pinned_row(src, row, d);
+      for (int c = lane; c < d; c += 32) {
+        o[c] = pinned_value(x, c, src.block_shift);
+      }
+    }
   }
 }
 
@@ -1079,8 +1140,7 @@ void exact_distances(float const* probe,
                      int64_t const* ids,
                      float* distances,
                      int64_t n_pairs,
-                     float const* const* blocks,
-                     int64_t rows_per_block,
+                     exact_rows const& source,
                      int64_t dim,
                      rmm::cuda_stream_view stream,
                      float const* certain_below,
@@ -1096,11 +1156,27 @@ void exact_distances(float const* probe,
                                                                             ids,
                                                                             distances,
                                                                             n_pairs,
-                                                                            blocks,
-                                                                            rows_per_block,
+                                                                            source,
                                                                             static_cast<int>(dim),
                                                                             certain_below,
                                                                             certain_value);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+void gather_exact_rows(exact_rows const& source,
+                       int64_t start,
+                       int64_t stride,
+                       int64_t count,
+                       int64_t dim,
+                       float* out,
+                       rmm::cuda_stream_view stream)
+{
+  if (count <= 0) { return; }
+  auto const warps_per_block = 8;
+  auto const grid            = static_cast<int>(
+    std::clamp<int64_t>((count + warps_per_block - 1) / warps_per_block, 1, 65535));
+  gather_exact_rows_kernel<<<grid, warps_per_block * 32, 0, stream.value()>>>(
+    source, start, stride, count, static_cast<int>(dim), out);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
