@@ -14,6 +14,10 @@ static void LoadInternal(ExtensionLoader& loader)
 {
   std::string const name = SIRIUS_STRINGIFY(SIRIUS_EXTENSION_NAME);
   if (name == "sirius_cuda12" || name == "sirius_cuda13") {
+    // Conflict checks rely on DuckDB registering each backend under its own name.
+    if (loader.GetRegisteredExtensionName() != name) {
+      throw InvalidInputException("Cannot load %s under an alias; use LOAD sirius instead", name);
+    }
     auto const* other = name == "sirius_cuda12" ? "sirius_cuda13" : "sirius_cuda12";
     if (loader.GetDatabaseInstance().ExtensionIsLoaded(other)) {
       throw InvalidInputException("Cannot load %s while %s is already loaded", name, other);

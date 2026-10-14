@@ -18,10 +18,15 @@ target_link_libraries(sirius_test_hide_driver PRIVATE ${CMAKE_DL_LIBS})
 
 foreach(version IN ITEMS 12 13)
   set(name sirius_cuda${version})
-  build_loadable_extension(${name} " " backend.cpp)
+  # Exercise the production entry point with a CUDA-free registration stub.
+  build_loadable_extension(${name} " " ../../src/sirius/sirius_extension.cpp
+                           backend.cpp)
+  target_include_directories(${name}_loadable_extension
+                             PRIVATE ../../src/include ../../../include)
   target_compile_definitions(
-    ${name}_loadable_extension PRIVATE SIRIUS_TEST_BACKEND=${name}
-                                       SIRIUS_TEST_CUDA_VERSION=${version})
+    ${name}_loadable_extension
+    PRIVATE SIRIUS_EXTENSION_NAME=${name} SIRIUS_EXTENSION_VERSION="test"
+            SIRIUS_TEST_CUDA_VERSION=${version})
 endforeach()
 
 add_custom_target(

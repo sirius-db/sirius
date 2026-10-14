@@ -151,8 +151,10 @@ the driver's PTX compiler; other dependency paths need separate qualification.
 
 The conflict checks reject sequential loads of different backends in one
 database. They do not enforce process-wide exclusion across databases or
-concurrent loads. Applications should load `sirius`, rather than select backends
-manually.
+concurrent loads. CUDA backends reject alternate registration names (`LOAD ... AS ...`) so aliases
+cannot bypass these checks. The loader also reserves those backend names.
+Applications should load `sirius`, rather than select
+backends manually.
 
 The loader tests build fake drivers and backend extensions, so they need no GPU:
 

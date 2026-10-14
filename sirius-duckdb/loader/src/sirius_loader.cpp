@@ -34,6 +34,12 @@ extern "C" {
 
 DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader)
 {
+  // The nested backend load must not acquire this loader's own registration lock.
+  auto const& name = loader.GetRegisteredExtensionName();
+  if (name == "sirius_cuda12" || name == "sirius_cuda13") {
+    throw duckdb::InvalidInputException(
+      "Cannot load sirius under a CUDA backend name; use LOAD sirius instead");
+  }
   auto close_driver = [](void* handle) { dlclose(handle); };
   std::unique_ptr<void, decltype(close_driver)> driver(
     dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL), close_driver);

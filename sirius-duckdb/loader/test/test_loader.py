@@ -148,6 +148,32 @@ class LoaderTests(unittest.TestCase):
                 self.assertNotIn("run INSTALL", result.stderr)
                 self.assertNotIn("automatically install", result.stderr)
 
+    def test_backends_reject_aliases_before_registration(self):
+        for backend, other in [(12, 13), (13, 12)]:
+            for alias in ["previous_backend", f"sirius_cuda{other}"]:
+                with self.subTest(backend=backend, alias=alias):
+                    result = self.query(
+                        f"LOAD {quote(self.backend(backend))} AS {alias};",
+                        env={"SIRIUS_TEST_BACKEND_FAILURE": "1"},
+                    )
+                    self.assert_failure(
+                        result, f"Cannot load sirius_cuda{backend} under an alias"
+                    )
+                    self.assertNotIn(
+                        "Backend initialization failed for test", result.stderr
+                    )
+
+    def test_loader_rejects_backend_names(self):
+        for backend in [12, 13]:
+            with self.subTest(backend=backend):
+                self.assert_failure(
+                    self.query(
+                        f"LOAD {quote(self.loader)} AS sirius_cuda{backend};",
+                        version=backend * 1000,
+                    ),
+                    "Cannot load sirius under a CUDA backend name",
+                )
+
     def test_conflicting_loaded_backend(self):
         self.assert_failure(
             self.query(f"LOAD {quote(self.backend(12))}; LOAD {quote(self.loader)};"),

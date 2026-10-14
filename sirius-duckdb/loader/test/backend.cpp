@@ -14,16 +14,15 @@
  * limitations under the License.
  */
 
-#define DUCKDB_EXTENSION_MAIN
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "sirius/duckdb.hpp"
 
 #include <cstdlib>
 
-#define SIRIUS_TEST_ENTRY(name) DUCKDB_CPP_EXTENSION_ENTRY(name, loader)
+namespace sirius {
 
-extern "C" {
-SIRIUS_TEST_ENTRY(SIRIUS_TEST_BACKEND)
+void register_duckdb_extension(duckdb::ExtensionLoader& loader)
 {
   if (std::getenv("SIRIUS_TEST_BACKEND_FAILURE")) {
     throw duckdb::InvalidInputException("Backend initialization failed for test");
@@ -36,4 +35,5 @@ SIRIUS_TEST_ENTRY(SIRIUS_TEST_BACKEND)
       output.Reference(duckdb::Value(SIRIUS_TEST_CUDA_VERSION), duckdb::count_t(input.size()));
     }));
 }
-}
+
+}  // namespace sirius
