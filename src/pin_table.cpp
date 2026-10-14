@@ -49,10 +49,12 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <functional>
 #include <future>
 #include <memory>
@@ -257,12 +259,13 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   // SIRIUS_PIN_PHASE_DEBUG prints where a pin's time went; it synchronizes after each decode,
   // so only for attribution.
   bool const timing = std::getenv("SIRIUS_PIN_PHASE_DEBUG") != nullptr;
-  bool const overlap = [] {
+  std::size_t const depth = [] {
     auto const* v = std::getenv("SIRIUS_PIN_OVERLAP");
-    return v == nullptr || std::string_view{v} != "0";
+    return v == nullptr ? std::size_t{1} : static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
   }();
   auto const pin_t0 = std::chrono::steady_clock::now();
-  double decode_s = 0, finish_s = 0, wait_s = 0;
+  std::atomic<std::int64_t> decode_ns{0};
+  double finish_s = 0, wait_s = 0;
   std::size_t batches = 0;
 
   // Rows materialized so far, in emission order — feeds the chunk-contiguity
@@ -415,51 +418,52 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     on_batch(std::move(tbl), target, stream, std::move(column_storage), std::move(chunk_stats));
   };
 
-  // At most one batch is being read and decoded, on a worker, while this thread finishes the
-  // batch before it, so the file read and both transfers of neighbouring batches overlap. The
-  // decodes still run one after another, which keeps the placement cursor and the ingestible
-  // as single-threaded as before. SIRIUS_PIN_OVERLAP=0 does each batch start to finish instead.
-  std::optional<std::future<decoded_batch>> in_flight;
+  // Up to `depth` batches are read and decoded on workers while this thread finishes the oldest
+  // one, so file reads, both transfers and the decode of neighbouring batches overlap; batches are
+  // still finished in emission order. SIRIUS_PIN_OVERLAP sets the depth (default 1); 0 does each
+  // batch start to finish.
+  auto const since = [](auto t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  };
+  auto const timed_decode = [&](std::unique_ptr<op::scan::scan_info> b) {
+    auto const t0 = std::chrono::steady_clock::now();
+    auto decoded  = decode_batch(std::move(b));
+    decode_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count();
+    return decoded;
+  };
+  auto const timed_finish = [&](decoded_batch decoded) {
+    auto const t0 = std::chrono::steady_clock::now();
+    finish_batch(std::move(decoded));
+    finish_s += since(t0);
+    ++batches;
+  };
+  std::deque<std::future<decoded_batch>> in_flight;
+  auto const take_oldest = [&] {
+    auto const t0 = std::chrono::steady_clock::now();
+    auto decoded  = in_flight.front().get();
+    in_flight.pop_front();
+    wait_s += since(t0);
+    return decoded;
+  };
   auto handle_batch = [&](std::unique_ptr<op::scan::scan_info> batch) {
     if (!batch) { return; }
-    if (!overlap) {
-      auto const t0 = std::chrono::steady_clock::now();
-      auto decoded  = decode_batch(std::move(batch));
-      auto const t1 = std::chrono::steady_clock::now();
-      finish_batch(std::move(decoded));
-      decode_s += std::chrono::duration<double>(t1 - t0).count();
-      finish_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
-      ++batches;
+    if (depth == 0) {
+      timed_finish(timed_decode(std::move(batch)));
       return;
     }
     std::optional<decoded_batch> ready;
-    if (in_flight) {
-      auto const t0 = std::chrono::steady_clock::now();
-      ready         = in_flight->get();
-      in_flight.reset();
-      wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    }
-    in_flight = std::async(std::launch::async, [&decode_batch, &decode_s, b = std::move(batch)]() mutable {
-      auto const t0 = std::chrono::steady_clock::now();
-      auto decoded  = decode_batch(std::move(b));
-      decode_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-      return decoded;
-    });
-    if (ready) {
-      auto const t0 = std::chrono::steady_clock::now();
-      finish_batch(std::move(*ready));
-      finish_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-      ++batches;
-    }
+    if (in_flight.size() == depth) { ready = take_oldest(); }
+    in_flight.push_back(std::async(std::launch::async, [&timed_decode, b = std::move(batch)]() mutable {
+      return timed_decode(std::move(b));
+    }));
+    if (ready) { timed_finish(std::move(*ready)); }
   };
   auto drain = [&] {
-    if (!in_flight) { return; }
-    auto ready = in_flight->get();
-    in_flight.reset();
-    auto const t0 = std::chrono::steady_clock::now();
-    finish_batch(std::move(ready));
-    finish_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    ++batches;
+    while (!in_flight.empty()) {
+      timed_finish(take_oldest());
+    }
   };
 
   while (!ingestible.has_processed_all_metadata()) {
@@ -478,11 +482,11 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   drain();
   if (timing) {
     std::fprintf(stderr,
-                 "[pin-phases] %zu batches, overlap %s: decode %.3f s, finish %.3f s, waited for "
-                 "decode %.3f s, wall %.3f s\n",
+                 "[pin-phases] %zu batches, %zu decodes in flight: decode %.3f s, finish %.3f s, "
+                 "waited for decode %.3f s, wall %.3f s\n",
                  batches,
-                 overlap ? "on" : "off",
-                 decode_s,
+                 depth,
+                 static_cast<double>(decode_ns.load()) * 1e-9,
                  finish_s,
                  wait_s,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_t0).count());
