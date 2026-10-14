@@ -172,7 +172,8 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
                                                      num_partitions,
                                                      stream,
                                                      *space,
-                                                     batch_telemetry());
+                                                     batch_telemetry(),
+                                                     partition_key_cast::normalize);
 
     for (std::size_t i = 0; i < slices.size(); ++i) {
       // Empty partition stays WAITING until finalize.
