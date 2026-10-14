@@ -14,7 +14,7 @@ import re
 import shutil
 import time
 import tomllib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from .classify import SEVERITY, Verdict, normalize_reason
@@ -103,13 +103,9 @@ def load_known_issues(path: pathlib.Path | None) -> list[KnownIssue]:
 EXTRA_REPRODUCERS = 5  # further query/dataset pairs kept under more/ per finding
 
 
-def signature(rec: QueryRecord, verdict: str | None = None) -> str:
-    """Group errors by reason; keep each distinct mismatch or timeout input apart.
-
-    ``verdict`` is the observed one when a known issue has claimed the record, so
-    distinct issues or reasons with the same feature labels stay apart.
-    """
-    v = verdict or rec.verdict
+def signature(rec: QueryRecord) -> str:
+    """Group errors by reason; keep each distinct mismatch or timeout input apart."""
+    v = rec.verdict
     if v in (Verdict.MISMATCH, Verdict.VARIANT_MISMATCH, Verdict.TIMEOUT):
         variant = json.dumps(rec.variant, sort_keys=True) if rec.variant else ""
         key = f"{v}|{rec.dataset}|{rec.comparison}|{variant}|{rec.sql}"
@@ -155,6 +151,9 @@ class Report:
         self.status = "complete"
         self.stop_reason = "budget completed"
         self.worker_context: dict[int, dict[str, Any]] = {}
+        self.harness_errors: list[dict[str, Any]] = (
+            []
+        )  # worker stops that were not findings
         self._environment: dict[str, Any] | None = None
         self._runtime: dict[str, dict[str, Any]] = {}
         self.record_paths: dict[tuple[str, str], pathlib.Path] = {}
@@ -187,7 +186,8 @@ class Report:
         self._log.flush()
         if not verdict.is_finding() and verdict != Verdict.KNOWN_ISSUE:
             return None
-        sig = signature(rec, observed.value)
+        # Signed as observed, so distinct issues or reasons with the same labels stay apart.
+        sig = signature(replace(rec, verdict=observed.value, reason=reason))
         self.record_signatures[(rec.dataset, rec.sql)] = sig
         if sig in self.findings:
             entry = self.findings[sig]
@@ -460,6 +460,7 @@ class Report:
             "elapsed_seconds": round(elapsed, 1),
             "queries": self.queries,
             "datasets": self.datasets,
+            "harness_errors": self.harness_errors,
             "counts": dict(self.counts),
             "findings": ordered,
             "gaps": self.gaps(ordered),

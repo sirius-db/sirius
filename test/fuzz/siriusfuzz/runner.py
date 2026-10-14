@@ -338,17 +338,18 @@ class Evaluator:
                 sql, cpu, mode
             )
 
-        def cpu_ok(sql: str) -> RunResult | None:
+        def cpu_ok(sql: str, typed: bool = False) -> RunResult | None:
             res = self.s.run(sql, gpu=False, timeout=self.timeout)
             if res.status != "ok" or res.result is None:
                 return None
-            self._type_columns(sql, res.result)
+            if typed:  # only result comparisons need the types
+                self._type_columns(sql, res.result)
             return res
 
         if verdict == Verdict.MISMATCH:
 
             def check(sql: str, query: Query | None = None) -> bool:
-                cpu = cpu_ok(sql)
+                cpu = cpu_ok(sql, typed=True)
                 if cpu is None:
                     return False
                 g = self.s.run(sql, gpu=gpu, timeout=self.timeout)
@@ -365,7 +366,7 @@ class Evaluator:
             name, value = next(iter(variant.items()))
 
             def check_variant(sql: str, query: Query | None = None) -> bool:
-                cpu = cpu_ok(sql)
+                cpu = cpu_ok(sql, typed=True)
                 if cpu is None:
                     return False
                 base = self.s.run(sql, gpu=gpu, timeout=self.timeout)
@@ -717,6 +718,9 @@ class Orchestrator:
         self.active_paths: dict[int, pathlib.Path] = {}
         self.deadline: float | None = None
         self.worker_spawns: dict[int, int] = {}
+        self.finished: set[int] = set()  # workers whose exit has been handled
+        # Worker -> (old pid, deadline): respawn once that process group is gone.
+        self.respawn_pending: dict[int, tuple[int, float]] = {}
 
     def _spawn(self, worker_id: int) -> None:
         self.spawn_count += 1
@@ -781,12 +785,20 @@ class Orchestrator:
         which can take a while after SIGKILL (see Shell._reap); the next shell must not
         start before that.
         """
-        if not p.is_alive():
-            return False  # reaped earlier; the pid may belong to someone else by now
-        self._kill_group(p)
+        if not p.is_alive() and w in self.finished:
+            return False  # handled when it exited; the pid may belong to someone else by now
+        self._kill_group(p)  # alive, or died unnoticed with its shell possibly still up
         p.join(timeout=5)
         if wait:
             self._wait_shell_gone(w, p, time.time() + TEARDOWN_SECONDS)
+        return True
+
+    @staticmethod
+    def _group_alive(pid: int) -> bool:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return False
         return True
 
     @staticmethod
@@ -800,9 +812,7 @@ class Orchestrator:
 
     def _wait_shell_gone(self, w: int, p: Any, deadline: float) -> None:
         while True:
-            try:
-                os.killpg(p.pid, 0)
-            except ProcessLookupError:
+            if not self._group_alive(p.pid):
                 return
             if time.time() >= deadline:
                 self._say(f"[w{w}] shell still exiting after {TEARDOWN_SECONDS:.0f}s")
@@ -845,7 +855,7 @@ class Orchestrator:
         for w in range(self.opts.workers):
             self._spawn(w)
         last_progress = start
-        finished: set[int] = set()
+        finished = self.finished = set()
         while True:
             try:
                 msg = self.queue.get(timeout=0.5)
@@ -884,9 +894,8 @@ class Orchestrator:
                 sql_info = self.inflight.get(w)
                 if sql_info is not None and self._overdue(w, sql_info[2], now):
                     self._worker_hung(w, p, sql_info, finished)
-                elif (
-                    sql_info is None
-                    and now - self.last_seen[w] > self.opts.startup_timeout
+                elif sql_info is None and self._overdue(
+                    w, self.last_seen[w], now, self.opts.startup_timeout
                 ):
                     self.report.status = "incomplete"
                     self.report.stop_reason = (
@@ -894,11 +903,14 @@ class Orchestrator:
                     )
                     self._kill_worker(w, p)
                     finished.add(w)
+            self._respawn_ready(finished, now)
             if now - last_progress >= self.opts.progress_every:
                 last_progress = now
                 self._progress(start)
-            if len(finished) >= len(self.procs) and all(
-                w in finished for w in self.procs
+            if (
+                not self.respawn_pending
+                and len(finished) >= len(self.procs)
+                and all(w in finished for w in self.procs)
             ):
                 break
         for w, p in self.procs.items():
@@ -906,17 +918,23 @@ class Orchestrator:
             if p.is_alive():
                 self._kill_worker(w, p)
 
-    def _overdue(self, w: int, began: float, now: float) -> bool:
-        """A worker inside a query is hung once its current step outlives the budget
-        it declared in the active file (run timeout plus shell teardown, or a shell
-        restart) by HANG_GRACE_SECONDS. Without a budget, the run's own applies."""
+    def _overdue(
+        self, w: int, began: float, now: float, budget: float | None = None
+    ) -> bool:
+        """A worker is hung once its current step outlives its budget by HANG_GRACE_SECONDS.
+
+        The worker declares the budget in its active file (run timeout plus shell
+        teardown, or a shell restart); ``budget`` is the floor when it declares none
+        or a smaller one, by default a run's.
+        """
         since = began
-        budget = self.cfg.oracle.query_timeout_seconds + TEARDOWN_SECONDS
+        if budget is None:
+            budget = self.cfg.oracle.query_timeout_seconds + TEARDOWN_SECONDS
         active_path = self.active_paths.get(w)
         if active_path and active_path.exists():
             active = json.loads(active_path.read_text())
             since = max(since, active.get("started_at", since))
-            budget = active.get("budget", budget)
+            budget = max(budget, active.get("budget", 0.0))
         return now - since > budget + HANG_GRACE_SECONDS
 
     def _handle(self, msg: dict[str, Any], finished: set[int]) -> None:
@@ -954,13 +972,24 @@ class Orchestrator:
             self._say(f"[w{w}] {msg['msg']}")
         elif t == "done":
             finished.add(w)
-            self.inflight.pop(w, None)
+            sql_info = self.inflight.pop(w, None)
             reason = msg.get("reason", "worker stopped")
             if reason.startswith("harness error"):
                 # A failed shell restart or a harness bug mid-query: a fresh worker
-                # carries on, within the same restart budget as a dead one.
+                # carries on, within the same restart budget as a dead one. The old
+                # worker is still closing its session, perhaps on a hung shell.
                 self._say(f"[w{w}] stopped: {reason}")
-                self._maybe_respawn(w, finished)
+                self.report.harness_errors.append(
+                    {
+                        "worker": w,
+                        "reason": reason,
+                        "sql": sql_info[0] if sql_info else None,
+                    }
+                )
+                p = self.procs.get(w)
+                if p is not None:
+                    self._kill_worker(w, p, wait=False)
+                    self._maybe_respawn(w, finished, after_pid=p.pid)
             elif reason != "finished":
                 self.report.status = "incomplete"
                 self.report.stop_reason = reason
@@ -989,7 +1018,6 @@ class Orchestrator:
         finished.add(w)
         # Only the Python process died; its shell is in the same group and may still run.
         self._kill_group(p)
-        self._wait_shell_gone(w, p, time.time() + TEARDOWN_SECONDS)
         tail = self._stderr_tail(w)
         reason = extract_crash_reason(tail, p.exitcode)
         if info is not None:
@@ -1027,7 +1055,7 @@ class Orchestrator:
             self.report.status = "incomplete"
             self.report.stop_reason = "worker exited without reporting completion"
             return
-        self._maybe_respawn(w, finished)
+        self._maybe_respawn(w, finished, after_pid=p.pid)
 
     def _worker_hung(
         self,
@@ -1038,7 +1066,7 @@ class Orchestrator:
     ) -> None:
         sql, stem, since, query_labels = info
         self.inflight.pop(w, None)
-        self._kill_worker(w, p)
+        self._kill_worker(w, p, wait=False)
         finished.add(w)
         tail = self._stderr_tail(w)
         rec = QueryRecord(
@@ -1063,9 +1091,13 @@ class Orchestrator:
         self.report.add(rec)
         self.total_results += 1
         self._say(f"[w{w}] HANG: killed after {time.time() - since:.0f}s")
-        self._maybe_respawn(w, finished)
+        self._maybe_respawn(w, finished, after_pid=p.pid)
 
-    def _maybe_respawn(self, w: int, finished: set[int]) -> None:
+    def _maybe_respawn(
+        self, w: int, finished: set[int], after_pid: int | None = None
+    ) -> None:
+        """Respawn within the budget; with ``after_pid``, only once that worker's
+        process group (its shell, which may still hold the GPU) is gone."""
         if (
             self.opts.max_queries is not None
             and self.total_results >= self.opts.max_queries
@@ -1080,9 +1112,23 @@ class Orchestrator:
                 )
             return
         self.respawns += 1
+        if after_pid is not None and self._group_alive(after_pid):
+            self.respawn_pending[w] = (after_pid, time.time() + TEARDOWN_SECONDS)
+            return
         finished.discard(w)
         self._spawn(w)
         self._say(f"[w{w}] respawned ({self.respawns}/{self.opts.max_respawns})")
+
+    def _respawn_ready(self, finished: set[int], now: float) -> None:
+        for w, (pid, deadline) in list(self.respawn_pending.items()):
+            if self._group_alive(pid) and now < deadline:
+                continue
+            if now >= deadline:
+                self._say(f"[w{w}] shell still exiting after {TEARDOWN_SECONDS:.0f}s")
+            del self.respawn_pending[w]
+            finished.discard(w)
+            self._spawn(w)
+            self._say(f"[w{w}] respawned ({self.respawns}/{self.opts.max_respawns})")
 
     def _attach_active(self, w: int, rec: QueryRecord) -> None:
         path = self.active_paths.get(w)

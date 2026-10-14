@@ -125,7 +125,6 @@ class DataGenerator:
         self.rng = rng
         self.types = st.types_from_names(config.features.types)
         self._pools: dict[str, list[Any]] = {}
-        self._build_pools()
 
     # -- pools -------------------------------------------------------------
 
@@ -170,6 +169,8 @@ class DataGenerator:
         self._pools["bool"] = [True, False]
 
     def pool(self, kind: str) -> list[Any]:
+        if not self._pools:
+            self._build_pools()
         return self._pools[kind]
 
     # -- schema ------------------------------------------------------------

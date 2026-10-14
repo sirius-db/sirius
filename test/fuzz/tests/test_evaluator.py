@@ -473,7 +473,7 @@ class ReportTests(unittest.TestCase):
             runner = Orchestrator(cfg, report, 1, OrchestratorOptions(quiet=True))
             runner.active_paths[0] = active
             runner.inflight[0] = ("SELECT current", "w0-d0", time.time(), [])
-            process = SimpleNamespace(exitcode=-11)
+            process = SimpleNamespace(exitcode=-11, pid=0)
             with patch.object(runner, "_maybe_respawn"), patch.object(
                 runner, "_kill_group"
             ), patch.object(runner, "_wait_shell_gone"):
