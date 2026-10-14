@@ -406,7 +406,7 @@ TEST_CASE("a filtered decode with no survivors delivers empty prefix columns",
   }
 }
 
-TEST_CASE("a nullable-selection refusal after filtering returns every selected column",
+TEST_CASE("a filtered decode over a null-masked column returns every selected column",
           "[fused_scan_filter][delivery]")
 {
   if (gate_off()) { return; }
@@ -416,7 +416,8 @@ TEST_CASE("a nullable-selection refusal after filtering returns every selected c
   simpatico::stream_pool pool;
   REQUIRE(pool.init(4));
 
-  // The filter selects 250 rows, then the gather that would compact the null-masked "n" refuses.
+  // A compacted decode cannot carry the stored bitmask of "n" (it spans the whole chunk), so the
+  // filtered decode is refused before any device work and every column decodes in full.
   auto request      = range_request(kOutputWidth);
   request.routes[1] = sc::decode_route::full;
   sc::scan_filter_result result;
