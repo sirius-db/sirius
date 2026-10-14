@@ -154,8 +154,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   }
 
   // The operator requires every group to be a bare reference to a column the child has. Checked
-  // here because neither consumer can still fall back cleanly: one throws in the vocabulary of
-  // aggregates, and the other reads the index unguarded at execution time.
+  // here because the loop below casts each group unchecked and the kernels read the index
+  // unguarded at execution time.
   auto const child_column_count = planned_types.size();
   for (duckdb::idx_t i = 0; i < groups.size(); i++) {
     auto const& group = *groups[i];
