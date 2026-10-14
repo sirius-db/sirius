@@ -1,4 +1,4 @@
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR MUSL_ENABLED)
   return()
 endif()
 
