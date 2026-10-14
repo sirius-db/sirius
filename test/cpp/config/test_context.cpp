@@ -225,6 +225,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
+    REQUIRE(setting_count(con, "enable_order_preserving_partition") == 0);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
@@ -257,6 +258,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
     result = con.Query("SET enable_dense_count_join = false");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET enable_order_preserving_partition = false");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
     result = con.Query("SET dense_count_join_max_bytes = 1024");
@@ -293,6 +297,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
+    REQUIRE(setting_count(con, "enable_order_preserving_partition") == 0);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
@@ -316,6 +321,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 1);
+    REQUIRE(setting_count(con, "enable_order_preserving_partition") == 1);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
@@ -369,6 +375,13 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET enable_dense_count_join");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_order_preserving_partition = false");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE_FALSE(duckdb::session_operator_params(*con.context).enable_order_preserving_partition);
+    result = con.Query("RESET enable_order_preserving_partition");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET dense_count_join_max_bytes = 1024");
@@ -2495,6 +2508,30 @@ TEST_CASE("Sirius configuration enables dense count join by default and accepts 
     Catch::Matchers::ContainsSubstring("sirius.operator_params.dense_count_join_max_bytes") &&
       Catch::Matchers::ContainsSubstring("internal engine policy") &&
       Catch::Matchers::ContainsSubstring("remove this key"));
+}
+
+TEST_CASE(
+  "Sirius configuration enables order-preserving partitions by default and accepts a YAML "
+  "override",
+  "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config defaults;
+  REQUIRE(defaults.get_operator_params().enable_order_preserving_partition);
+  REQUIRE(sirius::config::DEFAULT_ENABLE_ORDER_PRESERVING_PARTITION);
+
+  sirius::sirius_config disabled;
+  REQUIRE_NOTHROW(
+    disabled.load_from_file(data_dir / "valid_order_preserving_partition_disable.yaml"));
+  REQUIRE_FALSE(disabled.get_operator_params().enable_order_preserving_partition);
+
+  sirius::sirius_config invalid_type;
+  REQUIRE_THROWS_WITH(
+    invalid_type.load_from_file(data_dir / "invalid_order_preserving_partition_type.yaml"),
+    Catch::Matchers::ContainsSubstring("operator_params.enable_order_preserving_partition") &&
+      Catch::Matchers::ContainsSubstring("bad conversion"));
 }
 
 TEST_CASE("Sirius query options stay local and snapshots remain immutable",

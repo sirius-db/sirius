@@ -2,6 +2,7 @@ target_sources(
   sirius_objects
   PRIVATE date_cast.cu
           dense_count_join_impl.cu
+          stable_hash_partition.cu
           device_copy_batch.cpp
           dynamic_filter_replica_transfer.cu
           sirius_dynamic_bloom_filter.cu

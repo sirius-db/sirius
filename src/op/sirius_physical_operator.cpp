@@ -431,6 +431,12 @@ bool sirius_physical_operator::like_swar_fastpath_enabled() const noexcept
   return _pipeline != nullptr && _pipeline->get_operator_params().like_swar_fastpath;
 }
 
+bool sirius_physical_operator::order_preserving_partition_enabled() const noexcept
+{
+  return _pipeline != nullptr ? _pipeline->get_operator_params().enable_order_preserving_partition
+                              : sirius::config::DEFAULT_ENABLE_ORDER_PRESERVING_PARTITION;
+}
+
 std::shared_ptr<like_multiliteral_cache const> sirius_physical_operator::like_cache() const noexcept
 {
   return _pipeline != nullptr ? _pipeline->get_like_multiliteral_cache() : nullptr;

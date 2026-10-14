@@ -94,6 +94,10 @@ class gpu_merge_impl {
    * @param num_group_cols The number of group columns.
    * @param aggregates The aggregate functions. Should satisfy `num_group_cols + group_idx.size() =
    * num input columns`.
+   * @param try_sorted_keys Whether to look for sorted input. With a single INT64 group column, the
+   * batches are then concatenated in the order of their first key, and when the result is verified
+   * ascending, the merge uses cuDF's sorted-keys group-by. This pays off only when the hash
+   * partitions upstream keep their input order. The result is the same either way.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
    *
@@ -103,6 +107,7 @@ class gpu_merge_impl {
     const std::vector<cucascade::read_only_data_batch>& input,
     int num_group_cols,
     const std::vector<cudf::aggregation::Kind>& aggregates,
+    bool try_sorted_keys,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});

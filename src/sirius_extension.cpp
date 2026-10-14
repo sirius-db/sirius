@@ -2793,6 +2793,16 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
 }
 
+static void SetEnableOrderPreservingPartition(ClientContext& context,
+                                              SetScope scope,
+                                              Value& parameter)
+{
+  auto* params                              = get_operator_params(context, scope);
+  params->enable_order_preserving_partition = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_ORDER_PRESERVING_PARTITION to {}",
+                   params->enable_order_preserving_partition);
+}
+
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
@@ -3275,6 +3285,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_dense_count_join),
                     SetEnableDenseCountJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_order_preserving_partition",
+                    "runtime override for order-preserving hash partitions and the sorted merge",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_order_preserving_partition),
+                    SetEnableOrderPreservingPartition);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",

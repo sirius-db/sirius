@@ -170,6 +170,7 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
                                                      _spec.key_columns,
                                                      _spec.key_cast_types,
                                                      num_partitions,
+                                                     order_preserving_partition_enabled(),
                                                      stream,
                                                      *space,
                                                      batch_telemetry());
