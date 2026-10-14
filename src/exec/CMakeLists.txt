@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
   PRIVATE admission_control.cpp
+          arrow_result_stream.cpp
           batch_stream.cpp
           stream_session.cpp
           stream_bind_catalog.cpp

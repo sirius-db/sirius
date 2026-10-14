@@ -187,13 +187,14 @@ TEST_CASE("gpu_execution - pin_table host tier streams without fitting the whole
     auto count_result = con.Query("SELECT count(*) FROM t;");
     REQUIRE(count_result);
     REQUIRE_FALSE(count_result->HasError());
-    REQUIRE(count_result->GetValue(0, 0).GetValue<std::int64_t>() == kRows);
+    REQUIRE(count_result->Collection().GetValue(0, 0).GetValue<std::int64_t>() == kRows);
 
     // sum(v) = sum(2*i for i in [0, N)) = N*(N-1); stays within int64.
     auto sum_result = con.Query("SELECT sum(v) FROM t;");
     REQUIRE(sum_result);
     REQUIRE_FALSE(sum_result->HasError());
-    REQUIRE(sum_result->GetValue(0, 0).ToString() == std::to_string(kRows * (kRows - 1)));
+    REQUIRE(sum_result->Collection().GetValue(0, 0).ToString() ==
+            std::to_string(kRows * (kRows - 1)));
 
     auto unpin_result = con.Query("CALL unpin_table('t');");
     REQUIRE(unpin_result);

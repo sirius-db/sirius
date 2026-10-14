@@ -30,12 +30,22 @@ if(SIRIUS_BUILD_SHARED)
 endif()
 
 if(SIRIUS_BUILD_STATIC)
+  # Mark the conditional dependency as a target so exports apply our namespace.
+  foreach(target core_functions_extension parquet_extension)
+    get_target_property(links ${target} INTERFACE_LINK_LIBRARIES)
+    string(REPLACE ">:duckdb_static>" ">:$<TARGET_NAME:duckdb_static>>"
+                   exported_links "${links}")
+    if(exported_links STREQUAL links)
+      message(FATAL_ERROR "${target}: expected conditional duckdb_static link")
+    endif()
+    set_property(TARGET ${target} PROPERTY INTERFACE_LINK_LIBRARIES
+                                           "${exported_links}")
+  endforeach()
   # Source-built support libraries remain separate archives in the package.
   install(
     TARGETS sirius_core
             simpatico
             duckdb_static
-            dummy_static_extension_loader
             core_functions_extension
             parquet_extension
             cucascade_static

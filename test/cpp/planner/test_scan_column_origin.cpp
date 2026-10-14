@@ -77,7 +77,7 @@ std::optional<at> origin_of(duckdb::LogicalOperator const& op,
 {
   auto const origin = resolve_scan_column_origin(op, ordinal, policy);
   if (!origin) { return std::nullopt; }
-  return at{origin->get->table_index, origin->ordinal};
+  return at{origin->get->table_index.index, origin->ordinal};
 }
 
 // Assign each table a distinct cardinality so resolving the wrong scan is visible.
@@ -89,7 +89,7 @@ constexpr std::size_t stub_cardinality_of(duckdb::idx_t table_index)
 struct stub_cardinality_source {
   std::optional<std::size_t> operator()(duckdb::LogicalGet const& get) const
   {
-    return stub_cardinality_of(get.table_index);
+    return stub_cardinality_of(get.table_index.index);
   }
 };
 
@@ -103,7 +103,7 @@ struct counting_source {
   std::optional<std::size_t> operator()(duckdb::LogicalGet const& get) const
   {
     ++*calls;
-    return stub_cardinality_of(get.table_index);
+    return stub_cardinality_of(get.table_index.index);
   }
 };
 
@@ -111,12 +111,16 @@ struct counting_source {
 duckdb::unique_ptr<duckdb::LogicalGet> make_get(duckdb::idx_t table_index, duckdb::idx_t width)
 {
   duckdb::vector<duckdb::LogicalType> types(width, duckdb::LogicalType::INTEGER);
-  duckdb::vector<duckdb::string> names;
+  duckdb::vector<duckdb::Identifier> names;
   for (duckdb::idx_t i = 0; i < width; ++i) {
-    names.push_back("c" + std::to_string(i));
+    names.emplace_back("c" + std::to_string(i));
   }
-  auto get = duckdb::make_uniq<duckdb::LogicalGet>(
-    table_index, duckdb::TableFunction(), nullptr, std::move(types), std::move(names));
+  auto get =
+    duckdb::make_uniq<duckdb::LogicalGet>(duckdb::TableIndex(table_index),
+                                          duckdb::BoundTableFunction(duckdb::TableFunction()),
+                                          nullptr,
+                                          std::move(types),
+                                          std::move(names));
   for (duckdb::idx_t i = 0; i < width; ++i) {
     get->AddColumnId(i);
   }
@@ -138,8 +142,8 @@ duckdb::unique_ptr<duckdb::LogicalProjection> make_projection(
   duckdb::unique_ptr<duckdb::LogicalOperator> child,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions)
 {
-  auto projection =
-    duckdb::make_uniq<duckdb::LogicalProjection>(/*table_index=*/0, std::move(expressions));
+  auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(
+    duckdb::TableIndex(/*table_index=*/0), std::move(expressions));
   projection->children.push_back(std::move(child));
   return projection;
 }
@@ -148,8 +152,8 @@ duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_join(
   duckdb::JoinType join_type,
   duckdb::unique_ptr<duckdb::LogicalOperator> left,
   duckdb::unique_ptr<duckdb::LogicalOperator> right,
-  duckdb::vector<duckdb::idx_t> left_projection_map  = {},
-  duckdb::vector<duckdb::idx_t> right_projection_map = {})
+  duckdb::vector<duckdb::ProjectionIndex> left_projection_map  = {},
+  duckdb::vector<duckdb::ProjectionIndex> right_projection_map = {})
 {
   auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
   join->children.push_back(std::move(left));
@@ -162,10 +166,8 @@ duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_join(
 duckdb::JoinCondition make_condition(duckdb::unique_ptr<duckdb::Expression> left,
                                      duckdb::unique_ptr<duckdb::Expression> right)
 {
-  duckdb::JoinCondition condition;
-  condition.left       = std::move(left);
-  condition.right      = std::move(right);
-  condition.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::JoinCondition condition(
+    std::move(left), std::move(right), duckdb::ExpressionType::COMPARE_EQUAL);
   return condition;
 }
 
@@ -191,7 +193,7 @@ TEST_CASE("walk uses the projected scan width when projection_ids narrow the sca
           "[planner][scan_column_origin]")
 {
   auto get            = make_get(/*table_index=*/0, /*width=*/4);
-  get->projection_ids = {2};  // scan output is one column
+  get->projection_ids = {duckdb::ProjectionIndex(2)};  // scan output is one column
   get->ResolveOperatorTypes();
 
   REQUIRE(resolve_pass_through_scan(*get, 0) == get.get());
@@ -254,7 +256,7 @@ TEST_CASE("walk applies the FILTER projection map", "[planner][scan_column_origi
   }
   SECTION("with a projection map: mapped")
   {
-    filter->projection_map = {1};
+    filter->projection_map = {duckdb::ProjectionIndex(1)};
     filter->ResolveOperatorTypes();
     REQUIRE(resolve_pass_through_scan(*filter, 0) != nullptr);  // map[0] = 1, the reference
     REQUIRE(resolve_pass_through_scan(*filter, 1) == nullptr);  // past the map
@@ -280,7 +282,7 @@ TEST_CASE("walk applies the ORDER_BY projection map", "[planner][scan_column_ori
   }
   SECTION("with a projection map: mapped")
   {
-    order->projection_map = {1};
+    order->projection_map = {duckdb::ProjectionIndex(1)};
     order->ResolveOperatorTypes();
     REQUIRE(resolve_pass_through_scan(*order, 0) != nullptr);
     REQUIRE(resolve_pass_through_scan(*order, 1) == nullptr);
@@ -329,8 +331,10 @@ TEST_CASE("walk resolves aggregate group ordinals only", "[planner][scan_column_
   auto make_aggregate = [](duckdb::unique_ptr<duckdb::LogicalOperator> child) {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
     aggregates.push_back(make_computed());  // structural stand-in for an aggregate expression
-    auto aggregate = duckdb::make_uniq<duckdb::LogicalAggregate>(
-      /*group_index=*/50, /*aggregate_index=*/51, std::move(aggregates));
+    auto aggregate =
+      duckdb::make_uniq<duckdb::LogicalAggregate>(duckdb::TableIndex(/*group_index=*/50),
+                                                  duckdb::TableIndex(/*aggregate_index=*/51),
+                                                  std::move(aggregates));
     aggregate->groups.push_back(make_ref(1));
     aggregate->children.push_back(std::move(child));
     return aggregate;
@@ -355,7 +359,7 @@ TEST_CASE("walk resolves aggregate group ordinals only", "[planner][scan_column_
   SECTION("multiple grouping sets preserve values but can repeat rows")
   {
     auto aggregate = make_aggregate(make_get(/*table_index=*/0, /*width=*/2));
-    aggregate->grouping_sets.push_back(duckdb::GroupingSet{0});
+    aggregate->grouping_sets.push_back(duckdb::GroupingSet{duckdb::ProjectionIndex(0)});
     aggregate->grouping_sets.push_back(duckdb::GroupingSet{});
     aggregate->ResolveOperatorTypes();
 
@@ -373,7 +377,7 @@ TEST_CASE("walk composes a three-level stack", "[planner][scan_column_origin]")
   auto const* raw = get.get();
 
   auto filter            = duckdb::make_uniq<duckdb::LogicalFilter>();
-  filter->projection_map = {2, 0};
+  filter->projection_map = {duckdb::ProjectionIndex(2), duckdb::ProjectionIndex(0)};
   filter->children.push_back(std::move(get));
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
@@ -406,7 +410,11 @@ TEST_CASE("scan column origin - inner join forwards both sides only for values",
 TEST_CASE("scan column origin - projection maps select the forwarded columns",
           "[planner][scan_column_origin]")
 {
-  auto join = make_join(duckdb::JoinType::LEFT, make_get(0, 3), make_get(1, 3), {2}, {0, 2});
+  auto join = make_join(duckdb::JoinType::LEFT,
+                        make_get(0, 3),
+                        make_get(1, 3),
+                        {duckdb::ProjectionIndex(2)},
+                        {duckdb::ProjectionIndex(0), duckdb::ProjectionIndex(2)});
   join->ResolveOperatorTypes();
   REQUIRE(join->types.size() == 3);
   CHECK(origin_of(*join, 0, kValues) == at{0, 2});
@@ -435,7 +443,7 @@ TEST_CASE("scan column origin - right semi and anti joins emit the right block o
           "[planner][scan_column_origin]")
 {
   for (auto const type : {duckdb::JoinType::RIGHT_SEMI, duckdb::JoinType::RIGHT_ANTI}) {
-    auto join = make_join(type, make_get(0, 2), make_get(1, 2), {}, {1});
+    auto join = make_join(type, make_get(0, 2), make_get(1, 2), {}, {duckdb::ProjectionIndex(1)});
     join->ResolveOperatorTypes();
     REQUIRE(join->types.size() == 1);
     for (auto const policy : {kValues, kRows}) {
@@ -505,7 +513,7 @@ TEST_CASE("walk locates join ordinals through non-empty projection maps",
     auto join = make_join(duckdb::JoinType::SEMI,
                           std::move(projection),
                           make_get(/*table_index=*/1, /*width=*/2),
-                          /*left_projection_map=*/{1});
+                          /*left_projection_map=*/{duckdb::ProjectionIndex(1)});
     join->ResolveOperatorTypes();
 
     REQUIRE(join->types.size() == 1);
@@ -523,7 +531,7 @@ TEST_CASE("walk locates join ordinals through non-empty projection maps",
     auto join = make_join(duckdb::JoinType::ANTI,
                           std::move(projection),
                           make_get(/*table_index=*/1, /*width=*/2),
-                          /*left_projection_map=*/{1});
+                          /*left_projection_map=*/{duckdb::ProjectionIndex(1)});
     join->ResolveOperatorTypes();
 
     REQUIRE(join->types.size() == 1);
@@ -539,7 +547,7 @@ TEST_CASE("walk locates join ordinals through non-empty projection maps",
     auto join             = make_join(duckdb::JoinType::SINGLE,
                           std::move(left),
                           std::move(right),
-                          /*left_projection_map=*/{2});
+                          /*left_projection_map=*/{duckdb::ProjectionIndex(2)});
     join->ResolveOperatorTypes();
 
     REQUIRE(join->types.size() == 3);  // one mapped left column + two right columns
@@ -562,7 +570,7 @@ TEST_CASE("walk locates join ordinals through non-empty projection maps",
                           make_get(/*table_index=*/0, /*width=*/2),
                           std::move(projection),
                           /*left_projection_map=*/{},
-                          /*right_projection_map=*/{1});
+                          /*right_projection_map=*/{duckdb::ProjectionIndex(1)});
     join->ResolveOperatorTypes();
 
     REQUIRE(join->types.size() == 1);
@@ -575,7 +583,7 @@ TEST_CASE("walk locates join ordinals through non-empty projection maps",
     auto join            = make_join(duckdb::JoinType::MARK,
                           std::move(left),
                           make_get(/*table_index=*/1, /*width=*/2),
-                          /*left_projection_map=*/{2});
+                          /*left_projection_map=*/{duckdb::ProjectionIndex(2)});
     join->ResolveOperatorTypes();
 
     REQUIRE(join->types.size() == 2);  // one mapped left column + the mark
@@ -592,34 +600,34 @@ TEST_CASE("walk refuses unmodelled operators", "[planner][scan_column_origin]")
 {
   SECTION("WINDOW")
   {
-    auto window = duckdb::make_uniq<duckdb::LogicalWindow>(/*window_index=*/60);
+    auto window = duckdb::make_uniq<duckdb::LogicalWindow>(duckdb::TableIndex(/*window_index=*/60));
     window->children.push_back(make_get(/*table_index=*/0, /*width=*/2));
     REQUIRE(resolve_pass_through_scan(*window, 0) == nullptr);
   }
   SECTION("UNION")
   {
-    auto set_op = duckdb::make_uniq<duckdb::LogicalSetOperation>(
-      /*table_index=*/61,
-      /*column_count=*/2,
-      make_get(/*table_index=*/0, /*width=*/2),
-      make_get(/*table_index=*/1, /*width=*/2),
-      duckdb::LogicalOperatorType::LOGICAL_UNION,
-      /*setop_all=*/true);
+    auto set_op =
+      duckdb::make_uniq<duckdb::LogicalSetOperation>(duckdb::TableIndex(/*table_index=*/61),
+                                                     /*column_count=*/2,
+                                                     make_get(/*table_index=*/0, /*width=*/2),
+                                                     make_get(/*table_index=*/1, /*width=*/2),
+                                                     duckdb::LogicalOperatorType::LOGICAL_UNION,
+                                                     /*setop_all=*/true);
     REQUIRE(resolve_pass_through_scan(*set_op, 0) == nullptr);
   }
   SECTION("UNNEST")
   {
-    auto unnest = duckdb::make_uniq<duckdb::LogicalUnnest>(/*unnest_index=*/62);
+    auto unnest = duckdb::make_uniq<duckdb::LogicalUnnest>(duckdb::TableIndex(/*unnest_index=*/62));
     unnest->children.push_back(make_get(/*table_index=*/0, /*width=*/2));
     REQUIRE(resolve_pass_through_scan(*unnest, 0) == nullptr);
   }
   SECTION("CTE_REF")
   {
     auto cte_ref = duckdb::make_uniq<duckdb::LogicalCTERef>(
-      /*table_index=*/63,
-      /*cte_index=*/0,
+      duckdb::TableIndex(/*table_index=*/63),
+      duckdb::TableIndex(/*cte_index=*/0),
       duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER},
-      duckdb::vector<duckdb::string>{"a"});
+      duckdb::vector<duckdb::Identifier>{"a"});
     REQUIRE(resolve_pass_through_scan(*cte_ref, 0) == nullptr);
   }
 }

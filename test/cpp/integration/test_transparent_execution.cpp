@@ -95,7 +95,7 @@ class TransparentExecutionFixture {
     return setting.ToString();
   }
 
-  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+  static std::vector<std::vector<std::string>> collect_rows(duckdb::QueryResult& result)
   {
     std::vector<std::vector<std::string>> rows;
     for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
@@ -139,8 +139,8 @@ class TransparentExecutionFixture {
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
     // Compare row data as strings, independent of output order.
-    auto& gpu_mat = gpu_result->Cast<duckdb::MaterializedQueryResult>();
-    auto& cpu_mat = cpu_result->Cast<duckdb::MaterializedQueryResult>();
+    auto& gpu_mat = *gpu_result;
+    auto& cpu_mat = *cpu_result;
     auto gpu_rows = collect_rows(gpu_mat);
     auto cpu_rows = collect_rows(cpu_mat);
 
@@ -347,7 +347,7 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
       second_error = result->GetError();
       return;
     }
-    auto& materialized = result->Cast<duckdb::MaterializedQueryResult>();
+    auto& materialized = *result;
     if (materialized.RowCount() != 1 || materialized.GetValue(0, 0).ToString() != "42") {
       second_error = "second query returned unexpected result";
     }

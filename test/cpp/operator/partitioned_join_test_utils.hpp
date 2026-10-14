@@ -100,10 +100,10 @@ struct partitioned_join_options {
       op::SiriusPhysicalOperatorType::PROJECTION, types, 1);
   };
 
-  duckdb::JoinCondition condition;
-  condition.left  = duckdb::make_uniq<duckdb::BoundReferenceExpression>(options.side_types[0], 0);
-  condition.right = duckdb::make_uniq<duckdb::BoundReferenceExpression>(options.side_types[0], 0);
-  condition.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::JoinCondition condition(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(options.side_types[0], 0),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(options.side_types[0], 0),
+    duckdb::ExpressionType::COMPARE_EQUAL);
   duckdb::vector<duckdb::JoinCondition> conditions;
   conditions.push_back(std::move(condition));
   tree.join = duckdb::make_uniq<op::sirius_physical_hash_join>(

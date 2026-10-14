@@ -39,6 +39,7 @@
 #include <duckdb/planner/operator/logical_set_operation.hpp>
 #include <duckdb/planner/operator/logical_top_n.hpp>
 #include <duckdb/planner/table_filter.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 #include <utility>
 
@@ -51,20 +52,20 @@ using sirius::planner::build_subtree_is_filtering;
 duckdb::unique_ptr<duckdb::LogicalGet> make_get()
 {
   return duckdb::make_uniq<duckdb::LogicalGet>(
-    /*table_index=*/0,
-    duckdb::TableFunction(),
+    duckdb::TableIndex(/*table_index=*/0),
+    duckdb::BoundTableFunction(duckdb::TableFunction()),
     /*bind_data=*/nullptr,
     duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER},
-    duckdb::vector<duckdb::string>{"a"});
+    duckdb::vector<duckdb::Identifier>{"a"});
 }
 
 duckdb::unique_ptr<duckdb::LogicalGet> make_filtered_get()
 {
   auto get = make_get();
   get->table_filters.PushFilter(
-    duckdb::ColumnIndex{0},
-    duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_GREATERTHAN,
-                                              duckdb::Value::INTEGER(5)));
+    duckdb::ProjectionIndex{0},
+    sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                  duckdb::Value::INTEGER(5)));
   return get;
 }
 
@@ -72,7 +73,8 @@ duckdb::unique_ptr<duckdb::LogicalProjection> make_projection_over(
   duckdb::unique_ptr<duckdb::LogicalOperator> child)
 {
   auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(
-    /*table_index=*/7, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+    duckdb::TableIndex(/*table_index=*/7),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
   projection->children.push_back(std::move(child));
   return projection;
 }
@@ -80,24 +82,25 @@ duckdb::unique_ptr<duckdb::LogicalProjection> make_projection_over(
 duckdb::unique_ptr<duckdb::LogicalDelimGet> make_delim_get()
 {
   return duckdb::make_uniq<duckdb::LogicalDelimGet>(
-    /*table_index=*/2, duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+    duckdb::TableIndex(/*table_index=*/2),
+    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
 }
 
 duckdb::unique_ptr<duckdb::LogicalCTERef> make_cte_ref()
 {
   return duckdb::make_uniq<duckdb::LogicalCTERef>(
-    /*table_index=*/3,
-    /*cte_index=*/0,
+    duckdb::TableIndex(/*table_index=*/3),
+    duckdb::TableIndex(/*cte_index=*/0),
     duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER},
-    duckdb::vector<duckdb::string>{"a"});
+    duckdb::vector<duckdb::Identifier>{"a"});
 }
 
 duckdb::unique_ptr<duckdb::LogicalAggregate> make_aggregate_over(
   duckdb::unique_ptr<duckdb::LogicalOperator> child)
 {
   auto aggregate = duckdb::make_uniq<duckdb::LogicalAggregate>(
-    /*group_index=*/4,
-    /*aggregate_index=*/5,
+    duckdb::TableIndex(/*group_index=*/4),
+    duckdb::TableIndex(/*aggregate_index=*/5),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
   aggregate->children.push_back(std::move(child));
   return aggregate;
@@ -132,13 +135,12 @@ duckdb::unique_ptr<duckdb::LogicalOrder> make_order_over(
 
 duckdb::unique_ptr<duckdb::LogicalSetOperation> make_set_operation(duckdb::LogicalOperatorType type)
 {
-  return duckdb::make_uniq<duckdb::LogicalSetOperation>(
-    /*table_index=*/8,
-    /*column_count=*/1,
-    make_get(),
-    make_get(),
-    type,
-    /*setop_all=*/false);
+  return duckdb::make_uniq<duckdb::LogicalSetOperation>(duckdb::TableIndex(/*table_index=*/8),
+                                                        /*column_count=*/1,
+                                                        make_get(),
+                                                        make_get(),
+                                                        type,
+                                                        /*setop_all=*/false);
 }
 
 }  // namespace
@@ -201,7 +203,8 @@ TEST_CASE("evidence propagates up through non-filtering operators", "[dynamic_fi
 TEST_CASE("a childless non-filtering operator carries no evidence", "[dynamic_filter][evidence]")
 {
   auto const projection = duckdb::make_uniq<duckdb::LogicalProjection>(
-    /*table_index=*/1, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+    duckdb::TableIndex(/*table_index=*/1),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
   REQUIRE_FALSE(build_subtree_is_filtering(*projection));
 }
 
@@ -245,14 +248,16 @@ TEST_CASE("malformed projections carry no opaque fallback evidence", "[dynamic_f
   SECTION("a childless projection")
   {
     auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(
-      /*table_index=*/6, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+      duckdb::TableIndex(/*table_index=*/6),
+      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
     REQUIRE_FALSE(build_relation_is_opaque(*projection));
   }
 
   SECTION("a projection with a null child")
   {
     auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(
-      /*table_index=*/6, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+      duckdb::TableIndex(/*table_index=*/6),
+      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
     projection->children.push_back(nullptr);
     REQUIRE_FALSE(build_relation_is_opaque(*projection));
   }

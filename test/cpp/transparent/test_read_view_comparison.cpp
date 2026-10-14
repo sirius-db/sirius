@@ -264,7 +264,7 @@ TEST_CASE("Pre-declined scan receives a contract without a candidate view",
   auto registry = std::make_shared<read_view_registry>();
   duckdb::TableFunction function("iceberg_scan", {}, nullptr, nullptr);
   sirius::op::sirius_physical_table_scan scan({},
-                                              std::move(function),
+                                              duckdb::BoundTableFunction(function),
                                               nullptr,
                                               {},
                                               {},

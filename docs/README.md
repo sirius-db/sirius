@@ -97,9 +97,9 @@ Execution is out-of-core with tiered memory management (GPU/host/disk), automati
 Use Sirius through DuckDB's Python API: load the extension, execute SQL, and fetch results.
 Supported queries run on the GPU automatically, just as they do in the DuckDB shell.
 
-The default Pixi environment includes DuckDB's Python package. Its DuckDB version must match
-the version used to build the Sirius extension. Forked or nightly DuckDB builds may also require
-a Python package built from compatible source.
+The v2 extension requires the exact DuckDB revision pinned in this repository.
+Use the built CLI above. The default environment's DuckDB 1.5 Python package cannot
+load this extension; Python use requires a package built from the matching revision.
 
 Save this example as `example.py` in the repository root and replace `/path/to/lineitem.parquet`
 with your TPC-H Parquet file. `allow_unsigned_extensions` allows loading the locally built
@@ -134,6 +134,10 @@ pixi run python example.py
 
 For an example using TPC-H data from Parquet files or a DuckDB database, see the
 [Python benchmark script](../test/tpch_performance/performance_test.py).
+
+The Python benchmark and power/throughput runners require a Python DuckDB client
+built from the pinned v2 revision; the default environment's 1.5 client cannot
+load this extension. The CLI-based scripts use the built v2 host.
 
 ## Pinning Tables for Hot Runs
 
@@ -257,7 +261,10 @@ Sirius is under active development. Notable current limitations include:
 - **Data Type Coverage:** Sirius currently supports commonly used data types including `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, `VARCHAR`, `DATE`, `TIMESTAMP`, and `DECIMAL`. We are actively working on supporting additional data types—such as nested types.
 - **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
 
-For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). **If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.**
+- **DuckDB v2 fallback errors:** If runtime CPU fallback also fails, the query can report `Interrupted` instead of the underlying error. Tracked in [#2145](https://github.com/sirius-db/sirius/issues/2145).
+- **DuckDB v2 regex rewrites:** Whole-input backreference replacements, including the ClickBench Q28 URL pattern, are rewritten to `regexp_extract(..., 'k')` and currently require CPU fallback instead of using the GPU regex implementation. Tracked in [#2146](https://github.com/sirius-db/sirius/issues/2146).
+
+For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). Unsupported types and operators fall back to DuckDB CPU execution when fallback is enabled.
 
 ## Contributors and Partners
 

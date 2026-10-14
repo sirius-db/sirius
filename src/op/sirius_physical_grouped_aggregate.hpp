@@ -55,7 +55,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
     duckdb::vector<std::unique_ptr<sirius::ast::node>> groups,
     duckdb::vector<duckdb::GroupingSet> grouping_sets,
-    duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions,
+    duckdb::vector<duckdb::unsafe_vector<duckdb::ProjectionIndex>> grouping_functions,
     std::size_t estimated_cardinality,
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity,
@@ -77,8 +77,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   /// (planner::resolve_decimal_sum_input_bounds); nullopt when unproven.
   std::vector<std::optional<std::uint64_t>> cudf_aggregate_input_max_abs;
 
-  // AVG decomposition metadata
+  // Partial aggregate layout and finalization metadata
   std::vector<AggregateSlot> aggregate_slots;
+  duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;
   bool has_count_distinct = false;
 
@@ -106,6 +107,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   //! Runtime schema of the local COUNT(DISTINCT) accumulator. The local aggregate and PARTITION
   //! carry LIST sets; MERGE_GROUP_BY later converts those sets to the declared BIGINT count.
   [[nodiscard]] duckdb::vector<sirius::logical_type> get_count_distinct_local_output_types() const;
+
+  [[nodiscard]] bool has_stddev_samp() const;
 
   // Source interface
   bool is_source() const override { return true; }
