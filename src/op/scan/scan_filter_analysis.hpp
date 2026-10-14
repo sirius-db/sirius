@@ -142,6 +142,15 @@ sirius::pushdown_request build_pushdown_request(scan_filter_analysis const& anal
  * that happened to is a per-batch fact the decoder reports
  * (@c sirius::pushdown_outcome::predicate_columns).
  */
+enum class predicate_stage { untouched, pruning_only, answer, enforced };
+
+// IDs are indices in the immutable residual program, never column IDs.
+struct predicate_progress {
+  std::size_t conjunct;
+  predicate_stage stage;
+  std::optional<std::size_t> answer_slot;
+};
+
 class residual_filter {
  public:
   residual_filter() = default;
@@ -170,12 +179,17 @@ class residual_filter {
   [[nodiscard]] std::unique_ptr<sirius::ast::node> against(
     std::vector<std::size_t> const& answered_positions, bool answers_enforced = false) const;
 
+  [[nodiscard]] std::unique_ptr<sirius::ast::node> against_progress(
+    std::span<predicate_progress const> progress) const;
+  [[nodiscard]] std::size_t size() const noexcept { return _conjuncts.size(); }
+
  private:
   struct conjunct {
     std::unique_ptr<sirius::ast::node> comparison;
     /// Set when this conjunct's column can arrive as the answer; the batch
     /// position that answer occupies.
     std::optional<std::size_t> answered_at;
+    std::size_t value_at;
   };
   std::vector<conjunct> _conjuncts;
 };
