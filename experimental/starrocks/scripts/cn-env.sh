@@ -7,6 +7,16 @@
 #
 # NIXL_PREFIX / UCX_PREFIX / NIXL_PLUGIN_DIR may also be overridden individually; values
 # already exported by the operator always win.
+#
+# Usage: `source experimental/starrocks/scripts/cn-env.sh && cargo build --release` (the pixi
+# cn-build / cn-test / cn-run / cluster tasks do this). Source it BEFORE the first build:
+# nixl-sys's build script doesn't re-run when NIXL_PREFIX or NIXL_NO_STUBS_FALLBACK change, so a
+# build made without it keeps the stub, which the CN refuses at start-up, until
+# `cargo clean -p nixl-sys`.
+#
+# Run-time settings the CN reads (not set here): SIRIUS_CN_NIXL_WINDOW (WRITEs in flight per hop,
+# default 4) and SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS (longest a WRITE may take, default 30); both
+# must be positive integers. Pin each CN to exactly one GPU with CUDA_VISIBLE_DEVICES=<n>.
 
 _here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)   # experimental/starrocks/scripts
 SR_DIR=$(cd "$_here/.." && pwd)                       # experimental/starrocks
