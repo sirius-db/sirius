@@ -84,7 +84,8 @@ duckdb::DataTable& resolve_storage(duckdb::Connection& con, const std::string& t
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto entry =
+    schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
@@ -135,7 +136,7 @@ TEST_CASE("insert delta: capture boundary math and transient segment lanes",
   REQUIRE(plan.n_total == kBase + kDelta);
   REQUIRE(plan.delta_rows() == kDelta);
   REQUIRE(plan.buffer_manager != nullptr);
-  REQUIRE(plan.transaction.transaction_id != 0);
+  REQUIRE(plan.transaction.GetTransactionId() != 0);
 
   REQUIRE(plan.row_groups.size() == 1);
   auto const& rg = plan.row_groups[0];
@@ -145,19 +146,20 @@ TEST_CASE("insert delta: capture boundary math and transient segment lanes",
   REQUIRE(rg.row_group_start == kBase);
   REQUIRE(rg.columns.size() == 3);
 
-  // Fixed-width columns: one transient data segment, rebased to slice start,
-  // sized exactly rows * type_size.
-  auto const& col_k = rg.columns[0];
-  REQUIRE(col_k.data_segments.size() == 1);
-  REQUIRE(col_k.data_segments[0].is_transient);
-  REQUIRE(col_k.data_segments[0].segment_start == 0);
-  REQUIRE(col_k.data_segments[0].segment_count == kDelta);
-  REQUIRE(col_k.data_segments[0].bytes_size == kDelta * sizeof(int32_t));
-  REQUIRE_FALSE(col_k.validity_segments.empty());
-
-  auto const& col_v = rg.columns[1];
-  REQUIRE(col_v.data_segments.size() == 1);
-  REQUIRE(col_v.data_segments[0].bytes_size == kDelta * sizeof(int64_t));
+  // V2 suballocates multiple transient segments. Together they must cover the delta exactly.
+  for (std::size_t col = 0; col < 2; ++col) {
+    auto const& data = rg.columns[col].data_segments;
+    REQUIRE_FALSE(data.empty());
+    std::size_t rows = 0;
+    for (auto const& segment : data) {
+      REQUIRE(segment.is_transient);
+      REQUIRE(segment.segment_start == rows);
+      REQUIRE(segment.bytes_size == segment.segment_count * types[col].fixed_width_byte_size());
+      rows += segment.segment_count;
+    }
+    REQUIRE(rows == kDelta);
+  }
+  REQUIRE_FALSE(rg.columns[0].validity_segments.empty());
 
   // Varchar: the whole used extent is staged and max_string_length is filled.
   auto const& col_s = rg.columns[2];
@@ -396,14 +398,9 @@ TEST_CASE("insert delta: all-NULL constant validity is captured, not skipped",
   exec_ok(*env.con, "ROLLBACK");
 }
 
-TEST_CASE("insert delta: appends into the boundary row group are captured",
-          "[duckdb_insert_delta][scan]")
+TEST_CASE("insert delta: small appends open a fresh row group in v2", "[duckdb_insert_delta][scan]")
 {
   delta_test_db env;
-  // A PRIMARY KEY makes DuckDB append into the existing tail row group
-  // instead of opening a fresh one, so the delta begins inside the last
-  // cached row group (k_offset > 0). The skeleton walk starts at that
-  // boundary row group and must not skip past it.
   exec_ok(*env.con, "CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER)");
   exec_ok(*env.con, "INSERT INTO t SELECT range, range FROM range(10000)");
   exec_ok(*env.con, "CHECKPOINT");
@@ -419,11 +416,36 @@ TEST_CASE("insert delta: appends into the boundary row group are captured",
   REQUIRE(plan.n_total == 10002);
   REQUIRE(plan.row_groups.size() == 1);
   auto const& rg = plan.row_groups[0];
-  REQUIRE(rg.row_group_index == 0);  // the boundary row group itself
-  REQUIRE(rg.k_offset == 10000);
+  REQUIRE(rg.row_group_index == 1);
+  REQUIRE(rg.k_offset == 0);
   REQUIRE(rg.row_count == 2);
   REQUIRE(rg.row_group_start == 10000);
   REQUIRE(rg.columns.size() == 2);
+  exec_ok(*env.con, "ROLLBACK");
+}
+
+TEST_CASE("insert delta: a slice starts inside a transient segment", "[duckdb_insert_delta][scan]")
+{
+  delta_test_db env;
+  exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  std::vector<sirius::logical_type> types{sirius::logical_type::make(sirius::type_id::INTEGER)};
+  std::vector<duckdb::storage_t> const cols{0};
+  auto plan = capture_insert_delta_plan(storage, *env.con->context, 9992, cols, types);
+  REQUIRE(plan.n_total == 10000);
+  REQUIRE(plan.row_groups.size() == 1);
+  auto const& rg = plan.row_groups[0];
+  REQUIRE(rg.row_group_index == 0);
+  REQUIRE(rg.k_offset == 9992);
+  REQUIRE(rg.row_count == 8);
+  REQUIRE(rg.row_group_start == 9992);
+  std::vector<std::uint8_t> slab(rg.transient_staging_bytes);
+  copy_delta_row_group(rg, *plan.buffer_manager, slab.data());
+  auto const& segments = rg.columns[0].data_segments;
+  REQUIRE(segments.size() == 1);
+  std::int32_t expected[] = {9992, 9993, 9994, 9995, 9996, 9997, 9998, 9999};
+  REQUIRE(std::memcmp(slab.data() + segments[0].slab_offset, expected, sizeof(expected)) == 0);
   exec_ok(*env.con, "ROLLBACK");
 }
 

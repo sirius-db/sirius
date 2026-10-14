@@ -148,7 +148,9 @@ TEST_CASE("dispose_on_idle reclaims a disposed request's chunks on the next swee
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_dispose();
 
-  sirius_scan_manager manager{dispose_on_idle_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, dispose_on_idle_config(), *memory, topology};
   auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -190,7 +192,9 @@ TEST_CASE("dispose_on_idle keeps a chunk a live request still shares", "[cache][
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_dispose();
 
-  sirius_scan_manager manager{dispose_on_idle_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, dispose_on_idle_config(), *memory, topology};
   auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -255,7 +259,8 @@ TEST_CASE("scan inputs populate the cache without a readahead manager",
   cfg.cache.eviction      = sirius::io::cache::eviction_policy::lru;
   cfg.max_readahead_scans = 0;
   cfg.apply_cache_mode();
-  sirius_scan_manager manager{cfg, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *memory, topology};
   auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -300,7 +305,9 @@ TEST_CASE("Deferred scan inputs initialize prefetch only when admitted",
   };
   temp_data_file file(8ull << 20);
   auto memory = initialize_memory_manager(1);
-  sirius_scan_manager manager{dispose_on_idle_config(), *memory, single_gpu_index_for_dispose()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, dispose_on_idle_config(), *memory, single_gpu_index_for_dispose()};
   auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   auto ds = manager.create_datasource(file.path.string());

@@ -131,7 +131,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Init build submodules
-        run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+        run: git submodule update --init --depth=1 --jobs 4 duckdb sirius-duckdb/duckdb substrait cucascade
 
       - name: Init vcpkg with full history for version overrides
         if: matrix.build.environment == 'vcpkg'
@@ -186,24 +186,12 @@ jobs:
           grep -E '(FAILED:|: error:|: fatal error:)' /tmp/build.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Python DuckDB version check
-        if: >-
-          matrix.build.arch == 'x64' && matrix.build.compiler == 'gcc'
-          && matrix.build.build-type == 'release' && matrix.build.environment == 'default'
-          && matrix.build.cudf-channel == 'stable'
+      - name: Check the pinned DuckDB revisions
         run: |
-          pixi run --locked python - <<'PY'
-          import json
-          from pathlib import Path
-
-          import duckdb
-
-          presets = json.loads(Path("cmake/CMakePresets.json").read_text())
-          base = next(preset for preset in presets["configurePresets"] if preset["name"] == "base")
-          expected = base["cacheVariables"]["OVERRIDE_GIT_DESCRIBE"]
-          actual = duckdb.sql("SELECT version()").fetchone()[0]
-          assert actual == expected, f"Python DuckDB {actual} does not match Sirius DuckDB {expected}"
-          PY
+          engine=$(git rev-parse HEAD:duckdb)
+          wrapper=$(git rev-parse HEAD:sirius-duckdb/duckdb)
+          [[ "$engine" == "$wrapper" ]]
+          grep -q "duckdb_version: $engine" .github/workflows/distribution.yml
 
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the

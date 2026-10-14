@@ -89,7 +89,7 @@ replay_admission admit_cpu_replay(duckdb::ClientContext& context,
        context.transaction.ActiveTransaction().transaction_validity.IsInvalidated())) {
     return {false, late_failure_condition::transaction_invalid};
   }
-  if (context.interrupted.load()) { return {false, late_failure_condition::cancelled}; }
+  if (context.IsInterrupted()) { return {false, late_failure_condition::cancelled}; }
   if (non_rollbackable_state) { return {false, late_failure_condition::non_rollbackable}; }
   return {true, std::nullopt};
 }

@@ -140,6 +140,7 @@ def main() -> int:
 
     with MANIFEST.open("rb") as fh:
         reader = fastavro.reader(fh)
+        metadata = dict(reader.metadata)
         schema = reader.writer_schema
         records = list(reader)
 
@@ -172,7 +173,7 @@ def main() -> int:
 
     shutil.copy2(MANIFEST, MANIFEST.with_suffix(".avro.bak"))
     with MANIFEST.open("wb") as fh:
-        fastavro.writer(fh, schema, records, codec="null")
+        fastavro.writer(fh, schema, records, codec="null", metadata=metadata)
     print(f"wrote {MANIFEST.name}: content_offset={len(MAGIC)} size={len(blob)}")
 
     print("validating:")

@@ -33,6 +33,7 @@
 #include <duckdb/storage/data_table.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <op/scan/duckdb_native_metadata_cache.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -92,7 +93,7 @@ TEST_CASE("metadata walk microbenchmark on an unpinned table", "[.][walk_bench]"
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table);
+  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table));
   REQUIRE(entry);
   auto& storage = entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 
@@ -134,10 +135,12 @@ TEST_CASE("metadata walk microbenchmark on an unpinned table", "[.][walk_bench]"
   }
 
   auto make_filter_set = [&](int day_offset) {
-    auto filters                   = std::make_unique<duckdb::TableFilterSet>();
-    auto date                      = duckdb::Date::FromDate(1998, 9, 1 + (day_offset % 27));
-    filters->filters[shipdate_key] = duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO, duckdb::Value::DATE(date));
+    auto filters = std::make_unique<duckdb::TableFilterSet>();
+    auto date    = duckdb::Date::FromDate(1998, 9, 1 + (day_offset % 27));
+    filters->SetFilterByColumnIndex(
+      duckdb::ProjectionIndex(shipdate_key),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO,
+                                    duckdb::Value::DATE(date)));
     return filters;
   };
 

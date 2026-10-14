@@ -55,7 +55,7 @@ table_filter_conjunct string_equality(std::size_t primary_index, std::size_t bat
     duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value("DELIVER IN PERSON"));
   return {primary_index,
           batch_position,
-          duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+          duckdb::BoundComparisonExpression::Create(
             duckdb::ExpressionType::COMPARE_EQUAL, std::move(column), std::move(constant))};
 }
 

@@ -93,7 +93,7 @@ ninja = ">=1.13.2,<2"
 ccache = ">=4.14,<5"
 
 [feature.check.tasks]
-duckdb-substrait-build = {cmd = "bash scripts/build-duckdb-substrait.sh",description = "Build DuckDB v1.5.5 with the repo's substrait consumer as a loadable extension (+ shell) under .duckdb-substrait/"}
+duckdb-substrait-build = {cmd = "bash scripts/build-duckdb-substrait.sh",description = "Build DuckDB v1.5.5 with the pinned pre-v2 substrait consumer as a loadable extension (+ shell) under .duckdb-substrait/"}
 tpch-expected = {cmd = "python scripts/validate_tpch_results.py expected",description = "Generate tests/expected/tpch-sf1/ from the parquet dataset with DuckDB (pass --data DIR)"}
 tpch-cpu-diff = {cmd = "bash scripts/cpu-diff.sh",description = "CPU differential: export the corpus plans, run them through DuckDB's substrait consumer, validate against the expected results"}
 

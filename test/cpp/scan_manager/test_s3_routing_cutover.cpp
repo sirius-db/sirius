@@ -506,7 +506,9 @@ TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx", "[s3
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
     *fixture.memory,
     fixture.topology};
@@ -574,7 +576,9 @@ TEST_CASE("scan_manager create_datasource normalizes file URI paths before routi
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
     *fixture.memory,
     fixture.topology};
@@ -591,7 +595,9 @@ TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio", "[s3][
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::kvikio),
     *fixture.memory,
     fixture.topology};
@@ -613,7 +619,8 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query", "[s3][routing
   scan_manager_fixture fixture;
   auto cfg       = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   cfg.cache.mode = sirius::io::cache::cache_mode::sirius;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
   REQUIRE(datasource != nullptr);
@@ -649,7 +656,8 @@ TEST_CASE("scan_manager tolerates a routed S3 ioctx when cache.mode is none", "[
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   REQUIRE_FALSE(cfg.cache.use_prefetching_cache());
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
   REQUIRE(datasource != nullptr);
@@ -670,7 +678,8 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   // test server to serve the burst, but still per-reactor rather than global.
   cfg.rest.max_connections = 1;
   cfg.rest_n_reactors      = 2;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   // Routes s3:// to the REST ioctx and starts its reactors; the size HEAD it
   // costs is the baseline the warm-up requests are counted on top of.
@@ -712,7 +721,8 @@ TEST_CASE("warmup is a no-op for backends with nothing to connect", "[s3][routin
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   // The default ioctx is the local uring one: a file it can open is already
   // "connected", so the base class no-op is the whole implementation.
@@ -728,7 +738,8 @@ TEST_CASE("rest dispatch spreads a request over two reactors and rotates when id
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   cfg.rest_n_reactors = 4;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/pool.parquet");
   auto* rest_ctx  = require_rest_ioctx(datasource);
@@ -763,7 +774,9 @@ TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independentl
   auto parquet_bytes      = read_binary_file(fixture_path);
   range_s3_server server(std::move(parquet_bytes));
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
     *fixture.memory,
     fixture.topology};
@@ -804,7 +817,9 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
   auto parquet_bytes      = read_binary_file(fixture_path);
   range_s3_server server(std::move(parquet_bytes));
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
+    scan_lifecycle,
     make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
     *fixture.memory,
     fixture.topology};

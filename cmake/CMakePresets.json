@@ -48,7 +48,6 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_LINKER_TYPE": "MOLD",
         "EXPORT_DYNAMIC_SYMBOLS": "ON",
-        "OVERRIDE_GIT_DESCRIBE": "v1.5.6",
         "SIRIUS_BUILD_TESTS": "ON"
       },
       "generator": "Ninja",

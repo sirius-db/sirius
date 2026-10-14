@@ -137,7 +137,9 @@ TEST_CASE("a replacing pin does not redirect an active query's origin", "[late_m
   ::cuda::stream_ref const stream{cudaStream_t{}};
   manager_fixture fixture;
   auto* space = fixture.memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  sirius_scan_manager manager{scan_manager_config{}, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, scan_manager_config{}, *fixture.memory, fixture.topology};
 
   pin_once(manager, *space, 128, stream);
   auto const first = capture_origin(manager);
@@ -168,7 +170,9 @@ TEST_CASE("unpin keeps an active query's origin valid until its owner releases",
   ::cuda::stream_ref const stream{cudaStream_t{}};
   manager_fixture fixture;
   auto* space = fixture.memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  sirius_scan_manager manager{scan_manager_config{}, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, scan_manager_config{}, *fixture.memory, fixture.topology};
 
   pin_once(manager, *space, 128, stream);
   auto const origin = capture_origin(manager);
@@ -193,7 +197,9 @@ TEST_CASE("pin, unpin, re-pin keeps active origins on distinct entries",
   ::cuda::stream_ref const stream{cudaStream_t{}};
   manager_fixture fixture;
   auto* space = fixture.memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  sirius_scan_manager manager{scan_manager_config{}, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, scan_manager_config{}, *fixture.memory, fixture.topology};
 
   pin_once(manager, *space, 128, stream);
   auto const from_first_query = capture_origin(manager);

@@ -1306,21 +1306,19 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
 }  // namespace
 
 sirius_scan_manager::sirius_scan_manager(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   const scan_manager_config& config,
   cucascade::memory::memory_reservation_manager& reservation_manager,
   std::shared_ptr<const sirius::memory::topology_index> topology_index,
   std::shared_ptr<op::scan::physical_check_counters> physical_counters)
-  : _config(validate_scan_manager_config(config)),
+  : _query_lifecycle(lifecycle),
+    _config(validate_scan_manager_config(config)),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
-    // num_threads + k_max_concurrent_queries, not num_threads + 1: each query's coalescer
-    // sequencer task BLOCKS (worker_loop -> process_provider_inputs -> queue.wait_dequeue)
-    // and is unblocked only by that query's own split_provider tasks, which run on this same
-    // pool. With Q concurrent queries, Q threads are parked in sequencers at all times, so
-    // sizing for a single sequencer would let Q queries consume the entire working budget
-    // and deadlock by starvation. See k_max_concurrent_queries for the bound and its TODO.
-    _thread_pool(_config.thread_pool.num_threads + k_max_concurrent_queries,
+    // Query execution is serialized by SiriusContext's lifecycle slot. Reserve one extra
+    // worker for the query's blocking coalescer so its producers retain their working budget.
+    _thread_pool(_config.thread_pool.num_threads + 1,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _ioctx_registry(_config, reservation_manager)
@@ -1983,20 +1981,6 @@ void sirius_scan_manager::prepare_for_query(
   // locally and never leaves a half-built entry visible to reset() or a concurrent prepare.
   {
     std::lock_guard lk{_query_states_mutex};
-    if (_query_states.size() >= static_cast<std::size_t>(k_max_concurrent_queries)) {
-      // The pool is sized for k_max_concurrent_queries parked sequencers; past that, each
-      // extra query eats into the working budget and at pool size it deadlocks outright.
-      // Loud rather than silent, so the missing config option reports itself the first time
-      // real concurrency is exercised. See k_max_concurrent_queries.
-      SIRIUS_LOG_WARN(
-        "[sirius_scan_manager::prepare_for_query] registering query {} brings the live query "
-        "count to {}, above the {} the scan thread pool is sized for; scan throughput will "
-        "degrade and {} concurrent queries would deadlock. Raise k_max_concurrent_queries.",
-        query_id,
-        _query_states.size() + 1,
-        k_max_concurrent_queries,
-        _thread_pool.num_threads() + k_max_concurrent_queries);
-    }
     _query_states.emplace(query_id, state);
   }
 
@@ -2008,16 +1992,20 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
 {
   std::shared_ptr<preparation_admission> admission;
   for (auto const& entry : state.scans) {
-    auto const* info = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(
-      &entry.op->get_ingestible().table_info());
+    auto& ingestible = entry.op->get_ingestible();
+    auto const* info =
+      dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&ingestible.table_info());
     if (!info || !info->deferred) continue;
     if (!admission) {
-      admission    = info->deferred->admission;
+      admission    = info->deferred->admission();
       state.ledger = admission->consume();
-    } else if (admission != info->deferred->admission) {
+    } else if (admission != info->deferred->admission()) {
       throw std::logic_error("Iceberg scans must share the statement admission");
     }
-    info->deferred->ledger = state.ledger;
+    auto* iceberg = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&ingestible);
+    if (!iceberg) throw std::logic_error("deferred DV preparation requires an Iceberg ingestible");
+    iceberg->begin_preparation(
+      std::make_shared<op::scan::iceberg_dv_attempt>(info->deferred, state.ledger));
   }
   state.coordinator = std::make_unique<preparation_coordinator>(
     *state.completion, *state.dispatcher, state.preparation);
@@ -2083,7 +2071,8 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
     connectors.push_back(scan.op->get_shared_split_connector());
   }
 
-  state.prefetcher = std::make_unique<memory_prefetcher>(cfg, std::move(connectors), gpu_space);
+  state.prefetcher =
+    std::make_unique<memory_prefetcher>(cfg, std::move(connectors), gpu_space, _query_lifecycle);
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
@@ -2251,6 +2240,10 @@ void sirius_scan_manager::install_s3_config(std::string_view path,
 
 void sirius_scan_manager::query_scan_manager_state::drain() noexcept
 {
+  // The engine retires scans while their operators are alive. Window cleanup and state
+  // destruction repeat this barrier after a prepared statement may have released its plan.
+  // Keep providers alive for batch disposal, but never revisit the borrowed operators.
+  if (std::exchange(drained, true)) { return; }
   if (coordinator) coordinator->request_stop(stop_reason::normal_eos);
   if (completion && completion->injections)
     completion->release_footer_for_testing(completion->injections->hold_footer_index);
@@ -2288,6 +2281,11 @@ std::shared_ptr<sirius_scan_manager::query_scan_manager_state> sirius_scan_manag
   std::lock_guard lk{_query_states_mutex};
   auto it = _query_states.find(query_id);
   return it == _query_states.end() ? nullptr : it->second;
+}
+
+void sirius_scan_manager::quiesce(sirius::query_id_t query_id)
+{
+  if (auto state = get_query_state(query_id)) { state->drain(); }
 }
 
 void sirius_scan_manager::reset(sirius::query_id_t query_id)
@@ -3618,7 +3616,7 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
     plan.survivor_chunk_indices.push_back(c);
   }
   if (n_chunks == 0 || !entry.zone_maps.has_stats() || table_filters == nullptr ||
-      table_filters->filters.empty() || column_ids == nullptr) {
+      !table_filters->HasFilters() || column_ids == nullptr) {
     return plan;
   }
 
@@ -3636,8 +3634,9 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
     std::size_t entry_pos;
   };
   std::vector<usable_filter> usable;
-  for (auto const& [col_idx, filter] : table_filters->filters) {
-    if (!filter) { continue; }
+  for (auto const& filter_entry : *table_filters) {
+    auto const col_idx = filter_entry.GetIndex().GetIndex();
+    auto const* filter = &filter_entry.Filter();
     if (col_idx >= column_ids->size()) { continue; }  // defensive
     auto const& column_id = (*column_ids)[col_idx];
     // rowid / empty / virtual sentinels have no storage stats.
@@ -3650,7 +3649,7 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
     auto const pos = it->second;
     if (pos >= entry.zone_maps.column_count()) { continue; }  // absent for this column
     if (!filter_safe_for_stats(*filter, entry.zone_maps.column_type(pos))) { continue; }
-    usable.push_back({filter.get(), pos});
+    usable.push_back({filter, pos});
   }
   if (usable.empty()) { return plan; }
 
@@ -3877,8 +3876,8 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
           request.entry_name               = pinned_name;
           request.first_consuming_contract = op->contract_id();
           request.profiles                 = duckdb_info->profiles;
-          request.storage_version =
-            duckdb_info->storage->GetAttached().GetStorageManager().GetStorageVersion();
+          request.storage_version          = static_cast<uint64_t>(
+            duckdb_info->storage->GetAttached().GetStorageManager().GetStorageVersion());
           state.pending_insert_delta_jobs.push_back(std::move(request));
           delta_request = std::prev(state.pending_insert_delta_jobs.end());
         }

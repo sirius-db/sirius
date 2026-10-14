@@ -182,9 +182,9 @@ TEST_CASE_METHOD(CrossProductFixture,
   INFO(result->ToString());
   REQUIRE_FALSE(result->HasError());
   // Each value of 0..49999 appears 50000 times.
-  CHECK(result->GetValue(0, 0).ToString() == "2500000000");
-  CHECK(result->GetValue(1, 0).ToString() == "62498750000000");
-  CHECK(result->GetValue(2, 0).ToString() == "62498750000000");
+  CHECK(result->Collection().GetValue(0, 0).ToString() == "2500000000");
+  CHECK(result->Collection().GetValue(1, 0).ToString() == "62498750000000");
+  CHECK(result->Collection().GetValue(2, 0).ToString() == "62498750000000");
 }
 
 TEST_CASE_METHOD(CrossProductFixture,
