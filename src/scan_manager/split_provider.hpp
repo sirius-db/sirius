@@ -104,6 +104,8 @@ class split_provider {
    */
   virtual op::scan::gpu_ingestible::metadata_scan_task_t next_split_provider();
 
+  virtual op::scan::gpu_ingestible::preparation_claim claim_preparation();
+
   /// Accessor for the borrowed ingestible. Callers that need a
   /// @c shared_ptr<gpu_ingestible> can promote via
   /// `provider.get_ingestible().shared_from_this()`.

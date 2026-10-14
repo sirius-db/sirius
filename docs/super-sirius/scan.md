@@ -674,6 +674,59 @@ graph TD
 
 The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator. At query prep the scan manager either serves the operator from a pinned cache (`cached_databatch_provider`) or builds a `split_provider` over the ingestible. The provider dispatches one metadata task per file (parquet) or row-group range (duckdb-native); the query-thread coordinator coalesces and balances each batch, validates publication before prefetch, then pushes splits onto the operator's connector. The task creator turns each pulled split into a `gpu_pipeline_task` on the split's preferred GPU; `execute()` materializes, optionally post-filters/projects, and emits a `data_batch` to the downstream pipeline.
 
+## Shared materialization components
+
+`parquet_gpu_ingestible` and `iceberg_gpu_ingestible` compose `parquet_scan_core`.
+The core retains file enumeration, footer preparation, coalescing, reader options,
+and the existing bulk/general decoder selection. Iceberg owns snapshot and delete
+applicability, suppresses row filtering during decode when positions are needed,
+and delegates the mask operation to `positional_visibility`.
+
+`finish_materialization()` orders mapping, visibility, residual evaluation, and
+projection. A batch carries its contract and execution generation, cardinality,
+completion flags, and per-conjunct predicate progress. Pruning is not enforcement;
+an answer is a bound BOOL8 slot. `residual_filter::against_progress()` refuses
+unknown conjuncts and attempts to reconstruct values overwritten by answers.
+The legacy Parquet bridge retains its existing AST, survivor rowid, and scan-plan
+assembly. Its one expression-completion flag is derived from legacy state at the
+bridge; it does not introduce a second mutable conjunct map.
+
+Source lineage is either original-file runs, explicit original positions, or
+unavailable. Runs retain offsets across pruned row groups. Visibility requires
+lineage until it has completed; it must not use pinned-input survivor rowids as
+file positions. An internal INT8 carrier preserves positive cardinality for a
+zero-column batch. A zero-row batch does not mean end-of-stream.
+
+Two reusable entry points additionally exercise this finish contract:
+
+- `materialize_mapped_parquet()` takes an immutable `field_id_mapping`, the opened
+  datasource, retained footer, physical contract, and exact row groups. The mapper
+  binds physical names by field ID, reorders fields, fills explicitly typed defaults,
+  and permits INT32-to-INT64 conversion only when approved at compilation. It checks
+  the decoded dtype before conversion and preserves original file row positions.
+  The current core profile accepts flat boolean, integer, float, and string fields.
+  `materialize_mapped_parquet_runs()` coalesces compatible admitted units and flushes
+  at mapping/default/original-schema boundaries. Different object identities can
+  coalesce; repeated files retain repeated rows and separate lineage. The caller
+  reserves decoded memory plus `additional_bytes()` for each admitted run, including
+  all results retained in the returned vector. These
+  entry points do not enable Iceberg schema evolution in SQL.
+- `import_arrow_host()` accepts an owned Arrow C Data tree, its bound input schema,
+  task memory resource, and retirement lane. The flat host profile accepts booleans,
+  signed/unsigned integers, FLOAT32/64, UTF8, DATE32, microsecond timestamps without
+  timezone, and DECIMAL128 (precision 1–38, nonnegative scale no larger than precision).
+  It refuses nested, dictionary, extension, binary, large-string, and device arrays.
+  Decimal imports normalize to the approved DECIMAL128 carrier. Input buffers and
+  metadata must be readable producer-owned C Data memory; raw pointers do not provide
+  allocation extents. The producer must detach statement-affine callbacks before
+  ownership transfer. Input/staging capacity remains owned through retirement, even
+  if import throws. The caller reserves output/temporary memory and drains the lane.
+
+A direct GPU reader can supply an owning batch to the same validator and finish
+without an Arrow or CPU-vector round trip. These helpers do not register a new SQL
+source adapter or relax the existing Iceberg equality-delete, snapshot, schema, or
+remote-DV gates.
+
 ## Key Files
 
 | File | Purpose |
@@ -682,7 +735,11 @@ The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator.
 | `src/op/scan/sirius_gpu_scan_operator_data.hpp` | `scan_operator_input` (fresh-read or resident-batch split) |
 | `src/op/scan/gpu_ingestible.hpp` / `src/op/scan/gpu_ingestible.cpp` | `gpu_ingestible` abstraction + `materialize_table` dispatch |
 | `src/op/scan/gpu_ingestible_types.hpp` | `ingestible_table_info`, `scan_info`, `filtered_table` / `filter_state` |
-| `src/op/scan/parquet_gpu_ingestible.hpp` / `src/op/scan/parquet_gpu_ingestible.cpp` | Parquet ingestible + `parquet_batch_coalescer` + `make_ingestible` |
+| `src/op/scan/parquet_gpu_ingestible.hpp` / `src/op/scan/parquet_gpu_ingestible.cpp` | Parquet facade + `make_ingestible` |
+| `src/op/scan/parquet_scan_core.hpp` / `.cpp` | Shared Parquet preparation, coalescing, decode, and legacy finish bridge |
+| `src/op/scan/materialization_contract.hpp` / `.cpp` | Program/batch validation and shared finish ordering |
+| `src/op/scan/field_id_mapping.hpp` / `.cpp` | Per-file immutable field-ID mapping and conversion approval |
+| `src/op/scan/arrow_materializer.hpp` / `.cpp` | Owned host Arrow import with stream retirement |
 | `src/op/scan/duckdb_native_gpu_ingestible.cpp` / `src/op/scan/duckdb_native_gpu_ingestible.hpp` | DuckDB-native ingestible + `duckdb_native_batch_coalescer` |
 | `src/op/scan/batch_coalescer.hpp` | Coalescer interface |
 | `src/op/scan/owning_table_view.hpp` | View-or-table handle with no-alloc reorder/drop/select |

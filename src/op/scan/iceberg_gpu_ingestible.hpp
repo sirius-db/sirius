@@ -27,7 +27,6 @@
 #include <vector>
 
 namespace sirius::op::scan {
-class iceberg_dv_attempt;
 class iceberg_dv_preparation;
 
 /**
@@ -40,6 +39,7 @@ class iceberg_ingestible_table_info : public parquet_ingestible_table_info {
  public:
   /// As passed to @c iceberg_scan.
   std::string table_path;
+  bool allows_cached_rows() const override;
 
   /// Legacy adapter input, used only when delete_sets and deferred are absent.
   /// Resolved at plan time on the legacy path: an unreadable manifest must fail planning rather
@@ -56,7 +56,7 @@ class iceberg_ingestible_table_info : public parquet_ingestible_table_info {
 /**
  * @brief Parquet ingestible that applies Iceberg deletes to each decoded batch.
  *
- * Only two things differ from the base:
+ * The adapter adds two semantic operations around the shared Parquet core:
  *
  * 1. @ref next_split_provider forces reader-side pushdown off for files with deletes. Positional
  *    deletes are keyed on a row's position within its file, so rows dropped during decode make
@@ -64,21 +64,59 @@ class iceberg_ingestible_table_info : public parquet_ingestible_table_info {
  *    the deletes — the order Iceberg requires. Row-group PRUNING stays on: it only removes rows
  *    the predicate could not match, and the footer still gives the survivors' offsets.
  *
- * 2. @ref materialize_metadata_to_table decodes through the base, then applies per-file deletes.
+ * 2. @ref materialize_metadata_to_table decodes through the core, then applies per-file deletes.
  *
  * Equality deletes are declined by the planner: they need their key columns force-projected.
  */
-class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
+class iceberg_gpu_ingestible : public gpu_ingestible {
  public:
   explicit iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestible_table_info> info);
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
-  /// Installs the execution's attempt (ledger + result slots) once the statement admission has
-  /// been consumed; preparation work cannot be claimed before this.
-  void begin_preparation(std::shared_ptr<iceberg_dv_attempt> attempt);
-  bool can_claim_preparation();
+  void set_execution_completion(std::shared_ptr<pipeline::completion_handler> c) override
+  {
+    gpu_ingestible::set_execution_completion(c);
+    _core.set_execution_completion(std::move(c));
+  }
+  std::unique_ptr<batch_coalescer> create_batch_coalescer() const override
+  {
+    return _core.create_batch_coalescer();
+  }
+  bool has_processed_all_metadata() const override { return _core.has_processed_all_metadata(); }
+  const ingestible_table_info& table_info() const noexcept override { return _core.table_info(); }
+  std::vector<std::size_t> materialized_column_order() const override
+  {
+    return _core.materialized_column_order();
+  }
+  bool output_assembly_is_leading_identity() const noexcept override
+  {
+    return _core.output_assembly_is_leading_identity();
+  }
+  std::optional<std::size_t> output_prefix_width() const noexcept override
+  {
+    return _core.output_prefix_width();
+  }
+  bool has_row_filter() const noexcept override { return _core.has_row_filter(); }
+  bool can_report_survivors() const noexcept override { return true; }
+  scan_filter_analysis const& filter_analysis() const override { return _core.filter_analysis(); }
+  std::unique_ptr<cudf::table> post_filter_and_project(
+    filtered_table&& input,
+    const cucascade::memory::memory_space& space,
+    ::cuda::stream_ref stream,
+    bool like                                                    = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> cache = nullptr,
+    std::unique_ptr<cudf::column>* survivors                     = nullptr,
+    std::span<std::size_t const> elided                          = {}) override
+  {
+    return _core.post_filter_and_project(
+      std::move(input), space, stream, like, std::move(cache), survivors, elided);
+  }
+  bool can_claim_preparation() override;
+  std::shared_ptr<scan_manager::preparation_admission> preparation_admission() const override;
+  void attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>) override;
+  preparation_claim claim_preparation(io::ioctx_resolver resolve) override;
   scan_manager::unit_key next_preparation_unit() const;
-  void stop_preparation() noexcept;
+  void stop_preparation() noexcept override;
   void finish_preparation() noexcept;
 
   filtered_table materialize_metadata_to_table(
@@ -86,10 +124,10 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
     const cucascade::memory::memory_space& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
-    expression_query_policy policy = {}) override;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
 
  private:
+  parquet_scan_core _core;
   /// Resolves which scanned file each manifest-side key refers to, once. A mismatch would
   /// silently find no deletes for that file, so ambiguity is refused.
   void build_delete_key_map(std::vector<std::string> const& resolved_file_paths,
@@ -101,7 +139,6 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
 
   std::shared_ptr<iceberg_delete_sets const> _delete_sets;
   std::shared_ptr<iceberg_dv_preparation> _deferred;
-  std::shared_ptr<iceberg_dv_attempt> _attempt;
   scan_manager::w_permit _next_permit;
   size_t _next_preparation = 0;
   bool _next_registered    = false;
