@@ -60,6 +60,12 @@ class sirius_physical_cte : public sirius_physical_operator {
 
   bool sink_order_dependent() const override { return false; }
 
+  // execute() forwards producer batches; types describes the consumer subtree's result.
+  [[nodiscard]] bool declared_output_schema_is_runtime_schema() const noexcept override
+  {
+    return false;
+  }
+
  public:
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;

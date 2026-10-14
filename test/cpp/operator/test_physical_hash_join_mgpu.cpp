@@ -794,3 +794,58 @@ TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters 
 
   fs::remove_all(tmp, ec);
 }
+
+TEST_CASE("native prepared join keys compare with CPU through multi-partition execution",
+          "[mgpu][multi_gpu][native_join_keys][gpu_execution]")
+{
+  if (!require_two_gpus()) return;
+  auto tmp = make_tmp("native-keys");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+  generate_large_probe_side(tmp / "left");
+  generate_large_probe_side(tmp / "right");
+  mgpu_env_params params{};
+  params.cache                      = "none";
+  params.hash_partition_bytes       = 8'000'000;
+  params.max_build_hash_table_bytes = 1'000'000;
+  auto yaml                         = tmp / "native-keys.yaml";
+  write_mgpu_yaml(yaml, params);
+  scoped_log_dir logs(tmp / "logs", "debug");
+  scoped_mgpu_env env(yaml);
+  auto con                        = env.make_connection();
+  auto multi_partition_join_count = [&] {
+    (void)sirius::log::get_sink()->flush();
+    std::size_t count = 0;
+    std::error_code log_error;
+    for (auto const& entry : fs::recursive_directory_iterator(logs.path(), log_error)) {
+      if (!entry.is_regular_file()) { continue; }
+      std::ifstream in(entry.path());
+      std::string line;
+      while (std::getline(in, line)) {
+        if (line.find("sirius_physical_hash_join id ") == std::string::npos) { continue; }
+        const std::string marker = "partition strategy: ";
+        auto const position      = line.find(marker);
+        if (position == std::string::npos) { continue; }
+        std::istringstream strategy(line.substr(position + marker.size()));
+        int partitions = 0;
+        if (strategy >> partitions && partitions > 1) { ++count; }
+      }
+    }
+    return count;
+  };
+  for (auto const& predicate : {"CAST(l.k AS INTEGER) = r.k",
+                                "CAST(l.k AS DECIMAL(18,1)) = CAST(r.k AS DECIMAL(18,2))",
+                                "l.k + 1 = r.k + 1",
+                                "l.k = r.k AND CAST(l.v AS INTEGER) IS NOT DISTINCT FROM r.v"}) {
+    INFO(predicate);
+    auto const before = multi_partition_join_count();
+    auto query        = "SELECT l.k, count(*) FROM read_parquet('" + parquet_glob(tmp / "left") +
+                 "') l JOIN read_parquet('" + parquet_glob(tmp / "right") + "') r ON " + predicate +
+                 " GROUP BY l.k ORDER BY l.k LIMIT 50";
+    require_gpu_matches_cpu(con, query, /*force_cpu_reference=*/true);
+    // Execution-time sizing must choose multiple partitions for this query's hash join.
+    REQUIRE(multi_partition_join_count() > before);
+  }
+  fs::remove_all(tmp, ec);
+}

@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
   PRIVATE aggregate/aggregate_op_util.cpp
+          aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
           aggregate/gpu_aggregate_impl.cpp
           merge/gpu_merge_impl.cpp
@@ -29,12 +30,14 @@ target_sources(
           scan/parquet_materialize.cpp
           scan/duckdb_native_gpu_ingestible.cpp
           scan/table_scan/bound_read_view.cpp
+          scan/table_scan/parquet_physical_profile.cpp
           scan/iceberg_metadata_reader.cpp
           scan/puffin_reader.cpp
           scan/positional_delete_filter.cpp
           scan/equality_delete_filter.cpp
           scan/iceberg_delete_pipeline.cpp
           scan/iceberg_gpu_ingestible.cpp
+          scan/iceberg_dv_preparation.cpp
           dynamic_filter/dynamic_filter_key_domain.cpp
           dynamic_filter/dynamic_filter_publish_plan.cpp
           dynamic_filter/complete_build_inventory.cpp

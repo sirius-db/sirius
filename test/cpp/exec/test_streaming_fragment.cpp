@@ -27,7 +27,8 @@
 #include <cucascade/data/data_batch.hpp>
 #include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
-#include <duckdb/main/materialized_query_result.hpp>
+#include <duckdb/main/query_result.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
@@ -171,7 +172,7 @@ TEST_CASE_METHOD(fragment_fixture,
 {
   auto expected = con->Query(std::string("SELECT count(*) FROM (") + kLeafQuery + ") t");
   REQUIRE_FALSE(expected->HasError());
-  auto const expected_rows = expected->GetValue(0, 0).GetValue<std::int64_t>();
+  auto const expected_rows = expected->Collection().GetValue(0, 0).GetValue<std::int64_t>();
 
   con->BeginTransaction();
   try {
@@ -296,10 +297,7 @@ TEST_CASE_METHOD(fragment_fixture,
         auto result = engine.get_result();
         REQUIRE(result != nullptr);
         REQUIRE_FALSE(result->HasError());
-        auto materialized =
-          duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
-            std::move(result));
-        rows = materialized->RowCount();
+        rows = result->RowCount();
       },
       window.query_id());
     window.finish();
@@ -339,7 +337,7 @@ TEST_CASE_METHOD(fragment_fixture,
   auto expected = con->Query("SELECT count(*) FROM (" + leaf + ") t");
   REQUIRE_FALSE(expected->HasError());
   auto const expected_rows =
-    static_cast<std::size_t>(expected->GetValue(0, 0).GetValue<std::int64_t>());
+    static_cast<std::size_t>(expected->Collection().GetValue(0, 0).GetValue<std::int64_t>());
   REQUIRE(expected_rows > 0);
 
   con->BeginTransaction();
@@ -369,6 +367,55 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver.run();
     REQUIRE(drain_row_count(receiver, 1) == expected_rows);
 
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-4b: an export-only Parquet drift cannot publish a GPU stream",
+                 "[integration][streaming_fragment]")
+{
+  sirius::test::scratch_dir directory("fragment_export_drift");
+  auto write = [&](std::string const& sql) {
+    auto result = con->Query(sql);
+    if (result->HasError()) INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+  };
+  write("SET gpu_execution=false");
+  write("COPY (SELECT 0::INTEGER keep, 1::INTEGER x) TO " + directory.file_literal("a.parquet") +
+        " (FORMAT PARQUET)");
+  write("COPY (SELECT 1::INTEGER keep, 2.5::DOUBLE x) TO " + directory.file_literal("b.parquet") +
+        " (FORMAT PARQUET)");
+  write("SET gpu_execution=true");
+  auto query =
+    "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ") WHERE keep=1";
+  con->BeginTransaction();
+  try {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(query);
+    spec.outputs     = {0};
+    streaming_fragment sender(*con->context, std::move(spec));
+    sender.build();
+    REQUIRE(sender.sink_types().size() == 1);
+    REQUIRE(sender.sink_types()[0].id() == sirius::type_id::INTEGER);
+    REQUIRE_THROWS(sender.run());
+    // The only retained file carries DOUBLE. It must fail qualification before
+    // the reader or sink can publish a mismatched payload: a receiver relaying
+    // from the failed sender gets the failure, never a batch.
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source =
+      sirius::test::sql_plan_source("SELECT x FROM sirius_stream_source(0)");
+    receiver_spec.inputs[0] = stream_input_spec{
+      {"x"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      {0}};
+    receiver_spec.outputs = {1};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+    receiver.build();
+    REQUIRE_THROWS(receiver.relay_from(sender, 0, 0, 0));
     con->Rollback();
   } catch (...) {
     con->Rollback();
@@ -451,16 +498,13 @@ TEST_CASE_METHOD(fragment_fixture,
     auto result = fragment.take_result();
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
-    auto materialized =
-      duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
-        std::move(result));
-    REQUIRE(materialized->RowCount() == kLeafRows);
-    REQUIRE(materialized->names == duckdb::vector<std::string>{"col_0"});
-    REQUIRE(materialized->types ==
+    REQUIRE(result->RowCount() == kLeafRows);
+    REQUIRE(result->GetNames() == duckdb::vector<duckdb::Identifier>{duckdb::Identifier("col_0")});
+    REQUIRE(result->GetTypes() ==
             duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
     std::vector<std::int32_t> values;
-    for (duckdb::idx_t row = 0; row < materialized->RowCount(); ++row) {
-      values.push_back(materialized->GetValue(0, row).GetValue<std::int32_t>());
+    for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+      values.push_back(result->Collection().GetValue(0, row).GetValue<std::int32_t>());
     }
     std::sort(values.begin(), values.end());
     REQUIRE(values == std::vector<std::int32_t>{1, 2, 3, 4, 5});
@@ -705,20 +749,20 @@ TEST_CASE_METHOD(fragment_fixture,
           auto bound     = leaf(context);
           bound.prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
             duckdb::StatementType::SELECT_STATEMENT);
-          bound.prepared->names = {"a"};
+          bound.prepared->names = {duckdb::Identifier("a")};
           bound.prepared->types = {duckdb::LogicalType::HUGEINT};
           return bound;
         };
       streaming_fragment fragment(*con->context, std::move(spec));
       fragment.build();
       fragment.run();
-      auto result = duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
-        fragment.take_result());
-      REQUIRE(result->types == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::HUGEINT});
+      auto result = fragment.take_result();
+      REQUIRE(result->GetTypes() ==
+              duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::HUGEINT});
       REQUIRE(result->RowCount() == 2);
       // A sign-dropping widen would turn -7 into a value no int64 holds.
-      REQUIRE(result->GetValue(0, 0).GetValue<std::int64_t>() +
-                result->GetValue(0, 1).GetValue<std::int64_t>() ==
+      REQUIRE(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() +
+                result->Collection().GetValue(0, 1).GetValue<std::int64_t>() ==
               -5);
     }
 
@@ -955,7 +999,7 @@ TEST_CASE_METHOD(fragment_fixture,
   auto expected = con->Query("SELECT count(*) FROM (" + scan + ") t");
   REQUIRE_FALSE(expected->HasError());
   auto const expected_rows =
-    static_cast<std::size_t>(expected->GetValue(0, 0).GetValue<std::int64_t>());
+    static_cast<std::size_t>(expected->Collection().GetValue(0, 0).GetValue<std::int64_t>());
   REQUIRE(expected_rows > 0);
 
   con->BeginTransaction();
@@ -1117,4 +1161,38 @@ TEST_CASE_METHOD(fragment_fixture,
     con->Rollback();
     throw;
   }
+}
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "runtime retirement retains resources until the query window closes",
+                 "[integration][query_retirement]")
+{
+  using retirement = duckdb::SiriusContext::query_retirement_mode;
+  auto mode        = retirement::completed;
+  SECTION("successful completion") { mode = retirement::completed; }
+  SECTION("cancellation") { mode = retirement::cancelled; }
+
+  auto runtime = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  query_window window(*runtime, *con->context, "retirement_ownership");
+  auto const query_id         = window.query_id();
+  auto& lifecycle             = runtime->get_query_lifecycle_registry();
+  auto resource               = std::make_shared<int>(42);
+  std::weak_ptr<int> retained = resource;
+  lifecycle.retain_resources(query_id, std::move(resource));
+
+  runtime->retire_query_work(query_id, mode);
+  CHECK_FALSE(lifecycle.accepts_work(query_id));
+  CHECK(lifecycle.activity(query_id).work == 0);
+  CHECK_FALSE(retained.expired());
+  CHECK(runtime->get_data_repository_manager(query_id) != nullptr);
+
+  // Engine destruction and the execution window can both retire the same query.
+  REQUIRE_NOTHROW(runtime->retire_query_work(query_id, retirement::cancelled));
+  CHECK_FALSE(retained.expired());
+  window.finish();
+  CHECK(retained.expired());
+  CHECK(runtime->get_data_repository_manager(query_id) == nullptr);
+  REQUIRE_NOTHROW(runtime->retire_query_work(query_id, retirement::cancelled));
+  CHECK(runtime->get_runtime_health() == duckdb::SiriusContext::runtime_health::OK);
 }

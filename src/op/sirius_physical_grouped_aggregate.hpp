@@ -29,8 +29,12 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <set>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -51,45 +55,51 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
     duckdb::vector<std::unique_ptr<sirius::ast::node>> groups,
     duckdb::vector<duckdb::GroupingSet> grouping_sets,
-    duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions,
+    duckdb::vector<duckdb::unsafe_vector<duckdb::ProjectionIndex>> grouping_functions,
     std::size_t estimated_cardinality,
     duckdb::TupleDataValidityType group_validity,
-    duckdb::TupleDataValidityType distinct_validity);
+    duckdb::TupleDataValidityType distinct_validity,
+    std::vector<std::optional<std::uint64_t>> aggregate_input_max_abs = {});
 
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
 
-  // TODO: we may need some of these variables later when we implement grouping sets
-
-  // //! The grouping sets
-  // duckdb::GroupedAggregateData grouped_aggregate_data;
-
-  // //! The radix partitioned hash tables (one per grouping set)
-  // duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
-  // duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
-  // //! A recreation of the input chunk, with nulls for everything that isn't a group
-  // duckdb::vector<sirius::logical_type> input_group_types;
-
-  // // Filters given to sink and friends
-  // duckdb::unsafe_vector<std::size_t> non_distinct_filter;
-  // duckdb::unsafe_vector<std::size_t> distinct_filter;
-
-  // duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
+  /// The grouping sets as positions in `group_idx`, and the arguments of each GROUPING()
+  /// function. Used when the aggregate computes several grouping sets or GROUPING().
+  std::vector<std::set<std::size_t>> grouping_set_keys;
+  std::vector<std::vector<std::size_t>> grouping_functions;
 
   // Grouped aggregatge definitions for cudf compute
   std::vector<int> group_idx;
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
+  /// Parallel to cudf_aggregates: the plan-time bound on |unscaled value| of a decimal SUM input
+  /// (planner::resolve_decimal_sum_input_bounds); nullopt when unproven.
+  std::vector<std::optional<std::uint64_t>> cudf_aggregate_input_max_abs;
 
-  // AVG decomposition metadata
+  // Partial aggregate layout and finalization metadata
   std::vector<AggregateSlot> aggregate_slots;
+  duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;
   bool has_count_distinct = false;
 
  public:
+  /// Whether the aggregate computes several grouping sets or GROUPING() functions. The local
+  /// output then has a set id column and one column per GROUPING() function after the keys.
+  [[nodiscard]] bool has_grouping_sets() const noexcept
+  {
+    return grouping_sets.size() > 1 || !grouping_functions.empty();
+  }
+
+  /// Number of leading output columns that the merge groups by.
+  [[nodiscard]] std::size_t num_output_group_columns() const noexcept
+  {
+    return group_idx.size() + (has_grouping_sets() ? 1 + grouping_functions.size() : 0);
+  }
+
   std::vector<int> get_output_grouping_indices() const
   {
-    std::vector<int> indices(group_idx.size());
+    std::vector<int> indices(num_output_group_columns());
     std::iota(indices.begin(), indices.end(), 0);
     return indices;
   }
@@ -97,6 +107,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   //! Runtime schema of the local COUNT(DISTINCT) accumulator. The local aggregate and PARTITION
   //! carry LIST sets; MERGE_GROUP_BY later converts those sets to the declared BIGINT count.
   [[nodiscard]] duckdb::vector<sirius::logical_type> get_count_distinct_local_output_types() const;
+
+  [[nodiscard]] bool has_stddev_samp() const;
 
   // Source interface
   bool is_source() const override { return true; }

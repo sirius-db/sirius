@@ -38,6 +38,8 @@
 // through the same metadata, so several fixtures here carry no storage at all.
 
 #include "operator/operator_test_utils.hpp"
+#include "scan/fused_scan_filter_test_utils.hpp"
+#include "sirius_context.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -55,6 +57,7 @@
 #include <catch.hpp>
 #include <compression/compressed_representation.hpp>
 #include <compression/compressed_scan.hpp>
+#include <compression/decompression_pushdown_policy.hpp>
 #include <compression/device_compressed_blob.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -62,6 +65,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/load_balancing_scan_batch_coalescer.hpp>
@@ -72,6 +76,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -380,8 +385,15 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
     return _info;
   }
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override { return {}; }
+  [[nodiscard]] std::optional<std::size_t> output_prefix_width() const noexcept override
+  {
+    return prefix_width;
+  }
 
   stub_table_info _info;
+  /// What output_prefix_width reports; a decode that dropped filter-only columns is served only at
+  /// this width.
+  std::optional<std::size_t> prefix_width;
 };
 
 template <typename T>
@@ -414,6 +426,10 @@ sirius::scan_manager::mvcc_chunk_mask make_test_mask(std::size_t rows)
 /// order, then either ends the stream or throws — the provider behaviors the
 /// drain must handle.
 struct scripted_provider final : databatch_provider {
+  scripted_provider()
+  {
+    validation.identity = validation.layout = validation.structure = {true, true};
+  }
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   std::vector<sirius::scan_manager::mvcc_chunk_mask> masks;
   std::vector<bool> converting;
@@ -1719,6 +1735,114 @@ TEST_CASE("transactional steal serves decode-row-filtered splits but refuses pre
   REQUIRE_FALSE(split.converted_table_steal_pending);
 }
 
+// The TPC-H q3 lineitem shape on a GPU-tier compressed pin: the scan's own filter is a range on a
+// column only that filter reads, and a hash join has published a membership filter on an output
+// column by the time the split decodes. prepare_for_processing attaches the join filter to the
+// decode, which still applies the scan's whole filter, so the filter-only column is dropped and the
+// decoded batch leaves the wrapper without a copy.
+TEST_CASE("a compressed split decoded with a join filter keeps the drop and the steal",
+          "[cached_serving][transactional_steal]")
+{
+  namespace fsf = sirius::test::fused_scan_filter;
+  if (!sirius::decompression_pushdown_enabled()) {
+    WARN("filtered-decode env gate off in this process; skipping");
+    return;
+  }
+  auto& e                         = env();
+  ::cuda::stream_ref const stream = e.stream();
+  using replacements = sirius::op::scan::scan_operator_input::converted_column_replacements;
+
+  // One resident split of fsf::compress_range_source, with the scan's covering request attached the
+  // way the cached provider attaches it and `filter` published on output column "v".
+  auto const make_split = [&](std::shared_ptr<sirius::op::sirius_dynamic_filter const> filter) {
+    auto blob   = std::make_shared<sirius::compressed_device_blob>();
+    blob->table = fsf::compress_range_source(stream);
+    stream.sync();
+    auto rep = std::make_unique<sirius::compressed_device_representation>(
+      *e.gpu_space,
+      std::move(blob),
+      std::vector<std::string>{"v", "k", "f"},
+      /*compressed_bytes=*/64,
+      /*uncompressed_bytes=*/fsf::kSelected.size() * static_cast<std::size_t>(fsf::kRows) *
+        sizeof(std::int32_t),
+      /*num_rows=*/fsf::kRows);
+    rep->set_pushdown_scan(std::make_shared<const sirius::decompression_pushdown_scan>(
+      fsf::covered_request(fsf::kOutputWidth)));
+    auto split = std::make_unique<sirius::op::scan::scan_operator_input>(
+      cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(rep)));
+    split->row_filter_pending = true;
+    auto channel              = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    auto producer             = channel->register_producer({0});
+    channel->freeze_registration();
+    REQUIRE(producer.push_filter(0, std::move(filter)));
+    split->dynamic_filters = std::move(channel);
+    return split;
+  };
+  auto const require_rows = [&](cudf::table_view out, fsf::source_rows const& expected) {
+    REQUIRE(static_cast<std::size_t>(out.num_columns()) == fsf::kOutputWidth);
+    CHECK(fsf::column_to_host(out.column(0), stream) == expected.v);
+    CHECK(fsf::column_to_host(out.column(1), stream) == expected.k);
+  };
+  auto const range_and_keys = fsf::rows_where(
+    [](cudf::size_type i) { return fsf::in_filter_range(i) && fsf::in_key_set(i % 100); });
+
+  stub_ingestible ingestible;
+  ingestible.prefix_width = fsf::kOutputWidth;
+
+  SECTION("an accepting join filter, no carrier conversion")
+  {
+    auto split = make_split(fsf::make_key_set(stream));
+    split->prepare_for_processing(e.gpu_space, stream);
+    CHECK(split->pushdown_row_filtered);
+    CHECK(split->pushdown_filter_only_columns_dropped);
+    REQUIRE(split->stolen_table != nullptr);
+    CHECK(static_cast<std::size_t>(split->stolen_table->num_columns()) == fsf::kOutputWidth);
+
+    auto result = ingestible.materialize_table(*split, stream);
+    CHECK(result.state == sirius::op::scan::filter_state::ROW_FILTERED);
+    auto out = result.table.release(stream, e.gpu_space->get_default_allocator());
+    REQUIRE(out != nullptr);
+    require_rows(out->view(), range_and_keys);
+  }
+
+  SECTION("an accepting join filter with a carrier conversion")
+  {
+    auto split                      = make_split(fsf::make_key_set(stream));
+    split->needs_carrier_conversion = true;
+    split->prepare_for_processing(e.gpu_space, stream);
+    CHECK(split->pushdown_row_filtered);
+    CHECK(split->pushdown_filter_only_columns_dropped);
+    REQUIRE(split->stolen_table == nullptr);
+    REQUIRE(split->converted_table_steal_pending);
+
+    // The decode is exactly the output width, so the transactional steal takes it; null
+    // replacements transfer the source columns as they are.
+    auto out = split->transactionally_steal_converted_table(
+      fsf::kOutputWidth, [](cudf::table_view) { return replacements(fsf::kOutputWidth); }, stream);
+    REQUIRE(out != nullptr);
+    require_rows(out->view(), range_and_keys);
+  }
+
+  SECTION("a join filter that declines")
+  {
+    // A STRING key set cannot probe the INT32 "v", so the decode applies the range alone.
+    std::vector<std::string> const keys{"a", "b"};
+    auto const key_column = fsf::upload_strings(keys, stream);
+    auto split            = make_split(std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+      key_column->view(), stream, cudf::get_current_device_resource_ref()));
+    split->prepare_for_processing(e.gpu_space, stream);
+    CHECK(split->pushdown_row_filtered);
+    CHECK(split->pushdown_filter_only_columns_dropped);
+    REQUIRE(split->stolen_table != nullptr);
+
+    auto result = ingestible.materialize_table(*split, stream);
+    CHECK(result.state == sirius::op::scan::filter_state::ROW_FILTERED);
+    auto out = result.table.release(stream, e.gpu_space->get_default_allocator());
+    REQUIRE(out != nullptr);
+    require_rows(out->view(), fsf::rows_where(fsf::in_filter_range));
+  }
+}
+
 // Compressed chunks are opaque blobs, but the carrier fold never needs to open them: the pin
 // driver recorded each chunk's compress-input types in column_storage, and by Simpatico's
 // round-trip contract decompression reproduces exactly those types. These tests pin that the
@@ -1877,4 +2001,119 @@ TEST_CASE("validate_recorded_column_storage cross-checks recorded carriers again
     REQUIRE_NOTHROW(sirius::scan_manager::validate_recorded_column_storage(
       sirius::pinned_column_storage_matrix{}, 0, 2, kContext, stored));
   }
+}
+
+TEST_CASE("Resident refusal closes the connector and separates certificate counters",
+          "[cached_serving][scan_manager][certificate][consumption]")
+{
+  using namespace sirius::op::scan;
+  auto& e = env();
+  scripted_provider provider;
+  provider.contract_id            = 81;
+  provider.validation.query_token = 17;
+  provider.batches                = {make_test_batch(e, 4)};
+  split_connector connector;
+  std::stop_source stop;
+  duckdb::SiriusContext observer;
+  bool native_pin = false;
+  bool mismatch   = false;
+  SECTION("stale token") { provider.validation.query_token++; }
+  SECTION("identity absent") { provider.validation.identity.applies = false; }
+  SECTION("native checks absent") { native_pin = true; }
+  SECTION("different contract")
+  {
+    provider.contract_id++;
+    mismatch = true;
+  }
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), false, 81, 17, &observer, false, native_pin);
+  CHECK(connector.peek_resident_batches().empty());
+  CHECK_FALSE(connector.is_closed());  // terminal exception remains schedulable
+  if (mismatch) {
+    REQUIRE_THROWS_WITH(connector.get_next_split(), "resident scan contract mismatch");
+  } else {
+    REQUIRE_THROWS_AS(connector.get_next_split(), certificate_incomplete);
+  }
+  auto stats = observer.get_transparent_execution_stats();
+  CHECK(stats.certificate_mismatches == (mismatch ? 1 : 0));
+  CHECK(stats.certificate_incompletes == (mismatch ? 0 : 1));
+}
+
+TEST_CASE("Resident dequeue backstop rejects a stale query before processing",
+          "[cached_serving][scan_manager][certificate][consumption]")
+{
+  using namespace sirius::op::scan;
+  auto& e = env();
+  duckdb::SiriusContext observer;
+  sirius_gpu_scan_operator scan({}, 4, nullptr, 81, &observer, nullptr);
+  scan.set_query_validation(17, {});
+  scripted_provider provider;
+  provider.contract_id            = 81;
+  provider.validation.query_token = 18;
+  provider.batches                = {make_test_batch(e, 4)};
+  std::stop_source stop;
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, scan.get_split_connector(), stop.get_token(), false, 81, 18);
+  REQUIRE_THROWS_AS(scan.get_next_task_input_data(), certificate_incomplete);
+  CHECK(observer.get_transparent_execution_stats().certificate_incompletes == 1);
+  CHECK(observer.get_transparent_execution_stats().certificate_mismatches == 0);
+}
+
+TEST_CASE("Cached workers reject a returned batch when connection interruption is observed",
+          "[cached_serving][scan_preparation][interrupt]")
+{
+  enum class cancel_at { before_read, after_read, size_estimate };
+  auto point = GENERATE(cancel_at::before_read, cancel_at::after_read, cancel_at::size_estimate);
+  auto& e    = env();
+  bool interrupted = point == cancel_at::before_read;
+  struct interrupting_representation : cucascade::gpu_table_representation {
+    using gpu_table_representation::gpu_table_representation;
+    bool* interrupted = nullptr;
+    std::size_t get_size_in_bytes() const override
+    {
+      if (interrupted) { *interrupted = true; }
+      return gpu_table_representation::get_size_in_bytes();
+    }
+  };
+  struct interrupting_provider : databatch_provider {
+    scripted_provider scripted;
+    std::function<void()> on_return;
+    databatch_provider::batch get_next_batch() override
+    {
+      auto next = scripted.get_next_batch();
+      on_return();
+      return next;
+    }
+  } provider;
+  if (point == cancel_at::size_estimate) {
+    auto column = make_gpu_column(*e.gpu_space, {7, 7, 7, 7});
+    auto repr   = std::make_unique<interrupting_representation>(
+      cudf::table_view(std::vector<cudf::column_view>{column->view()}),
+      column,
+      column->alloc_size(),
+      *e.gpu_space,
+      ::cuda::stream_ref{cudaStream_t{}});
+    provider.on_return = [&, representation = repr.get()] {
+      representation->interrupted = &interrupted;
+    };
+    provider.scripted.batches = {
+      cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr))};
+  } else {
+    provider.scripted.batches = {make_test_batch(e, 4)};
+    provider.on_return        = [&] { interrupted = true; };
+  }
+  auto gate         = std::make_shared<sirius::scan_manager::preparation_gate>();
+  gate->interrupted = [&] { return interrupted; };
+  std::exception_ptr failure;
+  gate->report_error = [&](auto error) { failure = error; };
+  split_connector connector;
+  std::stop_source stop;
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), false, 0, 0, nullptr, false, false, nullptr, 0, gate);
+  REQUIRE(failure);
+  CHECK_THROWS_AS(std::rethrow_exception(failure), duckdb::InterruptException);
+  CHECK_THROWS_AS(connector.get_next_split(), duckdb::InterruptException);
+  CHECK(connector.peek_resident_batches().empty());
+  CHECK(provider.scripted.served == (point == cancel_at::before_read ? 0 : 1));
+  CHECK(gate->closed);
 }

@@ -27,9 +27,11 @@
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/execution/executor.hpp>
 #include <duckdb/execution/operator/helper/physical_result_collector.hpp>
+#include <duckdb/execution/operator/helper/physical_result_sink.hpp>
+#include <duckdb/main/buffered_data/batched_buffered_data.hpp>
+#include <duckdb/main/buffered_data/simple_buffered_data.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_context.hpp>
-#include <duckdb/main/pending_query_result.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/main/query_result.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
@@ -61,18 +63,29 @@ struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
 // ClientContext (not a fresh Connection) keeps it on the same transaction and MVCC
 // snapshot, including this transaction's uncommitted writes. Returns a materialized
 // result; throws if the CPU plan itself fails.
+// DuckDB v2 shares cancellation state between executors, but not their errors:
+// the outer query can report Interrupted before receiving the nested error (#2145).
 duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
   duckdb::ClientContext& client,
   duckdb::PreparedStatementData& cpu_prepared,
   duckdb::unique_ptr<duckdb::Executor>& out_executor)
 {
-  // Force a materialized (non-streaming) result so the whole plan runs before any
-  // row is streamed out of the operator.
-  cpu_prepared.output_type = duckdb::QueryResultOutputType::FORCE_MATERIALIZED;
-  cpu_prepared.memory_type = duckdb::QueryResultMemoryType::IN_MEMORY;
-
   auto collector = duckdb::PhysicalResultCollector::GetResultCollector(client, cpu_prepared);
   D_ASSERT(collector->type == duckdb::PhysicalOperatorType::RESULT_COLLECTOR);
+  auto& sink = collector->Cast<duckdb::PhysicalResultSink>();
+  duckdb::ResultFormatContext format_context{
+    cpu_prepared.types, cpu_prepared.names, client.GetClientProperties(), sink.ordering};
+  // Decide retention before scheduling so nested producers never wait on the
+  // outer query to consume their result.
+  duckdb::shared_ptr<duckdb::BufferedData> buffer;
+  if (sink.ordering == duckdb::ResultOrdering::BATCH_INDEX_ORDERED) {
+    buffer = duckdb::make_shared_ptr<duckdb::BatchedBufferedData>(
+      client, duckdb::ResultLifetime::RETAINED, std::move(format_context), nullptr);
+  } else {
+    buffer = duckdb::make_shared_ptr<duckdb::SimpleBufferedData>(
+      client, duckdb::ResultLifetime::RETAINED, std::move(format_context), nullptr);
+  }
+  sink.SetResultBuffer(buffer);
 
   // Suppress profiling for the nested run: it shares the context's single
   // QueryProfiler with the outer query, so letting it re-initialize would corrupt
@@ -84,13 +97,17 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
   out_executor   = duckdb::make_uniq<duckdb::Executor>(client);
   auto& executor = *out_executor;
   try {
+    executor.SetResultBuffer(buffer);
     executor.Initialize(std::move(collector));
-    duckdb::PendingExecutionResult exec_result;
-    while (!duckdb::PendingQueryResult::IsResultReady(exec_result = executor.ExecuteTask())) {
-      if (exec_result == duckdb::PendingExecutionResult::BLOCKED) { executor.WaitForTask(); }
+    duckdb::QueryResultState exec_result;
+    while (!duckdb::IsTerminal(exec_result = executor.ExecuteTask())) {
+      if (exec_result == duckdb::QueryResultState::BLOCKED) { executor.WaitForTask(); }
     }
     if (executor.HasError()) { executor.ThrowException(); }
-    auto result                   = executor.GetResult();
+    auto result = executor.GetResult();
+    // Pipeline completion precedes task destruction. Drain workers before the
+    // private executor can be released, as DuckDB does in query cleanup.
+    executor.CancelTasks();
     client_config.enable_profiler = saved_enable_profiler;
     return result;
   } catch (...) {
@@ -113,12 +130,13 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   std::vector<sirius::op::scan::bound_read_view> physical_original_views,
   std::string query_sql,
   duckdb::vector<duckdb::LogicalType> types,
-  duckdb::vector<std::string> names,
+  duckdb::vector<duckdb::Identifier> names,
   duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
   plan_source_policy source_policy,
   duckdb::idx_t estimated_cardinality,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan,
-  std::uint64_t validated_plan_pin_epoch)
+  std::uint64_t validated_plan_pin_epoch,
+  std::optional<uint64_t> captured_transaction_id)
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
     logical_plan_(std::move(logical_plan)),
@@ -129,6 +147,7 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
     result_names_(std::move(names)),
     cpu_fallback_prepared_(std::move(cpu_fallback_prepared)),
     source_policy_(std::move(source_policy)),
+    captured_transaction_id_(captured_transaction_id),
     validated_sirius_plan_(std::move(validated_sirius_plan)),
     validated_plan_pin_epoch_(validated_plan_pin_epoch)
 {
@@ -178,6 +197,10 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     duckdb::ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
+    failure_cause failure;
+    late_failure_trace failure_trace;
+    bool non_rollbackable_state = false;
+    std::shared_ptr<op::scan::test_injections const> injections;
     auto lease_release = duckdb::SiriusContext::StandaloneQueryScope::lease_release_result{};
     // The execution window: begin mutations and slot acquire in one scope on
     // this thread; finished (mandatory cleanup and release) below, before the
@@ -286,7 +309,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           // Suppress the optimizer hooks for this nested replan (the guard is a
           // no-op when Sirius has no per-connection state registered).
           duckdb::SiriusContext::InternalQueryGuard guard(context.client);
-          duckdb::Parser parser(context.client.GetParserOptions());
+          duckdb::Parser parser(context.client);
           parser.ParseQuery(query_sql_);
           if (parser.statements.size() != 1) {
             throw duckdb::ExecutorException(
@@ -322,7 +345,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           logical_original_views_ ? &*logical_original_views_ : nullptr,
           physical_original_views_,
           *planner.read_views);
-        planner.read_views->publish_supported(
+        planner.read_views->publish_correspondence(
           sirius::op::scan::certificate_evidence_scope::binding_correspondence,
           comparison.correspondence,
           physical_original_views_);
@@ -343,9 +366,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       }
 
       // Execute via the standard sirius_interface path.
-      duckdb::PendingQueryParameters parameters;
       state.result = state.iface->sirius_execute_query(
-        context.client, "transparent_execution", gpu_prepared, parameters, window->query_id());
+        context.client, "transparent_execution", std::move(gpu_prepared), window->query_id());
 
       if (state.result->HasError()) {
         gpu_error = state.result->GetErrorObject();
@@ -364,6 +386,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       gpu_failed                = true;
       runtime_unavailable_error = true;
     } catch (std::exception& e) {
+      if (window) window->report_failure(std::current_exception());
       gpu_error  = duckdb::ErrorData(e);
       gpu_failed = true;
     }
@@ -378,12 +401,23 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // exception escaping the try above is handled by the window's destructor
     // backstop instead.
     if (window) {
+      injections = window->injections();
+      failure    = window->failure();
+      if (gpu_failed) failure_trace.cause = failure.cause;
+      non_rollbackable_state = window->non_rollbackable_state();
+      if (gpu_failed && state.sirius_context)
+        state.sirius_context->record_late_failure(failure.cause);
       window->finish();
       lease_release = window->lease_release();
       window.reset();
     }
 
     if (gpu_failed) {
+      failure_trace.cause = failure.cause;
+      if (lease_release.state ==
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::not_entered &&
+          state.sirius_context)
+        state.sirius_context->record_late_failure(failure.cause);
       const std::string gpu_msg = gpu_error.RawMessage();
       SIRIUS_LOG_ERROR("Transparent GPU execution error: {}", gpu_msg);
 
@@ -432,6 +466,24 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         throw duckdb::ExecutorException(
           "Sirius CPU replay refused because checkpoint-lease cleanup did not complete");
       }
+
+      D_ASSERT(!state.result && !state.current_chunk && !state.finished);
+      const bool read_only      = injections && injections->override_read_only
+                                    ? *injections->override_read_only
+                                    : cpu_fallback_prepared_->properties.IsReadOnly();
+      auto captured_transaction = captured_transaction_id_;
+      if (injections && injections->transaction_mismatch && captured_transaction)
+        *captured_transaction ^= 1;
+      if (injections && injections->interrupt_before_replay) context.client.Interrupt();
+      auto admission = admit_cpu_replay(
+        context.client, read_only, captured_transaction, non_rollbackable_state, false);
+      failure_trace.replay     = admission.admitted;
+      failure_trace.refused_by = admission.refused_by;
+      if (!admission.admitted) {
+        if (state.sirius_context) state.sirius_context->record_late_refusal(*admission.refused_by);
+        throw duckdb::ExecutorException("Sirius CPU replay refused: " + gpu_msg);
+      }
+      if (state.sirius_context) state.sirius_context->record_late_replay(failure.cause, read_only);
 
       // Fall back: run the stored CPU plan on a private executor bound to the same
       // ClientContext (same transaction / MVCC snapshot).

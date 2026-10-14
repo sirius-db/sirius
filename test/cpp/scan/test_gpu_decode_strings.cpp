@@ -380,7 +380,7 @@ TEST_CASE("gpu_decode_strings DICT_FSST admits no symbol table when only the NUL
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   rmm::device_buffer device(bytes.data(), bytes.size(), stream);
-  auto const rows = mode == 1 ? 1u : 0u;
+  uint32_t const rows = mode == 1 ? 1u : 0u;
   gpu_string_codec_run run{CompressionType::COMPRESSION_DICT_FSST,
                            {{static_cast<uint8_t const*>(device.data()),
                              static_cast<uint32_t>(bytes.size()),
@@ -394,8 +394,8 @@ TEST_CASE("gpu_decode_strings DICT_FSST admits no symbol table when only the NUL
   input.has_nulls  = false;
   input.data.push_back(run);
   auto column = gpu_decode_strings_column(input, stream, mr);
-  REQUIRE(column->size() == rows);
-  REQUIRE(column->null_count() == rows);
+  REQUIRE(column->size() == static_cast<cudf::size_type>(rows));
+  REQUIRE(column->null_count() == static_cast<cudf::size_type>(rows));
 }
 
 TEST_CASE("gpu_decode_strings DICT_FSST rejects cumulative dictionary offset overflow",

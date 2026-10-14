@@ -28,6 +28,7 @@
 
 #include <cuda/stream>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <unordered_set>
@@ -43,6 +44,9 @@ namespace op {
  * aggregate_id: COUNT(DISTINCT ...) is the `count` id with the distinct() modifier set, and is
  * intercepted by the caller (COLLECT_SET path) before this helper runs — so there is no
  * count_distinct case to add here.
+ *
+ * STDDEV_SAMP maps to Kind::M2 as an internal marker for its count/mean/M2 STRUCT.
+ * The local executor expands the marker into three cuDF aggregations and packs their results.
  *
  * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg`
  * (decomposes into SUM + COUNT_VALID) and `first` (NTH_ELEMENT, handled by the caller).
@@ -69,9 +73,40 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
                                                       ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr);
 
+/// |v| as an unsigned 64-bit magnitude; the most negative value's 2^63 fits.
+constexpr std::uint64_t decimal_magnitude(std::int64_t v)
+{
+  auto const bits = static_cast<std::uint64_t>(v);
+  return v < 0 ? std::uint64_t{0} - bits : bits;
+}
+
+/// Whether a SUM of @p num_rows values of magnitude at most @p max_abs can exceed the storage
+/// width of @p type (2^31-1 for DECIMAL32, 2^63-1 for DECIMAL64). Throws
+/// sirius::internal_exception for any other type.
+bool decimal_sum_may_overflow(cudf::data_type type,
+                              cudf::size_type num_rows,
+                              std::uint64_t max_abs);
+
+/// A decimal SUM input of one batch: its column and, when the planner proved one from base-table
+/// statistics (planner::resolve_decimal_sum_input_bounds), the largest |unscaled value| it holds.
+struct decimal_sum_candidate {
+  int column;
+  std::optional<std::uint64_t> max_abs;
+};
+
+/// The columns among @p candidates (DECIMAL32 or DECIMAL64) whose SUM over this batch could
+/// overflow their storage width. A column whose every candidate carries a bound is decided on the
+/// host from the batch row count; the others are measured with decimal_sums_needing_widening. A
+/// batch without unproven columns therefore costs no device work and no synchronization.
+std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
+                                              std::vector<decimal_sum_candidate> const& candidates,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr);
+
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded
  * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), all others use one.
+ * STDDEV_SAMP uses a count/mean/M2 STRUCT identified by Kind::M2 and finalizes after merge.
  * COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then counts list elements.
  */
 struct AggregateSlot {
@@ -81,6 +116,7 @@ struct AggregateSlot {
                     ///< COUNT_VALID.
   cudf::data_type output_type{cudf::type_id::EMPTY};  ///< For AVG: the desired output cudf type
                                                       ///< (FLOAT64 or DECIMAL).
+  bool is_stddev_samp = false;                        ///< count/mean/M2 state finalized after merge
 };
 
 /**
@@ -99,6 +135,8 @@ struct CudfAggregateDefinitions {
 
   /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions.
   std::vector<AggregateSlot> aggregate_slots;
+  /// Runtime partial schema: group keys followed by expanded aggregate carriers.
+  duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;  ///< True if any aggregate is AVG
   bool has_count_distinct = false;  ///< True if any aggregate is COUNT(DISTINCT col)
 };

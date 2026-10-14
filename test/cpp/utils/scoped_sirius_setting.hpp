@@ -79,7 +79,7 @@ class scoped_sirius_setting final {
     auto current = con_.Query("SELECT current_setting('" + name_ + "');");
     REQUIRE(current);
     REQUIRE_FALSE(current->HasError());
-    original_ = current->GetValue(0, 0);
+    original_ = current->Collection().GetValue(0, 0);
 
     auto applied = con_.Query("SET " + name_ + " = " + value.value.ToSQLString() + ";");
     REQUIRE(applied);

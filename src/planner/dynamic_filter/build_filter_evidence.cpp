@@ -24,7 +24,8 @@ bool build_subtree_is_filtering(duckdb::LogicalOperator const& op)
 {
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_GET:
-      return !op.Cast<duckdb::LogicalGet>().table_filters.filters.empty();
+      return op.Cast<duckdb::LogicalGet>().table_filters.HasFilters() ||
+             op.Cast<duckdb::LogicalGet>().table_filters.HasMultiColumnFilters();
     case duckdb::LogicalOperatorType::LOGICAL_FILTER:
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N: return true;
     default: break;

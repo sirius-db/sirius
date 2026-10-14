@@ -171,7 +171,7 @@ TEST_CASE("gpu_decode_table BITPACKING - FOR unpacks frame + packed deltas",
       deltas[i] = (i * 7) % 4096;
     auto bytes = make_for_block<int32_t>(-50, 12, deltas);
     auto out   = decode_one<int32_t>(bytes, I32, 100);
-    for (uint32_t i = 0; i < 100; ++i)
+    for (int32_t i = 0; i < 100; ++i)
       REQUIRE(out[i] == -50 + ((i * 7) % 4096));
   }
 

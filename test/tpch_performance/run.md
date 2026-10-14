@@ -62,7 +62,7 @@ Each run creates a directory under `runs/<timestamp>_sf<SF>_2iter/` containing:
 - `comparison.txt` — cold/warm timing table with speedup ratios
 - `timings.csv` — long-format iteration runtimes (engine,query,iteration,runtime_s)
 
-**Note:** The DuckDB baseline uses the same Sirius-built binary (`build/release/duckdb`) but with `SIRIUS_CONFIG_FILE` unset so the Sirius extension does not initialize. This means DuckDB runs on CPU using all available cores.
+**Note:** Both engines use `sirius-duckdb/build/release/duckdb`. The Sirius runner loads the extension explicitly; the DuckDB baseline leaves it unloaded and runs on CPU.
 
 ### Running individual queries
 
@@ -107,7 +107,7 @@ sirius:
 
 `run_tpch_parquet_and_generate_telemetry.sh` runs TPC-H queries in Sirius,
 labels each `(query, iteration)` pair with `sirius_set_query_label`, and writes
-Quent postcard files to `sirius.telemetry.output_directory`.
+Quent NDJSON files to `sirius.telemetry.output_directory`.
 
 ```bash
 pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \

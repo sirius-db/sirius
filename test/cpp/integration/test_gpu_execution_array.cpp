@@ -54,7 +54,7 @@ class disabled_optimizers_guard {
     auto current = _con.Query("SELECT current_setting('disabled_optimizers');");
     REQUIRE(current);
     REQUIRE_FALSE(current->HasError());
-    _saved       = current->GetValue(0, 0).ToString();
+    _saved       = current->Collection().GetValue(0, 0).ToString();
     auto updated = _con.Query("SET disabled_optimizers = '" + _saved + (_saved.empty() ? "" : ",") +
                               extra + "';");
     REQUIRE(updated);
@@ -415,7 +415,7 @@ TEST_CASE_METHOD(ArrayFixture,
     "WHERE column_name = 'a' AND compression = 'Constant';");
   REQUIRE(storage);
   REQUIRE_FALSE(storage->HasError());
-  REQUIRE(storage->GetValue(0, 0).GetValue<int64_t>() > 0);
+  REQUIRE(storage->Collection().GetValue(0, 0).GetValue<int64_t>() > 0);
 
   compare_gpu_vs_cpu("SELECT id, a FROM arr_const;");
 }
@@ -442,7 +442,7 @@ TEST_CASE_METHOD(ArrayFixture,
     REQUIRE(storage);
     REQUIRE_FALSE(storage->HasError());
     UNSCOPED_INFO("expected child codec " << codec << " on table " << table);
-    REQUIRE(storage->GetValue(0, 0).GetValue<int64_t>() > 0);
+    REQUIRE(storage->Collection().GetValue(0, 0).GetValue<int64_t>() > 0);
   };
 
   // RLE: long runs of equal child elements (300 consecutive equal values per
@@ -484,7 +484,7 @@ TEST_CASE_METHOD(ArrayFixture,
     "WHERE column_name = 'a' AND compression IN ('ALP', 'ALPRD');");
   REQUIRE(alp_seg);
   REQUIRE_FALSE(alp_seg->HasError());
-  REQUIRE(alp_seg->GetValue(0, 0).GetValue<int64_t>() > 0);
+  REQUIRE(alp_seg->Collection().GetValue(0, 0).GetValue<int64_t>() > 0);
   compare_gpu_vs_cpu("SELECT id, a FROM arr_alp;");
 }
 

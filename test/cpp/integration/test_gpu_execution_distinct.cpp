@@ -366,13 +366,14 @@ TEST_CASE_METHOD(DistinctFixture,
   auto const prior_result = con->Query("SELECT current_setting('default_collation');");
   REQUIRE(prior_result);
   REQUIRE_FALSE(prior_result->HasError());
-  auto const prior = prior_result->GetValue(0, 0);
+  auto const prior = prior_result->Collection().GetValue(0, 0);
   {
     sirius::test::scoped_sirius_setting collation{*con, "default_collation", "nocase"};
     expect_plan_fallback_matches_cpu("SELECT DISTINCT s_short FROM dist_t");
   }
   // A failed restore would leak nocase into every later integration case.
-  REQUIRE(con->Query("SELECT current_setting('default_collation');")->GetValue(0, 0) == prior);
+  REQUIRE(con->Query("SELECT current_setting('default_collation');")->Collection().GetValue(0, 0) ==
+          prior);
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -443,7 +444,7 @@ class DistinctFloatFixture : public sirius::test::GpuExecutionFixture {
     for (auto* zeros : {d_zeros.get(), f_zeros.get()}) {
       REQUIRE(zeros);
       REQUIRE_FALSE(zeros->HasError());
-      REQUIRE(zeros->GetValue(0, 0).GetValue<int64_t>() == 1);
+      REQUIRE(zeros->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
     }
   }
 };

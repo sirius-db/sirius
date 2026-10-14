@@ -20,10 +20,13 @@
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "event/query_event_publisher.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -42,9 +45,11 @@
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -75,7 +80,7 @@ class sirius_engine;
 namespace duckdb {
 
 class Connection;
-class MaterializedQueryResult;
+class QueryResult;
 
 /// \brief Per-connection Sirius state, registered on every ClientContext under
 /// its own key ("sirius_connection_state").
@@ -334,9 +339,42 @@ class SiriusContext : public ClientContextState {
     uint64_t classification_failures          = 0;
     uint64_t read_view_mismatches             = 0;
     uint64_t certificate_mismatches           = 0;
+    uint64_t certificate_incompletes          = 0;
     uint64_t execution_rebuilds               = 0;
     uint64_t checkpoint_revalidation_failures = 0;
     uint64_t lease_held_at_replay             = 0;
+    static constexpr std::size_t semantic_reason_count =
+      static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_delete_corrupt) + 1;
+    std::array<uint64_t, semantic_reason_count> semantic_declines{};
+    std::array<uint64_t, 3> semantic_verdicts{};
+    uint64_t certification_added_time_us_sum = 0;
+    uint64_t certification_added_time_us_max = 0;
+    uint64_t certification_added_bytes       = 0;
+    uint64_t inherited_capture_bytes         = 0;
+    uint64_t certification_borrowed_files    = 0;
+    uint64_t delete_preparation_time_us      = 0;
+    std::array<uint64_t, 2> budget_exceeded{};
+    uint64_t setting_lookups_per_attempt = 0;
+    std::array<uint64_t, sirius::transparent::late_failure_cause_count> late_failures{};
+    std::array<uint64_t, sirius::transparent::late_failure_cause_count> late_replays{};
+    std::array<uint64_t, 6> late_failure_no_replay{};
+    uint64_t late_replay_not_read_only  = 0;
+    uint64_t discarded_speculative_work = 0;
+    uint64_t window_tasks_started       = 0;
+    std::map<std::string, uint64_t> parquet_reader_calls, native_decoder_calls;
+    std::map<std::string, uint64_t> readahead_registrations;
+    uint64_t prefetcher_conversions = 0;
+    std::map<uint64_t, sirius::op::scan::scan_publication_observation> publications_by_query;
+    uint64_t iceberg_manifest_walks       = 0;
+    uint64_t iceberg_dv_manifest_reads    = 0;
+    uint64_t iceberg_delete_payload_loads = 0;
+    uint64_t iceberg_inventory_bytes_peak = 0;
+    uint64_t split_physical_checks        = 0;
+    uint64_t split_flushed_for_schema     = 0;
+    std::array<uint64_t, semantic_reason_count> split_physical_rejections{};
+    uint64_t parquet_type_mismatch_observed = 0;
+    uint64_t parquet_type_refusals          = 0;
+    std::unordered_map<uint64_t, uint64_t> scan_lowerings;
   };
 
   SiriusContext();
@@ -379,9 +417,9 @@ class SiriusContext : public ClientContextState {
   /// \brief Called on each execute of a reusable prepared statement. Requests a
   /// rebind for Sirius-backed plans so GPU eligibility is re-decided with current
   /// stats.
-  RebindQueryInfo OnExecutePrepared(ClientContext& context,
-                                    PreparedStatementCallbackInfo& info,
-                                    RebindQueryInfo current_rebind) final;
+  RebindQueryInfo OnRebindPreparedStatement(ClientContext& context,
+                                            BindPreparedStatementCallbackInfo& info,
+                                            RebindQueryInfo current_rebind) final;
 
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::parsed_sirius_config& config);
@@ -399,6 +437,10 @@ class SiriusContext : public ClientContextState {
    * state (Sirius not registered) makes the guard a no-op.
    */
   struct InternalQueryGuard {
+    /// Check the owning execution window before DuckDB starts a database transaction.
+    static void before_transaction_start(ClientContext& outer,
+                                         AttachedDatabase const& database,
+                                         bool read_only);
     explicit InternalQueryGuard(ClientContext& context) noexcept
       : state_(get_sirius_connection_state(context))
     {
@@ -424,7 +466,8 @@ class SiriusContext : public ClientContextState {
     internal_connection(const internal_connection&)            = delete;
     internal_connection& operator=(const internal_connection&) = delete;
 
-    unique_ptr<MaterializedQueryResult> Query(const string& sql);
+    unique_ptr<QueryResult> Query(const string& sql);
+    unique_ptr<QueryResult> Submit(const string& sql);
 
    private:
     struct implementation;
@@ -443,6 +486,7 @@ class SiriusContext : public ClientContextState {
                                              std::string_view phase,
                                              uint64_t iteration = 0);
   std::function<void()> cpu_replay_hook_for_testing;
+  std::function<void()> cpu_replay_query_hook_for_testing;
   void before_cpu_replay_for_testing(ClientContext& context);
 
   /// \brief Whether the given connection is inside an internal-query bracket.
@@ -552,6 +596,19 @@ class SiriusContext : public ClientContextState {
     /// releaser; all window logging is best-effort and can neither retain the
     /// slot nor poison the runtime.
     void finish();
+    [[nodiscard]] sirius::transparent::failure_cause failure() const
+    {
+      return completion_->failure();
+    }
+    [[nodiscard]] bool non_rollbackable_state() const
+    {
+      return completion_->non_rollbackable_state;
+    }
+    [[nodiscard]] std::shared_ptr<sirius::op::scan::test_injections const> injections() const
+    {
+      return completion_->injections;
+    }
+    void report_failure(std::exception_ptr error) { completion_->report_error(std::move(error)); }
 
     /// \brief This window's query id — the key its data repositories are registered under.
     /// Pass it to the execution path (sirius_execute_query) so operators wire into this
@@ -578,6 +635,7 @@ class SiriusContext : public ClientContextState {
     scope_state state_   = scope_state::ACTIVE;
     lease_release_result lease_release_;
     bool inject_cleanup_failure_ = false;
+    std::shared_ptr<sirius::pipeline::completion_handler> completion_;
   };
 
   /// \brief Terminate the Sirius context, releasing all resources.
@@ -617,6 +675,20 @@ class SiriusContext : public ClientContextState {
 
   /// \brief The registry itself, for subsystems that hold a long-lived binding to it.
   [[nodiscard]] sirius::data::data_repository_manager_registry& get_data_repository_registry();
+
+  /// \brief The per-query enqueue gate, for tests and for subsystems that consult it directly.
+  enum class query_retirement_mode { completed, cancelled };
+
+  /// Close publication, stop scan producers, and settle this query's asynchronous work.
+  /// Completed queries validate empty queues; cancelled queries discard queued work.
+  /// Called by the query owner, never by a worker holding one of the query's leases.
+  /// Keeps the plan and registries owned until the execution window releases them.
+  void retire_query_work(sirius::query_id_t query_id, query_retirement_mode mode);
+
+  [[nodiscard]] sirius::exec::query_lifecycle_registry& get_query_lifecycle_registry() noexcept
+  {
+    return query_lifecycle_;
+  }
 
   [[nodiscard]] sirius::pipeline::task_scheduler& get_task_scheduler();
   [[nodiscard]] const sirius::pipeline::task_scheduler& get_task_scheduler() const;
@@ -678,7 +750,8 @@ class SiriusContext : public ClientContextState {
     std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
     sirius::query_id_t query_id,
     std::shared_ptr<sirius::pipeline::completion_handler> handler,
-    sirius::telemetry::query_telemetry_info telemetry_info);
+    sirius::telemetry::query_telemetry_info telemetry_info,
+    std::function<bool()> interrupted = {});
 
   /// \brief Get the current query.
   /// \brief Get the current Sirius configuration (const).
@@ -721,6 +794,7 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
+  void record_transparent_certificate_incomplete() noexcept;
 
   /// \brief Record a CPU/candidate bound read-view comparison failure.
   void record_transparent_read_view_mismatch() noexcept;
@@ -732,6 +806,24 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
+  void record_scan_certification(sirius::op::scan::eligibility_certificate const& certificate);
+  void record_certification_budget(bool time, bool bytes, uint64_t lookups);
+  std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters() const
+  {
+    return physical_counters_;
+  }
+  void record_scan_lowering(uint64_t contract);
+  void record_delete_preparation(uint64_t elapsed_us);
+  std::shared_ptr<sirius::pipeline::completion_handler> window_completion(
+    sirius::query_id_t id) const;
+  void record_late_failure(sirius::transparent::late_failure_cause cause) noexcept;
+  void record_late_replay(sirius::transparent::late_failure_cause cause, bool read_only) noexcept;
+  void record_late_refusal(sirius::transparent::late_failure_condition condition) noexcept;
+  std::shared_ptr<std::atomic<uint64_t>> window_task_counter() const
+  {
+    return window_tasks_started_;
+  }
+  void record_semantic_decline(sirius::op::scan::verdict_reason reason) noexcept;
 
   /// Shared event source for planning, pinning, and execution observations.
   [[nodiscard]] sirius::event::query_event_publisher& get_event_publisher() const noexcept
@@ -758,23 +850,25 @@ class SiriusContext : public ClientContextState {
                               sirius::query_id_t query_id,
                               std::string_view window_label,
                               std::string_view pool_tag);
-  /// The mandatory per-query cleanup (the former QueryEnd body, order
-  /// preserved). Runs INSIDE the held slot; may throw. Only the mandatory
-  /// steps (query/drain/repositories/scan/task resets) can throw out of it —
-  /// telemetry and logging inside are best-effort and never abort the
-  /// remaining steps. @p query_id selects which query's repositories to drop;
+  /// Retire work and release query state inside the held admission permit; may throw. Only the
+  /// mandatory steps (query/drain/repositories/scan/task resets) can throw out of it — telemetry
+  /// and logging inside are best-effort and never abort the remaining steps. @p query_id selects
+  /// which query's repositories to drop;
   /// @p end_tag keys the pool-stats log line to the window.
   [[nodiscard]] std::size_t run_mandatory_cleanup(sirius::query_id_t query_id,
                                                   std::string_view end_tag,
                                                   bool inject_failure = false);
+  /// Release creator state, plan, repositories and scan providers after work retirement.
+  /// A failure stops release; remaining owners stay registered for the shutdown backstop.
+  std::size_t release_query_state(sirius::query_id_t query_id, bool inject_failure);
   /// noexcept variant for the StandaloneQueryScope destructor backstop: one
   /// attempt; on failure marks the runtime UNAVAILABLE.
   void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
                                       std::string_view end_tag) noexcept;
 
   /// \brief Best-effort per-query teardown for latched-unavailable paths, where no later
-  /// window will ever run the in-cleanup reset: drops @p query_id's task_creator state and its
-  /// queued tasks. Each step is separately guarded; neither can throw.
+  /// window will run cleanup. Retires work without retrying a partially failed release;
+  /// remaining resources stay owned until shutdown.
   void drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept;
 
   mutable std::mutex mutex_;
@@ -854,8 +948,14 @@ class SiriusContext : public ClientContextState {
   /// Observes where a query is in its execution.  Declared before the creator
   /// and scheduler that report into it so it outlives them on teardown.
   std::shared_ptr<sirius::event::query_event_publisher> query_event_publisher_;
-  // task_creator_ and downgrade_executors_ borrow this scheduler. terminate() stops their threads
-  // before reset; reverse member destruction also preserves that order if initialize() throws.
+  /// Per-query "may work still be enqueued?" gate, consulted by every enqueue point in the
+  /// engine. Opened at window begin, quiesced at the top of the query's cleanup so the drains
+  /// below it cannot be outrun by a completion callback, and closed once they finish. Declared
+  /// before the subsystems that hold a pointer to it so it is destroyed after them.
+  sirius::exec::query_lifecycle_registry query_lifecycle_;
+  // The creator and downgrade executors borrow this scheduler. Reverse member destruction
+  // destroys scan_manager_, creator, and downgrade executors before the scheduler if initialize()
+  // throws before terminate() can run; terminate() also stops their threads before reset.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
@@ -870,12 +970,36 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
+  std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =
+    std::make_shared<sirius::op::scan::physical_check_counters>();
+  // The existing lifecycle slot permits one active window. This borrowed outer
+  // context is valid only within that scope; release clears the association.
+  struct active_execution_window {
+    ClientContext const* outer;
+    sirius::query_id_t query_id;
+    bool internal_start_read_only;  // Test mode, captured once before window entry.
+  };
+  mutable std::mutex window_completions_mutex_;
+  std::optional<active_execution_window> active_window_;
+  std::map<uint64_t, std::shared_ptr<sirius::pipeline::completion_handler>> window_completions_;
+  std::array<std::atomic<uint64_t>, sirius::transparent::late_failure_cause_count> late_failures_{};
+  std::array<std::atomic<uint64_t>, sirius::transparent::late_failure_cause_count> late_replays_{};
+  std::array<std::atomic<uint64_t>, 6> late_failure_no_replay_{};
+  std::atomic<uint64_t> late_replay_not_read_only_{0};
+  std::atomic<uint64_t> discarded_speculative_work_{0};
+  std::shared_ptr<std::atomic<uint64_t>> window_tasks_started_ =
+    std::make_shared<std::atomic<uint64_t>>(0);
+  mutable std::mutex certification_stats_mutex_;
+  transparent_execution_stats certification_stats_;
   std::atomic<uint64_t> transparent_classification_failure_count_{0};
   std::atomic<uint64_t> transparent_read_view_mismatch_count_{0};
   std::atomic<uint64_t> transparent_certificate_mismatch_count_{0};
+  std::atomic<uint64_t> transparent_certificate_incomplete_count_{0};
   std::atomic<uint64_t> transparent_execution_rebuild_count_{0};
   std::atomic<uint64_t> checkpoint_revalidation_failure_count_{0};
   std::atomic<uint64_t> lease_held_at_replay_count_{0};
+  std::array<std::atomic<uint64_t>, transparent_execution_stats::semantic_reason_count>
+    semantic_decline_counts_{};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

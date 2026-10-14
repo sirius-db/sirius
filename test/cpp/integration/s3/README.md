@@ -25,7 +25,7 @@ The manual equivalent of `make s3-test` is:
 
 ```bash
 SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 \
-  build/release/extension/sirius/test/cpp/sirius_unittest --order decl "[s3][integration]~[large]~[aws]"
+  build/release/test/cpp/sirius_unittest --order decl "[s3][integration]~[large]~[aws]"
 ```
 
 ## Tags and gates
@@ -100,7 +100,7 @@ selector above. Run one command per selector, keeping the entire
 selector in one quoted argument:
 
 ```bash
-bin=build/release/extension/sirius/test/cpp/sirius_unittest
+bin=build/release/test/cpp/sirius_unittest
 spec='[s3][integration]~[large]~[aws]'
 
 # Catch2 v2
@@ -135,7 +135,7 @@ SF10 tests report a failed describe of the SF10 object as a skip unless
 STRICT is set. The three tests that PUT objects into managed SeaweedFS skip when
 the endpoint is externally managed; device tests also report unavailable CUDA.
 The PUT cases cover ETag invalidation, kvikio stream ordering, and
-`transparent S3 glob rejects parquet files whose schemas differ instead of decoding them together`.
+`transparent S3 glob refuses semantic type drift before decoding`.
 
 `unittest.cpp` terminates and reaps the server before exiting. On Linux the
 server also receives SIGKILL if the test process dies. Each process has its own

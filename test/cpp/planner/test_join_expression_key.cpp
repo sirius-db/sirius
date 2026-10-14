@@ -21,7 +21,7 @@
  *        plain column reference so PARTITION/CONCAT/hash-join see an ordinary column index.
  */
 
-#include "expression/ast/to_duckdb.hpp"
+#include "expression/ast/node.hpp"
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -31,9 +31,13 @@
 #include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <duckdb/planner/operator/logical_dummy_scan.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
@@ -90,7 +94,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> result;
   try {
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
@@ -100,7 +104,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
 
     auto plan = std::move(planner.plan);
 
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -108,7 +112,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
     resolver.VisitOperator(*plan);
 
     sirius::planner::sirius_physical_plan_generator gen(context);
@@ -141,11 +146,7 @@ sirius::op::sirius_physical_hash_join* find_hash_join(sirius::op::sirius_physica
   return nullptr;
 }
 
-bool is_bound_ref(const sirius::ast::node& side)
-{
-  auto expr = sirius::ast::to_duckdb(side);
-  return expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
-}
+bool is_bound_ref(const sirius::ast::node& side) { return side.holds<sirius::ast::reference>(); }
 
 /// Assert that every equality condition side of @p hj is a plain column reference (BOUND_REF),
 /// i.e. any complex expression was materialized out into a projection below the join.
@@ -265,7 +266,7 @@ TEST_CASE_METHOD(join_expression_key_fixture,
 }
 
 TEST_CASE_METHOD(join_expression_key_fixture,
-                 "join expression key - mixed SEMI and ANTI keep casts in hash keys",
+                 "join expression key - mixed SEMI and ANTI materialize casts in hash keys",
                  "[join_expression_key][isolated_context]")
 {
   const bool anti             = GENERATE(false, true);
@@ -288,12 +289,12 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   const auto expected_type = right_family ? (anti ? JoinType::RIGHT_ANTI : JoinType::RIGHT_SEMI)
                                           : (anti ? JoinType::ANTI : JoinType::SEMI);
   REQUIRE(hj->join_type == expected_type);
-  CHECK_FALSE(has_projection_child(*hj));
+  CHECK(has_projection_child(*hj));
   REQUIRE(hj->conditions.size() == 2);
   for (auto const& condition : hj->conditions) {
     if (condition.comparison == sirius::comparison_type::equal) {
-      CHECK_FALSE(is_bound_ref(*condition.left));
-      CHECK_FALSE(is_bound_ref(*condition.right));
+      CHECK(is_bound_ref(*condition.left));
+      CHECK(is_bound_ref(*condition.right));
     }
   }
   CHECK(hj->types.size() == 2);
@@ -302,7 +303,7 @@ TEST_CASE_METHOD(join_expression_key_fixture,
 }
 
 TEST_CASE_METHOD(join_expression_key_fixture,
-                 "join expression key - hash-only casts stay unmaterialized",
+                 "join expression key - hash-only casts are evaluated before partitioning",
                  "[join_expression_key][isolated_context]")
 {
   const std::string join_type = GENERATE("JOIN", "SEMI JOIN", "ANTI JOIN");
@@ -313,10 +314,10 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   REQUIRE(plan);
   auto* hj = find_hash_join(plan.get());
   REQUIRE(hj);
-  CHECK_FALSE(has_projection_child(*hj));
+  CHECK(has_projection_child(*hj));
   REQUIRE(hj->conditions.size() == 1);
-  CHECK_FALSE(is_bound_ref(*hj->conditions[0].left));
-  CHECK_FALSE(is_bound_ref(*hj->conditions[0].right));
+  CHECK(is_bound_ref(*hj->conditions[0].left));
+  CHECK(is_bound_ref(*hj->conditions[0].right));
 }
 
 TEST_CASE_METHOD(join_expression_key_fixture,
@@ -356,4 +357,26 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   REQUIRE(!con->Query("INSERT INTO names VALUES ('Call Center'), (NULL)")->HasError());
   auto plan = generate_sirius_plan(*con, "SELECT lower(name), upper(name) FROM names");
   REQUIRE(plan);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "DELIM join with an arbitrary condition declines before wrapping the join",
+                 "[join_expression_key][isolated_context]")
+{
+  auto join =
+    make_uniq<LogicalComparisonJoin>(JoinType::INNER, LogicalOperatorType::LOGICAL_DELIM_JOIN);
+  join->delim_flipped = GENERATE(false, true);
+  join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(0)));
+  join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(1)));
+  join->conditions.emplace_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+                                make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+                                ExpressionType::COMPARE_EQUAL);
+  join->conditions.emplace_back(BoundComparisonExpression::Create(
+    ExpressionType::COMPARE_GREATERTHAN,
+    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0),
+    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1)));
+  join->ResolveOperatorTypes();
+  sirius::planner::sirius_physical_plan_generator planner(*con->context);
+  CHECK_THROWS_WITH(planner.create_plan(std::move(join)),
+                    Catch::Matchers::ContainsSubstring("arbitrary join conditions"));
 }

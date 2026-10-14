@@ -19,6 +19,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb_table_identity.hpp"
 #include "event/query_event_publisher.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
@@ -28,6 +29,7 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_snapshot_identity.hpp"
 #include "pin_table.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/insert_delta_job.hpp"
@@ -36,6 +38,7 @@
 #include "scan_manager/mvcc_mask_cache.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
+#include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -99,9 +102,11 @@ class rest_ioctx;
 namespace sirius::op::scan {
 class sirius_gpu_scan_operator;
 class gpu_ingestible;
+struct physical_check_counters;
 }  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
+class preparation_ledger;
 class load_balancing_scan_batch_coalescer;
 }  // namespace sirius::scan_manager
 
@@ -189,12 +194,17 @@ class cache_entry_info {
  * which columns the user pinned) along with the data batches making up the
  * pinned table. The vector may be empty until splits are populated.
  */
+using pin_validation = op::scan::pin_validation;
+
 struct pinned_entry {
   /// Identity of this materialization, independent of the source table's identity.
   /// ANN indexes must match it before using row positions from their build snapshot.
   std::shared_ptr<const pin_snapshot_identity> snapshot_identity{
     std::make_shared<const pin_snapshot_identity>()};
 
+  // Pin-time evidence only. Query-dependent checks belong to the provider.
+  pin_validation::check identity_evidence{true, false};
+  pin_validation::check layout_evidence{true, false};
   /// Cache identity + column layout for this pinned table. Drives the cache-hit
   /// match (@ref cache_entry_info::can_serve_with_columns) and the per-column
   /// gather; replaces the heavyweight read-side ingestible_table_info.
@@ -459,24 +469,6 @@ struct parquet_bind_result {
   std::size_t total_num_rows{0};
 };
 
-/// Number of concurrent queries the scan manager sizes its thread pool for.
-///
-/// Each query's coalescer runs exactly ONE sequencer task that BLOCKS in
-/// queue.wait_dequeue, and is unblocked only by that query's own split_provider tasks
-/// running on the same pool. So every concurrent query needs a parked thread on top of the
-/// working budget. With Q concurrent queries and a pool of size P, Q >= P is a hard
-/// deadlock: every thread parked in a sequencer, none left to feed them.
-///
-/// Left at 1 so the pool stays exactly the size it was before per-query state landed
-/// (num_threads + 1, the old single-sequencer allowance) — this makes the concurrency
-/// refactor behaviorally neutral for existing single-query runs.
-///
-/// TODO: promote to a real option on @ref scan_manager_config (scan_manager/config.hpp),
-/// parsed alongside thread_pool.num_threads in sirius_config.cpp's from_yaml, and RAISE IT
-/// before enabling more than a couple of concurrent queries. Nothing else should read this
-/// constant once it moves.
-inline constexpr int k_max_concurrent_queries = 1;
-
 /**
  * @brief Manages scan-side preparation for a query.
  *
@@ -497,9 +489,11 @@ class sirius_scan_manager {
    * @param topology_index Hardware GPU/NUMA topology index.  Drives round-robin
    *        GPU assignment for scans and is forwarded to the prefetching cache.
    */
-  sirius_scan_manager(const scan_manager_config& config,
+  sirius_scan_manager(sirius::exec::query_lifecycle_registry& lifecycle,
+                      const scan_manager_config& config,
                       cucascade::memory::memory_reservation_manager& reservation_manager,
-                      std::shared_ptr<const sirius::memory::topology_index> topology_index);
+                      std::shared_ptr<const sirius::memory::topology_index> topology_index,
+                      std::shared_ptr<op::scan::physical_check_counters> physical_counters = {});
 
   ~sirius_scan_manager();
 
@@ -521,9 +515,9 @@ class sirius_scan_manager {
   /// Walks @p query 's pipelines in scan-operator order. For each GPU parquet
   /// scan source, the factory builds a split_provider from the operator's
   /// scan_info, installs a fresh split_connector on the operator, and stores
-  /// the provider in a map keyed by the operator. A driver thread then runs
-  /// the providers SEQUENTIALLY in registration order: provider[0] starts,
-  /// when its future completes provider[1] starts, and so on. Consumers (the
+  /// the provider in the per-query state. Preparation is armed here; after GPU
+  /// consumers start, execute runs it on the same query owner. Cached providers
+  /// continue to run on the existing worker executor. Consumers (the
   /// gpu scan operators) block in split_connector::get_next_split until splits
   /// arrive or the connector is closed, so no separate wake-up channel is
   /// needed.
@@ -544,13 +538,35 @@ class sirius_scan_manager {
   ///        distributed round-robin across this subset instead of all GPUs.
   void prepare_for_query(const sirius::planner::query& query,
                          bool enable_pinned_zone_map_pruning,
-                         const std::vector<int>& allocated_gpu_ids);
+                         const std::vector<int>& allocated_gpu_ids,
+                         std::shared_ptr<pipeline::completion_handler> completion = nullptr,
+                         std::function<bool()> interrupted                        = {});
+  // Called by execute after task_scheduler starts the GPU consumers.
+  void run_preparation_on_query_thread(sirius::query_id_t);
+  void close_preparation(sirius::query_id_t, stop_reason) noexcept;
+  void release_footer_hold_for_testing(uint64_t file_number)
+  {
+    if (auto completion = _execution_completion.load())
+      completion->release_footer_for_testing(file_number);
+  }
+  bool wait_for_preparation_error_for_testing(std::chrono::milliseconds timeout)
+  {
+    auto completion = _execution_completion.load();
+    return completion && completion->wait_for_error_for_testing(timeout);
+  }
+  bool wait_for_publication_for_testing(std::chrono::milliseconds timeout)
+  {
+    auto completion = _execution_completion.load();
+    return completion && completion->wait_for_publication_for_testing(timeout);
+  }
 
   /// \brief Drop everything held for @p query_id: stop and join its scan work, then destroy
   ///        its providers and coalescer. Other queries are untouched. No-op for an unknown id.
   ///
   /// Blocking — waits out this query's in-flight reads. The wait happens OUTSIDE the state
   /// mutex, so another connection's prepare_for_query is never parked behind it.
+  // Stop producers while retaining providers/buffers until downstream retirement.
+  void quiesce(sirius::query_id_t query_id);
   void reset(sirius::query_id_t query_id);
 
   /// Drain and drop this query's scan work while retaining checkpoint protection.
@@ -592,6 +608,9 @@ class sirius_scan_manager {
   /// keys without registering scan providers, so their lifetime is tracked separately.
   void acquire_checkpoint_key(sirius::query_id_t query_id, duckdb::AttachedDatabase& database);
   [[nodiscard]] bool holds_checkpoint_key(duckdb::AttachedDatabase const& database) const noexcept;
+  /// Query-local check for transaction-start ordering; never borrows another window's key.
+  [[nodiscard]] bool holds_checkpoint_key(sirius::query_id_t query_id,
+                                          duckdb::AttachedDatabase const& database) const noexcept;
   [[nodiscard]] bool holds_any_checkpoint_key() const noexcept;
   [[nodiscard]] std::size_t checkpoint_key_count() const noexcept;
   [[nodiscard]] std::size_t checkpoint_key_count(sirius::query_id_t query_id) const noexcept;
@@ -909,7 +928,9 @@ class sirius_scan_manager {
   struct query_scan_manager_state {
     ~query_scan_manager_state() { drain(); }
 
-    query_scan_manager_state()                                           = default;
+    explicit query_scan_manager_state(preparation_options options) : preparation(std::move(options))
+    {
+    }
     query_scan_manager_state(const query_scan_manager_state&)            = delete;
     query_scan_manager_state& operator=(const query_scan_manager_state&) = delete;
     query_scan_manager_state(query_scan_manager_state&&)                 = delete;
@@ -917,7 +938,14 @@ class sirius_scan_manager {
 
     //! Stop and join every task this query put on the shared pool. Idempotent, and safe to
     //! call outside the state mutex — it can block for as long as an in-flight read.
+    //! Calls for this state are serialized by the query owner.
     void drain() noexcept;
+
+    bool drained{false};
+    preparation_options const preparation;  // Immutable attempt snapshot.
+    uint64_t query_token = 0;
+    std::shared_ptr<preparation_ledger> ledger;
+    std::shared_ptr<op::scan::physical_check_counters> physical_counters;
 
     //! A disk-backed scan owns the provider that feeds file metadata into the coalescer.
     //! Construction rejects a null provider so the alternative always represents a runnable
@@ -966,6 +994,9 @@ class sirius_scan_manager {
     //! shared with every scan split this query emits.
     std::shared_ptr<readahead_scan_manager> readahead;
 
+    //! Completion state and late-failure injection belong to this query's scans.
+    std::shared_ptr<pipeline::completion_handler> completion;
+
     //! This query's sequencer for opportunistic fadvise calls; gets one pipeline slot per
     //! scan. Its slot map is keyed by operator id, which restarts at 0 per query.
     std::unique_ptr<load_balancing_scan_batch_coalescer> metadata_processor;
@@ -981,10 +1012,13 @@ class sirius_scan_manager {
     //! request_stop() here stops only this query's work; the shared pool and every other
     //! query keep running.
     std::unique_ptr<exec::scoped_dispatcher> dispatcher;
+    // Destroyed before the dispatcher; drain has already quiesced the owner loop.
+    std::unique_ptr<preparation_coordinator> coordinator;
   };
 
-  /// \brief Enqueue @p state's metadata producers before starting its coalescer consumers.
-  void start_metadata_processing(query_scan_manager_state& state);
+  /// \brief Register scan sources and arm the completion gate without submitting disk work.
+  void start_metadata_processing(query_scan_manager_state& state,
+                                 std::function<bool()> interrupted);
 
   //! Resolve a query's state, or nullptr when it has already been reset.
   [[nodiscard]] std::shared_ptr<query_scan_manager_state> get_query_state(
@@ -1043,11 +1077,13 @@ class sirius_scan_manager {
   /// credential rotation cannot retire the context while a request is in flight.
   std::shared_ptr<sirius::io::rest::rest_ioctx> rest_ioctx_for_list(std::string_view path);
 
+  exec::query_lifecycle_registry& _query_lifecycle;
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
   /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of
   /// the GPU id set fed to the round-robin scan-balancing strategy.
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
+  std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
@@ -1137,10 +1173,12 @@ class sirius_scan_manager {
   struct checkpoint_lock_entry {
     duckdb::AttachedDatabase* database;
     duckdb::unique_ptr<duckdb::StorageLockKey> key;
+    uint64_t query_token = 0;
   };
   void release_checkpoint_keys(sirius::query_id_t query_id);
   std::map<sirius::query_id_t, std::vector<checkpoint_lock_entry>> _checkpoint_locks;
   mutable std::mutex _checkpoint_locks_mutex;
+  std::atomic<std::shared_ptr<pipeline::completion_handler>> _execution_completion;
 
   io::io_context_registry _ioctx_registry;
 };

@@ -92,9 +92,9 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   for (auto& delim_expr : op.duplicate_eliminated_columns) {
     D_ASSERT(delim_expr->GetExpressionType() == duckdb::ExpressionType::BOUND_REF);
     auto& bound_ref = delim_expr->Cast<duckdb::BoundReferenceExpression>();
-    delim_types.push_back(bound_ref.return_type);
-    distinct_groups.push_back(
-      duckdb::make_uniq<duckdb::BoundReferenceExpression>(bound_ref.return_type, bound_ref.index));
+    delim_types.push_back(bound_ref.GetReturnType());
+    distinct_groups.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+      bound_ref.GetReturnType(), bound_ref.Index()));
   }
   // now create the duplicate eliminated join
   duckdb::unique_ptr<sirius::op::sirius_physical_delim_join> delim_join;

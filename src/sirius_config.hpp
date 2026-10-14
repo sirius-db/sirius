@@ -149,6 +149,10 @@ struct operator_params {
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
+  /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
+  /// join is larger is split into tasks over row ranges of the left batch.
+  uint64_t cross_join_task_bytes = config::derived_default_batch_size();
+
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
@@ -206,6 +210,11 @@ struct operator_params {
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
+  /// Decide decimal SUM widening from base-table statistics at plan time: an aggregate input with
+  /// a proven magnitude bound skips the per-batch min/max scan and its stream synchronization
+  /// (planner::resolve_decimal_sum_input_bounds). Off: every batch is measured.
+  bool enable_decimal_sum_stats_bound = true;
+
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
@@ -248,15 +257,15 @@ struct operator_params {
   uint64_t avg_variable_column_bytes = 32;
 };
 
+constexpr std::string QUENT_NDJSON_EXPORTER = "ndjson";
+
 struct telemetry_config {
   bool enable_quent{true};
-  /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
-  /// Roughly doubles telemetry volume; no-op when enable_quent is false.
-  bool enable_batch_events{true};
   /// Capture NVTX ranges (Sirius and libcudf) into Quent; no-op when
   /// enable_quent is false.
   bool enable_nvtx{false};
-  std::string exporter{"ndjson"};
+
+  std::string exporter{QUENT_NDJSON_EXPORTER};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
   /// Optional override naming an NVTX injection library. Normally Sirius uses
@@ -310,6 +319,8 @@ struct sirius_config {
   // Explicit hardware-resolving helpers for internal configuration consumers.
   // Runtime startup takes parsed_sirius_config instead.
   void load_from_file(const std::filesystem::path& config_path);
+  /// Replace all settings with hardware-resolved defaults. Apply programmatic
+  /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept

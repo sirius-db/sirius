@@ -25,6 +25,7 @@
 #include <codegen/selection/selection.hpp>
 #include <codegen/util/stream_pool.hpp>
 #include <log/logging.hpp>
+#include <sirius/exception.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -126,8 +127,8 @@ struct chunk_pushdown_config {
 
   /// At least one row-restricting conjunct survives on this chunk.
   bool enabled = false;
-  /// The decode carries EVERY row-restricting conjunct of the scan's filter,
-  /// so a batch it compacts needs no further filtering.
+  /// The decode carries EVERY row-restricting conjunct of the scan's own filter (see
+  /// `pushdown_outcome::row_filtered`), so a batch it compacts needs no further filtering.
   bool covers_whole_filter = false;
   std::vector<range_slot> ranges;                     ///< parallel to selected columns
   std::vector<sirius::codegen::decode_route> routes;  ///< parallel to selected columns
@@ -135,29 +136,17 @@ struct chunk_pushdown_config {
 
 /// Narrow @p request to what @p table can honour for @p selected_columns.
 ///
-/// A conjunct on a column that cannot evaluate it while decoding is DROPPED
-/// (sound: the decode then only under-filters, and the scan's residual filter
-/// still runs) and clears @c covers_whole_filter. The config is disabled only
-/// when nothing survives.
+/// A conjunct on a column that cannot evaluate it while decoding is DROPPED (sound: the decode then
+/// only under-filters, and the scan's residual filter still runs) and clears `covers_whole_filter`.
+/// The config is disabled only when nothing survives.
 ///
-/// into the selection, or a dynamic join filter. It lets the config enable with
-/// no range sources at all.
-///
-/// @p has_dynamic_join_selection narrows that to just the join-filter half: a
-/// dictionary-answered equality is validated up front (simpatico_codegen.cpp's
-/// bool8_filters check) and any failure there refuses the WHOLE decode, so an
-/// equality source that reaches this point is guaranteed applied — it never
-/// affects coverage. A membership probe carries no such guarantee: its
-/// directive is only checked for a non-null probe here, and @c compute_mask
-/// can still decline per batch at decode time (a type mismatch), in which case
-/// that source silently contributes nothing. Coverage must not claim "every
-/// surviving row satisfies the scan's own filter" off a source that might not
-/// have run, so only a dynamic join filter clears it.
+/// @p has_external_selection means the request carries a row-selecting source that is not a range
+/// (a dictionary-answered equality or a join filter), which lets the config enable with no range at
+/// all. Coverage concerns only the scan's own filter; see `pushdown_outcome::row_filtered`.
 chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table const& table,
                                                   std::span<const std::size_t> selected_columns,
                                                   pushdown_request const& request,
-                                                  bool has_external_selection,
-                                                  bool has_dynamic_join_selection)
+                                                  bool has_external_selection)
 {
   chunk_pushdown_config config;
   bool const any_range = std::any_of(request.columns.begin(),
@@ -254,12 +243,12 @@ chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table co
   // applied — an extra guaranteed source only ever removes MORE rows, which
   // cannot make a surviving row stop satisfying the scan's own filter.
   //
-  // A dynamic join filter DOES clear coverage: its probe carries no such
-  // guarantee (compute_mask can decline per batch at decode time), so
-  // covers_whole_filter must not claim "every surviving row satisfies the
-  // scan's own filter" off a source that might not actually have run.
-  config.covers_whole_filter = request.ranges_cover_whole_filter && !dropped_conjunct &&
-                               selecting_columns > 0 && !has_dynamic_join_selection;
+  // Join filters do not bear on coverage either way: coverage is a claim about the scan's own
+  // filter, which every surviving row satisfies whether or not a join filter ran. One that ran
+  // removed only rows the join rejects; one that declined on this batch or was dropped by the probe
+  // cap (decompression_pushdown_max_membership_sources) left such rows for the join to reject.
+  config.covers_whole_filter =
+    request.ranges_cover_whole_filter && !dropped_conjunct && selecting_columns > 0;
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decompression-pushdown] config ENABLED: {} row-selecting range column(s), "
     "external_sources={}, {}/{} column(s) decode compacted, covers_whole_filter={}",
@@ -360,13 +349,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
       sources.push_back({selection_source::kind::membership, i, &probe});
     }
   }
-  bool const has_dynamic_join_selection =
-    std::any_of(sources.begin(), sources.end(), [](auto const& s) {
-      return s.what == selection_source::kind::membership;
-    });
 
-  auto const config = build_chunk_pushdown_config(
-    chunk, selected, request, !sources.empty(), has_dynamic_join_selection);
+  auto const config = build_chunk_pushdown_config(chunk, selected, request, !sources.empty());
   if (!config.enabled) { return nullptr; }
 
   // Then the conjuncts planning just decided this chunk can evaluate.
@@ -394,6 +378,12 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   wave_request.routes.reserve(selected.size());
   for (std::size_t i = 0; i < selected.size(); ++i) {
     wave_request.routes.push_back(config.routes[i]);
+  }
+  // A pure-filter column is dead once this decode carries the scan's whole filter -- exactly the
+  // condition row_filtered is set under below -- so only the output prefix is delivered.
+  if (config.covers_whole_filter && request.output_prefix_width &&
+      *request.output_prefix_width < selected.size()) {
+    wave_request.delivered_prefix = *request.output_prefix_width;
   }
   std::string order_echo;
   for (auto const& source : sources) {
@@ -437,14 +427,24 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
       "[decompression-pushdown] assembly REFUSED ({}); the batch decoded plainly", error);
   }
-  // row_filtered only when the decode carried EVERY restricting conjunct: a
-  // partially applied request must leave the batch untagged so the scan
-  // evaluates the residual (re-checking already-applied conjuncts on the
-  // surviving rows is idempotent).
+  // row_filtered only when the decode carried every conjunct of the scan's own filter: a partially
+  // applied request must leave the batch untagged so the scan evaluates the residual (re-checking
+  // already-applied conjuncts on the surviving rows is idempotent).
   if (result.status == sirius::codegen::scan_filter_status::declined_unselective) {
     outcome.selection_unprofitable = true;
   } else if (result.applied && config.covers_whole_filter) {
-    outcome.row_filtered = true;
+    outcome.row_filtered                = true;
+    outcome.filter_only_columns_dropped = wave_request.delivered_prefix.has_value();
+  }
+  auto const expected_width =
+    outcome.filter_only_columns_dropped ? *wave_request.delivered_prefix : selected.size();
+  if (static_cast<std::size_t>(table->num_columns()) != expected_width) {
+    throw sirius::internal_exception(
+      "[decompression_pushdown_scan] the decode returned {} column(s), expected {} "
+      "(filter_only_columns_dropped={})",
+      table->num_columns(),
+      expected_width,
+      outcome.filter_only_columns_dropped);
   }
   // Every equality the request carried was ANDed into the batch mask before
   // wave 2 ran, so on an applied decode the surviving rows already satisfy
@@ -455,7 +455,7 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decompression-pushdown] decode {} (status={} generation={}): ranges={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
-    "selection_unprofitable={}",
+    "selection_unprofitable={} filter_only_columns_dropped={}",
     result.applied ? "APPLIED" : "NOT applied (plain output)",
     static_cast<int>(result.status),
     result.source_generation,
@@ -467,7 +467,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
     table->num_columns(),
     config.covers_whole_filter,
     outcome.row_filtered,
-    outcome.selection_unprofitable);
+    outcome.selection_unprofitable,
+    outcome.filter_only_columns_dropped);
   return table;
 }
 
@@ -619,10 +620,12 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
                   ? simpatico::decompress(chunk, selected, decode_pool(), mr)
                   : simpatico::decompress(chunk, selected, predicates, decode_pool(), mr);
   }
-  // An active equality directive yields BOOL8 on every path — the filtered
-  // decode and the plain rerun alike — so the substituted positions are exactly
-  // the active entries.
-  for (std::size_t i = 0; i < predicates.size(); ++i) {
+  // An active equality directive yields BOOL8 on every path — the filtered decode and the plain
+  // rerun alike — so the substituted positions are exactly the active entries the decoded table
+  // still holds (a filter-only column past the delivered prefix is not in it, and neither is its
+  // answer).
+  auto const width = static_cast<std::size_t>(out.table->num_columns());
+  for (std::size_t i = 0; i < predicates.size() && i < width; ++i) {
     if (predicates[i].active()) { out.outcome.predicate_columns.push_back(i); }
   }
   return out;

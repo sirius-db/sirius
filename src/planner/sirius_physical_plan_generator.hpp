@@ -20,12 +20,14 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sirius::op {
@@ -61,6 +63,7 @@ class LogicalProjection;
 class LogicalSetOperation;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
+class TableFilterSet;
 }  // namespace duckdb
 
 namespace sirius::planner {
@@ -71,6 +74,14 @@ namespace sirius::planner {
 struct scan_contract_provenance {
   std::optional<uint64_t> window_id;
   uint64_t finalize_generation = 0;
+  op::scan::certification_budget budget;
+  op::scan::test_injections injections;
+  uint64_t setting_lookups          = 0;
+  uint64_t certification_scan_index = 0;
+  uint64_t lineage_time_us          = 0;
+  std::optional<std::pair<op::scan::verdict_reason, std::string>> first_pre_decline;
+  // A fragment publishes cuDF batches directly; it has no DuckDB host exporter.
+  bool host_export_available = true;
 };
 
 /// Resolved parquet file set identifying a parquet-family scan
@@ -85,6 +96,10 @@ struct scan_contract_provenance {
   duckdb::FunctionData const* bind_data,
   duckdb::vector<duckdb::Value> const& parameters);
 
+//! Bind unpushed filters to output positions; the scan projection must include their columns.
+duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> extract_unpushed_scan_filters(
+  duckdb::LogicalGet const& op, duckdb::TableFilterSet& table_filters);
+
 //! The physical plan generator generates a physical execution plan from a
 //! logical query plan
 class sirius_physical_plan_generator {
@@ -97,14 +112,14 @@ class sirius_physical_plan_generator {
   duckdb::LogicalDependencyList dependencies;
   //! Recursive CTEs require at least one ChunkScan, referencing the working_table.
   //! This data structure is used to establish it.
-  duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
+  duckdb::unordered_map<duckdb::TableIndex, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
     recursive_cte_tables;
   //! Used to reference the recurring tables
-  duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
+  duckdb::unordered_map<duckdb::TableIndex, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
     recurring_cte_tables;
   //! Materialized CTE ids must be collected.
   duckdb::unordered_map<
-    std::size_t,
+    duckdb::TableIndex,
     duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>>
     materialized_ctes;
 

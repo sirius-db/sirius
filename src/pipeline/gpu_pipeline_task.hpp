@@ -22,6 +22,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -322,12 +323,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   /// weak_ptr so that memory can be released as soon as the last owner drops.
   /// This is used in the destructor to unsubscribe.
   std::vector<std::weak_ptr<cucascade::data_batch>> _subscribed_batches;
-  //! Batch ids claimed for telemetry in the constructor; released by id in the
-  //! dtor because the weak pointers above are usually dead by then.
-  std::vector<uint64_t> _claimed_batch_ids;
-  //! The processing-space reservation reported on the preparing/computing
-  //! telemetry states as a MemoryTier usage (nil id = none).
-  uuid::UUID _reservation_tier_resource_id{};
+  /// MemorySpace used by the task reservation (nil id = none).
+  quent::Uuid _reservation_memory_resource_id{quent::nil_uuid()};
   uint64_t _reservation_bytes = 0;
 };
 

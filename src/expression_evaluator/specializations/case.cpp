@@ -22,6 +22,7 @@
 
 // cudf
 #include <cudf/ast/expressions.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/reduction.hpp>
@@ -77,6 +78,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::case_expr const& alt
           "expression.");
       }
       continue;
+    }
+
+    // A folded WHEN can be a scalar, including NULL (which selects ELSE).
+    if (current_mask.is_scalar()) {
+      current_mask = evaluate_result(cudf::make_column_from_scalar(
+        current_mask.get_scalar(), _input_table.num_rows(), _stream, _mr));
     }
 
     // Otherwise, evaluate the THEN and selectively copy to the output.

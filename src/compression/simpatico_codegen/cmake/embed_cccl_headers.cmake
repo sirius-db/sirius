@@ -1,177 +1,90 @@
-# Transitively scan the CCCL (<cuda/std/...>, <cub/...>) #include closure the
-# runtime NVRTC JIT needs, and emit a .cpp that embeds each header as a
-# raw-string literal exposed as an EmbeddedJitHeader table. Passing these to
-# nvrtcCreateProgram() as named in-memory headers lets the JIT compile with NO
-# -I into a CCCL tree, so a binary distribution needs only the driver + the
-# nvrtc runtime it already links. Invoked via `cmake -P`.
-#
-# Required -D inputs: INCLUDE_DIRS_FILE contains CMake's evaluated CCCL include
-# directories, one per line; OUT is the path of the .cpp to generate. DEPFILE
-# optionally names a Make/Ninja depfile for the transitively scanned headers.
-#
-# The scan follows every literal `#include` line (both #ifdef branches) from the
-# fixed kernel-prelude roots below. Dependencies reached through macro-expanded
-# includes must be seeded explicitly. Recomputed at build time, so it tracks the
-# CCCL version in use.
-
+# Embed the complete approved CCCL library trees, not an include closure.
+# INCLUDE_DIRS_FILE contains CMake's evaluated include roots in search order.
+# OUT names the generated .cpp; DEPFILE optionally tracks files and directories
+# so content edits, additions, removals, and search-root shadowing regenerate
+# it.
 cmake_minimum_required(VERSION 3.24)
+include("${CMAKE_CURRENT_LIST_DIR}/jit_header_manifest.cmake")
+file(STRINGS "${INCLUDE_DIRS_FILE}" include_dirs)
 
-file(STRINGS "${INCLUDE_DIRS_FILE}" cccl_include_dirs)
-
-# Installed packages share one include root; source packages use separate
-# component roots. Search the directories in the order supplied by CMake.
-function(find_cccl_header name output)
-  set(${output}
-      ""
-      PARENT_SCOPE)
-  cmake_path(SET relative_name NORMALIZE "${name}")
-  if(IS_ABSOLUTE "${relative_name}" OR relative_name MATCHES "^\\.\\.(/|$)")
-    return()
+set(names "")
+set(dependencies "")
+foreach(include_dir IN LISTS include_dirs)
+  if(NOT IS_ABSOLUTE "${include_dir}")
+    message(
+      FATAL_ERROR "CCCL include directory must be absolute: ${include_dir}")
   endif()
-  foreach(include_dir IN LISTS cccl_include_dirs)
-    cmake_path(SET candidate NORMALIZE "${include_dir}/${relative_name}")
-    if(EXISTS "${candidate}" AND NOT IS_DIRECTORY "${candidate}")
-      set(${output}
-          "${candidate}"
-          PARENT_SCOPE)
-      return()
+  # Track even a currently absent earlier root: creating it may shadow headers.
+  set(parent "${include_dir}")
+  while(NOT IS_DIRECTORY "${parent}")
+    get_filename_component(parent "${parent}" DIRECTORY)
+  endwhile()
+  list(APPEND dependencies "${parent}")
+  foreach(component cub thrust cuda nv)
+    file(
+      GLOB_RECURSE entries FOLLOW_SYMLINKS
+      LIST_DIRECTORIES TRUE
+      RELATIVE "${include_dir}"
+      "${include_dir}/${component}/*")
+    # Track the component root too, including an empty directory.
+    if(IS_DIRECTORY "${include_dir}/${component}")
+      list(APPEND dependencies "${include_dir}/${component}")
     endif()
-  endforeach()
-endfunction()
-
-foreach(marker cub/version.cuh cuda/std/cstdint thrust/version.h)
-  find_cccl_header("${marker}" header)
-  if(NOT header)
-    message(
-      FATAL_ERROR
-        "embed_cccl_headers: '${marker}' is missing from CCCL include directories: ${cccl_include_dirs}"
-    )
-  endif()
-endforeach()
-
-# Union of the includes emitted by the encode + decode kernel preludes.
-set(roots
-    cub/block/block_reduce.cuh
-    cub/block/block_scan.cuh
-    cub/block/block_exchange.cuh
-    cuda/std/cstdint
-    cuda/std/cstddef
-    cuda/std/climits
-    cuda/std/type_traits)
-foreach(root IN LISTS roots)
-  find_cccl_header("${root}" header)
-  if(NOT header)
-    message(
-      FATAL_ERROR
-        "embed_cccl_headers: required prelude header '${root}' is missing from CCCL include directories: ${cccl_include_dirs}"
-    )
-  endif()
-endforeach()
-
-# Some CCCL versions reach these through macro-expanded includes, which the
-# literal-include scanner cannot discover. Seed them when present.
-foreach(root thrust/system/cpp/detail/execution_policy.h
-             thrust/system/cuda/detail/execution_policy.h)
-  find_cccl_header("${root}" header)
-  if(header)
-    list(APPEND roots "${root}")
-  else()
-    message(STATUS "embed_cccl_headers: skipping optional header '${root}'")
-  endif()
-endforeach()
-
-set(worklist ${roots})
-set(found "")
-
-while(worklist)
-  list(POP_FRONT worklist rel)
-  if(rel IN_LIST found)
-    continue()
-  endif()
-  find_cccl_header("${rel}" abs)
-  if(NOT abs)
-    continue()
-  endif()
-  list(APPEND found "${rel}")
-
-  file(READ "${abs}" content)
-  get_filename_component(curdir "${rel}" DIRECTORY)
-  # Anchor to line start (a newline followed by only whitespace then '#') so we
-  # don't match example `#include` lines inside doc comments — those would drag
-  # in large unused subtrees (e.g. all of thrust/). A leading newline is
-  # prepended so a directive on the first line still matches.
-  string(REGEX MATCHALL "[\r\n][ \t]*#[ \t]*include[ \t]*[<\"][^>\"\r\n]+[>\"]"
-               incs "\n${content}")
-  foreach(inc IN LISTS incs)
-    string(REGEX REPLACE ".*[<\"]([^>\"]+)[>\"].*" "\\1" name "${inc}")
-    set(resolved "")
-    # 1) resolve through CCCL's include directories (<cuda/...>, <cub/...>)
-    find_cccl_header("${name}" header)
-    if(header)
-      set(resolved "${name}")
-    elseif(curdir)
-      # 2) resolve relative to the including file's directory (quoted includes)
-      cmake_path(SET relative_name NORMALIZE "${curdir}/${name}")
-      if(NOT relative_name MATCHES "^\\.\\./")
-        find_cccl_header("${relative_name}" header)
-        if(header)
-          set(resolved "${relative_name}")
-        endif()
+    foreach(name IN LISTS entries)
+      if(IS_DIRECTORY "${include_dir}/${name}")
+        list(APPEND dependencies "${include_dir}/${name}")
+      else()
+        list(APPEND names "${name}")
       endif()
-    endif()
-    # Names that don't resolve under CCCL are nvrtc built-ins or host headers
-    # guarded out under __CUDACC_RTC__ — skip them.
-    if(resolved AND NOT resolved IN_LIST found)
-      list(APPEND worklist "${resolved}")
-    endif()
+    endforeach()
   endforeach()
-endwhile()
+endforeach()
+list(REMOVE_DUPLICATES names)
+list(SORT names)
+list(LENGTH names count)
+foreach(marker cub/version.cuh cuda/std/cstdint thrust/version.h)
+  if(NOT marker IN_LIST names)
+    message(
+      FATAL_ERROR "CCCL header '${marker}' is missing from: ${include_dirs}")
+  endif()
+endforeach()
 
-list(REMOVE_DUPLICATES found)
-list(SORT found)
-list(LENGTH found n)
-if(n EQUAL 0)
-  message(FATAL_ERROR "embed_cccl_headers: the scanned CCCL closure is empty")
-endif()
-
-# Raw-string delimiter (<=16 chars, C++ limit) chosen so it cannot appear in a
-# CCCL header.
 set(D "CCCL_EMB_9F3A")
 set(body "// AUTO-GENERATED by embed_cccl_headers.cmake -- DO NOT EDIT.\n")
 string(APPEND body
-       "// ${n} CCCL headers, the runtime NVRTC JIT include closure.\n")
-string(APPEND body "#include \"codegen/jit/cccl_embedded_headers.h\"\n")
-string(APPEND body "namespace codegen::jit {\n")
-
-set(idx 0)
-set(header_dependencies "")
-foreach(rel IN LISTS found)
-  find_cccl_header("${rel}" header)
-  list(APPEND header_dependencies "${header}")
-  file(READ "${header}" hsrc)
-  string(APPEND body "static const char* kCcclName${idx} = \"${rel}\";\n")
-  string(APPEND body
-         "static const char* kCcclSrc${idx} =\nR\"${D}(${hsrc})${D}\";\n")
-  math(EXPR idx "${idx}+1")
-endforeach()
-
+       "// ${count} headers from the complete CCCL library bundle.\n")
+string(
+  APPEND body
+  "#include \"codegen/jit/cccl_embedded_headers.h\"\nnamespace codegen::jit {\n"
+)
 string(APPEND body "const EmbeddedJitHeader kCcclEmbeddedHeaders[] = {\n")
-set(idx 0)
-foreach(rel IN LISTS found)
-  string(APPEND body "  {kCcclName${idx}, kCcclSrc${idx}},\n")
-  math(EXPR idx "${idx}+1")
+set(manifest "simpatico-headers-v2\n")
+foreach(name IN LISTS names)
+  foreach(include_dir IN LISTS include_dirs)
+    set(header "${include_dir}/${name}")
+    if(EXISTS "${header}" AND NOT IS_DIRECTORY "${header}")
+      break()
+    endif()
+  endforeach()
+  list(APPEND dependencies "${header}")
+  jit_read_header("${header}" content)
+  string(FIND "${content}" ")${D}\"" delimiter_collision)
+  if(NOT delimiter_collision EQUAL -1)
+    message(FATAL_ERROR "Embedded raw-string delimiter occurs in ${header}")
+  endif()
+  jit_manifest_record("${name}" "${content}" record)
+  string(APPEND manifest "${record}")
+  string(APPEND body "  {\"${name}\", R\"${D}(${content})${D}\"},\n")
 endforeach()
-string(APPEND body "};\n")
-string(APPEND body "const int kCcclEmbeddedHeaderCount = ${n};\n")
+string(APPEND body "};\nconst int kCcclEmbeddedHeaderCount = ${count};\n")
+jit_bundle_identity("${manifest}" digest)
+string(APPEND body
+       "const char kCcclEmbeddedHeadersIdentity[] = \"${digest}\";\n")
 string(APPEND body "}  // namespace codegen::jit\n")
-
 file(WRITE "${OUT}" "${body}")
 
-# Teach the build graph about the dynamically discovered closure. If any scanned
-# header changes (including gaining a new literal include), the custom command
-# reruns and discovers the updated closure.
 if(DEFINED DEPFILE AND NOT DEPFILE STREQUAL "")
-  # Escape a path for a Make/Ninja depfile and return it through output.
+  # Escape Make/Ninja depfile syntax, including roots containing spaces.
   function(escape_depfile_path input output)
     set(escaped "${input}")
     string(REPLACE "\\" "/" escaped "${escaped}")
@@ -183,15 +96,13 @@ if(DEFINED DEPFILE AND NOT DEPFILE STREQUAL "")
         "${escaped}"
         PARENT_SCOPE)
   endfunction()
-
-  escape_depfile_path("${OUT}" depfile_out)
-  set(_depfile_body "${depfile_out}:")
-  foreach(header IN LISTS header_dependencies)
-    escape_depfile_path("${header}" depfile_header)
-    string(APPEND _depfile_body " \\\n  ${depfile_header}")
+  escape_depfile_path("${OUT}" escaped_output)
+  set(depfile "${escaped_output}:")
+  list(REMOVE_DUPLICATES dependencies)
+  foreach(dependency IN LISTS dependencies)
+    escape_depfile_path("${dependency}" escaped_dependency)
+    string(APPEND depfile " \\\n  ${escaped_dependency}")
   endforeach()
-  string(APPEND _depfile_body "\n")
-  file(WRITE "${DEPFILE}" "${_depfile_body}")
+  file(WRITE "${DEPFILE}" "${depfile}\n")
 endif()
-
-message(STATUS "embed_cccl_headers: embedded ${n} CCCL headers into ${OUT}")
+message(STATUS "Embedded ${count} CCCL headers into ${OUT}")

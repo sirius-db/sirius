@@ -36,7 +36,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
       sirius::from_duckdb_vec(op.chunk_types),
       sirius::op::SiriusPhysicalOperatorType::CTE_SCAN,
       op.estimated_cardinality,
-      op.cte_index);
+      op.cte_index.index);
 
     auto cte = recursive_cte_tables.find(op.cte_index);
     if (cte == recursive_cte_tables.end()) {
