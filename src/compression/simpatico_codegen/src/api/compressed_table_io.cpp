@@ -598,7 +598,11 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
     validity.null_count = cr.validity.null_count;
     if (validity.kind == validity_kind::mask) {
       auto const sz = static_cast<std::size_t>(cr.validity.size_bytes);
-      validity.mask = rmm::device_buffer(sz, stream, mr);
+      // From leaf_mr, like every enumerated payload buffer: the writer lists the mask
+      // among them (push_validity), and a caller placing them in its own slab hands
+      // slices out by allocation order, so a mask taken from mr would shift every
+      // later leaf onto the wrong slice.
+      validity.mask = rmm::device_buffer(sz, stream, leaf_mr);
       if (sz > 0) fetch(cr.validity.payload_offset, sz, validity.mask.data(), stream);
     }
 
