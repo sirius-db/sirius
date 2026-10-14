@@ -834,6 +834,7 @@ struct resident_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
   std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> manager;
   /// One cache chunk per split, laid out a chunk apart, so no two splits share
   /// a chunk and each prefetch does IO of its own.
@@ -851,7 +852,8 @@ struct resident_fixture {
     cfg.cache.eviction          = eviction_policy::lru;
     cfg.max_readahead_scans     = 0;
     cfg.apply_cache_mode();
-    manager = std::make_unique<sirius::scan_manager::sirius_scan_manager>(cfg, *memory, topology);
+    manager = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
+      scan_lifecycle, cfg, *memory, topology);
     auto* cache = manager->ensure_default_cache();
     REQUIRE(cache != nullptr);
     REQUIRE(cache->is_armed());

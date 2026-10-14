@@ -287,8 +287,9 @@ TEST_CASE("the default cache is not built until something uses it",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+    scan_lifecycle, config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
   CHECK(manager.io_ctx()->cache() == nullptr);
 
   // A reset must not be what builds it either: only caches that existed are
@@ -308,8 +309,9 @@ TEST_CASE("concurrent first uses build the default cache once", "[scan_manager][
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+    scan_lifecycle, config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
 
   constexpr int n_threads = 8;
   std::vector<sirius::io::cache::prefetching_cache*> seen(n_threads, nullptr);
