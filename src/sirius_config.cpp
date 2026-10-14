@@ -18,6 +18,7 @@
 
 #include "exec/config.hpp"
 #include "log/logging.hpp"
+#include "memory/registered_host_memory_resource.hpp"
 #include "yaml_reader.hpp"
 
 #include <cuda_runtime_api.h>
@@ -520,6 +521,11 @@ struct host_mem_config {
   std::size_t block_size{cucascade::memory::default_block_size};
   std::size_t pool_size{cucascade::memory::default_pool_size};
   std::size_t initial_number_pools{cucascade::memory::default_initial_number_pools};
+  // Where each pool's memory comes from: false keeps cucascade's cudaHostAlloc; true touches the
+  // pages on prefault_threads threads and registers them with CUDA, which is several times faster.
+  bool register_pools{false};
+  bool huge_pages{true};
+  unsigned prefault_threads{8};
 
   static void from_yaml(const YAML::Node& node, host_mem_config& opt)
   {
@@ -553,6 +559,9 @@ struct host_mem_config {
     r.optional("block_size", yaml::bytes(opt.block_size));
     r.optional("pool_size", opt.pool_size);
     r.optional("initial_number_pools", opt.initial_number_pools);
+    r.optional("register_pools", opt.register_pools);
+    r.optional("huge_pages", opt.huge_pages);
+    r.optional("prefault_threads", opt.prefault_threads);
     r.reject_unknown();
     validate_downgrade_fractions(
       "sirius.memory.host", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
@@ -586,6 +595,13 @@ struct host_mem_config {
     // cucascade config field — the names line up with the resulting config struct, not with the
     // setter's parameter names.
     builder.set_host_pool_features(block_size, pool_size, initial_number_pools);
+    if (register_pools) {
+      builder.set_host_memory_resource_factory(
+        [huge = huge_pages, threads = prefault_threads](int numa_node, std::size_t) {
+          return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+            sirius::memory::registered_host_memory_resource{numa_node, huge, threads}};
+        });
+    }
   }
 };
 
