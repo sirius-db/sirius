@@ -12,6 +12,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -38,6 +39,15 @@ const ENV_HINT: &str = "source experimental/starrocks/scripts/cn-env.sh (NIXL_PR
                         UCX_TLS=cuda_copy,cuda_ipc,tcp,self";
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// WRITEs kept in flight per hop unless `SIRIUS_CN_NIXL_WINDOW` says otherwise.
+const DEFAULT_WINDOW: u64 = 4;
+/// Longest a WRITE may take unless `SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS` says otherwise.
+const DEFAULT_XFER_TIMEOUT_SECS: u64 = 30;
+/// Alloc refusals for want of pool memory are retried this many times, backing off up to
+/// [`ALLOC_MAX_BACKOFF`]: a receiver's pool frees up as it consumes earlier batches.
+const ALLOC_RETRIES: u32 = 8;
+const ALLOC_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Handle to the transport thread.
 #[derive(Debug)]
@@ -186,6 +196,10 @@ struct Transport {
     local_md: Vec<u8>,
     /// Remote agent name per peer, once its metadata is loaded.
     peers: HashMap<SocketAddr, String>,
+    /// WRITEs kept in flight per hop (`SIRIUS_CN_NIXL_WINDOW`).
+    window: usize,
+    /// Longest a WRITE may take (`SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS`).
+    xfer_timeout: Duration,
 }
 
 /// One posted WRITE, completed oldest first.
@@ -211,7 +225,19 @@ struct HopTotals {
 
 impl Transport {
     fn bring_up(agent_name: &str, exchange: Arc<DirectExchange>) -> Result<Self, String> {
+        // A stub nixl-sys (built without NIXL_PREFIX) aborts the process at its first call when
+        // libnixl_capi.so can't be loaded, so refuse it here with the hint instead.
+        if nixl_sys::is_stub() {
+            return Err(format!(
+                "nixl-sys was built as a stub ({ENV_HINT}); if it was built before sourcing \
+                 cn-env.sh, run `cargo clean -p nixl-sys` and rebuild"
+            ));
+        }
         check_single_visible_device(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref())?;
+        let window = positive_env("SIRIUS_CN_NIXL_WINDOW")?.unwrap_or(DEFAULT_WINDOW) as usize;
+        let xfer_timeout = Duration::from_secs(
+            positive_env("SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS")?.unwrap_or(DEFAULT_XFER_TIMEOUT_SECS),
+        );
         let agent = Agent::new(agent_name).map_err(|err| {
             format!("failed to create nixl agent '{agent_name}': {err} ({ENV_HINT})")
         })?;
@@ -245,7 +271,12 @@ impl Transport {
             .map_err(|err| format!("failed to serialize nixl agent metadata: {err}"))?;
         info!(
             agent = agent_name,
-            device, base, len, "nixl transport ready; GPU slab registered"
+            device,
+            base,
+            len,
+            window,
+            xfer_timeout_s = xfer_timeout.as_secs(),
+            "nixl transport ready; GPU slab registered"
         );
         Ok(Self {
             _registration: registration,
@@ -254,6 +285,8 @@ impl Transport {
             device: device as u64,
             local_md,
             peers: HashMap::new(),
+            window,
+            xfer_timeout,
         })
     }
 
@@ -272,26 +305,37 @@ impl Transport {
         let started = Instant::now();
         let peer = request.peer;
         let remote = self.remote_agent(peer)?;
-        let window = env_u64("SIRIUS_CN_NIXL_WINDOW").map_or(4, |n| n as usize);
+        let window = self.window;
         let mut totals = HopTotals::default();
-        std::thread::scope(|scope| {
+        // Set by the announcer once the peer refused or missed a frame: the pump then stops
+        // exporting, allocating and writing batches nobody will receive.
+        let stop = AtomicBool::new(false);
+        let shipped = std::thread::scope(|scope| {
             let (announce, frames) = channel::<(u64, u64)>();
             let (slot, names) = (request.slot, &request.names);
-            let announcer = scope.spawn(move || announce_all(peer, slot, names, frames));
+            let stop_ref = &stop;
+            let announcer = std::thread::Builder::new()
+                .name("nixl-announce".to_string())
+                .spawn_scoped(scope, move || {
+                    announce_all(peer, slot, names, frames, stop_ref)
+                })
+                .map_err(|err| format!("failed to spawn the nixl announce thread: {err}"))?;
             let mut inflight = VecDeque::new();
             let pumped = self.pump(
                 request,
                 &remote,
-                window,
                 &mut inflight,
                 &announce,
+                &stop,
                 &mut totals,
             );
             // Wait out every WRITE still posted: a finished one frees the sender's batch, and the
-            // receiver's buffers it filled are never announced, so they are released.
+            // receiver's buffers it filled are never announced, so they are released. Once the
+            // peer stops answering, further Releases would each wait out `RPC_TIMEOUT`.
+            let mut peer_up = true;
             for mut write in inflight {
-                if self.complete(&remote, &mut write).is_ok() {
-                    let _ = call(peer, control_params(), &NixlEnvelope::Release(write.remote));
+                if self.complete(&remote, &mut write).is_ok() && peer_up {
+                    peer_up = release_remote(peer, write.remote);
                 }
             }
             if pumped.is_ok() {
@@ -301,8 +345,15 @@ impl Transport {
             let announced = announcer
                 .join()
                 .unwrap_or_else(|_| Err("the announce thread panicked".to_string()));
-            pumped.and(announced)
-        })?;
+            // The announcer's error is the cause when it stopped the pump.
+            announced.and(pumped)
+        });
+        if let Err(err) = shipped {
+            // A restarted peer comes back under the same agent name with a new registration, so
+            // stale metadata would fail every later hop: reload it on the next one.
+            self.forget_peer(peer, &remote);
+            return Err(err);
+        }
         info!(
             peer = %peer,
             dest_stream = request.slot.node_id,
@@ -322,14 +373,17 @@ impl Transport {
         &self,
         request: &SendRequest,
         remote: &str,
-        window: usize,
         inflight: &mut VecDeque<Write>,
         announce: &Sender<(u64, u64)>,
+        stop: &AtomicBool,
         totals: &mut HopTotals,
     ) -> Result<(), String> {
         let mut drained = false;
         loop {
-            while !drained && inflight.len() < window {
+            if stop.load(Ordering::Acquire) {
+                return Err("the peer stopped accepting this hop's frames".to_string());
+            }
+            while !drained && inflight.len() < self.window {
                 match request.executor.export_direct_next(request.slot)? {
                     Some(batch) => inflight.push_back(self.post(request.peer, remote, batch)?),
                     None => drained = true,
@@ -349,14 +403,14 @@ impl Transport {
 
     /// Allocates the receiver's buffers for `batch` and posts one WRITE of all of them.
     fn post(&self, peer: SocketAddr, remote: &str, batch: ExportedBatch) -> Result<Write, String> {
-        let reply = call(peer, control_params(), &NixlEnvelope::Alloc(batch.layout))
+        let reply = alloc(peer, batch.layout)
             .and_then(|reply| AllocReply::decode(&reply))
             .inspect_err(|_| self.release(batch.token))?;
         let request = self
             .create_write(remote, &batch.src, &reply)
             .inspect_err(|_| {
                 self.release(batch.token);
-                let _ = call(peer, control_params(), &NixlEnvelope::Release(reply.token));
+                release_remote(peer, reply.token);
             })?;
         let posted = Instant::now();
         let in_progress = match self.agent.post_xfer_req(&request, None) {
@@ -408,15 +462,19 @@ impl Transport {
 
     /// Waits for `write` to finish, then frees the sender's batch. A WRITE that fails or times out
     /// may still be in flight, so its request is leaked rather than released (dropping it would
-    /// release it) and both batches stay held.
+    /// release it) and both batches stay held. TODO(#2041): quarantine them until the WRITE ends.
     fn complete(&self, remote: &str, write: &mut Write) -> Result<(), String> {
-        let timeout = env_u64("SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS")
-            .map_or(Duration::from_secs(30), Duration::from_secs);
+        let timeout = self.xfer_timeout;
+        // Polls back off from a few microseconds to 100 us, so a long WRITE doesn't keep a core
+        // spinning next to the brpc and engine threads. WRITEs take 0.3-4 ms at SF1000, so a
+        // longer cap would notice one finishing that much later.
+        let mut backoff = Duration::from_micros(4);
         while let Some(request) = &write.request {
             match self.agent.get_xfer_status(request) {
                 Ok(XferStatus::Success) => write.request = None,
                 Ok(XferStatus::InProgress) if write.posted.elapsed() < timeout => {
-                    std::thread::yield_now()
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_micros(100));
                 }
                 status => {
                     std::mem::forget(write.request.take());
@@ -455,24 +513,36 @@ impl Transport {
         Ok(name)
     }
 
+    /// Drops `peer`'s cached metadata, so the next hop to it loads it again.
+    fn forget_peer(&mut self, peer: SocketAddr, remote: &str) {
+        if self.peers.remove(&peer).is_some()
+            && let Err(err) = self.agent.invalidate_remote_md(remote)
+        {
+            warn!(%peer, remote, error = %err, "failed to invalidate a peer's nixl metadata");
+        }
+    }
+
     fn release(&self, token: u64) {
         release(&self.exchange, token);
     }
 }
 
-/// Sends `(token, rows)` frames in order, then EOS (token 0). After the first failure the rest
-/// are not announced, so their receive buffers are released instead.
+/// Sends `(token, rows)` frames in order, then EOS (token 0). After the first failure it sets
+/// `stop` and announces nothing more: the failed frame's and later frames' receive buffers are
+/// released instead, until the peer stops answering.
 fn announce_all(
     peer: SocketAddr,
     slot: SenderSlot,
     names: &[String],
     frames: Receiver<(u64, u64)>,
+    stop: &AtomicBool,
 ) -> Result<(), String> {
     let mut result = Ok(());
+    let mut peer_up = true;
     for (seq, (token, rows)) in frames.into_iter().enumerate() {
         if result.is_err() {
-            if token != 0 {
-                let _ = call(peer, control_params(), &NixlEnvelope::Release(token));
+            if token != 0 && peer_up {
+                peer_up = release_remote(peer, token);
             }
             continue;
         }
@@ -487,8 +557,51 @@ fn announce_all(
             &envelope,
         )
         .map(drop);
+        if result.is_err() {
+            stop.store(true, Ordering::Release);
+            // The peer may never have taken this frame. Releasing it is a no-op if it did (tokens
+            // are never reused), and a failed hop sends no EOS, so its receiver never runs.
+            if token != 0 {
+                peer_up = release_remote(peer, token);
+            }
+        }
     }
     result
+}
+
+/// Asks `peer` to free the receive buffers under `token`, logging a failure. Returns whether the
+/// peer answered: callers stop sending it Releases once it doesn't, since each would wait out
+/// `RPC_TIMEOUT` for nothing.
+fn release_remote(peer: SocketAddr, token: u64) -> bool {
+    match call(peer, control_params(), &NixlEnvelope::Release(token)) {
+        Ok(_) => true,
+        Err(error) => {
+            warn!(%peer, token, %error, "failed to release receive buffers on a peer");
+            false
+        }
+    }
+}
+
+/// Asks `peer` for receive buffers matching `layout`, retrying while its pool is momentarily too
+/// full: it frees up as the receiver consumes earlier batches.
+fn alloc(peer: SocketAddr, layout: Vec<u8>) -> Result<Vec<u8>, String> {
+    let envelope = NixlEnvelope::Alloc(layout);
+    let mut backoff = Duration::from_millis(20);
+    for _ in 0..ALLOC_RETRIES {
+        match call(peer, control_params(), &envelope) {
+            Err(err) if is_pool_exhausted(&err) => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(ALLOC_MAX_BACKOFF);
+            }
+            other => return other,
+        }
+    }
+    call(peer, control_params(), &envelope)
+}
+
+/// Whether a refused Alloc ran into a full receive pool, as the direct exchange reports it.
+fn is_pool_exhausted(error: &str) -> bool {
+    error.contains("refused transmit_chunk") && error.contains("bytes requested")
 }
 
 /// One `transmit_chunk` round trip to `peer`, returning the reply attachment.
@@ -525,18 +638,32 @@ fn release(exchange: &DirectExchange, token: u64) {
     }
 }
 
-/// A positive integer from the environment.
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok()?.parse().ok().filter(|&n| n > 0)
+/// A positive integer from the environment: `None` when unset, an error when not one.
+fn positive_env(name: &str) -> Result<Option<u64>, String> {
+    parse_positive(name, std::env::var(name).ok().as_deref())
 }
 
-/// One CN per GPU: cross-process `cuda_ipc` is only proven with each CN seeing its own device.
+fn parse_positive(name: &str, value: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|&n| n > 0)
+        .map(Some)
+        .ok_or_else(|| format!("{name}={value:?} must be a positive integer"))
+}
+
+/// One CN per GPU: cross-process `cuda_ipc` is only proven with each CN seeing its own device, so
+/// CUDA_VISIBLE_DEVICES must name exactly one.
 fn check_single_visible_device(visible: Option<&str>) -> Result<(), String> {
     let Some(visible) = visible else {
-        return Ok(());
+        return Err("CUDA_VISIBLE_DEVICES is unset; pin each CN to one GPU".to_string());
     };
     let devices = visible.split(',').filter(|d| !d.trim().is_empty()).count();
-    if devices > 1 {
+    if devices != 1 {
         return Err(format!(
             "CUDA_VISIBLE_DEVICES={visible:?} names {devices} devices; pin each CN to one GPU"
         ));
@@ -546,12 +673,35 @@ fn check_single_visible_device(visible: Option<&str>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_single_visible_device;
+    use super::{check_single_visible_device, is_pool_exhausted, parse_positive};
 
     #[test]
     fn one_cn_sees_one_gpu() {
-        assert!(check_single_visible_device(None).is_ok());
         assert!(check_single_visible_device(Some(" 3, ")).is_ok());
+        assert!(check_single_visible_device(None).is_err());
+        assert!(check_single_visible_device(Some("")).is_err());
         assert!(check_single_visible_device(Some("0,1")).is_err());
+    }
+
+    #[test]
+    fn tunables_reject_garbage_and_zero() {
+        assert_eq!(parse_positive("X", None), Ok(None));
+        assert_eq!(parse_positive("X", Some(" 8 ")), Ok(Some(8)));
+        assert!(parse_positive("X", Some("0")).is_err());
+        assert!(parse_positive("X", Some("four")).is_err());
+    }
+
+    #[test]
+    fn only_a_full_pool_is_retried() {
+        assert!(is_pool_exhausted(
+            "127.0.0.1:8060 refused transmit_chunk: failed to allocate receive buffers: direct \
+             exchange: 645722880 bytes requested, 441915129 available"
+        ));
+        assert!(!is_pool_exhausted(
+            "127.0.0.1:8060 refused transmit_chunk: direct exchange: already closed"
+        ));
+        assert!(!is_pool_exhausted(
+            "transmit_chunk to 127.0.0.1:8060: connection refused"
+        ));
     }
 }
