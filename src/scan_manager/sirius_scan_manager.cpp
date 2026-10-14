@@ -728,6 +728,25 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
            it->second.begin(), it->second.end(), [](auto const& col) { return col != nullptr; });
 }
 
+/// Whether every chunk of a GPU-tier pin records the memory space it lives in,
+/// which is how a consumer on another GPU reaches it.
+[[nodiscard]] bool pinned_chunks_have_placement(pinned_entry const& entry)
+{
+  if (!entry.device_chunks.empty()) {
+    return std::all_of(entry.device_chunks.begin(),
+                       entry.device_chunks.end(),
+                       [](auto const& chunk) { return chunk.memory_space != nullptr; });
+  }
+  auto const& names = entry.cache_info.column_names();
+  if (names.empty()) { return false; }
+  auto const it = entry.data_batches_by_column.find(names.front());
+  if (it == entry.data_batches_by_column.end()) { return false; }
+  return entry.chunk_memory_spaces.size() == it->second.size() &&
+         std::none_of(entry.chunk_memory_spaces.begin(),
+                      entry.chunk_memory_spaces.end(),
+                      [](auto const* space) { return space == nullptr; });
+}
+
 /// Admit the plan's group-by-rowid extension, or refuse it with a reason.
 ///
 /// The plan pass found a ride that continues past the aggregates and reported
@@ -861,7 +880,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
                                               pinned_entry const& entry,
                                               std::span<std::size_t const> selected_columns,
                                               bool serves_whole_chunks,
-                                              bool single_gpu_pin)
+                                              std::size_t gpu_space_count)
 {
   if (!late_mat::late_mat_enabled()) { return {}; }
   // An uninstalled deferral looks exactly like one that installed and did
@@ -875,10 +894,20 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   if (entry.tier != cucascade::memory::Tier::GPU) {
     return decline("the pinned entry is not device-resident");
   }
-  if (!single_gpu_pin) {
-    return decline(
-      "more than one GPU space is active; materialization is not yet device-aware and cannot "
-      "safely gather a chunk pinned on a different GPU than the consumer");
+  bool const has_compressed_chunk =
+    std::any_of(entry.device_chunks.begin(), entry.device_chunks.end(), [](auto const& chunk) {
+      return chunk.compressed != nullptr;
+    });
+  if (gpu_space_count > 1) {
+    // A chunk on another GPU than the consumer is gathered where it lives
+    // (late_mat::materialize), which needs its placement on record. A compressed
+    // chunk decodes only on the GPU that holds it.
+    if (!pinned_chunks_have_placement(entry)) {
+      return decline("the pin spans more than one GPU and a chunk's placement is not recorded");
+    }
+    if (has_compressed_chunk) {
+      return decline("the pin spans more than one GPU and holds compressed chunks");
+    }
   }
   if (!serves_whole_chunks) {
     return decline("a served batch is not one pinned chunk's whole row span");
@@ -890,11 +919,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
     // served chunk. A COMPRESSED chunk is filtered inside the fused decode
     // instead, and those survivors never reach the scan's output path, so a
     // pin with any compressed chunk is refused rather than guessed at.
-    bool const compressed_chunks =
-      std::any_of(entry.device_chunks.begin(), entry.device_chunks.end(), [](auto const& chunk) {
-        return chunk.compressed != nullptr;
-      });
-    if (compressed_chunks) {
+    if (has_compressed_chunk) {
       return decline(
         "the scan restricts rows and its pin is compressed, so the surviving rows are decided "
         "inside the decode");
@@ -918,12 +943,8 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   // alone once the scan can skip decoding what it replaces with a rowid, so it
   // gets its own floor. The two are the same number until someone measures the
   // difference (SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED).
-  bool const compressed_origin =
-    std::any_of(entry.device_chunks.begin(), entry.device_chunks.end(), [](auto const& chunk) {
-      return chunk.compressed != nullptr;
-    });
   late_mat::defer_policy policy;
-  if (compressed_origin) {
+  if (has_compressed_chunk) {
     policy.min_value_bytes = late_mat::min_value_bytes_compressed(policy.min_value_bytes);
   }
   auto const planned = sirius::planner::plan_deferral(scan_op, policy);
@@ -1773,14 +1794,8 @@ void sirius_scan_manager::prepare_for_query(
   // The rides that DID install, so a rider can be argued against the scan that
   // owns the port it would join.
   std::vector<installed_ride> installed_rides;
-  // resolve_pinned_column/materialize() pass a pin's raw column views and compressed-table
-  // pointers straight to a gather that runs on the consumer's current GPU, with no per-device
-  // tag and no P2P check, clone, or host-staging fallback. On more than one GPU space a chunk's
-  // owning device need not be the consumer's, which can dereference a remote pointer outright.
-  // Fail closed here — matching the memory prefetcher's single-GPU prototype gate
-  // (maybe_start_memory_prefetcher, above) — until materialization is device-aware.
-  bool const single_gpu_pin =
-    _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size() == 1;
+  auto const gpu_space_count =
+    _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size();
   for (auto& assignment : cached_assignments) {
     mvcc_chunk_mask_set masks;  // stays empty for parquet pins
     std::vector<insert_delta_split> delta_splits;
@@ -1891,7 +1906,7 @@ void sirius_scan_manager::prepare_for_query(
       *assignment.entry,
       assignment.columns,
       /*serves_whole_chunks=*/!has_any_mask(masks) && delta_splits.empty(),
-      single_gpu_pin);
+      gpu_space_count);
     if (late_mat.may_ride_along) {
       // Addressable but deferring nothing of its own: it may still join another
       // scan's ride, which can only be decided once every assignment has been

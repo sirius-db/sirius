@@ -18,8 +18,10 @@
 
 #include "compression/compressed_representation.hpp"
 #include "late_mat/multi_source_gather.hpp"
+#include "log/logging.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
@@ -28,6 +30,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
@@ -35,8 +38,13 @@
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/chunk_row_set.hpp>
 #include <codegen/selection/selection.hpp>
+#include <cucascade/cuda/event.hpp>
+#include <cucascade/error.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -45,6 +53,8 @@
 namespace sirius::late_mat {
 
 namespace {
+
+std::atomic<std::uint64_t> g_remote_batches_materialized{0};
 
 std::unique_ptr<cudf::column> gather_one(cudf::column_view const& source,
                                          cudf::column_view const& map,
@@ -68,17 +78,35 @@ cudf::column_view int32_map(rmm::device_buffer const& buf, std::int64_t count)
                            0};
 }
 
+/// The device the consumer runs on. The pipeline task made it current before
+/// the port ran, and every local gather below is enqueued against it.
+int current_device()
+{
+  int device = 0;
+  CUCASCADE_CUDA_TRY(cudaGetDevice(&device));
+  return device;
+}
+
+/// A batch pinned on a GPU other than the consumer's.
+bool is_remote(batch_source const& source, int consumer_device)
+{
+  return source.memory_space != nullptr &&
+         source.memory_space->get_tier() == cucascade::memory::Tier::GPU &&
+         source.memory_space->get_device_id() != consumer_device;
+}
+
 /// Can this column be produced straight from the raw ids, with no sort?
 ///
-/// Two things have to hold. Nothing may be compressed, since a compressed row
+/// Three things have to hold. Nothing may be compressed, since a compressed row
 /// is decoded rather than copied and producing it once per reference is the
-/// waste deduplication exists to avoid. And a multi-batch column has to be
-/// fixed width, because the one-pass gather copies a fixed element and a
-/// variable-width column would need its offsets rebuilt.
-bool can_gather_raw(pinned_column_view const& column)
+/// waste deduplication exists to avoid. Every batch must be on the consumer's
+/// GPU, because the one-pass gather dereferences every batch from there. And a
+/// multi-batch column has to be fixed width, because the one-pass gather copies
+/// a fixed element and a variable-width column would need its offsets rebuilt.
+bool can_gather_raw(pinned_column_view const& column, int consumer_device)
 {
   for (auto const& b : column.batches) {
-    if (b.is_compressed()) { return false; }
+    if (b.is_compressed() || is_remote(b, consumer_device)) { return false; }
   }
   if (column.batches.size() == 1) { return true; }
   return cudf::is_fixed_width(column.dtype);
@@ -256,15 +284,217 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
     checked->view(), int32_map(selection.local_indices, selection.survivors), stream, mr);
 }
 
+/// Buffers released from a column on another GPU. They stay alive here until
+/// the copies that read them have been ordered ahead of their frees.
+using retired_buffers = std::vector<std::unique_ptr<rmm::device_buffer>>;
+
+/// What a remote gather allocated on the owning GPU: the gather map and, once
+/// handed to the peer copies, the gathered column's buffers.
+///
+/// The owner's stream reads the consumer's selection indices; the consumer's
+/// stream reads the owner's gathered buffers; rmm frees each buffer on the
+/// stream it was allocated on. So before anything is freed, on every exit path
+/// including a throw mid-way, each stream is ordered behind the other's queued
+/// reads. All no-throw; if an event fails, the stream waited for is
+/// synchronized instead.
+class owner_scratch {
+ public:
+  owner_scratch(int owner_device,
+                ::cuda::stream_ref owner_stream,
+                int consumer_device,
+                ::cuda::stream_ref consumer_stream)
+    : _owner_device{owner_device},
+      _owner_stream{owner_stream},
+      _consumer_device{consumer_device},
+      _consumer_stream{consumer_stream}
+  {
+  }
+  ~owner_scratch() { release(); }
+  owner_scratch(owner_scratch const&)            = delete;
+  owner_scratch& operator=(owner_scratch const&) = delete;
+
+  rmm::device_buffer map;   ///< batch-local indices, copied to the owner
+  retired_buffers retired;  ///< the gathered column's buffers, after release()
+
+  /// Order each stream behind the other, then free the owner's buffers. Idempotent.
+  void release() noexcept
+  {
+    if (_released) { return; }
+    _released = true;
+    // Consumer behind owner: the owner's index copy reads `local_indices`.
+    if (!order(_owner_stream, _owner_device, _consumer_stream, _consumer_device)) {
+      rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{_owner_device}};
+      (void)cudaStreamSynchronize(_owner_stream.get());
+    }
+    // Owner behind consumer: the consumer's copies read the gathered buffers.
+    if (!order(_consumer_stream, _consumer_device, _owner_stream, _owner_device)) {
+      (void)cudaStreamSynchronize(_consumer_stream.get());
+    }
+    (void)cudaGetLastError();
+    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{_owner_device}};
+    retired.clear();
+    map = rmm::device_buffer{};
+  }
+
+ private:
+  /// Make `waiter` wait for everything `producer` has queued so far.
+  [[nodiscard]] static bool order(::cuda::stream_ref producer,
+                                  int producer_device,
+                                  ::cuda::stream_ref waiter,
+                                  int waiter_device) noexcept
+  {
+    cudaEvent_t event{};
+    bool ordered = false;
+    {
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{producer_device}};
+      if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) { return false; }
+      ordered = cudaEventRecord(event, producer.get()) == cudaSuccess;
+    }
+    if (ordered) {
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{waiter_device}};
+      ordered = cudaStreamWaitEvent(waiter.get(), event, 0) == cudaSuccess;
+    }
+    (void)cudaEventDestroy(event);
+    return ordered;
+  }
+
+  int _owner_device;
+  ::cuda::stream_ref _owner_stream;
+  int _consumer_device;
+  ::cuda::stream_ref _consumer_stream;
+  bool _released = false;
+};
+
+std::unique_ptr<rmm::device_buffer> peer_copy(std::unique_ptr<rmm::device_buffer> source,
+                                              int source_device,
+                                              int destination_device,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr,
+                                              retired_buffers& retire)
+{
+  auto const bytes = source ? source->size() : std::size_t{0};
+  auto copy        = std::make_unique<rmm::device_buffer>(bytes, stream, mr);
+  // Hand the source to the scratch BEFORE queueing a read of it, so a throw
+  // here leaves nothing queued against a buffer about to be freed.
+  rmm::device_buffer const* retained = nullptr;
+  if (source) { retained = retire.emplace_back(std::move(source)).get(); }
+  if (bytes > 0) {
+    CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
+      copy->data(), destination_device, retained->data(), source_device, bytes, stream.get()));
+  }
+  return copy;
+}
+
+/// Rebuild @p column on the current device: every buffer and every child is
+/// peer-copied as it is, so any dtype crosses. The column's own buffers end
+/// up in @p retire.
+std::unique_ptr<cudf::column> transfer_column(std::unique_ptr<cudf::column> column,
+                                              int source_device,
+                                              int destination_device,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr,
+                                              retired_buffers& retire)
+{
+  auto const type       = column->type();
+  auto const size       = column->size();
+  auto const null_count = column->null_count();
+  auto contents         = column->release();
+
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.reserve(contents.children.size());
+  for (auto& child : contents.children) {
+    children.push_back(
+      transfer_column(std::move(child), source_device, destination_device, stream, mr, retire));
+  }
+  auto data =
+    peer_copy(std::move(contents.data), source_device, destination_device, stream, mr, retire);
+  auto null_mask =
+    peer_copy(std::move(contents.null_mask), source_device, destination_device, stream, mr, retire);
+  return std::make_unique<cudf::column>(
+    type, size, std::move(*data), std::move(*null_mask), null_count, std::move(children));
+}
+
+/// A batch pinned on another GPU: gather its survivors where it lives, then
+/// bring only those rows over.
+///
+/// Two transfers cross, both the size of the SELECTION rather than the batch:
+/// the batch-local indices go to the owner, the gathered rows come back. Both
+/// are cudaMemcpyPeerAsync, so a pair with working peer DMA takes it and a pair
+/// without is staged through host by the driver. The owner's work runs on a
+/// stream of its own space, ordered by events behind the consumer's selection
+/// build and ahead of the consumer's copy.
+std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& source,
+                                                       batch_selection const& selection,
+                                                       int consumer_device,
+                                                       ::cuda::stream_ref stream,
+                                                       rmm::device_async_resource_ref mr)
+{
+  if (source.is_compressed()) {
+    // Its decode would run on the owning GPU against a selection that lives on
+    // this one, which is why install_late_materialization declines such a pin.
+    // A batch that reaches the port anyway cannot fall back: the scan has
+    // already emitted rowids in place of values.
+    throw std::runtime_error(
+      "late_mat::materialize: internal error: a compressed batch pinned on another GPU reached "
+      "the port; the installer declines such pins, and the scan has already emitted rowids in "
+      "place of values so the query cannot fall back");
+  }
+  g_remote_batches_materialized.fetch_add(1, std::memory_order_relaxed);
+  auto const& owner       = *source.memory_space;
+  auto const owner_device = owner.get_device_id();
+  auto const owner_stream = owner.acquire_stream();
+  auto const owner_mr     = owner.get_default_allocator();
+
+  // An event belongs to the device current when it is created: the consumer's
+  // outside the owner guard, the owner's inside it.
+  cucascade::cuda::cuda_event selection_ready;
+  selection_ready.record(stream);
+
+  // Outlives `gathered`, so buffers not yet handed over are freed first.
+  owner_scratch scratch{owner_device, owner_stream, consumer_device, stream};
+  std::unique_ptr<cudf::column> gathered;
+  std::optional<cucascade::cuda::cuda_event> gathered_ready;
+  {
+    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{owner_device}};
+    selection_ready.wait(owner_stream);
+    if (selection.dense) {
+      gathered = std::make_unique<cudf::column>(source.uncompressed, owner_stream, owner_mr);
+    } else {
+      auto const map_bytes = static_cast<std::size_t>(selection.survivors) * sizeof(std::int32_t);
+      scratch.map          = rmm::device_buffer(map_bytes, owner_stream, owner_mr);
+      CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(scratch.map.data(),
+                                             owner_device,
+                                             selection.local_indices.data(),
+                                             consumer_device,
+                                             map_bytes,
+                                             owner_stream.get()));
+      gathered = gather_one(
+        source.uncompressed, int32_map(scratch.map, selection.survivors), owner_stream, owner_mr);
+    }
+    gathered_ready.emplace();
+    gathered_ready->record(owner_stream);
+  }
+
+  gathered_ready->wait(stream);
+  auto local = transfer_column(
+    std::move(gathered), owner_device, consumer_device, stream, mr, scratch.retired);
+  scratch.release();
+  return local;
+}
+
 /// A batch's surviving rows, as a column of its own.
 ///
 /// Dense batches are copied rather than gathered: the gather map would be the
 /// identity, and building one to apply it is more work than the copy.
 std::unique_ptr<cudf::column> materialize_batch(batch_source const& source,
                                                 batch_selection const& selection,
+                                                int consumer_device,
                                                 ::cuda::stream_ref stream,
                                                 rmm::device_async_resource_ref mr)
 {
+  if (is_remote(source, consumer_device)) {
+    return materialize_remote_batch(source, selection, consumer_device, stream, mr);
+  }
   if (source.is_compressed()) { return materialize_compressed(source, selection, stream, mr); }
   if (selection.dense) {
     auto copied =
@@ -298,9 +528,13 @@ std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
 
   if (selection.original_count() == 0) { return cudf::make_empty_column(column.dtype); }
 
+  auto const consumer_device = current_device();
+
   // Nothing here needs the rows sorted or deduplicated, so do not build a
   // canonical form that a later compressed column may never ask for either.
-  if (can_gather_raw(column)) { return materialize_raw(column, selection, stream, mr); }
+  if (can_gather_raw(column, consumer_device)) {
+    return materialize_raw(column, selection, stream, mr);
+  }
 
   auto const& canonical = selection.canonical(stream, mr);
   if (canonical.total_survivors == 0) { return cudf::make_empty_column(column.dtype); }
@@ -308,9 +542,22 @@ std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
   // In pin order, so the assembled column is in pinned-table order.
   std::vector<std::unique_ptr<cudf::column>> pieces;
   pieces.reserve(column.batches.size());
+  std::size_t remote_batches = 0;
+  std::int64_t remote_rows   = 0;
   for (std::size_t b = 0; b < column.batches.size(); ++b) {
     if (canonical.batches[b].survivors == 0) { continue; }
-    pieces.push_back(materialize_batch(column.batches[b], canonical.batches[b], stream, mr));
+    if (is_remote(column.batches[b], consumer_device)) {
+      ++remote_batches;
+      remote_rows += canonical.batches[b].survivors;
+    }
+    pieces.push_back(
+      materialize_batch(column.batches[b], canonical.batches[b], consumer_device, stream, mr));
+  }
+  if (remote_batches > 0) {
+    SIRIUS_LOG_INFO("[late-mat] GPU {}: gathered {} row(s) from {} batch(es) pinned on other GPUs",
+                    consumer_device,
+                    remote_rows,
+                    remote_batches);
   }
 
   std::unique_ptr<cudf::column> assembled;
@@ -332,6 +579,11 @@ std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
   // which is why deduplicating was worth a sort for the consumers that need it.
   return gather_one(
     assembled->view(), int32_map(canonical.restore_rank, selection.original_count()), stream, mr);
+}
+
+std::uint64_t remote_batches_materialized() noexcept
+{
+  return g_remote_batches_materialized.load(std::memory_order_relaxed);
 }
 
 }  // namespace sirius::late_mat
