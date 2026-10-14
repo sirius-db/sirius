@@ -317,6 +317,7 @@ shell guarantees that. A plain DuckDB CLI that refuses a `LOAD` names the versio
 **Shell protocol.** Every statement is followed by a marker on each stream, written with the
 shell's own dot commands so they never pass through SQL or Sirius; results (JSON on stdout) and
 errors (stderr) are delimited exactly, and the banner Sirius prints on stdout when it falls back
-is kept out of the result. DECIMAL and HUGEINT values arrive as
+is kept out of the result. The shell streams rows as they arrive, so a query that fails midway
+leaves a partial result on stdout; the error on stderr decides the outcome. DECIMAL and HUGEINT values arrive as
 strings and compare exactly; floating-point values arrive as numbers and compare with the
 tolerances. A query whose output columns share a name is still compared positionally.

@@ -397,7 +397,10 @@ batch JSON mode, and loads the matching Sirius extension. Every statement is
 followed by a marker on each stream, written
 with the shell's own dot commands (`.print`, and `.output /dev/stderr` for the
 stderr one), so results and error text are delimited exactly and the markers can
-never be intercepted by Sirius the way a `SELECT` would be. The banner Sirius
+never be intercepted by Sirius the way a `SELECT` would be. The shell streams
+JSON rows as they are produced, so a query that fails after its first rows
+leaves an unterminated line on stdout; a bare `.print` closes it before the
+marker, and the error on stderr decides the statement's outcome. The banner Sirius
 prints on stdout when it falls back is removed from the result and kept as log.
 The shell's stderr, including Sirius's backtrace on a fault, is kept with the
 worker's log.

@@ -230,11 +230,13 @@ class Shell:
         self.counter += 1
         tag = f"{_SENTINEL}-{self.counter}"
         stderr_tag = f"{tag}-stderr"
-        # Dot commands never reach SQL, so Sirius cannot intercept the markers.
+        # Dot commands never reach SQL, so Sirius cannot intercept the markers. The
+        # shell streams JSON rows as they arrive, so a query that fails midway leaves
+        # its last output line open; the bare .print closes it before the marker.
         text = (
             f"{sql.rstrip().rstrip(';')}\n;\n"
             f".output /dev/stderr\n.print {stderr_tag}\n.output\n"
-            f".print {tag}\n"
+            f".print\n.print {tag}\n"
         )
         start = time.monotonic()
         try:
@@ -291,6 +293,9 @@ class Shell:
         out, banners = _strip_fallback_banners(out)
         if banners:
             log = "\n".join(part for part in (log, "".join(banners).strip()) if part)
+        if error:
+            # A failure while streaming leaves a partial result on stdout; the error wins.
+            return ShellResult("error", error=error, log=log, elapsed=elapsed)
         body = "".join(out).strip()
         if body:
             try:
@@ -304,9 +309,7 @@ class Shell:
                 )
             columns = [key for key, _ in parsed[0]] if parsed else []
             rows = [tuple(value for _, value in pairs) for pairs in parsed]
-            return ShellResult("ok", columns, rows, error, log, elapsed)
-        if error:
-            return ShellResult("error", error=error, log=log, elapsed=elapsed)
+            return ShellResult("ok", columns, rows, "", log, elapsed)
         return ShellResult("ok", [], [], "", log, elapsed)
 
     def _died(self, start: float, err: list[str]) -> ShellResult:
