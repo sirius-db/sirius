@@ -285,4 +285,50 @@ mod tests {
             Some(r#type::Kind::Fp64(_))
         ));
     }
+
+    /// Every mapped kind renders as the DuckDB type name the engine parses for a stream column.
+    #[test]
+    fn duckdb_type_name_covers_every_mapped_kind() {
+        let cases = [
+            (r#type::Kind::Bool(Default::default()), "BOOLEAN"),
+            (r#type::Kind::I8(Default::default()), "TINYINT"),
+            (r#type::Kind::I16(Default::default()), "SMALLINT"),
+            (r#type::Kind::I32(Default::default()), "INTEGER"),
+            (r#type::Kind::I64(Default::default()), "BIGINT"),
+            (r#type::Kind::Fp32(Default::default()), "FLOAT"),
+            (r#type::Kind::Fp64(Default::default()), "DOUBLE"),
+            (r#type::Kind::FixedChar(Default::default()), "VARCHAR"),
+            (r#type::Kind::Varchar(Default::default()), "VARCHAR"),
+            (r#type::Kind::String(Default::default()), "VARCHAR"),
+            (r#type::Kind::Binary(Default::default()), "BLOB"),
+            (r#type::Kind::FixedBinary(Default::default()), "BLOB"),
+            (r#type::Kind::Date(Default::default()), "DATE"),
+            (
+                r#type::Kind::PrecisionTimestamp(Default::default()),
+                "TIMESTAMP",
+            ),
+            (
+                r#type::Kind::Decimal(r#type::Decimal {
+                    precision: 15,
+                    scale: 2,
+                    ..Default::default()
+                }),
+                "DECIMAL(15,2)",
+            ),
+        ];
+        for (kind, expected) in cases {
+            let name = duckdb_type_name(&Type { kind: Some(kind) }).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    /// A kind with no DuckDB name, or no kind at all, is an error rather than a guessed name.
+    #[test]
+    fn duckdb_type_name_rejects_unmapped_kinds() {
+        let interval = Type {
+            kind: Some(r#type::Kind::IntervalYear(Default::default())),
+        };
+        assert!(duckdb_type_name(&interval).is_err());
+        assert!(duckdb_type_name(&Type { kind: None }).is_err());
+    }
 }
