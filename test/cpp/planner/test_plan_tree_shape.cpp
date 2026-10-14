@@ -36,7 +36,6 @@
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
-#include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
@@ -1171,10 +1170,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                                  sirius::logical_type::make(sirius::type_id::BIGINT)});
   }
 
-  SECTION("DISTINCT over nested materialized CTEs checks the innermost body's schema")
+  SECTION("DISTINCT over nested materialized CTEs checks the body's schema")
   {
-    // `d` is read twice and joined on `other`, so it keeps both columns and is wider than the
-    // one-column body and `c`.
+    // `d` is read twice and joined on `other`, so its definition keeps both columns and is wider
+    // than the one-column body the DISTINCT reads.
     auto plan = generate_sirius_plan(
       *con,
       "SELECT DISTINCT * FROM (WITH c AS MATERIALIZED (SELECT id FROM big_left), "
@@ -1188,8 +1187,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(outer->type == SiriusPhysicalOperatorType::CTE);
     auto* inner = outer->children[1].get();
     REQUIRE(inner->type == SiriusPhysicalOperatorType::CTE);
-    CHECK(inner->get_types().size() == 2);
-    CHECK(outer->get_output_types().size() == 1);
+    CHECK(inner->children[0]->get_types().size() == 2);
+    CHECK(inner->get_types().size() == 1);
+    CHECK(outer->get_types().size() == 1);
   }
 }
 
@@ -1443,33 +1443,6 @@ TEST_CASE("planned_aggregate_type narrows HUGEINT only", "[plan_tree_shape]")
   CHECK(generator::planned_aggregate_type(LogicalType::UHUGEINT) == LogicalType::UHUGEINT);
   CHECK(generator::planned_aggregate_type(LogicalType::DECIMAL(38, 0)) ==
         LogicalType::DECIMAL(38, 0));
-}
-
-TEST_CASE("get_output_types reads through nested CTEs to the innermost body", "[plan_tree_shape]")
-{
-  using sirius::op::sirius_physical_cte;
-  auto const int_t = sirius::logical_type::make(sirius::type_id::INTEGER);
-  auto const big_t = sirius::logical_type::make(sirius::type_id::BIGINT);
-  auto leaf        = [](duckdb::vector<sirius::logical_type> types) {
-    return duckdb::make_uniq<sirius_physical_operator>(
-      SiriusPhysicalOperatorType::INVALID, std::move(types), /*estimated_cardinality=*/1);
-  };
-  auto inner =
-    duckdb::make_uniq<sirius_physical_cte>("d",
-                                           /*table_index=*/1,
-                                           duckdb::vector<sirius::logical_type>{int_t, int_t},
-                                           leaf({int_t, int_t}),
-                                           leaf({big_t}),
-                                           /*estimated_cardinality=*/1);
-  sirius_physical_cte outer("c",
-                            /*table_index=*/0,
-                            duckdb::vector<sirius::logical_type>{int_t},
-                            leaf({int_t}),
-                            std::move(inner),
-                            /*estimated_cardinality=*/1);
-
-  CHECK(outer.get_types() == duckdb::vector<sirius::logical_type>{int_t});
-  CHECK(outer.get_output_types() == duckdb::vector<sirius::logical_type>{big_t});
 }
 
 //===----------------------------------------------------------------------===//
