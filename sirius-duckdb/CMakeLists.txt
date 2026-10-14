@@ -39,6 +39,14 @@ foreach(flags IN ITEMS CMAKE_SHARED_LINKER_FLAGS CMAKE_MODULE_LINKER_FLAGS)
   if(DUCKDB_MOLD_FLAGS)
     string(REPLACE "${DUCKDB_MOLD_FLAGS}" "" ${flags} "${${flags}}")
   endif()
+  string(REGEX REPLACE "-fuse-ld=bfd([ \t]|$)" " " remaining_flags
+                       "${${flags}}")
+  if(remaining_flags MATCHES "-fuse-ld=")
+    message(
+      FATAL_ERROR
+        "Sirius requires BFD: remove -fuse-ld from ${flags} and select the host linker with DUCKDB_LINKER"
+    )
+  endif()
 endforeach()
 
 build_static_extension(${extension_name} ${EXTENSION_SOURCES})

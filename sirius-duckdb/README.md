@@ -97,12 +97,14 @@ The core-extension layout has three artifacts:
 Driver support below CUDA 12, a missing driver, or an unsuccessful version query
 produces an error. Versions 12000–12999 select `sirius_cuda12`; 13000 and newer
 select `sirius_cuda13`. This layout is for DuckDB core distribution:
-`AutoLoadExtension` trusts core signatures and uses DuckDB's configured
-auto-install repository, not the repository the loader came from. Community
+the loader follows DuckDB's autoload policy, trusting core signatures and using
+DuckDB's configured auto-install repository, not the repository it came from. Community
 signatures are not supported. Backend errors include the selected backend and
 driver version; the loader does not retry with the other CUDA version.
 
-These are Linux glibc amd64/arm64 builds. The existing Makefile and distribution
+These are Linux glibc amd64/arm64 SBSA builds; Jetson/Tegra is not supported.
+The loader does not detect or reject unsupported GPU architectures.
+The existing Makefile and distribution
 workflows still build the direct `sirius` backend for development and existing
 consumers. Before publishing the loader, stop publishing the direct backend as
 `sirius` for the same DuckDB version and platform. Publish the loader and both
@@ -129,18 +131,22 @@ pass `-Dsirius_DIR=/path/to/install/lib/cmake/sirius`.
 The loader-only config needs no engine submodules. Upstream DuckDB's extension
 metadata and CI dependency provisioning remain separate integration work.
 DuckDB's manifest merger must preserve our `dlpack` and `flatbuffers` overrides;
-the pinned DuckDB version still requires the upstream override-merging fix.
+the pinned DuckDB version still requires the
+[override-merging fix](https://github.com/duckdb/duckdb/compare/v2.0-cyanoptera...mbrobbel:duckdb:fix/merge-extension-vcpkg-overrides).
 Its CMake manifest merger finds the manifest in the extension source directory.
 The newer `sync_out_of_tree_extensions.py` path also needs subdirectory-aware
-manifest discovery before it can provision this layout.
+manifest discovery before it can provision this layout. The cuVS compiler patch
+is prepared separately on
+[the upstream-fix branch](https://github.com/NVIDIA/cuvs/compare/main...mbrobbel:cuvs:fix/refine-host-template-arguments).
 
 The build job supplies GPU architectures. CUDA 12 builds include Blackwell's
 `100-real` and `120-real` targets and require a toolkit of at least 12.8.
 Core CI must supply those targets too; selecting a backend by driver version
 does not check GPU architecture. The 12000/13000 thresholds select a CUDA major
 version, not a tested minimum driver for every backend feature. Before core
-publication, qualify the oldest supported drivers against the packaged CUDA
-libraries and their JIT paths. Simpatico compiles cubins rather than relying on
+publication, test the CUDA 12.9 backend on the oldest supported CUDA 12 driver,
+including cuDF NVRTC/nvJitLink paths, then record the tested minimum or raise the
+loader threshold. Simpatico compiles cubins rather than relying on
 the driver's PTX compiler; other dependency paths need separate qualification.
 
 The conflict checks reject sequential loads of different backends in one
