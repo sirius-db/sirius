@@ -383,10 +383,10 @@ TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution distinct UNION falls back at plan time",
                  "[integration][gpu_execution][distinct]")
 {
-  // Each binds as a DISTINCT directly over a UNION ALL, the shape the builder refuses. The
-  // message check pins the refusal to that guard: a fallback from any other refusal, such as a
-  // compress projection when compressed materialization is on, must fail here. Another fixture
-  // may have cleared the mask Sirius publishes at load, so restate it.
+  // Each plans as a DISTINCT over a UNION ALL, with at most an identity projection between, the
+  // shape the builder refuses. The message check pins the refusal to that guard: a fallback from
+  // any other refusal, such as a compress projection when compressed materialization is on, must
+  // fail here. Another fixture may have cleared the mask Sirius publishes at load, so restate it.
   sirius::test::scoped_sirius_setting optimizer_mask{
     *con, "disabled_optimizers", "in_clause,compressed_materialization,late_materialization"};
   auto const expect_union_refused = [this](std::string const& query) {
