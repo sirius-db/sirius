@@ -317,7 +317,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> ranged_info(fs:
   info->names                = {"a"};
   info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
   info->column_ids.push_back(duckdb::ColumnIndex(0));
-  info->projected_output_count      = 1;
+  info->projected_output_count = 1;
   info->approximate_batch_size = std::size_t{1} << 30;
   return info;
 }
