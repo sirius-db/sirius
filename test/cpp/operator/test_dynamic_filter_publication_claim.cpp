@@ -147,12 +147,10 @@ struct claim_fixture {
       duckdb::ExpressionType::COMPARE_EQUAL);
     conditions.push_back(std::move(condition));
     if (add_inequality_condition) {
-      duckdb::JoinCondition inequality;
-      inequality.left =
-        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 1);
-      inequality.right =
-        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 1);
-      inequality.comparison = duckdb::ExpressionType::COMPARE_LESSTHAN;
+      duckdb::JoinCondition inequality(
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 1),
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 1),
+        duckdb::ExpressionType::COMPARE_LESSTHAN);
       conditions.push_back(std::move(inequality));
     }
 
