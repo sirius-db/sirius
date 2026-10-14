@@ -102,8 +102,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   for (duckdb::idx_t i = 0; i < group_count; i++) {
     auto& target = op.distinct_targets[i];
     if (target->GetExpressionType() == duckdb::ExpressionType::BOUND_REF) {
-      auto& bound_ref                      = target->Cast<duckdb::BoundReferenceExpression>();
-      group_by_references[bound_ref.index] = i;
+      auto& bound_ref                        = target->Cast<duckdb::BoundReferenceExpression>();
+      group_by_references[bound_ref.Index()] = i;
     } else if (!first_non_reference_target) {
       first_non_reference_target = i;
     }
@@ -165,10 +165,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
         " is not a plain column reference (falling back to CPU): '" + group.ToString() + "'");
     }
     auto const& bound_ref = group.Cast<duckdb::BoundReferenceExpression>();
-    if (bound_ref.index >= child_column_count) {
+    if (bound_ref.Index() >= child_column_count) {
       throw duckdb::NotImplementedException(
         "DISTINCT: group key " + std::to_string(i) + " reads column " +
-        std::to_string(bound_ref.index) + " of a child that has " +
+        std::to_string(bound_ref.Index()) + " of a child that has " +
         std::to_string(child_column_count) + (child_column_count == 1 ? " column" : " columns") +
         " (falling back to CPU)");
     }
@@ -180,7 +180,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   group_types.reserve(groups.size());
   group_nodes.reserve(groups.size());
   for (auto const& group : groups) {
-    auto const index = group->Cast<duckdb::BoundReferenceExpression>().index;
+    auto const index = group->Cast<duckdb::BoundReferenceExpression>().Index();
     group_types.push_back(planned_types[index]);
     group_nodes.push_back(std::make_unique<sirius::ast::node>(
       sirius::ast::reference{static_cast<std::uint32_t>(index), planned_types[index]}));
