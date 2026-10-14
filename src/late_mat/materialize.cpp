@@ -318,8 +318,8 @@ class owner_scratch {
   owner_scratch(owner_scratch const&)            = delete;
   owner_scratch& operator=(owner_scratch const&) = delete;
 
-  rmm::device_buffer map;   ///< batch-local indices, copied to the owner
-  retired_buffers retired;  ///< the gathered column's buffers, after release()
+  rmm::device_buffer map;                  ///< batch-local indices, copied to the owner
+  retired_buffers retired;                 ///< the gathered column's buffers, after release()
   std::unique_ptr<cudf::column> gathered;  ///< owner-device column, until its buffers are retired
 
   /// Order each stream behind the other, then free the owner's buffers. Idempotent.
@@ -384,7 +384,7 @@ std::unique_ptr<Buffer> peer_copy(std::unique_ptr<Buffer> source,
     static_assert(std::is_same_v<typename Buffer::value_type, std::byte>,
                   "peer_copy only supports the cudf null-mask byte buffer type");
   }
-  auto const bytes = source ? source->size() : std::size_t{0};
+  auto const bytes       = source ? source->size() : std::size_t{0};
   Buffer const* retained = nullptr;
   {
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{source_device}};
@@ -447,7 +447,8 @@ std::unique_ptr<cudf::column> transfer_column(std::unique_ptr<cudf::column> colu
       children.push_back(
         transfer_column(std::move(child), source_device, destination_device, stream, mr, retire));
     }
-    data = peer_copy(std::move(contents.data), source_device, destination_device, stream, mr, retire);
+    data =
+      peer_copy(std::move(contents.data), source_device, destination_device, stream, mr, retire);
     null_mask = peer_copy(
       std::move(contents.null_mask), source_device, destination_device, stream, mr, retire);
     return std::make_unique<cudf::column>(
@@ -507,7 +508,8 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{owner_device}};
     selection_ready.wait(owner_stream);
     if (selection.dense) {
-      scratch.gathered = std::make_unique<cudf::column>(source.uncompressed, owner_stream, owner_mr);
+      scratch.gathered =
+        std::make_unique<cudf::column>(source.uncompressed, owner_stream, owner_mr);
     } else {
       auto const map_bytes = static_cast<std::size_t>(selection.survivors) * sizeof(std::int32_t);
       scratch.map          = rmm::device_buffer(map_bytes, owner_stream, owner_mr);
