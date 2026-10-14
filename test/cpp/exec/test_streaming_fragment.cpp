@@ -15,6 +15,7 @@
  */
 
 #include "../operator/operator_test_utils.hpp"
+#include "exec/stream_plan_bindings.hpp"
 #include "exec/streaming_fragment.hpp"
 #include "helper/logical_type.hpp"
 #include "helper/type_conversions.hpp"
@@ -29,6 +30,7 @@
 #include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/query_result.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
@@ -38,8 +40,10 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using Catch::Matchers::ContainsSubstring;
@@ -150,6 +154,32 @@ std::map<std::string, std::int64_t> drain_groups(streaming_fragment& fragment, s
     }
   }
   return groups;
+}
+
+//! The first comparison join in `op`'s subtree, or nullptr.
+duckdb::LogicalOperator* find_comparison_join(duckdb::LogicalOperator& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) { return &op; }
+  for (auto& child : op.children) {
+    if (auto* join = find_comparison_join(*child)) { return join; }
+  }
+  return nullptr;
+}
+
+//! Every input stream scanned in `op`'s subtree.
+std::set<stream_id_t> scanned_streams(duckdb::LogicalOperator& op)
+{
+  std::set<stream_id_t> streams;
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto& get = op.Cast<duckdb::LogicalGet>();
+    if (get.bind_data) {
+      streams.insert(get.bind_data->Cast<sirius::exec::stream_source_bind_data>().stream_id);
+    }
+  }
+  for (auto& child : op.children) {
+    streams.merge(scanned_streams(*child));
+  }
+  return streams;
 }
 
 void merge_disjoint_groups(std::map<std::string, std::int64_t>& dst,
@@ -1256,7 +1286,7 @@ TEST_CASE_METHOD(fragment_fixture,
       REQUIRE(copied);
       REQUIRE_FALSE(copied->HasError());
     };
-    // Distinct keys so a 2-way hash is likely to populate both destinations.
+    // Distinct keys so the 2-way hash populates both destinations; the hash is deterministic.
     write(sales_0,
           "('east'::VARCHAR, 10::BIGINT), ('west'::VARCHAR, 20::BIGINT), "
           "('east'::VARCHAR, 5::BIGINT), ('north'::VARCHAR, 3::BIGINT), "
@@ -1327,6 +1357,7 @@ TEST_CASE_METHOD(fragment_fixture,
 
       auto part = drain_groups(root, 1);
       INFO("dest=" << dest << " groups=" << part.size());
+      REQUIRE_FALSE(part.empty());
       merge_disjoint_groups(got, std::move(part));
     }
 
@@ -1373,5 +1404,51 @@ TEST_CASE_METHOD(fragment_fixture,
   } catch (...) {
     con->Rollback();
     throw;
+  }
+}
+
+// ============================================================================
+// FRAG-16: the declared row counts pick the join's build side
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-16: the stream declared smaller is the join's build side",
+                 "[integration][streaming_fragment]")
+{
+  auto const int_types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  // Both orders, so the build side follows the declared counts rather than the SQL's join order.
+  for (auto [left_rows, right_rows, expected_build] :
+       {std::tuple<std::uint64_t, std::uint64_t, stream_id_t>{10, 1'000'000, 0},
+        std::tuple<std::uint64_t, std::uint64_t, stream_id_t>{1'000'000, 10, 1}}) {
+    auto plan_sql = sirius::test::sql_plan_source(
+      "SELECT l.k FROM sirius_stream_source(0) l JOIN sirius_stream_source(1) r ON l.k = r.k");
+    std::set<stream_id_t> build_streams;
+
+    fragment_spec spec;
+    spec.plan_source = [&](duckdb::ClientContext& context) {
+      auto bound = plan_sql(context);
+      // DuckDB builds the hash table on the comparison join's right child.
+      if (auto* join = find_comparison_join(*bound.plan)) {
+        build_streams = scanned_streams(*join->children[1]);
+      }
+      return bound;
+    };
+    spec.inputs[0] = stream_input_spec{{"k"}, int_types, {0}, left_rows};
+    spec.inputs[1] = stream_input_spec{{"k"}, int_types, {0}, right_rows};
+    spec.outputs   = {2};
+
+    con->BeginTransaction();
+    try {
+      streaming_fragment fragment(*con->context, std::move(spec));
+      fragment.build();
+      INFO("left_rows=" << left_rows << " right_rows=" << right_rows);
+      REQUIRE(build_streams == std::set<stream_id_t>{expected_build});
+
+      con->Rollback();
+    } catch (...) {
+      con->Rollback();
+      throw;
+    }
   }
 }
