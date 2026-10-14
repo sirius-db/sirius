@@ -1,3 +1,5 @@
 target_sources(
-  sirius_objects PRIVATE compressed_representation.cpp compressed_scan.cpp
-                         compression_converters.cpp plan_register.cpp)
+  sirius_objects
+  PRIVATE compressed_disk_representation.cpp compressed_representation.cpp
+          compressed_scan.cpp compression_converters.cpp plan_register.cpp
+          spill_compression.cpp)

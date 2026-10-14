@@ -86,7 +86,7 @@ std::optional<std::vector<uint64_t>> sirius_physical_concat::plan_pull_for_parti
   for (auto const batch_id : batch_ids) {
     auto batch_idle = repo.get_data_batch_by_id(batch_id, partition_idx);
     auto batch_ro   = batch_idle->to_read_only();
-    total_batch_size += batch_ro.get_data()->get_size_in_bytes();
+    total_batch_size += batch_ro.get_data()->get_uncompressed_data_size_in_bytes();
     if (total_batch_size > _concat_batch_bytes) {
       // The accumulated group is complete; the overflowing batch seeds the next group.
       if (!group.empty()) { return group; }

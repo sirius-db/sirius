@@ -16,6 +16,7 @@
 
 #include "sirius_context.hpp"
 
+#include "compression/spill_compression.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -895,6 +896,9 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     throw std::runtime_error("SiriusContext::initialize: no GPUs discovered");
   }
   config_ = config.resolve(discovery.get_topology());
+  // The spill converters run on downgrade threads with no client context, so they
+  // read process-wide settings rather than this configuration.
+  sirius::compression::apply_spill_compression_config(config_.get_compression_config());
   sirius::converter_registry::initialize(config_.get_downgrade_executor_config().copy_chunk_bytes);
 
   // Discovery is shared by all subsystems; execution GPU ids come from the
