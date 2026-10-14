@@ -87,7 +87,7 @@ async fn read_schemas_concurrently(paths: &[String]) -> Result<Vec<Vec<PSlotDesc
 /// Infers one schema for a multi-file FILES() call.
 ///
 /// The schema comes from the first file; every other file must agree on column names
-/// (ASCII case-insensitive, matching StarRocks name resolution) and types. Positional
+/// (exactly: the GPU scan looks projected columns up by case-sensitive name) and types. Positional
 /// slot fields (id/slot_idx/column_pos) are per-file bookkeeping and are not compared.
 ///
 /// Deliberately stricter than native StarRocks, which samples `schema_sample_file_count`
@@ -110,7 +110,7 @@ pub(crate) async fn parquet_files_schema(paths: &[String]) -> Result<Vec<PSlotDe
             ));
         }
         for (idx, (expected, found)) in slots.iter().zip(&other).enumerate() {
-            if !expected.col_name.eq_ignore_ascii_case(&found.col_name) {
+            if expected.col_name != found.col_name {
                 return Err(format!(
                     "FILES() schema mismatch: column {idx} is named '{}' in '{first}' but '{}' in '{path}'",
                     expected.col_name, found.col_name
@@ -483,12 +483,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_file_accepts_case_differing_column_names() {
+    async fn multi_file_rejects_case_differing_column_names() {
         let first = write_parquet("case_a", "message m { optional int64 L_ORDERKEY; }");
         let second = write_parquet("case_b", "message m { optional int64 l_orderkey; }");
-        let slots = files_schema(&[&first, &second]).await.unwrap();
-        // The first file wins the spelling, matching StarRocks case-insensitive resolution.
-        assert_eq!(slots[0].col_name, "L_ORDERKEY");
+        let err = files_schema(&[&first, &second]).await.unwrap_err();
+        assert!(
+            err.contains("is named 'L_ORDERKEY'") && err.contains("but 'l_orderkey'"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
