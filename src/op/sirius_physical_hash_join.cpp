@@ -1009,9 +1009,14 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
   // build (exact IN-list / Bloom / zone map for every key type). Raising it to several partitions
   // would leave only Bloom accumulation (integer keys, peer DMA) or nothing, and M4a measured the
   // probe-side filter as worth more than the rebuilt tables (Q21: 73 GB probed vs 4.3 GB). Keep
-  // such a build whole; the rebuild saving is forfeited only for this case.
+  // such a build whole; the rebuild saving is forfeited only for this case. The conditions mirror
+  // PARTITION's whole-build fold (sirius_physical_partition.cpp): build-side sizing (a probe-driven
+  // join's single probe partition says nothing about its build), a build-side CONCAT to fold into,
+  // and a build under the hash-table budget. Where PARTITION would not fold the build whole, no
+  // filter is published from it, and pinning the count would forfeit the raise for nothing.
   bool const keep_whole_build_filter =
-    publishes_dynamic_filters() &&
+    in.is_build_side && in.build_foldable && publishes_dynamic_filters() &&
+    in.total_bytes < _max_build_hash_table_bytes &&
     natural_num_partitions(in.total_bytes, _hash_partition_bytes, num_gpus()) == 1;
   std::optional<uint64_t> other_side_estimate;
   if (larger_side_partitioning && !keep_whole_build_filter) {
