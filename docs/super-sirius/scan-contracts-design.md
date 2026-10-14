@@ -77,6 +77,8 @@ In tests, the scan statistics retain each query's readahead registrations by fil
 
 Each execution attempt owns its preparation units. A unit identifies one scan input and stays pending until all required evidence is ready: footer approval, native segment checks, a delete set, or checkpoint state. Readiness alone does not authorize publication. The gate rechecks cancellation and validates the split before prefetch initialization or connector insertion.
 
+The coordinator obtains admission, ledger attachment, claim readiness, work/key/required-input claims, and cleanup through `gpu_ingestible` capabilities. It does not identify Iceberg by type. All deferred scans in a statement must supply the same admission object. Cache matching similarly asks the adapter whether cached rows can satisfy its visibility requirements.
+
 Eligible Iceberg deletion-vector scans share one host-memory admission for the statement. The reservation covers retained descriptors and delete positions plus bounded temporary decode work, including allocation granularity. Buffers use the reserved backing, and immutable per-file delete sets retain it until their last consumer releases it. A prepared execution consumes its admission once; a later execution needs a fresh admission.
 
 Temporary capacity is requested for multiple DV jobs, bounded by the DV unit count, scan workers, and preparation job, active-unit, and result-slot limits. If a request fails, admission halves the target concurrency down to one job. A valid partial grant is used only when it covers all retained results and at least one job's temporary bound; its size limits the admitted concurrency. Only one successful reservation is retained.

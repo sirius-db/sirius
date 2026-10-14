@@ -1,0 +1,370 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+// sirius
+#include <helper/logical_type.hpp>
+#include <memory/size_arithmetic.hpp>
+#include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
+#include <op/scan/scan_plan.hpp>
+#include <op/scan/table_scan/parquet_physical_profile.hpp>
+#include <sirius_config.hpp>
+
+// duckdb
+#include <duckdb/common/column_index.hpp>
+#include <duckdb/common/multi_file/multi_file_data.hpp>
+#include <duckdb/common/types.hpp>
+#include <duckdb/common/vector.hpp>
+#include <duckdb/planner/expression.hpp>
+#include <duckdb/planner/table_filter.hpp>
+
+// cudf
+#include <cudf/io/parquet.hpp>
+#include <cudf/io/text/byte_range_info.hpp>
+
+// standard library
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace sirius::scan_manager {
+class sirius_scan_manager;
+}  // namespace sirius::scan_manager
+namespace sirius::transparent {
+class read_view_registry;
+}
+
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}  // namespace sirius::op
+
+namespace sirius::op::scan {
+
+//===----------------------------------------------------------------------===//
+// parquet_ingestible_table_info
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Parquet bind-data carrier; factory for @c parquet_gpu_ingestible.
+ *
+ * Populated once by the pipeline converter from the DuckDB
+ * @c parquet_scan binding, parked on the gpu scan operator until
+ */
+class parquet_ingestible_table_info : public ingestible_table_info {
+ public:
+  duckdb::vector<duckdb::LogicalType> bound_types;      // Full nested bind schema, in P-space.
+  std::optional<iceberg_table_schema> physical_schema;  // Populated by the S3 Iceberg lowering.
+  bound_table_scan physical_contract;
+  leaf_set semantic_columns;
+  duckdb::vector<sirius::logical_type> returned_types;
+  std::vector<std::string> resolved_file_paths;
+  /// Per-file byte ranges `[start, start+length)`, parallel to @ref resolved_file_paths. An
+  /// empty outer vector means every file is read whole; so does an empty list, or one holding
+  /// a `(0,0)` range, for one file. A ranged file reads only the row groups whose start offset
+  /// falls inside one of its ranges (see parquet_byte_range.hpp) — the mechanism behind
+  /// distributed byte-range splits, where N ranges of one file must read every row exactly
+  /// once across scan instances. One file keeps one entry even when this scan owns several of
+  /// its ranges: the bound read view requires one entry per bound file.
+  std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> resolved_file_ranges;
+  duckdb::vector<duckdb::ColumnIndex> column_ids;
+  duckdb::vector<duckdb::idx_t> projection_ids;
+  duckdb::vector<std::string> names;
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
+  duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
+  std::vector<bound_virtual_column> virtual_columns;
+  /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
+  /// wired. The ingestible uses AST-capable filters for row-group pruning; the downstream
+  /// dynamic-filter operator applies membership filters post-decode.
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
+  /// Query-local contract registry. After read-view comparison it exposes the physical
+  /// original's evidence record without copying it or issuing planning-time I/O.
+  std::shared_ptr<sirius::transparent::read_view_registry> read_views;
+
+  /// Target decoded column-buffer budget for one data-batch split. Consumed
+  /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
+  /// the ingestible's metadata scan operates one file at a time and does no batching.
+  std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
+  std::size_t projected_output_count = 0;
+
+  parquet_ingestible_table_info() = default;
+
+  /// True when file @p index is read whole (no ranges, or a `(0,0)` range among them).
+  [[nodiscard]] bool reads_whole_file(std::size_t index) const
+  {
+    if (index >= resolved_file_ranges.size()) { return true; }
+    auto const& ranges = resolved_file_ranges[index];
+    return ranges.empty() || std::any_of(ranges.begin(), ranges.end(), [](auto const& range) {
+             return range.first == 0 && range.second == 0;
+           });
+  }
+
+  /// True when any file is read through byte ranges rather than whole.
+  [[nodiscard]] bool has_byte_ranges() const
+  {
+    for (std::size_t i = 0; i < resolved_file_ranges.size(); ++i) {
+      if (!reads_whole_file(i)) { return true; }
+    }
+    return false;
+  }
+
+  [[nodiscard]] std::span<std::string const> column_names() const override { return names; }
+
+  [[nodiscard]] std::span<std::string const> file_paths() const override
+  {
+    return std::span<std::string const>(resolved_file_paths.data(), resolved_file_paths.size());
+  }
+
+  [[nodiscard]] std::string display_name() const override
+  {
+    return resolved_file_paths.empty() ? "<unknown>" : resolved_file_paths.front();
+  }
+
+  [[nodiscard]] bool has_requested_user_virtual_columns() const;
+};
+
+/// Canonical identity form for a parquet file path so pinned-cache matching
+/// (@ref cache_entry_info::can_serve_with_columns, a raw set-equality on
+/// resolved_file_paths) is independent of spelling: relative vs absolute,
+/// redundant '/', './..', 'file://', and symlinks all collapse. Remote URIs
+/// (scheme://) pass through. Apply ONLY at the cache-identity boundary
+/// (cache_entry_info): resolved_file_paths on the bind info stay as bound, so
+/// Hive partition parsing reads the original path and is not confused by a
+/// symlink-resolved 'key=value' directory segment.
+[[nodiscard]] std::string canonical_scan_file_path(std::string const& raw);
+
+/// In-place @ref canonical_scan_file_path over a resolved-file-path vector.
+void canonicalize_scan_file_paths(std::vector<std::string>& paths);
+
+struct filename_column_size_estimate {
+  std::size_t output_bytes;
+  std::size_t working_bytes;
+};
+
+/// Size the repeated filename column and cuDF's temporary pointer/length pairs.
+/// Uses the active cuDF large-string settings and saturates on overflow.
+[[nodiscard]] filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
+                                                                          std::size_t path_bytes);
+
+//===----------------------------------------------------------------------===//
+// parquet_split_info
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Per-split scan metadata for a parquet row-group batch.
+ *
+ * One emitted by @c parquet_gpu_ingestible::next_split_provider for each
+ * row-group partition. Carries everything @c materialize_table needs to
+ * issue the read: the byte-range slices (with their per-file ioctx +
+ * io_object), the shared reader options (column projection / filter
+ * pushdown), the canonical scan plan, and the per-batch pushdown safety
+ * flag.
+ */
+class parquet_split_info : public scan_info {
+ public:
+  explicit parquet_split_info(std::vector<fadvise_entry> hints) : scan_info(std::move(hints)) {}
+
+  /// The column-chunk byte ranges this split reads, one vector per entry of
+  /// @c rg_slices (empty for a slice with no metadata or no row groups).
+  ///
+  /// Computed once by the coalescer, which already walks them to build this
+  /// split's fadvise hints, and handed over here so materialization can reuse
+  /// them: each computation builds a @c hybrid_scan_reader and walks the
+  /// footer's row groups, which is far from free on a many-row-group file.
+  [[nodiscard]] std::span<std::vector<cudf::io::text::byte_range_info> const>
+  column_chunk_byte_ranges() const
+  {
+    return _column_chunk_ranges;
+  }
+
+  void set_column_chunk_byte_ranges(
+    std::vector<std::vector<cudf::io::text::byte_range_info>> ranges)
+  {
+    _column_chunk_ranges = std::move(ranges);
+  }
+
+  /// Row-group slices for this batch — possibly across multiple parquet
+  /// files when the per-file row groups don't fill the byte budget.
+  std::vector<row_group_slice> rg_slices;
+  /// Shared parquet_reader_options (column projection, filter pushdown
+  /// when AST translation succeeded). Shared across every split emitted
+  /// by the same batch.
+  std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
+  /// Canonical scan_plan for the table, shared across every split of
+  /// this ingestible.
+  std::shared_ptr<scan_plan const> plan;
+  /// When true, @c materialize_table MUST NOT call @c set_filter on its
+  /// reader options; the parquet file has a FLBA-decimal column whose
+  /// row-group stats cudf cannot compare against an AST literal. The
+  /// filter still applies post-decode via @c expression_evaluator.
+  bool disable_filter_pushdown = false;
+  /// Hive partition values for this split, in @c scan_plan::partition_columns
+  /// order. Empty when the plan has no partition columns. Kept on the split so
+  /// @ref materialize_table can call @c assemble_scan_output inline on the
+  /// reader-side pushdown path and emit @c filter_state::ROW_FILTERED_AND_PROJECTED.
+  std::vector<std::string> partition_values;
+  /// Whether the scan plan needs post-decode assembly (hive partition
+  /// injection or column reordering). Mirrors @c needs_output_assembly(*plan).
+  bool needs_assembly = false;
+
+  [[nodiscard]] std::size_t estimated_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& s : rg_slices) {
+      total = memory::saturating_add(total, s.estimated_output_bytes);
+    }
+    return total;
+  }
+
+  [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    std::size_t runs  = 0;
+    for (auto const& s : rg_slices) {
+      total = memory::saturating_add(total, s.estimated_decode_working_bytes);
+      runs  = memory::saturating_add(runs, s.row_group_indices.size());
+    }
+    // The provenance-preserving virtual path decodes one table per selected row group. When
+    // several pieces are present they all remain alive while concatenate allocates an equally
+    // sized result, so reserve both sides of that peak.
+    return plan && plan->has_user_virtual_columns() && runs > 1
+             ? memory::saturating_mul(total, std::size_t{2})
+             : total;
+  }
+
+ private:
+  /// Parallel to @c rg_slices. See @ref column_chunk_byte_ranges.
+  std::vector<std::vector<cudf::io::text::byte_range_info>> _column_chunk_ranges;
+};
+
+//===----------------------------------------------------------------------===//
+// parquet_file_scan_info
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Per-file metadata unit emitted by @ref next_split_provider.
+ *
+ * Each metadata-scan task processes exactly one parquet file: it reads the
+ * footer, prunes row groups against the filter, and records per-row-group byte
+ * accounting. The result is one @c parquet_file_scan_info. File batching and
+ * row-group chunking by byte budget are then performed downstream by
+ * @c parquet_batch_coalescer, which coalesces these into @c parquet_split_info
+ * data batches. The shared @c reader_options and @c scan_plan live on the
+ * ingestible and are stamped onto the emitted splits by the coalescer.
+ */
+class parquet_file_scan_info : public scan_info {
+ public:
+  /// A single pruned row group with the byte accounting the coalescer chunks on.
+  /// @c output_bytes estimates the decoded size of projected data columns before
+  /// row filtering, while @c decode_working_bytes also includes columns decoded
+  /// only for filtering. Fixed-width columns contribute row_count x cuDF
+  /// decoded width plus validity; VARCHAR uses the parquet decoded BYTE_ARRAY
+  /// statistic (@c SizeStatistics, or the encoded size when the writer omitted it)
+  /// plus offsets and validity. See @c rg_contribution in parquet_gpu_ingestible.cpp.
+  /// Scans with no projected data column use decoded read columns as their
+  /// nonzero execution-history basis.
+  struct row_group_entry {
+    cudf::size_type index;
+    std::size_t output_bytes;
+    std::size_t decode_working_bytes;
+    std::size_t compressed_bytes;
+    int64_t num_rows;
+  };
+
+  /// Parsed footer metadata for this file.
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::vector<uint8_t> original_schema;
+  std::string arrow_schema;
+  /// File path (also the datasource cache key).
+  std::string file_path;
+  /// Stable position in DuckDB's bound file list.
+  std::size_t file_index = 0;
+  /// Pre-built datasource for this file, reused by @c materialize_table. May be
+  /// null for local paths no sirius backend claims.
+  std::shared_ptr<io::sirius_datasource> datasource;
+  /// Pruned row groups for this file, in file order, with byte accounting.
+  std::vector<row_group_entry> row_groups;
+  /// Per-file reader options. These differ from the plan defaults when the
+  /// row-count carrier column is unavailable in a schema-evolved file.
+  std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
+  /// Hive partition values for this file, in @c scan_plan::partition_columns
+  /// order. Empty when the plan has no partition columns.
+  std::vector<std::string> partition_values;
+  /// When true, this file has an FLBA-decimal column whose row-group stats cudf
+  /// cannot compare against an AST literal — reader-side pushdown must be
+  /// disabled for any split that includes it.
+  bool disable_filter_pushdown = false;
+  /// When true, the plan's row-count carrier column (scan_plan::carrier_batch_index)
+  /// could not be resolved in this file — schema evolution, or no row groups —
+  /// so @ref reader_options carries no column projection and the file reads its
+  /// natural batch. Splits never mix files that differ on this.
+  bool carrier_unavailable = false;
+
+  [[nodiscard]] std::size_t estimated_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& rg : row_groups) {
+      total = memory::saturating_add(total, rg.output_bytes);
+    }
+    return total;
+  }
+
+  [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& rg : row_groups) {
+      total = memory::saturating_add(total, rg.decode_working_bytes);
+    }
+    return total;
+  }
+};
+
+/// A top-level `<col> IS [NOT] NULL` conjunct, recorded so the row groups it
+/// excludes can still be pruned from the parquet null_count statistic even
+/// though cuDF's stats filter cannot evaluate the predicate itself.
+struct null_prune_predicate {
+  duckdb::idx_t batch_index;  ///< index into the scan's batch column order
+  bool expects_null;          ///< true for IS NULL, false for IS NOT NULL
+};
+
+//===----------------------------------------------------------------------===//
+// parquet_gpu_ingestible
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Concrete @c gpu_ingestible for parquet sources.
+ *
+ * Owns the shared scan plan, reader options, and coalesced filter expression.
+ * @ref next_split_provider hands out one file at a time: each metadata-scan task
+ * reads that file's footer, prunes its row groups, and emits a single
+ * @c parquet_file_scan_info. File bundling and row-group chunking by byte budget
+ * are handled downstream by @c parquet_batch_coalescer (@ref create_batch_coalescer),
+ * which coalesces the per-file units into @c parquet_split_info data batches.
+ *
+ * @ref materialize_table is the per-split read + filter step; it also assembles
+ * hive-partition output inline (it owns the per-split partition values).
+ * @ref post_filter_and_project applies a pending filter and non-partition
+ * projection.
+ */
+
+}  // namespace sirius::op::scan

@@ -39,6 +39,12 @@ op::scan::gpu_ingestible::metadata_scan_task_t split_provider::next_split_provid
   return _ingestible->next_split_provider(_resolve);
 }
 
+op::scan::gpu_ingestible::preparation_claim split_provider::claim_preparation()
+{
+  if (_ingestible->preparation_admission()) return _ingestible->claim_preparation(_resolve);
+  return {next_split_provider(), {}, {}};
+}
+
 template <typename Scheduler>
 void split_provider::run(Scheduler& scheduler, const push_callback_t& on_split)
 {
