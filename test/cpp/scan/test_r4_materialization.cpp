@@ -240,6 +240,18 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto repeated = materialize_mapped_parquet_runs(units, contract, stream.view(), mr);
   REQUIRE(repeated.size() == 1);
   REQUIRE(repeated[0].rows == 6);
+  auto floating_fields             = fields;
+  floating_fields[2].type          = duckdb::LogicalType::DOUBLE;
+  floating_fields[2].missing_value = duckdb::Value::DOUBLE(0.0);
+  auto floating_program            = program;
+  floating_program.output_types[2] = cudf::data_type{cudf::type_id::FLOAT64};
+  floating_program.input_types     = floating_program.output_types;
+  auto positive_zero               = field_id_mapping::compile(
+    resolved.artifact, resolved.identity, floating_program, floating_fields);
+  floating_fields[2].missing_value = duckdb::Value::DOUBLE(-0.0);
+  auto negative_zero               = field_id_mapping::compile(
+    resolved.artifact, resolved.identity, floating_program, floating_fields);
+  REQUIRE_FALSE(positive_zero.compatible_with(negative_zero));
   fields[0].allow_int32_to_int64 = false;
   REQUIRE_THROWS(field_id_mapping::compile(resolved.artifact, resolved.identity, program, fields));
   REQUIRE_THROWS(field_id_mapping::compile(resolved.artifact, "other-version", program, fields));
