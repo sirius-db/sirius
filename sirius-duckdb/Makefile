@@ -1,7 +1,9 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-OVERRIDE_GIT_DESCRIBE ?= v1.5.6
 DISABLE_SANITIZER ?= 1
+
+# Match DuckDB's linker flags to the extension's BFD requirement.
+override EXT_FLAGS += -DDUCKDB_LINKER=bfd
 
 SIRIUS_DUCKDB_LINKAGE ?= $(if $(VCPKG_TOOLCHAIN_PATH),static,shared)
 # Scan verification resolves the DuckDB host's exported factories.
@@ -11,7 +13,7 @@ export VCPKG_CUDA_ARCHITECTURES ?= $(CUDAARCHS)
 override EXT_FLAGS += -DVCPKG_MANIFEST_FEATURES=static -DVCPKG_INSTALL_OPTIONS=--clean-buildtrees-after-build
 endif
 ifneq ($(strip $(SIRIUS_INSTALL_DIR)),)
-override EXT_FLAGS += -Dsirius_DIR='$(SIRIUS_INSTALL_DIR)/lib/cmake/sirius'
+override EXT_FLAGS += -Dsirius_ROOT='$(SIRIUS_INSTALL_DIR)'
 endif
 
 GEN ?= ninja

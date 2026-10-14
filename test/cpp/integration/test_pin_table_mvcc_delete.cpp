@@ -60,10 +60,8 @@ void expect_fallback_matches_cpu(sirius::test::GpuExecutionFixture& fx, const st
   REQUIRE(cpu_result);
   REQUIRE_FALSE(cpu_result->HasError());
 
-  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    gpu_result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    cpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*gpu_result);
+  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*cpu_result);
   REQUIRE(gpu_rows == cpu_rows);
 }
 
@@ -192,11 +190,8 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("CHECKPOINT;");
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   run_ok("DELETE FROM t;");
-  // A bare count(*) compiles to a rowid-only scan the cache cannot serve
-  // (rowid is not cached; unguarded, such scans silently read the STALE disk
-  // image and would count 50000 here) — cache-or-CPU sends them to the CPU
-  // fallback with the correct (empty) answer.
-  expect_fallback_matches_cpu(*this, "SELECT count(*) FROM t;");
+  // V2 can answer COUNT from metadata without scanning the stale disk image.
+  compare_gpu_vs_cpu("SELECT count(*) FROM t;");
   // Column-anchored scans serve from the cache, masked down to emptiness.
   compare_gpu_vs_cpu("SELECT count(k) FROM t;");
   compare_gpu_vs_cpu("SELECT k FROM t;");
@@ -240,16 +235,15 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
 
   {
-    // count(k) anchors a cached column (a bare count(*) is a rowid-only scan
-    // the cache never serves).
+    // SUM anchors a cached column; v2 can answer a bare COUNT from metadata.
     auto before = sirius::test::get_transparent_execution_stats(*con_a);
-    auto result = con_a->Query("SELECT count(k) FROM t;");
+    auto result = con_a->Query("SELECT count(k), sum(k) FROM t;");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
     auto after = sirius::test::get_transparent_execution_stats(*con_a);
     sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
     // A's snapshot predates the delete: the fallback must serve all rows.
-    REQUIRE(result->GetValue(0, 0).ToString() == "100000");
+    REQUIRE(result->Collection().GetValue(0, 0).ToString() == "100000");
   }
 
   run_ok_on(*con_a, "COMMIT;");
@@ -257,12 +251,12 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   {
     // Fresh snapshot: newer than v_base, no inserts — served from the cache.
     auto before = sirius::test::get_transparent_execution_stats(*con_a);
-    auto result = con_a->Query("SELECT count(k) FROM t;");
+    auto result = con_a->Query("SELECT count(k), sum(k) FROM t;");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
     auto after = sirius::test::get_transparent_execution_stats(*con_a);
     sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-    REQUIRE(result->GetValue(0, 0).ToString() == "99500");
+    REQUIRE(result->Collection().GetValue(0, 0).ToString() == "99500");
   }
 
   run_ok("CALL unpin_table('t');");

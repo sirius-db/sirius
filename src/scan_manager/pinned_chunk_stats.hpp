@@ -126,6 +126,8 @@ class pinned_zone_maps {
  *  - IS NULL, IS NOT NULL
  *  - AND, OR, OPTIONAL whose descendants all pass (an OPTIONAL with no child rejects)
  */
+[[nodiscard]] bool filter_safe_for_stats(duckdb::TableFilter const& filter);
+
 [[nodiscard]] bool filter_safe_for_stats(duckdb::TableFilter const& filter,
                                          duckdb::LogicalType const& stats_type);
 

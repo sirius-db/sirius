@@ -68,7 +68,8 @@ class SIRIUS_FFI_EXPORT Context {
   /// Arrow C Data Interface stream at `out_stream_addr` (one schema, a sequence
   /// of record batches). `out_stream_addr` is the address of a caller-owned
   /// `ArrowArrayStream` that the caller releases per the Arrow ABI. Throws on
-  /// translation or execution failure.
+  /// translation or execution failure. The stream keeps the database context alive until
+  /// released; its last release can tear down the engine on the releasing thread.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
  private:

@@ -184,9 +184,17 @@ std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
     cudf::host_span<uint8_t const>(footer->data(), footer->size()), options);
   auto parsed = std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
   std::string arrow_schema;
+  // Stable cuDF returns a string here; nightly cuDF wraps the value in an optional.
+  auto metadata_value = [](auto const& value) -> std::string {
+    if constexpr (requires { value.has_value(); }) {
+      return value.value_or(std::string{});
+    } else {
+      return std::string{value};
+    }
+  };
   for (auto const& entry : parsed->key_value_metadata) {
     if (entry.key == "ARROW:schema") {
-      arrow_schema = entry.value;
+      arrow_schema = metadata_value(entry.value);
       break;
     }
   }

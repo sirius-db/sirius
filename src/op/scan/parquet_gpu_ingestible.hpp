@@ -31,7 +31,7 @@
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 #include <duckdb/planner/expression.hpp>
-#include <duckdb/planner/table_filter.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 
 // cudf
 #include <cudf/io/parquet.hpp>
@@ -98,7 +98,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
   /// the ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-  std::size_t scan_output_arity      = 0;
+  std::size_t projected_output_count = 0;
 
   parquet_ingestible_table_info() = default;
 

@@ -72,7 +72,7 @@ class scoped_setting {
       fixture.con->Query("SELECT value FROM duckdb_settings() WHERE name = '" + name + "'");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
-    return result->GetValue(0, 0).ToString();
+    return result->Collection().GetValue(0, 0).ToString();
   }
 
   sirius::test::GpuExecutionFixture& fixture;

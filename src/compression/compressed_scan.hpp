@@ -188,6 +188,10 @@ struct pushdown_outcome {
   /// compacted to the surviving rows, so the scan can skip filtering
   /// altogether and only project.
   ///
+  /// The scan's filter is its own pushed-down filter. Join filters
+  /// (`pushdown_request::column_entry::membership`) are not part of it: they are optional, so
+  /// whether any of them ran on a batch does not bear on this flag.
+  ///
   /// A partially applied request must leave this false: the residual conjuncts
   /// still have to run, and re-checking already-applied ones on the surviving
   /// rows is idempotent.

@@ -512,14 +512,13 @@ TEST_CASE("translator: join condition uses requested comparison operator",
   }
 }
 
-TEST_CASE("translator: join condition unsupported comparison returns nullopt",
-          "[expression_translator]")
+TEST_CASE("translator: DISTINCT FROM join condition is supported", "[expression_translator]")
 {
   auto condition  = make_reference_join_condition(duckdb::ExpressionType::COMPARE_DISTINCT_FROM);
   auto translator = make_translator();
   auto translated = translator.translate_join_condition(condition);
 
-  REQUIRE_FALSE(translated.has_value());
+  REQUIRE(translated.has_value());
 }
 
 //===----------------------------------------------------------------------===//
