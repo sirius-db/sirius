@@ -282,9 +282,9 @@ struct telemetry_config {
   std::string nvtx_injection_lib{};
 };
 
-/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
-/// These settings apply exclusively to cached input-table pinning and have no
-/// effect on spill-path compression (Phase 3).
+/// Parameters for pin_table: Simpatico compression of cached input tables, and the pin-time
+/// uniqueness facts recorded for them. These settings apply exclusively to cached input-table
+/// pinning and have no effect on spill-path compression (Phase 3).
 struct compression_config {
   /// When true, pin_table(tier=>'host') attempts to compress each chunk with
   /// Simpatico before storing it in host memory. Falls back to uncompressed
@@ -311,6 +311,14 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
+
+  /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
+  /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
+  /// When on, pin_table observes every column it is not already asked to observe; an observed
+  /// column must be an integer column without a repeated value in any chunk to stay a candidate.
+  /// When off, the planner ignores pin-time facts and the pin observes only the columns that
+  /// late materialization asks for.
+  bool prove_unique_keys{true};
 };
 
 class configuration_input_error : public std::runtime_error {

@@ -1317,11 +1317,17 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     }
   }
 
-  // Late-mat uniqueness probe: which pinned columns to observe for whole-table
-  // distinctness (off unless SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS asks for it). The
+  // Uniqueness probe: which pinned columns to observe for whole-table distinctness.
+  // SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS names columns late materialization needs; the
   // names outlive cache_info, which every insert path moves from.
   auto const pinned_column_names = cache_info.column_names();
   auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
+  // With pin_table_prove_unique_keys, every other column is observed too, as a join-key candidate.
+  auto const probe_unique_automatic = sirius::late_mat::pin_unique_automatic_selection(
+    probe_unique_columns, comp_cfg.prove_unique_keys);
+  for (std::size_t i = 0; i < probe_unique_columns.size(); ++i) {
+    if (probe_unique_automatic[i]) { probe_unique_columns[i] = true; }
+  }
 
   auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
                           std::vector<std::size_t> row_counts) {
@@ -1356,7 +1362,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                       {.expression_policy   = pin_op_params.expression_policy(),
                                        .capture_chunk_stats = capture_chunk_stats,
                                        .enable_compressed_materialization = compressed_pin,
-                                       .probe_unique_columns              = probe_unique_columns});
+                                       .probe_unique_columns              = probe_unique_columns,
+                                       .probe_unique_automatic = probe_unique_automatic});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(host_result.column_storage));
@@ -1388,7 +1395,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       {.expression_policy                 = pin_op_params.expression_policy(),
        .capture_chunk_stats               = false,
        .enable_compressed_materialization = compressed_pin,
-       .probe_unique_columns              = probe_unique_columns});
+       .probe_unique_columns              = probe_unique_columns,
+       .probe_unique_automatic            = probe_unique_automatic});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(dev_result.column_storage));
@@ -1411,7 +1419,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                       {.expression_policy   = pin_op_params.expression_policy(),
                                        .capture_chunk_stats = capture_chunk_stats,
                                        .enable_compressed_materialization = compressed_pin,
-                                       .probe_unique_columns              = probe_unique_columns});
+                                       .probe_unique_columns              = probe_unique_columns,
+                                       .probe_unique_automatic = probe_unique_automatic});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(mat.column_storage));
@@ -2767,6 +2776,16 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
+static void SetPinTableProveUniqueKeys(ClientContext& context, SetScope scope, Value& parameter)
+{
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("Pin uniqueness options are session settings");
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  duckdb::session_compression_config(context).prove_unique_keys = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_prove_unique_keys to {}", BooleanValue::Get(parameter));
+}
+
 static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                                                SetScope scope,
                                                Value& parameter)
@@ -3427,6 +3446,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::DOUBLE,
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
+
+  config.AddExtensionOption(
+    "pin_table_prove_unique_keys",
+    "Prove pinned parquet columns distinct at pin time, and let joins whose build key was proven "
+    "distinct take the single-pass distinct hash join, as for a PRIMARY KEY",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(compression_defaults.prove_unique_keys),
+    SetPinTableProveUniqueKeys);
 
   add_sirius_option(
     config,

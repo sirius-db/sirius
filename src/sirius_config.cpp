@@ -458,6 +458,7 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
     return std::isfinite(value) && value >= 0.0;
   });
   r.optional("input_plan_dir", opt.input_plan_dir);
+  r.optional("prove_unique_keys", opt.prove_unique_keys);
   r.reject_unknown();
 }
 

@@ -41,5 +41,6 @@ sirius:
     min_batch_size_bytes: 8MiB
     max_compressed_fraction: 0.6
     input_plan_dir: /tmp/sirius-compression-plans
+    prove_unique_keys: false
   telemetry:
     enable_quent: false
