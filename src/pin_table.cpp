@@ -261,7 +261,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   bool const timing = std::getenv("SIRIUS_PIN_PHASE_DEBUG") != nullptr;
   std::size_t const depth = [] {
     auto const* v = std::getenv("SIRIUS_PIN_OVERLAP");
-    return v == nullptr ? std::size_t{1} : static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+    return v == nullptr ? std::size_t{2} : static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
   }();
   auto const pin_t0 = std::chrono::steady_clock::now();
   std::atomic<std::int64_t> decode_ns{0};
@@ -420,8 +420,9 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
 
   // Up to `depth` batches are read and decoded on workers while this thread finishes the oldest
   // one, so file reads, both transfers and the decode of neighbouring batches overlap; batches are
-  // still finished in emission order. SIRIUS_PIN_OVERLAP sets the depth (default 1); 0 does each
-  // batch start to finish.
+  // still finished in emission order. SIRIUS_PIN_OVERLAP sets the depth (default 2; a 38 GB pin
+  // on an RTX A5000 took 13.8 / 9.4 / 7.9 / 7.3 s at 0 / 1 / 2 / 3); 0 does each batch start to
+  // finish.
   auto const since = [](auto t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   };
