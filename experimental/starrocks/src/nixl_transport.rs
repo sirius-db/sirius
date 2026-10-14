@@ -58,6 +58,12 @@ const ALLOC_MAX_BACKOFF: Duration = Duration::from_secs(1);
 /// fragment and no WRITE is in flight.
 const IDLE_WAIT: Duration = Duration::from_millis(2);
 
+/// Polls of a WRITE in flight back off from [`POLL_FIRST`] to [`POLL_MAX`], so a long WRITE doesn't
+/// keep a core spinning next to the brpc and engine threads. WRITEs take 0.3-4 ms at SF1000, so a
+/// longer cap would notice one finishing that much later.
+const POLL_FIRST: Duration = Duration::from_micros(4);
+const POLL_MAX: Duration = Duration::from_micros(100);
+
 /// Handle to the transport thread.
 #[derive(Debug)]
 pub struct NixlTransport {
@@ -417,8 +423,13 @@ impl Transport {
             .iter()
             .map(|hop| self.remote_agent(hop.peer))
             .collect::<Result<Vec<_>, _>>()?;
+        let peers: Vec<_> = hops
+            .iter()
+            .map(|hop| hop.peer)
+            .zip(remotes.iter().cloned())
+            .collect();
         let window = self.window;
-        std::thread::scope(|scope| {
+        let shipped = std::thread::scope(|scope| {
             let mut lanes = Vec::with_capacity(hops.len());
             let mut announcers = Vec::with_capacity(hops.len());
             for (hop, remote) in hops.into_iter().zip(remotes) {
@@ -426,9 +437,13 @@ impl Transport {
                 let (peer, slot, names) = (hop.peer, hop.slot, hop.names);
                 let stop = Arc::new(AtomicBool::new(false));
                 let announcer_stop = Arc::clone(&stop);
-                announcers.push(
-                    scope.spawn(move || announce_all(peer, slot, &names, frames, &announcer_stop)),
-                );
+                let announcer = std::thread::Builder::new()
+                    .name("nixl-announce".to_string())
+                    .spawn_scoped(scope, move || {
+                        announce_all(peer, slot, &names, frames, &announcer_stop)
+                    })
+                    .map_err(|err| format!("failed to spawn a nixl announce thread: {err}"))?;
+                announcers.push(announcer);
                 lanes.push(Lane {
                     peer,
                     slot,
@@ -444,17 +459,16 @@ impl Transport {
             }
             let pumped = self.pump(&mut lanes, window);
             // Wait out every WRITE still posted: a finished one frees the sender's batch, and the
-            // receiver's buffers it filled are never announced, so they are released.
+            // receiver's buffers it filled are never announced, so they are released. A peer that
+            // stops answering gets no more Releases: each would wait out `RPC_TIMEOUT`.
+            let mut down = HashSet::new();
             for lane in &mut lanes {
                 for mut write in std::mem::take(&mut lane.inflight) {
-                    if self.complete(&lane.remote, &mut write).is_ok() {
-                        let _ = call(
-                            lane.peer,
-                            control_params(),
-                            &NixlEnvelope::Release(write.remote),
-                        );
-                    } else {
+                    if self.complete(&lane.remote, &mut write).is_err() {
                         self.quarantine(lane.peer, write);
+                    } else if !down.contains(&lane.peer) && !release_remote(lane.peer, write.remote)
+                    {
+                        down.insert(lane.peer);
                     }
                 }
                 if pumped.is_ok() {
@@ -489,13 +503,24 @@ impl Transport {
                     "shipping packed exchange hop"
                 );
             }
-            pumped.and(announced)
-        })
+            // An announcer's error is the cause when it stopped the pump.
+            announced.and(pumped)
+        });
+        if shipped.is_err() {
+            // Every hop of a failed ship failed with it. A restarted peer comes back under the
+            // same agent name with a new registration, so stale metadata would fail every later
+            // hop: reload it on the next one.
+            for (peer, remote) in peers {
+                self.forget_peer(peer, &remote);
+            }
+        }
+        shipped
     }
 
     /// Serves every lane round robin until each source ended and its WRITEs finished.
     fn pump(&self, lanes: &mut [Lane], window: usize) -> Result<(), String> {
         let mut next_wait = 0;
+        let mut backoff = POLL_FIRST;
         loop {
             let mut progressed = false;
             for lane in lanes.iter_mut() {
@@ -509,10 +534,11 @@ impl Transport {
                 return Ok(());
             }
             if progressed {
+                backoff = POLL_FIRST;
                 continue;
             }
             if lanes.iter().any(|lane| !lane.inflight.is_empty()) {
-                std::thread::yield_now();
+                back_off(&mut backoff);
                 continue;
             }
             // Every source is waiting on its fragment: block briefly on one, taking turns.
@@ -662,8 +688,9 @@ impl Transport {
 
     /// Waits for `write` to finish; see [`poll`](Self::poll).
     fn complete(&self, remote: &str, write: &mut Write) -> Result<(), String> {
+        let mut backoff = POLL_FIRST;
         while !self.poll(remote, write)? {
-            std::thread::yield_now();
+            back_off(&mut backoff);
         }
         Ok(())
     }
@@ -834,6 +861,12 @@ fn announce_all(
         }
     }
     result
+}
+
+/// Sleeps `backoff`, then doubles it up to [`POLL_MAX`].
+fn back_off(backoff: &mut Duration) {
+    std::thread::sleep(*backoff);
+    *backoff = (*backoff * 2).min(POLL_MAX);
 }
 
 /// Asks `peer` to free the receive buffers under `token`, logging a failure. Returns whether the
