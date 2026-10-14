@@ -7,7 +7,7 @@
 //! the root.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
@@ -99,6 +99,34 @@ struct PendingReceiver {
 /// no longer refused, and the state it rebuilds waits for senders that never come.
 const PURGED_QUERIES: usize = 1024;
 
+/// Receivers remembered after their handoff, so a late sender or replayed frame is refused or
+/// dropped instead of starting a sender set no receiver will read. Oldest evicted first.
+const HANDED_OVER: usize = 4096;
+
+/// What became of one remote frame. Returned once per frame, so the large accepted variant is
+/// not worth boxing.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum RemoteFrame {
+    /// Kept; the receiver, if this frame completed its sender set.
+    Accepted(Option<ReadyFragment>),
+    /// A replay of a frame already kept, dropped without keeping its batch again. A resent frame
+    /// may name the very buffer its first copy delivered, so freeing it is the transport's call.
+    Duplicate,
+}
+
+#[cfg(test)]
+impl RemoteFrame {
+    /// The accepted frame's ready receiver; panics on a duplicate.
+    fn accepted(self) -> Option<ReadyFragment> {
+        match self {
+            Self::Accepted(ready) => ready,
+            Self::Duplicate => panic!("frame was dropped as a duplicate"),
+        }
+    }
+}
+
 /// What a purged query still held: the caller frees it outside the exchange lock.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Purged {
@@ -124,8 +152,12 @@ struct ExchangeState {
     receivers: HashMap<FragmentInstanceId, PendingReceiver>,
     sources: HashMap<ExchangeKey, HashMap<i32, SenderSource>>,
     /// Next expected remote-frame sequence number per sender. A duplicate (below) is dropped
-    /// idempotently; a gap (above) is a lost frame and fails the sender.
+    /// idempotently; a gap (above) is a lost frame and fails the sender. Kept after the
+    /// receiver's handoff, so a late replay is still recognized as one.
     remote_seq: HashMap<(ExchangeKey, i32), i64>,
+    /// Receivers already handed over by `take_ready`; `handed_over_order` is oldest first.
+    handed_over: HashSet<FragmentInstanceId>,
+    handed_over_order: VecDeque<FragmentInstanceId>,
     /// Queries purged after a failure or cancel, by [`FragmentInstanceId::query_hi`], with the
     /// error that purged them; `purged_order` is oldest first. A late receiver, sender or frame of
     /// one is refused, with that error, instead of rebuilding state that would never complete.
@@ -134,6 +166,17 @@ struct ExchangeState {
 }
 
 impl ExchangeState {
+    /// Refuses `fragment_instance_id` once its receiver has run: whatever arrives now would never
+    /// be read.
+    fn refuse_handed_over(&self, fragment_instance_id: FragmentInstanceId) -> Result<(), String> {
+        if self.handed_over.contains(&fragment_instance_id) {
+            return Err(format!(
+                "the receiver of fragment instance {fragment_instance_id} already ran"
+            ));
+        }
+        Ok(())
+    }
+
     fn refuse_purged(&self, fragment_instance_id: FragmentInstanceId) -> Result<(), String> {
         if let Some(error) = self.purged.get(&fragment_instance_id.query_hi()) {
             // The original error, so whichever refusal reaches the FE first still names the cause.
@@ -153,6 +196,7 @@ pub(crate) struct LocalExchange {
 
 impl LocalExchange {
     /// Registers a receiver fragment, returning it when every exchange input is already complete.
+    /// `expected_senders` lists `(exchange node id, number of senders)` per exchange input.
     pub(crate) fn register_receiver(
         &self,
         fragment_instance_id: FragmentInstanceId,
@@ -175,7 +219,9 @@ impl LocalExchange {
         }
         let mut state = self.lock();
         state.refuse_purged(fragment_instance_id)?;
-        if state.receivers.contains_key(&fragment_instance_id) {
+        if state.receivers.contains_key(&fragment_instance_id)
+            || state.handed_over.contains(&fragment_instance_id)
+        {
             return Err(format!(
                 "duplicate receiver registration for fragment {fragment_instance_id}"
             ));
@@ -200,6 +246,7 @@ impl LocalExchange {
     ) -> Result<Option<ReadyFragment>, String> {
         let mut state = self.lock();
         state.refuse_purged(key.fragment_instance_id)?;
+        state.refuse_handed_over(key.fragment_instance_id)?;
         let senders = state.sources.entry(key).or_default();
         if senders.contains_key(&sender_id) {
             return Err(format!("duplicate sender {sender_id} for exchange {key:?}"));
@@ -208,7 +255,10 @@ impl LocalExchange {
         Self::take_ready(&mut state, key.fragment_instance_id)
     }
 
-    /// Records one frame from a remote sender: a batch, eos, or both.
+    /// Records one frame from a remote sender: a batch, eos, or both. `seq` counts from 0 per
+    /// sender; a replayed `seq` is dropped as [`RemoteFrame::Duplicate`] and a skipped one fails
+    /// the sender. Only an accepted frame advances `seq`, so a frame refused here can be resent.
+    /// A refused frame's batch is not kept and is the caller's to free.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn push_remote_frame(
         &self,
@@ -218,7 +268,7 @@ impl LocalExchange {
         eos: bool,
         names: Vec<String>,
         batch: Option<RemoteBatch>,
-    ) -> Result<Option<ReadyFragment>, String> {
+    ) -> Result<RemoteFrame, String> {
         if names.is_empty() {
             return Err(format!(
                 "remote sender {sender_id} for exchange {key:?} sent a frame without column \
@@ -233,57 +283,74 @@ impl LocalExchange {
         }
         let mut state = self.lock();
         state.refuse_purged(key.fragment_instance_id)?;
-        let expected_seq = state.remote_seq.entry((key, sender_id)).or_insert(0);
-        if seq < *expected_seq {
+        let expected_seq = state
+            .remote_seq
+            .get(&(key, sender_id))
+            .copied()
+            .unwrap_or(0);
+        if seq < expected_seq {
             info!(
                 exchange = ?key,
                 sender_id, seq, "dropping duplicate remote exchange frame"
             );
-            return Ok(None);
+            return Ok(RemoteFrame::Duplicate);
         }
-        if seq > *expected_seq {
+        if seq > expected_seq {
             return Err(format!(
                 "remote sender {sender_id} for exchange {key:?} skipped from frame seq \
                  {expected_seq} to {seq}; a frame was lost"
             ));
         }
-        *expected_seq += 1;
+        state.refuse_handed_over(key.fragment_instance_id)?;
+        match state
+            .sources
+            .get(&key)
+            .and_then(|senders| senders.get(&sender_id))
+        {
+            None => {}
+            Some(SenderSource::LocalParked { .. }) => {
+                return Err(format!(
+                    "remote frame for exchange {key:?} sender {sender_id} collides with a local \
+                     parked sender of the same id"
+                ));
+            }
+            Some(SenderSource::Remote { closed: true, .. }) => {
+                return Err(format!(
+                    "remote sender {sender_id} for exchange {key:?} sent frame seq {seq} after eos"
+                ));
+            }
+            Some(SenderSource::Remote {
+                names: known_names, ..
+            }) if known_names != &names => {
+                return Err(format!(
+                    "remote sender {sender_id} for exchange {key:?} changed its column names from \
+                     {known_names:?} to {names:?}"
+                ));
+            }
+            Some(SenderSource::Remote { .. }) => {}
+        }
 
-        let senders = state.sources.entry(key).or_default();
-        let source = senders
+        let source = state
+            .sources
+            .entry(key)
+            .or_default()
             .entry(sender_id)
             .or_insert_with(|| SenderSource::Remote {
-                names: names.clone(),
+                names,
                 sender_id,
                 batches: Vec::new(),
                 closed: false,
             });
         let SenderSource::Remote {
-            names: known_names,
-            batches,
-            closed,
-            ..
+            batches, closed, ..
         } = source
         else {
-            return Err(format!(
-                "remote frame for exchange {key:?} sender {sender_id} collides with a local \
-                 parked sender of the same id"
-            ));
+            unreachable!("a local sender of this id was refused above");
         };
-        if *closed {
-            return Err(format!(
-                "remote sender {sender_id} for exchange {key:?} sent frame seq {seq} after eos"
-            ));
-        }
-        if known_names != &names {
-            return Err(format!(
-                "remote sender {sender_id} for exchange {key:?} changed its column names from \
-                 {known_names:?} to {names:?}"
-            ));
-        }
         batches.extend(batch);
         *closed = eos;
-        Self::take_ready(&mut state, key.fragment_instance_id)
+        state.remote_seq.insert((key, sender_id), seq + 1);
+        Self::take_ready(&mut state, key.fragment_instance_id).map(RemoteFrame::Accepted)
     }
 
     /// Hands the receiver over, exactly once, when every expected sender of every exchange input
@@ -344,9 +411,15 @@ impl LocalExchange {
                 ReadyExchangeInput { node_id, sources }
             })
             .collect();
-        state
-            .remote_seq
-            .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
+        state.handed_over.insert(fragment_instance_id);
+        state.handed_over_order.push_back(fragment_instance_id);
+        if state.handed_over_order.len() > HANDED_OVER {
+            let oldest = state.handed_over_order.pop_front().expect("over capacity");
+            state.handed_over.remove(&oldest);
+            state
+                .remote_seq
+                .retain(|(key, _), _| key.fragment_instance_id != oldest);
+        }
         Ok(Some(ReadyFragment {
             params: receiver.params,
             inputs,
@@ -623,12 +696,14 @@ mod tests {
             exchange
                 .push_remote_frame(key, 0, 0, false, names(), Some(remote(1)))
                 .unwrap()
+                .accepted()
                 .is_none()
         );
         assert!(
             exchange
                 .push_remote_frame(key, 0, 1, false, names(), Some(remote(2)))
                 .unwrap()
+                .accepted()
                 .is_none()
         );
         assert!(
@@ -641,6 +716,7 @@ mod tests {
         let ready = exchange
             .push_remote_frame(key, 0, 2, true, names(), None)
             .unwrap()
+            .accepted()
             .expect("eos completes the sender set");
         let SenderSource::Remote {
             names: got_names,
@@ -665,20 +741,21 @@ mod tests {
             .push_remote_frame(key, 0, 0, false, names(), Some(remote(1)))
             .unwrap();
         assert!(
-            exchange
-                .push_remote_frame(key, 0, 0, false, names(), Some(remote(1)))
-                .unwrap()
-                .is_none(),
+            matches!(
+                exchange.push_remote_frame(key, 0, 0, false, names(), Some(remote(1))),
+                Ok(RemoteFrame::Duplicate)
+            ),
             "replayed data frame is dropped"
         );
         exchange
             .push_remote_frame(key, 0, 1, true, names(), None)
-            .unwrap();
+            .unwrap()
+            .accepted();
         assert!(
-            exchange
-                .push_remote_frame(key, 0, 1, true, names(), None)
-                .unwrap()
-                .is_none(),
+            matches!(
+                exchange.push_remote_frame(key, 0, 1, true, names(), None),
+                Ok(RemoteFrame::Duplicate)
+            ),
             "replayed eos frame is dropped"
         );
         let ready = exchange
@@ -712,8 +789,139 @@ mod tests {
             exchange
                 .push_remote_frame(key, 0, 0, false, names(), Some(remote(1)))
                 .unwrap()
+                .accepted()
                 .is_none()
         );
+    }
+
+    /// Each refused frame names its cause, and none of them is kept.
+    #[test]
+    fn malformed_remote_frames_are_refused() {
+        let exchange = LocalExchange::default();
+        let key = key(9, 7);
+        let refused = |result: Result<RemoteFrame, String>, cause: &str| {
+            let err = result.unwrap_err();
+            assert!(err.contains(cause), "{err}");
+        };
+        refused(
+            exchange.push_remote_frame(key, 0, 0, false, Vec::new(), Some(remote(1))),
+            "without column names",
+        );
+        refused(
+            exchange.push_remote_frame(key, 0, 0, false, names(), None),
+            "neither a batch nor eos",
+        );
+        exchange
+            .push_remote_frame(key, 0, 0, false, names(), Some(remote(1)))
+            .unwrap()
+            .accepted();
+        refused(
+            exchange.push_remote_frame(key, 0, 1, false, vec!["x".to_string()], Some(remote(2))),
+            "changed its column names",
+        );
+        exchange
+            .push_remote_frame(key, 0, 1, true, names(), None)
+            .unwrap()
+            .accepted();
+        refused(
+            exchange.push_remote_frame(key, 0, 2, false, names(), Some(remote(3))),
+            "after eos",
+        );
+        exchange.push_sender(key, 1, local(key, 1)).unwrap();
+        refused(
+            exchange.push_remote_frame(key, 1, 0, true, names(), None),
+            "collides with a local parked sender",
+        );
+    }
+
+    /// A refused frame does not advance `seq`, so the sender can resend it; it is not mistaken for
+    /// a duplicate of itself.
+    #[test]
+    fn a_refused_frame_can_be_resent() {
+        let exchange = LocalExchange::default();
+        let key = key(10, 7);
+        exchange
+            .push_remote_frame(key, 0, 0, false, vec!["x".to_string()], Some(remote(1)))
+            .unwrap()
+            .accepted();
+        assert!(
+            exchange
+                .push_remote_frame(key, 0, 1, true, names(), Some(remote(2)))
+                .is_err()
+        );
+        exchange
+            .push_remote_frame(key, 0, 1, true, vec!["x".to_string()], Some(remote(2)))
+            .unwrap()
+            .accepted();
+        let ready = exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+            .unwrap()
+            .expect("the resent eos completes the set");
+        let SenderSource::Remote { batches, .. } = &ready.inputs[0].sources[0] else {
+            panic!("expected a remote source");
+        };
+        assert_eq!(batches, &vec![remote(1), remote(2)]);
+    }
+
+    /// A local and a remote sender on one exchange complete it together.
+    #[test]
+    fn local_and_remote_senders_complete_one_exchange() {
+        let exchange = LocalExchange::default();
+        let key = key(11, 7);
+        exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 2)], params())
+            .unwrap();
+        assert!(
+            exchange
+                .push_sender(key, 0, local(key, 0))
+                .unwrap()
+                .is_none()
+        );
+        let ready = exchange
+            .push_remote_frame(key, 1, 0, true, names(), Some(remote(1)))
+            .unwrap()
+            .accepted()
+            .expect("the remote eos completes the set");
+        assert!(matches!(
+            ready.inputs[0].sources[..],
+            [
+                SenderSource::LocalParked { .. },
+                SenderSource::Remote { .. }
+            ]
+        ));
+    }
+
+    /// After the handoff, a replayed frame is still a duplicate, and new frames, senders or a
+    /// second registration of the receiver are refused instead of starting a set nobody reads.
+    #[test]
+    fn a_handed_over_receiver_refuses_late_input() {
+        let exchange = LocalExchange::default();
+        let key = key(12, 7);
+        exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+            .unwrap();
+        exchange
+            .push_remote_frame(key, 0, 0, true, names(), Some(remote(1)))
+            .unwrap()
+            .accepted()
+            .expect("handed over");
+
+        assert!(matches!(
+            exchange.push_remote_frame(key, 0, 0, true, names(), Some(remote(1))),
+            Ok(RemoteFrame::Duplicate)
+        ));
+        let already_ran = |err: String| assert!(err.contains("already ran"), "{err}");
+        already_ran(
+            exchange
+                .push_remote_frame(key, 1, 0, true, names(), Some(remote(2)))
+                .unwrap_err(),
+        );
+        already_ran(exchange.push_sender(key, 2, local(key, 2)).unwrap_err());
+        let err = exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+            .unwrap_err();
+        assert!(err.contains("duplicate receiver registration"), "{err}");
+        assert_eq!(exchange.counts(), ExchangeCounts::default());
     }
 
     fn query_key(hi: i64, instance: i64, node_id: i32) -> ExchangeKey {
@@ -787,7 +995,11 @@ mod tests {
         };
         refused(exchange.register_receiver(key.fragment_instance_id, vec![(7, 1)], params()));
         refused(exchange.push_sender(key, 0, local(key, 0)));
-        refused(exchange.push_remote_frame(key, 0, 0, true, names(), Some(remote(5))));
+        refused(
+            exchange
+                .push_remote_frame(key, 0, 0, true, names(), Some(remote(5)))
+                .map(|_| None),
+        );
         assert_eq!(exchange.counts(), ExchangeCounts::default());
         // Another query is unaffected.
         let live = query_key(44, 2, 7);
