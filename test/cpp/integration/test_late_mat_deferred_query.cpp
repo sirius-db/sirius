@@ -135,7 +135,7 @@ void generate_parquet(fs::path const& customer_dir, fs::path const& orders, fs::
   REQUIRE_FALSE(r->HasError());
 }
 
-std::vector<std::string> rows_of(duckdb::MaterializedQueryResult& r)
+std::vector<std::string> rows_of(duckdb::QueryResult& r)
 {
   std::vector<std::string> rows;
   auto r_rows = r.Collection().GetRows();
