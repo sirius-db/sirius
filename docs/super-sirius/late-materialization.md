@@ -201,9 +201,11 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   possible.
 - **A compressed chunk on a multi-GPU pin is refused.** Its decode runs on the GPU that holds
   it, against a selection that lives on the consumer's; the installer declines such a pin
-  rather than stage the selection across. (Compressed origins are refused on nullability
-  grounds today anyway, above.) A pin whose chunks have no recorded placement is refused the
-  same way, since a consumer on another GPU could not reach them.
+  rather than stage the selection across, and the query runs as an ordinary scan. (Compressed
+  origins are refused on nullability grounds today anyway, above.) A pin whose chunks have no
+  recorded placement is refused the same way, since a consumer on another GPU could not reach
+  them. `materialize_remote_batch` still refuses such a batch if one reaches it, as an internal
+  error: by then the scan has emitted rowids, so there is nothing to fall back to.
 
 ## More than one GPU
 
@@ -231,8 +233,9 @@ two small transfers to it. A remote batch forces the canonical path (per-batch s
 because the one-pass raw gather dereferences every batch from the consumer's GPU.
 
 The `[multi_gpu]`-tagged cases in `test_materialize.cpp` and `test_late_mat_deferred_query.cpp`
-exercise this with a batch pinned on GPU 1 and a consumer on GPU 0; `run_unit_tests.py`'s
-`late_mat` step runs them with every GPU visible.
+exercise this with a batch pinned on GPU 1 and a consumer on GPU 0, and the latter also pins the
+table compressed across both GPUs to show the installer declines and the query still comes back
+right; `run_unit_tests.py`'s `late_mat` step runs them with every GPU visible.
 
 ## Results
 

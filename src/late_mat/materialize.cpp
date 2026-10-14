@@ -430,9 +430,14 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
                                                        rmm::device_async_resource_ref mr)
 {
   if (source.is_compressed()) {
+    // Its decode would run on the owning GPU against a selection that lives on
+    // this one, which is why install_late_materialization declines such a pin.
+    // A batch that reaches the port anyway cannot fall back: the scan has
+    // already emitted rowids in place of values.
     throw std::runtime_error(
-      "late_mat::materialize: a compressed batch pinned on another GPU cannot be materialized; "
-      "its decode would run on the owning GPU against a selection that lives on this one");
+      "late_mat::materialize: internal error: a compressed batch pinned on another GPU reached "
+      "the port; the installer declines such pins, and the scan has already emitted rowids in "
+      "place of values so the query cannot fall back");
   }
   g_remote_batches_materialized.fetch_add(1, std::memory_order_relaxed);
   auto const& owner       = *source.memory_space;
