@@ -19,6 +19,8 @@
 #include "op/sirius_physical_union.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <string>
+
 namespace sirius::planner {
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
@@ -61,15 +63,29 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
       "UNION with fewer than two inputs is not supported on the GPU (falling back to CPU)");
   }
 
-  auto union_op = duckdb::make_uniq<sirius::op::sirius_physical_union>(
-    sirius::from_duckdb_vec(op.types), op.estimated_cardinality);
+  auto declared_types = sirius::from_duckdb_vec(op.types);
+  auto union_op =
+    duckdb::make_uniq<sirius::op::sirius_physical_union>(declared_types, op.estimated_cardinality);
 
-  for (auto& child : op.children) {
-    auto arm = create_plan(*child);
-    if (arm->get_types().size() != op.types.size()) {
+  for (duckdb::idx_t arm_index = 0; arm_index < op.children.size(); arm_index++) {
+    auto arm                  = create_plan(*op.children[arm_index]);
+    auto const& planned_types = arm->get_types();
+    if (planned_types.size() != declared_types.size()) {
       throw duckdb::NotImplementedException(
         "UNION: input column count does not match the set operation output (falling back to "
         "CPU)");
+    }
+    // Arms are forwarded unconverted, so each must plan the declared type or, below an
+    // aggregate, its `planned_aggregate_type`.
+    for (duckdb::idx_t i = 0; i < declared_types.size(); i++) {
+      if (planned_types[i] == declared_types[i]) { continue; }
+      if (planned_types[i] == sirius::from_duckdb(planned_aggregate_type(op.types[i]))) {
+        continue;
+      }
+      throw duckdb::NotImplementedException(
+        "UNION: arm " + std::to_string(arm_index) + " plans " + planned_types[i].to_string() +
+        " for column " + std::to_string(i) + " but the union declares " +
+        declared_types[i].to_string() + " (falling back to CPU)");
     }
     union_op->children.push_back(std::move(arm));
   }
