@@ -83,10 +83,13 @@ struct preparation_coordinator::state {
 
   struct job_ticket {
     std::shared_ptr<state> st;
+    std::function<std::unique_ptr<op::scan::scan_info>()> work;
     size_t index = 0;
     bool active = false, completed = false;
     ~job_ticket()
     {
+      // Also order capture release before settlement when dispatch discards the task.
+      work = {};
       if (active && !completed) st->settle(index, {});
     }
   };
@@ -532,22 +535,23 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
   auto work = source->hooks.claim();
   if (work) {
     // Workers cannot see this slot until enqueue; source registration is already frozen.
-    free->unit = work->unit;
+    free->unit   = work->unit;
+    ticket->work = std::move(work->work);
     if (before_submit) before_submit();
     {
       std::lock_guard check(gate->mutex);
       gate->check_interrupted();
     }
-    dispatcher->enqueue([ticket = std::move(ticket), work = std::move(work->work)]() mutable {
+    dispatcher->enqueue([ticket = std::move(ticket)]() mutable {
       auto& owner = *ticket->st;
       std::unique_ptr<op::scan::scan_info> value;
       try {
-        value = work();
+        value = ticket->work();
       } catch (...) {
         owner.completion->report_error(std::current_exception());
         owner.stop();
       }
-      work              = {};  // Release physical-input captures before the job ticket is returned.
+      ticket->work      = {};  // Release physical-input captures before the job ticket is returned.
       ticket->completed = true;
       owner.settle(ticket->index, std::move(value));
     });

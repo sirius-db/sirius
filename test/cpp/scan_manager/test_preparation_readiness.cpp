@@ -564,6 +564,108 @@ TEST_CASE("Preparation cancel retirement and stop bookkeeping allocate no host m
   CHECK(released == 1);
 }
 
+TEST_CASE("Rejected and abandoned job settlement allocate no host memory",
+          "[.][host_allocation_fault][preparation_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  const bool abandoned = GENERATE(false, true);
+  CAPTURE(abandoned);
+  fixture f(1, 1);
+  struct measurement {
+    std::optional<fault> counting;
+    std::thread::id owner;
+    bool control_fired = false, finished = false, same_thread = false;
+    size_t allocations = 0;
+    void arm() noexcept
+    {
+      {
+        fault control{fault::every_allocation_scope, 1};
+        try {
+          void* pointer                         = ::operator new(64);
+          *static_cast<volatile char*>(pointer) = 1;
+          ::operator delete(pointer);
+        } catch (std::bad_alloc const&) {
+          control_fired = control.fired();
+        }
+        (void)control.stop();
+      }
+      owner = std::this_thread::get_id();
+      counting.emplace(fault::every_allocation_scope, 0);
+    }
+    void finish() noexcept
+    {
+      same_thread = owner == std::this_thread::get_id();
+      if (same_thread && counting) {
+        allocations = counting->stop();
+        counting.reset();
+        finished = true;
+      }
+    }
+  };
+  auto measured = std::make_shared<measurement>();
+  auto blocked  = f.make_hold();
+  std::atomic<size_t> work_calls{0};
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({99, 1}, required);
+  REQUIRE(unit);
+  auto cleanup = f.shutdown_guard();
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [measured](auto* value) {
+      measured->finish();
+      delete value;
+    });
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+  REQUIRE(unit->complete_input(checkpoint_input{7}));
+  std::function<std::unique_ptr<sirius::op::scan::scan_info>()> work;
+  if (abandoned) {
+    struct arm_on_destroy {
+      std::shared_ptr<measurement> measured;
+      explicit arm_on_destroy(std::shared_ptr<measurement> measured) : measured(std::move(measured))
+      {
+      }
+      ~arm_on_destroy() { measured->arm(); }
+    };
+    auto token = std::make_shared<arm_on_destroy>(measured);
+    work       = [token = std::move(token), &work_calls] {
+      ++work_calls;
+      return std::make_unique<tagged>(1);
+    };
+    f.dispatcher.enqueue([blocked] { blocked->wait(); });
+    REQUIRE(blocked->await());
+  } else {
+    work = [&, measured] {
+      ++work_calls;
+      auto input = std::make_unique<tagged>(1);
+      blocked->wait();
+      measured->arm();
+      return input;
+    };
+  }
+  f.source(std::make_shared<accumulator>(1),
+           std::make_shared<sink>(),
+           single_job(std::move(work), std::move(unit)));
+  f.start();
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (f.coordinator.snapshot().wakes < 2 && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  REQUIRE(f.coordinator.snapshot().wakes >= 2);
+  if (!abandoned) REQUIRE(blocked->await());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  blocked->release();
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK_FALSE(f.completion.has_error());
+  CHECK(work_calls == (abandoned ? 0 : 1));
+  CHECK(measured->control_fired);
+  CHECK(measured->same_thread);
+  CHECK(measured->finished);
+  CHECK(measured->allocations == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
 TEST_CASE("Queue allocation failure unwinds every caller payload outside the gate",
           "[.][host_allocation_fault][preparation_allocation_fault]")
 {
