@@ -113,16 +113,21 @@ impl RuntimeFilters {
         self.lock().deferred.remove(&instance)
     }
 
-    /// Forgets everything held for `query`; its deferred scans never run.
-    pub(crate) fn purge_query(&self, query: FragmentInstanceId) -> usize {
+    /// Forgets everything held for `query`, returning its deferred scans, which never run.
+    pub(crate) fn purge_query(&self, query: FragmentInstanceId) -> Vec<DeferredScan> {
         let query_hi = query.query_hi();
         let mut state = self.lock();
         state.builds.retain(|(query, _), _| *query != query_hi);
-        let before = state.deferred.len();
-        state
+        let instances: Vec<FragmentInstanceId> = state
             .deferred
-            .retain(|instance, _| instance.query_hi() != query_hi);
-        before - state.deferred.len()
+            .keys()
+            .filter(|instance| instance.query_hi() == query_hi)
+            .copied()
+            .collect();
+        instances
+            .iter()
+            .filter_map(|instance| state.deferred.remove(instance))
+            .collect()
     }
 
     /// Scans waiting for a filter. Zero on an idle CN.
@@ -262,7 +267,7 @@ mod tests {
         filters.record_builds(instance(10, 1), vec![built(0, 13)]);
         let sites = filters.sites(instance(9, 5), &[0]);
         filters.defer(instance(9, 5), scan(sites));
-        assert_eq!(filters.purge_query(instance(9, 0)), 1);
+        assert_eq!(filters.purge_query(instance(9, 0)).len(), 1);
         assert_eq!(filters.deferred(), 0);
         assert!(filters.sites(instance(9, 5), &[0]).is_empty());
         assert_eq!(filters.sites(instance(10, 5), &[0]).len(), 1);
