@@ -1,0 +1,34 @@
+From c6789babfcc1743653292209d36b4efedfbf59fa Mon Sep 17 00:00:00 2001
+From: Matthijs Brobbel <m1brobbel@gmail.com>
+Date: Tue, 13 Oct 2026 12:17:57 +0000
+Subject: [PATCH] Fix host refinement template calls for Clang
+
+---
+ cpp/src/neighbors/refine/refine_host.hpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/cpp/src/neighbors/refine/refine_host.hpp b/cpp/src/neighbors/refine/refine_host.hpp
+index d8e9d577..2d7c5232 100644
+--- a/cpp/src/neighbors/refine/refine_host.hpp
++++ b/cpp/src/neighbors/refine/refine_host.hpp
+@@ -415,7 +415,7 @@ template <typename DC, typename IdxT, typename DataT, typename DistanceT, typena
+       for (size_t j = 0; j < refined_k; j++) {
+         indices(i, j) = std::get<1>(refined_pairs[i][j]);
+         if (distances.data_handle() != nullptr) {
+-          distances(i, j) = DC::template postprocess(std::get<0>(refined_pairs[i][j]));
++          distances(i, j) = DC::template postprocess<DistanceT>(std::get<0>(refined_pairs[i][j]));
+         }
+       }
+     }
+@@ -454,7 +454,8 @@ template <typename DC, typename IdxT, typename DataT, typename DistanceT, typena
+         for (size_t j = 0; j < refined_k; j++) {
+           indices(i, j) = std::get<1>(refined_pairs[tid][j]);
+           if (distances.data_handle() != nullptr) {
+-            distances(i, j) = DC::template postprocess(std::get<0>(refined_pairs[tid][j]));
++            distances(i, j) =
++              DC::template postprocess<DistanceT>(std::get<0>(refined_pairs[tid][j]));
+           }
+         }
+       }
+-- 
+2.53.0

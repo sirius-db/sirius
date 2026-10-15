@@ -9,11 +9,12 @@ vcpkg_from_github(
   v${VERSION}
   SHA512
   73c98310f8f2723545eba183ef4e40f531e60f62976c0306a281a8dd4da9927262982f687ec5d2ead1bf61eb224b16a991499c32474667b4785d6b2e87f2a124
-  # NVCC 13.2 miscompiles kernel pointers with std::optional parameters.
   PATCHES
+  # NVCC 13.2 miscompiles kernel pointers with std::optional parameters.
   fix-pq-kernel-optional.patch
   static-cuda-math.patch
   disable-openmp.patch
+  fix-host-refine-template-arguments.patch
   HEAD_REF
   main)
 

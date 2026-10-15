@@ -1,7 +1,7 @@
 // Layer-1 decode-side cache smoke test (plain-CUDA renderer).
 //
 // Three properties to pin down:
-//   1. `source_digest` is deterministic and hex-encoded.
+//   1. Identity encoding is covered by the host-only tests/cache suite.
 //   2. Two structurally identical rendered sources hit the same cache slot.
 //   3. A different shape gets its own slot.
 
@@ -37,19 +37,6 @@ static double timed_ms(F&& fn)
 int main()
 {
   if (cudaSetDevice(0) != cudaSuccess) return report_fail("cudaSetDevice(0) failed");
-
-  {
-    auto a = jit::source_digest("hello world");
-    auto b = jit::source_digest("hello world");
-    auto c = jit::source_digest("hello world!");
-    if (a != b) return report_fail("digest not deterministic");
-    if (a == c) return report_fail("digest collided across inputs");
-    if (a.size() != 16) return report_fail("digest length != 16", "got: " + a);
-    for (char ch : a) {
-      if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')))
-        return report_fail("digest contains non-hex char", "got: " + a);
-    }
-  }
 
   jit::CompileOptions opts;
   opts.arch_cc = jit::arch_cc_for_current_device();
