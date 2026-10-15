@@ -32,8 +32,6 @@
 #include <cudf/types.hpp>
 #include <cudf/wrappers/timestamps.hpp>
 
-#include <variant>
-
 // rmm
 #include <cuda/stream>
 

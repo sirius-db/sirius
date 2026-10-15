@@ -16,6 +16,7 @@
 
 #pragma once
 
+// TODO: Remove with the cudf port patch and CMake workaround after cudf#24173 ships.
 // cuDF 26.10 needs <variant> before its AST header.
 // clang-format off
 #include <variant>

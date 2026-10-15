@@ -26,8 +26,6 @@
 
 #include <op/scan/iceberg_equality_delete_mask.hpp>
 
-#include <variant>
-
 namespace sirius::op::scan {
 
 namespace {

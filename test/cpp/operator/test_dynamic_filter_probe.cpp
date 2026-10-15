@@ -66,7 +66,6 @@
 #include <string>
 #include <type_traits>
 #include <utility>
-#include <variant>
 #include <vector>
 
 using sirius::op::classify_membership_key;

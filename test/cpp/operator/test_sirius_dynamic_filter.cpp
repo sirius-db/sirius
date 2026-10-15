@@ -34,7 +34,6 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
-#include <variant>
 #include <vector>
 
 using sirius::op::column_ref_resolver_fn;

@@ -31,7 +31,6 @@
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
-#include <variant>
 
 namespace sirius::op {
 

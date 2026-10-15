@@ -20,8 +20,6 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 
-#include <variant>
-
 // R2a T5: RED_FEATURE after commit (b).
 #include <catch.hpp>
 #include <io/parquet_helpers.hpp>

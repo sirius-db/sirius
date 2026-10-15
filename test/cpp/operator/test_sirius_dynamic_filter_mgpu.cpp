@@ -50,7 +50,6 @@
 #include <cstdint>
 #include <memory>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace {

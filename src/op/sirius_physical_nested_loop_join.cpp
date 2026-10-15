@@ -48,7 +48,6 @@
 
 #include <cstdio>
 #include <span>
-#include <variant>
 
 namespace sirius {
 namespace op {

@@ -30,7 +30,6 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <variant>
 
 namespace sirius::op::scan {
 

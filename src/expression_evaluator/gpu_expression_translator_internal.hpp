@@ -33,8 +33,6 @@
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/types.hpp>
 
-#include <variant>
-
 // rmm
 #include <rmm/cuda_stream.hpp>
 

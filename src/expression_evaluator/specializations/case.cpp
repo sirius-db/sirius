@@ -28,8 +28,6 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/reduction.hpp>
 
-#include <variant>
-
 // standard library
 #include <ranges>
 
