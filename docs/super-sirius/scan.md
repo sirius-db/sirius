@@ -231,6 +231,18 @@ Explicit unit retirement returns registry membership, not a physical
 byte reservation. External ready snapshots, provider caches and published consumer inputs
 keep their existing ownership; preparation quiescence does not invalidate them.
 
+The normal C++ suite includes `[preparation_cleanup]`. Linux allocation-refusal
+tests are hidden and require the existing test-only interposer explicitly:
+
+```bash
+pixi run cmake --build --preset release --target sirius_host_allocation_fault
+pixi run env LD_PRELOAD="$PWD/build/release/libsirius_host_allocation_fault.so" \
+  build/release/test/cpp/sirius_unittest '[preparation_allocation_fault]'
+```
+
+This interposer checks ordinary `operator new` on the armed thread, not all native,
+aligned, device or process allocations. CI runs this hidden group separately.
+
 ### split_provider
 
 `split_provider` is concrete and composes a `gpu_ingestible` non-owningly (the operator owns the lifetime; the provider is always torn down first by `reset(query_id)`). Its `has_more_splits` / `next_split_provider` delegate to the ingestible. The standalone `run(scheduler, on_split)` path enqueues one task per claimed metadata unit; the connector is closed (with any captured exception) when the last enqueued task drops its reference to the shared completion state.
