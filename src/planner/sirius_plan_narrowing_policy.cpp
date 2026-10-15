@@ -390,8 +390,11 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
     case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN: {
       if (op.children.size() != 2) { break; }
       auto const& join = op.Cast<sirius::op::sirius_physical_hash_join>();
-      auto lhs         = child_maps[0];
-      auto rhs         = child_maps[1];
+      // A probe-accumulate join folds native probe values into its aggregates, so no carrier
+      // may cross it: take the default boundary-restore path.
+      if (join.accumulate) { break; }
+      auto lhs = child_maps[0];
+      auto rhs = child_maps[1];
       // Key columns are restored below the join before the output mapping, so they leave the map
       // with a boundary restore and can never earn transport through the join output.
       auto mark_keys = [&state](sirius::ast::node const* condition_side, carried_columns& side) {
