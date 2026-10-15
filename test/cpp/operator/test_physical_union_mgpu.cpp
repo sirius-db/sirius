@@ -163,7 +163,7 @@ void require_distinct_union_counts(fs::path const& yaml, fs::path const& tmp)
     auto rows = con.Query("SELECT count(*) FROM (" + query + ") t;");
     REQUIRE(rows);
     REQUIRE_FALSE(rows->HasError());
-    REQUIRE(rows->GetValue(0, 0).GetValue<int64_t>() == expected);
+    REQUIRE(rows->Collection().GetValue(0, 0).GetValue<int64_t>() == expected);
   };
   require_count(union_of({wide, narrow}, "UNION"), 100000 + 1000 - 1);
   require_count(union_of({wide, middle, narrow}, "UNION"), 100000 + 200000 + 1000 - 2);
