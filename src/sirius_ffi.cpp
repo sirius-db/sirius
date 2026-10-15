@@ -305,7 +305,8 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
 std::unique_ptr<DirectExchange> Context::direct_exchange() const
 {
   if (!impl_->exchange) { return nullptr; }
-  return std::make_unique<DirectExchange>(impl_->exchange);
+  // Not make_unique: the constructor is private to Context.
+  return std::unique_ptr<DirectExchange>(new DirectExchange(impl_->exchange));
 }
 
 DirectExchange::DirectExchange(std::shared_ptr<sirius::exec::direct_exchange> exchange)
