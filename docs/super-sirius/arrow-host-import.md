@@ -18,7 +18,7 @@ device memory resource. The caller selects the device and ensures the stream and
 resource belong to that device. Every device buffer request uses that resource;
 the helper never switches the current global resource or chooses a reservation.
 It synchronizes its stream before successful return, including before final table
-construction. Recoverable failures drain the stream before propagating the
+construction. Recoverable post-enqueue failures drain the stream before propagating the
 original exception.
 
 The caller retains complete ArrowArray/ArrowSchema roots, their pointer arrays,

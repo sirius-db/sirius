@@ -119,7 +119,7 @@ class arrow_host_import_plan {
   const std::vector<logical_type>& types,
   std::pmr::memory_resource& host_resource);
 
-/** Copy a checked plan on the caller-selected device/stream/resource. Completes its stream
+/** Copy a checked plan on the caller-selected device/stream/resource. Completes work it enqueues
  * before returning or propagating an exception; never releases the borrowed producer roots.
  * A moved-from plan must not be imported. No device or query reservation is chosen here.
  * If stream draining fails, the caller must retain the plan/roots and treat that CUDA failure
