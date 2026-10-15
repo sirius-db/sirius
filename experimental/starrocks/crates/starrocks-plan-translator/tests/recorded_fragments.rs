@@ -2,7 +2,8 @@
 //!
 //! The fixtures under `tests/fixtures/` are `TExecPlanFragmentParams` in thrift binary protocol,
 //! re-encoded from `SIRIUS_CN_DUMP_FRAGMENTS` dumps by `tests/fixtures/debug_to_thrift.py`.
-//! Each directory holds the fragments of one recorded query.
+//! Each directory holds one recorded query's fragments, or the fragments of the queries one
+//! change unblocked.
 
 use starrocks_plan_translator::{ExchangeInput, PlanTranslator, TranslateError, TranslatedPlan};
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
@@ -13,6 +14,9 @@ use thrift::protocol::{TBinaryInputProtocol, TSerializable};
 /// (file scan, partial SUM, HASH_PARTITIONED sink on `region`), a merge fragment (EXCHANGE 2,
 /// merge SUM, UNPARTITIONED sink) and a gather fragment (EXCHANGE 4, result sink).
 const TWO_CN_GROUP_BY: &str = "2cn-files-group-by";
+/// Two-phase aggregation fragments that used to fail with "two-phase aggregation supports SUM
+/// only".
+const TWO_PHASE_AGG: &str = "tpch-sf1000-two-phase-agg";
 
 /// Reads a recorded fragment from a fixture directory.
 fn load(dir: &str, name: &str) -> TExecPlanFragmentParams {
@@ -110,4 +114,72 @@ fn group_by_gather_reads_the_exchange() {
     assert!(function_names(&plan).is_empty());
     assert_eq!(stream_types(&plan, 4), ["VARCHAR", "BIGINT"]);
     assert_eq!(plan.output_partition_columns, None);
+}
+
+/// q13's merge fragment (SORT <- AGG merge count <- EXCHANGE) sums the partial counts.
+#[test]
+fn q13_merge_count_sums_partial_counts() {
+    let plan = translate(TWO_PHASE_AGG, "q13-merge").unwrap();
+    let names = function_names(&plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+    assert!(!names.contains(&"count".to_string()), "{names:?}");
+    // c_count (key) and the partial count(*), both BIGINT.
+    assert_eq!(stream_types(&plan, 10), ["BIGINT", "BIGINT"]);
+}
+
+/// q04's and q21's merge fragments also sum partial counts. Their partial fragments still fail
+/// earlier, on a RIGHT SEMI (q04, q21) and RIGHT ANTI (q21) hash join, so they have no fixture.
+#[test]
+fn q04_and_q21_merge_count_sums_partial_counts() {
+    for (name, exchange) in [("q04-merge", 9), ("q21-merge", 25)] {
+        let plan = translate(TWO_PHASE_AGG, name).unwrap();
+        let names = function_names(&plan);
+        assert!(names.contains(&"sum".to_string()), "{name}: {names:?}");
+        assert!(!names.contains(&"count".to_string()), "{name}: {names:?}");
+        assert_eq!(
+            stream_types(&plan, exchange),
+            ["VARCHAR", "BIGINT"],
+            "{name}"
+        );
+    }
+}
+
+/// q13's partial fragment counts orders per customer (one-phase), then partially counts
+/// customers per order count.
+#[test]
+fn q13_partial_count_translates() {
+    let plan = translate(TWO_PHASE_AGG, "q13-partial").unwrap();
+    let names = function_names(&plan);
+    assert!(names.contains(&"count".to_string()), "{names:?}");
+}
+
+/// q02's merge fragment re-applies MIN to the partial minimums, which cross the exchange as
+/// DECIMAL(15,2) like the input.
+#[test]
+fn q02_merge_min_translates() {
+    let plan = translate(TWO_PHASE_AGG, "q02-merge").unwrap();
+    let names = function_names(&plan);
+    assert!(names.contains(&"min".to_string()), "{names:?}");
+    assert_eq!(stream_types(&plan, 15), ["INTEGER", "DECIMAL(15,2)"]);
+}
+
+/// q02's partial fragment joins and partially aggregates MIN(ps_supplycost) per part.
+#[test]
+fn q02_partial_min_translates() {
+    let plan = translate(TWO_PHASE_AGG, "q02-partial").unwrap();
+    let names = function_names(&plan);
+    assert!(names.contains(&"min".to_string()), "{names:?}");
+}
+
+/// q15's global MAX over the per-supplier revenue: a partial MAX above a merge SUM in one
+/// fragment. The merge MAX fragment never reached the CN in the recorded run (the FE stopped
+/// deploying once this one failed), so it has no fixture.
+#[test]
+fn q15_partial_max_translates() {
+    let plan = translate(TWO_PHASE_AGG, "q15-partial-max").unwrap();
+    let names = function_names(&plan);
+    assert!(names.contains(&"max".to_string()), "{names:?}");
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+    // supplier key and the partial revenue sum, a DECIMAL128(38,4) lowered to FP64.
+    assert_eq!(stream_types(&plan, 8), ["INTEGER", "DOUBLE"]);
 }
