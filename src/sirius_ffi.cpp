@@ -52,6 +52,8 @@
 
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <chrono>
 #include <cstdlib>
 #include <map>
@@ -571,7 +573,10 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_direct(std::uint64_t
 void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)
 {
   impl_->require_built("push_received()");
-  auto& exchange       = impl_->ctx.require_exchange();
+  auto& exchange = impl_->ctx.require_exchange();
+  // The batch's writer event is created on the current device and recorded on a slab stream, and
+  // the table is freed into the slab, so both happen on the slab's device.
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{exchange.region().device}};
   const auto& declared = impl_->fragment->input_spec(stream_id);
   auto table           = exchange.take(token);
   check_declared_schema(declared, table->view(), stream_id, "received batch");
