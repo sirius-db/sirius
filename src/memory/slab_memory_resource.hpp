@@ -50,6 +50,8 @@ struct slab_region {
  * The slab is the capacity rounded down to 2 MiB, taken whole when the pool is built; the pool
  * never grows.
  */
+/// A factory for a pool over one cudaMalloc of the space's capacity rounded up to 2 MiB. The
+/// factory throws on a capacity below 2 MiB.
 [[nodiscard]] cucascade::memory::DeviceMemoryResourceFactoryFn make_slab_pool_factory();
 
 /// The slab behind @p gpu's allocator, or nullopt unless make_slab_pool_factory built it.

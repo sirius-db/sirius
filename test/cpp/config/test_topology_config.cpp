@@ -182,6 +182,24 @@ TEST_CASE("sirius_config selects the slab pool on both GPU memory paths", "[gpu_
   CHECK(sirius::memory::find_slab(gpu).has_value());
 }
 
+TEST_CASE("a slab space below 2 MiB fails to build", "[gpu_allocator][config]")
+{
+  scoped_yaml yaml("sirius_small_slab.yaml",
+                   "sirius:\n"
+                   "  space:\n"
+                   "    gpu:\n"
+                   "      - device_id: 0\n"
+                   "        memory_capacity: 1MiB\n"
+                   "        allocator: slab\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+  auto const& config =
+    std::get<cucascade::memory::gpu_memory_space_config>(cfg.get_memory_space_configs().front());
+  CHECK_THROWS_WITH(cucascade::memory::memory_space(config),
+                    Catch::Matchers::ContainsSubstring("below 2 MiB"));
+}
+
 TEST_CASE("sirius_config rejects an unknown GPU allocator", "[gpu_allocator][config]")
 {
   auto const text = GENERATE(as<std::string>{},

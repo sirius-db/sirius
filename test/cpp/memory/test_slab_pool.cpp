@@ -42,15 +42,15 @@ namespace {
 
 using cucascade::memory::memory_space;
 
-// Not a multiple of 2 MiB, so the slab is 1 MiB smaller than the space's capacity.
+// Not a multiple of 2 MiB, so the slab is 1 MiB larger than the space's capacity.
 constexpr std::size_t capacity = std::size_t{65} << 20;
 
 cucascade::memory::gpu_memory_space_config gpu_config(
-  cucascade::memory::DeviceMemoryResourceFactoryFn factory)
+  cucascade::memory::DeviceMemoryResourceFactoryFn factory, std::size_t bytes = capacity)
 {
   cucascade::memory::gpu_memory_space_config config;
   config.device_id              = 0;
-  config.memory_capacity        = capacity;
+  config.memory_capacity        = bytes;
   config.per_stream_reservation = false;
   config.mr_factory_fn          = std::move(factory);
   return config;
@@ -69,7 +69,7 @@ TEST_CASE("the slab backs cuDF allocations and outlives its pool", "[slab_pool]"
     slab = sirius::memory::find_slab(*manager.get_memory_space(cucascade::memory::Tier::GPU, 0));
     REQUIRE(slab.has_value());
     CHECK(slab->device == 0);
-    CHECK(slab->len == rmm::align_down(capacity, std::size_t{2} << 20));
+    CHECK(slab->len == rmm::align_up(capacity, std::size_t{2} << 20));
 
     rmm::cuda_stream stream;
     auto const column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
@@ -92,6 +92,12 @@ TEST_CASE("find_slab finds nothing behind the default async pool", "[slab_pool]"
 {
   memory_space gpu(gpu_config(nullptr));
   CHECK_FALSE(sirius::memory::find_slab(gpu).has_value());
+}
+
+TEST_CASE("the slab pool refuses a capacity below 2 MiB", "[slab_pool]")
+{
+  CHECK_THROWS_WITH(memory_space(gpu_config(sirius::memory::make_slab_pool_factory(), 1 << 20)),
+                    Catch::Matchers::ContainsSubstring("below 2 MiB"));
 }
 
 TEST_CASE("the slab pool keeps the async pool's reservation accounting", "[slab_pool]")
@@ -118,10 +124,15 @@ TEST_CASE("the defragmenter rethrows a slab pool OOM without retrying", "[slab_p
   memory_space gpu(gpu_config(sirius::memory::make_slab_pool_factory()));
   auto const stream = gpu.acquire_stream();
 
-  // Within the space's capacity but larger than the slab, so the pool itself fails.
+  // The slab's free space is split into 2 and 24 MiB, so 24.5 MiB is within the space's capacity
+  // (40 + 24.5 <= 65 MiB) but fits no block, and the pool itself fails.
+  std::optional<rmm::device_buffer> front{
+    std::in_place, std::size_t{2} << 20, stream, gpu.get_default_allocator()};
+  rmm::device_buffer const middle(std::size_t{40} << 20, stream, gpu.get_default_allocator());
+  front.reset();
   std::exception_ptr oom;
   try {
-    rmm::device_buffer buffer(capacity, stream, gpu.get_default_allocator());
+    rmm::device_buffer buffer((std::size_t{49} << 20) / 2, stream, gpu.get_default_allocator());
   } catch (cucascade::memory::cucascade_out_of_memory const& e) {
     // Not CHECK(a == b): Catch would print MemoryError through std::error_code, and cuCascade
     // does not export the make_error_code that needs.

@@ -86,8 +86,10 @@ cucascade::memory::DeviceMemoryResourceFactoryFn make_slab_pool_factory()
             std::size_t capacity) -> ::cuda::mr::any_resource<::cuda::mr::device_accessible> {
     // memory_space calls the factory without setting the device.
     rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
-    auto const len = rmm::align_down(capacity, slab_granularity);
-    RMM_EXPECTS(len > 0, "slab pool capacity is below 2 MiB");
+    RMM_EXPECTS(capacity >= slab_granularity, "slab pool capacity is below 2 MiB");
+    // Rounded up, so the pool holds all the capacity the space's reservations can promise. A
+    // cudaMalloc this large is backed by whole 2 MiB pages anyway.
+    auto const len = rmm::align_up(capacity, slab_granularity);
     return rmm::mr::pool_memory_resource(slab_upstream{device, len}, len, len);
   };
 }
