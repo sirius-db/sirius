@@ -97,8 +97,6 @@ class SIRIUS_FFI_EXPORT Context {
 /// accessors throws.
 class SIRIUS_FFI_EXPORT DirectExchange {
  public:
-  explicit DirectExchange(std::shared_ptr<sirius::exec::direct_exchange> exchange);
-
   /// The CUDA device and address range of the slab every buffer lies in.
   [[nodiscard]] int device() const noexcept;
   [[nodiscard]] std::uintptr_t region_base() const noexcept;
@@ -120,7 +118,11 @@ class SIRIUS_FFI_EXPORT DirectExchange {
   [[nodiscard]] std::size_t outstanding() const;
 
  private:
+  explicit DirectExchange(std::shared_ptr<sirius::exec::direct_exchange> exchange);
+
   std::shared_ptr<sirius::exec::direct_exchange> exchange_;
+
+  friend class Context;
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
