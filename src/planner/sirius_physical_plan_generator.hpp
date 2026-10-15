@@ -66,6 +66,10 @@ class LogicalCTERef;
 
 namespace sirius::planner {
 
+/// Output columns of @p op proven to form a unique key, or an empty set when uniqueness cannot be
+/// proven. Shared by the join planner and the probe-accumulate detection.
+std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOperator& op);
+
 /// Attribution attached to every scan contract created by one plan build.
 /// Execution-time plans carry a window id; plans built before an execution
 /// window carry a non-zero planning/finalize generation instead.
@@ -224,6 +228,12 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
+    duckdb::LogicalAggregate& op);
+
+  //! Fuse `GROUP BY <join key>` MIN/MAX/COUNT over an INNER join with a unique build side into a
+  //! probe-accumulate hash join plus its emit operator. Returns null, leaving the logical tree
+  //! untouched, when the pattern or the `enable_probe_accumulate` setting does not apply.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_probe_accumulate(
     duckdb::LogicalAggregate& op);
 
   // Sirius reads and projects nested (STRUCT/LIST/MAP) columns but cannot operate

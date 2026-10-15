@@ -791,6 +791,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   }
 
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
+  if (auto fused = try_plan_probe_accumulate(op)) { return fused; }
 
   // Resolved before the child is planned: planning moves expressions out of the logical subtree.
   auto const decimal_sum_bounds = decimal_sum_stats_bound_enabled(context)

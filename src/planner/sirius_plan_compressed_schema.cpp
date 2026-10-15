@@ -340,6 +340,9 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
     case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN: {
       if (slot->children.size() != 2) { break; }
       auto& join = slot->Cast<sirius::op::sirius_physical_hash_join>();
+      // A probe-accumulate join folds native probe values into its aggregates, so no carrier
+      // may cross it: take the default boundary-restore path.
+      if (join.accumulate) { break; }
       std::unordered_set<std::size_t> left_keys;
       std::unordered_set<std::size_t> right_keys;
       for (auto const& condition : join.conditions) {
