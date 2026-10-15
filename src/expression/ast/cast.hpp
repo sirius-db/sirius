@@ -55,6 +55,10 @@ struct cast {
   /// A cast's result type is its target type.
   [[nodiscard]] sirius::logical_type const& return_type() const noexcept { return target_type; }
 
+  /// Whether evaluation lowers this cast to one cuDF AST CAST_TO_* op. Only semantic casts that
+  /// cannot round or overflow do; see sirius::cast_lowers_to_cudf_ast.
+  [[nodiscard]] bool lowers_to_cudf_ast() const;
+
   std::size_t cudf_ast_op_count() const;
 };
 
