@@ -42,9 +42,9 @@ namespace {
 
 // Overlapping keys between a and b (k = 3) so multiset semantics are observable, a disjoint third
 // table for N-ary chains, an empty table, and a BIGINT-keyed table for super-type reconciliation.
-class UnionAllFixture : public sirius::test::GpuExecutionFixture {
+class UnionFixture : public sirius::test::GpuExecutionFixture {
  public:
-  UnionAllFixture()
+  UnionFixture()
   {
     run_ok("CREATE TABLE ua (k INTEGER, v VARCHAR);");
     run_ok("CREATE TABLE ub (k INTEGER, v VARCHAR);");
@@ -80,9 +80,9 @@ class UnionAllFixture : public sirius::test::GpuExecutionFixture {
 
 }  // namespace
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL two arms",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   compare_gpu_vs_cpu("SELECT k, v FROM ua UNION ALL SELECT k, v FROM ub");
   compare_gpu_vs_cpu("SELECT k FROM ua UNION ALL SELECT k FROM ub");
@@ -90,9 +90,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   compare_gpu_vs_cpu("SELECT k, v FROM ub UNION ALL SELECT k, v FROM ua");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL is a multiset, not a set",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // (3, 'c') is in both inputs and must survive twice: the count is what catches de-duplication.
   compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT k, v FROM ua UNION ALL SELECT k, v FROM ub) t");
@@ -102,9 +102,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   compare_gpu_vs_cpu("SELECT k, v FROM ua UNION ALL SELECT k, v FROM ua");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL with an empty arm",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // An empty arm's pipeline finishes without pushing a batch, so the operator must fall through
   // to the other arm rather than reporting exhausted. The base's all-ports readiness test can
@@ -114,9 +114,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   compare_gpu_vs_cpu("SELECT k FROM uempty UNION ALL SELECT k FROM uempty");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL is N-ary",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // At the pinned DuckDB a chain binds to ONE set-operation node with N children rather than a
   // left-deep tree of binary nodes, which is why the operator loops over children.
@@ -131,9 +131,9 @@ TEST_CASE_METHOD(UnionAllFixture,
     "SELECT k FROM uc UNION ALL SELECT k FROM ua");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL arms of unequal length",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // A row-count check on asymmetric inputs, and no more than that. Arm stranding needs an arm
   // with a second batch to strand, which the shared 100 MB scan_task_batch_size cannot produce:
@@ -143,9 +143,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   compare_gpu_vs_cpu("SELECT k FROM uc UNION ALL SELECT k FROM ua");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL reconciles types in the binder",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // INTEGER + BIGINT reconcile to BIGINT; the cast is already a projection inside the INTEGER arm.
   compare_gpu_vs_cpu("SELECT k FROM ua UNION ALL SELECT k FROM uwide");
@@ -154,9 +154,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   compare_gpu_vs_cpu("SELECT k FROM ua UNION ALL SELECT 999");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION over HUGEINT aggregates narrowed to BIGINT",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // DuckDB types sum(INTEGER) as HUGEINT and the union declares that, but each GPU arm plans the
   // aggregate as BIGINT, so the union's declared type and its arms' planned type differ.
@@ -167,9 +167,9 @@ TEST_CASE_METHOD(UnionAllFixture,
     "SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub ORDER BY s");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL preserves NULLs",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // Bag union has no key and no comparison, so a NULL must be forwarded, not dropped or coalesced.
   compare_gpu_vs_cpu("SELECT k, v FROM ua UNION ALL SELECT k, v FROM ub");
@@ -177,9 +177,9 @@ TEST_CASE_METHOD(UnionAllFixture,
     "SELECT count(*) FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t WHERE k IS NULL");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL composes with downstream operators",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // Aggregate downstream: UNION becomes a pipeline sink under the group-by's hash PARTITION,
   // which is the is_sink() == true shape.
@@ -206,9 +206,9 @@ TEST_CASE_METHOD(UnionAllFixture,
     "SELECT a.k, a.v FROM ua a JOIN (SELECT k FROM ub UNION ALL SELECT k FROM uc) t ON a.k = t.k");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL nested inside another UNION ALL arm",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // An arm whose own subtree is a UNION: the inner and outer passthrough sinks must not collide,
   // since port names are per-operator.
@@ -223,9 +223,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   compare_gpu_vs_cpu("SELECT k FROM (SELECT k FROM ua GROUP BY k) g UNION ALL SELECT k FROM ub");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL over a narrowed scan",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // The compressed-schema pass treats UNION as a native carrier boundary and restores every arm,
   // so two arms never present different carriers for one logical column. uwide.k is BIGINT with
@@ -250,9 +250,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   REQUIRE_FALSE(con->Query("CALL unpin_table('uwide');")->HasError());
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution declines the rest of the set-operation family",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // EXCEPT and INTERSECT must leave the GPU path cleanly via a fallback -- not error, and not
   // silently produce a bag union. Both are refused during plan generation (the generator switch),
@@ -262,9 +262,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution keeps a non-recursive WITH RECURSIVE UNION on the CPU",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union]")
 {
   // With no self-reference the binder plans a bare distinct UNION with no DISTINCT above it, so the
   // set-operation builder's refusal is all that stands between this query and duplicate rows.
@@ -288,9 +288,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   REQUIRE(count->GetValue(0, 0).GetValue<int64_t>() == 5);
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL over a materialized CTE arm",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // Regression for the arity guard in sirius_plan_set_operation.cpp, which reads the arm's
   // physical `types`. Before DuckDB v2 a materialized CTE declared its materialization side, so an
@@ -336,9 +336,9 @@ TEST_CASE_METHOD(UnionAllFixture,
     "SELECT k FROM m");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution distinct UNION deduplicates across arms",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union]")
 {
   // (3, 'c') is in both ua and ub, so each of these has a row to drop.
   compare_gpu_vs_cpu("SELECT k, v FROM ua UNION SELECT k, v FROM ub");
@@ -356,9 +356,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT k, v FROM ua UNION SELECT k, v FROM ub) t");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution distinct UNION as an arm of UNION ALL",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union][union_all]")
 {
   // The arm's root is the DISTINCT's merge, an unconditional sink feeding a passthrough sink.
   compare_gpu_vs_cpu("(SELECT k FROM ua UNION SELECT k FROM ub) UNION ALL SELECT k FROM ua");
@@ -367,9 +367,9 @@ TEST_CASE_METHOD(UnionAllFixture,
     "UNION ALL SELECT k FROM ua) t");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution distinct UNION reconciles types and keeps NULL",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union]")
 {
   compare_gpu_vs_cpu("SELECT k FROM ua UNION SELECT k FROM uwide");
   compare_gpu_vs_cpu("SELECT k FROM ua UNION SELECT 3");
@@ -377,9 +377,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   compare_gpu_vs_cpu("SELECT k FROM ua UNION SELECT k FROM ua");
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution distinct UNION over a narrowed scan",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union]")
 {
   // As in the UNION ALL case above: the narrowed arm is restored at the union, below the DISTINCT.
   auto pin = con->Query("CALL pin_table(format='duckdb', name='uwide', tier='gpu');");
@@ -395,9 +395,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   REQUIRE_FALSE(con->Query("CALL unpin_table('uwide');")->HasError());
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution distinct UNION over identical arms",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union]")
 {
   // DuckDB's common-subplan pass turns a subplan of two or more operators repeated across the arms
   // into a materialized CTE under the DISTINCT. Fail loudly if it stops doing so.
@@ -406,9 +406,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   compare_gpu_vs_cpu(query);
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution distinct UNION over a shared subplan whose definition is wider",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union]")
 {
   // The CTE's definition is (v VARCHAR, k INTEGER) and its body one INTEGER column, so a
   // compressed-schema pass that read the definition would give column 0 a STRING carrier. The pin
@@ -430,9 +430,9 @@ TEST_CASE_METHOD(UnionAllFixture,
   REQUIRE_FALSE(con->Query("CALL unpin_table('ua');")->HasError());
 }
 
-TEST_CASE_METHOD(UnionAllFixture,
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution distinct UNION over HUGEINT aggregates narrowed to BIGINT",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union]")
 {
   // The DISTINCT groups on the union's declared HUGEINT over arms planned as BIGINT.
   compare_gpu_vs_cpu("SELECT sum(k) FROM ua UNION SELECT sum(k) FROM ub");
@@ -477,7 +477,7 @@ class UnionFloatFixture : public sirius::test::GpuExecutionFixture {
 
 TEST_CASE_METHOD(UnionFloatFixture,
                  "gpu_execution distinct UNION groups NaN and signed zero across arms",
-                 "[integration][gpu_execution][union_all]")
+                 "[integration][gpu_execution][union]")
 {
   // Either engine may keep either member of a pair, so the rows compare canonicalized and the
   // count compares exactly.

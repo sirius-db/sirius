@@ -191,7 +191,7 @@ std::map<int, size_t> run_and_collect(fs::path const& yaml, std::string const& q
 }  // namespace
 
 TEST_CASE("physical_union - unequal arms drain across many batches",
-          "[single-gpu][operator-mgpu][union_all][gpu_execution]")
+          "[single-gpu][operator-mgpu][union][union_all][gpu_execution]")
 {
   auto tmp  = make_tmp_dir("unequal-1gpu");
   auto yaml = tmp / "mgpu.yaml";
@@ -224,7 +224,7 @@ TEST_CASE("physical_union - unequal arms drain across many batches",
 }
 
 TEST_CASE("physical_union - three arms of descending width",
-          "[single-gpu][operator-mgpu][union_all][gpu_execution]")
+          "[single-gpu][operator-mgpu][union][union_all][gpu_execution]")
 {
   auto tmp  = make_tmp_dir("three-arm-1gpu");
   auto yaml = tmp / "mgpu.yaml";
@@ -258,7 +258,7 @@ TEST_CASE("physical_union - three arms of descending width",
 }
 
 TEST_CASE("physical_union - balanced arms distribute across two GPUs",
-          "[mgpu][operator-mgpu][union_all][gpu_execution][multi_gpu]")
+          "[mgpu][operator-mgpu][union][union_all][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -285,7 +285,7 @@ TEST_CASE("physical_union - balanced arms distribute across two GPUs",
 }
 
 TEST_CASE("physical_union - unequal arms do not strand work on one GPU",
-          "[mgpu][operator-mgpu][union_all][gpu_execution][multi_gpu]")
+          "[mgpu][operator-mgpu][union][union_all][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -314,7 +314,7 @@ TEST_CASE("physical_union - unequal arms do not strand work on one GPU",
 }
 
 TEST_CASE("physical_union - distinct UNION dedups across many batches",
-          "[single-gpu][operator-mgpu][union_all][gpu_execution]")
+          "[single-gpu][operator-mgpu][union][gpu_execution]")
 {
   auto tmp  = make_tmp_dir("distinct-1gpu");
   auto yaml = tmp / "mgpu.yaml";
@@ -328,7 +328,7 @@ TEST_CASE("physical_union - distinct UNION dedups across many batches",
 }
 
 TEST_CASE("physical_union - distinct UNION dedups across many batches on two GPUs",
-          "[mgpu][operator-mgpu][union_all][gpu_execution][multi_gpu]")
+          "[mgpu][operator-mgpu][union][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
