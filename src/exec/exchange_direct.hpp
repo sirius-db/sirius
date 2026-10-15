@@ -138,6 +138,7 @@ class direct_exchange {
   /// Frees what @p token holds; an unknown or consumed token is ignored.
   void release(std::uint64_t token);
 
+  /// Tokens neither released nor consumed.
   [[nodiscard]] std::size_t outstanding() const;
 
   /// Frees every token. Later calls throw, except close() and the accessors.

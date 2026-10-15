@@ -56,8 +56,10 @@ namespace {
 static_assert(std::endian::native == std::endian::little, "the direct layout is little-endian");
 
 constexpr std::array<char, 4> magic{'S', 'X', 'D', '1'};
-constexpr std::size_t min_column_bytes = 13;
-constexpr std::size_t alignment        = 256;
+// The fixed part of a column above: type_id, scale, null_count and has_mask.
+constexpr std::size_t min_column_bytes = 3 * sizeof(std::int32_t) + sizeof(std::uint8_t);
+// The per-allocation rounding the reservation tracker charges.
+constexpr std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
 
 void require(bool ok, std::string_view what)
 {
