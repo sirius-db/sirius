@@ -43,9 +43,6 @@ struct arrow_batch {
     if (array.release != nullptr) { array.release(&array); }
     if (schema.release != nullptr) { schema.release(&schema); }
   }
-
-  [[nodiscard]] std::uintptr_t array_addr() { return reinterpret_cast<std::uintptr_t>(&array); }
-  [[nodiscard]] std::uintptr_t schema_addr() { return reinterpret_cast<std::uintptr_t>(&schema); }
 };
 
 /// The first record batch of `sql`, run on a plain DuckDB (no Sirius).

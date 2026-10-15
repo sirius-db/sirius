@@ -910,3 +910,31 @@ TEST_CASE("arrow_host_import: immutable plans import on independent worker strea
     REQUIRE(left.second[row] == (row % 2 == 0));
   }
 }
+
+TEST_CASE("arrow_host_import: decimal payload overflow is refused before device allocation",
+          "[arrow_host_import]")
+{
+  for (const auto precision : {5, 9, 10, 18, 19, 38}) {
+    CAPTURE(precision);
+    auto batch =
+      arrow_batch_from_sql("SELECT 0::DECIMAL(" + std::to_string(precision) + ",2) AS d");
+    auto& child = *batch->array.children[0];
+    scoped_restore guard(child);
+    const auto* validity = child.buffers[0];
+    __int128_t limit     = 1;
+    for (int digit = 0; digit < precision; ++digit) {
+      limit *= 10;
+    }
+    import_test_resource observed;
+    for (auto value : {limit, -limit}) {
+      const void* buffers[] = {validity, &value};
+      child.buffers         = buffers;
+      REQUIRE_THROWS_WITH(import(*batch,
+                                 {"d"},
+                                 declared({duckdb::LogicalType::DECIMAL(precision, 2)}),
+                                 rmm::device_async_resource_ref{observed}),
+                          ContainsSubstring("outside its declared precision"));
+      REQUIRE(observed.counts->attempts == 0);
+    }
+  }
+}
