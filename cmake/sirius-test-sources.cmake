@@ -233,6 +233,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
     test/cpp/planner/test_scan_column_origin.cpp
+    test/cpp/planner/test_join_key_nullability.cpp
     test/cpp/planner/test_scan_filter_projection.cpp
     test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
