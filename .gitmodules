@@ -10,8 +10,8 @@
 	branch = v2
 [submodule "cucascade"]
 	path = cucascade
-	url = https://github.com/kevkrist/cuCascade.git
-	branch = pr1834-allocation-accounting
+	url = https://github.com/NVIDIA/cuCascade.git
+	branch = main
 [submodule ".claude/claude-tools"]
 	path = .claude/claude-tools
 	url = https://github.com/sirius-db/claude-tools.git

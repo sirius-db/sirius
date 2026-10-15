@@ -57,10 +57,7 @@ bool pushdown_request::selects_rows() const noexcept
 
 namespace {
 
-// Streams (decode lanes) per decode call for cross-column parallelism. Work is submitted from the
-// calling thread so cuCascade memory-reservation tracking (attached to the calling thread) sees all
-// allocations. 4 is not a configuration parameter — it matches the typical SM occupancy sweet spot
-// for column-parallel decode without thread-spawn overhead.
+// Lane submission stays on the calling host thread for per-thread reservation accounting.
 constexpr std::size_t kDecodeStreams = 4;
 
 //===----------------------------------------------------------------------===//
@@ -421,8 +418,7 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   sirius::codegen::scan_filter_result result;
   auto table =
     simpatico::decompress_scan_filter(chunk, selected, wave_request, result, lanes, stream, mr);
-  // The decode's work has completed; re-point the selection buffers to `stream` so their teardown
-  // follows the batch's ordering.
+  // Rebind selection buffers so their deallocation follows the caller's stream ordering.
   result.set_stream(stream);
   // row_filtered only when the decode carried every conjunct of the scan's own filter: a partially
   // applied request must leave the batch untagged so the scan evaluates the residual (re-checking
@@ -505,13 +501,8 @@ decompression_pushdown_scan::with_membership_probes(
 std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::for_chunk(
   simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const
 {
-  // An in-place equality answer is only worth asking for where the plan can
-  // resolve the predicate without materialising the column (a dictionary root);
-  // pushing it into any other plan is correct but only moves the comparison.
-  // Critically, non-dictionary BOOL8 requests cause the fused decode path to
-  // reject row filtering, which was measured as an +83 % throughput regression
-  // on fusion-enabled plans. Stripping equals_any here therefore applies on both
-  // the device and host conversion paths.
+  // Non-dictionary BOOL8 requests disable fused row filtering, so retain only dictionary
+  // predicates.
   auto narrowed  = _request;
   bool any_asked = false;
   for (std::size_t i = 0; i < narrowed.columns.size(); ++i) {
@@ -594,13 +585,15 @@ decompression_pushdown_scan::compaction_forecast decompression_pushdown_scan::fo
 // Entry point
 //===----------------------------------------------------------------------===//
 
-decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
-                                   std::span<const std::size_t> selected,
-                                   decompression_pushdown_scan const* scan,
-                                   decode_visibility_mask const& keep_mask,
-                                   cucascade::memory::memory_space const& space,
-                                   ::cuda::stream_ref stream,
-                                   rmm::device_async_resource_ref mr)
+decompress_result decompress_chunk(
+  simpatico::compressed_table const& chunk,
+  std::span<const std::size_t> selected,
+  decompression_pushdown_scan const* scan,
+  decode_visibility_mask const& keep_mask,
+  cucascade::memory::memory_space const& space,
+  cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope tracking_scope,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
 {
   decompress_result out;
   static pushdown_request const no_request;
@@ -618,52 +611,45 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
     throw std::logic_error(
       "decompress_chunk: the memory space is not a GPU space on the current device");
   }
-  auto* allocator = space.get_memory_resource_of<cucascade::memory::Tier::GPU>();
-  if (!allocator) { throw std::logic_error("decompress_chunk: missing GPU reservation allocator"); }
-  auto allocation_context = allocator->allocation_context_for(stream);
-  // Persistent lanes belong to this host thread and GPU. The context admits their allocations
-  // against the caller's reservation, while the allocator remembers each pointer's origin for free.
-  // Converters rebind returned buffers to their task stream before a worker's lanes can be
-  // destroyed. One lane per selected column or filter mask source, whichever is more, up to
-  // kDecodeStreams: the filter's first wave decodes one request per source, so several sources on
-  // one column still run in parallel, while a lane that would receive no request would only add
-  // another stream to the decode's waits. Membership probes run in the first wave only when the
-  // chunk has no range, equality, or visibility mask; otherwise they run one at a time on the first
-  // lane after it. They are counted regardless, because whether a range survives planning is
-  // decided later, by build_chunk_pushdown_config inside decompress_with_pushdown: an extra lane
-  // receives no decode work, while a missing one would serialize concurrent probes.
-  // cuda::stream_ref has no default constructor, so the unused tail of the array repeats the first
-  // lane and is never passed on.
-  std::size_t mask_sources = 0;
-  if (!request.empty() && !request.row_selection_disabled) {
-    for (auto const& entry : request.columns) {
-      mask_sources +=
-        (entry.range ? 1 : 0) + (entry.equals_any.empty() ? 0 : 1) + entry.membership.size();
+  if (space.get_memory_resource_of<cucascade::memory::Tier::GPU>() == nullptr) {
+    throw std::logic_error("decompress_chunk: missing GPU reservation allocator");
+  }
+  // Per-stream reservations require the caller's stream; per-thread reservations cover auxiliary
+  // lanes. Count mask sources as well as output columns so multiple filters on one column can run
+  // concurrently.
+  std::size_t lane_count = 1;
+  if (tracking_scope ==
+      cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD) {
+    std::size_t mask_sources = 0;
+    if (!request.empty() && !request.row_selection_disabled) {
+      for (auto const& entry : request.columns) {
+        mask_sources +=
+          (entry.range ? 1 : 0) + (entry.equals_any.empty() ? 0 : 1) + entry.membership.size();
+      }
+    }
+    lane_count =
+      std::clamp<std::size_t>(std::max(selected.size(), mask_sources), 1, kDecodeStreams);
+  }
+
+  auto all_lanes = [stream]<std::size_t... I>(std::index_sequence<I...>) {
+    return std::array<::cuda::stream_ref, kDecodeStreams>{((void)I, stream)...};
+  }(std::make_index_sequence<kDecodeStreams>{});
+  if (lane_count > 1) {
+    auto& pool = simpatico::thread_device_stream_pool(kDecodeStreams);
+    if (pool.streams.size() < lane_count) {
+      throw std::logic_error("decompress_chunk: decode pool has too few streams");
+    }
+    // Order lane reads after input writes queued on the caller's stream.
+    auto const inputs_ready = stream.record_event();
+    for (std::size_t i = 0; i < lane_count; ++i) {
+      all_lanes[i] = ::cuda::stream_ref{pool.streams[i]};
+      all_lanes[i].wait(inputs_ready);
     }
   }
-  auto const lane_count =
-    std::clamp<std::size_t>(std::max(selected.size(), mask_sources), 1, kDecodeStreams);
-  auto& pool = simpatico::thread_device_stream_pool(kDecodeStreams);
-  if (pool.streams.size() < lane_count) {
-    throw std::logic_error("decompress_chunk: decode pool has too few streams");
-  }
-  auto const first_lane = ::cuda::stream_ref{pool.streams.at(0)};
-  auto const all_lanes  = [&]<std::size_t... I>(std::index_sequence<I...>) {
-    return std::array<::cuda::stream_ref, kDecodeStreams>{
-      first_lane,
-      (I + 1 < lane_count ? ::cuda::stream_ref{pool.streams.at(I + 1)} : first_lane)...};
-  }(std::make_index_sequence<kDecodeStreams - 1>{});
   std::span<const ::cuda::stream_ref> const lanes{all_lanes.data(), lane_count};
-  // Two conditions enable decode-time pushdown:
-  // (a) The ordinary path: non-empty request with row selection enabled.
-  // (b) A visibility mask is present alongside row_selection_disabled=true (e.g., a
-  //     without_row_selection() scan that still carries equals_any predicates and an MVCC mask).
-  //     Without this guard, the old gate short-circuited before decompress_with_pushdown and the
-  //     mask was applied post-decode by materialize_table instead of being fused into wave 1.
-  //     When scan==nullptr (all predicates dropped by for_chunk), decompress_with_pushdown is still
-  //     called but build_chunk_pushdown_config returns config.enabled=false (no sources), so it
-  //     returns nullptr and execution falls through to plain decompress; the mask is then applied
-  //     post-decode by materialize_table, preserving correctness.
+  // A visibility mask can still participate in pushdown when scan row selection is disabled.
+  // If no supported filter source remains, the ordinary decode leaves the mask for the scan to
+  // apply.
   bool const has_pushdown =
     (!request.empty() && !request.row_selection_disabled) || keep_mask.has_mask();
   if (has_pushdown) {

@@ -2177,8 +2177,7 @@ TEST_CASE("validate_recorded_column_storage cross-checks recorded carriers again
   }
 }
 
-// Decode takes its streams from the target GPU memory space, so both compressed-to-GPU converters
-// and decompress_chunk refuse a space that cannot supply them, before any payload fetch or decode.
+// Reject non-GPU targets before compressed converters fetch payloads or launch decoding.
 TEST_CASE("compressed decode rejects a memory space that is not a GPU space",
           "[cached_serving][scan_manager][compression]")
 {
@@ -2229,13 +2228,15 @@ TEST_CASE("compressed decode rejects a memory space that is not a GPU space",
   {
     simpatico::compressed_table const empty;
     REQUIRE_THROWS_WITH(
-      sirius::decompress_chunk(empty,
-                               {},
-                               nullptr,
-                               sirius::decode_visibility_mask{},
-                               *e.host_space,
-                               e.stream(),
-                               rmm::mr::get_current_device_resource_ref()),
+      sirius::decompress_chunk(
+        empty,
+        {},
+        nullptr,
+        sirius::decode_visibility_mask{},
+        *e.host_space,
+        cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD,
+        e.stream(),
+        rmm::mr::get_current_device_resource_ref()),
       Catch::Matchers::ContainsSubstring("not a GPU space on the current device"));
   }
 }
