@@ -26,6 +26,8 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <telemetry/data_batch_probe.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
+#include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 #include <vss/pinned_column.hpp>
 #include <vss/vector_clustering.hpp>
@@ -2015,4 +2017,66 @@ TEST_CASE_METHOD(KMeansFixture,
     run_ok("SELECT * FROM unpin_table('kxp_corpus');");
     run_ok("SELECT * FROM unpin_table('kxp_probe');");
   }
+}
+
+TEST_CASE("lists stay off a device too small to also run a join over them",
+          "[vss][kmeans][approx][lists][isolated_context]")
+{
+  // A 1.5 GB pool: the lists fit, but beside them less is left than a join needs. On the device,
+  // a join's tasks ran out of memory nothing could free and waited on it for good.
+  sirius::test::scratch_dir scratch{"kmeans_lists_headroom"};
+  auto const yaml = scratch.path() / "small_pool.yaml";
+  {
+    std::ofstream f(yaml);
+    f << "sirius:\n"
+         "  topology:\n"
+         "    num_gpus: 1\n"
+         "  memory:\n"
+         "    gpu:\n"
+         "      usage_limit_bytes: 1500000000\n"
+         "      reservation_limit_fraction: 1.0\n"
+         "    host:\n"
+         "      capacity_bytes: 4000000000\n"
+         "      initial_number_pools: 4\n"
+         "      pool_size: 512\n"
+         "      block_size: 1048576\n"
+         "  executor:\n"
+         "    pipeline:\n"
+         "      num_threads: 4\n"
+         "    task_creator:\n"
+         "      num_threads: 2\n"
+         "    downgrade:\n"
+         "      num_threads: 1\n"
+         "      monitor_period: 10ms\n";
+  }
+  sirius::test::shared_test_env env(yaml);
+  auto con = env.make_connection();
+  ok_rows(con, "ATTACH " + scratch.file_literal("lists_headroom.db") + " AS lh;");
+  ok_rows(con, "USE lh;");
+  ok_rows(
+    con,
+    "CREATE TABLE lh_corpus AS SELECT i::BIGINT AS id, list_transform(range(32), lambda d: "
+    "((hash(i * 1000 + d) % 1000)::FLOAT / 100.0))::FLOAT[32] AS vec FROM range(100000) t(i);");
+  ok_rows(con, "CREATE TABLE lh_probe AS SELECT id, vec FROM lh_corpus WHERE id % 50 = 0;");
+  ok_rows(con, "CHECKPOINT;");
+  ok_rows(con, "SELECT * FROM pin_table(name => 'lh_corpus', tier => 'host', format => 'duckdb');");
+  ok_rows(con, "SELECT * FROM pin_table(name => 'lh_probe', tier => 'host', format => 'duckdb');");
+  ok_rows(con,
+          "SELECT * FROM sirius_kmeans_fit('lh_corpus','vec', name => 'lh', n_clusters => 16);");
+  auto const built = ok_rows(
+    con, "SELECT tier FROM sirius_kmeans_build_lists('lh_corpus','vec','lh', storage => 'int8');");
+  REQUIRE(built.size() == 1);
+  CHECK(built[0][0] == "host");
+  auto const pairs = ok_rows(con,
+                             "SELECT left_id FROM sirius_knn_join('lh_probe','vec','lh_corpus',"
+                             "'vec', metric => 'l2', k => 10, search_mode => 'approx', "
+                             "clustering => 'lh', n_probes => 4);");
+  std::set<std::string> probes;
+  for (auto const& r : pairs) {
+    probes.insert(r.at(0));
+  }
+  CHECK(pairs.size() == 20000);
+  CHECK(probes.size() == 2000);
+  ok_rows(con, "SELECT * FROM unpin_table('lh_corpus');");
+  ok_rows(con, "SELECT * FROM unpin_table('lh_probe');");
 }

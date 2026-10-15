@@ -684,6 +684,15 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   if (on_device) {
     reservation = index_cache.reserve_index_memory(
       vec_bytes + row_bytes + row_bytes / 2 + (std::size_t{1} << 24), c.target_gpu);
+    // Lists on the device are memory the engine cannot spill, so they go there only if what is left
+    // can still run joins over them: a quarter of the device, and at least 2 GiB (one task over a
+    // 200k-row probe chunk at 16 probes needs ~1.4 GiB). Squeezed in tighter, a join's tasks run
+    // out of memory that nothing will free.
+    auto const headroom =
+      std::max<std::size_t>(std::size_t{2} << 30, c.space->get_max_memory() / 4);
+    if (reservation != nullptr && c.space->get_available_memory() < headroom) {
+      reservation.reset();
+    }
     on_device = reservation != nullptr;
   }
   if (!on_device) {

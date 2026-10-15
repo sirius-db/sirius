@@ -34,6 +34,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -154,6 +155,24 @@ std::unique_ptr<vector_chunk_source> make_materialized_chunk_source(
   const telemetry::batch_telemetry_info& telemetry_info,
   duckdb::SiriusContext* ctx = nullptr);
 
+/// How many of one join's tasks may exist at once. Lists kept on the device are outside what the
+/// engine can move to make room. A task that runs out of memory beside them is requeued and the
+/// next ones start, each holding what it has made while it waits for memory none of them can free,
+/// so the join stops for good even on one pipeline thread. Each task's input carries a ticket,
+/// which rides on its output to the materialize stage; released there, it makes room and re-arms
+/// the operator.
+struct vector_join_admission {
+  std::mutex mutex;
+  std::size_t limit{std::numeric_limits<std::size_t>::max()};
+  std::size_t in_flight{0};
+  std::weak_ptr<pipeline::sirius_pipeline> pipeline;
+
+  [[nodiscard]] bool capped() const noexcept
+  {
+    return limit != std::numeric_limits<std::size_t>::max();
+  }
+};
+
 /**
  * @brief The input handed to one sirius_physical_vector_join_stream::execute() call.
  *
@@ -192,10 +211,30 @@ class vector_join_stream_input : public operator_data {
   /// stage can gather that batch's left columns.
   [[nodiscard]] std::size_t left_idx() const { return _left_idx; }
 
+  /// The task's place under vector_join_admission, if the join is capped.
+  void set_ticket(std::shared_ptr<void> ticket) { _ticket = std::move(ticket); }
+  [[nodiscard]] std::shared_ptr<void> const& ticket() const { return _ticket; }
+
  private:
   std::size_t _left_idx;
   ::cucascade::memory::memory_space* _gpu_memory_space = nullptr;
   std::size_t _estimated_bytes;
+  std::shared_ptr<void> _ticket;
+};
+
+/// The join's output for the materialize stage, holding the task's admission ticket until that
+/// stage is done with it.
+class vector_join_stream_output : public partitioned_operator_data {
+ public:
+  vector_join_stream_output(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+                            std::size_t partition_idx,
+                            std::shared_ptr<void> ticket)
+    : partitioned_operator_data(std::move(data_batches), partition_idx), _ticket(std::move(ticket))
+  {
+  }
+
+ private:
+  std::shared_ptr<void> _ticket;
 };
 
 /**
@@ -375,6 +414,7 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   std::int64_t _n_clusters{0};
   bool _cluster_index_built{false};
   std::mutex _op_mutex;
+  std::shared_ptr<vector_join_admission> _admission = std::make_shared<vector_join_admission>();
   bool _initialized{false};
   //! Why initialization failed; thrown by the one task scheduled for it.
   std::exception_ptr _init_error;

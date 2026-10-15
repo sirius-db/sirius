@@ -16,6 +16,7 @@
 
 #include "vss/sirius_physical_vector_join_stream.hpp"
 
+#include "creator/task_creator.hpp"
 #include "cuda/vss/brute_force_search.hpp"
 #include "cuda/vss/brute_force_threshold.hpp"
 #include "cuda/vss/cudf_raft_interop.hpp"
@@ -90,6 +91,37 @@
 namespace sirius::op {
 
 namespace {
+
+/// A task's place under vector_join_admission: released, it makes room and asks the task creator
+/// for this join's next tasks, as a streaming source does when data arrives (schedule() only
+/// enqueues, so any thread may call it).
+struct admission_ticket {
+  explicit admission_ticket(std::shared_ptr<vector_join_admission> admission)
+    : _admission(std::move(admission))
+  {
+  }
+  admission_ticket(admission_ticket const&)            = delete;
+  admission_ticket& operator=(admission_ticket const&) = delete;
+  ~admission_ticket()
+  {
+    {
+      std::lock_guard<std::mutex> lock(_admission->mutex);
+      --_admission->in_flight;
+    }
+    try {
+      if (auto p = _admission->pipeline.lock()) {
+        auto* creator = p->get_task_creator();
+        auto head     = p->get_source();
+        if (creator != nullptr && head) { creator->schedule(head.get()); }
+      }
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN("[sirius_physical_vector_join_stream] re-arming after a task: {}", e.what());
+    }
+  }
+
+ private:
+  std::shared_ptr<vector_join_admission> _admission;
+};
 
 /// A host-tier pin chunk as the uncompressed host table the corpus stream slices and sizes. A
 /// compressed pin chunk has no per-column size to stage by, so it is refused with what to change.
@@ -1078,6 +1110,35 @@ void sirius_physical_vector_join_stream::initialize_locked()
       _max_probe_chunk_bytes = std::max(_max_probe_chunk_bytes, _probe->chunk_bytes(i));
     }
   }
+  // Lists on the device leave this join's tasks the rest of it, which the engine cannot enlarge by
+  // moving anything. As many tasks may hold memory at once as fit there. The materialize stage runs
+  // in the same task after the search has freed its scratch, so a task needs the search's estimate;
+  // the quarter on top is for what that stage stages once for all tasks, outside any of them.
+  _admission->pipeline = get_pipeline();
+  if (_lists != nullptr && _lists->tier == cucascade::memory::Tier::GPU && _sirius_ctx != nullptr &&
+      _num_left > 1) {
+    auto const spaces =
+      _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    if (!spaces.empty()) {
+      std::size_t need = 0;
+      for (std::size_t i = 0; i < _num_left; ++i) {
+        need = std::max(need, per_left_batch_estimate(i));
+      }
+      need += need / 4;
+      auto const room = 0.9 * static_cast<double>(spaces.front()->get_available_memory());
+      _admission->limit =
+        std::max<std::size_t>(1, static_cast<std::size_t>(room / static_cast<double>(need)));
+      if (std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[vecjoin-phase] admission: %zu of %zu tasks at once (%.2f GiB free on the "
+                     "device beside the lists, %.2f GiB a task)\n",
+                     _admission->limit,
+                     _num_left,
+                     room / 0.9 / 1073741824.0,
+                     static_cast<double>(need) / 1073741824.0);
+      }
+    }
+  }
   _initialized = true;
 }
 
@@ -1121,7 +1182,14 @@ std::optional<task_creation_hint> sirius_physical_vector_join_stream::get_next_t
     if (_init_error_task_issued) { return std::nullopt; }
     return task_creation_hint{TaskCreationHint::READY, this};
   }
-  if (_num_left == 0 || _next_left >= _num_left || _hint_returned) { return std::nullopt; }
+  if (_num_left == 0 || _next_left >= _num_left) { return std::nullopt; }
+  if (_admission->capped()) {
+    // At the cap, a task's release re-arms this operator.
+    std::lock_guard<std::mutex> admission_lock(_admission->mutex);
+    if (_admission->in_flight >= _admission->limit) { return std::nullopt; }
+    return task_creation_hint{TaskCreationHint::READY, this};
+  }
+  if (_hint_returned) { return std::nullopt; }
   _hint_returned = true;
   return task_creation_hint{TaskCreationHint::READY, this};
 }
@@ -1154,8 +1222,20 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::get_next_task
   // under device pressure (10M self-join through every list) every task then waits for memory
   // that only those batches could free. Left idle in the port, the engine evicts them and the
   // chunk source stages each one back when its task runs.
+  std::shared_ptr<void> ticket;
+  if (_admission->capped()) {
+    {
+      std::lock_guard<std::mutex> admission_lock(_admission->mutex);
+      if (_admission->in_flight >= _admission->limit) { return nullptr; }
+      ++_admission->in_flight;
+    }
+    ticket = std::make_shared<admission_ticket>(_admission);
+  }
   auto const left_idx = _next_left++;
-  return std::make_unique<vector_join_stream_input>(left_idx, per_left_batch_estimate(left_idx));
+  auto input =
+    std::make_unique<vector_join_stream_input>(left_idx, per_left_batch_estimate(left_idx));
+  input->set_ticket(std::move(ticket));
+  return input;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1496,6 +1576,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 
   auto const left_idx = join_in->left_idx();
   auto const dim      = _request.dim;
+  // A capped task keeps its admission ticket until the materialize stage is done with the output.
+  auto const output = [&](std::vector<std::shared_ptr<cucascade::data_batch>> batches)
+    -> std::unique_ptr<operator_data> {
+    if (join_in->ticket()) {
+      return std::make_unique<vector_join_stream_output>(
+        std::move(batches), left_idx, join_in->ticket());
+    }
+    return std::make_unique<partitioned_operator_data>(std::move(batches), left_idx);
+  };
   if (_request.probe_scalar && _scalar_probe_rows != 1) {
     throw std::runtime_error(
       _scalar_probe_rows > 1
@@ -1520,7 +1609,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     std::vector<std::shared_ptr<cucascade::data_batch>> batches;
     batches.push_back(sirius::make_data_batch(
       std::make_unique<cudf::table>(std::move(empty_cols)), *mem_space, stream, batch_telemetry()));
-    return std::make_unique<partitioned_operator_data>(std::move(batches), left_idx);
+    return output(std::move(batches));
   }
 
   // Every mode is served by searching each left row to some depth and then deciding which
@@ -3301,7 +3390,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       std::make_unique<cudf::table>(std::move(cols)), *mem_space, stream, batch_telemetry());
     std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
     batches.push_back(std::move(batch));
-    return std::make_unique<partitioned_operator_data>(std::move(batches), left_idx);
+    return output(std::move(batches));
   }
 
   vss::shaped_join_result shaped;
@@ -3382,7 +3471,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   auto batch = sirius::make_data_batch(std::move(out_table), *mem_space, stream, batch_telemetry());
   auto batches = std::move(offloaded);
   batches.push_back(std::move(batch));
-  return std::make_unique<partitioned_operator_data>(std::move(batches), left_idx);
+  return output(std::move(batches));
 }
 
 //===----------------------------------------------------------------------===//
