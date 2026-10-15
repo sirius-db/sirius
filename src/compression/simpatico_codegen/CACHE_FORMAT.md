@@ -115,6 +115,10 @@ Raw legacy/intermediate records are never accepted by this reader.
 
 Writers use `mkostemp` in the destination directory, handle short writes and
 `EINTR`, check close, and atomically rename the complete record into place.
+After writing, records get mode bits `0666 & ~umask`; the mask is read from Linux
+`/proc/self/status` per publication without changing process-wide state. If the
+mask is unavailable, the owner-only temporary mode is left unchanged. A failed
+permission change aborts publication and removes only that writer's temporary.
 Each writer owns only its unique temporary file. Failure removes that temporary,
 not the destination: another writer may already have repaired it. Redundant
 compilation is allowed. No `fsync` or power-failure durability is promised;
@@ -166,11 +170,11 @@ It does not query NVRTC and can also remove abandoned temporary files left after
 automatic maintenance. Unlike automatic retention, this is a quiescent operation.
 
 The host storage suite links the same implementation as production. Linker-level
-syscall fault injection tests partial/zero/interrupted writes, close and rename
-failures without adding production test hooks. Threads and child processes stress
-same-key publication. Pruning tests cover retention/grace, future timestamps,
-unrelated files/symlinks, and concurrent publication/read/prune races. All
-maintenance tests operate only in owned temporary directories.
+syscall fault injection tests partial/zero/interrupted writes, permission changes,
+close and rename failures without adding production test hooks. Threads and child
+processes stress same-key publication. Pruning tests cover retention/grace, future
+timestamps, unrelated files/symlinks, and concurrent publication/read/prune races.
+All maintenance tests operate only in owned temporary directories.
 
 ## Coverage
 

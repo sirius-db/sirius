@@ -25,11 +25,21 @@ namespace cache                   = codegen::jit::detail;
 constexpr std::size_t header_size = 8 + 8 + cache::Digest{}.size();
 constexpr std::size_t hex_size    = cache::Digest{}.size() * 2;
 
-enum class Fault { none, short_write, interrupted, partial_failure, zero_write, close, rename };
+enum class Fault {
+  none,
+  short_write,
+  interrupted,
+  partial_failure,
+  zero_write,
+  fchmod,
+  close,
+  rename
+};
 thread_local Fault fault = Fault::none;
 thread_local int writes  = 0;
 
 extern "C" ssize_t __real_write(int, const void*, size_t);
+extern "C" int __real_fchmod(int, mode_t);
 extern "C" int __real_close(int);
 extern "C" int __real_rename(const char*, const char*);
 
@@ -50,6 +60,14 @@ extern "C" ssize_t __wrap_write(int fd, const void* bytes, size_t size)
   if (fault == Fault::short_write || fault == Fault::partial_failure)
     size = std::min(size, size_t{7});
   return __real_write(fd, bytes, size);
+}
+extern "C" int __wrap_fchmod(int fd, mode_t mode)
+{
+  if (fault == Fault::fchmod) {
+    errno = EACCES;
+    return -1;
+  }
+  return __real_fchmod(fd, mode);
 }
 extern "C" int __wrap_close(int fd)
 {
@@ -111,6 +129,25 @@ bool uniform_payload(const std::vector<char>& bytes, std::size_t expected_size)
          std::ranges::all_of(bytes, [&](char value) { return value == bytes.front(); });
 }
 
+void publication_permissions(const fs::path& root)
+{
+  struct RestoreUmask {
+    mode_t previous = ::umask(0022);
+    ~RestoreUmask() { ::umask(previous); }
+  } restore;
+  const auto path = root / "permissions" / "test.cubin";
+  const std::vector<char> bytes(32, 'p');
+  // All mask changes finish before any concurrent tests start.
+  for (const mode_t mask : {0022, 0077, 0022}) {
+    ::umask(mask);
+    cache::write_cubin_file_atomic(path.string(), bytes);
+    struct stat metadata{};
+    require(::stat(path.c_str(), &metadata) == 0, "published permissions unavailable");
+    require((metadata.st_mode & 0777) == (0666 & ~mask),
+            "publication did not respect the current umask");
+  }
+}
+
 void publication_and_faults(const fs::path& root)
 {
   const auto path = root / "records" / "test.cubin";
@@ -132,7 +169,7 @@ void publication_and_faults(const fs::path& root)
       "record stores canonical XXH3-128");
   }
   for (const auto injected :
-       {Fault::partial_failure, Fault::zero_write, Fault::close, Fault::rename}) {
+       {Fault::partial_failure, Fault::zero_write, Fault::fchmod, Fault::close, Fault::rename}) {
     fault  = injected;
     writes = 0;
     cache::write_cubin_file_atomic(path.string(), replacement);
@@ -460,6 +497,7 @@ int main()
 {
   try {
     Directory root;
+    publication_permissions(root.path);
     publication_and_faults(root.path);
     concurrent_writers(root.path);
     environment_namespaces(root.path);
