@@ -113,9 +113,23 @@ class SiriusConnectionState : public ClientContextState {
   {
     captured_plan_.reset();
     captured_original_views_.reset();
+    std::lock_guard lock(cpu_replay_error_mutex_);
+    cpu_replay_error_.reset();
   }
 
   void QueryEnd() final { pinned_update_guard_.reset(); }
+
+  /// \brief Report @p error, not the interrupt it raised, when the CPU replay failed.
+  ///
+  /// The transparent CPU replay runs a nested DuckDB Executor on this connection. When it fails,
+  /// Executor::PushError raises the connection's shared interrupt flag before the error reaches the
+  /// outer query's executor. A client thread polling the outer query can see the flag in between
+  /// and fail the query with InterruptException (#2145). DuckDB drains the outer query's tasks
+  /// before QueryEnd, so the replay's error is recorded by then and replaces that interrupt.
+  void QueryEnd(ClientContext& context, optional_ptr<ErrorData> error) final;
+
+  /// \brief Record the error that failed this query's CPU replay, from the replaying thread.
+  void record_cpu_replay_error(ErrorData error, string query);
 
   [[nodiscard]] bool has_pinned_update_guard() const noexcept
   {
@@ -295,6 +309,13 @@ class SiriusConnectionState : public ClientContextState {
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
   std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;
+  /// The failed CPU replay's error and the query it belongs to. Written by a worker thread.
+  struct cpu_replay_error {
+    ErrorData error;
+    string query;
+  };
+  std::mutex cpu_replay_error_mutex_;
+  std::optional<cpu_replay_error> cpu_replay_error_;
   uint64_t connection_id_;
   uint64_t query_ordinal_ = 0;
 };

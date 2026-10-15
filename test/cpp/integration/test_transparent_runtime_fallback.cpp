@@ -422,6 +422,45 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
   REQUIRE(scalar(*con, "SELECT count(*) FROM rf_off;") == "10");
 }
 
+// When the CPU replay of a failed GPU attempt fails too, the query reports the replay's error,
+// exactly as DuckDB alone reports it. The replay's executor shares the connection's interrupt flag
+// and raises it when it fails; the outer query must not report that as "Interrupted!" (#2145).
+// The race needs the GPU operator to run on a worker thread, so repeat the query.
+TEST_CASE_METHOD(RuntimeFallbackFixture,
+                 "runtime fallback: a failing CPU replay reports its error, not Interrupted",
+                 "[transparent][fallback][late_failure][integration][replay_error]")
+{
+  // One row overflows BIGINT multiplication; every other row is valid.
+  create_table(
+    "CREATE TABLE rf_replay_error AS SELECT i AS id, "
+    "CASE WHEN i = 777777 THEN 9223372036854775807 ELSE i END AS v FROM range(2000000) t(i);");
+  std::string const query = "SELECT sum(v * 2) AS s FROM rf_replay_error;";
+
+  con->Query("SET gpu_execution = false;");
+  auto cpu = con->Query(query);
+  REQUIRE(cpu);
+  REQUIRE(cpu->HasError());
+  REQUIRE(cpu->GetErrorType() == duckdb::ExceptionType::OUT_OF_RANGE);
+  con->Query("SET gpu_execution = true;");
+
+  inject("replay-error");
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    CAPTURE(attempt);
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto gpu    = con->Query(query);
+    auto after  = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(gpu);
+    REQUIRE(gpu->HasError());
+    REQUIRE(gpu->GetError() == cpu->GetError());
+    REQUIRE(gpu->GetErrorType() == duckdb::ExceptionType::OUT_OF_RANGE);
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 1);
+  }
+
+  // The connection is still usable.
+  clear_injection();
+  REQUIRE(scalar(*con, "SELECT count(*) FROM rf_replay_error;") == "2000000");
+}
+
 TEST_CASE_METHOD(RuntimeFallbackFixture,
                  "prepared parameters reach GPU execution and runtime fallback",
                  "[transparent][fallback][integration]")
@@ -660,10 +699,8 @@ void run_s3mix_scenario(std::string const& scenario)
     auto started = std::chrono::steady_clock::now();
     auto failed  = fixture.con->Query(query);
     REQUIRE(failed->HasError());
-    // DuckDB v2 can report Interrupted before the nested CPU reader error reaches
-    // the outer executor (#2145). Keep connection recovery covered independently.
-    CHECK((failed->GetError() == cpu->GetError() ||
-           failed->GetErrorType() == duckdb::ExceptionType::INTERRUPT));
+    // The CPU reader error, not the interrupt the failed replay raised (#2145).
+    CHECK(failed->GetError() == cpu->GetError());
     auto after = sirius::test::get_transparent_execution_stats(*fixture.con);
     CHECK(after.successful_rebinds == before.successful_rebinds + 1);
     CHECK(after.fallbacks == before.fallbacks);

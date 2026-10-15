@@ -1416,6 +1416,32 @@ SiriusConnectionState::SiriusConnectionState()
   connection_id_ = next_connection_id.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
+void SiriusConnectionState::record_cpu_replay_error(ErrorData error, string query)
+{
+  if (error.Type() == ExceptionType::INTERRUPT) { return; }  // a real cancellation stays one
+  std::lock_guard lock(cpu_replay_error_mutex_);
+  if (!cpu_replay_error_) { cpu_replay_error_.emplace(std::move(error), std::move(query)); }
+}
+
+void SiriusConnectionState::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
+{
+  std::optional<cpu_replay_error> replay;
+  {
+    std::lock_guard lock(cpu_replay_error_mutex_);
+    replay = std::exchange(cpu_replay_error_, std::nullopt);
+  }
+  if (replay && error && error->HasError() && error->Type() == ExceptionType::INTERRUPT) {
+    try {
+      // Finish the error as DuckDB does for a query error (FailQueryInternal).
+      context.ProcessError(replay->error, replay->query);
+      *error = std::move(replay->error);
+    } catch (...) {
+      // Keep the interrupt: DuckDB must still end the query.
+    }
+  }
+  ClientContextState::QueryEnd(context, error);
+}
+
 shared_ptr<SiriusConnectionState> get_sirius_connection_state(ClientContext& context)
 {
   // Callers include noexcept per-query paths (QueryBegin/QueryEnd, the guard
