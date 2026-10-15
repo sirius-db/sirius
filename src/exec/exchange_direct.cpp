@@ -123,6 +123,12 @@ std::optional<std::vector<std::uint64_t>> sources(direct_export const& table,
   return src;
 }
 
+rmm::cuda_stream stream_on(int device)
+{
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+  return rmm::cuda_stream{};
+}
+
 }  // namespace
 
 std::vector<std::uint8_t> encode_layout(direct_layout const& layout)
@@ -243,7 +249,7 @@ direct_export describe_table(cudf::table_view const& table, rmm::cuda_stream_vie
 }
 
 direct_exchange::direct_exchange(cucascade::memory::memory_space& gpu, memory::slab_region region)
-  : _gpu{gpu}, _region{std::move(region)}
+  : _gpu{gpu}, _region{std::move(region)}, _stream{stream_on(_region.device)}
 {
 }
 
@@ -253,7 +259,7 @@ std::optional<direct_exchange::exported> direct_exchange::export_batch(
   std::lock_guard const lock{_mutex};
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
   require_open();
-  rmm::cuda_stream_view const stream{_gpu.acquire_stream()};
+  auto const stream = _stream.view();
   direct_export described;
   std::optional<std::vector<std::uint64_t>> src;
   std::unique_ptr<cudf::table> copy;
@@ -316,7 +322,7 @@ std::pair<std::uint64_t, std::vector<std::uint64_t>> direct_exchange::allocate(
     throw rmm::out_of_memory(std::format(
       "direct exchange: {} bytes requested, {} available", total, _gpu.get_available_memory()));
   }
-  auto const stream = _gpu.acquire_stream();
+  auto const stream = _stream.view();
   auto* tracker     = _gpu.get_memory_resource_of<cucascade::memory::Tier::GPU>();
   if (!tracker->attach_reservation_to_tracker(
         stream,
@@ -331,7 +337,12 @@ std::pair<std::uint64_t, std::vector<std::uint64_t>> direct_exchange::allocate(
     entry.buffers.emplace_back(b.alloc, stream, _gpu.get_default_allocator());
   }
   // The pool reuses a block freed on another stream behind a stream wait, which the NIC ignores.
-  rmm::cuda_stream_view{stream}.synchronize();
+  stream.synchronize();
+  // The buffers leave as a table that may outlive this exchange and its stream, so they are freed
+  // on one of the space's streams instead; nothing is pending on them after the sync.
+  for (auto& buffer : entry.buffers) {
+    buffer.set_stream(_gpu.acquire_stream());
+  }
 
   std::vector<std::uint64_t> dst;
   for (std::size_t i = 0; i < plan.size(); ++i) {
