@@ -53,6 +53,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::late_mat {
@@ -291,7 +292,9 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
 
 /// Buffers released from a column on another GPU. They stay alive here until
 /// the copies that read them have been ordered ahead of their frees.
-using retired_buffers = std::vector<std::shared_ptr<void>>;
+using retired_buffer  = std::variant<std::unique_ptr<rmm::device_buffer>,
+                                     std::unique_ptr<::cuda::device_buffer<std::byte>>>;
+using retired_buffers = std::vector<retired_buffer>;
 
 /// What a remote gather allocated on the owning GPU: the gather map and, once
 /// handed to the peer copies, the gathered column's buffers.
