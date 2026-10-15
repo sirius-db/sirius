@@ -18,6 +18,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/transform.hpp>
 
 #include <rmm/resource_ref.hpp>
 
@@ -55,12 +56,14 @@ namespace sirius::temporal {
 
 // Applies a bound DATE/day signature. Offsets preserve NULL and infinity and
 // throw invalid_input_exception on finite overflow. Differences subtract raw day
-// counts in INT64. Inputs must have equal lengths; overflow checks synchronize
+// counts in INT64. Column inputs must have row_count rows; scalar inputs broadcast
+// their single row. The caller retains input ownership; overflow checks synchronize
 // the supplied stream.
 [[nodiscard]] std::unique_ptr<cudf::column> date_arithmetic_checked(
-  cudf::column_view const& left,
-  cudf::column_view const& right,
+  cudf::transform_input const& left,
+  cudf::transform_input const& right,
   date_arithmetic_operation operation,
+  cudf::size_type row_count,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
