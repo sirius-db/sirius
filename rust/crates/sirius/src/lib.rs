@@ -255,7 +255,9 @@ impl Fragment<'_> {
         }))
     }
 
-    /// Push the batch received under `token` into input stream `stream_id`, consuming the token.
+    /// Push the batch received under `token` into input stream `stream_id`, consuming the token
+    /// unless the call fails before reading it: before `build`, after `run` started, or on an
+    /// undeclared input. A batch whose columns differ from the declared ones is refused.
     pub fn push_received(&mut self, stream_id: u64, token: u64) -> Result<(), Exception> {
         self.inner.pin_mut().push_received(stream_id, token)
     }
