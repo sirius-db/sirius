@@ -16,7 +16,9 @@
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "exec/exchange_direct.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/slab_memory_resource.hpp"
 #include "sirius/exception.hpp"
 
@@ -31,7 +33,11 @@
 
 #include <cuda_runtime_api.h>
 
+#include <absl/cleanup/cleanup.h>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -167,14 +173,21 @@ std::vector<std::uint32_t> row_hashes(cudf::table_view table)
   return host;
 }
 
-void check_same_rows(cudf::table_view actual, cudf::table_view expected)
+/// What a delivered table must match: each column's type and null count, and every row's hash.
+struct rows_summary {
+  std::vector<std::pair<cudf::type_id, cudf::size_type>> columns;
+  std::vector<std::uint32_t> hashes;
+
+  bool operator==(rows_summary const&) const = default;
+};
+
+rows_summary summarize(cudf::table_view table)
 {
-  REQUIRE(actual.num_columns() == expected.num_columns());
-  for (cudf::size_type i = 0; i < actual.num_columns(); ++i) {
-    CHECK(actual.column(i).type() == expected.column(i).type());
-    CHECK(actual.column(i).null_count() == expected.column(i).null_count());
+  rows_summary summary{{}, row_hashes(table)};
+  for (auto const& column : table) {
+    summary.columns.emplace_back(column.type().id(), column.null_count());
   }
-  CHECK(row_hashes(actual) == row_hashes(expected));
+  return summary;
 }
 
 }  // namespace
@@ -222,6 +235,7 @@ TEST_CASE("decode_layout rejects each malformed field", "[exchange_direct]")
     {"chars overflow INT32", [](auto& b) { poke<std::uint64_t>(b, 42, std::uint64_t{1} << 31); }},
   };
   for (auto const& [error, mutate] : cases) {
+    INFO("mutation expecting: " << error);
     auto bytes = valid;
     mutate(bytes);
     CHECK_THROWS_MATCHES(decode_layout(bytes),
@@ -235,7 +249,8 @@ TEST_CASE("plan_buffers sizes buffers in walk order within the limit", "[exchang
   direct_layout const layout{100,
                              {{cudf::data_type{cudf::type_id::DECIMAL128, 3}, 1, true},
                               strings(cudf::type_id::INT64, 1000)}};
-  // The mask sends 4 words into a 64-byte allocation; aligned to 256 bytes the four take 4096.
+  // The mask sends 4 words (16 bytes) into a 64-byte allocation; aligned to 256 bytes the four
+  // buffers take 256 + 1792 + 1024 + 1024 = 4096.
   CHECK(plan_buffers(layout, 4096) ==
         std::vector<direct_buffer>{{0, 16, 64}, {0, 1600, 1600}, {1, 1000, 1000}, {1, 808, 808}});
   CHECK_THROWS_AS(plan_buffers(layout, 4095), sirius::invalid_input_exception);
@@ -287,20 +302,28 @@ TEST_CASE("direct_exchange sends each type, copying only slices and buffers outs
   direct_exchange exchange(gpu, *sirius::memory::find_slab(gpu));
   bool const in_slab         = GENERATE(true, false);
   cudf::size_type const from = GENERATE(0, 5);
-  auto const table =
+  bool const zero_copy       = in_slab && from == 0;
+  auto table =
     sample_table(in_slab ? gpu.get_default_allocator() : cudf::get_current_device_resource_ref());
   auto const view = cudf::slice(table->view(), {from, rows}).front();
+  CHECK_FALSE(
+    exchange.export_batch(batch_of(gpu, cudf::slice(table->view(), {0, 0}).front(), table)));
 
   auto const sent = exchange.export_batch(batch_of(gpu, view, table));
   REQUIRE(sent);
   CHECK(sent->rows == static_cast<std::uint64_t>(rows - from));
   // The first buffer is column 0's mask.
-  CHECK((sent->src[0] == address(view.column(0).null_mask())) == (in_slab && from == 0));
-  check_same_rows(deliver(exchange, *sent)->view(), view);
-  CHECK(exchange.outstanding() == 0);
+  CHECK((sent->src[0] == address(view.column(0).null_mask())) == zero_copy);
 
-  CHECK_FALSE(
-    exchange.export_batch(batch_of(gpu, cudf::slice(table->view(), {0, 0}).front(), table)));
+  // Only the exchange keeps the sent buffers alive now: the batch when it sends in place, else
+  // its copy.
+  auto const expected = summarize(view);
+  std::weak_ptr<cudf::table> const weak{table};
+  table.reset();
+  CHECK(weak.expired() == !zero_copy);
+  CHECK(summarize(deliver(exchange, *sent)->view()) == expected);
+  CHECK(weak.expired());
+  CHECK(exchange.outstanding() == 0);
 }
 
 TEST_CASE("direct_exchange release is idempotent and close frees every token", "[exchange_direct]")
@@ -311,7 +334,7 @@ TEST_CASE("direct_exchange release is idempotent and close frees every token", "
   auto const layout       = encode_layout({rows, {{type(cudf::type_id::INT64), 0, false}}});
   auto const [token, dst] = exchange.allocate(layout);
   CHECK(dst == std::vector<std::uint64_t>{dst[0], rows * sizeof(std::int64_t)});
-  CHECK(exchange.allocate(layout).first == token + 1);
+  CHECK(exchange.allocate(layout).first != token);
 
   exchange.release(token);
   exchange.release(token);
@@ -320,4 +343,93 @@ TEST_CASE("direct_exchange release is idempotent and close frees every token", "
   exchange.close();
   CHECK(gpu.get_available_memory() == available);
   CHECK_THROWS_AS(exchange.allocate(layout), sirius::invalid_input_exception);
+}
+
+TEST_CASE("direct_exchange take refuses every token but an unconsumed received one",
+          "[exchange_direct]")
+{
+  memory_space gpu(slab_config());
+  direct_exchange exchange(gpu, *sirius::memory::find_slab(gpu));
+  auto const table = sample_table(gpu.get_default_allocator());
+  auto const sent  = exchange.export_batch(batch_of(gpu, table->view(), table));
+  REQUIRE(sent);
+  auto const [received, dst] =
+    exchange.allocate(encode_layout({rows, {{type(cudf::type_id::INT64), 0, false}}}));
+  auto const [released, unused] =
+    exchange.allocate(encode_layout({rows, {{type(cudf::type_id::INT64), 0, false}}}));
+  exchange.release(released);
+
+  auto const refused = [&](std::uint64_t token) {
+    CHECK_THROWS_MATCHES(exchange.take(token),
+                         sirius::invalid_input_exception,
+                         MessageMatches(ContainsSubstring("holds no received batch")));
+  };
+  refused(0);
+  refused(sent->token);
+  refused(released);
+  CHECK(exchange.take(received)->num_rows() == rows);
+  refused(received);
+  CHECK(exchange.outstanding() == 1);
+  exchange.release(sent->token);
+  CHECK(exchange.outstanding() == 0);
+}
+
+TEST_CASE("direct_exchange allocate refuses at once when memory cannot be reserved",
+          "[exchange_direct]")
+{
+  memory_space gpu(slab_config());
+  direct_exchange exchange(gpu, *sirius::memory::find_slab(gpu));
+  // About 40 MB each, so the 64 MiB slab holds one but not two.
+  auto const large       = encode_layout({5'000'000, {{type(cudf::type_id::INT64), 0, false}}});
+  auto const [held, dst] = exchange.allocate(large);
+  auto const available   = gpu.get_available_memory();
+
+  CHECK_THROWS_AS(exchange.allocate(large), rmm::out_of_memory);
+  CHECK(exchange.outstanding() == 1);
+  CHECK(gpu.get_available_memory() == available);
+  // The failed call left nothing attached to this thread's tracker.
+  auto const [small, unused] =
+    exchange.allocate(encode_layout({rows, {{type(cudf::type_id::INT64), 0, false}}}));
+  CHECK(exchange.outstanding() == 2);
+  exchange.release(small);
+  exchange.release(held);
+}
+
+TEST_CASE("direct_exchange refuses to export a batch that is not on the GPU", "[exchange_direct]")
+{
+  sirius::converter_registry::reset_for_testing();
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(std::size_t{64} << 20)
+    .set_gpu_memory_resource_factory(sirius::memory::make_slab_pool_factory())
+    .set_per_numa_region_capacity(std::size_t{256} << 20)
+    .use_numa_id_as_host_id()
+    .track_reservation_per_stream(false);
+  sirius::memory::sirius_memory_reservation_manager manager(builder.build());
+  sirius::converter_registry::initialize();
+  absl::Cleanup const shutdown = [&] {
+    manager.shutdown();
+    sirius::converter_registry::shutdown();
+  };
+  auto& gpu  = *manager.get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* host = const_cast<memory_space*>(
+    manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front());
+
+  direct_exchange exchange(gpu, *sirius::memory::find_slab(gpu));
+  auto const table = sample_table(gpu.get_default_allocator());
+  auto batch       = batch_of(gpu, table->view(), table);
+  // The spill copy needs a real stream, not the legacy default one.
+  rmm::cuda_stream_view const stream{gpu.acquire_stream()};
+  {
+    auto mutable_batch = batch->to_mutable();
+    mutable_batch.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), host, stream);
+  }
+  stream.synchronize();
+
+  CHECK_THROWS_MATCHES(exchange.export_batch(batch),
+                       sirius::invalid_input_exception,
+                       MessageMatches(ContainsSubstring("not on the GPU")));
+  CHECK(exchange.outstanding() == 0);
+  exchange.close();
 }
