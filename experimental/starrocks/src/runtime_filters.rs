@@ -130,6 +130,14 @@ impl RuntimeFilters {
             .collect()
     }
 
+    /// Whether a scan of `query` (any instance id of it) waits for a filter.
+    pub(crate) fn holds(&self, query: FragmentInstanceId) -> bool {
+        self.lock()
+            .deferred
+            .keys()
+            .any(|instance| instance.query_hi() == query.query_hi())
+    }
+
     /// Scans waiting for a filter. Zero on an idle CN.
     pub(crate) fn deferred(&self) -> usize {
         self.lock().deferred.len()
