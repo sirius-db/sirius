@@ -235,6 +235,8 @@ By execution time every equality-condition side is a plain column reference: a c
 
 **NULL comparison for keys.** `compare_nulls()` picks the `null_equality` flag threaded through every cuDF join call (including the build helpers and `filtered_join`/`mark_join`): `EQUAL` only when *every* equi-key is `IS NOT DISTINCT FROM`, `UNEQUAL` otherwise (any plain `=`, delim joins, and MARK). A null-safe key *mixed* with plain `=` is instead routed through MIXED_JOIN (see below).
 
+Before physical lowering, catalog `NOT NULL` constraints can prove null-safe keys equivalent to ordinary equality for matching rows. Normalization changes all null-safe equality keys together only when every key has a proven non-null operand; it uses no data statistics and excludes MARK joins. This can admit ordinary equality dynamic filters without changing the join's matching behavior. See [dynamic-filter null handling](dynamic-filters.md#nulls).
+
 **Nullable mixed SEMI/ANTI residuals.** These joins, including RIGHT_SEMI/RIGHT_ANTI, retain equality-key hashing when a build residual contains NULL. `prepare_mixed_filter_build()` appends a non-null validity column for each nullable residual input to the build conditional table. This prevents cuDF 26.08 build deduplication from confusing NULL with a valid value having identical stored bytes when its conditional comparator uses the equality table's nullability. The flags preserve duplicate elimination for valid rows, do not change predicate column indices, and are excluded from the join output. Only residual conditions enter the AST; hash-key casts continue through normal key preparation.
 
 **Broadcast small build tables.** On multi-GPU, a build side is a broadcast candidate when it is small (`< small_table_bytes`), or when it fits `max_broadcast_join_size` and the estimated probe-to-build ratio is at least `num_gpus * 1.25`; MARK joins are forced broadcast whenever `num_gpus > 1` (see [MARK joins](#mark-joins)). Instead of routing the whole build to one GPU, the join places one partition on each GPU (`partition_placement::one_per_device`, so `placement.num_partitions()` equals the GPU count) and PARTITION *replicates* the small build table to every slot (the `_broadcast` flag), so each GPU builds its own hash table and joins its local probe rows. The build sink deposits the build batch into every slot; the probe sink routes each batch to the slot placed on its current GPU (`partition_placement::first_partition_for_device`). Once the probe side finishes, any slot that received replicated build data but no probe rows is discarded (`discard_build_only_slots_if_probe_complete`). Right-family / mixed joins reject BUILD_PROBE and fall back to the normal partition count.
@@ -419,9 +421,18 @@ Repartitions data into N buckets based on partition keys. Partition keys are alw
 - **Modes:** `HASH` (most common), `RANGE`, `EVENLY`, `CUSTOM`, `NONE`
 - **Adaptive count:** the downstream consumer's `get_partition_strategy()` computes N from input size and `hash_partition_bytes`. N is fixed on the first task because it determines each row's hash bucket.
 - **Placement:** the same strategy carries a `partition_placement` (which GPU each partition runs on). `apply_partition_strategy()` latches the count, broadcast flag, and placement on both siblings and installs the placement on the consumer and on every operator the partitions sink into (a join's CONCATs), which stamp each partition's device on the data they emit. A placement naming a GPU outside the consumer's admitted set is rejected. The consumer's `placement()` accessor throws if no placement has been installed; standalone operator tests must call `set_placement()` explicitly.
-- **Sibling coordination:** Build-side partition normally determines the shared count. For RIGHT-family hash joins other than `RIGHT_DELIM_JOIN`, the retained probe side determines it instead.
+- **Sibling coordination:** Build-side partition normally determines the shared count. For RIGHT-family hash joins other than `RIGHT_DELIM_JOIN`, the complete probe side determines it instead. An eligible RIGHT_SEMI/RIGHT_ANTI build first runs its BUILD_FILTER stage before following probe-sizing readiness.
 - **Projected sizing (aggregate fanout):** when runtime estimation is enabled, the group-by partition uses a projected total and a `PARTIAL` ingress. It waits if no estimate is available. See [data management](data-management.md#runtime-data-size-estimation).
 - **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_placement`, `_broadcast`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`, `_size_estimate`
+
+### `sirius_physical_build_filter` — `BUILD_FILTER`
+**File:** `src/op/dynamic_filter/sirius_physical_build_filter.hpp`
+
+Publishes an optional equality-key Bloom filter before a RIGHT_SEMI/RIGHT_ANTI join's probe-driven partition sizing. Both joins preserve only build-side rows, so probe rows with no matching build key can be removed safely. The stage requires dynamic filters, `enable_dynamic_filter_multi_partition`, a positive Bloom cap, and admitted INT32 or INT64 keys.
+
+- **Complete input:** a FULL barrier and finished source pipeline let the arrival ledger certify every original batch before any is popped. Certification is independent of downstream partition count; accumulation inside ordinary PARTITION still requires more than one output partition.
+- **GPU execution:** scheduled tasks contribute keys to the owning join's publication session and forward the same batches unchanged. The final contribution publishes before stage completion, while partitioning and join strategies remain unchanged.
+- **Fallback:** unsupported input or an optional publication failure keeps the data path intact. Consumers never wait on filter channels, and there is no global scan barrier. See [early publication](dynamic-filters.md#early-publication-for-right-semianti-joins).
 
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/op/sirius_physical_concat.hpp`
@@ -553,6 +564,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | UNION | Set op | `UNION ALL` only; N-ary identity fan-in, no data touched |
 | PARTITION | Pipeline | Hash/range partitioning |
+| BUILD_FILTER | Pipeline | Complete-build Bloom publication; forwards batches unchanged |
 | CONCAT | Pipeline | Partition reassembly |
 | PASSTHROUGH_SINK | Pipeline | UNION arm terminator; forwards batches unpartitioned |
 | MERGE_TOP_N | Pipeline | Merge per-partition top-N |

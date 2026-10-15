@@ -42,6 +42,7 @@
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
@@ -1316,6 +1317,21 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
       auto child_physical = child_orig->has_physical_overrides() ? child_orig->get_physical_types()
                                                                  : std::vector<cudf::data_type>{};
 
+      if (is_build && join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+        auto& join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
+        if (!join.is_delim_join_inner() &&
+            (join.join_type == duckdb::JoinType::RIGHT_SEMI ||
+             join.join_type == duckdb::JoinType::RIGHT_ANTI) &&
+            join.publishes_dynamic_filters() &&
+            join.dynamic_filter_plan().multi_partition_enabled()) {
+          auto publish = duckdb::make_uniq<sirius::op::sirius_physical_build_filter>(
+            child_types, est_card, join.dynamic_filter_session());
+          if (!child_physical.empty()) { publish->set_physical_types(child_physical); }
+          publish->children.push_back(std::move(child_orig));
+          child_orig = std::move(publish);
+        }
+      }
+
       auto concat =
         duckdb::make_uniq<sirius::op::sirius_physical_concat>(child_types,
                                                               est_card,
@@ -1831,6 +1847,8 @@ bool terminal_sink_supports_fusion(const sirius::op::sirius_physical_operator& s
     case T::DENSE_COUNT_JOIN:
     case T::HASH_JOIN:
     case T::NESTED_LOOP_JOIN: return false;
+    // Publication needs its complete-input ledger and a separate source pipeline.
+    case T::BUILD_FILTER: return false;
     // Partition sinks require complete upstream input in a single task.
     case T::PARTITION:
     case T::SORT_PARTITION: return false;

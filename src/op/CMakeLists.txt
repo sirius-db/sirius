@@ -43,6 +43,7 @@ target_sources(
           dynamic_filter/complete_build_inventory.cpp
           dynamic_filter/dynamic_filter_replica_space.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
+          dynamic_filter/sirius_physical_build_filter.cpp
           dynamic_filter/sirius_dynamic_filter.cpp
           sirius_physical_column_data_scan.cpp
           sirius_physical_streaming_sink.cpp

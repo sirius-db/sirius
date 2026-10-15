@@ -318,6 +318,18 @@ step trace_through(sirius_physical_operator const& node,
     // column set this operator probes.
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return step::to(in_pos);
 
+    case SiriusPhysicalOperatorType::BUILD_FILTER: {
+      // Publication reads only join keys, which the following build partition withholds from
+      // deferral. Payloads keep their positions and can carry rowids through this stage.
+      auto const* partition =
+        dynamic_cast<op::sirius_physical_partition const*>(node.get_parent_op());
+      if (node.children.size() != 1 || node.children.front().get() != &from ||
+          partition == nullptr || !partition->is_build_partition()) {
+        return step::reads();
+      }
+      return step::to(in_pos);
+    }
+
     case SiriusPhysicalOperatorType::HASH_GROUP_BY:
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY: {
       auto const shape = read_group_by(node);
