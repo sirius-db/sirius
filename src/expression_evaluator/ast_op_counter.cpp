@@ -130,7 +130,7 @@ std::size_t in_list::cudf_ast_op_count() const
 
 std::size_t function_call::cudf_ast_op_count() const
 {
-  // cuDF AST does not enforce DuckDB's decimal result width and scale.
+  // Materialize every decimal function: cuDF AST does not enforce DuckDB's result width and scale.
   if (return_type().is_decimal() || std::ranges::any_of(arguments(), [](auto const& arg) {
         return arg->return_type().is_decimal();
       })) {

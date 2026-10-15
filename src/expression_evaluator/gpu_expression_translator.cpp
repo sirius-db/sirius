@@ -722,7 +722,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
 {
-  // cuDF AST does not enforce DuckDB's decimal result width and scale.
+  // Materialize every decimal function: cuDF AST does not enforce DuckDB's result width and scale.
   // Unsupported functions fall through to the default arm below.
   if (std::ranges::any_of(alt.arguments(),
                           [](auto const& arg) { return arg->return_type().is_decimal(); }) ||

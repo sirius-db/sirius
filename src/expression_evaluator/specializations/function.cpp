@@ -92,6 +92,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   auto const resolved_id = alt.function();
   auto const& args       = alt.arguments();
 
+  // Materialize every decimal function: cuDF AST does not enforce DuckDB's result width and scale.
   auto const skip_ast =
     alt.return_type().is_decimal() ||
     std::ranges::any_of(args, [](auto const& arg) { return arg->return_type().is_decimal(); });

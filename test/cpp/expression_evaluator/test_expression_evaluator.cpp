@@ -1326,7 +1326,8 @@ TEMPLATE_TEST_CASE("evaluate arithmetic functions",
 }
 
 // ---------------------------------------------------------------------------
-// Decimal arithmetic exercises both cuDF AST and materialized paths.
+// Decimal functions materialize under all strategies. The AST strategies verify
+// that fallback preserves DuckDB decimal width and scale.
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("evaluate decimal arithmetic (DECIMAL64)",
@@ -1458,11 +1459,12 @@ TEMPLATE_TEST_CASE("evaluate decimal arithmetic (DECIMAL32)",
   REQUIRE(out0 == expected);
 }
 
-TEMPLATE_TEST_CASE("evaluate decimal multiplication after DuckDB width casts",
-                   "[expression_evaluator][decimal]",
-                   mat_strategy,
-                   ast_interpret_strategy,
-                   ast_jit_strategy)
+TEMPLATE_TEST_CASE(
+  "evaluate materialized decimal multiplication under all strategies after DuckDB width casts",
+  "[expression_evaluator][decimal]",
+  mat_strategy,
+  ast_interpret_strategy,
+  ast_jit_strategy)
 {
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
@@ -1493,7 +1495,7 @@ TEMPLATE_TEST_CASE("evaluate nested decimal arithmetic (col + 1.00) * 2",
                    ast_interpret_strategy,
                    ast_jit_strategy)
 {
-  // Nested DECIMAL64 arithmetic exercises intermediate fixed_point AST results.
+  // Nested DECIMAL64 functions also materialize under the AST strategies.
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
   REQUIRE(space != nullptr);

@@ -52,8 +52,6 @@
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 
-#include <variant>
-
 // cuda
 #include <cuda_runtime_api.h>
 
@@ -1485,8 +1483,8 @@ TEST_CASE("translator: 100-row table with complex expression", "[expression_tran
 //===----------------------------------------------------------------------===//
 // Test: Decimal column vs. decimal literal comparisons
 //
-// Decimal column comparisons and DECIMAL32/64 arithmetic are supported by cuDF AST.
-// DECIMAL128 arithmetic remains materialized because it exceeds AST intermediate storage.
+// Decimal column comparisons use cuDF AST. Functions with decimal arguments or
+// results materialize at every width to preserve DuckDB result width and scale.
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("translator: decimal32 column EQUAL decimal literal", "[expression_translator]")
@@ -1603,15 +1601,17 @@ TEST_CASE("translator: decimal32 multiplication widening to decimal64 returns nu
   REQUIRE_FALSE(translate(translator, *mul).has_value());
 }
 
-TEST_CASE("translator: direct decimal128 column arithmetic returns nullopt",
+TEST_CASE("translator: decimal column arithmetic returns nullopt at every width",
           "[expression_translator]")
 {
-  auto const dec38 = logical_type::make_decimal(38, 2);
+  auto const width   = GENERATE(5, 18, 38);
+  auto const decimal = logical_type::make_decimal(width, 2);
 
   std::vector<std::unique_ptr<ast_node>> add_args;
-  add_args.push_back(make_ref_typed(0, dec38));
-  add_args.push_back(make_ref_typed(0, dec38));
-  auto add = make_func(sirius::function_id::add, std::move(add_args), dec38);
+  add_args.push_back(make_ref_typed(0, decimal));
+  add_args.push_back(make_ref_typed(0, decimal));
+  auto add = make_func(sirius::function_id::add, std::move(add_args), decimal);
+  REQUIRE(add->cudf_ast_op_count() == 0);
 
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *add);
