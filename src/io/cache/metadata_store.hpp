@@ -58,6 +58,8 @@ class metadata_store {
   [[nodiscard]] bool has_path(std::string_view path) const;
   [[nodiscard]] counters statistics() const;
   [[nodiscard]] std::string describe_metadata_store() const;
+  /// Drop all cached metadata after an opened-object identity mismatch.
+  void clear();
 
  private:
   struct entry {
@@ -72,7 +74,6 @@ class metadata_store {
 
   static std::string cache_key(std::string const& path);
   void retire(iterator it, entries& retired);
-  void clear();
   bool put_identity(std::string const& path,
                     object_identity identity,
                     uint64_t generation,

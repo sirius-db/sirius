@@ -28,6 +28,7 @@
 
 namespace sirius::op::scan {
 class iceberg_dv_preparation;
+class iceberg_dv_attempt;
 
 /**
  * @brief Parquet bind data plus the table's materialized Iceberg delete data.
@@ -106,14 +107,16 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
     bool like                                                    = false,
     std::shared_ptr<const sirius::like_multiliteral_cache> cache = nullptr,
     std::unique_ptr<cudf::column>* survivors                     = nullptr,
-    std::span<std::size_t const> elided                          = {}) override
+    std::span<std::size_t const> elided                          = {},
+    expression_query_policy policy                               = {}) override
   {
     return _core.post_filter_and_project(
-      std::move(input), space, stream, like, std::move(cache), survivors, elided);
+      std::move(input), space, stream, like, std::move(cache), survivors, elided, policy);
   }
   bool can_claim_preparation() override;
   std::shared_ptr<scan_manager::preparation_admission> preparation_admission() const override;
   void attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>) override;
+  void begin_preparation(std::shared_ptr<iceberg_dv_attempt> attempt);
   preparation_claim claim_preparation(io::ioctx_resolver resolve) override;
   scan_manager::unit_key next_preparation_unit() const;
   void stop_preparation() noexcept override;
@@ -124,7 +127,8 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
     const cucascade::memory::memory_space& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    expression_query_policy policy = {}) override;
 
  private:
   parquet_scan_core _core;
@@ -139,6 +143,7 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
 
   std::shared_ptr<iceberg_delete_sets const> _delete_sets;
   std::shared_ptr<iceberg_dv_preparation> _deferred;
+  std::shared_ptr<iceberg_dv_attempt> _attempt;
   scan_manager::w_permit _next_permit;
   size_t _next_preparation = 0;
   bool _next_registered    = false;

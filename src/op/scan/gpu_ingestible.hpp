@@ -95,7 +95,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     _execution_completion = std::move(completion);
   }
 
-  using metadata_scan_task_t = std::function<std::unique_ptr<scan_info>(std::stop_token)>;
+  using metadata_scan_task_t = std::function<std::unique_ptr<scan_info>()>;
 
   struct preparation_claim {
     metadata_scan_task_t work;

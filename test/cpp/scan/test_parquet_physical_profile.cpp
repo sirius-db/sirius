@@ -352,6 +352,28 @@ TEST_CASE("Iceberg per-file schema comparison preserves field ids and reasons",
   CHECK(check().reason == verdict_reason::iceberg_schema_no_rows);
 }
 
+TEST_CASE("Iceberg schema comparison rejects invalid field ids",
+          "[scan][parquet][profile][iceberg_schema]")
+{
+  footer_fixture f;
+  f.metadata.schema[1].field_id = 1;
+  iceberg_table_schema table{{{"x", 1, "INTEGER"}}};
+  auto check = [&] { return check_iceberg_file_schema(f.metadata, table, "fixture.parquet"); };
+
+  table.fields[0].id = 0;
+  CHECK(check().reason == verdict_reason::iceberg_schema_invalid_field_id);
+  table.fields[0].id = 1;
+  table.fields.push_back({"y", 1, "INTEGER"});
+  CHECK(check().reason == verdict_reason::iceberg_schema_invalid_field_id);
+  table.fields.pop_back();
+  f.metadata.schema[1].field_id = -1;
+  CHECK(check().reason == verdict_reason::iceberg_schema_invalid_field_id);
+  f.metadata.schema[1].field_id = 1;
+  f.metadata.schema.push_back(f.metadata.schema[1]);
+  f.metadata.schema.back().name = "y";
+  CHECK(check().reason == verdict_reason::iceberg_schema_invalid_field_id);
+}
+
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Parquet annotated lists keep their bound types and adjacent fields on GPU",
                  "[scan][parquet][profile][integration]")
@@ -889,7 +911,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto& manager = sirius::test::get_registered_sirius_context(*con)->get_scan_manager();
   auto source   = manager.create_datasource(path);
   REQUIRE(source);
-  // A foreign identity must not be accepted as a cache hit.
+  // The resolver preserves the cached artifact and its provenance; callers that
+  // require the opened identity (such as describe_parquet) reject it at their
+  // boundary before reading the payload.
   auto foreign = std::make_shared<parquet_metadata>(nullptr,
                                                     64,
                                                     parquet_encryption_evidence{},
@@ -901,7 +925,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto options = cudf::io::parquet_reader_options::builder().build();
   bool hit     = false;
   auto result  = resolve_parquet_metadata_with_identity(*source, 0, path, options, &hit);
-  CHECK_FALSE(hit);
-  CHECK(result.artifact != foreign);
-  CHECK(result.identity == source->get_io_object().identity_cache_key());
+  CHECK(hit);
+  CHECK(result.artifact == foreign);
+  CHECK(result.identity == "foreign-open");
 }

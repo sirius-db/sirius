@@ -162,6 +162,7 @@ enum class verdict_reason : uint16_t {
   iceberg_schema_footers_unreadable,
   iceberg_schema_no_rows,
   iceberg_schema_no_field_ids,
+  iceberg_schema_invalid_field_id,
   iceberg_schema_missing_field,
   iceberg_schema_promoted_type,
   iceberg_schema_field_count,

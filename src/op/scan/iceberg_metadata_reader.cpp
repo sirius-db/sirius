@@ -194,8 +194,8 @@ std::unordered_set<std::string> iceberg_files_without_partition_values(
                                      escape_sql_string(entry.manifest_path) + "') LIMIT 0");
       // The pinned Avro reader represents an empty record as INTEGER. Nonempty
       // partition records are STRUCTs. Unknown/unavailable schemas grant no proof.
-      it->second = result && !result->HasError() && result->types.size() == 1 &&
-                   result->types[0] == duckdb::LogicalType::INTEGER;
+      it->second = result && !result->HasError() && result->GetTypes().size() == 1 &&
+                   result->GetTypes()[0] == duckdb::LogicalType::INTEGER;
     }
     auto const path = sirius::io::strip_file_scheme(entry.file_path);
     if (it->second)

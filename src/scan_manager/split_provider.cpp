@@ -59,7 +59,7 @@ void split_provider::run(Scheduler& scheduler, const push_callback_t& on_split)
     scheduler.enqueue(
       [on_split, work = std::move(work), token = ctrl.acquire()](std::stop_token stop) mutable {
         try {
-          auto split = work(stop);
+          auto split = work();
           on_split(std::move(split));
         } catch (...) {
           on_split(std::current_exception());

@@ -575,7 +575,8 @@ residual_filter::residual_filter(std::vector<table_filter_conjunct> conjuncts,
     if (source.batch_position && answerable_batch_positions.count(*source.batch_position)) {
       answered_at = source.batch_position;
     }
-    _conjuncts.push_back({std::move(lowered), answered_at, source.batch_position});
+    _conjuncts.push_back(
+      {std::move(lowered), answered_at, source.batch_position.value_or(std::size_t{0})});
   }
 }
 

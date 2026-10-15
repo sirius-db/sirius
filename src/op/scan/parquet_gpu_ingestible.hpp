@@ -56,10 +56,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     bool like                                                    = false,
     std::shared_ptr<const sirius::like_multiliteral_cache> cache = nullptr,
     std::unique_ptr<cudf::column>* survivors                     = nullptr,
-    std::span<std::size_t const> elided                          = {}) override
+    std::span<std::size_t const> elided                          = {},
+    expression_query_policy policy                               = {}) override
   {
     return _core.post_filter_and_project(
-      std::move(input), space, stream, like, std::move(cache), survivors, elided);
+      std::move(input), space, stream, like, std::move(cache), survivors, elided, policy);
   }
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override
   {
@@ -70,9 +71,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     const cucascade::memory::memory_space& space,
     ::cuda::stream_ref stream,
     bool like,
-    std::shared_ptr<const sirius::like_multiliteral_cache> cache) override
+    std::shared_ptr<const sirius::like_multiliteral_cache> cache,
+    expression_query_policy policy = {}) override
   {
-    return _core.materialize_metadata_to_table(info, space, stream, like, std::move(cache));
+    return _core.materialize_metadata_to_table(info, space, stream, like, std::move(cache), policy);
   }
 
  private:

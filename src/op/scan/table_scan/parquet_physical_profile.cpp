@@ -171,11 +171,49 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
   std::stop_token stop)
 {
   auto const observed_identity = source.get_io_object().identity_cache_key();
-  // Metadata is always parsed from the complete footer with canonical reader
-  // options. Query projection and filter options belong to the data-read path,
-  // not to the metadata cache identity.
-  bool const cacheable     = !options.get_column_schema().has_value();
-  auto const metadata_opts = cudf::io::parquet_reader_options::builder().build();
+  // Profile all schema-affecting reader options. Custom nested column schemas
+  // are not yet serialised; bypass cache instead of conflating their results.
+  bool const cacheable = !options.get_column_schema().has_value();
+  auto schema_profile  = [](auto const& o) {
+    std::string key = "parquet-v1:";
+    auto append     = [&](auto v) { key += std::to_string(v) + ":"; };
+    append(o.is_enabled_convert_strings_to_categories());
+    append(o.is_enabled_use_pandas_metadata());
+    // Arrow-schema selection does not change the parsed Parquet footer used by the
+    // scan path; keep it out of the metadata identity so equivalent opens share
+    // the canonical artifact.
+    append(o.is_enabled_allow_mismatched_pq_schemas());
+    append(o.is_enabled_ignore_missing_columns());
+    append(o.is_enabled_case_sensitive_names());
+    append(static_cast<int>(o.get_timestamp_type().id()));
+    append(static_cast<int>(o.get_decimal_width()));
+    return key;
+  };
+  auto default_options = cudf::io::parquet_reader_options::builder().build();
+  auto profile         = schema_profile(options);
+  bool const canonical = cacheable && profile == schema_profile(default_options);
+  // Normal bind/pin/scan callers differ only in projection. Parse the complete
+  // footer with canonical options; the consumer applies its own projection to
+  // the resulting FileMetaData. This makes reuse independent of query columns
+  // without assuming that cuDF's projected parser is option-independent.
+  if (canonical) profile = "parquet-v1";
+  auto append = [&](auto v) { profile += std::to_string(v) + ":"; };
+  if (!canonical && options.get_column_names()) {
+    profile += "names:";
+    for (auto const& name : *options.get_column_names()) {
+      profile += std::to_string(name.size()) + ":" + name;
+    }
+  }
+  if (!canonical && options.get_column_indices()) {
+    profile += "indices:";
+    for (auto index : *options.get_column_indices())
+      append(index);
+  }
+  if (!canonical && options.get_column_field_ids()) {
+    profile += "fields:";
+    for (auto id : *options.get_column_field_ids())
+      append(id);
+  }
   if (cache_hit) *cache_hit = false;
   auto build = [&]() -> std::shared_ptr<io::io_object_metadata> {
     auto footer = fetch_plaintext_parquet_footer(source, contract, identity);
@@ -185,21 +223,14 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
       throw std::runtime_error("incomplete Parquet footer evidence: " + identity);
     }
     cudf::io::parquet::experimental::hybrid_scan_reader reader(
-      cudf::host_span<uint8_t const>(footer->data(), footer->size()), metadata_opts);
+      cudf::host_span<uint8_t const>(footer->data(), footer->size()),
+      canonical ? default_options : options);
     auto parsed =
       std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
     std::string arrow_schema;
-    // Stable cuDF returns a string here; nightly cuDF wraps the value in an optional.
-    auto metadata_value = [](auto const& value) -> std::string {
-      if constexpr (requires { value.has_value(); }) {
-        return value.value_or(std::string{});
-      } else {
-        return std::string{value};
-      }
-    };
     for (auto const& entry : parsed->key_value_metadata) {
       if (entry.key == "ARROW:schema") {
-        arrow_schema = metadata_value(entry.value);
+        arrow_schema = entry.value;
         break;
       }
     }
@@ -212,27 +243,17 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
                                                      observed_identity);
     return result;
   };
-  std::shared_ptr<io::io_object_metadata> metadata;
-  if (cacheable && source.io_ctx()) {
-    metadata =
-      source.io_ctx()->metadata_store().get_or_load(source.get_io_object(), build, cache_hit, stop);
-  } else {
-    metadata = build();
-  }
-  auto result = std::dynamic_pointer_cast<parquet_metadata>(metadata);
+  auto metadata = cacheable && source.io_ctx() ? source.io_ctx()->metadata_store().get_or_load(
+                                                   source.get_io_object(), build, cache_hit, stop)
+                                               : build();
+  auto result   = std::dynamic_pointer_cast<parquet_metadata>(metadata);
   if (!result) {
     // Preserve the existing miss behavior for a payload of another metadata type.
     if (cache_hit) *cache_hit = false;
     result = std::static_pointer_cast<parquet_metadata>(build());
     if (cacheable) std::ignore = source.store_metadata(result);
   }
-  if (result->built_for_identity != observed_identity) {
-    if (cache_hit) *cache_hit = false;
-    result = std::dynamic_pointer_cast<parquet_metadata>(build());
-    if (cacheable) std::ignore = source.store_metadata(result);
-  }
-  auto resolved_identity = result->built_for_identity;
-  return {result, std::move(resolved_identity)};
+  return {result, result->built_for_identity};
 }
 
 std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
@@ -537,13 +558,23 @@ physical_profile_result check_iceberg_file_schema(cudf::io::parquet::FileMetaDat
                     "table's current schema");
   std::map<std::pair<std::string, int32_t>, std::string> table_schema, file_schema;
   std::vector<int32_t> table_field_order, file_field_order;
+  std::unordered_set<int32_t> table_field_ids, file_field_ids;
   for (auto const& field : table.fields) {
-    table_schema.emplace(std::make_pair(field.name, field.id), field.type);
+    if (field.id <= 0 || !table_field_ids.insert(field.id).second)
+      return refuse(verdict_reason::iceberg_schema_invalid_field_id,
+                    "iceberg_scan table schema contains a non-positive or duplicate field id");
+    if (!table_schema.emplace(std::make_pair(field.name, field.id), field.type).second)
+      return refuse(verdict_reason::iceberg_schema_invalid_field_id,
+                    "iceberg_scan table schema contains a duplicate field name and field id");
     table_field_order.push_back(field.id);
   }
   for (std::size_t index = 0; index < metadata.schema.size(); ++index) {
     auto const& element = metadata.schema[index];
     if (!element.field_id) continue;
+    if (*element.field_id <= 0 || !file_field_ids.insert(*element.field_id).second)
+      return refuse(verdict_reason::iceberg_schema_invalid_field_id,
+                    "iceberg_scan data file '" + path +
+                      "' contains a non-positive or duplicate Parquet field id");
     file_schema.emplace(
       std::make_pair(element.name, *element.field_id),
       element.num_children > 0 || element.type == cudf::io::parquet::Type::UNDEFINED

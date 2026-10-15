@@ -725,6 +725,14 @@ Two reusable entry points additionally exercise this finish contract:
   allocation extents. The producer must detach statement-affine callbacks before
   ownership transfer. Input/staging capacity remains owned through retirement, even
   if import throws. The caller reserves output/temporary memory and drains the lane.
+  `materialize_arrow_stream()` is the internal sequential verifier above this
+  single-batch importer. Its source returns independently owned batches with a
+  contiguous sequence, declared row/byte envelope, and explicit `nullopt` EOS;
+  zero-row batches remain data. It validates the envelope against the imported
+  batch, sends each result directly to a sink without an unbounded queue, and
+  calls source cancellation on source, import, validation, or sink failure.
+  An adapter may translate an `ArrowArrayStream` one batch at a time, but no
+  public Fragment Arrow-input API or Paimon/DuckLake reader is introduced here.
 
 A direct GPU reader can supply an owning batch to the same validator and finish
 without an Arrow or CPU-vector round trip. These helpers do not register a new SQL
