@@ -49,6 +49,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "util/env_guard.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
 #include "utils/scoped_sirius_setting.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -1844,4 +1845,84 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   require_sinks_match_union(
     "(WITH m AS MATERIALIZED (SELECT rid FROM small_right) SELECT rid, rid * 2 FROM m) "
     "UNION ALL SELECT id, id * 2 FROM big_left");
+}
+
+namespace {
+
+bool delim_join_as_cte(Connection& con)
+{
+  auto result = con.Query("SELECT current_setting('delim_join_as_cte')");
+  REQUIRE_FALSE(result->HasError());
+  return result->Collection().GetValue(0, 0).GetValue<bool>();
+}
+
+std::size_t count_delim_joins(sirius_physical_operator* plan)
+{
+  return collect(plan, SiriusPhysicalOperatorType::LEFT_DELIM_JOIN).size() +
+         collect(plan, SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN).size();
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - Sirius defaults decorrelation to explicit delim joins",
+                 "[plan_tree_shape][isolated_context][delim_join]")
+{
+  // The fixture pins the session value; drop it so the database default Sirius installs applies.
+  REQUIRE_FALSE(con->Query("RESET delim_join_as_cte")->HasError());
+  REQUIRE_FALSE(delim_join_as_cte(*con));
+  // A connection opened after LOAD sees the same default without any SET.
+  Connection fresh(*db);
+  REQUIRE_FALSE(delim_join_as_cte(fresh));
+
+  std::string const correlated_aggregate =
+    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
+    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)";
+  // The TPC-H Q21 pattern: correlated EXISTS and NOT EXISTS with an inequality on a second key.
+  std::string const correlated_exists =
+    "SELECT COUNT(*) FROM items i1, parts p WHERE p.pk = i1.fk AND p.pname = 'p1' "
+    "AND EXISTS (SELECT 1 FROM items i2 WHERE i2.fk = i1.fk AND i2.qty <> i1.qty) "
+    "AND NOT EXISTS (SELECT 1 FROM items i3 WHERE i3.fk = i1.fk AND i3.qty <> i1.qty "
+    "AND i3.qty > 20)";
+
+  SECTION("default: delim joins and no CTE")
+  {
+    for (auto const& query : {correlated_aggregate, correlated_exists}) {
+      auto plan = generate_sirius_plan(*con, query);
+      INFO(query << "\n" << tree_to_string(plan.get()));
+      CHECK(count_delim_joins(plan.get()) > 0);
+      CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) == nullptr);
+    }
+  }
+
+  SECTION("an explicit session SET restores DuckDB's CTE rewrite")
+  {
+    sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+    REQUIRE(delim_join_as_cte(*con));
+    // The other session keeps the database default.
+    REQUIRE_FALSE(delim_join_as_cte(fresh));
+    for (auto const& query : {correlated_aggregate, correlated_exists}) {
+      auto plan = generate_sirius_plan(*con, query);
+      INFO(query << "\n" << tree_to_string(plan.get()));
+      CHECK(count_delim_joins(plan.get()) == 0);
+    }
+    auto plan = generate_sirius_plan(*con, correlated_aggregate);
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  }
+}
+
+TEST_CASE("plan tree shape - an explicit global delim_join_as_cte survives loading Sirius",
+          "[plan_tree_shape][isolated_context][delim_join]")
+{
+  scoped_temp_db_path db_path;
+  auto const cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
+                   "minimal.yaml";
+  sirius::util::env_guard const config("SIRIUS_CONFIG_FILE", cfg.string());
+  sirius::util::env_guard const enabled("SIRIUS_DISABLE", std::nullopt);
+  DBConfig db_config;
+  db_config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+  db_config.SetOptionByName("delim_join_as_cte", Value::BOOLEAN(true));
+  DuckDB db(db_path.path().c_str(), &db_config);
+  Connection con(db);
+  CHECK(delim_join_as_cte(con));
 }
