@@ -47,8 +47,9 @@
 
 // rmm
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <cuda/stream>
 
 // standard library
 #include <algorithm>
@@ -266,7 +267,7 @@ std::vector<cudf::size_type> build_null_indices(size_t num_rows,
 
 void apply_null_mask(cudf::column& column,
                      std::vector<cudf::size_type> const& null_rows,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   if (null_rows.empty() || column.size() == 0) { return; }
@@ -278,7 +279,10 @@ void apply_null_mask(cudf::column& column,
     cudf::clear_bit_unsafe(host_mask.data(), idx);
   }
 
-  rmm::device_buffer mask_buffer(host_mask.data(), bytes, stream, mr);
+  auto mask_buffer =
+    cudf::create_null_mask(column.size(), cudf::mask_state::UNINITIALIZED, stream, mr);
+  cudaMemcpyAsync(
+    mask_buffer.data(), host_mask.data(), bytes, cudaMemcpyHostToDevice, stream.get());
   column.set_null_mask(std::move(mask_buffer), static_cast<cudf::size_type>(null_rows.size()));
 }
 
@@ -329,7 +333,7 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
 cucascade::host_data_representation const& convert_to_host_table(
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   std::shared_ptr<cucascade::data_batch> const& batch,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto& manager = sirius_ctx->get_memory_manager();
 

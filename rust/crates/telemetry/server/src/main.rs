@@ -1,15 +1,24 @@
 use std::{net::ToSocketAddrs, path::PathBuf};
 
 use clap::Parser;
-use instrumentation_model::{Sirius, SiriusContext};
+use nvtx_server::{import_context_events, routes as nvtx_routes};
+use quent_analyzer::context::index_contexts;
 use quent_io::ExporterOptions;
 use quent_io::filesystem::{self, Format};
+use quent_query_engine_analyzer::ui::QuentViewer;
 use quent_query_engine_server::{
-    analyzer_cache::index_query_engines, analyzer_service_router, collector_service,
-    initialize_tracing,
+    analyzer_service_router_with_routes, collector_service, initialize_tracing,
 };
-use sirius_telemetry_analyzer::SiriusUiAnalyzer;
+use quent_store::{
+    context::ContextSet,
+    event::{CombinedEventLoader, filesystem::Loader},
+};
+use sirius_telemetry_analyzer::{SiriusUiAnalyzer, Viewer};
+use sirius_telemetry_instrumentation as instrumentation;
+use sirius_telemetry_store::Sirius;
 use tokio::net::TcpListener;
+
+type SiriusContext = instrumentation::Context<instrumentation::Sirius>;
 
 mod defaults {
     pub(crate) const QUENT_COLLECTOR_ADDRESS: &str = "[::]:7836";
@@ -32,7 +41,7 @@ struct Args {
     #[arg(long, default_value = defaults::QUENT_COLLECTOR_ADDRESS, env = env::QUENT_COLLECTOR_ADDRESS)]
     collector_address: String,
 
-    #[arg(long, default_value = "ndjson", env = env::QUENT_COLLECTOR_EXPORTER)]
+    #[arg(long, default_value = "ndjson", value_parser = ["ndjson"], env = env::QUENT_COLLECTOR_EXPORTER)]
     exporter: String,
 
     #[arg(long, default_value = "data", env = env::QUENT_COLLECTOR_OUTPUT_DIR)]
@@ -51,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_level,
         cors_address,
         collector_address,
-        exporter,
+        exporter: _,
         output_dir,
         analyzer_address,
     } = Args::parse();
@@ -69,23 +78,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let importer_output_dir = output_dir.clone();
     let lister_output_dir = output_dir.clone();
+    let nvtx_output_dir = output_dir.clone();
 
-    let format = match exporter.as_str() {
-        "ndjson" => Format::Ndjson,
-        "msgpack" => Format::Msgpack,
-        "postcard" => Format::Postcard,
-        other => return Err(format!("unknown exporter: {other}").into()),
-    };
     // Each context exports under `output_dir/<context-id>/<entity>/`, so the
     // collector writes per-entity streams beneath output_dir.
-    let exporter_kind =
-        ExporterOptions::FileSystem(filesystem::exporter::Options::new(format, output_dir));
+    let exporter_kind = ExporterOptions::FileSystem(filesystem::exporter::Options::new(
+        Format::Ndjson,
+        output_dir,
+    ));
 
     // The collector builds a fresh sink per incoming context, replaying each
     // remote source's events under that source's own context id.
     let collector = async {
         collector_service::<SiriusContext, _>(move |id| {
-            SiriusContext::try_with_id(id, Some(exporter_kind.clone())).map_err(|e| e.to_string())
+            SiriusContext::try_with_id(id, exporter_kind.clone()).map_err(|e| e.to_string())
         })?
         .serve(collector_addr)
         .await
@@ -94,23 +100,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Index the exported contexts by engine instance: each engine's telemetry is
     // the engine's own context plus its workers' contexts.
-    let lister = move || index_query_engines(&lister_output_dir);
+    let lister = move || {
+        index_contexts(&lister_output_dir, |context_dir| {
+            Ok(Viewer::context_inventory(context_dir)?)
+        })
+    };
 
     // Reconstruct one context's umbrella event stream from its per-entity
     // subdirectories; the analyzer cache chains this across all the contexts that
     // make up an engine instance.
     let importer = move |context_id| {
-        let dir = importer_output_dir.join(format!("{context_id}"));
-        Ok(Sirius::import_events(&dir)?)
+        let events = Loader::<Sirius>::new(&importer_output_dir, ContextSet::one(context_id))
+            .combined_events()
+            .map_err(quent_io::ImporterError::other)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(quent_io::ImporterError::other)?;
+        Ok::<Box<dyn Iterator<Item = _>>, quent_query_engine_server::error::ServerError>(Box::new(
+            events.into_iter(),
+        ))
     };
 
     let analyzer = async {
         axum::serve(
             TcpListener::bind(analyzer_addr).await?,
-            analyzer_service_router::<SiriusUiAnalyzer>(
+            analyzer_service_router_with_routes::<SiriusUiAnalyzer>(
                 Box::new(importer),
                 Box::new(lister),
                 cors_address,
+                nvtx_routes(Box::new(move |context_id| {
+                    import_context_events(&nvtx_output_dir, context_id)
+                })),
             )?
             .into_make_service(),
         )

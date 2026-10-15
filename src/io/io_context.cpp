@@ -19,20 +19,23 @@
 #include "io/cache/config.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/types.hpp"
+#include "io/uri_parser.hpp"
 
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <exception>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius::io {
 
-sirius_ioctx::sirius_ioctx()  = default;
-sirius_ioctx::~sirius_ioctx() = default;
+ioctx::ioctx()  = default;
+ioctx::~ioctx() = default;
 
-void sirius_ioctx::initialize_cache(
+void ioctx::initialize_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
   io::cache::config const& cache_config,
   std::shared_ptr<const sirius::memory::topology_index> topology_index) noexcept
@@ -40,13 +43,12 @@ void sirius_ioctx::initialize_cache(
   // One-shot.  Repeated calls are silent no-ops so callers can be
   // robust to multiple wiring sites.
   if (_cache) {
-    SIRIUS_LOG_WARN(
-      "sirius_ioctx::initialize_cache() called but prefetching_cache already present");
+    SIRIUS_LOG_WARN("ioctx::initialize_cache() called but prefetching_cache already present");
     return;
   }
   if (!can_use_prefetching_cache()) {
     SIRIUS_LOG_WARN(
-      "sirius_ioctx::initialize_cache() called but backend does not support vector host read");
+      "ioctx::initialize_cache() called but backend does not support vector host read");
     return;
   }
   try {
@@ -59,42 +61,137 @@ void sirius_ioctx::initialize_cache(
     SIRIUS_LOG_ERROR("prefetching_cache construction failed: unknown error");
     _cache.reset();
   }
+  // The reactors plan a fragmented fill's extent with
+  // cache::fill_span(fill, chunk->offset, their own staging block size).  A
+  // cache whose chunks are a different size makes every partial fill compute
+  // the wrong extent -- with the larger staging block that is an out-of-bounds
+  // write past the end of a pinned chunk.  The two are equal today only because
+  // both read the same front HOST arena; refuse the cache rather than let a
+  // future split of those resources corrupt the heap silently.
+  if (_cache && staging_block_size() != 0 && staging_block_size() != _cache->chunk_size()) {
+    SIRIUS_LOG_ERROR(
+      "ioctx::initialize_cache: backend {} stages in {}-byte blocks but the prefetching cache "
+      "chunk is {} bytes; the two must match because fragmented fills are planned with the "
+      "staging block size -- running without a cache",
+      static_cast<int>(type()),
+      staging_block_size(),
+      _cache->chunk_size());
+    _cache.reset();
+  }
 }
 
-void sirius_ioctx::shutdown_cache() noexcept { _cache.reset(); }
+void ioctx::shutdown_cache() noexcept { _cache.reset(); }
 
-std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path)
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path)
 {
   // Create the backend-appropriate io_object (local fds / object-store HEAD /
   // ...) and wrap it in a sirius_datasource bound to this ioctx.  Datasource
   // construction is uniform across backends, so it lives here rather than in a
   // per-backend hook.
-  return std::make_unique<sirius_datasource>(shared_from_this(), create_io_object(std::move(path)));
+  //
+  // `file://` is stripped HERE, at the single funnel above the create_io_object
+  // virtual, rather than at each call site: sirius_scan_manager normalizes on the
+  // paths it owns, but callers that hold an ioctx and open directly
+  // (parquet_gpu_ingestible::build_file_scan_info, iceberg_metadata_reader's
+  // delete-file reads, duckdb_native_gpu_ingestible) bypassed it entirely. An
+  // un-stripped URI reaches the local reactor's "unsupported path" throw, which
+  // becomes a RUNTIME fallback rather than a clean plan-time decline.
+  return std::make_unique<sirius_datasource>(shared_from_this(),
+                                             create_io_object(strip_file_scheme(path)));
 }
 
-std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path, open_hint hint)
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path, open_hint hint)
 {
   return std::make_unique<sirius_datasource>(shared_from_this(),
-                                             create_io_object(std::move(path), hint));
+                                             create_io_object(strip_file_scheme(path), hint));
 }
 
-std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path,
-                                                                 std::uint64_t known_size)
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path,
+                                                          std::uint64_t known_size)
 {
   return std::make_unique<sirius_datasource>(shared_from_this(),
-                                             create_io_object(std::move(path), known_size));
+                                             create_io_object(strip_file_scheme(path), known_size));
 }
 
-std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
-                                                                 open_hint /*hint*/)
+std::shared_ptr<io_object> ioctx::create_io_object(std::string path, open_hint /*hint*/)
 {
   return create_io_object(std::move(path));
 }
 
-std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
-                                                                 std::uint64_t /*known_size*/)
+std::shared_ptr<io_object> ioctx::create_io_object(std::string path, std::uint64_t /*known_size*/)
 {
   return create_io_object(std::move(path));
+}
+
+exec::semi_future<size_t> ioctx::host_read_async_io(const io_object& obj,
+                                                    size_t offset,
+                                                    size_t size,
+                                                    uint8_t* dst) noexcept
+{
+  if (size == 0) return exec::make_semi_future<size_t>(0);
+  try {
+    if (dst == nullptr) throw std::invalid_argument("host read destination is null");
+    std::vector<prepared_io_slice> slices{prepared_io_slice{range{offset, size}, host_buffer{dst}}};
+    return host_device_readv_async_io(obj, std::move(slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
+}
+
+exec::semi_future<size_t> ioctx::device_read_async_io(const io_object& obj,
+                                                      size_t offset,
+                                                      size_t size,
+                                                      uint8_t* dst,
+                                                      ::cuda::stream_ref stream) noexcept
+{
+  if (size == 0) return exec::make_semi_future<size_t>(0);
+  try {
+    if (dst == nullptr) throw std::invalid_argument("device read destination is null");
+    std::vector<prepared_io_slice> slices{
+      prepared_io_slice{range{offset, size}, device_buffer{dst, stream}}};
+    return host_device_readv_async_io(obj, std::move(slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
+}
+
+exec::semi_future<size_t> ioctx::host_readv_async_io(const io_object& obj,
+                                                     std::span<const slice> slices) noexcept
+{
+  if (slices.empty()) return exec::make_semi_future<size_t>(0);
+  try {
+    std::vector<prepared_io_slice> prepared_slices;
+    prepared_slices.reserve(slices.size());
+    for (auto const& current : slices) {
+      if (current.size() == 0) continue;
+      if (current.dst == nullptr) throw std::invalid_argument("host readv destination is null");
+      prepared_slices.emplace_back(range{current.offset(), current.size()},
+                                   host_buffer{current.dst});
+    }
+    return host_device_readv_async_io(obj, std::move(prepared_slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
+}
+
+exec::semi_future<size_t> ioctx::device_readv_async_io(const io_object& obj,
+                                                       std::span<const slice> slices,
+                                                       ::cuda::stream_ref stream) noexcept
+{
+  if (slices.empty()) return exec::make_semi_future<size_t>(0);
+  try {
+    std::vector<prepared_io_slice> prepared_slices;
+    prepared_slices.reserve(slices.size());
+    for (auto const& current : slices) {
+      if (current.size() == 0) continue;
+      if (current.dst == nullptr) throw std::invalid_argument("device readv destination is null");
+      prepared_slices.emplace_back(range{current.offset(), current.size()},
+                                   device_buffer{current.dst, stream});
+    }
+    return host_device_readv_async_io(obj, std::move(prepared_slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
 }
 
 }  // namespace sirius::io

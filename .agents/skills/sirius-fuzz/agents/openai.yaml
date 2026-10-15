@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sirius Fuzz"
+  short_description: "Run SQL checks on available developer hardware"
+  default_prompt: "Use $sirius-fuzz to check my environment, run a short SQL correctness campaign on an available development GPU, and summarize the saved results."

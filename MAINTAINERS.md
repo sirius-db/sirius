@@ -5,6 +5,7 @@
 | Felipe Aramburu | NVIDIA | felipeblazing |
 | Rodrigo Aramburu | NVIDIA | roaramburu |
 | Amin Aramoon | NVIDIA | aminaramoon |
+| James Bourbeau | NVIDIA | jrbourbeau |
 | Matthijs Brobbel | NVIDIA | mbrobbel |
 | Pradeep Garigipati | NVIDIA | 9prady9 |
 | Joost Hoozemans | NVIDIA | joosthooz |
@@ -16,8 +17,8 @@
 | Alexander Ocsa| NVIDIA| aocsa |
 | Joshua Patterson | NVIDIA | datametrician |
 | Johan Peltenburg | NVIDIA | johanpel |
-| Yu Teng | TBD | ran-yuan-rui |
+| Yu Teng | NVIDIA | ran-yuan-rui |
 | Dhruv Vats | NVIDIA | dhruv9vats |
 | Mike Wendt | NVIDIA | mike-wendt |
 | Bobbi Yogatama| NVIDIA | bwyogatama |
-| Xiangyao Yu | UW-Madison | yxymit |
+| Xiangyao Yu | UW-Madison, NVIDIA | yxymit |

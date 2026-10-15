@@ -1,0 +1,64 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    n_regionkey[#6]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  4:VEXCHANGE
+     offset: 0
+     distribute expr lists: n_regionkey[#6]
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: n_regionkey[#5]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    UNPARTITIONED
+
+  3:VAGGREGATE (merge finalize)(158)
+  |  group by: n_regionkey[#5]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: n_regionkey[#5]
+  |  
+  2:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    HASH_PARTITIONED: n_regionkey[#5]
+
+  1:VAGGREGATE (update serialize)(150)
+  |  STREAMING
+  |  group by: n_regionkey[#4]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: 
+  |  
+  0:VTVF_SCAN_NODE(142)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=2250, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.n_regionkey[#2]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

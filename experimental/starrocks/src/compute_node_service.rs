@@ -204,7 +204,16 @@ impl SiriusComputeNodeService {
         params: &TExecPlanFragmentParams,
     ) -> std::result::Result<(), String> {
         let params = self.resolve_descriptor_table(params)?;
-        let translated = self.translate_fragment_logged(&params)?;
+        let dump_seq = Self::dump_fragment(&params);
+        // Survey mode: accept every fragment so the FE dispatches (and we dump) the whole
+        // plan even when translation fails. Queries still fail at fetch_data.
+        if std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some() {
+            if let Err(err) = self.translate_fragment_logged(&params, dump_seq) {
+                tracing::warn!(error = %err, "translate-only mode: accepting untranslatable fragment");
+            }
+            return Ok(());
+        }
+        let translated = self.translate_fragment_logged(&params, dump_seq)?;
         self.execute_and_buffer(&params, &translated)
     }
 
@@ -243,6 +252,22 @@ impl SiriusComputeNodeService {
             cache.insert(query_id, desc.clone());
         }
         Ok(resolved)
+    }
+
+    /// Writes the received fragment params to `$SIRIUS_CN_DUMP_FRAGMENTS/fragment-<seq>.txt`
+    /// (debug format) for offline plan analysis. No-op when the variable is unset.
+    fn dump_fragment(params: &TExecPlanFragmentParams) -> Option<u64> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let Ok(dir) = std::env::var("SIRIUS_CN_DUMP_FRAGMENTS") else {
+            return None;
+        };
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::path::Path::new(&dir).join(format!("fragment-{seq:04}.txt"));
+        if let Err(err) = std::fs::write(&path, format!("{params:#?}")) {
+            tracing::warn!(error = %err, path = %path.display(), "failed to dump fragment params");
+        }
+        Some(seq)
     }
 
     /// Executes a RESULT_SINK fragment and buffers its rows. Non-result-sink fragments (e.g. a
@@ -310,12 +335,13 @@ impl SiriusComputeNodeService {
         Ok(())
     }
 
-    /// Converts a StarRocks thrift plan fragment to Substrait, logs substrait-explain output, and
+    /// Converts a StarRocks thrift plan fragment to Substrait, logs its protobuf debug output, and
     /// returns the translated plan for execution.
     #[instrument(skip_all)]
     fn translate_fragment_logged(
         &self,
         params: &TExecPlanFragmentParams,
+        dump_seq: Option<u64>,
     ) -> std::result::Result<TranslatedPlan, String> {
         let translated = self
             .translator
@@ -323,10 +349,26 @@ impl SiriusComputeNodeService {
             .map_err(|err| err.to_string())?;
         info!(
             output_names = ?translated.output_names,
-            plan = %translated.explain(),
+            plan = ?translated.plan,
             "translated StarRocks plan fragment"
         );
+        Self::dump_substrait(&translated, dump_seq);
         Ok(translated)
+    }
+
+    /// Writes the translated Substrait plan bytes to `$SIRIUS_CN_DUMP_FRAGMENTS/plan-<seq>.substrait`
+    /// so a failing plan can be replayed against the engine in isolation. No-op when unset.
+    fn dump_substrait(translated: &TranslatedPlan, dump_seq: Option<u64>) {
+        let Ok(dir) = std::env::var("SIRIUS_CN_DUMP_FRAGMENTS") else {
+            return;
+        };
+        let Some(seq) = dump_seq else {
+            return;
+        };
+        let path = std::path::Path::new(&dir).join(format!("plan-{seq:04}.substrait"));
+        if let Err(err) = std::fs::write(&path, translated.to_substrait_bytes()) {
+            tracing::warn!(error = %err, path = %path.display(), "failed to dump substrait plan");
+        }
     }
 
     /// Classifies the fragment output sink: `Ok(true)` for a MySQL text-protocol RESULT_SINK this
@@ -366,7 +408,7 @@ impl SiriusComputeNodeService {
             .map(|exec| FragmentInstanceId::from(&exec.fragment_instance_id))
     }
 
-    /// Extracts the parquet path from the binary-thrift attachment and infers its schema.
+    /// Extracts every parquet path from the binary-thrift attachment and infers one schema they all share.
     async fn file_schema_from_attachment(
         attachment: &[u8],
     ) -> std::result::Result<Vec<PSlotDescriptor>, String> {
@@ -375,26 +417,23 @@ impl SiriusComputeNodeService {
         let broker = request.scan_range.broker_scan_range.ok_or_else(|| {
             "TGetFileSchemaRequest scan_range carries no broker_scan_range".to_string()
         })?;
-        // Cross-file sampling and type promotion (what the native scanner does for multi-file
-        // FILES()) is a follow-up; reject multiple ranges rather than resolve a partial schema.
-        let ranges = broker.ranges;
-        if ranges.len() > 1 {
-            return Err(format!(
-                "multi-file FILES() schema inference is not supported yet ({} files); use a single file path",
-                ranges.len()
-            ));
+        if broker.ranges.is_empty() {
+            return Err("broker_scan_range carries no file ranges".to_string());
         }
-        let range = ranges
+        let paths = broker
+            .ranges
             .into_iter()
-            .next()
-            .ok_or_else(|| "broker_scan_range carries no file ranges".to_string())?;
-        if range.format_type != TFileFormatType::FORMAT_PARQUET {
-            return Err(format!(
-                "unsupported file format {:?}; only parquet schema inference is implemented",
-                range.format_type
-            ));
-        }
-        crate::file_schema::parquet_file_schema(&range.path).await
+            .map(|range| {
+                if range.format_type != TFileFormatType::FORMAT_PARQUET {
+                    return Err(format!(
+                        "unsupported file format {:?} for '{}'; only parquet schema inference is implemented",
+                        range.format_type, range.path
+                    ));
+                }
+                Ok(range.path)
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        crate::file_schema::parquet_files_schema(&paths).await
     }
 
     /// Deserializes a thrift struct using the StarRocks binary attachment protocol.

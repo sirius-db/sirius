@@ -52,8 +52,9 @@ fs::path integration_db_path()
 #endif
 }
 
-// `fuse_merge_pipelines` is a per-connection DuckDB setting (no process-global), so the toggle is
-// driven with `SET`/`RESET` on the connection the plan is generated on.
+// The unittest process explicitly enables guarded test settings before constructing a database.
+// The test-only toggle is per-connection, so drive it with `SET`/`RESET` on the connection whose
+// plan is generated.
 class fusion_flag_guard {
  public:
   fusion_flag_guard(duckdb::Connection& con, bool enabled) : con_(con)
@@ -71,8 +72,7 @@ class fusion_flag_guard {
 };
 
 const sirius_pipeline* pipeline_containing(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
-  SiriusPhysicalOperatorType type)
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines, SiriusPhysicalOperatorType type)
 {
   for (const auto& pipeline : pipelines) {
     for (const auto& op : pipeline->get_operators()) {
@@ -138,7 +138,7 @@ void require_unfused_terminal_shape(sirius::sirius_engine& engine,
 }
 
 //! True when some scheduled pipeline contains both operator types.
-bool pipeline_contains_both(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
+bool pipeline_contains_both(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines,
                             SiriusPhysicalOperatorType a,
                             SiriusPhysicalOperatorType b)
 {
@@ -155,8 +155,7 @@ bool pipeline_contains_both(const duckdb::vector<duckdb::shared_ptr<sirius_pipel
 }
 
 //! Dump scheduled pipeline shapes for diagnostic failures.
-std::string dump_pipeline_shapes(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+std::string dump_pipeline_shapes(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
 {
   std::string out;
   for (std::size_t i = 0; i < pipelines.size(); i++) {
@@ -172,15 +171,15 @@ std::string dump_pipeline_shapes(
 }
 
 //! Collect rows, sorting them unless emission order is significant.
-std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
-                                                   bool ordered)
+std::vector<std::vector<std::string>> collect_rows(duckdb::QueryResult& result, bool ordered)
 {
   std::vector<std::vector<std::string>> rows;
-  for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
+  auto result_rows = result.Collection().GetRows();
+  for (duckdb::idx_t r = 0; r < result_rows.size(); r++) {
     std::vector<std::string> row;
     row.reserve(result.ColumnCount());
     for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-      row.push_back(result.GetValue(c, r).ToString());
+      row.push_back(result_rows.GetValue(c, r).ToString());
     }
     rows.push_back(std::move(row));
   }
@@ -218,8 +217,8 @@ void require_fusion_results_match(duckdb::Connection& con,
   REQUIRE(fused->ColumnCount() == unfused->ColumnCount());
   REQUIRE(fused->RowCount() == unfused->RowCount());
 
-  auto& fused_mat   = fused->Cast<duckdb::MaterializedQueryResult>();
-  auto& unfused_mat = unfused->Cast<duckdb::MaterializedQueryResult>();
+  auto& fused_mat   = *fused;
+  auto& unfused_mat = *unfused;
   auto fused_rows   = collect_rows(fused_mat, ordered);
   auto unfused_rows = collect_rows(unfused_mat, ordered);
 

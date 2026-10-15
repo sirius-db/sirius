@@ -398,7 +398,7 @@ template <typename T>
 void launch_alp_typed(detail::cta_block_desc const* h_descs,
                       size_t num_vecs,
                       T* d_output,
-                      rmm::cuda_stream_view stream,
+                      ::cuda::stream_ref stream,
                       rmm::device_async_resource_ref mr)
 {
   constexpr uint32_t MAX_PACKED_BYTES = duckdb::AlpConstants::ALP_VECTOR_SIZE * sizeof(T);
@@ -412,10 +412,10 @@ void launch_alp_typed(detail::cta_block_desc const* h_descs,
                                h_descs,
                                num_vecs * sizeof(detail::cta_block_desc),
                                cudaMemcpyHostToDevice,
-                               stream.value()));
+                               stream.get()));
 
   kernel_decode_alp<MAX_PACKED_WORDS, T>
-    <<<static_cast<uint32_t>(num_vecs), ALP_BLOCK_DIM, 0, stream.value()>>>(
+    <<<static_cast<uint32_t>(num_vecs), ALP_BLOCK_DIM, 0, stream.get()>>>(
       d_descs.data(), d_output, static_cast<uint32_t>(num_vecs));
 }
 
@@ -630,7 +630,7 @@ template <typename T>
 void launch_alprd_typed(detail::cta_block_desc const* h_descs,
                         size_t num_vecs,
                         T* d_output,
-                        rmm::cuda_stream_view stream,
+                        ::cuda::stream_ref stream,
                         rmm::device_async_resource_ref mr)
 {
   // Live shmem: left stream (left_bw ≤ MAX_DICTIONARY_BIT_WIDTH) + right
@@ -650,10 +650,10 @@ void launch_alprd_typed(detail::cta_block_desc const* h_descs,
                                h_descs,
                                num_vecs * sizeof(detail::cta_block_desc),
                                cudaMemcpyHostToDevice,
-                               stream.value()));
+                               stream.get()));
 
   kernel_decode_alprd<SHMEM_WORDS, T>
-    <<<static_cast<uint32_t>(num_vecs), ALP_BLOCK_DIM, 0, stream.value()>>>(
+    <<<static_cast<uint32_t>(num_vecs), ALP_BLOCK_DIM, 0, stream.get()>>>(
       d_descs.data(), d_output, static_cast<uint32_t>(num_vecs));
 }
 
@@ -681,7 +681,7 @@ void decode_alp_data(gpu_codec_run const& run,
                      uint8_t* d_output,
                      cudf::data_type /*type*/,
                      uint32_t type_size,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   auto const descs = detail::build_block_descs<ALP_VECTOR_SIZE>(run);
@@ -721,7 +721,7 @@ void decode_alprd_data(gpu_codec_run const& run,
                        uint8_t* d_output,
                        cudf::data_type /*type*/,
                        uint32_t type_size,
-                       rmm::cuda_stream_view stream,
+                       ::cuda::stream_ref stream,
                        rmm::device_async_resource_ref mr)
 {
   auto const descs = detail::build_block_descs<ALP_VECTOR_SIZE>(run);

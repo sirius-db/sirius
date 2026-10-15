@@ -93,7 +93,7 @@ void add_int_batches(cucascade::shared_data_repository& repo,
 
 void attach_port(sirius_physical_sort_sample& sample_op,
                  cucascade::shared_data_repository& repo,
-                 duckdb::shared_ptr<mock_gpu_pipeline> src_pipeline = nullptr)
+                 std::shared_ptr<mock_gpu_pipeline> src_pipeline = nullptr)
 {
   auto port           = std::make_unique<sirius_physical_operator::port>();
   port->type          = MemoryBarrierType::PIPELINE;
@@ -167,7 +167,7 @@ TEST_CASE("sirius_physical_sort_sample get_next_task_hint waits for sample bytes
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(false);
 
   // get_next_task_hint() reports the upstream pipeline's first operator as the producer.
@@ -200,7 +200,7 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(true);
   attach_port(sample_op, *repo, src_pipeline);
 
@@ -249,7 +249,7 @@ TEST_CASE(
   add_int_batches(*repo, *space, num_batches, rows_per_batch);
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(true);
   attach_port(sample_op, *repo, src_pipeline);
 
@@ -328,7 +328,7 @@ TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual by
   repo->add_data_batch(std::move(batch), 0);
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(true);
   attach_port(sample_op, *repo, src_pipeline);
 
@@ -381,7 +381,7 @@ TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplic
   if (num_batches > 1) { add_int_batches(*repo, *space, num_batches - 1, rows_per_batch); }
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(upstream_finished);
   attach_port(sample_op, *repo, src_pipeline);
 

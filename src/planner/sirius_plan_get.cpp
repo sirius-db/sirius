@@ -15,11 +15,17 @@
  */
 
 #include "cudf/cudf_utils.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -29,26 +35,302 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
+#include "exec/stream_bind_catalog.hpp"
+#include "exec/stream_plan_bindings.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
+#include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
+#include "op/scan/iceberg_metadata_connection.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace sirius::planner {
 
 namespace {
+
+using scan_reason  = sirius::op::scan::verdict_reason;
+using scan_verdict = sirius::op::scan::eligibility_verdict;
+using pre_decline  = sirius::op::scan::pre_decline;
+
+pre_decline iceberg_decline(scan_reason reason,
+                            std::string text,
+                            scan_verdict verdict = scan_verdict::unsupported)
+{
+  return {verdict, reason, "iceberg_scan declines the GPU scan path: " + std::move(text)};
+}
+
+/// Descends into children so a struct's fields count toward the id space they occupy.
+void collect_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns,
+                       std::vector<int32_t>& out)
+{
+  for (auto const& column : columns) {
+    if (!column.identifier.IsNull() &&
+        column.identifier.type().id() == duckdb::LogicalTypeId::INTEGER) {
+      out.push_back(column.identifier.GetValue<int32_t>());
+    }
+    collect_field_ids(column.children, out);
+  }
+}
+
+/**
+ * @brief Refuse tables whose Iceberg field-id space has a gap, meaning a column was dropped.
+ *
+ * Iceberg never reuses a field id, so a column dropped and re-added under the same name gets a
+ * NEW id and must read NULL in older data files. This path resolves columns by NAME, so it finds
+ * the dropped column and returns data the table removed, with no error and no fallback.
+ *
+ * With no drops N fields occupy ids 1..N, so `max > count` means an id was retired. Reads only
+ * bind data, opens no files.
+ *
+ * A PRE-FILTER, not the whole test: a plain ADDED column keeps the space contiguous and slips
+ * through, but that case fails loudly instead of returning wrong rows. Resolving by field id is
+ * the complete fix; DuckDB's MultiFileColumnMapper already implements it.
+ */
+std::optional<std::string> iceberg_retired_field_id_decline_reason(duckdb::LogicalGet& op)
+{
+  auto const* bind_data = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
+  if (bind_data == nullptr) { return std::nullopt; }
+
+  // `reader_bind.schema` is the Iceberg schema and the only one carrying field ids; the generic
+  // `columns` list may leave `identifier` null, so it is a fallback only.
+  std::vector<int32_t> field_ids;
+  collect_field_ids(
+    bind_data->reader_bind.schema.empty() ? bind_data->columns : bind_data->reader_bind.schema,
+    field_ids);
+  if (field_ids.empty()) { return std::nullopt; }
+
+  auto const max_field_id = *std::max_element(field_ids.begin(), field_ids.end());
+  if (max_field_id <= static_cast<int32_t>(field_ids.size())) { return std::nullopt; }
+
+  return "iceberg_scan table has a gap in its Iceberg field ids (highest is " +
+         std::to_string(max_field_id) + " across " + std::to_string(field_ids.size()) +
+         " fields), so a column was dropped; this scan path resolves columns by name and would "
+         "read a dropped column's data in place of the re-added one";
+}
+
+// Why an `iceberg_scan` table must decline the GPU path, or nullopt when it may run there.
+//
+// V2 positional deletes and V3 deletion vectors are applied on GPU. Equality deletes are not:
+// they match on key VALUES, so the scan must force-project the key columns even when the query
+// does not select them, which is not wired.
+//
+// Conservative by construction: any failure to PROVE the table free of equality deletes declines
+// to CPU. A false positive costs performance; a false negative would drop deletes silently.
+//
+// Each decline returns the reason it actually hit — a probe that never managed to look is not
+// the same as a table that really carries equality deletes.
+std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
+  duckdb::LogicalGet& op,
+  duckdb::ClientContext& context,
+  uint64_t& delete_time_us,
+  std::optional<op::scan::iceberg_delete_inventory>& inventory,
+  std::string_view injection)
+{
+  if (op.parameters.empty() || op.parameters.front().IsNull()) {
+    return iceberg_decline(
+      scan_reason::iceberg_no_table_path,
+      "iceberg_scan called without a table path, so its delete files cannot be inspected");
+  }
+
+  std::string table_path;
+  try {
+    // GetValue<string>() calls ToString() even for INTEGER at this DuckDB pin.
+    if (op.parameters.front().type().id() != duckdb::LogicalTypeId::VARCHAR)
+      throw duckdb::InvalidInputException("Iceberg table path must be VARCHAR");
+    table_path = op.parameters.front().GetValue<std::string>();
+  } catch (...) {
+    return iceberg_decline(
+      scan_reason::iceberg_table_path_not_string,
+      "iceberg_scan table path is not a string, so its delete files cannot be inspected");
+  }
+  if (table_path.empty()) {
+    return iceberg_decline(
+      scan_reason::iceberg_table_path_empty,
+      "iceberg_scan table path is empty, so its delete files cannot be inspected");
+  }
+
+  // iceberg_scan has three snapshot selectors; the delete path honours only snapshot_from_id,
+  // so the others would resolve deletes against the CURRENT snapshot while the scan reads the
+  // time-travelled one — filtering snapshot A's data by snapshot B's deletes.
+  //
+  // Deliberately coarse: narrowing it to tables that actually have deletes at the SELECTED
+  // snapshot needs the very selector resolution that is missing. To lift it, thread the full
+  // selector into read_iceberg_delete_data AND into its cache key — the key currently records
+  // snapshot_from_id or "current", so two timestamps against one table would collide.
+  for (auto const& selector : {"snapshot_from_timestamp", "version"}) {
+    auto it = op.named_parameters.find(selector);
+    if (it != op.named_parameters.end() && !it->second.IsNull()) {
+      return iceberg_decline(
+        scan_reason::iceberg_selector_not_snapshot_id,
+        std::string("iceberg_scan was given '") + selector +
+          "', but the GPU scan path resolves delete files only by snapshot_from_id, so its "
+          "deletes would be read from the wrong snapshot");
+    }
+  }
+
+  // The flag rewrites bound data-file paths to <table_path>/data/<name>, while delete discovery
+  // calls iceberg_metadata() without it and keeps the manifests' originals. The two then match
+  // nothing and every delete is silently dropped.
+  if (auto it = op.named_parameters.find("allow_moved_paths");
+      it != op.named_parameters.end() && !it->second.IsNull()) {
+    bool moved = false;
+    try {
+      moved = it->second.GetValue<bool>();
+    } catch (...) {
+      moved = true;  // Unparsable: assume the rewrite is on rather than assume it is off.
+    }
+    if (moved) {
+      return iceberg_decline(
+        scan_reason::iceberg_moved_paths,
+        "iceberg_scan was given 'allow_moved_paths', which rewrites its data-file paths; the "
+        "GPU path discovers delete files under the paths the manifests record, so the two "
+        "would not match and the table's deletes would be dropped");
+    }
+  }
+
+  // "current" is resolved independently by DuckDB's bind, by Sirius's rebind of the serialized
+  // plan, and by delete discovery; nothing makes the three agree, so a commit landing between any
+  // two pairs one snapshot's data files with another's deletes. The id DuckDB bound is not
+  // reachable -- it lives in types the iceberg extension compiles privately.
+  //
+  // Do NOT resolve it here instead. Highest sequence number is not the current snapshot under
+  // rollback, branches or staged WAP commits, and comparing data-file sets cannot separate two
+  // snapshots that differ only in deletes. Lifting this needs serializable iceberg bind data
+  // upstream, or Sirius not planning twice.
+  {
+    auto const it = op.named_parameters.find("snapshot_from_id");
+    if (it == op.named_parameters.end() || it->second.IsNull()) {
+      return iceberg_decline(
+        scan_reason::iceberg_no_snapshot_id,
+        "iceberg_scan was called without 'snapshot_from_id', so the snapshot DuckDB bound "
+        "cannot be recovered; the GPU path resolves delete files in a separate pass and "
+        "would risk pairing one snapshot's data files with another's deletes");
+    }
+  }
+
+  if (auto reason = iceberg_retired_field_id_decline_reason(op)) {
+    return iceberg_decline(scan_reason::iceberg_field_id_gap, std::move(*reason));
+  }
+
+  if (!iceberg_table_schema_has_field_ids(op.bind_data.get())) {
+    return iceberg_decline(
+      scan_reason::iceberg_table_schema_no_field_ids,
+      "iceberg_scan table schema has no complete field-id mapping; the GPU path requires "
+      "field IDs to prove per-file schema correspondence");
+  }
+
+  std::optional<int64_t> snapshot_id;
+  // Inspect the same snapshot the scan will read.
+  auto sid_it = op.named_parameters.find("snapshot_from_id");
+  if (sid_it != op.named_parameters.end() && !sid_it->second.IsNull()) {
+    try {
+      snapshot_id = sid_it->second.GetValue<int64_t>();
+    } catch (...) {
+      return iceberg_decline(
+        scan_reason::iceberg_snapshot_id_not_integer,
+        "iceberg_scan snapshot_from_id is not an integer, so the snapshot the scan will read "
+        "cannot be inspected for delete files");
+    }
+  }
+  try {
+    // Opening a second Connection to the same database re-registers the SAME SiriusContext, so
+    // its query-lifecycle callbacks would fire QueryBegin (resetting next_operator_id and
+    // task_creator state) and QueryEnd (clearing all data repositories) underneath the query
+    // currently being planned. InternalQueryGuard suppresses both; without it this probe hangs
+    // the outer query. Same pattern as sirius_extension.cpp's CPU-fallback replay.
+    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (!sirius_ctx) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_plan_get] iceberg delete probe: no SiriusContext — CPU fallback for '{}'",
+        table_path);
+      return iceberg_decline(
+        scan_reason::interface_unavailable,
+        "the iceberg delete probe could not acquire the Sirius context, so the table could "
+        "not be proven free of equality-delete files",
+        scan_verdict::incomplete);
+    }
+    duckdb::SiriusContext::InternalQueryGuard guard(context);
+
+    // See iceberg_metadata_connection: one entry point, shared with discover_from_manifests so
+    // both agree on which tables are legible, and pinned to the same snapshot the scan was bound
+    // to. It mirrors the session's `unsafe_enable_version_guessing` rather than forcing it; a
+    // table the outer session cannot read fails here and the decline below sends it to DuckDB.
+    struct probe_timer {
+      uint64_t& elapsed;
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      bool stopped                                = false;
+      void stop()
+      {
+        if (stopped) return;
+        elapsed += std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count();
+        stopped = true;
+      }
+      ~probe_timer() { stop(); }
+    } timer{delete_time_us};
+    auto result = op::scan::read_delete_inventory(context, table_path, snapshot_id, injection);
+    auto const n_delete_files = result.equality_count;
+    timer.stop();
+    if (n_delete_files > 0) {
+      return iceberg_decline(
+        scan_reason::iceberg_equality_deletes,
+        "this iceberg table has " + std::to_string(n_delete_files) +
+          " equality-delete file(s), which the GPU scan path does not apply yet");
+    }
+
+    inventory = std::move(result.inventory);
+
+    return std::nullopt;
+  } catch (op::scan::inventory_query_error const& e) {
+    if (e.missing_result) {
+      return iceberg_decline(
+        scan_reason::evidence_missing,
+        "the iceberg delete probe returned no rows, so the table could not be proven free of "
+        "equality-delete files",
+        scan_verdict::incomplete);
+    }
+    return iceberg_decline(scan_reason::evidence_missing,
+                           "the iceberg delete probe could not read this table's metadata (" +
+                             std::string(e.what()) +
+                             "), so it could not be proven free of equality-delete files",
+                           scan_verdict::incomplete);
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_DEBUG("[sirius_plan_get] iceberg plan-time probe threw for '{}': {} — CPU fallback",
+                     table_path,
+                     e.what());
+    return iceberg_decline(
+      scan_reason::evidence_missing,
+      "an iceberg plan-time probe threw (" + std::string(e.what()) +
+        "), so the table could not be proven free of equality-delete files or of schema "
+        "evolution",
+      scan_verdict::incomplete);
+  }
+}
 
 // Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
 // boundary. The source vector is drained; size and order are preserved, with a
@@ -108,16 +390,6 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   return changed ? result : std::vector<cudf::data_type>{};
 }
 
-// An OPTIONAL_FILTER is advisory and an IS_NOT_NULL is applied by the scan itself, so
-// neither contributes to the predicate convert_table_filters_to_expression builds
-// (scan_utils.cpp). This must stay in step with that skip set: probing a filter the
-// scan discharges would reject plans the scan handles correctly.
-[[nodiscard]] bool is_discharged_without_translation(duckdb::TableFilterType filter_type)
-{
-  return filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
-         filter_type == duckdb::TableFilterType::IS_NOT_NULL;
-}
-
 // Pushed-down filters bypass LogicalFilter, so validate the remaining predicate at plan
 // time. The runtime translates again because it resolves references against
 // batch-relative positions.
@@ -125,7 +397,7 @@ void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
                                         duckdb::LogicalType const& column_type,
                                         std::string const& column_name)
 {
-  if (is_discharged_without_translation(filter.filter_type)) { return; }
+  if (duckdb::ExpressionFilter::IsOptionalFilter(filter)) { return; }
   auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(column_type, 0);
   auto expression = filter.ToExpression(*column_ref);
   if (sirius::ast::from_duckdb(*expression) == nullptr) {
@@ -134,42 +406,196 @@ void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
   }
 }
 
+// True when the MVCC-blind disk-native read of @p table would not reproduce this
+// transaction's view of it: rows the last checkpoint did not write (transaction-local
+// appends, transient segments), rows it deleted that the image still carries, or
+// in-memory update chains. Every physical column is walked, so a projection-free scan is
+// covered too. Walks every row group, so call it only where a scan is about to be
+// refused anyway (see #1160).
+[[nodiscard]] bool diverges_from_checkpointed_image(duckdb::ClientContext& context,
+                                                    duckdb::DuckTableEntry& table)
+{
+  auto& storage = table.GetStorage();
+  if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
+    return true;
+  }
+  std::vector<duckdb::storage_t> all_columns(storage.ColumnCount());
+  std::iota(all_columns.begin(), all_columns.end(), static_cast<duckdb::storage_t>(0));
+  if (sirius::op::scan::any_uncheckpointed_appends(storage, all_columns)) { return true; }
+  auto& transaction = duckdb::DuckTransaction::Get(context, table.ParentCatalog());
+  return sirius::op::scan::check_native_read_mvcc_state(
+           storage, all_columns, duckdb::TransactionData(transaction)) !=
+         sirius::op::scan::native_read_mvcc_state::exact;
+}
+
 }  // namespace
 
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
   duckdb::TableFilterSet& table_filters, const duckdb::vector<duckdb::ColumnIndex>& column_ids)
 {
-  // create the table filter map
-  auto table_filter_set = duckdb::make_uniq<duckdb::TableFilterSet>();
-  for (auto& table_filter : table_filters.filters) {
-    // find the relative column index from the absolute column index into the table
-    duckdb::optional_idx column_index;
-    for (std::size_t i = 0; i < column_ids.size(); i++) {
-      if (table_filter.first == column_ids[i].GetPrimaryIndex()) {
-        column_index = i;
-        break;
-      }
+  // V2 filter indexes already address column_ids, including multi-column references.
+  auto table_filter_set = table_filters.Copy();
+  for (auto const& entry : *table_filter_set) {
+    if (entry.GetIndex().GetIndex() >= column_ids.size()) {
+      throw duckdb::InternalException("Table filter index is outside scan columns");
     }
-    if (!column_index.IsValid()) {
-      throw duckdb::InternalException("Could not find column index for table filter");
-    }
-    table_filter_set->filters[column_index.GetIndex()] = std::move(table_filter.second);
   }
+
   return table_filter_set;
+}
+
+op::scan::pre_capture_result registered_iceberg_decline_reason(duckdb::LogicalGet& op,
+                                                               duckdb::ClientContext& context,
+                                                               scan_contract_provenance& provenance)
+{
+  op::scan::pre_capture_result result;
+  result.decline = iceberg_gpu_scan_decline_reason(op,
+                                                   context,
+                                                   result.cost.delete_preparation_time_us,
+                                                   result.inventory,
+                                                   provenance.injections.iceberg_discovery);
+  return result;
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet& op)
+{
+  auto const* bind = dynamic_cast<sirius::exec::stream_source_bind_data const*>(op.bind_data.get());
+  if (bind == nullptr) {
+    throw duckdb::InternalException("sirius_stream_source is missing its stream bind data");
+  }
+
+  auto catalog        = sirius::exec::catalog_for(context);
+  auto const& binding = catalog->get(bind->stream_id);
+
+  // Projection pushdown is off; a narrowed column list here would disagree with the binder.
+  auto column_ids = op.GetColumnIds();
+  if (column_ids.size() != binding.types.size()) {
+    throw duckdb::NotImplementedException(
+      "sirius_stream_source: column projection into a stream read is not supported (stream "
+      "declares %llu columns, plan requests %llu)",
+      static_cast<unsigned long long>(binding.types.size()),
+      static_cast<unsigned long long>(column_ids.size()));
+  }
+
+  auto view = std::make_shared<sirius::op::scan::bound_read_view const>(
+    sirius::op::scan::capture_bound_read_view(op, context));
+  sirius::op::scan::column_requirements columns;
+  columns.column_ids = op.GetColumnIds();
+  sirius::op::scan::materializer_contract_identity materializer{
+    sirius::op::scan::materializer_kind::stream, "sirius.stream.v1"};
+  auto const contract_id =
+    sirius::op::scan::allocate_scan_contract(*read_views,
+                                             contract_provenance.window_id,
+                                             contract_provenance.finalize_generation,
+                                             next_scan_node_id++,
+                                             std::move(view),
+                                             std::move(columns),
+                                             {},
+                                             std::move(materializer),
+                                             op.returned_types,
+                                             op.table_index.index);
+  sirius::op::scan::certification_result stream_result;
+  stream_result.verdict = sirius::op::scan::eligibility_verdict::supported;
+  read_views->record_verdict(contract_id, stream_result);
+  auto source =
+    duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(binding.types,
+                                                                    op.EstimateCardinality(context),
+                                                                    binding.repository,
+                                                                    binding.expected_senders,
+                                                                    read_views,
+                                                                    contract_id);
+
+  // Plan owns op; catalog.built back-pointer for session registration.
+  catalog->set_built(bind->stream_id, source.get());
+  return source;
+}
+
+duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> extract_unpushed_scan_filters(
+  duckdb::LogicalGet const& op, duckdb::TableFilterSet& table_filters)
+{
+  if (!op.function.supports_pushdown_type) { return {}; }
+  auto const& column_ids     = op.GetColumnIds();
+  auto const& projection_ids = op.projection_ids;
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
+  duckdb::unordered_set<std::size_t> to_remove;
+  for (auto& entry : table_filters) {
+    auto column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
+    auto& type     = op.returned_types[column_id];
+
+    // If the table function doesn't support pushdown for this column type,
+    // create a separate filter operator for it
+    if (!op.function.supports_pushdown_type(*op.bind_data, column_id)) {
+      auto const pos = std::find(projection_ids.begin(), projection_ids.end(), entry.GetIndex());
+      if (!projection_ids.empty() && pos == projection_ids.end()) {
+        throw duckdb::InternalException("Filter column is missing from the scan projection");
+      }
+      std::size_t column_id_filter = projection_ids.empty()
+                                       ? entry.GetIndex().GetIndex()
+                                       : static_cast<std::size_t>(pos - projection_ids.begin());
+      auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, column_id_filter);
+      select_list.push_back(entry.Filter().ToExpression(*column));
+      to_remove.insert(entry.GetIndex());
+    }
+  }
+  for (auto& col : to_remove) {
+    table_filters.RemoveFilterByColumnIndex(duckdb::ProjectionIndex(col));
+  }
+  return select_list;
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
+  if (op.has_pushed_projection) {
+    throw duckdb::NotImplementedException(
+      "Expressions pushed into a scan are not supported in Sirius");
+  }
   auto column_ids = op.GetColumnIds();
+  for (auto const& column : column_ids) {
+    if (column.IsPushdownExtract()) {
+      throw duckdb::NotImplementedException(
+        "Nested field extraction pushed into a scan is not supported in Sirius");
+    }
+  }
 
-  // Only GPU-route known table scan functions; all others (pragma, system catalog
-  // functions, etc.) must fall back to CPU.
-  static const std::unordered_set<std::string> kSupportedScanFunctions = {
-    "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet"};
-  if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
-    throw duckdb::NotImplementedException("Table function '%s' is not supported in Sirius",
-                                          op.function.name);
+  auto const lookup  = lookup_connector_classified(op, context);
+  auto const* source = lookup.entry;
+  if (!source) {
+    if (read_views->record_declined_lookup(op, lookup.decline)) {
+      auto state = context.registered_state
+                     ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                     : nullptr;
+      if (state) {
+        sirius::op::scan::eligibility_certificate refusal;
+        auto const& record = read_views->declined_lookups().at(op.table_index.index);
+        refusal.verdict    = record.verdict;
+        refusal.reason     = record.reason;
+        state->record_scan_certification(refusal);
+        state->record_semantic_decline(refusal.reason);
+      }
+    }
+    throw duckdb::NotImplementedException(
+      "Table function '%s' is not supported in Sirius (unverified callbacks, overload or bind "
+      "data)",
+      op.function.GetName().GetIdentifierName());
+  }
+
+  // An iceberg table's data files are parquet, and `iceberg_scan` binds them into the same
+  // MultiFileBindData `read_parquet` uses, so the parquet ingestible reads them as-is; the
+  // iceberg ingestible then applies positional deletes and deletion vectors to each decoded
+  // batch. Equality deletes are not applied yet, and reading a table that has them as plain
+  // parquet would silently return rows the table logically deleted — so refuse here, where
+  // NotImplementedException is the established CPU-fallback signal.
+  //
+  // The pre-capture check retains today's order, before residency and view capture.
+  // A marked scan is recorded in L0; S1.4 makes that a two-pass operation.
+  auto pre_capture    = source->decline_reason
+                          ? source->decline_reason(op, context, contract_provenance)
+                          : sirius::op::scan::pre_capture_result{};
+  auto marked_decline = std::move(pre_capture.decline);
+  if (marked_decline && !contract_provenance.first_pre_decline) {
+    contract_provenance.first_pre_decline = std::pair{marked_decline->reason, marked_decline->text};
   }
 
   auto sirius_state = context.registered_state
@@ -183,14 +609,41 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // One pinned-entry probe per scan: the compressed-materialization residency gate and
   // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
   // feeds only the gate, so its file resolution runs only when the feature is on.
+  // Both probes are OWNING: the shared_ptr holds the entry alive across the guards below, so a
+  // concurrent UNPIN on another connection cannot invalidate it mid-check. `pinned` is the
+  // shared raw view over whichever probe matched.
+  std::shared_ptr<sirius::scan_manager::pinned_entry const> pinned_owner;
   sirius::scan_manager::pinned_entry const* pinned = nullptr;
   bool serves_insert_deltas                        = false;
-  if (sirius_state && op.function.name == "seq_scan") {
+  if (!marked_decline && sirius_state && op.function.GetName() == "seq_scan") {
     auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (bind != nullptr && bind->table.IsDuckTable()) {
-      auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
-      pinned      = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
-        table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+      auto& table        = bind->table.Cast<duckdb::DuckTableEntry>();
+      auto& scan_manager = sirius_state->get_scan_manager();
+      auto const catalog = table.ParentCatalog().GetName().GetIdentifierName();
+      auto const& schema = table.ParentSchema().name.GetIdentifierName();
+      sirius::duckdb_table_identity const identity{table.oid,
+                                                   table.GetStorage().GetRowGroupCollection()};
+      pinned_owner = scan_manager.find_pinned_entry_for_duckdb_table(
+        catalog, schema, table.name.GetIdentifierName(), identity, &column_ids, &op.returned_types);
+      pinned = pinned_owner.get();
+      // A same-name pin for an older table cannot serve this scan, and the disk-native
+      // read behind it is MVCC-blind, so it may still hold the dropped table's image or
+      // this table's deleted rows.
+      if (pinned == nullptr) {
+        auto const superseded = scan_manager.pinned_entry_name_for_superseded_duckdb_table(
+          catalog, schema, table.name.GetIdentifierName(), identity);
+        if (superseded && diverges_from_checkpointed_image(context, table)) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' was dropped and recreated (or altered) after "
+            "pin_table, so pinned entry '%s' holds a different table, and this table has "
+            "diverged from its last-checkpointed image, which is all the disk-native read "
+            "sees. Run CHECKPOINT, or CALL unpin_table('%s') and pin_table again",
+            table.name,
+            *superseded,
+            *superseded);
+        }
+      }
       // Rows beyond the pinned prefix serve as insert-delta splits, decoded fresh at native
       // width. A narrow sidecar over them would pay per-batch exact-range verification and, on
       // an out-of-range inserted value, fail the query over to the CPU fallback — so the
@@ -201,11 +654,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         serves_insert_deltas = true;
       }
     }
-  } else if (sirius_state && compressed_materialization_on) {
-    auto const files =
-      resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
+  } else if (!marked_decline && sirius_state && compressed_materialization_on) {
+    auto const files = resolve_parquet_scan_file_paths(
+      op.function.GetName().GetIdentifierName(), op.bind_data.get(), op.parameters);
     if (!files.empty()) {
-      pinned = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+      pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+      pinned       = pinned_owner.get();
     }
   }
 
@@ -224,13 +678,18 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       "LogicalGet::project_input can only be set for table-in-out functions");
   }
 
+  // STREAMING_SOURCE leaf: fragment-declared repo + senders, not a file scan.
+  if (op.function.GetName() == sirius::exec::kStreamSourceFunctionName) {
+    return create_streaming_source_plan(op);
+  }
+
   // Plan-time probe for the duckdb-native seq_scan path: strings at/over
   // StringUncompressed::GetStringBlockLimit (a per-value limit) live in overflow
   // blocks the GPU string decoder cannot resolve. Refuse HERE, where the throw still
   // becomes a clean CPU fallback — the walker's refusal at pipeline conversion
   // surfaces as a mid-query error with none. Conservative for DICT_FSST, which
   // inlines strings up to 16 KiB (see prepare_duckdb_native_walk).
-  if (op.function.name == "seq_scan" && op.bind_data) {
+  if (op.function.GetName() == "seq_scan" && op.bind_data) {
     auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (table_scan_bind != nullptr && table_scan_bind->table.IsDuckTable()) {
       auto& table   = table_scan_bind->table.Cast<duckdb::DuckTableEntry>();
@@ -251,11 +710,18 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         auto stats = table.GetStatistics(context, primary);
         if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats) ||
             duckdb::StringStats::MaxStringLength(*stats) >= overflow_limit) {
-          throw duckdb::NotImplementedException(
+          auto text = duckdb::Exception::ConstructMessage(
             "duckdb-native scan: varchar column %llu may contain strings at/over the "
             "overflow-block limit (%llu bytes); overflow strings are not GPU-decodable",
             static_cast<unsigned long long>(primary),
             static_cast<unsigned long long>(overflow_limit));
+          marked_decline = pre_decline{
+            scan_verdict::unsupported, scan_reason::native_varchar_overflow, std::move(text)};
+          if (!contract_provenance.first_pre_decline) {
+            contract_provenance.first_pre_decline =
+              std::pair{marked_decline->reason, marked_decline->text};
+          }
+          break;
         }
       }
 
@@ -270,14 +736,18 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
       }
 
-      if (pinned != nullptr && pinned->mvcc != nullptr) {
+      // Plan and serve must judge recorded types against the scan's the same way. Treat a
+      // mismatched pin as unpinned so the fresh disk path remains available.
+      if (pinned != nullptr && pinned->mvcc != nullptr &&
+          sirius::scan_manager::pinned_native_types_match_columns(
+            *pinned, column_ids, op.returned_types)) {
         // Cache-or-CPU guards: while this table is MVCC-pinned, a GPU plan
         // either serves exactly from the pinned cache (DELETE keep-masks) or is
         // refused HERE, where the throw still becomes a clean CPU fallback. The
         // disk-native path is MVCC-blind, and the pin's checkpoint suppression
         // makes its snapshot increasingly stale — so scans the pin cannot serve
         // never fall through to it.
-        auto const n_cache = pinned->mvcc->n_cache();
+
         // (a) snapshot-too-old: this transaction opened before the pin, so
         // the cache's base image is from its future.
         auto const start_time =
@@ -288,7 +758,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             "snapshot (%llu) for table '%s'",
             static_cast<unsigned long long>(start_time),
             static_cast<unsigned long long>(pinned->mvcc->v_base),
-            table.name);
+            table.name.GetIdentifierName());
         }
         // (b) transaction-local appends: rows in this transaction's
         // LocalStorage live outside the table's segment trees, so neither the
@@ -299,26 +769,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' has uncommitted appends in this transaction; "
             "transaction-local inserts are not served from the cache",
-            table.name);
-        }
-        // (b') the insert delta does not serve ARRAY columns, so decline
-        // while rows beyond the pinned prefix exist. Rows inserted after
-        // this check are caught by the capture's own ARRAY check.
-        if (static_cast<std::size_t>(storage.GetTotalRows()) > n_cache) {
-          for (auto const& col_idx : column_ids) {
-            if (!col_idx.HasPrimaryIndex() || col_idx.IsRowIdColumn() ||
-                col_idx.IsVirtualColumn() || col_idx.IsEmptyColumn()) {
-              continue;
-            }
-            auto const primary = col_idx.GetPrimaryIndex();
-            if (primary < op.returned_types.size() &&
-                op.returned_types[primary].id() == duckdb::LogicalTypeId::ARRAY) {
-              throw duckdb::NotImplementedException(
-                "duckdb-native scan: table '%s' has rows beyond the pinned prefix and an ARRAY "
-                "projection; the insert delta does not serve ARRAY columns",
-                table.name);
-            }
-          }
+            table.name.GetIdentifierName());
         }
         bool pin_serves = !has_unservable_column;
         if (pin_serves && !column_ids.empty()) {
@@ -332,15 +783,16 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' is MVCC-pinned and the pin cannot serve the "
             "requested columns",
-            table.name);
+            table.name.GetIdentifierName());
         }
+        // Every guard passed, so the pinned entry serves this scan.
 #if 0
         // Disabled — these guards walk every row group of the table at plan
-        // time, per query; #1160 tracks running the checks from the scan
-        // manager at execution time instead. With this block off, (d) above
-        // has no clean-table relaxation and (c) is unguarded: post-pin UPDATE
-        // chains serve stale cached values (UPDATE support is #1162; pin_table
-        // still refuses tables that already carry update chains).
+        // time, per query. With this block off, (d) above has no clean-table
+        // relaxation. The update-chain branch is redundant because UPDATE
+        // statements on pinned tables are rejected before execution; direct
+        // UPDATE serving remains out of scope here (#1162).
+        auto const n_cache = pinned->mvcc->n_cache();
         std::vector<duckdb::storage_t> projected;
         for (auto const& col_idx : column_ids) {
           if (col_idx.HasPrimaryIndex() && !col_idx.IsRowIdColumn() &&
@@ -361,7 +813,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
               "duckdb-native scan: table '%s' is MVCC-pinned, the pin cannot serve the "
               "requested columns, and the table has diverged from its last-checkpointed "
               "image",
-              table.name);
+              table.name.GetIdentifierName());
           }
         } else if (sirius::op::scan::any_update_chains(storage, projected, n_cache)) {
           // (c) update-present on a column the cache would serve: update
@@ -370,7 +822,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' has in-memory update chains on a scanned "
             "column; updated values are not served from the cache",
-            table.name);
+            table.name.GetIdentifierName());
         }
 #endif
       }
@@ -400,7 +852,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' has uncommitted appends in this transaction; "
             "the disk-native read cannot see transaction-local rows",
-            table.name);
+            table.name.GetIdentifierName());
         }
         auto& txn = duckdb::DuckTransaction::Get(context, table.ParentCatalog());
         switch (sirius::op::scan::check_native_read_mvcc_state(
@@ -409,13 +861,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             throw duckdb::NotImplementedException(
               "duckdb-native scan: table '%s' has in-memory update chains on a scanned "
               "column; the disk-native read would return stale values",
-              table.name);
+              table.name.GetIdentifierName());
           case sirius::op::scan::native_read_mvcc_state::has_invisible_rows:
             throw duckdb::NotImplementedException(
               "duckdb-native scan: table '%s' has rows not visible to this transaction "
               "(uncheckpointed deletes or in-flight inserts); the disk-native read is "
               "MVCC-blind",
-              table.name);
+              table.name.GetIdentifierName());
           case sirius::op::scan::native_read_mvcc_state::exact: break;
         }
       }
@@ -424,18 +876,55 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   }
 
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
-  if (!op.table_filters.filters.empty()) {
+  if (op.table_filters.HasFilters() || op.table_filters.HasMultiColumnFilters()) {
     table_filters = create_table_filter_set(op.table_filters, column_ids);
     // Predicates pushed into table_filters bypass the LogicalFilter guard —
     // reject nested columns here too (e.g. `WHERE items IS NULL`).
-    for (auto const& entry : table_filters->filters) {
-      auto const column_id = column_ids[entry.first].GetPrimaryIndex();
+    for (auto const& entry : *table_filters) {
+      auto const column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
       if (column_id < op.returned_types.size()) {
-        auto const column_name =
-          column_id < op.names.size() ? op.names[column_id] : std::to_string(column_id);
+        auto const column_name = column_id < op.names.size()
+                                   ? op.names[column_id].GetIdentifierName()
+                                   : std::to_string(column_id);
         reject_nested_column_type(op.returned_types[column_id], column_name, "a filter predicate");
         reject_untranslatable_table_filter(
-          *entry.second, op.returned_types[column_id], column_name);
+          entry.Filter(), op.returned_types[column_id], column_name);
+      }
+    }
+  }
+
+  if (table_filters) {
+    auto const* multi_file = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
+    for (auto const& filter : table_filters->GetMultiColumnFilters()) {
+      auto const& expression =
+        duckdb::ExpressionFilter::GetExpressionFilter(*filter, "scan planning");
+      for (auto index : expression.column_indexes) {
+        if (index.GetIndex() >= column_ids.size()) {
+          throw duckdb::InternalException("Multi-column filter index is outside scan columns");
+        }
+        auto const primary = column_ids[index].GetPrimaryIndex();
+        if (!duckdb::ExpressionFilter::IsOptionalFilter(expression)) {
+          if (multi_file) {
+            for (auto const& partition : multi_file->reader_bind.hive_partitioning_indexes) {
+              if (partition.index == primary) {
+                throw duckdb::NotImplementedException(
+                  "Multi-column scan predicates on Hive partition columns are not supported in "
+                  "Sirius");
+              }
+            }
+          }
+        }
+        if (primary < op.returned_types.size()) {
+          auto const column_name = primary < op.names.size() ? op.names[primary].GetIdentifierName()
+                                                             : std::to_string(primary);
+          reject_nested_column_type(op.returned_types[primary], column_name, "a filter predicate");
+        }
+      }
+      if (!duckdb::ExpressionFilter::IsOptionalFilter(expression) &&
+          sirius::ast::from_duckdb(*expression.expr) == nullptr) {
+        throw duckdb::NotImplementedException(
+          "Unsupported multi-column scan predicate (falling back to CPU): %s",
+          expression.expr->ToString());
       }
     }
   }
@@ -448,51 +937,38 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // With FILTER_PUSHDOWN enabled, filters from WHERE clauses are pushed into table_filters.
   // Since we don't pass filters to the DuckDB table function (they're applied by Sirius),
   // we need to ensure all filter columns are included in BOTH column_ids and projection_ids.
-  // We track the original projection_ids so we can project back after filtering.
-  duckdb::vector<std::size_t> original_projection_ids = projection_ids;
+  // Empty projection_ids means all column_ids are already read and emitted.
+  // Do not turn that into an explicit projection containing only filter columns.
 
   // Save the original types before we modify projection_ids, because modifying projection_ids
   // might affect the types when we call ResolveOperatorTypes()
   duckdb::vector<duckdb::LogicalType> original_types = op.types;
+  auto const projected_output_count                  = original_types.size();
 
-  if (table_filters) {
-    for (auto& entry : table_filters->filters) {
-      // entry.first is the column index in the table_filters (after remapping by
-      // create_table_filter_set) We need to ensure this column is in projection_ids so it gets
-      // scanned by DuckDB
-
-      bool found_in_projection = false;
-      for (std::size_t j = 0; j < projection_ids.size(); j++) {
-        if (projection_ids[j] == entry.first) {
-          found_in_projection = true;
-          break;
-        }
+  if (table_filters && !projection_ids.empty()) {
+    auto include_column = [&](duckdb::ProjectionIndex index) {
+      if (index.GetIndex() >= column_ids.size()) {
+        throw duckdb::InternalException("Table filter index is outside scan columns");
       }
-
-      if (!found_in_projection) { projection_ids.push_back(entry.first); }
+      if (std::find(projection_ids.begin(), projection_ids.end(), index) == projection_ids.end()) {
+        projection_ids.push_back(index);
+      }
+    };
+    for (auto const& entry : *table_filters) {
+      include_column(entry.GetIndex());
+    }
+    for (auto const& filter : table_filters->GetMultiColumnFilters()) {
+      auto const& expr_filter =
+        duckdb::ExpressionFilter::GetExpressionFilter(*filter, "scan projection");
+      for (auto const index : expr_filter.column_indexes) {
+        include_column(index);
+      }
     }
   }
 
   // Handle cases where table function doesn't support pushdown for specific column types
   if (table_filters && op.function.supports_pushdown_type) {
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
-    duckdb::unordered_set<std::size_t> to_remove;
-    for (auto& entry : table_filters->filters) {
-      auto column_id = column_ids[entry.first].GetPrimaryIndex();
-      auto& type     = op.returned_types[column_id];
-
-      // If the table function doesn't support pushdown for this column type,
-      // create a separate filter operator for it
-      if (!op.function.supports_pushdown_type(*op.bind_data, column_id)) {
-        std::size_t column_id_filter = entry.first;
-        auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, column_id_filter);
-        select_list.push_back(entry.second->ToExpression(*column));
-        to_remove.insert(entry.first);
-      }
-    }
-    for (auto& col : to_remove) {
-      table_filters->filters.erase(col);
-    }
+    auto select_list = extract_unpushed_scan_filters(op, *table_filters);
 
     if (!select_list.empty()) {
       duckdb::vector<duckdb::LogicalType> filter_types;
@@ -506,7 +982,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
           duckdb::ExpressionType::CONJUNCTION_AND);
         for (auto& expr : select_list) {
-          conjunction->children.push_back(std::move(expr));
+          conjunction->GetChildrenMutable().push_back(std::move(expr));
         }
         combined = std::move(conjunction);
       } else {
@@ -529,13 +1005,24 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       sirius::from_duckdb_vec(op.returned_types),
       column_ids,
       duckdb::vector<duckdb::column_t>(),
-      op.names,
+      duckdb::IdentifiersToStrings(op.names),
       std::move(table_filters),
       op.estimated_cardinality,
       std::move(op.extra_info),
       std::move(op.parameters),
-      std::move(op.virtual_columns));
-    node->named_parameters = std::move(op.named_parameters);
+      std::move(op.virtual_columns),
+      projected_output_count,
+      op.returned_types);
+    node->named_parameters             = std::move(op.named_parameters);
+    node->read_views                   = read_views;
+    node->scan_node_id                 = next_scan_node_id++;
+    node->table_index                  = op.table_index.index;
+    node->contract_window_id           = contract_provenance.window_id;
+    node->contract_finalize_generation = contract_provenance.finalize_generation;
+    node->host_export_available        = contract_provenance.host_export_available;
+    node->delete_preparation_time_us   = pre_capture.cost.delete_preparation_time_us;
+    node->pre_declined                 = marked_decline;
+    node->delete_inventory             = std::move(pre_capture.inventory);
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
       bool projection_necessary = false;
@@ -593,26 +1080,34 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.bind_data),
     sirius::from_duckdb_vec(op.returned_types),
     column_ids,
-    op.projection_ids,
-    op.names,
+    duckdb::vector<std::size_t>(op.projection_ids.begin(), op.projection_ids.end()),
+    duckdb::IdentifiersToStrings(op.names),
     std::move(table_filters),
     op.estimated_cardinality,
     std::move(op.extra_info),
     std::move(op.parameters),
-    std::move(op.virtual_columns));
+    std::move(op.virtual_columns),
+    projected_output_count,
+    original_types);
   if (!physical_types.empty() && physical_types.size() == node->types.size()) {
     node->set_physical_types(std::move(physical_types));
     node->sidecar_from_gpu_tier_pin =
       pinned != nullptr && pinned->tier == cucascade::memory::Tier::GPU;
-    if (sirius_state) { sirius_state->record_compressed_materialization_scan_sidecar_installed(); }
+    if (sirius_state) {
+      sirius_state->get_event_publisher().publish_compressed_materialization(
+        sirius::event::compressed_materialization_activity::scan_sidecar_installed);
+    }
   }
-  node->named_parameters = std::move(op.named_parameters);
-  node->dynamic_filters  = op.dynamic_filters;
-  if (op.dynamic_filters) {
-    node->sirius_dynamic_filters = get_or_create_dynamic_filter_channel(op.dynamic_filters.get());
-    SIRIUS_LOG_INFO("[sirius_plan_get] LogicalGet has dynamic_filters attached (channel key={}).",
-                    static_cast<void const*>(op.dynamic_filters.get()));
-  }
+  node->named_parameters             = std::move(op.named_parameters);
+  node->read_views                   = read_views;
+  node->scan_node_id                 = next_scan_node_id++;
+  node->table_index                  = op.table_index.index;
+  node->contract_window_id           = contract_provenance.window_id;
+  node->contract_finalize_generation = contract_provenance.finalize_generation;
+  node->host_export_available        = contract_provenance.host_export_available;
+  node->delete_preparation_time_us   = pre_capture.cost.delete_preparation_time_us;
+  node->pre_declined                 = marked_decline;
+  node->delete_inventory             = std::move(pre_capture.inventory);
   if (filter) {
     filter->children.push_back(std::move(node));
     return filter;

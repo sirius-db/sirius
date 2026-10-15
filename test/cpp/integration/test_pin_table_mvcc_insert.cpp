@@ -57,10 +57,8 @@ void expect_fallback_matches_cpu(sirius::test::GpuExecutionFixture& fx, const st
   REQUIRE(cpu_result);
   REQUIRE_FALSE(cpu_result->HasError());
 
-  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    gpu_result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    cpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*gpu_result);
+  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*cpu_result);
   REQUIRE(gpu_rows == cpu_rows);
 }
 
@@ -95,10 +93,8 @@ void compare_gpu_vs_cpu_on(duckdb::Connection& con, const std::string& query)
   run_ok_on(con, "SET gpu_execution = true;");
   REQUIRE(cpu_result);
   REQUIRE_FALSE(cpu_result->HasError());
-  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    gpu_result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    cpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto gpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*gpu_result);
+  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(*cpu_result);
   REQUIRE(gpu_rows == cpu_rows);
 }
 
@@ -204,13 +200,11 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
 }
 
 TEST_CASE_METHOD(PinMvccInsertFixture,
-                 "mvcc insert: appends into an indexed tail row group keep per-segment constants",
+                 "mvcc insert: indexed appends keep per-segment constants",
                  "[integration][gpu_execution][pin_table_mvcc_insert]")
 {
-  // With a PRIMARY KEY, DuckDB appends into the existing tail row group
-  // instead of opening a fresh one, so the bulk-flushed CONSTANT segment's
-  // row group later gains rows with a different value: the row-group-level
-  // stats drift (min drops to 7) while the segment's own constant stays 9.
+  // A bulk-flushed CONSTANT segment retains 9 after a later append of 7.
+  // V2 opens a fresh row group for the append, including for indexed tables.
   run_ok("CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER);");
   run_ok("INSERT INTO t SELECT range::INTEGER, range::INTEGER FROM range(20000);");
   run_ok("CHECKPOINT;");
@@ -425,12 +419,17 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
 
   run_ok("INSERT INTO t VALUES (30000);");
-  // Bare count(*) binds only rowid, which is never cached, so the
-  // column-mismatch guard declines; the fallback must still count the delta row.
-  expect_fallback_matches_cpu(*this, "SELECT count(*) FROM t;");
+  // Keep a rowid-dependent predicate so v2 cannot answer COUNT from metadata.
+  expect_fallback_matches_cpu(*this, "SELECT count(*) FROM t WHERE rowid % 2 = 0;");
   run_ok("CALL unpin_table('t');");
 }
 
+// NOTE: The two ARRAY guard tests below encoded the pre-array-delta contract
+// (pin_table refuses ARRAY columns; ARRAY projections decline while a delta
+// exists). Fixed-size ARRAY columns now pin and serve through the insert delta,
+// so both are commented out and superseded by the ARRAY-delta cases appended at
+// the end of this file.
+/*
 TEST_CASE_METHOD(PinMvccInsertFixture,
                  "mvcc guards: pinning an ARRAY column is refused",
                  "[integration][gpu_execution][pin_table_mvcc_insert]")
@@ -446,7 +445,7 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   REQUIRE(refused);
   REQUIRE(refused->HasError());
-  REQUIRE_THAT(refused->GetError(), Catch::Contains("ARRAY"));
+  REQUIRE_THAT(refused->GetError(), Catch::Matchers::ContainsSubstring("ARRAY"));
 
   // A subset pin that leaves the ARRAY column out still works.
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['k']);");
@@ -474,6 +473,7 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
   run_ok("CALL unpin_table('t');");
 }
+*/
 
 TEST_CASE_METHOD(PinMvccInsertFixture,
                  "mvcc insert: the residency gate installs no narrow sidecar when deltas serve",
@@ -536,4 +536,153 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   run_ok("SET enable_compressed_materialization = false;");
   std::error_code ec;
   fs::remove_all(plan_dir, ec);
+}
+
+// Fixed-size ARRAY columns: pin and serve through the insert delta.
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc insert: a pinned ARRAY column serves the base from cache",
+                 "[integration][gpu_execution][pin_table_mvcc_insert][array]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, "
+    "CAST([range::INTEGER, range::INTEGER + 1, range::INTEGER + 2] AS INTEGER[3]) AS a "
+    "FROM range(20000);");
+  run_ok("CHECKPOINT;");
+  // The ARRAY column now pins alongside the scalar (no pin-time refusal).
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  // No delta: the array decodes straight from the pinned prefix.
+  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 19995 ORDER BY k;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc insert: post-pin ARRAY inserts serve through the transient delta",
+                 "[integration][gpu_execution][pin_table_mvcc_insert][array]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, "
+    "CAST([range::INTEGER, range::INTEGER + 1, range::INTEGER + 2] AS INTEGER[3]) AS a "
+    "FROM range(20000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  // Small transient append beyond the pinned prefix: the delta captures the
+  // array-level validity + child element trees and decodes them on-device.
+  run_ok(
+    "INSERT INTO t VALUES (20000, CAST([9, 9, 9] AS INTEGER[3])), "
+    "(20001, CAST([8, 7, 6] AS INTEGER[3]));");
+
+  // Spans the pin boundary: base rows 19998-19999 from cache, delta rows
+  // 20000-20001 from the transient delta lane.
+  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 19998 ORDER BY k;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc insert: bulk ARRAY inserts ride the persistent delta lane",
+                 "[integration][gpu_execution][pin_table_mvcc_insert][array]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, "
+    "CAST([range::INTEGER, range::INTEGER + 1, range::INTEGER + 2] AS INTEGER[3]) AS a "
+    "FROM range(20000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  // A commit of several full row groups: MergeStorage flushes the array's child
+  // data as persistent (file-backed) segments — the delta's file lane.
+  run_ok(
+    "INSERT INTO t SELECT range::INTEGER + 20000, "
+    "CAST([range::INTEGER, range::INTEGER + 1, range::INTEGER + 2] AS INTEGER[3]) "
+    "FROM range(130000);");
+  // Plus a small transient append: both lanes exercised in one array delta.
+  run_ok("INSERT INTO t VALUES (200000, CAST([1, 2, 3] AS INTEGER[3]));");
+
+  // Persistent delta rows.
+  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 149997 AND k < 150000 ORDER BY k;");
+  // The transient tail append.
+  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 200000 ORDER BY k;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc insert: ARRAY delta preserves array-level and child NULLs",
+                 "[integration][gpu_execution][pin_table_mvcc_insert][array]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, "
+    "CAST([range::INTEGER, range::INTEGER + 1, range::INTEGER + 2] AS INTEGER[3]) AS a "
+    "FROM range(20000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  // Array-level NULL (whole array) drives the array-level validity bucket;
+  // NULL child elements drive the child validity bucket.
+  run_ok(
+    "INSERT INTO t VALUES (20000, NULL::INTEGER[3]), "
+    "(20001, CAST([NULL, 5, NULL] AS INTEGER[3])), "
+    "(20002, CAST([7, NULL, 9] AS INTEGER[3]));");
+
+  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 19999 ORDER BY k;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc guards: an uncheckpointed append refuses an ARRAY-only pin",
+                 "[integration][gpu_execution][pin_table_mvcc_insert][array]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, "
+    "CAST([range::INTEGER, range::INTEGER + 1, range::INTEGER + 2] AS INTEGER[3]) AS a "
+    "FROM range(1000);");
+  run_ok("CHECKPOINT;");
+
+  // Commit one row without checkpointing. The appended ARRAY row lives only in
+  // the array-level validity and child segment trees as transient (in-memory)
+  // segments, not in the parent tree.
+  run_ok("INSERT INTO t VALUES (1000, CAST([1, 2, 3] AS INTEGER[3]));");
+
+  // Pin the ARRAY column ALONE. With no scalar column in the pin, the guard can
+  // only see the append by walking the array's validity and child trees; miss
+  // those and it slips through here and fails later in the decoder byte sizing.
+  auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['a']);");
+  REQUIRE(refused);
+  REQUIRE(refused->HasError());
+  REQUIRE_THAT(refused->GetError(), Catch::Matchers::ContainsSubstring("CHECKPOINT"));
+
+  // Folding the append into the base clears the guard; the ARRAY-only pin then
+  // succeeds and serves from cache.
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['a']);");
+  // Reference only the pinned ARRAY column with no predicate. A filter on the
+  // unpinned k breaks the partial pin's cache-or-CPU contract, and an array
+  // subscript filter (a[1]) is unsupported on the GPU scan; either forces a
+  // fallback. The unordered compare over all rows still covers the folded-in
+  // append row (k=1000).
+  compare_gpu_vs_cpu("SELECT a FROM t;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc guards: an ARRAY with a non-fixed-width child is refused",
+                 "[integration][gpu_execution][pin_table_mvcc_insert][array]")
+{
+  // A VARCHAR[N] child is stored as StandardColumnData too, so it passes the
+  // child cast and would silently stage zero-byte descriptors. Only fixed-width
+  // scalar children have a decoder path.
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, "
+    "CAST([range::VARCHAR, 'x', 'y'] AS VARCHAR[3]) AS a FROM range(100);");
+  run_ok("CHECKPOINT;");
+
+  auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  REQUIRE(refused);
+  REQUIRE(refused->HasError());
+  REQUIRE_THAT(refused->GetError(), Catch::Matchers::ContainsSubstring("fixed-width"));
+
+  // Pinning the scalar subset (leaving the ARRAY out) still works.
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['k']);");
+  compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
+  run_ok("CALL unpin_table('t');");
 }

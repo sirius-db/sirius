@@ -1,0 +1,3 @@
+sirius:
+  operator_params:
+    mark_join_build_switch_ratio: .nan

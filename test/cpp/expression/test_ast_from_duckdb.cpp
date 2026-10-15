@@ -27,6 +27,8 @@
 #include "catch.hpp"
 #include "expression/ast/from_duckdb.hpp"
 
+#include <duckdb/main/settings.hpp>
+
 // sirius — node accessors and per-node struct types
 #include "expression/ast/between.hpp"
 #include "expression/ast/case_expr.hpp"
@@ -42,6 +44,7 @@
 #include "expression/ast/unary_op.hpp"
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"  // sirius::comparison_type
+#include "expression/substring_slice.hpp"
 
 // duckdb — direct-ctor construction surface
 #include <duckdb/common/exception.hpp>
@@ -51,6 +54,7 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
+#include <duckdb/optimizer/expression_rewriter.hpp>
 #include <duckdb/planner/expression/bound_between_expression.hpp>
 #include <duckdb/planner/expression/bound_case_expression.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
@@ -64,8 +68,10 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 // standard library
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -179,7 +185,7 @@ TEST_CASE("ast_from_duckdb - BOUND_COMPARISON EQUAL translates to comparison nod
 {
   auto left  = make_bound_ref(0);
   auto right = make_bound_int_const(3);
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+  auto expr  = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
   auto out = sirius::ast::from_duckdb(*expr);
   REQUIRE(out);
@@ -197,7 +203,7 @@ TEST_CASE("ast_from_duckdb - BOUND_COMPARISON NOTEQUAL translates to comparison 
 {
   auto left  = make_bound_ref(0);
   auto right = make_bound_int_const(3);
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+  auto expr  = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_NOTEQUAL, std::move(left), std::move(right));
   auto out = sirius::ast::from_duckdb(*expr);
   REQUIRE(out);
@@ -210,7 +216,7 @@ TEST_CASE("ast_from_duckdb - BOUND_COMPARISON LESSTHAN translates to comparison 
 {
   auto left  = make_bound_ref(0);
   auto right = make_bound_int_const(3);
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+  auto expr  = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_LESSTHAN, std::move(left), std::move(right));
   auto out = sirius::ast::from_duckdb(*expr);
   REQUIRE(out);
@@ -223,7 +229,7 @@ TEST_CASE("ast_from_duckdb - BOUND_COMPARISON LESSTHANOREQUALTO translates to co
 {
   auto left  = make_bound_ref(0);
   auto right = make_bound_int_const(3);
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+  auto expr  = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_LESSTHANOREQUALTO, std::move(left), std::move(right));
   auto out = sirius::ast::from_duckdb(*expr);
   REQUIRE(out);
@@ -236,7 +242,7 @@ TEST_CASE("ast_from_duckdb - BOUND_COMPARISON GREATERTHAN translates to comparis
 {
   auto left  = make_bound_ref(0);
   auto right = make_bound_int_const(3);
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+  auto expr  = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_GREATERTHAN, std::move(left), std::move(right));
   auto out = sirius::ast::from_duckdb(*expr);
   REQUIRE(out);
@@ -249,7 +255,7 @@ TEST_CASE("ast_from_duckdb - BOUND_COMPARISON GREATERTHANOREQUALTO translates to
 {
   auto left  = make_bound_ref(0);
   auto right = make_bound_int_const(3);
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+  auto expr  = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_GREATERTHANOREQUALTO, std::move(left), std::move(right));
   auto out = sirius::ast::from_duckdb(*expr);
   REQUIRE(out);
@@ -262,7 +268,7 @@ TEST_CASE("ast_from_duckdb - BOUND_COMPARISON DISTINCT_FROM translates to compar
 {
   auto left  = make_bound_ref(0);
   auto right = make_bound_int_const(3);
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+  auto expr  = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_DISTINCT_FROM, std::move(left), std::move(right));
   auto out = sirius::ast::from_duckdb(*expr);
   REQUIRE(out);
@@ -275,7 +281,7 @@ TEST_CASE("ast_from_duckdb - BOUND_COMPARISON NOT_DISTINCT_FROM translates to co
 {
   auto left  = make_bound_ref(0);
   auto right = make_bound_int_const(3);
-  auto expr  = duckdb::make_uniq<BoundComparisonExpression>(
+  auto expr  = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_NOT_DISTINCT_FROM, std::move(left), std::move(right));
   auto out = sirius::ast::from_duckdb(*expr);
   REQUIRE(out);
@@ -291,8 +297,8 @@ TEST_CASE("ast_from_duckdb - BOUND_CONJUNCTION AND translates to conjunction(op_
           "[ast_from_duckdb]")
 {
   auto and_expr = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-  and_expr->children.push_back(make_bound_ref(0, LogicalTypeId::BOOLEAN));
-  and_expr->children.push_back(make_bound_ref(1, LogicalTypeId::BOOLEAN));
+  and_expr->GetChildrenMutable().push_back(make_bound_ref(0, LogicalTypeId::BOOLEAN));
+  and_expr->GetChildrenMutable().push_back(make_bound_ref(1, LogicalTypeId::BOOLEAN));
   auto out = sirius::ast::from_duckdb(*and_expr);
   REQUIRE(out);
   REQUIRE(out->holds<conjunction>());
@@ -307,8 +313,8 @@ TEST_CASE("ast_from_duckdb - BOUND_CONJUNCTION OR translates to conjunction(op_o
           "[ast_from_duckdb]")
 {
   auto or_expr = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_OR);
-  or_expr->children.push_back(make_bound_ref(0, LogicalTypeId::BOOLEAN));
-  or_expr->children.push_back(make_bound_ref(1, LogicalTypeId::BOOLEAN));
+  or_expr->GetChildrenMutable().push_back(make_bound_ref(0, LogicalTypeId::BOOLEAN));
+  or_expr->GetChildrenMutable().push_back(make_bound_ref(1, LogicalTypeId::BOOLEAN));
   auto out = sirius::ast::from_duckdb(*or_expr);
   REQUIRE(out);
   REQUIRE(out->holds<conjunction>());
@@ -322,11 +328,11 @@ TEST_CASE("ast_from_duckdb - BOUND_CONJUNCTION OR translates to conjunction(op_o
 TEST_CASE("ast_from_duckdb - BOUND_BETWEEN translates to between node with inclusive bounds",
           "[ast_from_duckdb]")
 {
-  auto bt  = duckdb::make_uniq<BoundBetweenExpression>(make_bound_ref(0),
-                                                      make_bound_int_const(1),
-                                                      make_bound_int_const(10),
-                                                      /*lower_inclusive=*/true,
-                                                      /*upper_inclusive=*/true);
+  auto bt  = duckdb::BoundBetweenExpression::Create(make_bound_ref(0),
+                                                   make_bound_int_const(1),
+                                                   make_bound_int_const(10),
+                                                   /*lower_inclusive=*/true,
+                                                   /*upper_inclusive=*/true);
   auto out = sirius::ast::from_duckdb(*bt);
   REQUIRE(out);
   REQUIRE(out->holds<between>());
@@ -349,7 +355,7 @@ TEST_CASE("ast_from_duckdb - BOUND_CASE WHEN/THEN/ELSE translates to case_expr",
           "[ast_from_duckdb]")
 {
   // CASE WHEN col(0) = 1 THEN 10 ELSE 0 END
-  auto check_expr = duckdb::make_uniq<BoundComparisonExpression>(
+  auto check_expr = duckdb::BoundComparisonExpression::Create(
     ExpressionType::COMPARE_EQUAL, make_bound_ref(0), make_bound_int_const(1));
   auto then_expr = make_bound_int_const(10);
 
@@ -359,8 +365,8 @@ TEST_CASE("ast_from_duckdb - BOUND_CASE WHEN/THEN/ELSE translates to case_expr",
 
   auto else_expr = make_bound_int_const(0);
   auto case_node = duckdb::make_uniq<BoundCaseExpression>(LogicalType{LogicalTypeId::INTEGER});
-  case_node->else_expr = std::move(else_expr);
-  case_node->case_checks.push_back(std::move(case_check));
+  case_node->ElseMutable() = std::move(else_expr);
+  case_node->CaseChecksMutable().push_back(std::move(case_check));
 
   auto out = sirius::ast::from_duckdb(*case_node);
   REQUIRE(out);
@@ -377,7 +383,7 @@ TEST_CASE("ast_from_duckdb - BOUND_CASE with unsupported WHEN propagates nullptr
 {
   // The WHEN subexpression is a BoundParameterExpression (unsupported -> nullptr).
   // The whole CASE must collapse to nullptr.
-  auto bad_when  = duckdb::make_uniq<BoundParameterExpression>(std::string{"p_when"});
+  auto bad_when  = duckdb::make_uniq<BoundParameterExpression>(duckdb::Identifier{"p_when"});
   auto then_expr = make_bound_int_const(10);
 
   BoundCaseCheck case_check;
@@ -386,8 +392,8 @@ TEST_CASE("ast_from_duckdb - BOUND_CASE with unsupported WHEN propagates nullptr
 
   auto else_expr = make_bound_int_const(0);
   auto case_node = duckdb::make_uniq<BoundCaseExpression>(LogicalType{LogicalTypeId::INTEGER});
-  case_node->else_expr = std::move(else_expr);
-  case_node->case_checks.push_back(std::move(case_check));
+  case_node->ElseMutable() = std::move(else_expr);
+  case_node->CaseChecksMutable().push_back(std::move(case_check));
 
   REQUIRE(sirius::ast::from_duckdb(*case_node) == nullptr);
 }
@@ -425,6 +431,114 @@ TEST_CASE("ast_from_duckdb - BOUND_CAST honors try_cast = true", "[ast_from_duck
   REQUIRE(c.try_cast == true);
 }
 
+TEST_CASE("ast_from_duckdb - BOUND_CAST between temporal and numeric returns nullptr",
+          "[ast_from_duckdb][narrow_domain]")
+{
+  // DuckDB binds these pairs to the null-cast (NULL for TRY_CAST, ConversionException for CAST),
+  // which the GPU cannot honor -- and translating them would hand the expression evaluator a
+  // cast whose shape matches a compressed-materialization carrier restore. Declining here is the
+  // planners' CPU-fallback signal.
+  SECTION("DATE -> SMALLINT")
+  {
+    auto cast_expr = BoundCastExpression::AddDefaultCastToType(
+      make_bound_ref(0, duckdb::LogicalTypeId::DATE), LogicalType{LogicalTypeId::SMALLINT});
+    REQUIRE(sirius::ast::from_duckdb(*cast_expr) == nullptr);
+  }
+
+  SECTION("DATE -> SMALLINT with try_cast")
+  {
+    auto cast_expr =
+      BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, duckdb::LogicalTypeId::DATE),
+                                                LogicalType{LogicalTypeId::SMALLINT},
+                                                /*try_cast=*/true);
+    REQUIRE(sirius::ast::from_duckdb(*cast_expr) == nullptr);
+  }
+
+  SECTION("SMALLINT -> DATE")
+  {
+    auto cast_expr = BoundCastExpression::AddDefaultCastToType(
+      make_bound_ref(0, duckdb::LogicalTypeId::SMALLINT), LogicalType{LogicalTypeId::DATE});
+    REQUIRE(sirius::ast::from_duckdb(*cast_expr) == nullptr);
+  }
+
+  SECTION("legal pairs still translate")
+  {
+    // Numeric widening and same-family temporal conversions are real cuDF casts and must keep
+    // translating -- the gate rejects only the mixed temporal/numeric pairs.
+    auto widen = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0),
+                                                           LogicalType{LogicalTypeId::BIGINT});
+    REQUIRE(sirius::ast::from_duckdb(*widen) != nullptr);
+
+    auto to_timestamp = BoundCastExpression::AddDefaultCastToType(
+      make_bound_ref(0, duckdb::LogicalTypeId::DATE), LogicalType{LogicalTypeId::TIMESTAMP});
+    REQUIRE(sirius::ast::from_duckdb(*to_timestamp) != nullptr);
+  }
+}
+
+TEST_CASE("ast_from_duckdb - unsigned casts require a carrier with enough range",
+          "[ast_from_duckdb][unsigned_narrowing]")
+{
+  // Counts are value bits: signed carriers reserve one bit for the sign, and
+  // Sirius represents HUGEINT/UHUGEINT using INT64/UINT64 rather than 128-bit storage.
+  using domain = std::pair<LogicalTypeId, int>;
+  for (auto [source, source_bits] : {domain{LogicalTypeId::UTINYINT, 8},
+                                     domain{LogicalTypeId::USMALLINT, 16},
+                                     domain{LogicalTypeId::UINTEGER, 32},
+                                     domain{LogicalTypeId::UBIGINT, 64},
+                                     domain{LogicalTypeId::UHUGEINT, 128}}) {
+    for (auto [target, target_bits] : {domain{LogicalTypeId::TINYINT, 7},
+                                       domain{LogicalTypeId::SMALLINT, 15},
+                                       domain{LogicalTypeId::INTEGER, 31},
+                                       domain{LogicalTypeId::BIGINT, 63},
+                                       domain{LogicalTypeId::HUGEINT, 63},
+                                       domain{LogicalTypeId::UTINYINT, 8},
+                                       domain{LogicalTypeId::USMALLINT, 16},
+                                       domain{LogicalTypeId::UINTEGER, 32},
+                                       domain{LogicalTypeId::UBIGINT, 64},
+                                       domain{LogicalTypeId::UHUGEINT, 64}}) {
+      for (bool try_cast : {false, true}) {
+        INFO("source=" << LogicalType(source).ToString()
+                       << " target=" << LogicalType(target).ToString() << " try_cast=" << try_cast);
+        auto expr = BoundCastExpression::AddDefaultCastToType(
+          make_bound_ref(0, source), LogicalType(target), try_cast);
+        auto translated = sirius::ast::from_duckdb(*expr);
+        // DuckDB elides same-type casts, leaving only the bound reference.
+        REQUIRE((translated != nullptr) == (source == target || source_bits <= target_bits));
+      }
+    }
+  }
+
+  // The nested cast must reject its parent comparison too, including a join predicate.
+  auto left  = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, LogicalTypeId::UBIGINT),
+                                                        LogicalType::HUGEINT);
+  auto right = BoundCastExpression::AddDefaultCastToType(make_bound_ref(1, LogicalTypeId::BIGINT),
+                                                         LogicalType::HUGEINT);
+  auto predicate = BoundComparisonExpression::Create(
+    ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
+  REQUIRE(sirius::ast::from_duckdb(*predicate) == nullptr);
+}
+
+TEST_CASE("ast_from_duckdb - exact unsigned carriers and safe widenings remain supported",
+          "[ast_from_duckdb][unsigned_narrowing]")
+{
+  auto direct = make_bound_ref(0, LogicalTypeId::UBIGINT);
+  REQUIRE(sirius::ast::from_duckdb(*direct) != nullptr);
+  for (auto source : {LogicalTypeId::TINYINT,
+                      LogicalTypeId::SMALLINT,
+                      LogicalTypeId::INTEGER,
+                      LogicalTypeId::BIGINT,
+                      LogicalTypeId::UTINYINT,
+                      LogicalTypeId::USMALLINT,
+                      LogicalTypeId::UINTEGER}) {
+    auto expr =
+      BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, source), LogicalType::HUGEINT);
+    REQUIRE(sirius::ast::from_duckdb(*expr) != nullptr);
+  }
+  auto widen = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, LogicalTypeId::UINTEGER),
+                                                         LogicalType::UBIGINT);
+  REQUIRE(sirius::ast::from_duckdb(*widen) != nullptr);
+}
+
 // ============================================================================
 // BOUND_FUNCTION
 // ============================================================================
@@ -432,13 +546,12 @@ TEST_CASE("ast_from_duckdb - BOUND_CAST honors try_cast = true", "[ast_from_duck
 TEST_CASE("ast_from_duckdb - BOUND_FUNCTION '+' resolves to function_id::add", "[ast_from_duckdb]")
 {
   auto add_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
+    duckdb::BoundScalarFunction(ScalarFunction(
+      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr)),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
     nullptr);
-  add_expr->children.push_back(make_bound_ref(0));
-  add_expr->children.push_back(make_bound_int_const(3));
+  add_expr->GetChildrenMutable().push_back(make_bound_ref(0));
+  add_expr->GetChildrenMutable().push_back(make_bound_int_const(3));
 
   auto out = sirius::ast::from_duckdb(*add_expr);
   REQUIRE(out);
@@ -449,20 +562,44 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION '+' resolves to function_id::add", "
   REQUIRE(fc.return_type().id() == sirius::type_id::INTEGER);
 }
 
+namespace {
+
+// DuckDB binds substring(VARCHAR, BIGINT[, BIGINT]) with constant-folded bounds.
+duckdb::unique_ptr<BoundFunctionExpression> make_substring(
+  std::string const& name, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> bounds)
+{
+  duckdb::vector<LogicalType> arg_types{LogicalType::VARCHAR};
+  for (auto const& bound : bounds) {
+    arg_types.push_back(bound->GetReturnType());
+  }
+  auto fn_expr = duckdb::make_uniq<BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(ScalarFunction(
+      duckdb::Identifier(name), std::move(arg_types), LogicalType::VARCHAR, nullptr)),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  fn_expr->GetChildrenMutable().push_back(make_bound_ref(0, LogicalTypeId::VARCHAR));
+  for (auto& bound : bounds) {
+    fn_expr->GetChildrenMutable().push_back(std::move(bound));
+  }
+  return fn_expr;
+}
+
+duckdb::unique_ptr<BoundFunctionExpression> make_substring(std::string const& name,
+                                                           std::vector<Value> const& bounds)
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  for (auto const& bound : bounds) {
+    children.push_back(duckdb::make_uniq<BoundConstantExpression>(bound));
+  }
+  return make_substring(name, std::move(children));
+}
+
+}  // namespace
+
 TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substring' resolves to function_id::substring",
           "[ast_from_duckdb]")
 {
-  auto fn_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::VARCHAR},
-    ScalarFunction("substring",
-                   {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
-                   LogicalType::VARCHAR,
-                   nullptr),
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
-    nullptr);
-  fn_expr->children.push_back(make_bound_ref(0, LogicalTypeId::VARCHAR));
-  fn_expr->children.push_back(make_bound_int_const(1));
-  fn_expr->children.push_back(make_bound_int_const(3));
+  auto fn_expr = make_substring("substring", {Value::BIGINT(1), Value::BIGINT(3)});
 
   auto out = sirius::ast::from_duckdb(*fn_expr);
   REQUIRE(out);
@@ -473,17 +610,7 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substring' resolves to function_id:
 TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substr' alias resolves to function_id::substring",
           "[ast_from_duckdb]")
 {
-  auto fn_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::VARCHAR},
-    ScalarFunction("substr",
-                   {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
-                   LogicalType::VARCHAR,
-                   nullptr),
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
-    nullptr);
-  fn_expr->children.push_back(make_bound_ref(0, LogicalTypeId::VARCHAR));
-  fn_expr->children.push_back(make_bound_int_const(1));
-  fn_expr->children.push_back(make_bound_int_const(3));
+  auto fn_expr = make_substring("substr", {Value::BIGINT(1), Value::BIGINT(3)});
 
   auto out = sirius::ast::from_duckdb(*fn_expr);
   REQUIRE(out);
@@ -491,16 +618,157 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substr' alias resolves to function_
   REQUIRE(out->get<function_call>().function() == sirius::function_id::substring);
 }
 
+TEST_CASE("ast_from_duckdb - two-argument substring translates", "[ast_from_duckdb]")
+{
+  for (int64_t offset : {int64_t{-3}, int64_t{0}, int64_t{4}}) {
+    CAPTURE(offset);
+    auto out = sirius::ast::from_duckdb(*make_substring("substring", {Value::BIGINT(offset)}));
+    REQUIRE(out);
+    REQUIRE(out->get<function_call>().arguments().size() == 2);
+  }
+}
+
+TEST_CASE("ast_from_duckdb - substring bounds the GPU cannot match return nullptr",
+          "[ast_from_duckdb]")
+{
+  SECTION("non-constant offset")
+  {
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> bounds;
+    bounds.push_back(make_bound_ref(1, LogicalTypeId::BIGINT));
+    REQUIRE_FALSE(sirius::ast::from_duckdb(*make_substring("substring", std::move(bounds))));
+  }
+  SECTION("NULL length")
+  {
+    REQUIRE_FALSE(sirius::ast::from_duckdb(
+      *make_substring("substring", {Value::BIGINT(1), Value(LogicalType::BIGINT)})));
+  }
+  SECTION("non-BIGINT bounds")
+  {
+    REQUIRE_FALSE(sirius::ast::from_duckdb(
+      *make_substring("substring", {Value::INTEGER(1), Value::INTEGER(3)})));
+  }
+  SECTION("bounds where DuckDB's ASCII and Unicode kernels disagree")
+  {
+    REQUIRE_FALSE(sirius::ast::from_duckdb(
+      *make_substring("substring", {Value::BIGINT(3), Value::BIGINT(-2)})));
+    REQUIRE_FALSE(sirius::ast::from_duckdb(
+      *make_substring("substring", {Value::BIGINT(-5), Value::BIGINT(3)})));
+  }
+  SECTION("bounds DuckDB rejects as out of range")
+  {
+    REQUIRE_FALSE(
+      sirius::ast::from_duckdb(*make_substring("substring", {Value::BIGINT(int64_t{1} << 33)})));
+    REQUIRE_FALSE(sirius::ast::from_duckdb(
+      *make_substring("substring", {Value::BIGINT(1), Value::BIGINT(int64_t{1} << 33)})));
+  }
+}
+
+TEST_CASE("gpu_substring_slice maps DuckDB bounds to cuDF slices", "[ast_from_duckdb]")
+{
+  using sirius::gpu_substring_slice;
+  auto const slice = [](int64_t offset, int64_t length) {
+    auto const result = gpu_substring_slice(offset, length);
+    REQUIRE(result);
+    return std::pair{result->start, result->stop};
+  };
+  using bounds = std::pair<std::optional<int32_t>, std::optional<int32_t>>;
+
+  REQUIRE(slice(4, sirius::substring_default_length) == bounds{3, INT32_MAX});
+  REQUIRE(slice(2, 3) == bounds{1, 4});
+  REQUIRE(slice(0, 3) == bounds{0, 2});
+  REQUIRE(slice(0, 1) == bounds{0, 0});
+  REQUIRE(slice(0, -1) == bounds{0, 0});
+  REQUIRE(slice(5, 0) == bounds{0, 0});
+  REQUIRE(slice(int64_t{1} << 31, 1) == bounds{INT32_MAX, INT32_MAX});
+  REQUIRE(slice(-3, sirius::substring_default_length) == bounds{-3, std::nullopt});
+  REQUIRE(slice(-3, 3) == bounds{-3, std::nullopt});
+  REQUIRE(slice(-2, -2) == bounds{-4, -2});
+  REQUIRE(slice(-(int64_t{1} << 32), -1) == bounds{INT32_MIN, INT32_MIN});
+
+  REQUIRE_FALSE(gpu_substring_slice(3, -2));
+  REQUIRE_FALSE(gpu_substring_slice(-3, 2));
+  REQUIRE_FALSE(gpu_substring_slice(int64_t{1} << 32, 1));
+  REQUIRE_FALSE(gpu_substring_slice(-1, -(int64_t{1} << 32) - 1));
+}
+
 TEST_CASE("ast_from_duckdb - BOUND_FUNCTION unknown name returns nullptr", "[ast_from_duckdb]")
 {
   auto fn_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction("nonexistent_fn", {LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
+    duckdb::BoundScalarFunction(
+      ScalarFunction("nonexistent_fn", {LogicalType::INTEGER}, LogicalType::INTEGER, nullptr)),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
     nullptr);
-  fn_expr->children.push_back(make_bound_ref(0));
+  fn_expr->GetChildrenMutable().push_back(make_bound_ref(0));
 
   REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
+}
+
+TEST_CASE("ast_from_duckdb - date_trunc admits only GPU-supported constant frequencies",
+          "[ast_from_duckdb]")
+{
+  auto fn_expr = duckdb::make_uniq<BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(ScalarFunction("date_trunc",
+                                               {LogicalType::VARCHAR, LogicalType::TIMESTAMP},
+                                               LogicalType::TIMESTAMP,
+                                               nullptr)),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  fn_expr->GetChildrenMutable().push_back(nullptr);
+  fn_expr->GetChildrenMutable().push_back(make_bound_ref(0, LogicalTypeId::TIMESTAMP));
+
+  for (auto const* unit : {"day", "hour", "minute", "second", "millisecond", "microsecond"}) {
+    CAPTURE(unit);
+    fn_expr->GetChildrenMutable()[0] = duckdb::make_uniq<BoundConstantExpression>(Value(unit));
+    REQUIRE(sirius::ast::from_duckdb(*fn_expr) != nullptr);
+  }
+  for (auto const* unit : {"year", "month", "week", "quarter", "decade", "DAY", "days"}) {
+    CAPTURE(unit);
+    fn_expr->GetChildrenMutable()[0] = duckdb::make_uniq<BoundConstantExpression>(Value(unit));
+    REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
+  }
+
+  SECTION("column frequency")
+  {
+    fn_expr->GetChildrenMutable()[0] = make_bound_ref(1, LogicalTypeId::VARCHAR);
+    REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
+  }
+  SECTION("NULL frequency")
+  {
+    fn_expr->GetChildrenMutable()[0] =
+      duckdb::make_uniq<BoundConstantExpression>(Value(LogicalType::VARCHAR));
+    REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
+  }
+}
+
+TEST_CASE("ast_from_duckdb - constant_or_null translates with its constant as the first argument",
+          "[ast_from_duckdb]")
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  children.push_back(make_bound_ref(0, LogicalTypeId::INTEGER));
+  children.push_back(make_bound_ref(1, LogicalTypeId::VARCHAR));
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  con.BeginTransaction();
+  auto fn_expr = duckdb::ExpressionRewriter::ConstantOrNull(
+    *con.context, std::move(children), Value::BOOLEAN(true));
+
+  auto out = sirius::ast::from_duckdb(*fn_expr);
+  REQUIRE(out);
+  REQUIRE(out->holds<function_call>());
+  auto const& fc = out->get<function_call>();
+  REQUIRE(fc.function() == sirius::function_id::constant_or_null);
+  REQUIRE(fc.return_type().id() == sirius::type_id::BOOLEAN);
+  REQUIRE(fc.arguments().size() == 3);
+  REQUIRE(fc.arguments()[0]->holds<constant>());
+  REQUIRE(fc.arguments()[1]->holds<reference>());
+  REQUIRE(fc.arguments()[2]->holds<reference>());
+
+  SECTION("non-constant first argument")
+  {
+    fn_expr->Cast<BoundFunctionExpression>().GetChildrenMutable()[0] =
+      make_bound_ref(2, LogicalTypeId::BOOLEAN);
+    REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
+  }
 }
 
 // ============================================================================
@@ -514,7 +782,7 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR NOT translates to unary_op(op_not)",
 {
   auto not_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
                                                              LogicalType{LogicalTypeId::BOOLEAN});
-  not_expr->children.push_back(make_bound_ref(0, LogicalTypeId::BOOLEAN));
+  not_expr->GetChildrenMutable().push_back(make_bound_ref(0, LogicalTypeId::BOOLEAN));
   auto out = sirius::ast::from_duckdb(*not_expr);
   REQUIRE(out);
   REQUIRE(out->holds<unary_op>());
@@ -528,7 +796,7 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR IS_NULL translates to unary_op(op_is
 {
   auto is_null_expr = duckdb::make_uniq<BoundOperatorExpression>(
     ExpressionType::OPERATOR_IS_NULL, LogicalType{LogicalTypeId::BOOLEAN});
-  is_null_expr->children.push_back(make_bound_ref(0));
+  is_null_expr->GetChildrenMutable().push_back(make_bound_ref(0));
   auto out = sirius::ast::from_duckdb(*is_null_expr);
   REQUIRE(out);
   REQUIRE(out->holds<unary_op>());
@@ -540,23 +808,19 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR IS_NOT_NULL translates to unary_op(o
 {
   auto is_not_null_expr = duckdb::make_uniq<BoundOperatorExpression>(
     ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType{LogicalTypeId::BOOLEAN});
-  is_not_null_expr->children.push_back(make_bound_ref(0));
+  is_not_null_expr->GetChildrenMutable().push_back(make_bound_ref(0));
   auto out = sirius::ast::from_duckdb(*is_not_null_expr);
   REQUIRE(out);
   REQUIRE(out->holds<unary_op>());
   REQUIRE(out->get<unary_op>().op == unary_op::kind::op_is_not_null);
 }
 
-TEST_CASE("ast_from_duckdb - BOUND_OPERATOR TRY translates to unary_op(op_try)",
-          "[ast_from_duckdb]")
+TEST_CASE("ast_from_duckdb - BOUND_OPERATOR TRY is unsupported", "[ast_from_duckdb]")
 {
   auto try_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_TRY,
                                                              LogicalType{LogicalTypeId::INTEGER});
-  try_expr->children.push_back(make_bound_ref(0));
-  auto out = sirius::ast::from_duckdb(*try_expr);
-  REQUIRE(out);
-  REQUIRE(out->holds<unary_op>());
-  REQUIRE(out->get<unary_op>().op == unary_op::kind::op_try);
+  try_expr->GetChildrenMutable().push_back(make_bound_ref(0));
+  REQUIRE(sirius::ast::from_duckdb(*try_expr) == nullptr);
 }
 
 TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COALESCE translates to coalesce(N children)",
@@ -564,9 +828,9 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COALESCE translates to coalesce(N ch
 {
   auto coalesce_expr = duckdb::make_uniq<BoundOperatorExpression>(
     ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
-  coalesce_expr->children.push_back(make_bound_ref(0));
-  coalesce_expr->children.push_back(make_bound_ref(1));
-  coalesce_expr->children.push_back(make_bound_int_const(0));
+  coalesce_expr->GetChildrenMutable().push_back(make_bound_ref(0));
+  coalesce_expr->GetChildrenMutable().push_back(make_bound_ref(1));
+  coalesce_expr->GetChildrenMutable().push_back(make_bound_int_const(0));
 
   auto out = sirius::ast::from_duckdb(*coalesce_expr);
   REQUIRE(out);
@@ -579,10 +843,10 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COMPARE_IN translates to in_list(neg
 {
   auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
                                                             LogicalType{LogicalTypeId::BOOLEAN});
-  in_expr->children.push_back(make_bound_ref(0));
-  in_expr->children.push_back(make_bound_int_const(2));
-  in_expr->children.push_back(make_bound_int_const(5));
-  in_expr->children.push_back(make_bound_int_const(8));
+  in_expr->GetChildrenMutable().push_back(make_bound_ref(0));
+  in_expr->GetChildrenMutable().push_back(make_bound_int_const(2));
+  in_expr->GetChildrenMutable().push_back(make_bound_int_const(5));
+  in_expr->GetChildrenMutable().push_back(make_bound_int_const(8));
 
   auto out = sirius::ast::from_duckdb(*in_expr);
   REQUIRE(out);
@@ -599,9 +863,9 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COMPARE_NOT_IN translates to in_list
 {
   auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_NOT_IN,
                                                             LogicalType{LogicalTypeId::BOOLEAN});
-  in_expr->children.push_back(make_bound_ref(0));
-  in_expr->children.push_back(make_bound_int_const(2));
-  in_expr->children.push_back(make_bound_int_const(4));
+  in_expr->GetChildrenMutable().push_back(make_bound_ref(0));
+  in_expr->GetChildrenMutable().push_back(make_bound_int_const(2));
+  in_expr->GetChildrenMutable().push_back(make_bound_int_const(4));
 
   auto out = sirius::ast::from_duckdb(*in_expr);
   REQUIRE(out);
@@ -618,8 +882,8 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR unsupported ExpressionType returns n
   // the demultiplex table; signal fallback via nullptr.
   auto nullif_expr = duckdb::make_uniq<BoundOperatorExpression>(
     ExpressionType::OPERATOR_NULLIF, LogicalType{LogicalTypeId::INTEGER});
-  nullif_expr->children.push_back(make_bound_ref(0));
-  nullif_expr->children.push_back(make_bound_int_const(0));
+  nullif_expr->GetChildrenMutable().push_back(make_bound_ref(0));
+  nullif_expr->GetChildrenMutable().push_back(make_bound_int_const(0));
 
   REQUIRE(sirius::ast::from_duckdb(*nullif_expr) == nullptr);
 }
@@ -629,10 +893,10 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR NOT with unsupported child propagate
 {
   // BoundParameterExpression translates to nullptr (BOUND_PARAMETER class).
   // Wrapping it in NOT must propagate the nullptr up.
-  auto bad_child = duckdb::make_uniq<BoundParameterExpression>(std::string{"p_not"});
+  auto bad_child = duckdb::make_uniq<BoundParameterExpression>(duckdb::Identifier{"p_not"});
   auto not_expr  = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
                                                              LogicalType{LogicalTypeId::BOOLEAN});
-  not_expr->children.push_back(std::move(bad_child));
+  not_expr->GetChildrenMutable().push_back(std::move(bad_child));
 
   REQUIRE(sirius::ast::from_duckdb(*not_expr) == nullptr);
 }
@@ -640,12 +904,12 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR NOT with unsupported child propagate
 TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COMPARE_IN with unsupported probe propagates nullptr",
           "[ast_from_duckdb]")
 {
-  auto bad_probe = duckdb::make_uniq<BoundParameterExpression>(std::string{"p_in"});
+  auto bad_probe = duckdb::make_uniq<BoundParameterExpression>(duckdb::Identifier{"p_in"});
   auto in_expr   = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
                                                             LogicalType{LogicalTypeId::BOOLEAN});
-  in_expr->children.push_back(std::move(bad_probe));
-  in_expr->children.push_back(make_bound_int_const(2));
-  in_expr->children.push_back(make_bound_int_const(3));
+  in_expr->GetChildrenMutable().push_back(std::move(bad_probe));
+  in_expr->GetChildrenMutable().push_back(make_bound_int_const(2));
+  in_expr->GetChildrenMutable().push_back(make_bound_int_const(3));
 
   REQUIRE(sirius::ast::from_duckdb(*in_expr) == nullptr);
 }
@@ -653,12 +917,12 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COMPARE_IN with unsupported probe pr
 TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COALESCE with unsupported child propagates nullptr",
           "[ast_from_duckdb]")
 {
-  auto bad_child     = duckdb::make_uniq<BoundParameterExpression>(std::string{"p_coalesce"});
+  auto bad_child = duckdb::make_uniq<BoundParameterExpression>(duckdb::Identifier{"p_coalesce"});
   auto coalesce_expr = duckdb::make_uniq<BoundOperatorExpression>(
     ExpressionType::OPERATOR_COALESCE, LogicalType{LogicalTypeId::INTEGER});
-  coalesce_expr->children.push_back(make_bound_ref(0));
-  coalesce_expr->children.push_back(std::move(bad_child));
-  coalesce_expr->children.push_back(make_bound_int_const(7));
+  coalesce_expr->GetChildrenMutable().push_back(make_bound_ref(0));
+  coalesce_expr->GetChildrenMutable().push_back(std::move(bad_child));
+  coalesce_expr->GetChildrenMutable().push_back(make_bound_int_const(7));
 
   REQUIRE(sirius::ast::from_duckdb(*coalesce_expr) == nullptr);
 }
@@ -669,7 +933,7 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COALESCE with unsupported child prop
 
 TEST_CASE("ast_from_duckdb - BOUND_PARAMETER returns nullptr", "[ast_from_duckdb]")
 {
-  auto param_expr = duckdb::make_uniq<BoundParameterExpression>(std::string{"p1"});
+  auto param_expr = duckdb::make_uniq<BoundParameterExpression>(duckdb::Identifier{"p1"});
   REQUIRE(sirius::ast::from_duckdb(*param_expr) == nullptr);
 }
 
@@ -706,7 +970,8 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
   // EMPTY_RESULT, stripping out every BoundExpression. Run the planner without
   // the optimizer so the test actually exercises from_duckdb on real Binder
   // output.
-  duckdb::ClientConfig::GetConfig(*conn.context).enable_optimizer = false;
+  duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+    *conn.context, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(false));
 
   auto plan =
     conn.ExtractPlan("SELECT a + 3, b LIKE 'x%', c IS NOT NULL FROM t WHERE a BETWEEN 1 AND 10");
@@ -820,4 +1085,26 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
   REQUIRE(saw_add);
   REQUIRE(saw_like);
   REQUIRE(saw_is_not_null);
+}
+
+TEST_CASE("ast_from_duckdb - case conversion functions translate", "[ast_from_duckdb][string_case]")
+{
+  auto const id = GENERATE(sirius::function_id::upper, sirius::function_id::lower);
+  auto expr     = duckdb::make_uniq<BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(
+      ScalarFunction(duckdb::Identifier(std::string(sirius::to_duckdb_function_name(id))),
+                         {LogicalType::VARCHAR},
+                     LogicalType::VARCHAR,
+                     nullptr)),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  expr->GetChildrenMutable().push_back(make_bound_ref(0, LogicalTypeId::VARCHAR));
+  auto out = sirius::ast::from_duckdb(*expr);
+  REQUIRE(out);
+  REQUIRE(out->holds<function_call>());
+  auto const& function = out->get<function_call>();
+  REQUIRE(function.function() == id);
+  REQUIRE(function.arguments().size() == 1);
+  REQUIRE(function.return_type().id() == sirius::type_id::VARCHAR);
+  REQUIRE(out->cudf_ast_op_count() == 0);
 }

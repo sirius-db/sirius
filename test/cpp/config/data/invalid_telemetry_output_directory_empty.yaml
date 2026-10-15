@@ -1,0 +1,4 @@
+sirius:
+  telemetry:
+    enable_quent: false
+    output_directory: ""

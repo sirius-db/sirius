@@ -16,8 +16,12 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
+#include "compressed_scan.hpp"
+#include "compression/simpatico_compressed_representation.hpp"
+
 #include <rmm/device_buffer.hpp>
+
+#include <cuda/stream>
 
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -77,7 +81,7 @@ void copy_device_to_pinned_blocks(
   cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& dst,
   std::uint64_t dst_offset,
   std::size_t size,
-  rmm::cuda_stream_view stream);
+  ::cuda::stream_ref stream);
 
 /// Copy @p size bytes from the pinned payload at logical byte offset @p src_offset
 /// into device @p dst_device, enqueued on @p stream (host→device).
@@ -86,7 +90,7 @@ void copy_pinned_blocks_to_device(
   std::uint64_t src_offset,
   void* dst_device,
   std::size_t size,
-  rmm::cuda_stream_view stream);
+  ::cuda::stream_ref stream);
 
 /**
  * @brief HOST-tier idata_representation backed by a pinned Simpatico-compressed chunk.
@@ -101,7 +105,7 @@ void copy_pinned_blocks_to_device(
  * Multiple compressed_host_representation objects may share the same underlying
  * blob (e.g. after select_columns() or clone()).
  */
-class compressed_host_representation : public cucascade::idata_representation {
+class compressed_host_representation : public simpatico_compressed_representation {
  public:
   /**
    * @brief Construct a compressed_host_representation owning a share of @p blob.
@@ -147,7 +151,7 @@ class compressed_host_representation : public cucascade::idata_representation {
 
   /// Clone shares the same backing blob (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view stream) override;
+    ::cuda::stream_ref stream) override;
 
   // ── Projection ──────────────────────────────────────────────────────────────
 
@@ -187,6 +191,32 @@ class compressed_host_representation : public cucascade::idata_representation {
     return _selected_indices;
   }
 
+  /// Attach the scan whose filter this projection decodes under.
+  ///
+  /// Call only on a freshly projected representation the caller owns outright
+  /// (as @ref select_columns returns): the scan's filter is a property of one
+  /// query, never of the shared pinned chunk. One carrier for the whole
+  /// request, so a clone copies a pointer and nothing can be forgotten.
+  void set_pushdown_scan(std::shared_ptr<const decompression_pushdown_scan> scan)
+  {
+    _pushdown_scan = std::move(scan);
+  }
+
+  /// The attached scan, or null when the columns decompress unfiltered.
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> const& pushdown_scan()
+    const noexcept
+  {
+    return _pushdown_scan;
+  }
+
+  /// Same freshly-projected-only ownership rule as the pushdown setter above.
+  void set_visibility_mask(decode_visibility_mask mask) { _visibility_mask = std::move(mask); }
+
+  [[nodiscard]] const decode_visibility_mask& visibility_mask() const noexcept
+  {
+    return _visibility_mask;
+  }
+
  private:
   /// Construct a projection sharing the same backing blob.
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
@@ -204,6 +234,8 @@ class compressed_host_representation : public cucascade::idata_representation {
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
+  std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
+  decode_visibility_mask _visibility_mask;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 
@@ -226,7 +258,7 @@ class compressed_host_representation : public cucascade::idata_representation {
  * simpatico::decompress() directly on the cached table, decompressing only the selected
  * columns when a projection is set.
  */
-class compressed_device_representation : public cucascade::idata_representation {
+class compressed_device_representation : public simpatico_compressed_representation {
  public:
   compressed_device_representation(
     cucascade::memory::memory_space& memory_space,
@@ -253,12 +285,16 @@ class compressed_device_representation : public cucascade::idata_representation 
 
   /// Clone shares the same cached table (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view stream) override;
+    ::cuda::stream_ref stream) override;
 
   /// Projection sharing the same cached blob; decompress will skip non-selected columns.
   [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(
     std::span<const std::size_t> indices) const;
 
+  /// Whether @ref table is readable. A chunk may legitimately carry no blob —
+  /// serving paths that need only the row count or a column projection never
+  /// touch one — so anything that DOES read the table must ask first.
+  [[nodiscard]] bool has_table() const noexcept;
   /// The cached compressed_table (defined in device_compressed_blob.hpp).
   [[nodiscard]] const simpatico::compressed_table& table() const noexcept;
 
@@ -271,6 +307,32 @@ class compressed_device_representation : public cucascade::idata_representation 
   [[nodiscard]] const std::optional<std::vector<std::size_t>>& selected_indices() const noexcept
   {
     return _selected_indices;
+  }
+
+  /// Attach the scan whose filter this projection decodes under.
+  ///
+  /// Call only on a freshly projected representation the caller owns outright
+  /// (as @ref select_columns returns): the scan's filter is a property of one
+  /// query, never of the shared pinned chunk. One carrier for the whole
+  /// request, so a clone copies a pointer and nothing can be forgotten.
+  void set_pushdown_scan(std::shared_ptr<const decompression_pushdown_scan> scan)
+  {
+    _pushdown_scan = std::move(scan);
+  }
+
+  /// The attached scan, or null when the columns decompress unfiltered.
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> const& pushdown_scan()
+    const noexcept
+  {
+    return _pushdown_scan;
+  }
+
+  /// Same freshly-projected-only ownership rule as the pushdown setter above.
+  void set_visibility_mask(decode_visibility_mask mask) { _visibility_mask = std::move(mask); }
+
+  [[nodiscard]] const decode_visibility_mask& visibility_mask() const noexcept
+  {
+    return _visibility_mask;
   }
 
  private:
@@ -289,6 +351,8 @@ class compressed_device_representation : public cucascade::idata_representation 
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
+  std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
+  decode_visibility_mask _visibility_mask;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 

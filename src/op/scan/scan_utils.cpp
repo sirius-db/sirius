@@ -15,15 +15,26 @@
  */
 
 // sirius
-#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
 #include <op/scan/scan_utils.hpp>
 
+// duckdb
+#include <duckdb/common/types/value.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/expression_iterator.hpp>
+#include <duckdb/planner/filter/conjunction_filter.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
+#include <duckdb/planner/filter/in_filter.hpp>
+
 // standard library
+#include <cstdint>
 #include <format>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -54,59 +65,132 @@ std::vector<std::optional<std::size_t>> build_batch_column_map(
   return map;
 }
 
+resolved_filter_column resolve_filtered_column(
+  duckdb::idx_t column_index,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
+  const std::unordered_set<std::size_t>& skip_primary_indices)
+{
+  if (column_index >= column_ids.size()) { return {}; }
+  auto const primary_index = static_cast<std::size_t>(column_ids[column_index].GetPrimaryIndex());
+  if (skip_primary_indices.count(primary_index) != 0) {
+    SIRIUS_LOG_DEBUG(
+      "TABLE_SCAN filter: skipping filter on primary_idx={} (hive partition or equivalent)",
+      primary_index);
+    return {};
+  }
+  if (column_index >= batch_position_by_column_id.size() ||
+      !batch_position_by_column_id[column_index].has_value()) {
+    return {filter_column_status::not_in_batch, primary_index, 0};
+  }
+  return {filter_column_status::usable, primary_index, *batch_position_by_column_id[column_index]};
+}
+
+std::vector<table_filter_conjunct> decompose_table_filters(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<sirius::logical_type>& returned_types,
+  const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
+  const std::unordered_set<std::size_t>& skip_primary_indices,
+  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types)
+{
+  std::vector<table_filter_conjunct> conjuncts;
+
+  for (auto const& entry : filters) {
+    auto const column_index = entry.GetIndex().GetIndex();
+    auto const& filter =
+      duckdb::ExpressionFilter::GetExpressionFilter(entry.Filter(), "scan filter decomposition");
+    if (duckdb::ExpressionFilter::IsOptionalFilter(filter)) { continue; }
+
+    auto const column = resolve_filtered_column(
+      column_index, column_ids, batch_position_by_column_id, skip_primary_indices);
+    if (column.status == filter_column_status::skipped) { continue; }
+    if (column.status == filter_column_status::not_in_batch) {
+      // A conjunct that has to be EVALUATED cannot reference a column that was
+      // never materialized — unlike a filter used only for pruning, which may
+      // be dropped. Loud, because it is a wiring bug rather than a shape we do
+      // not support.
+      throw std::runtime_error(
+        std::format("TABLE_SCAN filter: column_index ({}) not in projected batch", column_index));
+    }
+    sirius::logical_type col_type;
+    auto const source_id = column_ids.at(column_index).GetPrimaryIndex();
+    if (duckdb::IsVirtualColumn(source_id) || virtual_types.contains(source_id)) {
+      auto const type = virtual_types.find(source_id);
+      if (type == virtual_types.end()) {
+        throw std::runtime_error(
+          std::format("TABLE_SCAN filter: virtual column id ({}) has no bound type", source_id));
+      }
+      col_type = type->second;
+    } else {
+      col_type = returned_types.at(column.primary_index);
+    }
+    auto const batch_column_index = static_cast<duckdb::idx_t>(column.batch_position);
+
+    SIRIUS_LOG_DEBUG(
+      "TABLE_SCAN filter: column_index={}, primary_idx={}, type={}, filter_type={}, "
+      "batch_column_index={}",
+      column_index,
+      column.primary_index,
+      col_type.to_string(),
+      static_cast<int>(filter.filter_type),
+      batch_column_index);
+
+    auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+      sirius::to_duckdb(col_type), batch_column_index);
+    conjuncts.push_back(
+      {column.primary_index, column.batch_position, filter.ToExpression(*column_ref)});
+  }
+
+  for (auto const& entry : filters.GetMultiColumnFilters()) {
+    auto const* filter =
+      &duckdb::ExpressionFilter::GetExpressionFilter(*entry, "multi-column scan filter");
+    if (duckdb::ExpressionFilter::IsOptionalFilter(*filter)) { continue; }
+    auto expr                                      = filter->expr->Copy();
+    std::function<void(duckdb::Expression&)> remap = [&](duckdb::Expression& node) {
+      if (node.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+        auto& ref             = node.Cast<duckdb::BoundReferenceExpression>();
+        auto const scan_index = filter->column_indexes.at(ref.Index()).GetIndex();
+        auto const column     = resolve_filtered_column(
+          scan_index, column_ids, batch_position_by_column_id, skip_primary_indices);
+        if (column.status != filter_column_status::usable) {
+          throw std::runtime_error(
+            "TABLE_SCAN multi-column filter references an unavailable batch column");
+        }
+        ref.IndexMutable() = column.batch_position;
+      }
+      duckdb::ExpressionIterator::EnumerateChildren(
+        node, [&](duckdb::unique_ptr<duckdb::Expression>& child) { remap(*child); });
+    };
+    remap(*expr);
+    conjuncts.push_back({std::nullopt, std::nullopt, std::move(expr)});
+  }
+
+  return conjuncts;
+}
+
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
-  const std::unordered_set<std::size_t>& skip_primary_indices)
+  const std::unordered_set<std::size_t>& skip_primary_indices,
+  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types)
 {
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
+  auto conjuncts = decompose_table_filters(filters,
+                                           column_ids,
+                                           returned_types,
+                                           batch_position_by_column_id,
+                                           skip_primary_indices,
+                                           virtual_types);
 
-  for (auto& [column_index, filter] : filters.filters) {
-    // Skip optional and IS_NOT_NULL filters
-    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
-        filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
-      continue;
-    }
-
-    auto primary_idx = column_ids.at(column_index).GetPrimaryIndex();
-    if (skip_primary_indices.count(primary_idx)) {
-      SIRIUS_LOG_DEBUG(
-        "TABLE_SCAN filter: skipping filter on primary_idx={} (hive partition or equivalent)",
-        primary_idx);
-      continue;
-    }
-    auto const col_type = returned_types.at(primary_idx);
-
-    SIRIUS_LOG_DEBUG("TABLE_SCAN filter: column_index={}, primary_idx={}, type={}, filter_type={}",
-                     column_index,
-                     primary_idx,
-                     col_type.to_string(),
-                     static_cast<int>(filter->filter_type));
-
-    auto const& batch_pos = batch_position_by_column_id[column_index];
-    if (!batch_pos.has_value()) {
-      throw std::runtime_error(
-        std::format("TABLE_SCAN filter: column_index ({}) not in projected batch", column_index));
-    }
-    auto const batch_column_index = static_cast<duckdb::idx_t>(*batch_pos);
-
-    SIRIUS_LOG_DEBUG("TABLE_SCAN filter: batch_column_index={}", batch_column_index);
-
-    auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
-      sirius::to_duckdb(col_type), batch_column_index);
-    auto expr = filter->ToExpression(*column_ref);
-    filter_expressions.push_back(std::move(expr));
-  }
-
-  if (filter_expressions.empty()) { return nullptr; }
-  if (filter_expressions.size() == 1) { return std::move(filter_expressions[0]); }
+  if (conjuncts.empty()) { return nullptr; }
+  if (conjuncts.size() == 1) { return std::move(conjuncts[0].expr); }
 
   auto conjunction =
     duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
-  for (auto& expr : filter_expressions) {
-    conjunction->children.push_back(std::move(expr));
+  for (auto& conjunct : conjuncts) {
+    conjunction->GetChildrenMutable().push_back(std::move(conjunct.expr));
   }
   return conjunction;
 }

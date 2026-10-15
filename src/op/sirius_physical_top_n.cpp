@@ -25,6 +25,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
@@ -32,8 +33,6 @@
 #include <cudf/sorting.hpp>
 
 #include <rmm/resource_ref.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
@@ -45,12 +44,39 @@ namespace op {
 
 namespace {
 
+//! Selects the first `keep_rows` rows of `input` under the given lexicographic ordering.
+//!
+//! Sorting the keys into a permutation and gathering only the surviving rows is much cheaper than
+//! `cudf::sort_by_key` for a top-N: the sort materializes an int32 index column rather than a fully
+//! sorted copy of every payload column, and the gather touches `keep_rows` rows instead of all of
+//! them. Unlike `cudf::top_k_order` this honors SQL NULLS FIRST/LAST, so it is the fallback for
+//! nullable and multi-key orderings.
+std::unique_ptr<cudf::table> sorted_order_top_k(cudf::table_view input,
+                                                cudf::table_view keys,
+                                                std::vector<cudf::order> const& key_orders,
+                                                std::vector<cudf::null_order> const& null_orders,
+                                                cudf::size_type keep_rows,
+                                                ::cuda::stream_ref stream,
+                                                rmm::device_async_resource_ref memory_resource)
+{
+  auto indices = cudf::sorted_order(keys, key_orders, null_orders, stream, memory_resource);
+
+  auto indices_view = indices->view();
+  if (keep_rows < indices_view.size()) {
+    // Views into `indices`, which outlives the gather below.
+    indices_view = cudf::slice(indices_view, {0, keep_rows}, stream).front();
+  }
+
+  return cudf::gather(
+    input, indices_view, cudf::out_of_bounds_policy::DONT_CHECK, stream, memory_resource);
+}
+
 std::unique_ptr<cudf::table> compute_top_n_table(
   cudf::table_view input,
   duckdb::vector<duckdb::BoundOrderByNode> const& orders,
   std::size_t limit,
   std::size_t offset,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref memory_resource)
 {
   if (limit == 0 || input.num_rows() == 0) { return duckdb::make_empty_like(input); }
@@ -63,11 +89,11 @@ std::unique_ptr<cudf::table> compute_top_n_table(
   std::unique_ptr<cudf::table> kept;
   if (orders.size() == 1) {
     auto const& ord = orders[0];
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
       throw not_implemented_exception("TopN only supports bound reference expressions");
     }
-    auto const idx =
-      static_cast<cudf::size_type>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    auto const idx = static_cast<cudf::size_type>(
+      ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
     if (idx < 0 || idx >= input.num_columns()) {
       throw internal_exception("TopN order index out of range");
     }
@@ -77,15 +103,14 @@ std::unique_ptr<cudf::table> compute_top_n_table(
     if (input.column(idx).has_nulls()) {
       // cudf::top_k_order takes no null_order, so it cannot honor SQL NULLS FIRST/LAST when
       // selecting which rows are in the top k (it treats NULLs as the largest value). For a
-      // nullable key, fall back to a full sort that honors null placement, then slice the top k.
-      auto sorted = cudf::sort_by_key(
-        input, cudf::table_view({input.column(idx)}), {order}, {null_ord}, stream, memory_resource);
-      if (keep_rows == sorted->num_rows()) {
-        kept = std::move(sorted);
-      } else {
-        auto slices = cudf::slice(sorted->view(), {0, keep_rows}, stream);
-        kept        = std::make_unique<cudf::table>(slices.front(), stream, memory_resource);
-      }
+      // nullable key, fall back to a sort that honors null placement, then take the top k.
+      kept = sorted_order_top_k(input,
+                                cudf::table_view({input.column(idx)}),
+                                {order},
+                                {null_ord},
+                                keep_rows,
+                                stream,
+                                memory_resource);
     } else {
       auto indices =
         cudf::top_k_order(input.column(idx), keep_rows, order, stream, memory_resource);
@@ -100,7 +125,7 @@ std::unique_ptr<cudf::table> compute_top_n_table(
                                memory_resource);
     }
   } else {
-    // Multi-key: fall back to full sort_by_key
+    // Multi-key: cudf::top_k_order is single-column only, so sort the key tuple and take the top k.
     std::vector<cudf::column_view> key_views;
     key_views.reserve(orders.size());
     std::vector<cudf::order> key_orders;
@@ -109,11 +134,11 @@ std::unique_ptr<cudf::table> compute_top_n_table(
     null_orders.reserve(orders.size());
 
     for (auto const& ord : orders) {
-      if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+      if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
         throw not_implemented_exception("TopN only supports bound reference expressions");
       }
       auto const idx = static_cast<cudf::size_type>(
-        ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+        ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
       if (idx < 0 || idx >= input.num_columns()) {
         throw internal_exception("TopN order index out of range");
       }
@@ -122,16 +147,13 @@ std::unique_ptr<cudf::table> compute_top_n_table(
       null_orders.push_back(to_cudf_null_order(ord.type, ord.null_order));
     }
 
-    auto keys_table = cudf::table_view(key_views);
-    auto sorted =
-      cudf::sort_by_key(input, keys_table, key_orders, null_orders, stream, memory_resource);
-
-    if (keep_rows == sorted->num_rows()) {
-      kept = std::move(sorted);
-    } else {
-      auto slices = cudf::slice(sorted->view(), {0, keep_rows}, stream);
-      kept        = std::make_unique<cudf::table>(slices.front(), stream, memory_resource);
-    }
+    kept = sorted_order_top_k(input,
+                              cudf::table_view(key_views),
+                              key_orders,
+                              null_orders,
+                              keep_rows,
+                              stream,
+                              memory_resource);
   }
 
   return kept;
@@ -158,9 +180,9 @@ sirius_physical_top_n::sirius_physical_top_n(
 sirius_physical_top_n::~sirius_physical_top_n() {}
 
 std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_data& input_data,
-                                                              rmm::cuda_stream_view stream)
+                                                              ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_top_n::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_top_n::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (limit == 0) {
@@ -244,9 +266,9 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(
 }
 
 std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operator_data& input_data,
-                                                                    rmm::cuda_stream_view stream)
+                                                                    ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (limit == 0) {
@@ -258,15 +280,11 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   // gpu_pipeline_task::execute_pipeline_task_round ->
   // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
   // batches[0]->get_memory_space() == target_space here.
-  cucascade::memory::memory_space* space = nullptr;
-  for (auto const& batch : input_batches) {
-    space = batch.get_memory_space();
-    break;
-  }
-  if (space == nullptr) {
+  if (input_batches.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
+  auto* space = input_batches.front().get_memory_space();
 
   // R1 — read-only accessors held in a vector for the duration of cudf::concatenate
   // so the underlying table_views remain valid.

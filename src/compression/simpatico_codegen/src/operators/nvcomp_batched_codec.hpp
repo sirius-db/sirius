@@ -21,10 +21,10 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <nvcomp/shared_types.h>
@@ -95,7 +95,7 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
   batched_codec_ops const& ops,
   void const* src,
   std::size_t n_bytes,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
 // Decompress a frame produced by batched_compress_bytes into device `dst`, which
@@ -106,7 +106,7 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
                               std::size_t frame_size,
                               void* dst,
                               std::size_t out_bytes,
-                              rmm::cuda_stream_view stream,
+                              ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref mr);
 
 }  // namespace detail

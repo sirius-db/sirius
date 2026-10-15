@@ -16,11 +16,10 @@
 
 // Per-operator MGPU integration test for ORDER BY (physical_order).
 //
-// ORDER BY is partition-based: when the input working set exceeds
-// hash_partition_bytes sirius_physical_partition produces multiple
-// partitions that the task_creator pins `partition_idx % num_gpus`.
-// The merge stage pulls the per-partition sorted runs back into a single
-// sorted output. These TEST_CASEs cover the cross-GPU sort/merge path:
+// ORDER BY samples, range-partitions, and merges: SORT_PARTITION cuts each
+// sorted run into range slices and MERGE_SORT pulls them back into a single
+// sorted output, placing each task by data locality (sort has no partition
+// placement). These TEST_CASEs cover the cross-GPU sort/merge path:
 //
 //   1. Large sort across both GPUs — 4M rows with a permuted key so the
 //      partitioner produces >=2 partitions; asserts correctness and
@@ -75,7 +74,7 @@ fs::path make_tmp_dir(std::string const& tag)
 }  // namespace
 
 TEST_CASE("physical_order - large sort distributes across two GPUs",
-          "[mgpu][operator-mgpu][order][gpu_execution]")
+          "[mgpu][operator-mgpu][order][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -128,7 +127,7 @@ TEST_CASE("physical_order - large sort distributes across two GPUs",
 // a 2-element partition vector. See 12-CONTEXT.md and 12-stack-trace.txt for
 // the original off-by-one site at sirius_physical_hash_join.cpp:622-637.
 TEST_CASE("physical_order - small sort rangecheck regression",
-          "[mgpu][operator-mgpu][order][gpu_execution][regression]")
+          "[mgpu][operator-mgpu][order][gpu_execution][regression][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -168,7 +167,7 @@ TEST_CASE("physical_order - small sort rangecheck regression",
 }
 
 TEST_CASE("physical_order - small sort stays single-GPU",
-          "[mgpu][operator-mgpu][order][gpu_execution]")
+          "[mgpu][operator-mgpu][order][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -203,7 +202,7 @@ TEST_CASE("physical_order - small sort stays single-GPU",
 }
 
 TEST_CASE("physical_order - order by with limit over large input",
-          "[mgpu][operator-mgpu][order][gpu_execution]")
+          "[mgpu][operator-mgpu][order][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 

@@ -1,0 +1,26 @@
+# Sirius engine config for the engine-linked backend (`scripts/be.sh start --engine`).
+#
+# Sized for one small single-GPU box shared with the Doris FE (JVM heap 4 GiB, conf/fe.conf):
+# the built-in defaults claim 95% of VRAM and pin 90% of each NUMA node's RAM as the host tier,
+# which on a 32 GB host leaves nothing for the FE, the BE process, and the page cache. Keys are
+# documented in docs/super-sirius/configuration.md; relative paths resolve against the BE's
+# working directory (`experimental/doris/`, where be.sh runs it).
+sirius:
+  topology: { num_gpus: 1 }
+  memory:
+    gpu:
+      usage_limit_fraction: 0.9
+    host:
+      # Pinned (cudaMallocHost) per NUMA node; the box has one node.
+      capacity_bytes: 12Gi
+    disk:
+      # Spill tier for the host→disk downgrade path (SF10 on a 16 GB GPU needs it). be.sh
+      # creates the directory; cucascade only mkstemps files inside it.
+      disk_id: 0
+      capacity_bytes: 100Gi
+      downgrade_root_dirs: "log/sirius-spill"
+  telemetry:
+    # Quent per-query telemetry (operator timings) lands next to the other run logs.
+    enable_quent: true
+    output_directory: log/telemetry
+    engine_name: sirius-doris-be

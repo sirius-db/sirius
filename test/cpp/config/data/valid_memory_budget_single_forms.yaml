@@ -1,0 +1,8 @@
+sirius:
+  memory:
+    gpu:
+      usage_limit_bytes: 1 GiB
+      reservation_limit_fraction: 0.5
+    host:
+      capacity_fraction: 0.5
+      reservation_limit_bytes: 4 GiB

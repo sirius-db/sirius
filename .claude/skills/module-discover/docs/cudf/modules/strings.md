@@ -39,7 +39,6 @@ std::unique_ptr<column> ends_with(strings_column_view const& input, string_scala
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_function.cpp` — SQL LIKE, regex matching, prefix/suffix checks
 
 ### `cudf::strings::find`
 
@@ -49,7 +48,6 @@ std::unique_ptr<column> find(strings_column_view const& input, string_scalar con
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_function.cpp` — POSITION/INSTR function
 
 ### `cudf::strings::slice_strings`
 
@@ -64,7 +62,6 @@ std::unique_ptr<column> slice_strings(strings_column_view const& input,
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_function.cpp` — SQL SUBSTRING function
 
 ### `cudf::strings::count_characters` / `cudf::strings::count_bytes`
 
@@ -75,7 +72,6 @@ std::unique_ptr<column> count_bytes(strings_column_view const& input, ...);
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_function.cpp` — SQL LENGTH/CHAR_LENGTH
 
 ### `cudf::strings::replace_re`
 
@@ -90,7 +86,6 @@ std::unique_ptr<column> replace_with_backrefs(strings_column_view const& input,
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_function.cpp` — SQL REGEXP_REPLACE
 
 ### `cudf::strings::regex_program`
 
@@ -102,7 +97,6 @@ class regex_program {
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_function.cpp:37` — Compiling regex patterns for LIKE/REGEXP operations
 
 ## APIs Available but Not Used
 

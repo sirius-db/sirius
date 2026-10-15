@@ -14,13 +14,18 @@
  * limitations under the License.
  */
 
+// clang-format off
+#include <variant>
 #include "expression_evaluator/regex/regex_playground.hpp"
+// clang-format on
+
+#include <cudf/cudf_utils.hpp>
 
 namespace sirius {
 namespace regex {
 
 std::unique_ptr<cudf::column> regex_playground::jit_transform_clickbench_q28_regex(
-  const cudf::column_view& input)
+  const cudf::column_view& input, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   auto udf = R"***(
 __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda::std::optional<cudf::string_view> const url_opt) {
@@ -50,7 +55,9 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
     next = next.substr(3, next.length() - 3);
 
     // For "(?:www\.)?"
-    if (next.length() >= 4 && next[0] == 'w' && next[1] == 'w' && next[2] == 'w' && next[3] == '.') {
+    // Only consume the optional prefix when the required ([^/]+) group will remain non-empty.
+    // Otherwise the generic regex engine backtracks and captures "www." as the host.
+    if (next.length() > 4 && next[0] == 'w' && next[1] == 'w' && next[2] == 'w' && next[3] == '.' && next[4] != '/') {
         next = next.substr(4, next.length() - 4);
     }
 
@@ -66,22 +73,45 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
     }
     *out = next.substr(0, pos);
 
-    // For "/.*", a newline ('\n') will trigger mismatch
+    // For "/.*$": RE2's . excludes newlines and its $ only matches at the end of the text,
+    // so any newline after the host, trailing or not, means the pattern does not match.
     next = next.substr(pos + 1, next.length() - pos - 1);
     if (next.find('\n') != cudf::string_view::npos) {
         *out = url;
         return;
     }
+
 }
 )***";
 
   cudf::transform_input ti = input;
+#if CUDF_VERSION_NUM >= 2610
+  cudf::transform_output const output{cudf::data_type{cudf::type_id::STRING},
+                                      cudf::output_nullability::PRESERVE};
+  auto result  = cudf::transform(udf,
+                                cudf::udf_source_type::CUDA,
+                                cudf::null_aware::YES,
+                                std::nullopt,
+                                std::span(&ti, 1),
+                                std::span(&output, 1),
+                                std::vector<std::unique_ptr<cudf::column>>{},
+                                std::nullopt,
+                                stream,
+                                mr);
+  auto columns = result->release();
+  return std::move(columns.front());
+#else
   return cudf::transform_extended(std::span(&ti, 1),
                                   udf,
                                   cudf::data_type{cudf::type_id::STRING},
                                   cudf::udf_source_type::CUDA,
                                   std::nullopt,
-                                  cudf::null_aware::YES);
+                                  cudf::null_aware::YES,
+                                  std::nullopt,
+                                  cudf::output_nullability::PRESERVE,
+                                  stream,
+                                  mr);
+#endif
 }
 
 }  // namespace regex

@@ -18,8 +18,8 @@
  * @file test_partition_build_pipelines.cpp
  * @brief PARTITION's custom `build_pipelines` override and the wiring it produces: every
  *        PARTITION is its own single-operator pipeline, its tree child terminates the deeper
- *        meta-pipeline as sink, its input edge carries the probe/build barrier semantics from
- *        `resolve_barrier`, and its output routes to the downstream CONCAT/MERGE pipeline.
+ *        meta-pipeline as sink, its input edge uses consumer-owned probe/build barrier semantics,
+ *        and its output routes to the downstream CONCAT/MERGE pipeline.
  */
 
 #include "op/sirius_physical_concat.hpp"
@@ -59,10 +59,10 @@ fs::path integration_db_path()
 }
 
 //! All scheduled pipelines whose sink is a PARTITION.
-std::vector<duckdb::shared_ptr<sirius_pipeline>> partition_pipelines(
+std::vector<std::shared_ptr<sirius_pipeline>> partition_pipelines(
   pipeline_conversion_result& result)
 {
-  std::vector<duckdb::shared_ptr<sirius_pipeline>> out;
+  std::vector<std::shared_ptr<sirius_pipeline>> out;
   for (const auto& pipeline : result.scheduled_pipelines) {
     if (pipeline->get_sink() &&
         pipeline->get_sink()->type == SiriusPhysicalOperatorType::PARTITION) {
@@ -106,7 +106,7 @@ std::string chains_to_string(pipeline_conversion_result& result)
 //! Shared PARTITION invariants: single-operator pipeline whose tree child terminated its own
 //! deeper pipeline as sink (the promotion PARTITION's build_pipelines performs).
 void require_partition_pipeline_shape(pipeline_conversion_result& result,
-                                      const duckdb::shared_ptr<sirius_pipeline>& pipeline)
+                                      const std::shared_ptr<sirius_pipeline>& pipeline)
 {
   auto ops = pipeline->get_operators();
   REQUIRE(ops.size() == 1);
@@ -264,32 +264,48 @@ TEST_CASE_METHOD(partition_build_fixture,
   });
 }
 
-TEST_CASE_METHOD(partition_build_fixture,
-                 "PARTITION build_pipelines - aggregate fanout partition uses a FULL barrier",
-                 "[integration][pipeline][partition_build]")
+TEST_CASE_METHOD(
+  partition_build_fixture,
+  "PARTITION build_pipelines - aggregate fanout ingress follows runtime size estimation",
+  "[integration][pipeline][partition_build]")
 {
   const std::string query = "SELECT n_regionkey, count(*) FROM nation GROUP BY n_regionkey";
 
-  sirius::test::with_conversion_result(*con, query, [&](pipeline_conversion_result& result) {
-    auto partitions = partition_pipelines(result);
-    // The MERGE_GROUP_BY fanout partition from wrap_hash_group_by.
-    REQUIRE(partitions.size() == 1);
-    const auto& pipeline = partitions[0];
+  // Only the aggregate-fanout ingress barrier changes between settings.
+  auto check_ingress = [&](bool estimation_on, sirius::op::MemoryBarrierType expected) {
+    auto set = con->Query(std::string("SET enable_runtime_size_estimation = ") +
+                          (estimation_on ? "true;" : "false;"));
+    REQUIRE(set);
+    REQUIRE_FALSE(set->HasError());
 
-    require_partition_pipeline_shape(result, pipeline);
+    sirius::test::with_conversion_result(*con, query, [&](pipeline_conversion_result& result) {
+      INFO("enable_runtime_size_estimation = " << estimation_on);
+      auto partitions = partition_pipelines(result);
+      // The MERGE_GROUP_BY fanout partition from wrap_hash_group_by.
+      REQUIRE(partitions.size() == 1);
+      const auto& pipeline = partitions[0];
 
-    // The per-thread HASH_GROUP_BY output must be complete before partitioning for the
-    // merge: FULL barrier, and the promoted child is the HASH_GROUP_BY itself.
-    auto inputs = wirings_into(result, pipeline.get());
-    CHECK(inputs[0]->barrier_type == sirius::op::MemoryBarrierType::FULL);
-    CHECK(inputs[0]->source_pipeline->get_sink()->type ==
-          SiriusPhysicalOperatorType::HASH_GROUP_BY);
+      require_partition_pipeline_shape(result, pipeline);
 
-    // Downstream, the merge consumes the partition output.
-    auto outputs = wirings_out_of(result, pipeline.get());
-    REQUIRE(outputs.size() == 1);
-    auto* partition = pipeline->get_sink().get();
-    CHECK(outputs[0]->dest_pipeline->get_source().get() == partition->get_parent_op());
-    CHECK(partition->get_parent_op()->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
-  });
+      auto inputs = wirings_into(result, pipeline.get());
+      REQUIRE(inputs.size() == 1);
+      CHECK(inputs[0]->barrier_type == expected);
+      CHECK(inputs[0]->source_pipeline->get_sink()->type ==
+            SiriusPhysicalOperatorType::HASH_GROUP_BY);
+
+      // The merge always waits for every partition bucket.
+      auto outputs = wirings_out_of(result, pipeline.get());
+      REQUIRE(outputs.size() == 1);
+      CHECK(outputs[0]->barrier_type == sirius::op::MemoryBarrierType::FULL);
+      auto* partition = pipeline->get_sink().get();
+      CHECK(outputs[0]->dest_pipeline->get_source().get() == partition->get_parent_op());
+      CHECK(partition->get_parent_op()->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    });
+  };
+
+  check_ingress(/*estimation_on=*/false, sirius::op::MemoryBarrierType::FULL);
+
+  check_ingress(/*estimation_on=*/true, sirius::op::MemoryBarrierType::PARTIAL);
+
+  con->Query("SET enable_runtime_size_estimation = false;");
 }

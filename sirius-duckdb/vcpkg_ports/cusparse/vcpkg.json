@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "dependencies": [
+    "culibos",
+    "nvjitlink"
+  ],
+  "description": "NVIDIA cusparse static redistributables for CUDA 12 and 13.",
+  "license": "LicenseRef-Proprietary",
+  "name": "cusparse",
+  "supports": "linux & (x64 | arm64)",
+  "version": "12.8.1.7"
+}

@@ -1,0 +1,4 @@
+sirius:
+  memory:
+    gpu: {}
+    host: {}

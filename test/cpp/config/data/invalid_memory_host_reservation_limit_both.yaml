@@ -1,0 +1,5 @@
+sirius:
+  memory:
+    host:
+      reservation_limit_bytes: 4 GiB
+      reservation_limit_fraction: 0.5

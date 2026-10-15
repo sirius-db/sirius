@@ -1,5 +1,7 @@
 #include "codegen/jit/nvrtc_compiler.hpp"
 
+#include "compilation_request.hpp"
+
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
@@ -17,7 +19,7 @@
 // header tree on disk:
 //   - project headers (codegen/decode/rle_block.cuh, codegen/stdint_shim.hpp),
 //     embedded by cmake/embed_jit_headers.cmake
-//   - the CCCL closure (<cuda/std/...>, <cub/...>), embedded by
+//   - the complete CCCL library bundle, embedded by
 //     cmake/embed_cccl_headers.cmake
 // This lets a binary distribution JIT-compile with only the driver and the
 // nvrtc runtime the extension already links -- no CUDA toolkit headers on disk.
@@ -25,19 +27,6 @@
 #include "codegen/jit/embedded_headers.h"
 
 namespace codegen::jit {
-
-namespace {
-
-// Optional escape hatch: if the embedded CCCL closure ever lacks a header a
-// future renderer needs, SIMPATICO_JIT_CCCL_INCLUDE may point NVRTC at a real
-// CCCL dir as an extra -I. Unset by default; not required for correctness.
-const char* cccl_include_override()
-{
-  const char* e = std::getenv("SIMPATICO_JIT_CCCL_INCLUDE");
-  return (e != nullptr && *e != '\0') ? e : nullptr;
-}
-
-}  // namespace
 
 int arch_cc_for_current_device()
 {
@@ -92,6 +81,21 @@ namespace {
   } while (0)
 
 }  // namespace
+
+const detail::Digest& detail::cache_environment()
+{
+  static const Digest identity = [] {
+    int major = 0, minor = 0;
+    NVRTC_OR_THROW(nvrtcVersion(&major, &minor));
+    // Both linkage modes use the reported version. Same-version compiler
+    // patches intentionally retain reuse; header contents have their own digests.
+    return environment_identity({kEmbeddedJitHeadersIdentity,
+                                 kCcclEmbeddedHeadersIdentity,
+                                 static_cast<uint32_t>(major),
+                                 static_cast<uint32_t>(minor)});
+  }();
+  return identity;
+}
 
 CUfunction CompiledKernel::func_for_current_device() const
 {
@@ -155,6 +159,13 @@ CompiledKernel compile_plain_kernel(const std::string& source,
                                     const std::string& entry_symbol,
                                     const CompileOptions& opts)
 {
+  return detail::compile_request(detail::CompilationRequest(source, entry_symbol, opts));
+}
+
+CompiledKernel detail::compile_request(const CompilationRequest& request)
+{
+  const auto& source       = request.source;
+  const auto& entry_symbol = request.entry;
   if (source.empty()) { throw std::runtime_error("compile_plain_kernel: empty source"); }
   if (entry_symbol.empty()) {
     throw std::runtime_error("compile_plain_kernel: empty entry_symbol");
@@ -162,7 +173,7 @@ CompiledKernel compile_plain_kernel(const std::string& source,
 
   // All headers the rendered kernels #include are supplied to NVRTC as named
   // in-memory headers (embedded in the binary): the project headers plus the
-  // full CCCL closure (<cuda/std/...>, <cub/...>). So no header tree is needed
+  // complete CCCL bundle. So no header tree is needed
   // on disk at runtime. The include NAMES must match the `#include` strings
   // seen by NVRTC (the renderers' `"codegen/..."` and CCCL's `<...>`).
   std::vector<const char*> hdr_sources;
@@ -181,32 +192,13 @@ CompiledKernel compile_plain_kernel(const std::string& source,
   nvrtcProgram prog = nullptr;
   NVRTC_OR_THROW(nvrtcCreateProgram(&prog,
                                     source.c_str(),
-                                    "codegen_jit.cu",
+                                    CompilationRequest::program_name,
                                     static_cast<int>(hdr_names.size()),
                                     hdr_sources.data(),
                                     hdr_names.data()));
 
-  // Plain CUDA by default — no -default-device. Some rendered sources include
-  // shared headers that use c++20 and unannotated constexpr accessors; those
-  // opt into -default-device + c++20 via opts.default_device. The leaner path
-  // keeps the c++17/no-default-device setup.
-  const std::string arch_opt = "-arch=sm_" + std::to_string(opts.arch_cc);
-
-  std::vector<const char*> nvrtc_opts = {
-    opts.default_device ? "-std=c++20" : "-std=c++17",
-    arch_opt.c_str(),
-  };
-  // No -I is required (headers are embedded); the env override, when set, adds
-  // one as a fallback for a hypothetical embedded-closure gap.
-  std::string cccl_inc;
-  if (const char* ov = cccl_include_override()) {
-    cccl_inc = std::string("-I") + ov;
-    nvrtc_opts.push_back(cccl_inc.c_str());
-  }
-  if (opts.default_device) { nvrtc_opts.push_back("-default-device"); }
-
   nvrtcResult compile_result =
-    nvrtcCompileProgram(prog, static_cast<int>(nvrtc_opts.size()), nvrtc_opts.data());
+    nvrtcCompileProgram(prog, static_cast<int>(request.options.size()), request.options.data());
 
   // Capture the log unconditionally so warnings on success and errors
   // on failure surface to callers symmetrically.

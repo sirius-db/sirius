@@ -1,0 +1,4 @@
+sirius:
+  executor:
+    task_creator:
+      thread_name_prefix: custom_task_creator

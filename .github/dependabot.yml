@@ -12,3 +12,8 @@ updates:
       - /experimental/starrocks
     schedule:
       interval: daily
+    groups:
+      arrow-parquet:
+        patterns:
+          - "arrow*"
+          - "parquet*"

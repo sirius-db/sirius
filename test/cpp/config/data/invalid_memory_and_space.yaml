@@ -1,0 +1,10 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_bytes: 256MiB
+  space:
+    gpu:
+      - device_id: 0
+        memory_capacity: 128MiB

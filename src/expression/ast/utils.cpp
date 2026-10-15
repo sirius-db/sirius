@@ -79,7 +79,8 @@ std::unique_ptr<node> rebuild(node const& src, Xform const& xform)
         return std::make_unique<node>(
           case_expr{std::move(cases), xform(alt.else_), alt.return_type()});
       } else if constexpr (std::is_same_v<T, cast>) {
-        return std::make_unique<node>(cast{xform(alt.child), alt.target_type, alt.try_cast});
+        return std::make_unique<node>(
+          cast{xform(alt.child), alt.target_type, alt.try_cast, alt.kind});
       } else if constexpr (std::is_same_v<T, unary_op>) {
         return std::make_unique<node>(unary_op{alt.op, xform(alt.child)});
       } else if constexpr (std::is_same_v<T, coalesce>) {

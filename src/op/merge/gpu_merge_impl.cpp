@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/stddev.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/concatenate.hpp>
@@ -32,7 +33,7 @@ namespace op {
 
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   const std::vector<cucascade::read_only_data_batch>& input,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
@@ -58,7 +59,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
   const std::vector<cucascade::read_only_data_batch>& input,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<std::optional<cudf::size_type>>& merge_nth_index,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
@@ -88,6 +89,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
   // Aggregate on the concatenated table
   std::vector<std::unique_ptr<cudf::column>> output_cudf_cols;
   for (size_t c = 0; c < aggregates.size(); ++c) {
+    if (aggregates[c] == cudf::aggregation::Kind::M2) {
+      output_cudf_cols.push_back(merge_stddev_states(
+        concatenated->get_column(c).view(), stream, memory_space.get_default_allocator()));
+      continue;
+    }
     std::unique_ptr<cudf::reduce_aggregation> reduce_aggregation = nullptr;
     cudf::data_type output_type = concatenated->get_column(c).type();
     switch (aggregates[c]) {
@@ -124,6 +130,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
         reduce_aggregation = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
         break;
       }
+      case cudf::aggregation::Kind::MERGE_SETS: {
+        reduce_aggregation = cudf::make_merge_sets_aggregation<cudf::reduce_aggregation>(
+          cudf::null_equality::EQUAL, cudf::nan_equality::ALL_EQUAL);
+        break;
+      }
       case cudf::aggregation::Kind::NTH_ELEMENT: {
         if (!merge_nth_index[c].has_value()) {
           throw std::runtime_error(
@@ -147,8 +158,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
     output_cudf_cols.push_back(cudf::make_column_from_scalar(
       *output_scalar, 1, stream, memory_space.get_default_allocator()));
   }
-  auto output_cudf_table = std::make_unique<cudf::table>(
-    std::move(output_cudf_cols), stream, memory_space.get_default_allocator());
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(output_cudf_cols));
 
   // Create output data batch.
   return make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info);
@@ -158,7 +168,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   const std::vector<cucascade::read_only_data_batch>& input,
   int num_group_cols,
   const std::vector<cudf::aggregation::Kind>& aggregates,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
@@ -263,6 +273,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
         request.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
         break;
       }
+      case cudf::aggregation::Kind::M2: {
+        request.aggregations.push_back(
+          cudf::make_merge_m2_aggregation<cudf::groupby_aggregation>());
+        break;
+      }
       case cudf::aggregation::Kind::COLLECT_SET: {
         // Intermediate column is a LIST produced by local COLLECT_SET. MERGE_SETS unions the
         // per-partition lists and drops duplicates, producing a deduplicated LIST per group.
@@ -295,8 +310,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   }
 
   // Create the output data batch
-  auto output_table = std::make_unique<cudf::table>(
-    std::move(output_cols), stream, memory_space.get_default_allocator());
+  auto output_table = std::make_unique<cudf::table>(std::move(output_cols));
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
@@ -305,7 +319,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
   const std::vector<int>& order_key_idx,
   const std::vector<cudf::order>& column_order,
   const std::vector<cudf::null_order>& null_precedence,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {

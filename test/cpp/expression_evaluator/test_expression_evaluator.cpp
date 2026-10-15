@@ -32,6 +32,7 @@
 #include <expression/ast/comparison.hpp>
 #include <expression/ast/conjunction.hpp>
 #include <expression/ast/constant.hpp>
+#include <expression/ast/constant_range.hpp>
 #include <expression/ast/function_call.hpp>
 #include <expression/ast/in_list.hpp>
 #include <expression/ast/node.hpp>
@@ -42,17 +43,24 @@
 #include <expression/value.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
+#include <helper/numeric_narrowing.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <sirius/exception.hpp>
 
 // cudf, etc.
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/unary.hpp>
 
 #include <cuda_runtime_api.h>
 
 // standard library
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <numeric>
 
@@ -116,7 +124,7 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
   auto size   = static_cast<cudf::size_type>(values.size());
 
   auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-  auto* mask_ptr = static_cast<cudf::bitmask_type*>(null_mask.data());
+  auto* mask_ptr = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
 
   cudf::size_type null_count = 0;
   for (cudf::size_type i = 0; i < size; ++i) {
@@ -155,7 +163,7 @@ std::shared_ptr<data_batch> make_two_int32_batch_with_nulls(memory_space& space,
 
   auto make_col = [&](const std::vector<int32_t>& values, const std::vector<bool>& valids) {
     auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-    auto* mask_ptr = static_cast<cudf::bitmask_type*>(null_mask.data());
+    auto* mask_ptr = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
     cudf::size_type null_count = 0;
     for (cudf::size_type i = 0; i < size; ++i) {
       if (!valids[i]) {
@@ -300,6 +308,36 @@ std::shared_ptr<data_batch> make_decimal128_batch(memory_space& space,
   return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
+// A column of type `carrier` holding `values`. make_input_batch's generator stops at
+// INT32, INT64, and STRING; the narrow-domain paths need carriers strictly narrower than the
+// reference's declared type, and a reference pair needs two of them side by side.
+template <typename T>
+std::unique_ptr<cudf::column> make_carrier_column(memory_space& space,
+                                                  cudf::data_type carrier,
+                                                  const std::vector<T>& values)
+{
+  auto stream = cudf::get_default_stream();
+  auto col    = cudf::make_numeric_column(carrier,
+                                       static_cast<cudf::size_type>(values.size()),
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       get_resource_ref(space));
+  cudaMemcpy(col->mutable_view().data<T>(),
+             values.data(),
+             sizeof(T) * values.size(),
+             cudaMemcpyHostToDevice);
+  return col;
+}
+
+std::shared_ptr<data_batch> make_batch_from_columns(
+  memory_space& space, std::vector<std::unique_ptr<cudf::column>> columns)
+{
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto gpu_repr =
+    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  return data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
+}
+
 using exp_executor      = ::sirius::expression_evaluator;
 using exp_strategy_enum = ::sirius::expression_evaluator_strategy;
 auto constexpr MAT      = exp_strategy_enum::MATERIALIZE;
@@ -357,9 +395,11 @@ exec_result run_execute(memory_space& space,
 exec_result run_select(memory_space& space,
                        std::shared_ptr<data_batch> const& input_batch,
                        std::unique_ptr<ast_node> node,
-                       exp_strategy_enum strategy = MAT)
+                       exp_strategy_enum strategy = MAT,
+                       bool like_swar_fastpath    = true)
 {
-  exp_executor executor(*node, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  exp_executor executor(
+    *node, get_resource_ref(space), cudf::get_default_stream(), strategy, 2, like_swar_fastpath);
   auto input_ro     = input_batch->to_read_only();
   auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
   auto output_table = executor.select(in_repr.get_table_view());
@@ -379,6 +419,19 @@ std::vector<std::unique_ptr<ast_node>> one(std::unique_ptr<ast_node> n)
   std::vector<std::unique_ptr<ast_node>> v;
   v.push_back(std::move(n));
   return v;
+}
+
+// DATE literals. The shared builders in ast_test_support.hpp stop at the literal kinds its GPU
+// suites materialize; only the narrow-domain eligibility tests below need a date.
+sirius::ast::constant date_literal(int32_t days)
+{
+  return sirius::ast::constant{sirius::value{sirius::date_value{days}},
+                               logical_type::make(type_id::DATE)};
+}
+
+std::unique_ptr<ast_node> make_date_const(int32_t days)
+{
+  return std::make_unique<ast_node>(date_literal(days));
 }
 }  // namespace
 
@@ -645,6 +698,333 @@ TEST_CASE("narrow-domain BETWEEN evaluates on the narrowed carrier",
   }
 }
 
+TEST_CASE("narrow-domain reference pairs evaluate on their shared carrier",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto const bigint_type = logical_type::make(type_id::BIGINT);
+  auto const date_type   = logical_type::make(type_id::DATE);
+  auto const int8        = cudf::data_type{cudf::type_id::INT8};
+  auto const int16       = cudf::data_type{cudf::type_id::INT16};
+
+  // Epoch days spanning 1969-12-02 to 1998-12-31, so the same two columns serve the DATE sections.
+  std::vector<int16_t> const left_values{-30, 0, 209, 8035, 10'591, 10'591};
+  std::vector<int16_t> const right_values{-30, 5, 208, 10'591, 8035, 10'591};
+
+  struct evaluation {
+    std::size_t restored_casts;
+    std::size_t narrow_comparisons;
+    std::vector<uint8_t> values;
+    std::vector<bool> valids;
+  };
+
+  auto evaluate_predicate = [&](std::vector<std::unique_ptr<cudf::column>> columns,
+                                std::unique_ptr<ast_node> predicate) {
+    exp_executor executor(*predicate, get_resource_ref(*space));
+    auto input      = make_batch_from_columns(*space, std::move(columns));
+    auto input_ro   = input->to_read_only();
+    auto input_view = input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+    auto output     = executor.evaluate(input_view);
+    REQUIRE(output != nullptr);
+    REQUIRE(output->num_columns() == 1);
+    return evaluation{executor.restored_reference_cast_count_for_testing(),
+                      executor.narrow_domain_comparison_count_for_testing(),
+                      copy_bool_column_to_host(output->view().column(0)),
+                      copy_valids_to_host(output->view().column(0))};
+  };
+
+  // Two INT16 carriers holding `left_values` and `right_values`.
+  auto narrow_pair_columns = [&] {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(make_carrier_column(*space, int16, left_values));
+    columns.push_back(make_carrier_column(*space, int16, right_values));
+    return columns;
+  };
+
+  auto require_less_than = [&](evaluation const& result) {
+    REQUIRE(result.values.size() == left_values.size());
+    for (std::size_t i = 0; i < left_values.size(); ++i) {
+      REQUIRE(result.valids[i]);
+      REQUIRE(result.values[i] == ((left_values[i] < right_values[i]) ? 1U : 0U));
+    }
+  };
+
+  SECTION("two BIGINT references on one carrier compare narrow, neither side restored")
+  {
+    auto const result = evaluate_predicate(narrow_pair_columns(),
+                                           make_cmp(sirius::comparison_type::lt,
+                                                    make_ref_typed(0, bigint_type),
+                                                    make_ref_typed(1, bigint_type)));
+    REQUIRE(result.narrow_comparisons == 1);
+    REQUIRE(result.restored_casts == 0);
+    require_less_than(result);
+  }
+
+  SECTION("two BIGINT references on different carriers restore both sides")
+  {
+    // The positive case's twin: only the left carrier changes, and the pair stops engaging because
+    // the evaluator will not widen the narrower side to meet the other.
+    std::vector<int8_t> const left_int8{-30, 0, 100, 120, -128, 127};
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(make_carrier_column(*space, int8, left_int8));
+    columns.push_back(make_carrier_column(*space, int16, right_values));
+
+    auto const result = evaluate_predicate(std::move(columns),
+                                           make_cmp(sirius::comparison_type::lt,
+                                                    make_ref_typed(0, bigint_type),
+                                                    make_ref_typed(1, bigint_type)));
+    REQUIRE(result.narrow_comparisons == 0);
+    REQUIRE(result.restored_casts == 2);
+    for (std::size_t i = 0; i < left_int8.size(); ++i) {
+      REQUIRE(result.values[i] == ((left_int8[i] < right_values[i]) ? 1U : 0U));
+    }
+  }
+
+  SECTION("two DATE references on one carrier compare narrow, neither side restored")
+  {
+    auto const result = evaluate_predicate(
+      narrow_pair_columns(),
+      make_cmp(
+        sirius::comparison_type::lt, make_ref_typed(0, date_type), make_ref_typed(1, date_type)));
+    REQUIRE(result.narrow_comparisons == 1);
+    REQUIRE(result.restored_casts == 0);
+    require_less_than(result);
+  }
+
+  SECTION("a DATE reference and a DATE literal compare narrow")
+  {
+    constexpr int32_t last_day_1998 = 10'591;
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(make_carrier_column(*space, int16, left_values));
+
+    auto const result = evaluate_predicate(
+      std::move(columns),
+      make_cmp(
+        sirius::comparison_type::lt, make_ref_typed(0, date_type), make_date_const(last_day_1998)));
+    REQUIRE(result.narrow_comparisons == 1);
+    REQUIRE(result.restored_casts == 0);
+    for (std::size_t i = 0; i < left_values.size(); ++i) {
+      REQUIRE(result.valids[i]);
+      REQUIRE(result.values[i] == ((left_values[i] < last_day_1998) ? 1U : 0U));
+    }
+  }
+
+  SECTION("a DATE reference against a typed NULL yields NULL at the narrow width")
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(make_carrier_column(*space, int16, left_values));
+
+    auto const result = evaluate_predicate(
+      std::move(columns),
+      make_cmp(
+        sirius::comparison_type::lt, make_ref_typed(0, date_type), make_null_const(date_type)));
+    REQUIRE(result.narrow_comparisons == 1);
+    REQUIRE(result.restored_casts == 0);
+    REQUIRE(result.valids.size() == left_values.size());
+    for (auto const valid : result.valids) {
+      REQUIRE_FALSE(valid);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Narrow-domain eligibility predicates (sirius::ast, host-only)
+//
+// The evaluator reaches these through narrow_domain_carrier and
+// narrow_domain_reference_pair_carrier; the narrowing policy reaches the same predicates with the
+// planned carrier instead of the batch's. Testing them directly pins the shapes that are awkward
+// to build as batches -- mistyped payloads, decimal scale mismatches, unsigned families.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("constant_range - a DATE literal folds to its epoch-day signed range",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto const last_day_1998 = sirius::ast::constant_numeric_range(date_literal(10'591));
+  REQUIRE(last_day_1998.has_value());
+  REQUIRE(last_day_1998->domain == sirius::numeric_range_domain::SIGNED_INTEGER);
+  REQUIRE(static_cast<int64_t>(last_day_1998->minimum) == 10'591);
+  REQUIRE(static_cast<int64_t>(last_day_1998->maximum) == 10'591);
+
+  auto const pre_epoch = sirius::ast::constant_numeric_range(date_literal(-1));
+  REQUIRE(pre_epoch.has_value());
+  REQUIRE(static_cast<int64_t>(pre_epoch->minimum) == -1);
+  REQUIRE(static_cast<int64_t>(pre_epoch->maximum) == -1);
+
+  // A payload alternative disagreeing with the declared type folds to nothing rather than
+  // reinterpreting whichever alternative happens to be present.
+  auto const mistyped =
+    sirius::ast::constant{sirius::value{int32_t{10'591}}, logical_type::make(type_id::DATE)};
+  REQUIRE_FALSE(sirius::ast::constant_numeric_range(mistyped).has_value());
+
+  // DATE is the only temporal type admitted; a sub-day literal has no narrow domain to fold into.
+  auto const timestamp = sirius::ast::constant{sirius::value{sirius::timestamp_us_value{1}},
+                                               logical_type::make(type_id::TIMESTAMP)};
+  REQUIRE_FALSE(sirius::ast::constant_numeric_range(timestamp).has_value());
+
+  // A typed NULL carries no value to fold; constant_representable_in_carrier admits it instead.
+  auto const null_date = sirius::ast::constant{sirius::value{}, logical_type::make(type_id::DATE)};
+  REQUIRE_FALSE(sirius::ast::constant_numeric_range(null_date).has_value());
+}
+
+TEST_CASE("constant_range - a DATE literal is representable only inside the carrier",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto const int8_carrier   = cudf::data_type{cudf::type_id::INT8};
+  auto const int16_carrier  = cudf::data_type{cudf::type_id::INT16};
+  auto const uint16_carrier = cudf::data_type{cudf::type_id::UINT16};
+
+  REQUIRE(sirius::ast::constant_representable_in_carrier(int16_carrier, date_literal(10'591)));
+  REQUIRE(sirius::ast::constant_representable_in_carrier(int8_carrier, date_literal(100)));
+
+  // Out of the carrier's range the literal is rejected, never truncated into it.
+  REQUIRE_FALSE(sirius::ast::constant_representable_in_carrier(int8_carrier, date_literal(10'591)));
+  REQUIRE_FALSE(
+    sirius::ast::constant_representable_in_carrier(int16_carrier, date_literal(40'000)));
+
+  // Epoch days are signed, so an unsigned carrier is a different family even for a positive day.
+  REQUIRE_FALSE(sirius::ast::constant_representable_in_carrier(uint16_carrier, date_literal(100)));
+
+  // Only a validity bit is materialized, so a typed NULL fits even the narrowest carrier.
+  auto const null_date = sirius::ast::constant{sirius::value{}, logical_type::make(type_id::DATE)};
+  REQUIRE(sirius::ast::constant_representable_in_carrier(int8_carrier, null_date));
+}
+
+TEST_CASE("narrow_domain_carrier_eligible - epoch days never pair with a plain integer literal",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  using sirius::ast::narrow_domain_carrier_eligible;
+
+  auto const date_type     = logical_type::make(type_id::DATE);
+  auto const integer_type  = logical_type::make(type_id::INTEGER);
+  auto const int16_carrier = cudf::data_type{cudf::type_id::INT16};
+  auto const date_carrier  = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+
+  auto const date_const    = make_date_const(10'000);
+  auto const integer_const = make_int_const(10'000);
+
+  SECTION("a literal of the column's own domain engages")
+  {
+    REQUIRE(narrow_domain_carrier_eligible(date_type, int16_carrier, {date_const.get()}));
+    REQUIRE(narrow_domain_carrier_eligible(integer_type, int16_carrier, {integer_const.get()}));
+  }
+
+  SECTION("a literal of the other domain declines in both directions")
+  {
+    // Both operands land in the same INT16 carrier, where epoch days and plain integers are
+    // indistinguishable, so agreement at the narrow width would be a coincidence of the values.
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(date_type, int16_carrier, {integer_const.get()}));
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(integer_type, int16_carrier, {date_const.get()}));
+  }
+
+  SECTION("a typed NULL is admitted whatever domain it declares")
+  {
+    // Only the validity bit is materialized, so no carrier width can misread the literal and its
+    // declared type does not matter. Declining here would cost a DATE column the narrow path an
+    // integer column keeps for the very same predicate.
+    auto const null_date    = make_null_const(date_type);
+    auto const null_integer = make_null_const(integer_type);
+    REQUIRE(narrow_domain_carrier_eligible(date_type, int16_carrier, {null_date.get()}));
+    REQUIRE(narrow_domain_carrier_eligible(date_type, int16_carrier, {null_integer.get()}));
+    REQUIRE(narrow_domain_carrier_eligible(integer_type, int16_carrier, {null_date.get()}));
+  }
+
+  SECTION("a DATE literal outside the carrier declines")
+  {
+    auto const far_date = make_date_const(40'000);
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(date_type, int16_carrier, {far_date.get()}));
+  }
+
+  SECTION("a natively carried DATE column declines")
+  {
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(date_type, date_carrier, {date_const.get()}));
+  }
+
+  SECTION("a missing or non-constant operand declines")
+  {
+    auto const reference = make_ref_typed(0, date_type);
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(date_type, int16_carrier, {nullptr}));
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(date_type, int16_carrier, {reference.get()}));
+  }
+}
+
+TEST_CASE("narrow_domain_reference_pair_eligible - one shared carrier and one shared domain",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  using sirius::ast::narrow_domain_reference_pair_eligible;
+
+  auto const date_type      = logical_type::make(type_id::DATE);
+  auto const smallint_type  = logical_type::make(type_id::SMALLINT);
+  auto const integer_type   = logical_type::make(type_id::INTEGER);
+  auto const bigint_type    = logical_type::make(type_id::BIGINT);
+  auto const uinteger_type  = logical_type::make(type_id::UINTEGER);
+  auto const double_type    = logical_type::make(type_id::DOUBLE);
+  auto const timestamp_type = logical_type::make(type_id::TIMESTAMP);
+  auto const decimal_2      = logical_type::make_decimal(18, 2);
+  auto const decimal_3      = logical_type::make_decimal(18, 3);
+
+  auto const int8_carrier   = cudf::data_type{cudf::type_id::INT8};
+  auto const int16_carrier  = cudf::data_type{cudf::type_id::INT16};
+  auto const int32_carrier  = cudf::data_type{cudf::type_id::INT32};
+  auto const uint16_carrier = cudf::data_type{cudf::type_id::UINT16};
+  auto const dec32_scale_2  = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+  auto const dec32_scale_3  = cudf::data_type{cudf::type_id::DECIMAL32, -3};
+
+  SECTION("both sides narrowed onto one carrier engage")
+  {
+    REQUIRE(narrow_domain_reference_pair_eligible(
+      integer_type, int16_carrier, integer_type, int16_carrier));
+    REQUIRE(
+      narrow_domain_reference_pair_eligible(date_type, int16_carrier, date_type, int16_carrier));
+    REQUIRE(
+      narrow_domain_reference_pair_eligible(decimal_2, dec32_scale_2, decimal_2, dec32_scale_2));
+    // Unequal logical widths still compare exactly: narrowing preserves values and applies no
+    // offset, so the shared carrier is the whole contract.
+    REQUIRE(narrow_domain_reference_pair_eligible(
+      bigint_type, int16_carrier, integer_type, int16_carrier));
+  }
+
+  SECTION("different carriers decline even within one domain")
+  {
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      integer_type, int8_carrier, integer_type, int16_carrier));
+    // Scale belongs to the carrier, so a scale mismatch never reaches a width comparison.
+    REQUIRE_FALSE(
+      narrow_domain_reference_pair_eligible(decimal_2, dec32_scale_2, decimal_3, dec32_scale_3));
+  }
+
+  SECTION("a side that is not carried narrow declines")
+  {
+    // SMALLINT natively materializes as INT16, so an INT16 column of it is native, not narrowed.
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      smallint_type, int16_carrier, integer_type, int16_carrier));
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      integer_type, int32_carrier, integer_type, int32_carrier));
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      double_type, int16_carrier, integer_type, int16_carrier));
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      timestamp_type, int16_carrier, integer_type, int16_carrier));
+  }
+
+  SECTION("epoch days and plain integers decline at one carrier, in both orders")
+  {
+    REQUIRE_FALSE(
+      narrow_domain_reference_pair_eligible(date_type, int16_carrier, integer_type, int16_carrier));
+    REQUIRE_FALSE(
+      narrow_domain_reference_pair_eligible(integer_type, int16_carrier, date_type, int16_carrier));
+  }
+
+  SECTION("crossing the signedness family declines")
+  {
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      uinteger_type, uint16_carrier, integer_type, int16_carrier));
+    // Even at one carrier: INT16 is not a narrowing of UINT32, so the unsigned side is not carried.
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      uinteger_type, int16_carrier, integer_type, int16_carrier));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // evaluate() — reference, constant, comparison (basic smoke test per type)
 // ---------------------------------------------------------------------------
@@ -742,6 +1122,59 @@ TEMPLATE_TEST_CASE("evaluate projects references, constants, and comparisons",
       expected_cmp.push_back(v == "str_3" ? 1U : 0U);
     }
     REQUIRE(copy_bool_column_to_host(ov.column(2)) == expected_cmp);
+  }
+}
+
+TEMPLATE_TEST_CASE("evaluate casts scalar constants including HUGEINT and NULL",
+                   "[expression_evaluator][scalar_cast]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const hugeint = logical_type::make(type_id::HUGEINT);
+  auto const bigint  = logical_type::make(type_id::BIGINT);
+  auto const integer = logical_type::make(type_id::INTEGER);
+
+  for (auto const row_count : {0, 1, 7}) {
+    CAPTURE(row_count);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                row_count,
+                                                cudf::mask_state::UNALLOCATED,
+                                                cudf::get_default_stream(),
+                                                get_resource_ref(*space)));
+    auto input = std::make_unique<cudf::table>(std::move(columns));
+
+    std::vector<std::unique_ptr<ast_node>> nodes;
+    nodes.push_back(make_cast(make_int_const(-42), hugeint, false));
+    // The outer AST cast consumes the materialized HUGEINT cast as a temporary column.
+    nodes.push_back(make_cast(make_cast(make_int_const(1), hugeint, false), bigint, false));
+    nodes.push_back(make_cast(make_null_const(integer), hugeint, false));
+    nodes.push_back(make_cast(make_cast(make_null_const(integer), hugeint, false), bigint, false));
+    nodes.push_back(make_cast(make_int_const(42), logical_type::make(type_id::DOUBLE), false));
+    std::vector<ast_node const*> expressions;
+    for (auto const& node : nodes) {
+      expressions.push_back(node.get());
+    }
+    exp_executor executor(
+      expressions, get_resource_ref(*space), cudf::get_default_stream(), TestType::value, 1);
+    auto output     = executor.evaluate(input->view());
+    auto const view = output->view();
+    REQUIRE(view.num_rows() == row_count);
+    REQUIRE(view.num_columns() == 5);
+    for (int i = 0; i < 4; ++i) {
+      REQUIRE(view.column(i).type() == cudf::data_type{cudf::type_id::INT64});
+    }
+    REQUIRE(copy_column_to_host<int64_t>(view.column(0)) == std::vector<int64_t>(row_count, -42));
+    REQUIRE(copy_column_to_host<int64_t>(view.column(1)) == std::vector<int64_t>(row_count, 1));
+    REQUIRE(view.column(0).null_count() == 0);
+    REQUIRE(view.column(1).null_count() == 0);
+    REQUIRE(view.column(2).null_count() == row_count);
+    REQUIRE(view.column(3).null_count() == row_count);
+    REQUIRE(view.column(4).type() == cudf::data_type{cudf::type_id::FLOAT64});
+    REQUIRE(copy_column_to_host<double>(view.column(4)) == std::vector<double>(row_count, 42.0));
   }
 }
 
@@ -1283,6 +1716,120 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
       if (s != "str_1") { expected.push_back(s); }
     }
     REQUIRE(copy_string_column_to_host(ov.column(0)) == expected);
+  }
+
+  SECTION("LIKE '%tr%1%' — multi-literal SWAR fast path")
+  {
+    // col0 LIKE '%tr%1%' — a `%lit1%lit2%` pattern, dispatched to the SWAR fast path.
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_str_const("%tr%1%"));
+    auto expr = make_func(
+      sirius::function_id::like, std::move(children), logical_type::make(type_id::BOOLEAN));
+
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
+    auto in_strs                       = copy_string_column_to_host(iv.column(0));
+    std::vector<std::string> expected;
+    for (auto const& s : in_strs) {
+      auto const tr = s.find("tr");
+      if (tr != std::string::npos && s.find('1', tr + 2) != std::string::npos) {
+        expected.push_back(s);
+      }
+    }
+    REQUIRE(copy_string_column_to_host(ov.column(0)) == expected);
+  }
+
+  SECTION("LIKE fast-path classification is shared by pattern value across evaluators")
+  {
+    auto make_like_expression = [] {
+      std::vector<std::unique_ptr<ast_node>> children;
+      children.push_back(make_ref(0));
+      children.push_back(make_str_const("%tr%1%"));
+      return make_func(
+        sirius::function_id::like, std::move(children), logical_type::make(type_id::BOOLEAN));
+    };
+    auto first_expr  = make_like_expression();
+    auto second_expr = make_like_expression();
+    REQUIRE(first_expr.get() != second_expr.get());
+
+    auto input_ro   = input->to_read_only();
+    auto& repr      = input_ro.get_data()->cast<gpu_table_representation>();
+    auto like_cache = std::make_shared<sirius::like_multiliteral_cache>();
+    exp_executor first_executor(*first_expr,
+                                get_resource_ref(*space),
+                                cudf::get_default_stream(),
+                                strategy,
+                                exp_executor::default_min_ast_size,
+                                /*like_swar_fastpath=*/true,
+                                like_cache);
+    exp_executor second_executor(*second_expr,
+                                 get_resource_ref(*space),
+                                 cudf::get_default_stream(),
+                                 strategy,
+                                 exp_executor::default_min_ast_size,
+                                 /*like_swar_fastpath=*/true,
+                                 like_cache);
+
+    auto first       = first_executor.select(repr.get_table_view());
+    auto first_again = first_executor.select(repr.get_table_view());
+    auto second      = second_executor.select(repr.get_table_view());
+    REQUIRE(copy_string_column_to_host(first->view().column(0)) ==
+            copy_string_column_to_host(first_again->view().column(0)));
+    REQUIRE(copy_string_column_to_host(first->view().column(0)) ==
+            copy_string_column_to_host(second->view().column(0)));
+    REQUIRE(first_executor.like_shared_cache_lookup_count_for_testing() == 1);
+    REQUIRE(second_executor.like_shared_cache_lookup_count_for_testing() == 1);
+    REQUIRE(like_cache->classification_count_for_testing() == 1);
+  }
+
+  SECTION("NOT LIKE fallback classification is memoized across evaluator batches")
+  {
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_str_const("%tr_1%"));
+    auto expr = make_func(
+      sirius::function_id::not_like, std::move(children), logical_type::make(type_id::BOOLEAN));
+
+    auto input_ro   = input->to_read_only();
+    auto& repr      = input_ro.get_data()->cast<gpu_table_representation>();
+    auto like_cache = std::make_shared<sirius::like_multiliteral_cache>();
+    exp_executor executor(*expr,
+                          get_resource_ref(*space),
+                          cudf::get_default_stream(),
+                          strategy,
+                          exp_executor::default_min_ast_size,
+                          /*like_swar_fastpath=*/true,
+                          like_cache);
+
+    auto first               = executor.select(repr.get_table_view());
+    auto second              = executor.select(repr.get_table_view());
+    auto const input_strings = copy_string_column_to_host(repr.get_table_view().column(0));
+    std::vector<std::string> expected;
+    for (auto const& value : input_strings) {
+      if (value != "str_1") { expected.push_back(value); }
+    }
+    REQUIRE(copy_string_column_to_host(first->view().column(0)) == expected);
+    REQUIRE(copy_string_column_to_host(second->view().column(0)) == expected);
+    REQUIRE(executor.like_shared_cache_lookup_count_for_testing() == 1);
+    REQUIRE(like_cache->classification_count_for_testing() == 1);
+  }
+
+  SECTION("NOT LIKE '%tr%1%' — fast path agrees with the cudf path (fast path disabled)")
+  {
+    auto run_not_like = [&](bool like_swar_fastpath) {
+      std::vector<std::unique_ptr<ast_node>> children;
+      children.push_back(make_ref(0));
+      children.push_back(make_str_const("%tr%1%"));
+      auto expr = make_func(
+        sirius::function_id::not_like, std::move(children), logical_type::make(type_id::BOOLEAN));
+      auto [in_batch, out_batch, iv, ov] =
+        run_select(*space, input, std::move(expr), strategy, like_swar_fastpath);
+      return copy_string_column_to_host(ov.column(0));
+    };
+
+    auto const with_fast_path = run_not_like(true);
+    auto const with_cudf      = run_not_like(false);
+    REQUIRE(with_fast_path == with_cudf);
   }
 }
 
@@ -1837,6 +2384,77 @@ TEMPLATE_TEST_CASE("select OR conjunction",
     if (v < 3 || v > 17) { expected.push_back(v); }
   }
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == expected);
+}
+
+TEMPLATE_TEST_CASE("evaluate conjunction with scalar children",
+                   "[expression_evaluator]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 20}});
+
+  auto const boolean = logical_type::make(type_id::BOOLEAN);
+  auto bool_const    = [&](bool v) {
+    return std::make_unique<ast_node>(sirius::ast::constant{sirius::value{v}, boolean});
+  };
+  auto null_const = [&] { return make_null_const(boolean); };
+  auto cmp  = [] { return make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(17)); };
+  auto conj = [](sirius::ast::conjunction::kind kind, auto... children) {
+    std::vector<std::unique_ptr<ast_node>> v;
+    (v.push_back(std::move(children)), ...);
+    return make_conj(kind, std::move(v));
+  };
+  auto constexpr op_or  = sirius::ast::conjunction::kind::op_or;
+  auto constexpr op_and = sirius::ast::conjunction::kind::op_and;
+
+  std::vector<std::unique_ptr<ast_node>> exprs;
+  exprs.push_back(conj(op_or, cmp(), null_const()));                     // col0 > 17 OR NULL
+  exprs.push_back(conj(op_or, null_const(), cmp()));                     // NULL OR col0 > 17
+  exprs.push_back(conj(op_and, cmp(), null_const()));                    // col0 > 17 AND NULL
+  exprs.push_back(conj(op_or, cmp(), bool_const(true)));                 // col0 > 17 OR TRUE
+  exprs.push_back(conj(op_and, bool_const(false), cmp()));               // FALSE AND col0 > 17
+  exprs.push_back(conj(op_or, null_const(), bool_const(false), cmp()));  // NULL OR FALSE OR ...
+
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+  REQUIRE(ov.num_columns() == 6);
+  auto const in0 = copy_column_to_host<int32_t>(iv.column(0));
+
+  // Kleene logic: TRUE OR NULL = TRUE, FALSE AND NULL = FALSE, otherwise NULL.
+  std::vector<bool> or_null_valid, and_null_valid;
+  std::vector<uint8_t> gt;
+  for (auto v : in0) {
+    gt.push_back(v > 17 ? 1U : 0U);
+    or_null_valid.push_back(v > 17);
+    and_null_valid.push_back(v <= 17);
+  }
+  auto values_where = [](std::vector<uint8_t> values, std::vector<bool> const& valid) {
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if (!valid[i]) { values[i] = 0; }
+    }
+    return values;
+  };
+  auto check = [&](int col, std::vector<uint8_t> const& expected, std::vector<bool> const& valid) {
+    CAPTURE(col);
+    REQUIRE(ov.column(col).type() == cudf::data_type{cudf::type_id::BOOL8});
+    auto const valids = copy_valids_to_host(ov.column(col));
+    REQUIRE(valids == valid);
+    REQUIRE(values_where(copy_bool_column_to_host(ov.column(col)), valid) ==
+            values_where(expected, valid));
+  };
+
+  auto const all_valid = std::vector<bool>(in0.size(), true);
+  check(0, gt, or_null_valid);
+  check(1, gt, or_null_valid);
+  check(2, gt, and_null_valid);
+  check(3, std::vector<uint8_t>(in0.size(), 1U), all_valid);
+  check(4, std::vector<uint8_t>(in0.size(), 0U), all_valid);
+  check(5, gt, or_null_valid);
 }
 
 // ---------------------------------------------------------------------------
@@ -2401,6 +3019,43 @@ TEST_CASE("native_ast - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
   }
 }
 
+TEMPLATE_TEST_CASE("CASE accepts scalar WHEN conditions",
+                   "[expression_evaluator][case_expr]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto* space          = get_default_gpu_space();
+  auto input           = make_int32_input(*space);
+  auto const condition = GENERATE(-1, 0, 1);
+  auto const nested    = GENERATE(false, true);
+  auto const boolean   = logical_type::make(type_id::BOOLEAN);
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.push_back({std::make_unique<ast_node>(sirius::ast::constant{
+                     condition < 0 ? sirius::value{} : sirius::value{condition == 1}, boolean}),
+                   int_const_node_native(100)});
+  auto expr = std::make_unique<ast_node>(sirius::ast::case_expr{
+    std::move(cases), ref_node_native(0), logical_type::make(type_id::INTEGER)});
+  if (nested) {
+    expr = make_cmp(sirius::comparison_type::equal, std::move(expr), int_const_node_native(100));
+  }
+  auto output         = run_native_ast(*space, expr.get(), input.view, TestType::value);
+  auto const expected = copy_column_to_host<int32_t>(input.view.column(0));
+  REQUIRE(output->num_rows() == input.view.num_rows());
+  REQUIRE(output->view().column(0).null_count() == 0);
+  if (nested) {
+    auto actual = copy_column_to_host<int8_t>(output->view().column(0));
+    for (size_t i = 0; i < actual.size(); ++i) {
+      CHECK(actual[i] == (condition == 1 || expected[i] == 100));
+    }
+  } else {
+    auto actual = copy_column_to_host<int32_t>(output->view().column(0));
+    for (size_t i = 0; i < actual.size(); ++i) {
+      CHECK(actual[i] == (condition == 1 ? 100 : expected[i]));
+    }
+  }
+}
+
 // Native-AST executor coverage for the null-safe comparison kinds
 // (COMPARE_DISTINCT_FROM / COMPARE_NOT_DISTINCT_FROM) built directly as
 // sirius::ast::comparison nodes — the comparison-kind enum is preserved end to
@@ -2457,4 +3112,189 @@ TEST_CASE("native_ast - comparison DISTINCT_FROM / NOT_DISTINCT_FROM executes",
       REQUIRE(out_host[i] == ((valids[i] && values[i] == 30) ? 0U : 1U));
     }
   }
+}
+
+TEMPLATE_TEST_CASE("evaluate string case conversion",
+                   "[expression_evaluator][string_case]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  auto mr                 = get_resource_ref(*space);
+  auto stream             = cudf::get_default_stream();
+  auto string_type        = logical_type::make(type_id::VARCHAR);
+  auto const id           = GENERATE(sirius::function_id::upper, sirius::function_id::lower);
+
+  // Include ASCII, empty strings, NULL, Unicode, and mappings that expand into
+  // multiple code points. The expectations deliberately follow cuDF semantics.
+  std::vector<std::string> const values{"HeLLo 123!", "", "", "é", "ß", "İ"};
+  std::vector<std::unique_ptr<cudf::column>> rows;
+  std::vector<cudf::column_view> row_views;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    cudf::string_scalar scalar(values[i], i != 2, stream, mr);
+    rows.push_back(cudf::make_column_from_scalar(scalar, 1, stream, mr));
+    row_views.push_back(rows.back()->view());
+  }
+  auto input_column = cudf::concatenate(row_views, stream, mr);
+  cudf::table_view input({input_column->view()});
+
+  auto case_expr = [&](std::unique_ptr<ast_node> child) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(std::move(child));
+    return make_func(id, std::move(args), string_type);
+  };
+  auto evaluate = [&](ast_node const& expr, cudf::table_view table) {
+    sirius::expression_evaluator evaluator(expr, mr, stream, strategy);
+    return evaluator.evaluate(table);
+  };
+
+  SECTION("column inputs preserve NULLs and use cuDF Unicode mappings")
+  {
+    auto expr           = case_expr(make_ref_typed(0, string_type));
+    auto result         = evaluate(*expr, input);
+    auto const output   = result->view().column(0);
+    auto const expected = id == sirius::function_id::upper
+                            ? std::vector<std::string>{"HELLO 123!", "", "", "É", "SS", "İ"}
+                            : std::vector<std::string>{"hello 123!", "", "", "é", "ß", "i\u0307"};
+    REQUIRE(copy_string_column_to_host(output) == expected);
+    REQUIRE(copy_valids_to_host(output) == std::vector<bool>{true, true, false, true, true, true});
+  }
+  SECTION("case conversion composes inside an AST predicate")
+  {
+    auto expr =
+      make_cmp(sirius::comparison_type::equal,
+               case_expr(make_ref_typed(0, string_type)),
+               make_str_const(id == sirius::function_id::upper ? "HELLO 123!" : "hello 123!"));
+    sirius::expression_evaluator evaluator(*expr, mr, stream, strategy, /*min_ast_size=*/1);
+    auto result = evaluator.select(input);
+    REQUIRE(copy_string_column_to_host(result->view().column(0)) ==
+            std::vector<std::string>{"HeLLo 123!"});
+  }
+  SECTION("nested case conversion")
+  {
+    auto expr   = case_expr(case_expr(make_ref_typed(0, string_type)));
+    auto result = evaluate(*expr, input);
+    REQUIRE(result->num_rows() == input.num_rows());
+    REQUIRE(copy_valids_to_host(result->view().column(0)) == copy_valids_to_host(input.column(0)));
+    REQUIRE(copy_string_column_to_host(result->view().column(0))[0] ==
+            (id == sirius::function_id::upper ? "HELLO 123!" : "hello 123!"));
+  }
+  SECTION("empty input")
+  {
+    auto empty_column = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
+    cudf::table_view empty({empty_column->view()});
+    auto expr   = case_expr(make_ref_typed(0, string_type));
+    auto result = evaluate(*expr, empty);
+    REQUIRE(result->num_rows() == 0);
+    REQUIRE(result->view().column(0).type().id() == cudf::type_id::STRING);
+  }
+}
+TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][timestamp_bounds]")
+{
+  auto* space         = get_default_gpu_space();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const seconds  = GENERATE(true, false);
+  auto const source   = seconds ? sirius::type_id::TIMESTAMP_SEC : sirius::type_id::TIMESTAMP_MS;
+  auto const source_type = sirius::logical_type::make(source);
+  int64_t const scale    = seconds ? 1000000 : 1000;
+  int64_t const max      = std::numeric_limits<int64_t>::max();
+  int64_t const min      = std::numeric_limits<int64_t>::min();
+  auto expr              = sirius::ast::node{sirius::ast::cast{
+    make_ref_typed(0, source_type), sirius::logical_type::make(sirius::type_id::TIMESTAMP)}};
+  auto stream            = cudf::get_default_stream();
+  auto mr                = get_resource_ref(*space);
+  auto run               = [&](std::vector<int64_t> const& ticks, bool valid = true) {
+    auto col =
+      cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                ticks.size(),
+                                valid ? cudf::mask_state::UNALLOCATED : cudf::mask_state::ALL_NULL,
+                                stream,
+                                mr);
+    if (!ticks.empty()) {
+      REQUIRE(cudaMemcpy(col->mutable_view().data<int64_t>(),
+                         ticks.data(),
+                         ticks.size() * sizeof(int64_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+    }
+    auto view = cudf::bit_cast(col->view(), sirius::get_cudf_type(source_type));
+    return run_native_ast(*space, &expr, cudf::table_view{{view}}, strategy);
+  };
+  SECTION("inclusive finite bounds and infinity sentinels")
+  {
+    auto out                      = run({min / scale, max / scale, -max, max, -1, 0, 1});
+    auto actual                   = copy_column_to_host<int64_t>(out->view().column(0));
+    std::vector<int64_t> expected = {
+      (min / scale) * scale, (max / scale) * scale, -max, max, -scale, 0, scale};
+    CHECK(actual == expected);
+  }
+  SECTION("finite values outside either bound fail")
+  {
+    for (auto ticks : {min / scale - 1, max / scale + 1, min, -max + 1, max - 1}) {
+      CAPTURE(ticks);
+      REQUIRE_THROWS_AS(run({0, ticks, max}), sirius::invalid_input_exception);
+    }
+  }
+  SECTION("null payloads do not cause overflow")
+  {
+    auto out = run({min, max - 1}, false);
+    CHECK(out->view().column(0).null_count() == 2);
+  }
+  SECTION("empty input")
+  {
+    auto out = run({});
+    CHECK(out->num_rows() == 0);
+  }
+}
+
+TEST_CASE("subsecond extraction preserves minimum finite ticks",
+          "[expression_evaluator][timestamp_bounds]")
+{
+  auto* space         = get_default_gpu_space();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const days     = GENERATE(true, false);
+  auto const function =
+    GENERATE(sirius::function_id::millisecond, sirius::function_id::microsecond);
+  auto const type =
+    sirius::logical_type::make(days ? sirius::type_id::DATE : sirius::type_id::TIMESTAMP);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+  auto col =
+    cudf::make_numeric_column(cudf::data_type{days ? cudf::type_id::INT32 : cudf::type_id::INT64},
+                              4,
+                              cudf::mask_state::ALL_VALID,
+                              stream,
+                              mr);
+  if (days) {
+    auto const max             = std::numeric_limits<int32_t>::max();
+    std::vector<int32_t> ticks = {std::numeric_limits<int32_t>::min(), -max, max, 0};
+    REQUIRE(cudaMemcpy(col->mutable_view().data<int32_t>(),
+                       ticks.data(),
+                       ticks.size() * sizeof(int32_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+  } else {
+    auto const max             = std::numeric_limits<int64_t>::max();
+    std::vector<int64_t> ticks = {std::numeric_limits<int64_t>::min(), -max, max, 0};
+    REQUIRE(cudaMemcpy(col->mutable_view().data<int64_t>(),
+                       ticks.data(),
+                       ticks.size() * sizeof(int64_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+  }
+  cudf::set_null_mask(col->mutable_view().null_mask(), 3, 4, false, stream);
+  col->set_null_count(1);
+  auto view = cudf::bit_cast(col->view(), sirius::get_cudf_type(type));
+  std::vector<std::unique_ptr<sirius::ast::node>> args;
+  args.push_back(make_ref_typed(0, type));
+  auto expr         = sirius::ast::node{sirius::ast::function_call{
+    function, std::move(args), sirius::logical_type::make(sirius::type_id::BIGINT)}};
+  auto out          = run_native_ast(*space, &expr, cudf::table_view{{view}}, strategy);
+  auto const result = out->view().column(0);
+  std::vector<bool> expected_valids = {true, false, false, false};
+  CHECK(copy_valids_to_host(result) == expected_valids);
+  // INT64_MIN microseconds lies 5.224192 seconds into its minute.
+  CHECK(copy_column_to_host<int64_t>(result)[0] == (days ? 0
+                                                    : function == sirius::function_id::microsecond
+                                                      ? 5224192
+                                                      : 5224));
 }

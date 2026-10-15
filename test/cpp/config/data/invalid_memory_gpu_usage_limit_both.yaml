@@ -1,0 +1,5 @@
+sirius:
+  memory:
+    gpu:
+      usage_limit_bytes: 1 GiB
+      usage_limit_fraction: 0.5

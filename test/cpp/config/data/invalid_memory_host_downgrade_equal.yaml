@@ -1,0 +1,5 @@
+sirius:
+  memory:
+    host:
+      downgrade_trigger_fraction: 0.7
+      downgrade_stop_fraction: 0.7

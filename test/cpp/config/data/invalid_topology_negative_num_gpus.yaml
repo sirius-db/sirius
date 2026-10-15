@@ -1,0 +1,3 @@
+sirius:
+  topology:
+    num_gpus: -1

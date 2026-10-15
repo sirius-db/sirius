@@ -30,12 +30,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
   // Create the working_table that the PhysicalCTE will use for evaluation.
   auto working_table =
     duckdb::make_shared_ptr<duckdb::ColumnDataCollection>(context, op.children[0]->types);
-  // auto working_table_gpu =
-  // duckdb::make_shared_ptr<duckdb::GPUIntermediateRelation>(op.children[0]->types.size());
 
   // Add the ColumnDataCollection to the context of this PhysicalPlanGenerator
   recursive_cte_tables[op.table_index] = working_table;
-  // gpu_recursive_cte_tables[op.table_index] = working_table_gpu;
   materialized_ctes[op.table_index] =
     duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>();
 
@@ -44,16 +41,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
   // Initialize an empty vector to collect the scan operators.
   auto right = create_plan(*op.children[1]);
 
-  // _types must match the producer/materialization side (left = children[0]) because execute()
-  // is a passthrough that forwards the producer's batches. The previous right->types declaration
-  // misrepresented the operator's output schema and tripped the column-count validator in
-  // gpu_pipeline_task.cpp — silently at runtime, but visibly noisy in logs at scale.
-  // Capture left->types before std::move(left) so argument evaluation order is well-defined.
-  auto producer_types = left->types;
+  // V2 uses materialized CTEs for correlated joins: parents need the consumer schema,
+  // while the producer-forwarding stage opts out of the runtime output-schema check.
+  auto result_types = right->types;
   duckdb::unique_ptr<sirius::op::sirius_physical_cte> cte;
-  cte                = duckdb::make_uniq<sirius::op::sirius_physical_cte>(op.ctename,
-                                                           op.table_index,
-                                                           std::move(producer_types),
+  cte = duckdb::make_uniq<sirius::op::sirius_physical_cte>(op.ctename.GetIdentifierName(),
+                                                           op.table_index.index,
+                                                           std::move(result_types),
                                                            std::move(left),
                                                            std::move(right),
                                                            op.estimated_cardinality);

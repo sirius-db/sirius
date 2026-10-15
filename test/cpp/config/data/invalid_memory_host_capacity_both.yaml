@@ -1,0 +1,5 @@
+sirius:
+  memory:
+    host:
+      capacity_bytes: 8 GiB
+      capacity_fraction: 0.5

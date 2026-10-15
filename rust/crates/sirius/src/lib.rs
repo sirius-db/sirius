@@ -1,7 +1,7 @@
 //! Safe, idiomatic Rust bindings for [Sirius](https://github.com/sirius-db/sirius),
 //! the GPU-native SQL engine.
 //!
-//! This crate wraps the low-level [`sirius-sys`] cxx bindings in safe Rust types
+//! This crate wraps the low-level [`sirius-sys`][sirius_sys] cxx bindings in safe Rust types
 //! — the entry point for driving Sirius from Rust.
 //!
 //! Today it binds just enough to prove the toolchain links against the real
@@ -200,19 +200,6 @@ mod tests {
         let _guard = GPU_CONTEXT_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-
-        // Point the embedded DuckDB at the locally-built parquet extension (the
-        // SIRIUS_BUILD_DIR default mirrors sirius-sys's build.rs) so it can bind
-        // `parquet_scan`. Set under the GPU lock so no other context bring-up
-        // reads the environment concurrently.
-        if std::env::var_os("SIRIUS_DUCKDB_PARQUET_EXTENSION").is_none() {
-            let manifest = env!("CARGO_MANIFEST_DIR");
-            let build_dir = std::env::var("SIRIUS_BUILD_DIR")
-                .unwrap_or_else(|_| format!("{manifest}/../../../build/release"));
-            let parquet = format!("{build_dir}/extension/parquet/parquet.duckdb_extension");
-            // SAFETY: the GPU lock is held, so no other thread touches the environment here.
-            unsafe { std::env::set_var("SIRIUS_DUCKDB_PARQUET_EXTENSION", parquet) };
-        }
 
         // Write a tiny parquet fixture.
         let dir = tempfile::tempdir().unwrap();

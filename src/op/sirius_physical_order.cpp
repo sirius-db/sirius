@@ -21,8 +21,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/order/gpu_order_impl.hpp"
 #include "sirius/exception.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 namespace sirius {
 namespace op {
@@ -41,9 +40,9 @@ sirius_physical_order::sirius_physical_order(duckdb::vector<sirius::logical_type
 }
 
 std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_data& input_data,
-                                                              rmm::cuda_stream_view stream)
+                                                              ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_order::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_order::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
@@ -56,10 +55,10 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
   null_precedence.reserve(orders.size());
 
   for (auto const& ord : orders) {
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
       throw not_implemented_exception("Order by only supports bound reference expressions");
     }
-    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
     order_key_idx.push_back(idx);
     column_order.push_back(to_cudf_order(ord.type));
     null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));

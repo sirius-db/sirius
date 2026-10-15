@@ -77,22 +77,39 @@ static void write_backtrace_line(int fd, int frame_no, const char* raw_line)
   write(fd, "\n", 1);
 }
 
-// Best-effort flush of the global logger so the most recent log lines reach
-// disk before we terminate. This is NOT async-signal-safe: the sink takes
-// a mutex and may allocate, so if the crash happened while a thread held the
-// logging mutex (or inside the allocator) the flush could deadlock. We bound
-// that risk with alarm(): SIGALRM's default disposition terminates the
-// process, so a hung flush kills us within the deadline instead of hanging the
-// crash handler forever. alarm() and signal() are themselves signal-safe.
-static void flush_logs_best_effort()
+/// Hard deadline for the WHOLE handler, armed on entry. See arm_handler_deadline().
+constexpr unsigned kHandlerDeadlineSeconds = 10;
+
+// Bound every unsafe step in this handler with a wall-clock deadline.
+//
+// Only backtrace() and backtrace_symbols_fd() are async-signal-safe. backtrace_symbols(),
+// abi::__cxa_demangle() and the log flush all allocate and take locks — backtrace_symbols() goes
+// through _dl_addr(), which takes the dynamic loader lock. If the crash happened while any thread
+// held the loader lock, the malloc arena lock, or the logging mutex, those calls do not fail:
+// they spin or block forever. The process then looks alive (100% CPU, no output) instead of dead,
+// which is strictly worse than crashing — it hides the crash, survives SIGTERM, and cannot be
+// attached to once the parent has moved on.
+//
+// That is not hypothetical: it turned an ordinary deadlock in this codebase into an
+// unkillable spin that took an hour to diagnose, because every symptom pointed at a live process.
+//
+// SIGALRM's default disposition terminates, so this converts "hangs forever" into "dies within
+// kHandlerDeadlineSeconds". alarm() and signal() are themselves async-signal-safe.
+static void arm_handler_deadline()
 {
   signal(SIGALRM, SIG_DFL);  // ensure default (terminate) disposition
-  alarm(3);                  // hard deadline for the log + flush below
+  alarm(kHandlerDeadlineSeconds);
+}
+
+// Best-effort flush of the global logger so the most recent log lines reach disk before we
+// terminate. NOT async-signal-safe (the sink takes a mutex and may allocate); covered by the
+// handler-wide deadline armed in arm_handler_deadline(), so this must NOT cancel the alarm.
+static void flush_logs_best_effort()
+{
   SIRIUS_LOG_WARN("SIRIUS signal handler triggered, flushing logs");
-  // get_sink() never returns null; the flush itself is the risky part, bounded
-  // by the alarm above and by the handler's re-entrancy guard.
+  // get_sink() never returns null; the flush itself is the risky part, bounded by the
+  // handler-wide deadline and by the handler's re-entrancy guard.
   sirius::log::get_sink()->flush();
-  alarm(0);  // flush returned in time; cancel the deadline
 }
 
 static const char* signal_name(int sig)
@@ -117,6 +134,9 @@ static void segfault_handler(int sig)
   if (handling) { _exit(1); }
   handling = 1;
 
+  // Everything below this line is bounded. Nothing here may hang the process.
+  arm_handler_deadline();
+
   std::array<void*, kBacktraceMaxFrames> frames{};
   int n = backtrace(frames.data(), kBacktraceMaxFrames);
   if (n <= 0) {
@@ -124,15 +144,28 @@ static void segfault_handler(int sig)
     _exit(1);
   }
 
+  long tid          = static_cast<long>(syscall(SYS_gettid));
+  const char* sname = signal_name(sig);
+
+  // Emit the async-signal-safe form FIRST. backtrace_symbols_fd() writes straight to the fd with
+  // no allocation and no loader lock, so this reaches stderr even if the demangled pass below
+  // blocks and the deadline has to kill us. Un-demangled frames are far less readable, but a raw
+  // backtrace beats the silence that a hung handler produces.
+  {
+    const char* raw_header = "\n*** ";
+    write(STDERR_FILENO, raw_header, __builtin_strlen(raw_header));
+    write(STDERR_FILENO, sname, strlen(sname));
+    const char* raw_suffix = " — raw frames (async-signal-safe) ***\n";
+    write(STDERR_FILENO, raw_suffix, __builtin_strlen(raw_suffix));
+    backtrace_symbols_fd(frames.data(), n, STDERR_FILENO);
+  }
+
+  // From here on the output is nicer but the calls are not signal-safe.
   char** symbols = backtrace_symbols(frames.data(), n);
   if (!symbols) {
-    backtrace_symbols_fd(frames.data(), n, STDERR_FILENO);
     flush_logs_best_effort();
     _exit(1);
   }
-
-  long tid          = static_cast<long>(syscall(SYS_gettid));
-  const char* sname = signal_name(sig);
 
   auto write_header = [sname](int fd) {
     const char* suffix = " — backtrace from faulting thread ***\n";

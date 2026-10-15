@@ -1,0 +1,6 @@
+sirius:
+  space:
+    gpu:
+      - device_id: 0
+    host:
+      - numa_id: 0
