@@ -521,9 +521,10 @@ struct host_mem_config {
   std::size_t block_size{cucascade::memory::default_block_size};
   std::size_t pool_size{cucascade::memory::default_pool_size};
   std::size_t initial_number_pools{cucascade::memory::default_initial_number_pools};
-  // Where each pool's memory comes from: false keeps cucascade's cudaHostAlloc; true touches the
-  // pages on prefault_threads threads and registers them with CUDA, which is several times faster.
-  bool register_pools{false};
+  // Where each pool's memory comes from: true touches the pages on prefault_threads threads and
+  // registers them with CUDA, several times faster than cucascade's cudaHostAlloc, which false
+  // keeps.
+  bool register_pools{true};
   bool huge_pages{true};
   unsigned prefault_threads{8};
 

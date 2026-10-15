@@ -12,7 +12,6 @@ sirius:
       reservation_limit_fraction: 0.9
       downgrade_trigger_fraction: 0.8
       downgrade_stop_fraction: 0.7
-      register_pools: true
       prefault_threads: 2
     disk:
       disk_id: 0

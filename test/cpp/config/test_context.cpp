@@ -672,7 +672,8 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE(telemetry.engine_name == "sirius_config_test");
 }
 
-TEST_CASE("Sirius host pools can come from registered pages", "[sirius][context][isolated_context]")
+TEST_CASE("Sirius host pools come from registered pages by default",
+          "[sirius][context][isolated_context]")
 {
   finally cleanup_env{[]() {
     unsetenv("SIRIUS_CONFIG_FILE");
@@ -706,8 +707,8 @@ TEST_CASE("Sirius host pools can come from registered pages", "[sirius][context]
     cudaPointerAttributes attributes{};
     REQUIRE(cudaPointerGetAttributes(&attributes, host) == cudaSuccess);
     CHECK(attributes.type == cudaMemoryTypeHost);
-    // The default upstream allocates non-portable pools, so this flag is what tells the
-    // registered upstream apart from it.
+    // cucascade's own upstream (register_pools: false) allocates non-portable pools, so this flag
+    // is what tells the registered upstream apart from it.
     unsigned int flags = 0;
     REQUIRE(cudaHostGetFlags(&flags, host) == cudaSuccess);
     CHECK((flags & cudaHostAllocPortable) != 0);

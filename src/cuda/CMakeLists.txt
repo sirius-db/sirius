@@ -32,20 +32,20 @@ target_sources(
 # across files, so it is its own object library compiled whole-program, with
 # sirius_objects' includes, definitions and options; the targets that take
 # sirius_objects' objects take these too (cmake/sirius-targets.cmake).
-add_library(sirius_whole_program_objects OBJECT vss/bound_gemm.cu)
+add_library(sirius_vss_bound_gemm_objects OBJECT vss/bound_gemm.cu)
 set_target_properties(
-  sirius_whole_program_objects
+  sirius_vss_bound_gemm_objects
   PROPERTIES CUDA_SEPARABLE_COMPILATION OFF
              POSITION_INDEPENDENT_CODE ON
              CXX_VISIBILITY_PRESET hidden
              CUDA_STANDARD 20
              CUDA_STANDARD_REQUIRED ON)
 target_include_directories(
-  sirius_whole_program_objects
+  sirius_vss_bound_gemm_objects
   PRIVATE $<TARGET_PROPERTY:sirius_objects,INCLUDE_DIRECTORIES>)
 target_compile_definitions(
-  sirius_whole_program_objects
+  sirius_vss_bound_gemm_objects
   PRIVATE $<TARGET_PROPERTY:sirius_objects,COMPILE_DEFINITIONS>)
 target_compile_options(
-  sirius_whole_program_objects
+  sirius_vss_bound_gemm_objects
   PRIVATE $<TARGET_PROPERTY:sirius_objects,COMPILE_OPTIONS>)
