@@ -728,11 +728,17 @@ leaving the previous sink active.
 
 ### Expression Evaluation
 
-**File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
+**File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
+| `enable_regex_jit_impl` | true | Enable the specialized JIT implementation for supported regex patterns |
+
+These settings are connection-local: use `SET` or `SET SESSION`; `SET GLOBAL` is
+rejected. `RESET` restores the registered default. Query initialization captures both
+settings in an immutable snapshot, so later changes do not affect an existing query.
+Evaluators retain their own policy values rather than reading mutable global defaults.
 
 `expression_executor_strategy` remains registered as a deprecated compatibility alias for
 `expression_evaluator_strategy`; new configuration should use the evaluator name.
@@ -915,7 +921,6 @@ Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 
 | Flag | Value | Namespace |
 |------|-------|-----------|
-| `EXPRESSION_EVALUATOR_STRATEGY` | `ast_interpret` | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |

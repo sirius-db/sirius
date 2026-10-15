@@ -18,7 +18,6 @@
 #include "expression_evaluator/query_policy.hpp"
 
 // sirius
-#include <config.hpp>
 #include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternative types
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
@@ -48,16 +47,6 @@
 #include <vector>
 
 namespace sirius {
-
-/**
- * @brief Returns the current default expression_evaluator_strategy configured via
- * `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
- */
-inline expression_evaluator_strategy strategy_from_config()
-{
-  return active_expression_policy ? active_expression_policy->strategy
-                                  : duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY;
-}
 
 /**
  * @brief The expression_evaluator is responsible for evaluating Sirius AST expressions on the GPU

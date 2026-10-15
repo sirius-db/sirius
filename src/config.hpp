@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include <expression_evaluator/expression_evaluator_strategy.hpp>
-
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -29,15 +27,6 @@ namespace duckdb {
 // * Add a configuration field associated with Sirius (see InitialGPUConfigs in sirius_extension.cpp
 // for examples)
 struct Config {
-  // Strategy used by sirius::expression_evaluator.
-  // TODO: this should eventually be selected adaptively per-call by the executor based on
-  // expression shape and operator statistics; the config knob will become a policy override.
-  static ::sirius::expression_evaluator_strategy
-    EXPRESSION_EVALUATOR_STRATEGY;  // expression_evaluator_strategy
-
-  // Whether to use special JIT implementation for particular regex evaluation
-  static bool ENABLE_REGEX_JIT_IMPL;
-
   // For duckdb scan task:
   //  - the default batch size
   // TODO: probably want to use sirius config for this value

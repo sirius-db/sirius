@@ -15,34 +15,16 @@
  */
 
 #pragma once
-#include "config.hpp"
 
-#include <optional>
+#include "expression_evaluator/expression_evaluator_strategy.hpp"
+
 namespace sirius {
+
+/// Immutable evaluator input copied from the query or pin operation's settings snapshot.
+/// Standalone callers may use these fixed defaults; execution paths pass their own policy.
 struct expression_query_policy {
   expression_evaluator_strategy strategy{expression_evaluator_strategy::AST_INTERPRET};
   bool regex_jit{true};
 };
-// GPU workers install the immutable query policy for the complete task, including nested
-// evaluators. Scoped restoration is required because a worker serves different queries.
-inline thread_local std::optional<expression_query_policy> active_expression_policy;
-class scoped_expression_policy {
- public:
-  explicit scoped_expression_policy(expression_query_policy policy)
-    : previous(active_expression_policy)
-  {
-    active_expression_policy = policy;
-  }
-  ~scoped_expression_policy() { active_expression_policy = previous; }
-  scoped_expression_policy(const scoped_expression_policy&)            = delete;
-  scoped_expression_policy& operator=(const scoped_expression_policy&) = delete;
 
- private:
-  std::optional<expression_query_policy> previous;
-};
-inline bool query_regex_jit_enabled()
-{
-  return active_expression_policy ? active_expression_policy->regex_jit
-                                  : duckdb::Config::ENABLE_REGEX_JIT_IMPL;
-}
 }  // namespace sirius

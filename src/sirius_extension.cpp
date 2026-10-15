@@ -2486,7 +2486,7 @@ static void ApplyExpressionEvaluatorStrategy(ClientContext& context,
   if (scope == SetScope::GLOBAL)
     throw InvalidInputException("expression_evaluator_strategy is a session setting");
   duckdb::session_operator_params(context).expression_strategy = parsed;
-  SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EVALUATOR_STRATEGY to {}",
+  SIRIUS_LOG_DEBUG("Updated session expression_evaluator_strategy to {}",
                    sirius::strategy_to_string(parsed));
 }
 
@@ -2527,7 +2527,7 @@ static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value&
   if (scope == SetScope::GLOBAL)
     throw InvalidInputException("enable_regex_jit_impl is a session setting");
   duckdb::session_operator_params(context).enable_regex_jit = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated session ENABLE_REGEX_JIT_IMPL to {}", BooleanValue::Get(parameter));
+  SIRIUS_LOG_DEBUG("Updated session enable_regex_jit_impl to {}", BooleanValue::Get(parameter));
 }
 
 static void SetEnableLikeSwarFastpath(ClientContext& /*context*/,
@@ -2985,7 +2985,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', or "
     "'ast_jit'",
     LogicalType::VARCHAR,
-    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
+    Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionEvaluatorStrategy);
 
   // Deprecated alias for `expression_evaluator_strategy`; remove in a future release.
@@ -2994,7 +2994,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "[DEPRECATED - use expression_evaluator_strategy] Strategy for the expression_evaluator: "
     "'materialize', 'ast_interpret', or 'ast_jit'",
     LogicalType::VARCHAR,
-    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
+    Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionExecutorStrategyDeprecated);
 
   add_sirius_option(
@@ -3315,7 +3315,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     "enable_regex_jit_impl",
                     "Whether to use special JIT implementation for particular regex evaluation",
                     LogicalType::BOOLEAN,
-                    Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
+                    Value::BOOLEAN(operator_defaults.enable_regex_jit),
                     SetEnableRegexJitImpl);
 
   // Add in config option for the multi-literal LIKE SWAR fast path

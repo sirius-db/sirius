@@ -134,8 +134,8 @@ struct operator_params {
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
   bool like_swar_fastpath                           = false;
-  expression_evaluator_strategy expression_strategy = expression_evaluator_strategy::AST_INTERPRET;
-  bool enable_regex_jit                             = true;
+  expression_evaluator_strategy expression_strategy = expression_query_policy{}.strategy;
+  bool enable_regex_jit                             = expression_query_policy{}.regex_jit;
 
   [[nodiscard]] expression_query_policy expression_policy() const noexcept
   {
