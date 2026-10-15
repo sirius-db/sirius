@@ -315,22 +315,18 @@ TEST_CASE("arrow_host_import: refuses mismatched and unsupported batches before 
   }
   SECTION("released structs")
   {
-    auto release         = batch->array.release;
     batch->array.release = nullptr;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("already released"));
-    batch->array.release = release;
   }
-  SECTION("a released or missing column")
+  SECTION("a released column")
   {
-    auto& child   = *batch->array.children[0];
-    auto release  = child.release;
-    child.release = nullptr;
+    batch->array.children[0]->release = nullptr;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("missing or released"));
-    child.release         = release;
-    auto* children        = batch->array.children;
+  }
+  SECTION("a missing column")
+  {
     batch->array.children = nullptr;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("missing or released"));
-    batch->array.children = children;
   }
   SECTION("a format cudf refuses")
   {
@@ -343,44 +339,36 @@ TEST_CASE("arrow_host_import: refuses mismatched and unsupported batches before 
   {
     batch->array.length = std::int64_t{std::numeric_limits<cudf::size_type>::max()} + 1;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("longer than cudf's"));
-    batch->array.length = 3;
   }
   SECTION("a window past a child")
   {
     batch->array.offset = 1;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("spans rows [1, 4)"));
-    batch->array.offset = 0;
   }
   SECTION("struct-level nulls")
   {
     std::uint8_t validity   = 0b101;  // row 1 is null
     const void* buffers[]   = {&validity};
-    auto** saved            = batch->array.buffers;
-    auto saved_nulls        = batch->array.null_count;
     batch->array.buffers    = buffers;
     batch->array.null_count = 1;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("has null rows"));
-    batch->array.buffers    = saved;
-    batch->array.null_count = saved_nulls;
   }
   SECTION("shapes refused by name")
   {
-    const char* saved_format = column.format;
     for (auto [format, reason] : {std::pair{"U", "64-bit offsets"},
                                   std::pair{"Z", "64-bit offsets"},
                                   std::pair{"+L", "64-bit offsets"},
                                   std::pair{"tsu:UTC", "timezone-aware"},
                                   std::pair{"d:40,2,256", "decimal256"}}) {
+      scoped_restore iteration_guard(column);
       column.format = format;
       CAPTURE(format);
       REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring(reason));
     }
-    column.format = saved_format;
 
     ArrowSchema dictionary{};
     column.dictionary = &dictionary;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("dictionary-encoded"));
-    column.dictionary = nullptr;
   }
 }
 
@@ -443,7 +431,6 @@ TEST_CASE("arrow_host_import: string windows are checked before copy", "[arrow_h
   auto& child        = *batch->array.children[0];
   scoped_restore child_guard(child);
   const void* buffers[3] = {child.buffers[0], child.buffers[1], child.buffers[2]};
-  auto* saved            = child.buffers;
   SECTION("negative offsets")
   {
     const std::int32_t offsets[] = {-1, 0, 1, 2, 3};
@@ -451,7 +438,6 @@ TEST_CASE("arrow_host_import: string windows are checked before copy", "[arrow_h
     child.buffers                = buffers;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, strings),
                         ContainsSubstring("negative string offsets"));
-    child.buffers = saved;
   }
   SECTION("decreasing offsets")
   {
@@ -460,14 +446,12 @@ TEST_CASE("arrow_host_import: string windows are checked before copy", "[arrow_h
     child.buffers                = buffers;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, strings),
                         ContainsSubstring("decreasing string offsets"));
-    child.buffers = saved;
   }
   SECTION("missing data")
   {
     buffers[2]    = nullptr;
     child.buffers = buffers;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, strings), ContainsSubstring("no string data buffer"));
-    child.buffers = saved;
   }
   SECTION("valid string slice")
   {
@@ -890,5 +874,39 @@ TEST_CASE("arrow_host_import: null metadata is checked against selected bits",
   {
     schema.flags &= ~ARROW_FLAG_NULLABLE;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, types), ContainsSubstring("inconsistent"));
+  }
+}
+
+TEST_CASE("arrow_host_import: immutable plans import on independent worker streams",
+          "[arrow_host_import]")
+{
+  auto batch = arrow_batch_from_sql("SELECT i::INTEGER AS a, i % 2 = 0 AS b FROM range(513) t(i)");
+  const auto plan = sirius::inspect_arrow_host_batch(
+    &batch->array,
+    &batch->schema,
+    "workers",
+    {"a", "b"},
+    declared({duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN}),
+    *std::pmr::new_delete_resource());
+  int device = -1;
+  REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+  rmm::mr::cuda_async_memory_resource upstream;
+  const auto run = [&]() {
+    if (cudaSetDevice(device) != cudaSuccess) { throw std::runtime_error("select worker GPU"); }
+    rmm::cuda_stream stream;
+    auto table = sirius::import_arrow_host_table(
+      plan, stream.view(), rmm::device_async_resource_ref{upstream});
+    return std::pair{copy_column_to_host<std::int32_t>(table->get_column(0).view()),
+                     copy_column_to_host<bool>(table->get_column(1).view())};
+  };
+  auto first       = std::async(std::launch::async, run);
+  auto second      = std::async(std::launch::async, run);
+  const auto left  = first.get();
+  const auto right = second.get();
+  REQUIRE(left == right);
+  REQUIRE(left.first.size() == 513);
+  for (std::size_t row = 0; row < left.first.size(); ++row) {
+    REQUIRE(left.first[row] == row);
+    REQUIRE(left.second[row] == (row % 2 == 0));
   }
 }
