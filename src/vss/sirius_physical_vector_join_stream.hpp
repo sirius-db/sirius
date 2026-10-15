@@ -136,7 +136,6 @@ std::unique_ptr<vector_chunk_source> make_gpu_pinned_chunk_source(
 std::unique_ptr<vector_chunk_source> make_host_pinned_chunk_source(
   const sirius::scan_manager::pinned_entry& pin,
   const std::string& column,
-  std::int64_t dim,
   const telemetry::batch_telemetry_info& telemetry_info);
 
 /// Cluster lists: chunks are fixed-size spans of the cluster-ordered copy, viewed in place on the
@@ -184,8 +183,10 @@ struct vector_join_admission {
 /// the "default" port until execute() stages it, so the engine can spill it meanwhile.
 class vector_join_stream_input : public operator_data {
  public:
-  vector_join_stream_input(std::size_t left_idx, std::size_t estimated_bytes)
-    : _left_idx(left_idx), _estimated_bytes(estimated_bytes)
+  vector_join_stream_input(std::size_t left_idx,
+                           std::size_t estimated_bytes,
+                           std::optional<std::size_t> block = std::nullopt)
+    : _left_idx(left_idx), _estimated_bytes(estimated_bytes), _block(block)
   {
   }
 
@@ -211,6 +212,10 @@ class vector_join_stream_input : public operator_data {
   /// stage can gather that batch's left columns.
   [[nodiscard]] std::size_t left_idx() const { return _left_idx; }
 
+  /// Set when the task searches a block of probe rows (sirius_physical_vector_join_stream's
+  /// probe blocks) rather than one left batch.
+  [[nodiscard]] std::optional<std::size_t> block() const { return _block; }
+
   /// The task's place under vector_join_admission, if the join is capped.
   void set_ticket(std::shared_ptr<void> ticket) { _ticket = std::move(ticket); }
   [[nodiscard]] std::shared_ptr<void> const& ticket() const { return _ticket; }
@@ -219,6 +224,7 @@ class vector_join_stream_input : public operator_data {
   std::size_t _left_idx;
   ::cucascade::memory::memory_space* _gpu_memory_space = nullptr;
   std::size_t _estimated_bytes;
+  std::optional<std::size_t> _block;
   std::shared_ptr<void> _ticket;
 };
 
@@ -234,6 +240,28 @@ class vector_join_stream_output : public partitioned_operator_data {
   }
 
  private:
+  std::shared_ptr<void> _ticket;
+};
+
+/// The output of a task over a probe block: one batch per left batch the block touched, each
+/// partitioned by that left batch. Its pairs' left rows are rows of that batch.
+class vector_join_stream_block_output : public partitioned_operator_data {
+ public:
+  vector_join_stream_block_output(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+    std::vector<std::size_t> partitions,
+    std::shared_ptr<void> ticket)
+    : partitioned_operator_data(std::move(data_batches), partitions.front()),
+      _partitions(std::move(partitions)),
+      _ticket(std::move(ticket))
+  {
+  }
+
+  /// The left batch of each of get_data_batches(), in order.
+  [[nodiscard]] std::vector<std::size_t> const& partitions() const { return _partitions; }
+
+ private:
+  std::vector<std::size_t> _partitions;
   std::shared_ptr<void> _ticket;
 };
 
@@ -348,6 +376,18 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// which is the point of the fold.
   [[nodiscard]] std::size_t per_left_batch_estimate(std::size_t left_idx,
                                                     bool with_routing = true) const;
+  /// The same estimate for a task over @p n_left probe rows.
+  [[nodiscard]] std::size_t estimate_for_rows(std::size_t n_left, bool with_routing = true) const;
+
+  /// Group the probe chunks into blocks of probe rows when that pays (lists in host memory, which
+  /// a task reads across PCIe once per sweep); leaves @c _blocks empty otherwise. Caller holds
+  /// _op_mutex, after the corpus and probe sources are set up.
+  void plan_probe_blocks_locked();
+  /// Tasks to hand out: one per probe block, or one per probe chunk when there are none.
+  [[nodiscard]] std::size_t num_tasks() const
+  {
+    return _blocks.empty() ? _num_left : _blocks.size();
+  }
 
   /// The corpus row order, shared with materialize. Null on the pinned path, where the
   /// pinned_entry plays the same role.
@@ -429,6 +469,19 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   std::size_t _max_chunk_bytes{0};
   std::size_t _max_probe_chunk_bytes{0};
   std::size_t _num_left{0};
+  /// Rows [begin, end) of probe chunk @c chunk.
+  struct probe_piece {
+    std::size_t chunk;
+    std::int64_t begin;
+    std::int64_t end;
+  };
+  /// One task's probe rows when the join runs in probe blocks: pieces of consecutive probe chunks,
+  /// searched as one probe matrix.
+  struct probe_block {
+    std::vector<probe_piece> pieces;
+    std::int64_t rows{0};
+  };
+  std::vector<probe_block> _blocks;
   /// Probe rows in total, counted only when the probe stands in for a scalar subquery.
   std::size_t _scalar_probe_rows{0};
   std::size_t _next_left{0};

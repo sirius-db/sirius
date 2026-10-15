@@ -173,9 +173,8 @@ class host_pinned_chunk_source : public vector_chunk_source {
  public:
   host_pinned_chunk_source(const scan_manager::pinned_entry& pin,
                            const std::string& column,
-                           std::int64_t dim,
                            const telemetry::batch_telemetry_info& telemetry_info)
-    : _pin(pin), _telemetry_info(telemetry_info), _dim(dim)
+    : _pin(pin), _telemetry_info(telemetry_info)
   {
     auto const& names = _pin.cache_info.column_names();
     auto const it     = std::find(names.begin(), names.end(), column);
@@ -192,7 +191,7 @@ class host_pinned_chunk_source : public vector_chunk_source {
   [[nodiscard]] bool is_streaming() const override { return true; }
 
   // Row and byte counts without staging, so the memory estimate can size a task before any
-  // copy happens. A host chunk reports bytes; rows follow from the fixed vector width.
+  // copy happens, and a probe block can be cut to exact rows.
   [[nodiscard]] std::size_t chunk_bytes(std::size_t i) const override
   {
     auto const& chunk = _pin.host_chunks.at(i);
@@ -200,8 +199,10 @@ class host_pinned_chunk_source : public vector_chunk_source {
   }
   [[nodiscard]] std::size_t chunk_rows(std::size_t i) const override
   {
-    auto const width = static_cast<std::size_t>(_dim) * sizeof(float);
-    return width == 0 ? 0 : chunk_bytes(i) / width;
+    auto const& chunk = _pin.host_chunks.at(i);
+    if (!chunk) { return 0; }
+    return static_cast<std::size_t>(
+      uncompressed_host_chunk(*chunk).get_host_table()->columns.at(_column_index).num_rows);
   }
 
   staged_vector_chunk stage(std::size_t i,
@@ -270,7 +271,6 @@ class host_pinned_chunk_source : public vector_chunk_source {
   const scan_manager::pinned_entry& _pin;
   telemetry::batch_telemetry_info _telemetry_info;
   std::size_t _column_index{0};
-  std::int64_t _dim{0};
 };
 
 /// Build phase: the corpus is whatever the child scan deposited in the build port, walked in
@@ -319,9 +319,12 @@ class materialized_chunk_source : public vector_chunk_source {
         if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
           ro = host_resident(batch, std::move(ro));
         }
-        auto const bytes = host_repr(ro).column_size(_column_index);
-        _bytes.push_back(bytes);
-        _rows.push_back(row_bytes() == 0 ? 0 : bytes / row_bytes());
+        // Rows from the column's own count: its bytes include the list offsets, and a probe
+        // block is cut to exact rows.
+        auto const& host = host_repr(ro);
+        _bytes.push_back(host.column_size(_column_index));
+        _rows.push_back(
+          static_cast<std::size_t>(host.get_host_table()->columns.at(_column_index).num_rows));
       }
     }
   }
@@ -891,10 +894,9 @@ std::unique_ptr<vector_chunk_source> make_cluster_lists_chunk_source(
 std::unique_ptr<vector_chunk_source> make_host_pinned_chunk_source(
   const sirius::scan_manager::pinned_entry& pin,
   const std::string& column,
-  std::int64_t dim,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  return std::make_unique<host_pinned_chunk_source>(pin, column, dim, telemetry_info);
+  return std::make_unique<host_pinned_chunk_source>(pin, column, telemetry_info);
 }
 
 sirius_physical_vector_join_stream::sirius_physical_vector_join_stream(
@@ -1017,7 +1019,7 @@ void sirius_physical_vector_join_stream::initialize_locked()
     _probe = make_materialized_chunk_source(
       *_probe_side, /*column_index=*/0, _request.dim, batch_telemetry(), _sirius_ctx);
   } else if (left_pin->tier == cucascade::memory::Tier::HOST) {
-    _probe = make_host_pinned_chunk_source(*left_pin, left.column, _request.dim, batch_telemetry());
+    _probe = make_host_pinned_chunk_source(*left_pin, left.column, batch_telemetry());
   } else {
     _probe =
       make_gpu_pinned_chunk_source(*left_pin, left.column, vss::pinned_entry_gpu_space(*left_pin));
@@ -1064,8 +1066,7 @@ void sirius_physical_vector_join_stream::initialize_locked()
       }
     }
   } else if (right_pin->tier == cucascade::memory::Tier::HOST) {
-    _corpus =
-      make_host_pinned_chunk_source(*right_pin, right.column, _request.dim, batch_telemetry());
+    _corpus = make_host_pinned_chunk_source(*right_pin, right.column, batch_telemetry());
     // Sized from the widest chunk, since any one of them may be the one in flight when
     // the reservation is granted.
     auto const& names = right_pin->cache_info.column_names();
@@ -1110,6 +1111,7 @@ void sirius_physical_vector_join_stream::initialize_locked()
       _max_probe_chunk_bytes = std::max(_max_probe_chunk_bytes, _probe->chunk_bytes(i));
     }
   }
+  plan_probe_blocks_locked();
   // Lists on the device leave this join's tasks the rest of it, which the engine cannot enlarge by
   // moving anything. As many tasks may hold memory at once as fit there. The materialize stage runs
   // in the same task after the search has freed its scratch, so a task needs the search's estimate;
@@ -1140,6 +1142,83 @@ void sirius_physical_vector_join_stream::initialize_locked()
     }
   }
   _initialized = true;
+}
+
+void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
+{
+  _blocks.clear();
+  // Lists in host memory cross PCIe in every task, once per sweep, so the probe rows one task
+  // searches set how often they are read. Deep100M, 9.6 GB of INT8 lists, 10M probes at 64 probes
+  // each on a 24 GB device: one task per ~245k-row probe chunk 86.2 s, ~0.9M-row blocks (a quarter
+  // of the device) 62.7 s, 1.25M-row blocks (a third) 59.6 s; lists on the device 53.6 s. Blocks
+  // cut and join probe chunks to that size; only top-k answers are split back.
+  bool const wanted = _lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST &&
+                      _request.mode != vss::vector_join_mode::threshold &&
+                      _request.earlier_by.empty() && !_request.probe_scalar && _num_left > 0;
+  if (!wanted) { return; }
+  auto const k_join = std::max<std::int64_t>(
+    1, _right_total_rows > 0 ? std::min<std::int64_t>(_request.k, _right_total_rows) : _request.k);
+  std::int64_t block_rows = 0;
+  if (auto const* env = std::getenv("SIRIUS_VSS_PROBE_BLOCK_ROWS")) {
+    block_rows = std::max<std::int64_t>(0, std::atoll(env));
+  } else if (_sirius_ctx != nullptr) {
+    auto const spaces =
+      _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    if (spaces.empty()) { return; }
+    // The estimate is affine in the row count past a million rows; the joined probe matrix is on
+    // top of it.
+    constexpr std::size_t kA = std::size_t{1} << 20, kB = std::size_t{1} << 21;
+    auto const per_row = static_cast<double>(estimate_for_rows(kB) - estimate_for_rows(kA)) / kA +
+                         static_cast<double>(_request.dim) * sizeof(float);
+    auto const fixed = static_cast<double>(estimate_for_rows(kA)) -
+                       static_cast<double>(kA) * (per_row - _request.dim * sizeof(float));
+    // A third of the device, so a few tasks run at once; never less than a whole probe chunk,
+    // unless one does not fit in most of the device, which is what makes a small device work.
+    auto const device        = static_cast<double>(spaces.front()->get_max_memory());
+    std::size_t widest_chunk = 0;
+    for (std::size_t i = 0; i < _num_left; ++i) {
+      widest_chunk = std::max(widest_chunk, _probe->chunk_rows(i));
+    }
+    auto const chunk_need = fixed + per_row * static_cast<double>(widest_chunk);
+    auto const budget =
+      chunk_need <= 0.8 * device ? std::max(device / 3, chunk_need) : 0.8 * device;
+    block_rows =
+      budget > fixed ? static_cast<std::int64_t>((budget - fixed) / per_row) : std::int64_t{0};
+    block_rows = std::max<std::int64_t>(block_rows, std::int64_t{1} << 14);
+  }
+  block_rows = std::min<std::int64_t>(
+    block_rows, static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) / k_join);
+  if (block_rows <= 0) { return; }
+  // Blocks of even size, so the last is not a sliver that pays for a whole read of the lists alone.
+  std::int64_t total = 0;
+  for (std::size_t i = 0; i < _num_left; ++i) {
+    total += static_cast<std::int64_t>(_probe->chunk_rows(i));
+  }
+  if (total == 0) { return; }
+  auto const n_blocks = (total + block_rows - 1) / block_rows;
+  block_rows          = (total + n_blocks - 1) / n_blocks;
+  probe_block current;
+  for (std::size_t i = 0; i < _num_left; ++i) {
+    auto const rows = static_cast<std::int64_t>(_probe->chunk_rows(i));
+    for (std::int64_t at = 0; at < rows;) {
+      auto const take = std::min(rows - at, block_rows - current.rows);
+      current.pieces.push_back(probe_piece{i, at, at + take});
+      current.rows += take;
+      at += take;
+      if (current.rows == block_rows) {
+        _blocks.push_back(std::move(current));
+        current = probe_block{};
+      }
+    }
+  }
+  if (current.rows > 0) { _blocks.push_back(std::move(current)); }
+  if (std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+    std::fprintf(stderr,
+                 "[vecjoin-phase] probe blocks: %zu of up to %lld rows over %zu probe chunks\n",
+                 _blocks.size(),
+                 static_cast<long long>(block_rows),
+                 _num_left);
+  }
 }
 
 void sirius_physical_vector_join_stream::on_finalize_operator()
@@ -1182,7 +1261,7 @@ std::optional<task_creation_hint> sirius_physical_vector_join_stream::get_next_t
     if (_init_error_task_issued) { return std::nullopt; }
     return task_creation_hint{TaskCreationHint::READY, this};
   }
-  if (_num_left == 0 || _next_left >= _num_left) { return std::nullopt; }
+  if (num_tasks() == 0 || _next_left >= num_tasks()) { return std::nullopt; }
   if (_admission->capped()) {
     // At the cap, a task's release re-arms this operator.
     std::lock_guard<std::mutex> admission_lock(_admission->mutex);
@@ -1202,7 +1281,7 @@ bool sirius_physical_vector_join_stream::all_ports_empty()
   ensure_initialized_locked();
   // Not empty until the task carrying the error has failed the query.
   if (_init_error) { return false; }
-  return _next_left >= _num_left;
+  return _next_left >= num_tasks();
 }
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_stream::get_next_task_input_data()
@@ -1215,7 +1294,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::get_next_task
     _init_error_task_issued = true;
     return std::make_unique<vector_join_stream_input>(0, 0);
   }
-  if (_next_left >= _num_left) { return nullptr; }
+  if (_next_left >= num_tasks()) { return nullptr; }
 
   // The probe batch is deliberately NOT carried in the task input as a pipelineable batch: a
   // queued task subscribes to its batches, which removes them from the repository spill tier, and
@@ -1231,9 +1310,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::get_next_task
     }
     ticket = std::make_shared<admission_ticket>(_admission);
   }
-  auto const left_idx = _next_left++;
-  auto input =
-    std::make_unique<vector_join_stream_input>(left_idx, per_left_batch_estimate(left_idx));
+  auto const task = _next_left++;
+  std::unique_ptr<vector_join_stream_input> input;
+  if (_blocks.empty()) {
+    input = std::make_unique<vector_join_stream_input>(task, per_left_batch_estimate(task));
+  } else {
+    auto const& block = _blocks[task];
+    input             = std::make_unique<vector_join_stream_input>(
+      block.pieces.front().chunk, estimate_for_rows(static_cast<std::size_t>(block.rows)), task);
+  }
   input->set_ticket(std::move(ticket));
   return input;
 }
@@ -1597,9 +1682,29 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // Held for the whole task: every corpus chunk is searched against this probe chunk. A copy
   // staged back from the host is freed on the compute stream (the chunk sources rebind it), so
   // dropping it as execute returns, before the task's stream sync, is ordered behind the searches.
-  auto staged_probe  = _probe->stage_for_task(left_idx, *mem_space, stream);
-  auto const queries = vss::list_column_as_dataset_view(staged_probe.view, dim);
-  auto const n_left  = static_cast<std::int64_t>(queries.extent(0));
+  // A block's pieces are cut from their chunks into one probe matrix, and the chunks dropped.
+  probe_block const* const block = join_in->block() ? &_blocks[*join_in->block()] : nullptr;
+  staged_vector_chunk staged_probe;
+  std::unique_ptr<cudf::column> block_probe;
+  if (block == nullptr) {
+    staged_probe = _probe->stage_for_task(left_idx, *mem_space, stream);
+  } else {
+    std::vector<staged_vector_chunk> chunks;
+    std::vector<cudf::column_view> cuts;
+    chunks.reserve(block->pieces.size());
+    for (auto const& piece : block->pieces) {
+      chunks.push_back(_probe->stage_for_task(piece.chunk, *mem_space, stream));
+      cuts.push_back(cudf::slice(chunks.back().view,
+                                 {static_cast<cudf::size_type>(piece.begin),
+                                  static_cast<cudf::size_type>(piece.end)},
+                                 stream)
+                       .front());
+    }
+    block_probe = cudf::concatenate(cuts, stream, mr);
+  }
+  auto const probe_view = block != nullptr ? block_probe->view() : staged_probe.view;
+  auto const queries    = vss::list_column_as_dataset_view(probe_view, dim);
+  auto const n_left     = static_cast<std::int64_t>(queries.extent(0));
   // An empty probe batch joins to nothing; the search libraries refuse a zero-row query matrix.
   if (n_left == 0) {
     std::vector<std::unique_ptr<cudf::column>> empty_cols;
@@ -1624,7 +1729,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // term of a clustered search only paces admission; it is not exact enough to refuse on. The rest
   // is within ~10% of the peak, and pinned tables hold part of the device, so the bar is 90% of it.
   if (_request.mode != vss::vector_join_mode::threshold) {
-    auto const need = per_left_batch_estimate(left_idx, /*with_routing=*/false);
+    auto const need = block != nullptr
+                        ? estimate_for_rows(static_cast<std::size_t>(block->rows), false)
+                        : per_left_batch_estimate(left_idx, /*with_routing=*/false);
     if (static_cast<double>(need) > 0.9 * static_cast<double>(mem_space->get_max_memory())) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] k = " + std::to_string(k_join) + " over " +
@@ -1908,10 +2015,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       if (!dbg) { return; }
       stream.synchronize();
       auto const now = std::chrono::steady_clock::now();
-      std::fprintf(stderr,
-                   "[vecjoin-phase] %-22s %8.3f s\n",
-                   name,
-                   std::chrono::duration<double>(now - phase_t0).count());
+      std::fprintf(
+        stderr,
+        "[vecjoin-phase] %-22s %8.3f s, device in use %.2f GiB\n",
+        name,
+        std::chrono::duration<double>(now - phase_t0).count(),
+        static_cast<double>(mem_space->get_max_memory() - mem_space->get_available_memory(stream)) /
+          1073741824.0);
       phase_t0 = now;
     };
 
@@ -1950,7 +2060,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     vss::assignment_spec routing;
     routing.n_probes = n_probes;
     auto assignment  = vss::assign_to_centroids(
-      res, staged_probe.view, _centroids->view(), dim, routing, 0, metric, stream, mr);
+      res, probe_view, _centroids->view(), dim, routing, 0, metric, stream, mr);
     auto const n_edges = n_left * n_probes;  // row-major [n_left x n_probes]
     phase("assign probe->clusters");
 
@@ -2673,10 +2783,16 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // The compact chunks sweep 0 copied in stay on the device for sweep 1 while the budget still
     // has a margin free, and sweep 1 starts with them: lists that nearly fit are read about once.
     std::map<std::size_t, staged_vector_chunk> kept;
-    bool const keep_chunks = lists_on_host && any_bounded && !radius_join && [] {
-      auto const* v = std::getenv("SIRIUS_VSS_KEEP_LIST_CHUNKS");
-      return v == nullptr || std::strcmp(v, "0") != 0;
-    }();
+    // Probe blocks are sized to share the device, so only a lone small one keeps chunks: a ~1M-row
+    // task that kept them filled the device and ran out of memory in sweep 1.
+    bool const small_lone_block =
+      block != nullptr && _blocks.size() == 1 &&
+      estimate_for_rows(static_cast<std::size_t>(block->rows)) <= mem_space->get_max_memory() / 8;
+    bool const keep_chunks =
+      lists_on_host && any_bounded && !radius_join && (block == nullptr || small_lone_block) && [] {
+        auto const* v = std::getenv("SIRIUS_VSS_KEEP_LIST_CHUNKS");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+      }();
     auto const keep_margin = mem_space->get_max_memory() / 12;
     auto can_keep = [&] { return mem_space->make_reservation_or_null(keep_margin) != nullptr; };
     std::vector<std::size_t> kept_first;
@@ -3475,6 +3591,47 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     shaped.left_rows = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32});
     shaped.neighbors = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64});
     shaped.distances = cudf::make_empty_column(cudf::data_type{cudf::type_id::FLOAT32});
+  } else if (block != nullptr) {
+    // One output per left batch the block touched, shaped from its rows of the accumulator, with
+    // left rows counted from the start of that batch.
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+    std::vector<std::size_t> partitions;
+    std::int64_t first = 0;
+    for (auto const& piece : block->pieces) {
+      auto const rows = piece.end - piece.begin;
+      std::vector<cudf::size_type> const span{
+        static_cast<cudf::size_type>(first * k_join),
+        static_cast<cudf::size_type>((first + rows) * k_join)};
+      auto neighbors = std::make_unique<cudf::column>(
+        cudf::slice(acc_neighbors->view(), span, stream).front(), stream, mr);
+      auto distances = std::make_unique<cudf::column>(
+        cudf::slice(acc_distances->view(), span, stream).front(), stream, mr);
+      auto part = _request.mode == vss::vector_join_mode::global_top_k
+                    ? vss::shape_global_top_k(
+                        neighbors->view(), distances->view(), rows, k_join, _request.k, stream, mr)
+                    : vss::shape_per_row_top_k(
+                        std::move(neighbors), std::move(distances), rows, k_join, stream, mr);
+      if (piece.begin > 0) {
+        cudf::numeric_scalar<std::int32_t> const shift(
+          static_cast<std::int32_t>(piece.begin), true, stream);
+        part.left_rows = cudf::binary_operation(part.left_rows->view(),
+                                                shift,
+                                                cudf::binary_operator::ADD,
+                                                cudf::data_type{cudf::type_id::INT32},
+                                                stream,
+                                                mr);
+      }
+      std::vector<std::unique_ptr<cudf::column>> cols;
+      cols.push_back(std::move(part.left_rows));
+      cols.push_back(std::move(part.neighbors));
+      cols.push_back(std::move(part.distances));
+      batches.push_back(sirius::make_data_batch(
+        std::make_unique<cudf::table>(std::move(cols)), *mem_space, stream, batch_telemetry()));
+      partitions.push_back(piece.chunk);
+      first += rows;
+    }
+    return std::make_unique<vector_join_stream_block_output>(
+      std::move(batches), std::move(partitions), join_in->ticket());
   } else if (radius_join) {
     // Concatenate the per-chunk edge lists. No merge and no truncation test: every edge the
     // kernel emitted is inside eps and nothing later can displace it, so the answer is complete
@@ -3559,7 +3716,10 @@ void sirius_physical_vector_join_stream::sink(const operator_data& output_data,
 {
   auto const& part         = dynamic_cast<const partitioned_operator_data&>(output_data);
   auto const partition_idx = part.get_partition_idx().value_or(0);
-  for (auto& batch : part.get_data_batches()) {
+  auto const* block        = dynamic_cast<const vector_join_stream_block_output*>(&output_data);
+  auto const& out          = part.get_data_batches();
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    auto const& batch = out[i];
     for (auto& next_port_info : next_port_after_sink) {
       auto* consumer =
         dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
@@ -3568,7 +3728,9 @@ void sirius_physical_vector_join_stream::sink(const operator_data& output_data,
           "[sirius_physical_vector_join_stream::sink] next operator is not a partition consumer");
       }
       consumer->push_data_batch_partitioned(
-        next_port_info.next_operator_port_name, batch, partition_idx);
+        next_port_info.next_operator_port_name,
+        batch,
+        block != nullptr ? block->partitions()[i] : partition_idx);
     }
   }
 }
@@ -3579,19 +3741,25 @@ void sirius_physical_vector_join_stream::sink(const operator_data& output_data,
 std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::size_t left_idx,
                                                                         bool with_routing) const
 {
-  // Live at once: the accumulator, one batch's partial, and the stacked pair the
-  // merge reads (2x), plus the merge output. Six [n_left x k] blocks covers it, with
-  // the same 1 MiB floor the split design used. Notably independent of the right
-  // batch count -- the split design's merge stage scaled with it.
   auto const n_left = _probe->chunk_rows(left_idx);
-  auto const k      = static_cast<std::size_t>(std::max<std::int64_t>(
-    _right_total_rows > 0 ? std::min<std::int64_t>(_request.k, _right_total_rows) : _request.k, 1));
-  auto const block  = n_left * k * (sizeof(std::int64_t) + sizeof(float));
   // No reservation holds an output past a column's row limit: refuse here, once, instead of
   // through every out-of-memory retry of the task.
   auto const k_join =
     _right_total_rows > 0 ? std::min<std::int64_t>(_request.k, _right_total_rows) : _request.k;
   vss::column_size(static_cast<std::int64_t>(n_left) * k_join, "vector join output");
+  return estimate_for_rows(n_left, with_routing);
+}
+
+std::size_t sirius_physical_vector_join_stream::estimate_for_rows(std::size_t n_left,
+                                                                  bool with_routing) const
+{
+  // Live at once: the accumulator, one batch's partial, and the stacked pair the
+  // merge reads (2x), plus the merge output. Six [n_left x k] blocks covers it, with
+  // the same 1 MiB floor the split design used. Notably independent of the right
+  // batch count -- the split design's merge stage scaled with it.
+  auto const k     = static_cast<std::size_t>(std::max<std::int64_t>(
+    _right_total_rows > 0 ? std::min<std::int64_t>(_request.k, _right_total_rows) : _request.k, 1));
+  auto const block = n_left * k * (sizeof(std::int64_t) + sizeof(float));
 
   // cuVS tiles the pairwise distances against a bounded internal workspace, so its
   // scratch does not scale with the search shape -- the two figures recorded on the
@@ -3607,8 +3775,12 @@ std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::siz
   std::size_t staged_chunk = 0;
   if (_corpus && _corpus->is_streaming()) { staged_chunk = _max_chunk_bytes; }
   // A streamed probe side holds its chunk for the whole task, so it is live alongside the
-  // corpus chunk rather than instead of it.
+  // corpus chunk rather than instead of it. A probe block holds its rows joined into one matrix,
+  // after the chunks they were cut from are dropped.
   if (_probe && _probe->is_streaming()) { staged_chunk += _max_probe_chunk_bytes; }
+  if (!_blocks.empty()) {
+    staged_chunk += n_left * static_cast<std::size_t>(_request.dim) * sizeof(float);
+  }
 
   // The GEMM-ranked search holds its score tile, the prepared corpus chunk ([rows x d+pad]) and
   // the prepared probe chunk at once, and a threshold search its edge buffer (1M edges to start).

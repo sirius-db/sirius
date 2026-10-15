@@ -1284,6 +1284,63 @@ TEST_CASE_METHOD(
   same(fetch(eps + approx), exact);
 }
 
+TEST_CASE_METHOD(KMeansFixture,
+                 "probe blocks over host-tier lists answer as one task per probe chunk does",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Over lists in host memory a task searches a block of probe rows sized to the device rather than
+  // one probe chunk. The probe rows are pinned in ~10 MB chunks (~40k rows each); 50,000-row blocks
+  // cut chunks and join pieces of neighbouring ones, and the answer is split back by chunk.
+  auto const gen = [](const std::string& seed) {
+    return "list_transform(range(64), lambda d: ((hash(i * 1000 + d + " + seed +
+           ") % 1000)::FLOAT / 1000.0))::FLOAT[64]";
+  };
+  run_ok("CREATE TABLE kmpb_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
+         " AS vec FROM range(70000) t(i);");
+  run_ok("CREATE TABLE kmpb_probe AS SELECT i::INTEGER AS id, " + gen("100000000") +
+         " AS vec FROM range(130000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'kmpb_corpus', tier => 'host', format => 'duckdb');");
+  run_ok("SET scan_task_batch_size = 10000000;");
+  run_ok("SELECT * FROM pin_table(name => 'kmpb_probe', tier => 'gpu', format => 'duckdb');");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_fit('kmpb_corpus','vec', name => 'kmpb_c', n_clusters => 16);");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('kmpb_corpus','vec','kmpb_c', storage => 'int8', "
+    "tier => 'host');");
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_PROBE_BLOCK_ROWS"); }
+  } unset_env;
+  auto const count = [&](const std::string& sql) {
+    return std::stoll(ok_rows(*con, sql).at(0).at(0));
+  };
+  for (auto const& [mode, rows] :
+       {std::pair<std::string, long long>{"k => 10", 1300000},
+        std::pair<std::string, long long>{"k => 100, join_mode => 'global'", 100}}) {
+    auto const join =
+      "SELECT left_id, right_id, distance FROM sirius_knn_join('kmpb_probe','vec','kmpb_corpus',"
+      "'vec', metric => 'l2', search_mode => 'approx', clustering => 'kmpb_c', n_probes => 4, " +
+      mode + ")";
+    // One task per probe chunk, 50,000-row blocks, and blocks sized by the device.
+    std::vector<std::string> const block_rows{"0", "50000", ""};
+    for (std::size_t r = 0; r < block_rows.size(); ++r) {
+      if (block_rows[r].empty()) {
+        ::unsetenv("SIRIUS_VSS_PROBE_BLOCK_ROWS");
+      } else {
+        ::setenv("SIRIUS_VSS_PROBE_BLOCK_ROWS", block_rows[r].c_str(), 1);
+      }
+      run_ok("CREATE OR REPLACE TABLE kmpb_" + std::to_string(r) + " AS " + join + ";");
+    }
+    REQUIRE(count("SELECT count(*) FROM kmpb_0") == rows);
+    for (std::size_t r = 1; r < block_rows.size(); ++r) {
+      auto const other = "kmpb_" + std::to_string(r);
+      CHECK(count("SELECT count(*) FROM " + other) == rows);
+      CHECK(count("SELECT count(*) FROM (SELECT * FROM kmpb_0 EXCEPT SELECT * FROM " + other +
+                  ")") == 0);
+    }
+  }
+}
+
 TEST_CASE_METHOD(
   KMeansFixture,
   "a few probe rows over UINT8 and float16 cluster lists give the exact join's answer",

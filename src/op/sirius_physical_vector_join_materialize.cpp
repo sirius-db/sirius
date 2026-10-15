@@ -23,6 +23,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "vss/pinned_column.hpp"
+#include "vss/sirius_physical_vector_join_stream.hpp"
 #include "vss/staging_shortfall.hpp"
 #include "vss/vector_search_internal.hpp"
 
@@ -587,6 +588,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
 
   auto const& input        = dynamic_cast<const partitioned_operator_data&>(input_data);
   auto const partition_idx = input.get_partition_idx().value_or(0);  // = left batch index
+  // A probe block's output names the left batch of each of its pieces.
+  auto const* block = dynamic_cast<const vector_join_stream_block_output*>(&input_data);
   if (_request.count_only) {
     // Each piece is one BIGINT row, the count, already what the aggregate above sums.
     auto counts = input.get_data_batches();
@@ -630,7 +633,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   // is on the device at a time.
   auto& registry = sirius::converter_registry::get();
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
-  for (auto const& piece : input_batches) {
+  for (std::size_t i = 0; i < input_batches.size(); ++i) {
+    auto const& piece                     = input_batches[i];
     cucascade::memory::memory_space* host = nullptr;
     std::shared_ptr<cucascade::data_batch> staged;
     if (piece.get_current_tier() != cucascade::memory::Tier::GPU) {
@@ -642,7 +646,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
     }
     auto const tv =
       staged ? sirius::get_cudf_table_view(*staged) : sirius::get_cudf_table_view(piece);
-    auto out_table = materialize_piece(partition_idx, tv, *space, stream);
+    auto out_table = materialize_piece(
+      block != nullptr ? block->partitions()[i] : partition_idx, tv, *space, stream);
     staged.reset();
     auto batch = sirius::make_data_batch(std::move(out_table), *space, stream, batch_telemetry());
     if (host != nullptr) {
