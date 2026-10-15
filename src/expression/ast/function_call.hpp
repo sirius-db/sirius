@@ -17,8 +17,9 @@
 #pragma once
 
 // sirius
-#include "expression/function_id.hpp"  // sirius::function_id
+#include "expression/function_id.hpp"  // sirius::function_id, sirius::accepts_argument_count
 #include "helper/logical_type.hpp"     // sirius::logical_type
+#include "sirius/exception.hpp"        // sirius::internal_exception
 
 // standard library
 #include <memory>
@@ -36,7 +37,11 @@ struct node;
  *
  * No default state: the only way to construct a `function_call` is via the
  * three-argument constructor, so every instance was built with an explicit
- * function id, an arguments vector, and a return type. Move-only (the
+ * function id, an arguments vector, and a return type. The constructor rejects
+ * an argument count the function's GPU handler does not take (see
+ * sirius::accepts_argument_count), so the evaluator can index its arguments by
+ * position. Translators check the arity first and decline the expression
+ * instead. Move-only (the
  * arguments vector holds `unique_ptr<node>`); private fields with const
  * accessors prevent post-construction mutation. Moved-from instances are
  * left in the standard valid-but-unspecified state and must not be read.
@@ -48,6 +53,11 @@ class function_call {
                 sirius::logical_type return_type)
     : function_(id), arguments_(std::move(arguments)), return_type_(std::move(return_type))
   {
+    if (!accepts_argument_count(function_, arguments_.size())) {
+      throw internal_exception("[ast::function_call] {} does not take {} argument(s)",
+                               to_duckdb_function_name(function_),
+                               arguments_.size());
+    }
   }
 
   function_call()                                    = delete;
