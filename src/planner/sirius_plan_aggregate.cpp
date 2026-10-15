@@ -752,8 +752,7 @@ bool decimal_sum_stats_bound_enabled(duckdb::ClientContext& context)
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  return !sirius_ctx ||
-         sirius_ctx->get_config().get_operator_params().enable_decimal_sum_stats_bound;
+  return !sirius_ctx || duckdb::query_operator_options(context)->enable_decimal_sum_stats_bound;
 }
 
 }  // namespace
