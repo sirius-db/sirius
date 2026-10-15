@@ -99,6 +99,7 @@ scan_estimates read_estimates(std::unique_ptr<scan::parquet_ingestible_table_inf
   REQUIRE(file);
   auto const file_output  = file->estimated_bytes();
   auto const file_working = file->estimated_working_set_bytes();
+  CHECK(file->preparation_bytes() == file_working);
 
   auto coalescer = ingestible->create_batch_coalescer();
   auto batches   = coalescer->push(std::move(file));
@@ -112,6 +113,7 @@ scan_estimates read_estimates(std::unique_ptr<scan::parquet_ingestible_table_inf
   REQUIRE(batch);
   CHECK(batch->estimated_bytes() == file_output);
   CHECK(batch->estimated_working_set_bytes() == file_working);
+  CHECK(batch->preparation_bytes() == file_working);
   return {batch->estimated_bytes(),
           batch->estimated_working_set_bytes(),
           batch->plan->non_output_batch_positions().size()};
@@ -432,6 +434,7 @@ TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
     auto splits = coalescer->flush();
     REQUIRE(splits.size() == 1);
     CHECK(splits.front()->estimated_working_set_bytes() == 240);
+    CHECK(splits.front()->preparation_bytes() == 120);
   }
 
   SECTION("coalescer applies the concatenation peak to its byte cap")
@@ -463,6 +466,7 @@ TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
     auto full = push_one();
     REQUIRE(full.size() == 1);
     CHECK(full.front()->estimated_working_set_bytes() == 240);
+    CHECK(full.front()->preparation_bytes() == 120);
     CHECK(full.front()->estimated_bytes() == 40);
     auto tail = coalescer->flush();
     REQUIRE(tail.size() == 1);

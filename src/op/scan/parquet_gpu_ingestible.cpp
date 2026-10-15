@@ -347,6 +347,7 @@ std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
  */
 class parquet_batch_coalescer : public batch_coalescer {
  public:
+  std::size_t target_batch_bytes() const noexcept override { return _cap; }
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                           std::shared_ptr<scan_plan const> plan,

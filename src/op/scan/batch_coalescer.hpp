@@ -39,6 +39,7 @@ namespace sirius::op::scan {
 class batch_coalescer {
  public:
   using clock = std::chrono::steady_clock;
+  virtual std::size_t target_batch_bytes() const noexcept { return 0; }
   struct cursor_step {
     std::unique_ptr<scan_info> batch;
     bool finished;

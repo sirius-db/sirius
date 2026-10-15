@@ -485,26 +485,28 @@ Those two knobs derive the settings below, which are therefore **not** individua
 
 ### `sirius.executor.scan_manager.preparation`
 
-These settings are loaded at initialization. Count limits must be positive integers. Omitted limits are derived from the scan worker count, N (`scan_manager.num_threads`). Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
+These settings are loaded at initialization. Job limits default to unlimited; `0` also disables them. Other count limits must be positive integers. Control limits default to the scan worker count, N (`scan_manager.num_threads`); `lookahead_batches` defaults to 2. Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
 
 | Key | Default | Description |
 |---|---|---|
-| `max_inflight_jobs` | N | Maximum concurrent preparation jobs. |
-| `max_active_units` | 2N | Maximum active preparation units. |
-| `max_pending_results` | 2N | Capacity for result slots and pending output batches. |
+| `max_inflight_metadata_jobs` | unlimited | Maximum submitted metadata preparation jobs, including queued work. Omitted or `0` means unlimited. Completion returns the job slot. |
+| `max_inflight_dv_jobs` | unlimited | Maximum DV preparation jobs holding temporary-memory permits, including queued work. Omitted or `0` imposes no configured count cap. Admission may grant fewer permits when HOST memory is insufficient. |
+| `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
-| `underfilled_batch_residence` | 10 ms | Time from the first retained input until an underfilled batch becomes due. New arrivals do not reset it. `0` disables timed publication; negative values are rejected. Output backpressure and scheduling can delay publication. |
+| `underfilled_batch_residence` | disabled | Time from the first retained input until an underfilled batch becomes due. New arrivals do not reset it. `0` disables timed publication; negative values are rejected. Output backpressure and scheduling can delay publication. |
 | `interrupt_check_interval` | 10 ms | Maximum wait between interruption checks while preparation is idle. Must be positive. Draining an active read can take longer. |
+
+A file with a DV currently reads its footer and prepares its DV in the same job, so it uses a metadata job slot and a DV permit. The metadata limit does not size the DV reservation: admission reserves retained results plus K temporary workspaces, where K is bounded by the DV unit count, `scan_manager.num_threads`, and the DV limit when nonzero. Insufficient HOST memory may reduce K further. Neither setting changes the worker thread count. The previous `max_inflight_jobs` key is no longer accepted; use `max_inflight_metadata_jobs`.
 
 ```yaml
 sirius:
   executor:
     scan_manager:
       preparation:
-        max_inflight_jobs: 4
-        max_active_units: 8
-        max_pending_results: 8
+        max_inflight_metadata_jobs: 0
+        max_inflight_dv_jobs: 0
+        lookahead_batches: 2
         max_control_work: 4
         drain_quantum: 4
         underfilled_batch_residence: 20ms

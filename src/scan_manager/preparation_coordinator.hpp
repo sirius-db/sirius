@@ -37,6 +37,7 @@ class preparation_coordinator {
     // Bound by construct() while it still holds the concrete input type. Runs under the
     // publication gate before publish, at most once; must not wait for I/O or reenter the gate.
     std::function<void()> prepare;
+    size_t preparation_bytes = 0;
   };
   struct source {
     std::shared_ptr<op::scan::batch_coalescer> coalescer;
@@ -46,7 +47,7 @@ class preparation_coordinator {
     // Keep input owned by the caller on failure so cleanup does not run under the gate.
     std::function<void(publication&)> publish;
     std::function<void()> close;
-    std::function<void(std::function<void()>)> bind_consumption;
+    std::function<void(std::function<void(size_t)>)> bind_consumption;
     std::function<bool()> can_claim;
   };
   enum class lifecycle { constructed, armed, running, quiescent };

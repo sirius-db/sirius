@@ -21,23 +21,27 @@
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
-TEST_CASE("Preparation options have finite defaults and preserve post-resolution overrides",
+TEST_CASE("Preparation options default to unlimited jobs and preserve post-resolution overrides",
           "[scan_preparation][preparation_config]")
 {
   sirius::scan_manager::scan_manager_config config;
   config.thread_pool.num_threads = 3;
   auto defaults                  = config.preparation.resolve(3);
-  CHECK(defaults.max_inflight_jobs == 3);
-  CHECK(defaults.max_active_units >= defaults.max_inflight_jobs);
-  CHECK(defaults.max_pending_results >= defaults.max_inflight_jobs);
+  CHECK(defaults.max_inflight_metadata_jobs == 0);
+  CHECK(defaults.max_inflight_dv_jobs == 0);
+  config.preparation.max_inflight_metadata_jobs = 0;
+  config.preparation.max_inflight_dv_jobs       = 0;
+  CHECK(config.preparation.resolve(3).max_inflight_dv_jobs == 0);
+  CHECK(config.preparation.resolve(3).max_inflight_metadata_jobs == 0);
+  CHECK(defaults.lookahead_batches == 2);
   CHECK(defaults.max_control_work > 0);
   CHECK(defaults.drain_quantum > 0);
   CHECK(defaults.interrupt_check_interval == std::chrono::milliseconds(10));
-  CHECK(defaults.underfilled_batch_residence == std::chrono::milliseconds(10));
+  CHECK_FALSE(defaults.underfilled_batch_residence);
   config.preparation.interrupt_check_interval    = std::chrono::milliseconds(3);
-  config.preparation.max_inflight_jobs           = 2;
-  config.preparation.max_active_units            = 7;
-  config.preparation.max_pending_results         = 9;
+  config.preparation.max_inflight_metadata_jobs  = 2;
+  config.preparation.max_inflight_dv_jobs        = 7;
+  config.preparation.lookahead_batches           = 7;
   config.preparation.max_control_work            = 4;
   config.preparation.drain_quantum               = 5;
   config.preparation.underfilled_batch_residence = std::chrono::milliseconds(11);
@@ -53,23 +57,21 @@ TEST_CASE("Preparation options have finite defaults and preserve post-resolution
   auto const& resolved = engine.get_scan_manager_config();
   REQUIRE(resolved.thread_pool.num_threads == 3);
   auto snapshot = resolved.preparation.resolve(resolved.thread_pool.num_threads);
-  CHECK(snapshot.max_inflight_jobs == 2);
-  CHECK(snapshot.max_active_units == 7);
-  CHECK(snapshot.max_pending_results == 9);
+  CHECK(snapshot.max_inflight_metadata_jobs == 2);
+  CHECK(snapshot.max_inflight_dv_jobs == 7);
+  CHECK(snapshot.lookahead_batches == 7);
   CHECK(snapshot.max_control_work == 4);
   CHECK(snapshot.drain_quantum == 5);
   CHECK(snapshot.interrupt_check_interval == std::chrono::milliseconds(3));
   CHECK(snapshot.underfilled_batch_residence == std::chrono::milliseconds(11));
-  config.preparation.max_inflight_jobs = 1;
-  CHECK(snapshot.max_inflight_jobs == 2);  // independent attempt value
+  config.preparation.max_inflight_metadata_jobs = 1;
+  CHECK(snapshot.max_inflight_metadata_jobs == 2);  // independent attempt value
 }
 TEST_CASE("Invalid preparation options fail before constructing a scan manager",
           "[scan_preparation][preparation_config]")
 {
   sirius::scan_manager::scan_manager_config config;
-  SECTION("zero jobs") { config.preparation.max_inflight_jobs = 0; }
-  SECTION("zero units") { config.preparation.max_active_units = 0; }
-  SECTION("zero results") { config.preparation.max_pending_results = 0; }
+  SECTION("zero lookahead") { config.preparation.lookahead_batches = 0; }
   SECTION("zero control") { config.preparation.max_control_work = 0; }
   SECTION("zero quantum") { config.preparation.drain_quantum = 0; }
   SECTION("zero duration")
@@ -104,7 +106,7 @@ TEST_CASE("Manager construction validates preparation before creating worker or 
   host_config.initial_number_pools = 1;
   cucascade::memory::memory_reservation_manager memory({host_config});
   sirius::scan_manager::scan_manager_config config;
-  config.preparation.max_inflight_jobs = 0;
+  config.preparation.lookahead_batches = 0;
   sirius::exec::query_lifecycle_registry lifecycle;
   CHECK_THROWS_WITH(sirius::scan_manager::sirius_scan_manager(lifecycle, config, memory, nullptr),
                     "preparation limits and configured residence must be positive");
