@@ -22,6 +22,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
@@ -104,7 +105,8 @@ struct direct_export {
  * A sender exports a batch and keeps it alive under its token while the transport writes its
  * buffers into the receiver's; a receiver allocates those buffers from its slab under another
  * token, then takes them as a table. Tokens start at 1 and are never reused. Every method is
- * thread-safe and runs on the slab's device.
+ * thread-safe and runs on the slab's device. Copies and syncs run on a stream of its own, so they
+ * never wait for an operator's kernels.
  */
 class direct_exchange {
  public:
@@ -157,6 +159,8 @@ class direct_exchange {
 
   cucascade::memory::memory_space& _gpu;
   memory::slab_region _region;
+  /// Declared before _entries, so an exported copy freed on it is gone before the stream is.
+  rmm::cuda_stream _stream;
   mutable std::mutex _mutex;
   std::uint64_t _next{1};
   bool _closed{false};
