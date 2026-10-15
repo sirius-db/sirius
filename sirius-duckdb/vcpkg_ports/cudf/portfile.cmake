@@ -24,6 +24,18 @@ vcpkg_from_github(
   HEAD_REF
   main)
 
+# rapids-cmake otherwise downloads the CPM release asset during configure.
+vcpkg_download_distfile(
+  CPM_CMAKE_PATH
+  URLS
+  "https://api.github.com/repos/cpm-cmake/CPM.cmake/contents/cmake/CPM.cmake?ref=v0.42.0"
+  FILENAME
+  "CPM-v0.42.0.cmake"
+  SHA512
+  f9f671cc3fe5c07eea853cff23400d7d47e8e539b875c973917ac41ce2cbd7cc5b385cde17b21eccd8fc6b8b27f1e4c1c19b37f12f9a5730dee2d245f6bdaf9b
+  HEADERS
+  "Accept: application/vnd.github.raw+json")
+
 vcpkg_from_github(
   OUT_SOURCE_PATH
   RAPIDS_LOGGER_PATH
@@ -108,6 +120,14 @@ vcpkg_from_github(
   HEAD_REF
   dev)
 
+# cuco's bootstrap otherwise downloads RAPIDS.cmake from a moving branch.
+vcpkg_replace_string("${CUCO_PATH}/CMakeLists.txt" "file(DOWNLOAD"
+                     "file(COPY_FILE")
+vcpkg_replace_string(
+  "${CUCO_PATH}/CMakeLists.txt"
+  "https://raw.githubusercontent.com/rapidsai/rapids-cmake/\${rapids-cmake-branch}/RAPIDS.cmake"
+  "\"${RAPIDS_CMAKE_PATH}/RAPIDS.cmake\"")
+
 # Patch get_zstd.cmake to remove forced download - we provide zstd source via
 # CPM variable
 vcpkg_replace_string(
@@ -169,6 +189,8 @@ vcpkg_cmake_configure(
   "${SOURCE_PATH}/cpp"
   OPTIONS
   -DFETCHCONTENT_SOURCE_DIR_RAPIDS-CMAKE=${RAPIDS_CMAKE_PATH}
+  -DCPM_DOWNLOAD_LOCATION=${CPM_CMAKE_PATH}
+  -DEXTRACTED_CPM_VERSION=0.42.0
   -DCPM_LOCAL_PACKAGES_ONLY=ON
   -DCPM_rapids_logger_SOURCE=${RAPIDS_LOGGER_PATH}
   -DCPM_rtcx_SOURCE=${RTCX_PATH}
