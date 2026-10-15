@@ -88,10 +88,10 @@ std::unique_ptr<cudf::column> sample_vector_rows(cudf::column_view const& vector
 
   // The stride walk is what keeps this allocation-light: no shuffle, no random index buffer,
   // just an arithmetic sequence used as a gather map.
-  cudf::numeric_scalar<std::int32_t> const init(static_cast<std::int32_t>(sample.start), true,
-                                                stream);
-  cudf::numeric_scalar<std::int32_t> const step(static_cast<std::int32_t>(sample.stride), true,
-                                                stream);
+  cudf::numeric_scalar<std::int32_t> const init(
+    static_cast<std::int32_t>(sample.start), true, stream);
+  cudf::numeric_scalar<std::int32_t> const step(
+    static_cast<std::int32_t>(sample.stride), true, stream);
   auto const map =
     cudf::sequence(static_cast<cudf::size_type>(sample.count), init, step, stream, mr);
 

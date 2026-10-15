@@ -19,12 +19,11 @@
 #include "cuda/vss/cudf_raft_interop.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "duckdb/common/exception.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius/exception.hpp"
 #include "vss/bound_gemm.hpp"
 #include "vss/staging_shortfall.hpp"
-
-#include "duckdb/common/exception.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -34,14 +33,14 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
-#include <cucascade/cudf/host_table.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/cudf/host_table.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <array>
@@ -351,14 +350,15 @@ namespace {
 
 /// @ref stage_pinned_column_chunk, except that with @p may_decline a chunk whose own reservation
 /// the space cannot grant is not staged (nullopt) instead of reported as a shortfall.
-std::optional<staged_pinned_chunk> stage_chunk(const scan_manager::pinned_entry& pin,
-                                               const std::string& column_name,
-                                               std::size_t chunk_index,
-                                               cucascade::memory::memory_space& gpu_space,
-                                               rmm::cuda_stream_view stream,
-                                               const telemetry::batch_telemetry_info& telemetry_info,
-                                               staging_charge charge,
-                                               bool may_decline)
+std::optional<staged_pinned_chunk> stage_chunk(
+  const scan_manager::pinned_entry& pin,
+  const std::string& column_name,
+  std::size_t chunk_index,
+  cucascade::memory::memory_space& gpu_space,
+  rmm::cuda_stream_view stream,
+  const telemetry::batch_telemetry_info& telemetry_info,
+  staging_charge charge,
+  bool may_decline)
 {
   if (pin.tier != cucascade::memory::Tier::HOST) {
     auto const views = pinned_column_chunk_views(pin, column_name, gpu_space);

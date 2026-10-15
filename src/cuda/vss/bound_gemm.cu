@@ -29,7 +29,6 @@
 #include <mma.h>
 
 #include <algorithm>
-#include <optional>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -37,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <type_traits>
 
 namespace sirius::vss {
@@ -652,8 +652,9 @@ __device__ inline pinned_row locate_pinned_row(exact_rows const& src, int64_t ro
       hi = mid;
     }
   }
-  return {src.pin_blocks + src.chunk_block[lo],
-          src.chunk_offset[lo] + (p - src.chunk_rows[lo]) * d * static_cast<int64_t>(sizeof(float))};
+  return {
+    src.pin_blocks + src.chunk_block[lo],
+    src.chunk_offset[lo] + (p - src.chunk_rows[lo]) * d * static_cast<int64_t>(sizeof(float))};
 }
 
 __device__ inline float pinned_value(pinned_row const& r, int c, int block_shift)
@@ -743,8 +744,12 @@ __global__ void pin_row_keys_kernel(int64_t const* __restrict__ ids,
 }
 
 // One warp per sampled row.
-__global__ void gather_exact_rows_kernel(
-  exact_rows const src, int64_t start, int64_t stride, int64_t count, int d, float* __restrict__ out)
+__global__ void gather_exact_rows_kernel(exact_rows const src,
+                                         int64_t start,
+                                         int64_t stride,
+                                         int64_t count,
+                                         int d,
+                                         float* __restrict__ out)
 {
   int const lane = threadIdx.x % 32;
   for (int64_t j = (blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x) / 32; j < count;
@@ -1219,18 +1224,18 @@ void exact_distances(float const* probe,
   auto const warps_per_block = 8;
   auto const grid            = static_cast<int>(
     std::clamp<int64_t>((n_pairs + warps_per_block - 1) / warps_per_block, 1, 65535));
-  exact_distances_kernel<<<grid, warps_per_block * 32, 0, stream.value()>>>(probe,
-                                                                            rows,
-                                                                            k,
-                                                                            ids,
-                                                                            distances,
-                                                                            n_pairs,
-                                                                            source,
-                                                                            static_cast<int>(dim),
-                                                                            certain_below,
-                                                                            certain_value,
-                                                                            order ? order->data()
-                                                                                  : nullptr);
+  exact_distances_kernel<<<grid, warps_per_block * 32, 0, stream.value()>>>(
+    probe,
+    rows,
+    k,
+    ids,
+    distances,
+    n_pairs,
+    source,
+    static_cast<int>(dim),
+    certain_below,
+    certain_value,
+    order ? order->data() : nullptr);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

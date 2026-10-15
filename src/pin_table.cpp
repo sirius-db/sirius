@@ -258,7 +258,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
 
   // SIRIUS_PIN_PHASE_DEBUG prints where a pin's time went; it synchronizes after each decode,
   // so only for attribution.
-  bool const timing = std::getenv("SIRIUS_PIN_PHASE_DEBUG") != nullptr;
+  bool const timing       = std::getenv("SIRIUS_PIN_PHASE_DEBUG") != nullptr;
   std::size_t const depth = [] {
     auto const* v = std::getenv("SIRIUS_PIN_OVERLAP");
     return v == nullptr ? std::size_t{2} : static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
@@ -429,9 +429,9 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   auto const timed_decode = [&](std::unique_ptr<op::scan::scan_info> b) {
     auto const t0 = std::chrono::steady_clock::now();
     auto decoded  = decode_batch(std::move(b));
-    decode_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::steady_clock::now() - t0)
-                   .count();
+    decode_ns +=
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+        .count();
     return decoded;
   };
   auto const timed_finish = [&](decoded_batch decoded) {
@@ -456,9 +456,9 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     }
     std::optional<decoded_batch> ready;
     if (in_flight.size() == depth) { ready = take_oldest(); }
-    in_flight.push_back(std::async(std::launch::async, [&timed_decode, b = std::move(batch)]() mutable {
-      return timed_decode(std::move(b));
-    }));
+    in_flight.push_back(std::async(
+      std::launch::async,
+      [&timed_decode, b = std::move(batch)]() mutable { return timed_decode(std::move(b)); }));
     if (ready) { timed_finish(std::move(*ready)); }
   };
   auto drain = [&] {

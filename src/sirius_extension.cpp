@@ -2691,8 +2691,14 @@ static unique_ptr<FunctionData> SiriusKMeansBuildListsBind(ClientContext& contex
                   LogicalType::VARCHAR};
   return_types.push_back(LogicalType::VARCHAR);
   return_types.push_back(LogicalType::VARCHAR);
-  names = {
-    "n_rows", "n_clusters", "min_list", "max_list", "empty_lists", "tier", "encoding", "exact_rows"};
+  names = {"n_rows",
+           "n_clusters",
+           "min_list",
+           "max_list",
+           "empty_lists",
+           "tier",
+           "encoding",
+           "exact_rows"};
   return std::move(result);
 }
 

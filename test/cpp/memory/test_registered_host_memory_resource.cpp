@@ -71,9 +71,10 @@ void check_pool(void* pool)
 TEST_CASE("registered_host_memory_resource hands out pinned, device-mapped pools",
           "[registered_host_memory_resource]")
 {
-  auto const [numa_node, huge_pages, threads] =
-    GENERATE(std::tuple{-1, true, 8U}, std::tuple{0, true, 4U}, std::tuple{-1, false, 2U},
-             std::tuple{-1, true, 0U});
+  auto const [numa_node, huge_pages, threads] = GENERATE(std::tuple{-1, true, 8U},
+                                                         std::tuple{0, true, 4U},
+                                                         std::tuple{-1, false, 2U},
+                                                         std::tuple{-1, true, 0U});
   registered_host_memory_resource mr{numa_node, huge_pages, threads};
 
   std::vector<void*> pools;
@@ -118,7 +119,8 @@ TEST_CASE("registered_host_memory_resource fits the memory library's resource fa
   check_pool(pool);
   erased.deallocate_sync(pool, pool_bytes, alignof(std::max_align_t));
 
-  CHECK(registered_host_memory_resource{-1, true, 4} == registered_host_memory_resource{-1, true, 4});
+  CHECK(registered_host_memory_resource{-1, true, 4} ==
+        registered_host_memory_resource{-1, true, 4});
   CHECK_FALSE(registered_host_memory_resource{-1, true, 4} ==
               registered_host_memory_resource{0, true, 4});
 }

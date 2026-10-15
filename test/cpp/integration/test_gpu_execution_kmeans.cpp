@@ -21,7 +21,15 @@
  *        cluster-ordered copy of the table is built from.
  */
 
+#include <cudf/lists/lists_column_view.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
+#include <cuda_runtime_api.h>
+
 #include <catch.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <telemetry/data_batch_probe.hpp>
@@ -31,15 +39,6 @@
 #include <utils/transparent_execution_test_utils.hpp>
 #include <vss/pinned_column.hpp>
 #include <vss/vector_clustering.hpp>
-
-#include <cudf/lists/lists_column_view.hpp>
-
-#include <rmm/cuda_stream.hpp>
-
-#include <cucascade/memory/common.hpp>
-#include <cucascade/memory/memory_space.hpp>
-
-#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <cmath>
@@ -1540,12 +1539,11 @@ TEST_CASE_METHOD(KMeansFixture,
   auto const score = metric == "cosine" ? "similarity" : "distance";
   auto const fetch = [&](const std::string& args) {
     std::vector<std::tuple<std::string, std::string, double>> out;
-    for (auto const& r :
-         ok_rows(*con,
-                 std::string("SELECT left_id, right_id, ") + score + " FROM sirius_knn_join('" +
-                   prefix + "_probe','vec','" + prefix + "_corpus','vec', metric => '" + metric +
-                   "', search_mode => 'approx', clustering => '" + prefix + "_c', " + args +
-                   ");")) {
+    for (auto const& r : ok_rows(
+           *con,
+           std::string("SELECT left_id, right_id, ") + score + " FROM sirius_knn_join('" + prefix +
+             "_probe','vec','" + prefix + "_corpus','vec', metric => '" + metric +
+             "', search_mode => 'approx', clustering => '" + prefix + "_c', " + args + ");")) {
       out.emplace_back(r.at(0), r.at(1), std::stod(r.at(2)));
     }
     std::sort(out.begin(), out.end());
@@ -1848,8 +1846,9 @@ TEST_CASE_METHOD(KMeansFixture,
   }
   run_ok("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';");
   run_ok("SET pin_table_compression_min_batch_size_bytes = 0;");
-  run_ok("SELECT * FROM pin_table(name => 'gpc_corpus', tier => 'gpu', format => 'duckdb', "
-         "compression => true);");
+  run_ok(
+    "SELECT * FROM pin_table(name => 'gpc_corpus', tier => 'gpu', format => 'duckdb', "
+    "compression => true);");
   run_ok("SELECT * FROM pin_table(name => 'gpc_probe', tier => 'gpu', format => 'duckdb');");
   std::filesystem::remove_all(plan_dir);
 
@@ -1887,7 +1886,7 @@ TEST_CASE_METHOD(KMeansFixture,
   auto const gpu_spaces =
     ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   REQUIRE_FALSE(gpu_spaces.empty());
-  auto& space = *const_cast<cucascade::memory::memory_space*>(gpu_spaces.front());
+  auto& space   = *const_cast<cucascade::memory::memory_space*>(gpu_spaces.front());
   auto const mr = space.get_default_allocator();
   rmm::cuda_stream stream;
   sirius::telemetry::batch_telemetry_info const telemetry{};
@@ -1918,8 +1917,8 @@ TEST_CASE_METHOD(KMeansFixture,
       auto const pick     = sirius::vss::strided_row_sample(rows, take, 7);
       auto const in_place = sirius::vss::gather_pinned_rows(
         map->view(), first + pick.start, pick.stride, pick.count, 32, stream.view(), mr);
-      auto staged = sirius::vss::stage_pinned_column_chunk(
-        *pin, "vec", i, space, stream.view(), telemetry);
+      auto staged =
+        sirius::vss::stage_pinned_column_chunk(*pin, "vec", i, space, stream.view(), telemetry);
       auto const expected =
         sirius::vss::sample_vector_rows(staged.view, take, 7, stream.view(), mr);
       CHECK(in_place->size() == expected->size());
@@ -1985,10 +1984,11 @@ TEST_CASE_METHOD(KMeansFixture,
       }
       return out;
     };
-    auto const join = "FROM sirius_knn_join('kxp_probe','vec','kxp_corpus','vec', metric => 'l2', "
-                      "k => 5, ";
-    auto const exact = pairs(std::string("SELECT left_id, right_id ") + join +
-                             "search_mode => 'exact-gemm');");
+    auto const join =
+      "FROM sirius_knn_join('kxp_probe','vec','kxp_corpus','vec', metric => 'l2', "
+      "k => 5, ";
+    auto const exact =
+      pairs(std::string("SELECT left_id, right_id ") + join + "search_mode => 'exact-gemm');");
     REQUIRE(exact.size() == 1005);
     for (auto const* storage : {"int8", "float16"}) {
       std::map<std::string, std::vector<std::vector<std::string>>> answers;
@@ -1999,7 +1999,8 @@ TEST_CASE_METHOD(KMeansFixture,
                "', n_clusters => 16, seed => 3);");
         auto const built = ok_rows(*con,
                                    "SELECT exact_rows FROM sirius_kmeans_build_lists('kxp_corpus',"
-                                   "'vec','" + name + "', storage => '" + storage + "');");
+                                   "'vec','" +
+                                     name + "', storage => '" + storage + "');");
         unsetenv("SIRIUS_VSS_EXACT_COPY");
         REQUIRE(built.size() == 1);
         CHECK(built[0][0] == (std::string(copy) == "1" ? "copy" : "pin"));

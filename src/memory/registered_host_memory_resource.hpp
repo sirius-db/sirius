@@ -16,18 +16,18 @@
 
 #pragma once
 
+#include <rmm/error.hpp>
+
 #include <cuda/memory_resource>
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
 
-#include <rmm/error.hpp>
-
+#include <numa.h>
 #include <sys/mman.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <numa.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -68,7 +68,8 @@ class registered_host_memory_resource final {
     // A huge page can only back a range that starts on a huge-page boundary, and mmap aligns to
     // 4 KiB, so map one huge page more and give the slack on both sides back.
     auto const reserved = size + huge_page_bytes;
-    void* raw = ::mmap(nullptr, reserved, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* raw =
+      ::mmap(nullptr, reserved, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (raw == MAP_FAILED) {
       throw rmm::out_of_memory("registered_host_memory_resource: mmap of " +
                                std::to_string(reserved) + " bytes failed");
@@ -144,10 +145,10 @@ class registered_host_memory_resource final {
   {
     constexpr std::size_t page = 4096;
     // A thread is not worth starting for less than a few huge pages of work.
-    auto const workers = static_cast<unsigned>(
-      std::min<std::size_t>(_touch_threads, std::max<std::size_t>(1, size / (16 * huge_page_bytes))));
-    auto const span = mapped_size(size / workers);
-    auto fault      = [base, size, span](unsigned worker) {
+    auto const workers = static_cast<unsigned>(std::min<std::size_t>(
+      _touch_threads, std::max<std::size_t>(1, size / (16 * huge_page_bytes))));
+    auto const span    = mapped_size(size / workers);
+    auto fault         = [base, size, span](unsigned worker) {
       auto const begin = std::min(size, static_cast<std::size_t>(worker) * span);
       auto const end   = std::min(size, begin + span);
       for (auto offset = begin; offset < end; offset += page) {

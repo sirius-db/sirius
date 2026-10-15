@@ -2781,7 +2781,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       // A sweep that reads the lists in place stages nothing. FP16 lists on the host are copied
       // in compact for sweep 0 as well (and widened on the device when it ranks in FP32), so that
       // copy can be kept.
-      bool const direct = int8_search || (f16_bounded && (sweep == 1 || seed)) || f16_sweep0;
+      bool const direct        = int8_search || (f16_bounded && (sweep == 1 || seed)) || f16_sweep0;
       bool const widen_compact = lists_on_host && f16_bounded && sweep == 0 && !direct;
       bool const copy_compact  = (direct && lists_on_host) || widen_compact;
       auto stage_next          = [&](std::size_t j) {

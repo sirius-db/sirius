@@ -63,13 +63,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <string_view>
 #include <cstring>
 #include <future>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -765,8 +765,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     lists.exact_pin = map_pinned_rows(*c.pin, req.column, dim, *c.space, persistent, persistent_mr);
     if (lists.exact_pin && lists.exact_pin->n_rows() != n_rows) { lists.exact_pin.reset(); }
   }
-  if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) &&
-      !lists.exact_pin) {
+  if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) && !lists.exact_pin) {
     auto const exact_bytes =
       static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(dim) * sizeof(float);
     auto const refuse = [&](std::string const& why) {
