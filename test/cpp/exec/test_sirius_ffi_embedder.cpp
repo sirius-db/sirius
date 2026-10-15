@@ -148,6 +148,61 @@ std::vector<std::int64_t> result_i64s(sirius::ffi::Fragment& fragment)
   return collect_i64_column(stream);
 }
 
+/// sirius_decimal_divide(a, divisor, scale) over the parquet file's BIGINT column `a`, the way the
+/// StarRocks CN's translator spells it: a Substrait extension function named
+/// `sirius_decimal_divide:<signature>`, an i64 divisor and an i32 scale literal.
+std::string decimal_divide_plan(std::string const& path, std::int64_t divisor, std::int32_t scale)
+{
+  substrait::Plan plan;
+  auto* function = plan.add_extensions()->mutable_extension_function();
+  function->set_function_anchor(1);
+  function->set_name("sirius_decimal_divide:i64_i64_i32");
+
+  auto* root = plan.add_relations()->mutable_root();
+  root->add_names("q");
+  auto* project = root->mutable_input()->mutable_project();
+  project->mutable_common()->mutable_emit()->add_output_mapping(1);
+  auto* item = project->mutable_input()->mutable_read()->mutable_local_files()->add_items();
+  item->set_uri_file(path);
+  item->mutable_parquet();
+  auto* call = project->add_expressions()->mutable_scalar_function();
+  call->set_function_reference(1);
+  call->add_arguments()
+    ->mutable_value()
+    ->mutable_selection()
+    ->mutable_direct_reference()
+    ->mutable_struct_field()
+    ->set_field(0);
+  call->add_arguments()->mutable_value()->mutable_literal()->set_i64(divisor);
+  call->add_arguments()->mutable_value()->mutable_literal()->set_i32(scale);
+  return serialize_plan(plan);
+}
+
+/// The unscaled values of a DECIMAL128 result column.
+std::vector<__int128_t> collect_i128_column(ArrowArrayStream& stream)
+{
+  ArrowSchema schema{};
+  REQUIRE(stream.get_schema(&stream, &schema) == 0);
+  auto const* column_schema = schema.n_children >= 1 ? schema.children[0] : &schema;
+  CHECK(std::string(column_schema->format) == "d:38,8,128");
+  if (schema.release) { schema.release(&schema); }
+
+  std::vector<__int128_t> out;
+  for (;;) {
+    ArrowArray batch{};
+    REQUIRE(stream.get_next(&stream, &batch) == 0);
+    if (batch.release == nullptr) { break; }
+    auto const* col  = first_column(batch);
+    auto const* data = static_cast<__int128_t const*>(col->buffers[1]);
+    for (std::int64_t i = 0; i < col->length; ++i) {
+      out.push_back(data[i + col->offset]);
+    }
+    batch.release(&batch);
+  }
+  release_if(stream);
+  return out;
+}
+
 }  // namespace
 
 TEST_CASE("FFI leaf result_to_arrow returns parquet rows", "[isolated_context][sirius_ffi]")
@@ -319,6 +374,29 @@ TEST_CASE("FFI execute_substrait returns parquet rows", "[isolated_context][siri
   ArrowArrayStream stream{};
   ctx->execute_substrait(local_files_plan(path), reinterpret_cast<std::uintptr_t>(&stream));
   REQUIRE(collect_i64_column(stream) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+}
+
+TEST_CASE("FFI execute_substrait resolves sirius_decimal_divide", "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_decimal_divide");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+
+  // The Context's embedded DuckDB does not load the Sirius extension; it registers the function.
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  ArrowArrayStream stream{};
+  ctx->execute_substrait(decimal_divide_plan(path, 7, 8),
+                         reinterpret_cast<std::uintptr_t>(&stream));
+  // 1/7 .. 5/7 at scale 8, rounded half away from zero.
+  REQUIRE(collect_i128_column(stream) ==
+          std::vector<__int128_t>{14285714, 28571429, 42857143, 57142857, 71428571});
+
+  // 1/1 at scale 38 is 10^38 units: more than 38 digits. The fragment has no CPU fallback, so the
+  // GPU's error reaches the caller.
+  ArrowArrayStream overflow{};
+  REQUIRE_THROWS_WITH(ctx->execute_substrait(decimal_divide_plan(path, 1, 38),
+                                             reinterpret_cast<std::uintptr_t>(&overflow)),
+                      Catch::Matchers::ContainsSubstring("more than 38 digits"));
 }
 
 TEST_CASE("FFI a hash key on a single output is rejected at build()",

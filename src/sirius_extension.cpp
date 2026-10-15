@@ -95,6 +95,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
+#include "expression/decimal_divide_function.hpp"
 #include "helper/type_conversions.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
@@ -2374,6 +2375,9 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   // it wherever Sirius is loaded, not just on the FFI's embedded DuckDB, so a fragment plan binds
   // on the transparent path too.
   sirius::exec::register_stream_source_function(instance);
+  // Exact decimal division for the StarRocks compute node's DECIMAL `/` and AVG; the GPU
+  // evaluates it by name.
+  sirius::register_decimal_divide_function(instance);
 
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
