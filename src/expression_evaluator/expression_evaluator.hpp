@@ -236,8 +236,8 @@ class expression_evaluator {
    * @param expressions The expressions to evaluate.
    * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
    * @param stream The ::cuda::stream_ref in which to evaluate any cuDF operations.
-   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
-   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
+   * @param policy Expression strategy and regex JIT policy, copied from the query snapshot.
+   * Standalone callers use fixed defaults; SQL execution passes its policy explicitly.
    * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
    * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
@@ -251,7 +251,7 @@ class expression_evaluator {
     duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     ::cuda::stream_ref stream                   = cudf::get_default_stream(),
-    expression_evaluator_strategy strategy      = strategy_from_config(),
+    expression_query_policy policy              = {},
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
     std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
@@ -262,8 +262,8 @@ class expression_evaluator {
    * @param expression The expressions to evaluate.
    * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
    * @param stream The ::cuda::stream_ref in which to evaluate any cuDF operations.
-   * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
-   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
+   * @param policy Expression strategy and regex JIT policy, copied from the query snapshot.
+   * Standalone callers use fixed defaults; SQL execution passes its policy explicitly.
    * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
    * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
@@ -277,7 +277,7 @@ class expression_evaluator {
     sirius::ast::node const& expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     ::cuda::stream_ref stream                   = cudf::get_default_stream(),
-    expression_evaluator_strategy strategy      = strategy_from_config(),
+    expression_query_policy policy              = {},
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
     std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
@@ -296,7 +296,7 @@ class expression_evaluator {
     sirius::ast::node const* expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     ::cuda::stream_ref stream                   = cudf::get_default_stream(),
-    expression_evaluator_strategy strategy      = strategy_from_config(),
+    expression_query_policy policy              = {},
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
     std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
@@ -318,7 +318,7 @@ class expression_evaluator {
     std::vector<sirius::ast::node const*> expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     ::cuda::stream_ref stream                   = cudf::get_default_stream(),
-    expression_evaluator_strategy strategy      = strategy_from_config(),
+    expression_query_policy policy              = {},
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
     std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
@@ -416,7 +416,7 @@ class expression_evaluator {
     std::map<std::string, like_multiliteral_cache::entry_ptr, std::less<>>;
 
   std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to evaluate
-  expression_evaluator_strategy _strategy;  ///< The strategy to use for expression evaluation
+  const expression_query_policy _policy;  ///< Immutable policy retained for every evaluation
   rmm::device_async_resource_ref _mr;  ///< The allocator to pass to cudf APIs for any allocations
   ::cuda::stream_ref _stream{
     cudaStream_t{}};          ///< The stream in which to evaluate any cuDF operations

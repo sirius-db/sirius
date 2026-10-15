@@ -497,7 +497,8 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   ::cucascade::memory::memory_space const& mem_space,
   ::cuda::stream_ref stream,
   bool /*like_swar_fastpath*/,
-  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
+  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/,
+  expression_query_policy /*policy*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (_inject_decode_failure) {
@@ -585,7 +586,8 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* /*survivors*/,
-  std::span<std::size_t const> elided)
+  std::span<std::size_t const> elided,
+  expression_query_policy policy)
 {
   auto const output_arity        = _column_layout.output_data_positions.size();
   auto const decoded_cols        = _column_layout.data_roles.size();
@@ -602,7 +604,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     sirius::expression_evaluator exec(sirius_filter_ast.get(),
                                       mr_ref,
                                       stream,
-                                      strategy_from_config(),
+                                      policy,
                                       sirius::expression_evaluator::default_min_ast_size,
                                       like_swar_fastpath,
                                       std::move(like_cache));

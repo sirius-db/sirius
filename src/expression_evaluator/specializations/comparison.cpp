@@ -89,7 +89,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::comparison const& al
   if (narrow_carrier) { ++_narrow_domain_comparison_count; }
 
   auto const ast_op_count = alt.cudf_ast_op_count();
-  if (_strategy != expression_evaluator_strategy::MATERIALIZE &&
+  if (_policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto left  = evaluate_narrow_domain_operand(*alt.left, narrow_carrier, evaluation_mode::AST);
     auto right = evaluate_narrow_domain_operand(*alt.right, narrow_carrier, evaluation_mode::AST);

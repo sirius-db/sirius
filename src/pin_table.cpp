@@ -308,7 +308,8 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // post_filter_and_project (which would only apply a row filter or re-project to a
     // query's output layout, neither of which a pin needs). `batch` is borrowed by const
     // ref and outlives the call.
-    auto materialized     = ingestible.materialize_metadata_to_table(*batch, *target, stream);
+    auto materialized = ingestible.materialize_metadata_to_table(
+      *batch, *target, stream, false, nullptr, options.expression_policy);
     auto tbl              = materialized.table.release(stream, target->get_default_allocator());
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);

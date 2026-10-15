@@ -20,7 +20,6 @@
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
-#include "expression_evaluator/query_policy.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/io/parquet.hpp>
@@ -1209,10 +1208,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
   }
 
-  auto pin_options          = duckdb::query_operator_options(context);
-  auto const& pin_op_params = *pin_options;
-  sirius::scoped_expression_policy expression_policy(
-    {pin_op_params.expression_strategy, pin_op_params.enable_regex_jit});
+  auto pin_options               = duckdb::query_operator_options(context);
+  auto const& pin_op_params      = *pin_options;
   bool const capture_chunk_stats = pin_op_params.enable_pinned_zone_map_pruning;
   // Read from the connection running the CALL, so a table pins with the carriers that
   // connection asked for rather than whatever another connection set last.
@@ -1359,7 +1356,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                       *scan_mgr.io_ctx(),
                                       pinned_column_types,
                                       pin_comp,
-                                      {.capture_chunk_stats               = capture_chunk_stats,
+                                      {.expression_policy   = pin_op_params.expression_policy(),
+                                       .capture_chunk_stats = capture_chunk_stats,
                                        .enable_compressed_materialization = compressed_pin,
                                        .probe_unique_columns              = probe_unique_columns});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
@@ -1392,7 +1390,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       *scan_mgr.io_ctx(),
       pinned_column_types,
       pin_comp,
-      {.capture_chunk_stats               = false,
+      {.expression_policy                 = pin_op_params.expression_policy(),
+       .capture_chunk_stats               = false,
        .enable_compressed_materialization = compressed_pin,
        .probe_unique_columns              = probe_unique_columns});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
@@ -1410,13 +1409,15 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
-    auto mat = sirius::materialize_all_batches(*ingestible,
-                                               gpu_spaces_mut,
-                                               *scan_mgr.io_ctx(),
-                                               pinned_column_types,
-                                               {.capture_chunk_stats = capture_chunk_stats,
-                                                .enable_compressed_materialization = compressed_pin,
-                                                .probe_unique_columns = probe_unique_columns});
+    auto mat =
+      sirius::materialize_all_batches(*ingestible,
+                                      gpu_spaces_mut,
+                                      *scan_mgr.io_ctx(),
+                                      pinned_column_types,
+                                      {.expression_policy   = pin_op_params.expression_policy(),
+                                       .capture_chunk_stats = capture_chunk_stats,
+                                       .enable_compressed_materialization = compressed_pin,
+                                       .probe_unique_columns              = probe_unique_columns});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(mat.column_storage));

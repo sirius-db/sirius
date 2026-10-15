@@ -378,7 +378,10 @@ exec_result run_execute(memory_space& space,
   for (auto& n : nodes) {
     ast_nodes.push_back(std::move(n));
   }
-  exp_executor executor(ast_nodes, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  exp_executor executor(ast_nodes,
+                        get_resource_ref(space),
+                        cudf::get_default_stream(),
+                        sirius::expression_query_policy{strategy});
   auto input_ro     = input_batch->to_read_only();
   auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
   auto output_table = executor.evaluate(in_repr.get_table_view());
@@ -398,8 +401,12 @@ exec_result run_select(memory_space& space,
                        exp_strategy_enum strategy = MAT,
                        bool like_swar_fastpath    = true)
 {
-  exp_executor executor(
-    *node, get_resource_ref(space), cudf::get_default_stream(), strategy, 2, like_swar_fastpath);
+  exp_executor executor(*node,
+                        get_resource_ref(space),
+                        cudf::get_default_stream(),
+                        sirius::expression_query_policy{strategy},
+                        2,
+                        like_swar_fastpath);
   auto input_ro     = input_batch->to_read_only();
   auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
   auto output_table = executor.select(in_repr.get_table_view());
@@ -1158,8 +1165,11 @@ TEMPLATE_TEST_CASE("evaluate casts scalar constants including HUGEINT and NULL",
     for (auto const& node : nodes) {
       expressions.push_back(node.get());
     }
-    exp_executor executor(
-      expressions, get_resource_ref(*space), cudf::get_default_stream(), TestType::value, 1);
+    exp_executor executor(expressions,
+                          get_resource_ref(*space),
+                          cudf::get_default_stream(),
+                          sirius::expression_query_policy{TestType::value},
+                          1);
     auto output     = executor.evaluate(input->view());
     auto const view = output->view();
     REQUIRE(view.num_rows() == row_count);
@@ -1758,14 +1768,14 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
     exp_executor first_executor(*first_expr,
                                 get_resource_ref(*space),
                                 cudf::get_default_stream(),
-                                strategy,
+                                sirius::expression_query_policy{strategy},
                                 exp_executor::default_min_ast_size,
                                 /*like_swar_fastpath=*/true,
                                 like_cache);
     exp_executor second_executor(*second_expr,
                                  get_resource_ref(*space),
                                  cudf::get_default_stream(),
-                                 strategy,
+                                 sirius::expression_query_policy{strategy},
                                  exp_executor::default_min_ast_size,
                                  /*like_swar_fastpath=*/true,
                                  like_cache);
@@ -1796,7 +1806,7 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
     exp_executor executor(*expr,
                           get_resource_ref(*space),
                           cudf::get_default_stream(),
-                          strategy,
+                          sirius::expression_query_policy{strategy},
                           exp_executor::default_min_ast_size,
                           /*like_swar_fastpath=*/true,
                           like_cache);
@@ -2636,7 +2646,10 @@ std::unique_ptr<cudf::table> run_native_ast(memory_space& space,
                                             cudf::table_view tv,
                                             exp_strategy_enum strategy = MAT)
 {
-  exp_executor executor(expr_ptr, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  exp_executor executor(expr_ptr,
+                        get_resource_ref(space),
+                        cudf::get_default_stream(),
+                        sirius::expression_query_policy{strategy});
   return executor.evaluate(tv);
 }
 
@@ -3146,7 +3159,8 @@ TEMPLATE_TEST_CASE("evaluate string case conversion",
     return make_func(id, std::move(args), string_type);
   };
   auto evaluate = [&](ast_node const& expr, cudf::table_view table) {
-    sirius::expression_evaluator evaluator(expr, mr, stream, strategy);
+    sirius::expression_evaluator evaluator(
+      expr, mr, stream, sirius::expression_query_policy{strategy});
     return evaluator.evaluate(table);
   };
 
@@ -3167,7 +3181,8 @@ TEMPLATE_TEST_CASE("evaluate string case conversion",
       make_cmp(sirius::comparison_type::equal,
                case_expr(make_ref_typed(0, string_type)),
                make_str_const(id == sirius::function_id::upper ? "HELLO 123!" : "hello 123!"));
-    sirius::expression_evaluator evaluator(*expr, mr, stream, strategy, /*min_ast_size=*/1);
+    sirius::expression_evaluator evaluator(
+      *expr, mr, stream, sirius::expression_query_policy{strategy}, /*min_ast_size=*/1);
     auto result = evaluator.select(input);
     REQUIRE(copy_string_column_to_host(result->view().column(0)) ==
             std::vector<std::string>{"HeLLo 123!"});

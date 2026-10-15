@@ -2454,6 +2454,19 @@ TEST_CASE("Sirius query options stay local and snapshots remain immutable",
   CHECK(duckdb::query_operator_options(*a.context)->scan_task_batch_size == 67890);
   CHECK(runtime->get_config().get_operator_params().scan_task_batch_size ==
         defaults.scan_task_batch_size);
+  for (auto sql : {"SET GLOBAL expression_evaluator_strategy='ast_jit'",
+                   "SET GLOBAL enable_regex_jit_impl=true"}) {
+    auto rejected = a.Query(sql);
+    REQUIRE(rejected->HasError());
+  }
+  execute(a, "RESET expression_evaluator_strategy");
+  execute(a, "RESET enable_regex_jit_impl");
+  auto reset_policy = duckdb::query_operator_options(*a.context)->expression_policy();
+  CHECK(reset_policy.strategy == defaults.expression_strategy);
+  CHECK(reset_policy.regex_jit == defaults.enable_regex_jit);
+  // RESET affects future queries, not the snapshot already handed to an evaluator.
+  CHECK(first->expression_strategy == sirius::expression_evaluator_strategy::MATERIALIZE);
+  CHECK_FALSE(first->enable_regex_jit);
   auto global = a.Query("SET GLOBAL scan_task_batch_size=1");
   REQUIRE(global->HasError());
   CHECK(duckdb::query_operator_options(*a.context)->scan_task_batch_size == 67890);
