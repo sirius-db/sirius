@@ -258,8 +258,9 @@ struct pinned_entry {
   /// Tier the pinned data resides in. Drives which storage member above is used
   /// and which fetch path the cached provider takes.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
-  /// Representative memory space of a HOST-tier entry; the MVCC path expands
-  /// it into a per-chunk vector. GPU-tier entries leave it null.
+  /// Representative memory space of a HOST-tier or device-chunked GPU entry,
+  /// including zero-chunk entries. The HOST MVCC path expands it per chunk.
+  /// Column-major GPU entries leave it null and use chunk_memory_spaces instead.
   cucascade::memory::memory_space* memory_space{nullptr};
   /// Total rows across pinned chunks. Re-insertion merges only when this and the
   /// cache identity match.
@@ -638,7 +639,10 @@ class sirius_scan_manager {
   /// Re-insert semantics (keyed by @p name):
   ///   - If no entry exists for @p name, a fresh one is created.
   ///   - If an entry has the same source and row count, new columns are merged and
-  ///     duplicate columns are dropped. Chunk placement must also match.
+  ///     duplicate columns are dropped. Only column-major GPU entries support this
+  ///     merge; host and device-chunked entries are rejected, even when empty.
+  ///     Chunk placement must also match. Rejection preserves the published entry;
+  ///     UNPIN first to change the storage format of a same-source, same-row-count pin.
   ///   - If the source differs, including a recreated table with the same name, the
   ///     existing entry is replaced.
   ///   - If row counts differ, the existing entry is dropped and replaced. (An

@@ -2766,6 +2766,16 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
           "': a query is currently reading the pinned entry. Retry once it completes, or UNPIN "
           "and pin again (an unpin is safe mid-query).");
       }
+      auto const& previous = *existing_it->second;
+      // This merge extends column-major GPU storage only. Chunk-count checks cannot
+      // distinguish empty host/device-chunked entries; those still carry memory_space.
+      if (previous.tier != cucascade::memory::Tier::GPU || previous.memory_space != nullptr ||
+          !previous.host_chunks.empty() || !previous.device_chunks.empty()) {
+        throw std::runtime_error(
+          "[sirius_scan_manager::insert_pinned_entry] cannot merge '" + name +
+          "': existing pin does not use column-major GPU storage. UNPIN and pin again to "
+          "change storage format.");
+      }
       // A merge is only valid when the new pin reproduces the existing batch
       // boundaries and placement. The round-robin counter restarts at chunk 0
       // per pin_table call, and chunks at index i across all columns share a
@@ -2774,7 +2784,6 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
       // the same files differently. Reject any mismatch loudly rather than
       // silently aliasing.
       // Build privately: validation/allocation failure leaves the published generation intact.
-      auto const& previous = *existing_it->second;
       pinned_entry entry;
       // The source is unchanged. Preserve its evidence; revalidate the merged layout below.
       entry.identity_evidence      = previous.identity_evidence;

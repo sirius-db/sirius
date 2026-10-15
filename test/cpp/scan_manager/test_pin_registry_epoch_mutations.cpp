@@ -217,6 +217,73 @@ TEST_CASE("failed and successful replacement preserve old pin metadata for reade
   CHECK(previous->proven_unique_columns == std::vector<bool>{true});
 }
 
+TEST_CASE("empty host and device-chunked pins reject column merges without replacing metadata",
+          "[scan_manager][pin_registry_epoch]")
+{
+  epoch_fixture f;
+  auto const tier = GENERATE(cucascade::memory::Tier::HOST, cucascade::memory::Tier::GPU);
+  CAPTURE(tier);
+  auto* space = sirius::scan_test_utils::get_space(*f.memory, tier);
+  REQUIRE(space);
+  sirius::scan_manager::pinned_entry_metadata metadata{
+    .mvcc = sirius::scan_manager::duckdb_mvcc_metadata{42, {}, 7}, .proven_unique_columns = {"c0"}};
+  if (tier == cucascade::memory::Tier::HOST) {
+    f.manager.insert_pinned_entry_host(
+      kTable, make_cache_info({0}), {}, *space, {}, {}, {}, std::move(metadata));
+  } else {
+    f.manager.insert_pinned_entry_device(
+      kTable, make_cache_info({0}), {}, *space, {}, std::move(metadata));
+  }
+  auto lookup = [&] {
+    return f.manager.find_pinned_entry_for_duckdb_table(
+      "memory", "main", kTable, sirius::test::test_table_identity(42));
+  };
+  // Do not retain a reader: that would trigger the existing entry-in-use guard instead.
+  std::weak_ptr<const pinned_entry> previous = lookup();
+  REQUIRE_FALSE(previous.expired());
+  auto const old_snapshot = f.snapshot();
+  auto const before       = f.epoch();
+  REQUIRE_THROWS_WITH(
+    f.manager.insert_pinned_entry(kTable,
+                                  make_cache_info({1}),
+                                  {},
+                                  {},
+                                  {},
+                                  {},
+                                  {},
+                                  {.mvcc = sirius::scan_manager::duckdb_mvcc_metadata{99, {}, 8},
+                                   .proven_unique_columns = {"c1"}}),
+    Catch::Matchers::ContainsSubstring("existing pin does not use column-major GPU storage"));
+
+  auto current = lookup();
+  REQUIRE(current);
+  CHECK(current == previous.lock());
+  CHECK(current->snapshot_identity == old_snapshot);
+  CHECK(current->tier == tier);
+  CHECK(current->memory_space == space);
+  CHECK(current->num_rows == 0);
+  CHECK(current->cache_info.names == std::vector<std::string>{"c0"});
+  CHECK(current->proven_unique_columns == std::vector<bool>{true});
+  REQUIRE(current->mvcc);
+  CHECK(current->mvcc->v_base == 42);
+  CHECK(current->mvcc->checkpoint_iteration == 7);
+  CHECK(f.epoch() > before);
+}
+
+TEST_CASE("empty column-major GPU pins still accept compatible merges",
+          "[scan_manager][pin_registry_epoch]")
+{
+  epoch_fixture f;
+  auto insert_empty = [&] {
+    return f.manager.insert_pinned_entry(kTable, make_cache_info({0}), {}, {}, {}, {}, {});
+  };
+  CHECK(insert_empty() == std::vector<std::string>{"c0"});
+  auto const old_snapshot = f.snapshot();
+  CHECK(insert_empty().empty());
+  CHECK(f.snapshot() != old_snapshot);
+  CHECK(f.entry_column_count() == 1);
+}
+
 TEST_CASE("pin publication includes metadata and advances the epoch",
           "[scan_manager][pin_registry_epoch]")
 {
