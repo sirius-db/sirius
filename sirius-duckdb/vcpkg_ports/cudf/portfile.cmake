@@ -25,16 +25,7 @@ vcpkg_from_github(
   main)
 
 # rapids-cmake otherwise downloads the CPM release asset during configure.
-vcpkg_download_distfile(
-  CPM_CMAKE_PATH
-  URLS
-  "https://api.github.com/repos/cpm-cmake/CPM.cmake/contents/cmake/CPM.cmake?ref=v0.42.0"
-  FILENAME
-  "CPM-v0.42.0.cmake"
-  SHA512
-  f9f671cc3fe5c07eea853cff23400d7d47e8e539b875c973917ac41ce2cbd7cc5b385cde17b21eccd8fc6b8b27f1e4c1c19b37f12f9a5730dee2d245f6bdaf9b
-  HEADERS
-  "Accept: application/vnd.github.raw+json")
+include("${CMAKE_CURRENT_LIST_DIR}/../rapids_common.cmake")
 
 vcpkg_from_github(
   OUT_SOURCE_PATH
@@ -142,7 +133,9 @@ vcpkg_replace_string(
   "find_and_configure_dlpack(\${CUDF_MIN_VERSION_dlpack} \${CUDF_EXCLUDE_DEPS_FROM_ALL})"
   "set(DLPACK_INCLUDE_DIR \"${CURRENT_INSTALLED_DIR}/include\")")
 
-# The 26.10 AST header uses std::variant without including its header.
+# TODO: Remove with src/cudf/ast_compat.hpp once the release includes
+# cudf#24173. The 26.10 AST header uses std::variant without including its
+# header.
 vcpkg_replace_string(
   "${SOURCE_PATH}/cpp/include/cudf/ast/expressions.hpp" "#include <vector>"
   "#include <variant>\n#include <vector>")
@@ -190,7 +183,6 @@ vcpkg_cmake_configure(
   OPTIONS
   -DFETCHCONTENT_SOURCE_DIR_RAPIDS-CMAKE=${RAPIDS_CMAKE_PATH}
   -DCPM_DOWNLOAD_LOCATION=${CPM_CMAKE_PATH}
-  -DEXTRACTED_CPM_VERSION=0.42.0
   -DCPM_LOCAL_PACKAGES_ONLY=ON
   -DCPM_rapids_logger_SOURCE=${RAPIDS_LOGGER_PATH}
   -DCPM_rtcx_SOURCE=${RTCX_PATH}
