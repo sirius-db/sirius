@@ -176,3 +176,19 @@ python test/tpch_performance/performance_test.py --engine gpu --mode grouped \
 Checked-in SF1000 plans live in `src/compression/simpatico_codegen/plans/tpch_sf1000/`;
 per-column ratio and throughput annotations are in each file's comments. Re-measure with
 `simpatico_cli benchmark` when hardware changes.
+
+## Compression streams
+
+In Sirius builds, Simpatico leases its column-parallel CUDA streams from
+`cucascade::memory::exclusive_stream_pool`. Both scan decoding's four-stream
+thread/device cache and the compression/decompression APIs' temporary leases use
+this backend. Leases are exclusive and grow the per-device pool when needed, so
+concurrent callers cannot deadlock while acquiring several streams.
+
+These pools use the same implementation as pipeline execution, but have separate,
+process-lifetime owners: compressed and decoded buffers can retain their allocation
+stream after a call or submitting thread exits. Releasing a lease synchronizes its
+streams before returning them. The existing upload/decode synchronization and
+rebinding of decoded buffers to the downstream pipeline stream remain in place.
+Allocations still run on the calling thread for cuCascade reservation accounting.
+Standalone Simpatico builds retain their CUDA-only stream backend.

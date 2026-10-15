@@ -110,6 +110,7 @@ void validate_column_names(std::vector<std::string> const& column_names, size_t 
   }
 }
 
+#ifndef SIMPATICO_USE_CUCASCADE_STREAM_POOL
 // Process-lifetime cache of CUDA streams for the internal `int column_threads`
 // overloads. These overloads have no caller-owned pool, yet the objects they
 // return (a cudf::table, or a compressed_table whose leaf buffers live in cudf
@@ -163,11 +164,13 @@ stream_cache& global_stream_cache()
   return cache;
 }
 
+#endif
+
 // RAII lease of max(1, column_threads) cache streams into a stream_pool for the
 // duration of an internal-parallel call. On destruction the streams are returned
 // to the cache (NOT destroyed), so any buffer allocated on them stays valid for
 // its eventual async free even after this pool is gone. Concurrent leases get
-// disjoint streams (checkout is mutex-guarded and pops distinct handles), so each
+// disjoint streams (both backends lease exclusively), so each
 // call's sync_all only touches its own streams.
 // Capture the current device once for both checkout and check-in.
 struct leased_pool {
@@ -179,19 +182,26 @@ struct leased_pool {
     if (cudaGetDevice(&device) != cudaSuccess)
       throw plan_error("failed to query the current device for the internal stream lease");
 
+#ifdef SIMPATICO_USE_CUCASCADE_STREAM_POOL
+    if (!pool.init(static_cast<size_t>(std::max(1, column_threads))))
+      throw plan_error("failed to lease internal streams");
+#else
     pool.streams =
       global_stream_cache().checkout(device, static_cast<size_t>(std::max(1, column_threads)));
 
     if (pool.streams.empty()) throw plan_error("failed to lease internal streams");
+#endif
   }
 
   ~leased_pool()
   {
     // Destructors cannot throw; run_column_workers' own sync_all already
     // surfaced any async error before this cleanup sync runs.
+#ifndef SIMPATICO_USE_CUCASCADE_STREAM_POOL
     (void)pool.sync_all();
     global_stream_cache().check_in(
       device, pool.streams);  // leaves pool.streams empty; ~stream_pool is a no-op
+#endif
   }
 
   leased_pool(const leased_pool&)            = delete;
