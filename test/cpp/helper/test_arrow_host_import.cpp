@@ -938,3 +938,15 @@ TEST_CASE("arrow_host_import: decimal payload overflow is refused before device 
     }
   }
 }
+
+TEST_CASE("arrow_host_import: terminal drain errors retain structured causes",
+          "[arrow_host_import]")
+{
+  const auto original = std::make_exception_ptr(std::runtime_error("original copy failure"));
+  static_assert(noexcept(sirius::arrow_host_import_drain_error(cudaErrorUnknown, original)));
+  const sirius::arrow_host_import_drain_error error(cudaErrorUnknown, original);
+  REQUIRE(error.cuda_status() == cudaErrorUnknown);
+  REQUIRE(error.original_failure() == original);
+  REQUIRE(std::string_view(error.what()) == "Arrow import CUDA stream drain failed");
+  REQUIRE_THROWS_WITH(std::rethrow_exception(error.original_failure()), "original copy failure");
+}

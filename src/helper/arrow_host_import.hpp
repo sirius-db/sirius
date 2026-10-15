@@ -27,7 +27,6 @@
 #include <exception>
 #include <memory>
 #include <memory_resource>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -40,11 +39,15 @@ struct ArrowSchema;
 
 namespace sirius {
 
-class arrow_host_import_drain_error : public std::runtime_error {
+class arrow_host_import_drain_error : public std::exception {
  public:
-  arrow_host_import_drain_error(std::string message, int status, std::exception_ptr original)
-    : std::runtime_error(std::move(message)), status_(status), original_(std::move(original))
+  arrow_host_import_drain_error(int status, std::exception_ptr original) noexcept
+    : status_(status), original_(std::move(original))
   {
+  }
+  [[nodiscard]] const char* what() const noexcept override
+  {
+    return "Arrow import CUDA stream drain failed";
   }
   [[nodiscard]] int cuda_status() const noexcept { return status_; }
   [[nodiscard]] const std::exception_ptr& original_failure() const noexcept { return original_; }
@@ -59,8 +62,7 @@ class arrow_host_import_plan {
   arrow_host_import_plan(const arrow_host_import_plan&)            = delete;
   arrow_host_import_plan& operator=(const arrow_host_import_plan&) = delete;
   arrow_host_import_plan(arrow_host_import_plan&& other) noexcept
-    : error_prefix_(std::move(other.error_prefix_)),
-      columns_(std::move(other.columns_)),
+    : columns_(std::move(other.columns_)),
       rows_(std::exchange(other.rows_, -1)),
       bytes_(std::exchange(other.bytes_, 0)),
       host_bytes_(std::exchange(other.host_bytes_, 0))
@@ -81,10 +83,7 @@ class arrow_host_import_plan {
     std::pmr::vector<std::int32_t> offsets;
     std::pmr::vector<std::uint8_t> validity;
   };
-  explicit arrow_host_import_plan(std::pmr::memory_resource& resource)
-    : error_prefix_(&resource), columns_(&resource)
-  {
-  }
+  explicit arrow_host_import_plan(std::pmr::memory_resource& resource) : columns_(&resource) {}
   friend arrow_host_import_plan inspect_arrow_host_batch(const ArrowArray*,
                                                          const ArrowSchema*,
                                                          std::string_view,
@@ -95,7 +94,6 @@ class arrow_host_import_plan {
                                                               rmm::cuda_stream_view,
                                                               rmm::device_async_resource_ref);
 
-  std::pmr::string error_prefix_;
   std::pmr::vector<column_input> columns_;
   cudf::size_type rows_{0};
   std::uint64_t bytes_{0};

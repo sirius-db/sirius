@@ -376,8 +376,7 @@ arrow_host_import_plan inspect_arrow_host_batch(const ArrowArray* array,
   validate_batch(array, schema, error_prefix, names, types);
   const auto expected = check_columns(*schema, error_prefix, names, types);
   arrow_host_import_plan plan(host_resource);
-  plan.rows_         = static_cast<cudf::size_type>(array->length);
-  plan.error_prefix_ = error_prefix;
+  plan.rows_ = static_cast<cudf::size_type>(array->length);
   plan.columns_.reserve(types.size());
   const auto charge = [&](std::uint64_t bytes) {
     bytes = allocation_estimate(bytes);
@@ -573,11 +572,7 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const arrow_host_import_pla
     columns.clear();
     const auto status = cudaStreamSynchronize(stream.value());
     if (status != cudaSuccess) {
-      throw arrow_host_import_drain_error(
-        std::string(plan.error_prefix_) +
-          ": CUDA stream drain failed: " + cudaGetErrorString(status),
-        static_cast<int>(status),
-        original);
+      throw arrow_host_import_drain_error(static_cast<int>(status), original);
     }
     std::rethrow_exception(original);
   }

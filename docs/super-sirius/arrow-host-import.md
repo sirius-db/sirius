@@ -36,7 +36,9 @@ only while producer storage stays immutable, each import has its own valid strea
 and supplied resources support that usage.
 
 If draining itself fails, `arrow_host_import_drain_error` retains the original
-exception and CUDA status. A failed synchronization does not prove source release
+exception and CUDA status without allocating a diagnostic string. Its fixed
+`what()` message cannot replace this terminal classification with a formatting
+allocation failure. A failed synchronization does not prove source release
 is safe. The caller must retain the plan/roots and use its terminal CUDA-error
 handling until independent quiescence; it must not retry or CPU-replay that failure.
 The helper does not reset a device or establish a new global recovery policy.
@@ -79,7 +81,7 @@ custom GPU kernels, GPU null counting or GPU decimal rescaling/casting.
 `estimated_device_bytes()` estimates final carrier buffers; it is advisory rather
 than a hard bound on allocator/library overhead. `host_staging_bytes()` describes
 the normalized data buffers. The supplied PMR also accounts for the plan's column
-container and diagnostics; factory metadata, provider buffers, CUDA driver staging
+container; diagnostics, factory metadata, provider buffers, CUDA driver staging
 and allocator bookkeeping are not thereby charged or hard-bounded. Callers enforce
 their actual admission policies through the PMR/MR and retain the associated owners.
 These estimates are not a bound on native split planning or whole-process memory.
