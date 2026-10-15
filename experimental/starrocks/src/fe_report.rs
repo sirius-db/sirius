@@ -22,9 +22,9 @@
 //! The address comes from the dispatch request, so like the heartbeat's FE address it must match
 //! the configured FE host: a request cannot point the CN's outbound connections elsewhere.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::collections::HashMap;
 use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -40,14 +40,13 @@ use starrocks_thrift::{
 use tracing::{info, warn};
 
 use crate::Host;
+use crate::recent_queries::QueryEnds;
 use crate::result_store::FragmentInstanceId;
 
 /// How many times a report is tried when the FE cannot be reached.
 const ATTEMPTS: u32 = 3;
 /// The wait before trying an unreachable FE again.
 const RETRY_WAIT: Duration = Duration::from_secs(1);
-/// How many queries that ended on the FE's side are remembered.
-const ENDED_QUERIES: usize = 1024;
 
 /// Sends one `reportExecStatus` to the FE at `coord`, blocking. NOT_FOUND counts as delivered: the
 /// FE has already finished the query.
@@ -149,6 +148,9 @@ struct Report {
 pub(crate) struct ExecReports {
     /// The configured FE host, which every report's coordinator must match. `None` trusts any.
     frontend_host: Option<Host>,
+    /// Queries that ended on this CN. One the FE already ended (it cancelled it, or this CN's
+    /// result sink delivered its last row) reports a failure of its instances as CANCELLED.
+    ends: Arc<QueryEnds>,
     state: Mutex<ReportState>,
     /// Each FE address's reporter thread queue, started with its first report.
     reporters: Mutex<HashMap<(String, i32), Sender<Report>>>,
@@ -157,32 +159,17 @@ pub(crate) struct ExecReports {
 #[derive(Debug, Default)]
 struct ReportState {
     owed: HashMap<FragmentInstanceId, ReportTarget>,
-    /// Queries that ended on the FE's side, by [`FragmentInstanceId::query_hi`]: the FE cancelled
-    /// them, or this CN's result sink delivered their last row. An instance of one that fails
-    /// reports CANCELLED. `ended_order` is oldest first.
-    ended: HashMap<u64, String>,
-    ended_order: VecDeque<u64>,
     /// Whether each coordinator host seen so far matches the configured FE host.
     trusted: HashMap<String, bool>,
 }
 
-impl ReportState {
-    fn end(&mut self, query_hi: u64, reason: &str) {
-        if self.ended.insert(query_hi, reason.to_string()).is_none() {
-            self.ended_order.push_back(query_hi);
-            if self.ended_order.len() > ENDED_QUERIES {
-                let oldest = self.ended_order.pop_front().expect("over capacity");
-                self.ended.remove(&oldest);
-            }
-        }
-    }
-}
-
 impl ExecReports {
-    /// Reports only to coordinators on `frontend_host`, the FE the CN was configured with.
-    pub(crate) fn new(frontend_host: Option<Host>) -> Self {
+    /// Reports only to coordinators on `frontend_host`, the FE the CN was configured with, and
+    /// reads how queries ended from `ends`.
+    pub(crate) fn new(frontend_host: Option<Host>, ends: Arc<QueryEnds>) -> Self {
         Self {
             frontend_host,
+            ends,
             ..Self::default()
         }
     }
@@ -237,7 +224,7 @@ impl ExecReports {
         };
         let status = match outcome {
             Ok(()) => status(TStatusCode::OK, None),
-            Err(error) if state.ended.contains_key(&instance.query_hi()) => {
+            Err(error) if self.ends.ended_by_fe(instance) => {
                 status(TStatusCode::CANCELLED, Some(error))
             }
             Err(error) => status(TStatusCode::INTERNAL_ERROR, Some(error)),
@@ -246,11 +233,10 @@ impl ExecReports {
         self.send(Report { target, status });
     }
 
-    /// The FE cancelled `query` (any instance id of it): every instance of it that still owes a
-    /// report sends CANCELLED now, and so does any of them that fails later.
+    /// The FE cancelled `query` (any instance id of it), as recorded in `ends`: every instance of
+    /// it that still owes a report sends CANCELLED now, and so does any of them that fails later.
     pub(crate) fn cancel_query(&self, query: FragmentInstanceId, reason: &str) {
         let mut state = self.lock();
-        state.end(query.query_hi(), reason);
         let cancelled: Vec<FragmentInstanceId> = state
             .owed
             .keys()
@@ -280,7 +266,7 @@ impl ExecReports {
             .filter(|instance| instance.query_hi() == query.query_hi())
             .copied()
             .collect();
-        let code = if state.ended.contains_key(&query.query_hi()) {
+        let code = if self.ends.ended_by_fe(query) {
             TStatusCode::CANCELLED
         } else {
             TStatusCode::INTERNAL_ERROR
@@ -296,13 +282,6 @@ impl ExecReports {
                 status: status(code, Some(error)),
             });
         }
-    }
-
-    /// This CN's result sink of `query` (any instance id of it) delivered its last row: from now
-    /// on a failure of the query's instances is teardown, reported as CANCELLED.
-    pub(crate) fn delivered(&self, query: FragmentInstanceId) {
-        self.lock()
-            .end(query.query_hi(), "the query returned all of its rows");
     }
 
     /// How many instances still owe a report. Zero on an idle CN.
@@ -600,7 +579,7 @@ mod tests {
     #[test]
     fn a_coordinator_that_is_not_the_configured_fe_gets_no_report() {
         let frontend = FakeFrontend::start(TStatusCode::OK);
-        let reports = ExecReports::new(Some(Host::local()));
+        let reports = ExecReports::new(Some(Host::local()), Arc::default());
         let mut elsewhere = params(&frontend, 1);
         elsewhere.coord = Some(TNetworkAddress::new("10.0.0.9".to_string(), 9020));
         reports.expect(&elsewhere);
@@ -657,7 +636,8 @@ mod tests {
     #[test]
     fn each_instance_reports_once_and_after_its_query_ended_only_cancelled() {
         let frontend = FakeFrontend::start(TStatusCode::OK);
-        let reports = ExecReports::default();
+        let query_ends = Arc::new(QueryEnds::default());
+        let reports = ExecReports::new(None, Arc::clone(&query_ends));
         for instance in 1..=4 {
             reports.expect(&params(&frontend, instance));
         }
@@ -666,6 +646,7 @@ mod tests {
         reports.finish(&params(&frontend, 2), Err("scan exploded"));
         reports.settled_by_reply(&params(&frontend, 3));
         reports.finish(&params(&frontend, 3), Err("in the dispatch reply"));
+        query_ends.cancel(FragmentInstanceId::from_halves(9, 0), "user cancelled");
         reports.cancel_query(FragmentInstanceId::from_halves(9, 0), "user cancelled");
         reports.finish(&params(&frontend, 4), Err("after the cancel"));
         assert_eq!(reports.owed(), 0);
@@ -680,9 +661,10 @@ mod tests {
 
         // An instance of a query whose result this CN delivered in full fails as CANCELLED.
         let delivered = FakeFrontend::start(TStatusCode::OK);
-        let reports = ExecReports::default();
+        let query_ends = Arc::new(QueryEnds::default());
+        let reports = ExecReports::new(None, Arc::clone(&query_ends));
         reports.expect(&params(&delivered, 5));
-        reports.delivered(FragmentInstanceId::from_halves(9, 1));
+        query_ends.delivered(FragmentInstanceId::from_halves(9, 1));
         reports.finish(&params(&delivered, 5), Err("teardown failed"));
         assert_eq!(
             ends(&delivered.wait_for(1)),

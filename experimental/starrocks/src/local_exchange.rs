@@ -6,14 +6,14 @@
 //! when every expected sender is complete. There is no fusion: every leaf runs, then hops, then
 //! the root.
 
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
 use tracing::info;
 
 use crate::fragment_executor::{KeySource, SenderSlot};
+use crate::recent_queries::QueryEnds;
 use crate::result_store::FragmentInstanceId;
 
 /// Receiver identity used by both the stream sink and the exchange node.
@@ -93,10 +93,6 @@ struct PendingReceiver {
     expected_senders: HashMap<i32, usize>,
 }
 
-/// How many purged queries are remembered. A frame for a query purged longer ago than this is
-/// no longer refused, and the state it rebuilds waits for senders that never come.
-const PURGED_QUERIES: usize = 1024;
-
 /// Receivers remembered after their handoff, so a late sender or replayed frame is refused or
 /// dropped instead of starting a sender set no receiver will read. Oldest evicted first.
 const HANDED_OVER: usize = 4096;
@@ -168,11 +164,6 @@ struct ExchangeState {
     /// Receivers already handed over by `take_ready`; `handed_over_order` is oldest first.
     handed_over: HashSet<FragmentInstanceId>,
     handed_over_order: VecDeque<FragmentInstanceId>,
-    /// Queries purged after a failure or cancel, by [`FragmentInstanceId::query_hi`], with the
-    /// error that purged them; `purged_order` is oldest first. A late receiver, sender or frame of
-    /// one is refused, with that error, instead of rebuilding state that would never complete.
-    purged: HashMap<u64, String>,
-    purged_order: VecDeque<u64>,
 }
 
 impl ExchangeState {
@@ -186,26 +177,38 @@ impl ExchangeState {
         }
         Ok(())
     }
-
-    fn refuse_purged(&self, fragment_instance_id: FragmentInstanceId) -> Result<(), String> {
-        if let Some(error) = self.purged.get(&fragment_instance_id.query_hi()) {
-            // The original error first, so whichever refusal reaches the FE first leads with the
-            // cause.
-            return Err(format!(
-                "{error} (fragment instance {fragment_instance_id} came after its query failed)"
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Matches receiver-first StarRocks dispatch with later sender results.
 #[derive(Debug, Default)]
 pub(crate) struct LocalExchange {
     inner: Mutex<ExchangeState>,
+    /// Queries that ended here, failed or cancelled. A late receiver, sender or frame of one is
+    /// refused, with its cause, instead of rebuilding state that would never complete. Checked
+    /// and recorded under `inner`'s lock, so a purge and a registration never interleave.
+    ends: Arc<QueryEnds>,
 }
 
 impl LocalExchange {
+    /// An exchange that records ended queries in `ends`, shared with the rest of the CN.
+    pub(crate) fn new(ends: Arc<QueryEnds>) -> Self {
+        Self {
+            inner: Mutex::default(),
+            ends,
+        }
+    }
+
+    fn refuse_purged(&self, fragment_instance_id: FragmentInstanceId) -> Result<(), String> {
+        if let Some(error) = self.ends.cause(fragment_instance_id) {
+            // The original error first, so whichever refusal reaches the FE first leads with the
+            // cause.
+            return Err(format!(
+                "{error} (fragment instance {fragment_instance_id} came after its query ended)"
+            ));
+        }
+        Ok(())
+    }
+
     /// Registers a receiver fragment, returning it when every exchange input is already complete.
     /// `expected_senders` lists `(exchange node id, number of senders)` per exchange input.
     pub(crate) fn register_receiver(
@@ -229,7 +232,7 @@ impl LocalExchange {
             }
         }
         let mut state = self.lock();
-        state.refuse_purged(fragment_instance_id)?;
+        self.refuse_purged(fragment_instance_id)?;
         if state.receivers.contains_key(&fragment_instance_id)
             || state.handed_over.contains(&fragment_instance_id)
         {
@@ -256,7 +259,7 @@ impl LocalExchange {
         source: SenderSource,
     ) -> Result<Option<ReadyFragment>, String> {
         let mut state = self.lock();
-        state.refuse_purged(key.fragment_instance_id)?;
+        self.refuse_purged(key.fragment_instance_id)?;
         state.refuse_handed_over(key.fragment_instance_id)?;
         let senders = state.sources.entry(key).or_default();
         if senders.contains_key(&sender_id) {
@@ -292,7 +295,7 @@ impl LocalExchange {
             ));
         }
         let mut state = self.lock();
-        state.refuse_purged(key.fragment_instance_id)?;
+        self.refuse_purged(key.fragment_instance_id)?;
         let expected_seq = state
             .remote_seq
             .get(&(key, sender_id))
@@ -473,7 +476,7 @@ impl LocalExchange {
         let query_hi = query.query_hi();
         let ours = |id: &FragmentInstanceId| id.query_hi() == query_hi;
         let mut state = self.lock();
-        Self::mark(&mut state, query_hi, error);
+        self.ends.fail(query, error);
         let receivers: Vec<FragmentInstanceId> = state
             .receivers
             .keys()
@@ -519,26 +522,13 @@ impl LocalExchange {
     /// collecting what it holds yet. Returns false if the query had already failed here, keeping
     /// that first error.
     pub(crate) fn mark_failed(&self, query: FragmentInstanceId, error: &str) -> bool {
-        Self::mark(&mut self.lock(), query.query_hi(), error)
+        let _state = self.lock();
+        self.ends.fail(query, error)
     }
 
-    /// The error that failed `query` (any instance id of it) on this CN, if it did.
+    /// Why `query` (any instance id of it) ended on this CN, if it did.
     pub(crate) fn failure(&self, query: FragmentInstanceId) -> Option<String> {
-        self.lock().purged.get(&query.query_hi()).cloned()
-    }
-
-    /// Records the first error of query `query_hi`; returns whether this was it.
-    fn mark(state: &mut ExchangeState, query_hi: u64, error: &str) -> bool {
-        let Entry::Vacant(first) = state.purged.entry(query_hi) else {
-            return false;
-        };
-        first.insert(error.to_string());
-        state.purged_order.push_back(query_hi);
-        if state.purged_order.len() > PURGED_QUERIES {
-            let oldest = state.purged_order.pop_front().expect("over capacity");
-            state.purged.remove(&oldest);
-        }
-        true
+        self.ends.cause(query).map(|cause| cause.to_string())
     }
 
     /// What the rendezvous holds right now.
@@ -1139,17 +1129,21 @@ mod tests {
     }
 
     #[test]
-    fn purged_queries_are_remembered_up_to_a_bound() {
+    fn a_purged_query_is_refused_for_a_while_however_many_others_were_purged() {
         let exchange = LocalExchange::default();
-        for hi in 0..=PURGED_QUERIES as i64 {
+        exchange.purge_query(FragmentInstanceId::from_halves(1, 0), "boom");
+        for hi in 2..=5000 {
             exchange.purge_query(FragmentInstanceId::from_halves(hi, 0), "boom");
         }
-        let state = exchange.lock();
-        assert_eq!(state.purged.len(), PURGED_QUERIES);
         assert!(
-            !state.purged.contains_key(&0),
-            "the oldest purge is forgotten first"
+            exchange
+                .register_receiver(
+                    FragmentInstanceId::from_halves(1, 3),
+                    vec![(7, 1)],
+                    params()
+                )
+                .is_err(),
+            "the first purge is still remembered"
         );
-        assert!(state.purged.contains_key(&(PURGED_QUERIES as u64)));
     }
 }
