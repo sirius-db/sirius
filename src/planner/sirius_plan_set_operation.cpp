@@ -21,10 +21,17 @@
 
 namespace sirius::planner {
 
-// The generator switch routes only `LOGICAL_UNION` to this builder — `EXCEPT` / `INTERSECT` keep
-// their own throwing case — so the only discrimination left here is on `setop_all`.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
+{
+  switch (op.type) {
+    case duckdb::LogicalOperatorType::LOGICAL_UNION: return plan_union(op);
+    default: throw duckdb::InternalException("Unrecognized operator type for LogicalSetOperation");
+  }
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::plan_union(
+  duckdb::LogicalSetOperation& op)
 {
   // A distinct UNION usually lowers to a LOGICAL_DISTINCT above this node, but not always: a
   // WITH RECURSIVE body with no self-reference degrades to a plain LogicalSetOperation carrying

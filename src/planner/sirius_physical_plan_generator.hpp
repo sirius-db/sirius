@@ -198,9 +198,8 @@ class sirius_physical_plan_generator {
   // create_plan(duckdb::LogicalCopyToFile &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalExplain
   // &op);
-  //! `UNION ALL` only; a distinct UNION arrives as a DISTINCT above this node, and the builder
-  //! rejects the `setop_all == false` shape that has none. EXCEPT / INTERSECT share the same
-  //! DuckDB node but keep their own throwing case in the dispatch switch, so they never arrive.
+  //! Dispatches a set operation on its type. EXCEPT / INTERSECT share the same DuckDB node but
+  //! keep their own throwing case in the dispatch switch, so they never arrive.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalSetOperation& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalUpdate
@@ -231,6 +230,10 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
+  //! `UNION ALL` only; a distinct UNION arrives as a DISTINCT above this node, and the builder
+  //! rejects the `setop_all == false` shape that has none.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
+    duckdb::LogicalSetOperation& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);
