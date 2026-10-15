@@ -702,8 +702,10 @@ mod tests {
             .unwrap();
         sender.run().unwrap();
         let mut rows = 0;
+        let mut layout = Vec::new();
         while let Some(batch) = sender.export_direct(0).unwrap() {
             rows += batch.rows;
+            layout.clone_from(&batch.layout);
             let (token, dst) = exchange.allocate(&batch.layout).unwrap();
             let lengths = |buffers: &[(u64, u64)]| buffers.iter().map(|b| b.1).collect::<Vec<_>>();
             assert_eq!(lengths(&dst), lengths(&batch.src));
@@ -714,6 +716,16 @@ mod tests {
         assert_eq!(rows, 3);
         assert_eq!(exchange.outstanding().unwrap(), 0);
         assert!(exchange.allocate(b"not a layout").is_err());
+
+        // The handle may outlive its context: the region stays readable and every other call
+        // fails instead of touching the context's memory.
+        let region = exchange.region();
+        drop(sender);
+        drop(ctx);
+        assert_eq!(exchange.region(), region);
+        assert!(exchange.allocate(&layout).is_err());
+        assert!(exchange.release(1).is_err());
+        assert!(exchange.outstanding().is_err());
     }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`
