@@ -205,6 +205,11 @@ materialized wide. An operator the classifier does not model is by construction 
 restores at, so the default under uncertainty is native. Retractions are counted by the
 plan-time `scan_narrow_targets_retracted` counter.
 
+With the experimental `SIRIUS_EXP_DECODE_TO_TARGET=1`, a compacted (filter-pushdown) Simpatico
+decode of a GPU-tier compressed chunk writes such a column directly in its restore type, so the
+widening cast is skipped for those chunks; other decodes still restore in scan normalization. See
+[Decode to Restore Type](optimizations.md#decode-to-restore-type-experimental).
+
 The policy commutes with the dynamic-filter guard in the propagation pass — both only ever flip
 narrow → native, so a guard target the policy already retracted is a no-op for the guard, and
 payload columns that no dynamic filter targets keep their transport verdicts. Zero-benefit pruning
