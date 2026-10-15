@@ -54,7 +54,6 @@ class ConfigTests(unittest.TestCase):
             f.grouping_sets,
             f.full_join,
             f.cross_join,
-            f.set_ops.union,
             f.set_ops.except_,
             f.set_ops.intersect,
             f.subqueries.uncorrelated_scalar,
