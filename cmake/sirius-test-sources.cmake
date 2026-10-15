@@ -232,6 +232,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_build_filter_evidence.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
+    test/cpp/planner/test_duckdb_host_reference_symbols.cpp
     test/cpp/planner/test_duckdb_host_static_symbol.cpp
     test/cpp/planner/test_scan_column_origin.cpp
     test/cpp/planner/test_scan_filter_projection.cpp

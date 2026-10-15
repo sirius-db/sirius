@@ -95,6 +95,12 @@ jobs:
           set -o pipefail
           make -j$(nproc) EXTRA_EXTENSION_CONFIGS="$PWD/sirius-duckdb/test/extension_config.cmake" 2>&1 | tee /tmp/build.log
 
+      - name: Build no-export DuckDB hosts
+        # The official DuckDB CLI exports no DuckDB symbols (#2174); the wrapper CLI exports
+        # them all. Relink the wrapper CLI without -rdynamic to get a host of the official
+        # shape, plus a variant with the reference symbols demoted to LOCAL binding.
+        run: test/scripts/build_noexport_host.sh sirius-duckdb/build/release
+
       - name: Build shared DuckDB scan host tests
         run: |
           cmake --build build/release --target libduckdb.so
@@ -197,6 +203,20 @@ jobs:
         run: |
           nvidia-smi
           python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort
+
+      - name: Scan smoke in hosts without dynamic exports
+        # Loads the extension into the no-export CLI and runs a filtered Parquet scan and a
+        # filtered native-table scan with CPU fallback disabled, asserting a logged GPU
+        # execution for each: the scan verification must find the host's trusted reference
+        # definitions without dynamic exports (#2174), including when they are LOCAL.
+        timeout-minutes: 15
+        run: |
+          SMOKE_OUT_DIR=build/release/test/cpp/log/host_smoke test/scripts/host_cli_scan_smoke.sh \
+            ./sirius-duckdb/build/release/duckdb-noexport \
+            ./sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+          SMOKE_OUT_DIR=build/release/test/cpp/log/host_smoke_local test/scripts/host_cli_scan_smoke.sh \
+            ./sirius-duckdb/build/release/duckdb-noexport-local \
+            ./sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
 
       - name: Iceberg conformance (correctness + connection liveness)
         timeout-minutes: 20
