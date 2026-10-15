@@ -19,6 +19,7 @@
 
 #include <cuda/stream>
 
+#include <nvcomp/version.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -29,6 +30,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -97,6 +99,30 @@ void io_roundtrip(char const* label,
   expect(ct2.columns.size() == ct1.columns.size(),
          (std::string(label) + ": read column count").c_str());
 
+  if (dsl.find("-> ans") != std::string::npos) {
+    std::fstream file(tmp.path, std::ios::binary | std::ios::in | std::ios::out);
+    file.seekg(4);
+    char version = 0;
+    file.read(&version, 1);
+    expect(version == (NVCOMP_VER_MAJOR >= 6 ? 13 : 12), "ANS file version");
+#if NVCOMP_VER_MAJOR >= 6
+    version = 12;
+    file.seekp(4);
+    file.write(&version, 1);
+    file.close();
+    std::string old_err;
+    auto old = simpatico::read_compressed_table(
+      tmp.path, stream, rmm::mr::get_current_device_resource_ref(), &old_err);
+    expect(
+      old.columns.empty() && old_err.find("ANS payload requires nvCOMP 5") != std::string::npos,
+      "nvCOMP 5 ANS payload must be rejected by nvCOMP 6");
+    std::fstream restore(tmp.path, std::ios::binary | std::ios::in | std::ios::out);
+    version = 13;
+    restore.seekp(4);
+    restore.write(&version, 1);
+#endif
+  }
+
   // Metadata survives.
   for (std::size_t i = 0; i < ct1.columns.size(); ++i) {
     auto const& c1 = ct1.columns[i];
@@ -125,6 +151,33 @@ void io_roundtrip(char const* label,
   for (int i = 0; i < input.num_columns(); ++i)
     expect(columns_equal_any(input.column(i), out->view().column(i), stream),
            (std::string(label) + ": data mismatch col " + std::to_string(i)).c_str());
+
+  if (std::string_view(label) == "ans_only") {
+    std::vector<std::uint8_t> header;
+    std::vector<simpatico::payload_buffer_ref> buffers;
+    std::uint64_t payload_bytes = 0;
+    auto const err =
+      simpatico::build_compressed_table_header(ct1, header, buffers, payload_bytes, stream);
+    expect(err.empty() && buffers.size() == 1, "ANS frame layout");
+    std::fstream file(tmp.path, std::ios::binary | std::ios::in | std::ios::out);
+    file.seekp(static_cast<std::streamoff>(header.size() + buffers[0].offset + 15));
+    char marker = NVCOMP_VER_MAJOR >= 6 ? 0 : 6;
+    file.write(&marker, 1);
+    file.close();
+
+    std::string read_err;
+    auto changed = simpatico::read_compressed_table(
+      tmp.path, stream, rmm::mr::get_current_device_resource_ref(), &read_err);
+    expect(read_err.empty(), "ANS frame with mismatched marker loads");
+    bool rejected = false;
+    try {
+      (void)simpatico::decompress(changed, stream, rmm::mr::get_current_device_resource_ref());
+    } catch (std::runtime_error const& e) {
+      rejected =
+        std::string_view(e.what()).find("incompatible frame format") != std::string_view::npos;
+    }
+    expect(rejected, "ANS frame with mismatched marker must be rejected");
+  }
 }
 
 // Serialize `ct` through the production pin-path entry points and read it back:
@@ -271,6 +324,7 @@ void test_for_only()
 void test_zigzag()
 {
   auto t = make_int32_table(1, 4096, 113);
+  io_roundtrip("ans_only", t->view(), "input -> ans\n");
   io_roundtrip("zigzag_terminal",
                t->view(),
                "input -> delta -> differences\n"
