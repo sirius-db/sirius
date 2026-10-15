@@ -163,7 +163,9 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 - `src/op/sirius_physical_probe_accumulate_emit.cpp` — result emission
 - `src/cuda/probe_accumulate_impl.cu` — record layout, accumulate/initialize/emit kernels
 
-**Config:** `enable_probe_accumulate` (default `false`, see [Configuration](configuration.md)); needs `max_build_hash_table_bytes` large enough for the build keys. TPC-H SF1000 GB300: q21 written as a shared-scan pre-aggregation 0.542 s -> 0.425 s (original q21 SQL is not matched yet; see the page's status section).
+A planner rewrite (`sirius_plan_exists_rewrite.cpp`) turns DuckDB's delim-join decorrelation of `[NOT] EXISTS` with `=` and `<>` into a `MIN`/`MAX` aggregate per key, merging sibling subqueries over the same table into one scan and one aggregate, which this operator then fuses.
+
+**Config:** `enable_probe_accumulate` (default `false`, see [Configuration](configuration.md)); needs `max_build_hash_table_bytes` large enough for the build keys. TPC-H SF1000 GB300: q21 written as a shared-scan pre-aggregation 0.542 s -> 0.425 s; original q21 SQL 0.603 s -> 0.457 s through the automatic rewrite, sibling merge and fusion.
 
 ### Distinct Hash Join (PR #558)
 

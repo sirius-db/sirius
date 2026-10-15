@@ -132,8 +132,16 @@ bool compare_multiset(std::span<op::scan::read_view_fingerprint const* const> or
     count_fingerprint(counts, buckets, binding.view->identity->fingerprint, false);
   }
 
+  // The candidate may read an identical view fewer times than the original plan did, when a
+  // planner pass merged scans of one view into a single scan. It may not read a view more often,
+  // and a view the original read must still be read at least once.
+  bool merged_identical_scans = false;
   for (auto const& count : counts) {
     if (count.original > count.candidate) {
+      if (count.candidate > 0) {
+        merged_identical_scans = true;
+        continue;
+      }
       auto const difference = count.original - count.candidate;
       result.different_original_count += difference;
       append_difference(result.only_original, *count.value, difference);
@@ -147,7 +155,7 @@ bool compare_multiset(std::span<op::scan::read_view_fingerprint const* const> or
     }
   }
   if (!result.only_original.empty() || !result.only_candidate.empty() ||
-      original.size() != candidate.size()) {
+      (original.size() != candidate.size() && !merged_identical_scans)) {
     result.reason = "fingerprint_mismatch";
     return false;
   }
@@ -220,7 +228,9 @@ read_view_comparison compare_read_views_impl(
     return result;
   }
 
-  if (logical_original.size() != candidate.size()) {
+  // A candidate never reads more scans than the logical plan had. It may read fewer when a planner
+  // pass merged scans of one identical view into a single scan; that is checked below.
+  if (candidate.size() > logical_original.size()) {
     result.reason = "binding_mismatch";
     return result;
   }
@@ -241,6 +251,19 @@ read_view_comparison compare_read_views_impl(
     }
     if (!selector_proven(*candidate_binding.view, found->view)) {
       result.reason = "selector_unproven";
+      return result;
+    }
+  }
+  // Every logical scan the candidate does not read must be a duplicate of one it does: the same
+  // view read once instead of twice. A scan of any other view going missing is a mismatch.
+  for (auto const& original : logical_original) {
+    if (matched_table_indexes.contains(original.table_index)) { continue; }
+    bool const duplicates_a_read_view =
+      std::any_of(candidate.begin(), candidate.end(), [&](auto const& candidate_binding) {
+        return same_identity(original.view, candidate_binding.view);
+      });
+    if (!duplicates_a_read_view) {
+      result.reason = "binding_mismatch";
       return result;
     }
   }

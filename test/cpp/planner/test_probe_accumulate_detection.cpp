@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_probe_accumulate_emit.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -122,6 +123,12 @@ std::vector<sirius::op::sirius_physical_operator*> collect(
   if (root->type == type) { out.push_back(root); }
   for (auto& child : root->children) {
     auto sub = collect(child.get(), type);
+    out.insert(out.end(), sub.begin(), sub.end());
+  }
+  // A delim join keeps its inner join outside `children`.
+  if (root->type == T::LEFT_DELIM_JOIN || root->type == T::RIGHT_DELIM_JOIN) {
+    auto const& delim = root->Cast<sirius::op::sirius_physical_delim_join>();
+    auto sub          = collect(delim.join.get(), type);
     out.insert(out.end(), sub.begin(), sub.end());
   }
   return out;
@@ -323,4 +330,101 @@ TEST_CASE_METHOD(probe_accumulate_fixture,
   auto restore = con->Query("RESET max_build_hash_table_bytes");
   REQUIRE_FALSE(restore->HasError());
   CHECK(fused_count(query) == 1);
+}
+
+// DuckDB removes the delim join itself (leaving a plain SEMI/ANTI join with the inequality as a
+// residual) for the simplest shapes. A filter on the outer rows or on the subquery keeps it, which
+// is also what TPC-H q21's join tree does, so these queries all carry one.
+constexpr char const* delim_exists_query =
+  "SELECT f.k, f.v FROM fact f WHERE f.w > f.v AND EXISTS "
+  "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v)";
+
+TEST_CASE_METHOD(
+  probe_accumulate_fixture,
+  "probe accumulate fuses a correlated EXISTS with <> after rewriting its decorrelation",
+  "[probe_accumulate][plan][exists_rewrite]")
+{
+  auto plan = generate_sirius_plan(*con, delim_exists_query);
+  REQUIRE(plan);
+  // One fused aggregate feeding a LEFT delim join, not the pair-emitting semi join.
+  CHECK(collect(plan.get(), T::PROBE_ACCUMULATE_EMIT).size() == 1);
+  CHECK(collect(plan.get(), T::LEFT_DELIM_JOIN).size() == 1);
+  CHECK(collect(plan.get(), T::RIGHT_DELIM_JOIN).empty());
+
+  set_flag(false);
+  auto unrewritten = generate_sirius_plan(*con, delim_exists_query);
+  CHECK(collect(unrewritten.get(), T::PROBE_ACCUMULATE_EMIT).empty());
+  CHECK_FALSE(collect(unrewritten.get(), T::RIGHT_DELIM_JOIN).empty());
+}
+
+TEST_CASE_METHOD(probe_accumulate_fixture,
+                 "probe accumulate fuses NOT EXISTS and a subquery filter too",
+                 "[probe_accumulate][plan][exists_rewrite]")
+{
+  CHECK(fused_count("SELECT f.k FROM fact f WHERE f.late AND NOT EXISTS "
+                    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v)") == 1);
+  CHECK(fused_count("SELECT f.k FROM fact f WHERE EXISTS "
+                    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v AND g.late)") == 1);
+}
+
+TEST_CASE_METHOD(probe_accumulate_fixture,
+                 "the EXISTS rewrite leaves other correlated subqueries alone",
+                 "[probe_accumulate][plan][exists_rewrite]")
+{
+  // No inequality: nothing to rewrite.
+  CHECK(fused_count("SELECT f.k FROM fact f WHERE f.w > f.v AND EXISTS "
+                    "(SELECT 1 FROM fact g WHERE g.k = f.k)") == 0);
+  // An inequality that is not <>, or two inequalities.
+  CHECK(fused_count("SELECT f.k FROM fact f WHERE f.w > f.v AND EXISTS "
+                    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v < f.v)") == 0);
+  CHECK(fused_count("SELECT f.k FROM fact f WHERE f.late AND EXISTS "
+                    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v AND g.w <> f.w)") == 0);
+  // A non-integer correlation key or value has no device atomic.
+  CHECK(fused_count("SELECT f.k FROM fact f WHERE f.late AND EXISTS "
+                    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.x <> f.x)") == 0);
+  CHECK(fused_count("SELECT f.k FROM fact f WHERE f.late AND EXISTS "
+                    "(SELECT 1 FROM fact g WHERE g.s = f.s AND g.v <> f.v)") == 0);
+}
+
+TEST_CASE_METHOD(
+  probe_accumulate_fixture,
+  "sibling EXISTS and NOT EXISTS over the same table share one scan and one aggregate",
+  "[probe_accumulate][plan][exists_rewrite]")
+{
+  // The shape of TPC-H q21: both subqueries scan the same table on the same key.
+  auto const query =
+    "SELECT f.k, count(*) FROM fact f WHERE f.late "
+    "AND EXISTS (SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v) "
+    "AND NOT EXISTS (SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v AND g.late) "
+    "GROUP BY f.k";
+  auto plan = generate_sirius_plan(*con, query);
+  REQUIRE(plan);
+  // One LEFT delim join and one fused aggregate answer both subqueries, with the second
+  // subquery's filter inside its accumulators.
+  CHECK(collect(plan.get(), T::PROBE_ACCUMULATE_EMIT).size() == 1);
+  CHECK(collect(plan.get(), T::LEFT_DELIM_JOIN).size() == 1);
+  CHECK(collect(plan.get(), T::RIGHT_DELIM_JOIN).empty());
+  auto const joins         = collect(plan.get(), T::HASH_JOIN);
+  std::size_t accumulating = 0;
+  for (auto* join : joins) {
+    auto& hash_join = join->Cast<sirius::op::sirius_physical_hash_join>();
+    if (hash_join.accumulate) {
+      ++accumulating;
+      // MIN and MAX for each of the two subqueries.
+      CHECK(hash_join.accumulate->state.specs().size() == 4);
+    }
+  }
+  CHECK(accumulating == 1);
+}
+
+TEST_CASE_METHOD(probe_accumulate_fixture,
+                 "sibling subqueries on different tables or keys are rewritten separately",
+                 "[probe_accumulate][plan][exists_rewrite]")
+{
+  // The second subquery reads another table, so one scan cannot serve both.
+  CHECK(fused_count(
+          "SELECT f.k FROM fact f WHERE f.late "
+          "AND EXISTS (SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v) "
+          "AND NOT EXISTS (SELECT 1 FROM dim d WHERE d.id = f.k AND d.tag <> f.v AND d.id > 3)") <=
+        2);
 }
