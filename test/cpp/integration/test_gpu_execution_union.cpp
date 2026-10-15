@@ -378,6 +378,26 @@ TEST_CASE_METHOD(UnionFixture,
 }
 
 TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution distinct UNION over a collated VARCHAR key falls back at plan time",
+                 "[integration][gpu_execution][union]")
+{
+  // The binder pushes a collation over the distinct UNION's targets as it does for SELECT
+  // DISTINCT, so under a non-binary default_collation the DISTINCT lowering refuses the key. Every
+  // `v` is already lower case, so each nocase group holds one value and the CPU runs agree.
+  auto const prior_result = con->Query("SELECT current_setting('default_collation');");
+  REQUIRE(prior_result);
+  REQUIRE_FALSE(prior_result->HasError());
+  auto const prior = prior_result->Collection().GetValue(0, 0);
+  {
+    sirius::test::scoped_sirius_setting collation{*con, "default_collation", "nocase"};
+    expect_plan_fallback_matches_cpu("SELECT v FROM ua UNION SELECT v FROM ub");
+  }
+  // A failed restore would leak nocase into every later integration case.
+  REQUIRE(con->Query("SELECT current_setting('default_collation');")->Collection().GetValue(0, 0) ==
+          prior);
+}
+
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution distinct UNION over a narrowed scan",
                  "[integration][gpu_execution][union]")
 {

@@ -334,6 +334,33 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   require_join_child_wrap(delim.join->children[1].get(), delim.join.get(), /*is_build=*/true);
 }
 
+/// The chain every supported DISTINCT shape shares: one HASH_GROUP_BY with an empty aggregate
+/// list, wrapped as insert_gpu_pipeline_operators wraps a GROUP BY. Returns the HASH_GROUP_BY so
+/// each caller can assert its own key layout.
+sirius::op::sirius_physical_grouped_aggregate* require_distinct_wrap_chain(
+  sirius_physical_operator* plan)
+{
+  auto* merge = find_first(plan, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+  REQUIRE(merge != nullptr);
+  REQUIRE(merge->children.size() == 1);
+
+  auto* partition = merge->children[0].get();
+  REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
+  REQUIRE(partition->children.size() == 1);
+
+  auto* hgb = partition->children[0].get();
+  REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+  auto& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  CHECK(aggregate.aggregate_slots.empty());
+  CHECK(aggregate.cudf_aggregates.empty());
+  CHECK(aggregate.cudf_aggregate_idx.empty());
+  CHECK_FALSE(aggregate.has_avg);
+  CHECK_FALSE(aggregate.has_count_distinct);
+  CHECK(aggregate.grouping_sets.empty());
+  return &aggregate;
+}
+
 class dynamic_filter_switch_guard {
  public:
   dynamic_filter_switch_guard(Connection& con, bool enabled)
@@ -1384,31 +1411,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - DISTINCT lowers to a zero-aggregate grouped aggregate",
                  "[plan_tree_shape][isolated_context]")
 {
-  // The chain every supported DISTINCT shape shares: one HASH_GROUP_BY with an empty aggregate
-  // list, wrapped as insert_gpu_pipeline_operators wraps a GROUP BY. Returns the HASH_GROUP_BY so
-  // each section can assert its own key layout.
-  auto require_distinct_wrap_chain = [](sirius_physical_operator* plan) {
-    auto* merge = find_first(plan, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
-    REQUIRE(merge != nullptr);
-    REQUIRE(merge->children.size() == 1);
-
-    auto* partition = merge->children[0].get();
-    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-    CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
-    REQUIRE(partition->children.size() == 1);
-
-    auto* hgb = partition->children[0].get();
-    REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
-    auto& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
-    CHECK(aggregate.aggregate_slots.empty());
-    CHECK(aggregate.cudf_aggregates.empty());
-    CHECK(aggregate.cudf_aggregate_idx.empty());
-    CHECK_FALSE(aggregate.has_avg);
-    CHECK_FALSE(aggregate.has_count_distinct);
-    CHECK(aggregate.grouping_sets.empty());
-    return &aggregate;
-  };
-
   SECTION("plain DISTINCT keys the whole row in order and needs no projection")
   {
     auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id, val FROM big_left");
@@ -2226,7 +2228,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - UNION arm sinks declare the union's schema, not the arm's",
-                 "[plan_tree_shape][union_all][isolated_context]")
+                 "[plan_tree_shape][union][union_all][isolated_context]")
 {
   // CTE results and UNION arm sinks use the consumer schema, even when materialization
   // stores a different number of columns.
@@ -2267,6 +2269,27 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   require_sinks_match_union(
     "(WITH m AS MATERIALIZED (SELECT rid FROM small_right) SELECT rid, rid * 2 FROM m) "
     "UNION ALL SELECT id, id * 2 FROM big_left");
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - distinct UNION deduplicates directly over the native UNION",
+                 "[plan_tree_shape][union][isolated_context]")
+{
+  auto plan =
+    generate_sirius_plan(*con, "SELECT id FROM big_left UNION SELECT rid FROM small_right");
+  INFO(tree_to_string(plan.get()));
+
+  auto* aggregate = require_distinct_wrap_chain(plan.get());
+  CHECK(aggregate->group_idx == std::vector<int>{0});
+  // Nothing sits between the dedup and the union, not even an identity projection.
+  CHECK(collect(plan.get(), SiriusPhysicalOperatorType::PROJECTION).empty());
+  REQUIRE(aggregate->children.size() == 1);
+  auto* union_op = aggregate->children[0].get();
+  REQUIRE(union_op->type == SiriusPhysicalOperatorType::UNION);
+  REQUIRE(union_op->children.size() == 2);
+  for (auto& arm : union_op->children) {
+    CHECK(arm->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+  }
 }
 
 namespace {

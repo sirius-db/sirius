@@ -24,7 +24,7 @@ types = ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT",
 
 [features.set_ops]
 union_all = true
-union = false
+union = true
 except = false
 intersect = false
 
