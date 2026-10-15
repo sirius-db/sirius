@@ -321,7 +321,7 @@ class GpuExecutionFixture {
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
 
-    REQUIRE(gpu_result->types == cpu_result->types);
+    REQUIRE(gpu_result->GetTypes() == cpu_result->GetTypes());
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
