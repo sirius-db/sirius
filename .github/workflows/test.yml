@@ -248,7 +248,7 @@ jobs:
         run: |
           mkdir -p build/release/test/cpp/log/preparation-faults
           build/release/test/cpp/sirius_unittest '[preparation_allocation_fault]' \
-            --warn NoTests --reporter xml \
+            --reporter xml \
             --out build/release/test/cpp/log/preparation-faults/results.xml
 
       - name: Iceberg conformance (correctness + connection liveness)

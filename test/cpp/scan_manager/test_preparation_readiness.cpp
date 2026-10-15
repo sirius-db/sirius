@@ -531,23 +531,28 @@ TEST_CASE("Discarded dispatcher captures coalesce nested stop notifications",
   fixture f(1, 2, k_interrupt_check_interval, preparation_options{2, 2, 2, 2, 1, 20ms});
   auto blocked = f.make_hold();
   std::atomic<size_t> work_calls{0};
-  size_t depth = 0, peak = 0;
-  std::array<size_t, 2> releases{};
+  std::atomic<size_t> active{0}, peak{0};
+  std::array<std::atomic<size_t>, 2> releases{};
   struct notify_on_release {
     preparation_coordinator& coordinator;
-    size_t &depth, &peak, &releases;
+    std::atomic<size_t>&active, &peak, &releases;
     notify_on_release(preparation_coordinator& coordinator,
-                      size_t& depth,
-                      size_t& peak,
-                      size_t& releases)
-      : coordinator(coordinator), depth(depth), peak(peak), releases(releases)
+                      std::atomic<size_t>& active,
+                      std::atomic<size_t>& peak,
+                      std::atomic<size_t>& releases)
+      : coordinator(coordinator), active(active), peak(peak), releases(releases)
     {
     }
     ~notify_on_release()
     {
-      peak = std::max(peak, ++depth);
+      static thread_local size_t depth = 0;
+      auto nested                      = ++depth;
+      auto prior                       = peak.load();
+      while (prior < nested && !peak.compare_exchange_weak(prior, nested)) {}
+      ++active;
       ++releases;
       coordinator.request_stop(stop_reason::normal_eos);
+      --active;
       --depth;
     }
   };
@@ -559,7 +564,7 @@ TEST_CASE("Discarded dispatcher captures coalesce nested stop notifications",
            [&, next = size_t{0}]() mutable -> std::optional<preparation_coordinator::job> {
              if (next == releases.size()) return {};
              auto token =
-               std::make_shared<notify_on_release>(f.coordinator, depth, peak, releases[next++]);
+               std::make_shared<notify_on_release>(f.coordinator, active, peak, releases[next++]);
              return preparation_coordinator::job{[token = std::move(token), &work_calls] {
                                                    ++work_calls;
                                                    return std::make_unique<tagged>(1);
@@ -568,14 +573,15 @@ TEST_CASE("Discarded dispatcher captures coalesce nested stop notifications",
            });
   f.start();
   auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (f.coordinator.snapshot().wakes < 2 && std::chrono::steady_clock::now() < deadline)
+  // The third iteration starts only after both previous enqueue calls returned.
+  while (f.coordinator.snapshot().wakes < 3 && std::chrono::steady_clock::now() < deadline)
     std::this_thread::yield();
-  REQUIRE(f.coordinator.snapshot().wakes >= 2);
+  REQUIRE(f.coordinator.snapshot().wakes >= 3);
   REQUIRE(f.coordinator.snapshot().jobs_peak == 2);
   f.coordinator.request_stop(stop_reason::normal_eos);
   blocked->release();
   f.finish();
-  CHECK(depth == 0);
+  CHECK(active == 0);
   CHECK(peak == 1);
   CHECK(releases[0] == 1);
   CHECK(releases[1] == 1);
