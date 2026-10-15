@@ -722,14 +722,12 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
 {
-  // cuDF AST supports DECIMAL32/64 arithmetic, but DECIMAL128 binary operations
-  // exceed its intermediate storage width. Unsupported functions fall through
-  // to the default arm below, so checking decimal widths once up front is enough.
-  if (std::ranges::any_of(
-        alt.arguments(),
-        [](auto const& arg) { return sirius::is_cudf_ast_decimal128(arg->return_type()); }) ||
-      sirius::is_cudf_ast_decimal128(alt.return_type())) {
-    SIRIUS_LOG_DEBUG("[expression_translator] Blocking DECIMAL128 function from AST");
+  // cuDF AST does not enforce DuckDB's decimal result width and scale.
+  // Unsupported functions fall through to the default arm below.
+  if (std::ranges::any_of(alt.arguments(),
+                          [](auto const& arg) { return arg->return_type().is_decimal(); }) ||
+      alt.return_type().is_decimal()) {
+    SIRIUS_LOG_DEBUG("[expression_translator] Blocking decimal function from AST");
     return std::nullopt;
   }
 

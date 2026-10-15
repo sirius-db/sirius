@@ -1566,7 +1566,7 @@ TEST_CASE("translator: nested decimal comparison col(0) >= 2.00 AND col(0) <= 4.
   REQUIRE(host_vals == std::vector<uint8_t>{0, 1, 1, 1, 0});
 }
 
-TEST_CASE("translator: nested decimal32 arithmetic produces AST", "[expression_translator]")
+TEST_CASE("translator: nested decimal32 arithmetic returns nullopt", "[expression_translator]")
 {
   // Build (col(0) + col(0)) * 2.00 over a DECIMAL(5,2) column.
   auto const dec52 = logical_type::make_decimal(5, 2);
@@ -1585,7 +1585,22 @@ TEST_CASE("translator: nested decimal32 arithmetic produces AST", "[expression_t
 
   auto translator = make_translator();
   auto ast_tree   = translate(translator, *mul);
-  REQUIRE(ast_tree.has_value());
+  REQUIRE_FALSE(ast_tree.has_value());
+}
+
+TEST_CASE("translator: decimal32 multiplication widening to decimal64 returns nullopt",
+          "[expression_translator]")
+{
+  auto const dec32 = logical_type::make_decimal(9, 2);
+  auto const dec64 = logical_type::make_decimal(18, 4);
+
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref_typed(0, dec32));
+  args.push_back(make_ref_typed(1, dec32));
+  auto mul = make_func(sirius::function_id::mul, std::move(args), dec64);
+
+  auto translator = make_translator();
+  REQUIRE_FALSE(translate(translator, *mul).has_value());
 }
 
 TEST_CASE("translator: direct decimal128 column arithmetic returns nullopt",

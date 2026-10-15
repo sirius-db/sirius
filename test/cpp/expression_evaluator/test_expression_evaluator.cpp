@@ -1458,6 +1458,35 @@ TEMPLATE_TEST_CASE("evaluate decimal arithmetic (DECIMAL32)",
   REQUIRE(out0 == expected);
 }
 
+TEMPLATE_TEST_CASE("evaluate decimal multiplication after DuckDB width casts",
+                   "[expression_evaluator][decimal]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto const input_type  = logical_type::make_decimal(9, 2);
+  auto const wider_input = logical_type::make_decimal(18, 2);
+  auto const result_type = logical_type::make_decimal(18, 4);
+  std::vector<int32_t> raw{5'000'000, 7'500'000};
+  auto input = make_decimal32_batch(*space, 2, raw);
+
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(make_cast(make_ref_typed(0, input_type), wider_input, false));
+  children.push_back(make_cast(make_ref_typed(0, input_type), wider_input, false));
+  auto expr = make_func(sirius::function_id::mul, std::move(children), result_type);
+
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(expr)), strategy);
+  REQUIRE(ov.num_columns() == 1);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(ov.column(0).type().scale() == -4);
+  REQUIRE(copy_column_to_host<int64_t>(ov.column(0)) ==
+          std::vector<int64_t>{25'000'000'000'000, 56'250'000'000'000});
+}
+
 TEMPLATE_TEST_CASE("evaluate nested decimal arithmetic (col + 1.00) * 2",
                    "[expression_evaluator][decimal]",
                    mat_strategy,

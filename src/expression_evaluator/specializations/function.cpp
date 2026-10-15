@@ -92,10 +92,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   auto const resolved_id = alt.function();
   auto const& args       = alt.arguments();
 
-  auto const skip_ast = sirius::is_cudf_ast_decimal128(alt.return_type()) ||
-                        std::ranges::any_of(args, [](auto const& arg) {
-                          return sirius::is_cudf_ast_decimal128(arg->return_type());
-                        });
+  auto const skip_ast =
+    alt.return_type().is_decimal() ||
+    std::ranges::any_of(args, [](auto const& arg) { return arg->return_type().is_decimal(); });
   auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
                                                     supported_ast_functions.end(),
                                                     resolved_id) != supported_ast_functions.end();
