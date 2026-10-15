@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-// GPU-vs-CPU correctness for `UNION ALL`: sirius_physical_union + sirius_physical_passthrough_sink.
+// GPU-vs-CPU correctness for `UNION ALL`: sirius_physical_union + sirius_physical_passthrough_sink,
+// and for distinct `UNION`, which runs as the DISTINCT lowering over that same bag union.
 //
 // GpuExecutionFixture runs each query on the GPU -- asserting one GPU execution and ZERO fallbacks
 // -- and again on DuckDB CPU, then compares. The zero-fallback assertion is what makes these tests
@@ -30,10 +31,11 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
-#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
+#include <cstdint>
 #include <string>
 
 namespace {
@@ -55,6 +57,24 @@ class UnionAllFixture : public sirius::test::GpuExecutionFixture {
     run_ok("INSERT INTO uc VALUES (5, 'e');");
     run_ok("INSERT INTO uwide VALUES (100, 'w'), (200, 'x');");
     run_ok("CHECKPOINT;");
+  }
+
+  //! DuckDB's physical plan text for @p query, explained with GPU execution off.
+  std::string cpu_plan_text(std::string const& query)
+  {
+    run_ok("SET gpu_execution = false;");
+    auto const result = con->Query("EXPLAIN " + query);
+    run_ok("SET gpu_execution = true;");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    std::string text;
+    for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+      for (duckdb::idx_t column = 0; column < result->ColumnCount(); ++column) {
+        text += result->GetValue(column, row).ToString();
+        text += '\n';
+      }
+    }
+    return text;
   }
 };
 
@@ -135,6 +155,19 @@ TEST_CASE_METHOD(UnionAllFixture,
 }
 
 TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution UNION over HUGEINT aggregates narrowed to BIGINT",
+                 "[integration][gpu_execution][union_all]")
+{
+  // DuckDB types sum(INTEGER) as HUGEINT and the union declares that, but each GPU arm plans the
+  // aggregate as BIGINT, so the union's declared type and its arms' planned type differ.
+  compare_gpu_vs_cpu("SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub");
+  compare_gpu_vs_cpu(
+    "SELECT s + 1 FROM (SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub) t");
+  compare_gpu_vs_cpu_ordered(
+    "SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub ORDER BY s");
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution UNION ALL preserves NULLs",
                  "[integration][gpu_execution][union_all]")
 {
@@ -148,13 +181,6 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution UNION ALL composes with downstream operators",
                  "[integration][gpu_execution][union_all]")
 {
-  // COMPRESSED_MATERIALIZATION rewrites these narrow keys into __internal_compress_integral_*
-  // inside a projection, which the expression translator declines, so the query runs on the CPU
-  // and the fixture's GPU-execution assertion fails. Sirius masks that optimizer at load, but
-  // ~UniqueJoinFixture (test_gpu_execution_unique_join.cpp:68) resets the mask to '', so it is
-  // live again for anything running after it. The guard appends, restoring the mask it found.
-  sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
-
   // Aggregate downstream: UNION becomes a pipeline sink under the group-by's hash PARTITION,
   // which is the is_sink() == true shape.
   compare_gpu_vs_cpu(
@@ -184,9 +210,6 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution UNION ALL nested inside another UNION ALL arm",
                  "[integration][gpu_execution][union_all]")
 {
-  // Same COMPRESSED_MATERIALIZATION guard as the case above.
-  sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
-
   // An arm whose own subtree is a UNION: the inner and outer passthrough sinks must not collide,
   // since port names are per-operator.
   compare_gpu_vs_cpu(
@@ -208,8 +231,6 @@ TEST_CASE_METHOD(UnionAllFixture,
   // so two arms never present different carriers for one logical column. uwide.k is BIGINT with
   // small values (a narrowing candidate) against an INTEGER arm, and must be pinned for a sidecar
   // to be installed at all (sirius_plan_get.cpp:633).
-  // Same COMPRESSED_MATERIALIZATION guard as the case above.
-  sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
   auto pin = con->Query("CALL pin_table(format='duckdb', name='uwide', tier='gpu');");
   REQUIRE(pin);
   REQUIRE_FALSE(pin->HasError());
@@ -233,23 +254,47 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution declines the rest of the set-operation family",
                  "[integration][gpu_execution][union_all]")
 {
-  // Distinct UNION, EXCEPT and INTERSECT must leave the GPU path cleanly via a fallback -- not
-  // error, and not silently produce a bag union. All three are refused during plan generation
-  // (sirius_plan_distinct.cpp for distinct UNION, the generator switch for the other two),
-  // so this asserts a plan-time fallback. The helper also compares against the CPU result, which
-  // is what pins "still the right answer" without a hand-rolled second check.
-  expect_plan_fallback_matches_cpu("SELECT k FROM ua UNION SELECT k FROM ub");
+  // EXCEPT and INTERSECT must leave the GPU path cleanly via a fallback -- not error, and not
+  // silently produce a bag union. Both are refused during plan generation (the generator switch),
+  // so this asserts a plan-time fallback. The helper also compares against the CPU result, which is
+  // what pins "still the right answer" without a hand-rolled second check.
   expect_plan_fallback_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
   expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution keeps a non-recursive WITH RECURSIVE UNION on the CPU",
+                 "[integration][gpu_execution][union_all]")
+{
+  // With no self-reference the binder plans a bare distinct UNION with no DISTINCT above it, so the
+  // set-operation builder's refusal is all that stands between this query and duplicate rows.
+  std::string const cte = "WITH RECURSIVE c AS (SELECT k FROM ua UNION SELECT k FROM ub) ";
+  expect_plan_fallback_matches_cpu(cte + "SELECT * FROM c");
+  {
+    sirius::test::scoped_sirius_setting no_fallback{*con, "enable_duckdb_fallback", false};
+    auto const result = con->Query(cte + "SELECT * FROM c");
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(),
+                 Catch::Matchers::ContainsSubstring("WITH RECURSIVE body with no self-reference"));
+  }
+
+  // Four distinct keys and one NULL out of six input rows: the shape does need a dedup.
+  run_ok("SET gpu_execution = false;");
+  auto const count = con->Query(cte + "SELECT count(*) FROM c");
+  run_ok("SET gpu_execution = true;");
+  REQUIRE(count);
+  REQUIRE_FALSE(count->HasError());
+  REQUIRE(count->GetValue(0, 0).GetValue<int64_t>() == 5);
 }
 
 TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution UNION ALL over a materialized CTE arm",
                  "[integration][gpu_execution][union_all]")
 {
-  // Regression for the arity guard in sirius_plan_set_operation.cpp, which used to read the arm's
-  // *physical* width. A materialized CTE declares its materialization side, so an arm whose
-  // definition and body differ in width was declined to the CPU.
+  // Regression for the arity guard in sirius_plan_set_operation.cpp, which reads the arm's
+  // physical `types`. Before DuckDB v2 a materialized CTE declared its materialization side, so an
+  // arm whose definition and body differ in width was declined to the CPU.
   //
   // Two traps when reshaping these. The CTE must stay MATERIALIZED, or a single-reference one is
   // inlined away and no CTE node reaches the planner. And the definition's width must be forced
@@ -289,4 +334,162 @@ TEST_CASE_METHOD(UnionAllFixture,
     "SELECT k FROM ua "
     "UNION ALL "
     "SELECT k FROM m");
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution distinct UNION deduplicates across arms",
+                 "[integration][gpu_execution][union_all]")
+{
+  // (3, 'c') is in both ua and ub, so each of these has a row to drop.
+  compare_gpu_vs_cpu("SELECT k, v FROM ua UNION SELECT k, v FROM ub");
+  compare_gpu_vs_cpu("SELECT k FROM ua UNION SELECT k FROM ub");
+  compare_gpu_vs_cpu("SELECT k, v FROM ua UNION BY NAME SELECT v, k FROM ub");
+  // A chain of distinct UNIONs merges into one N-ary union; a mixed chain does not.
+  compare_gpu_vs_cpu("SELECT k FROM ua UNION SELECT k FROM ub UNION SELECT k FROM uc");
+  compare_gpu_vs_cpu("SELECT k FROM ua UNION ALL SELECT k FROM ub UNION SELECT k FROM uc");
+  compare_gpu_vs_cpu_ordered("SELECT k FROM ua UNION SELECT k FROM ub ORDER BY k NULLS LAST");
+  compare_gpu_vs_cpu_ordered(
+    "SELECT k FROM ua UNION SELECT k FROM ub ORDER BY k DESC NULLS LAST LIMIT 3");
+  // The same set written as a user's DISTINCT over a bag union.
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT * FROM (SELECT k, v FROM ua UNION ALL SELECT k, v FROM ub) t");
+  compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT k, v FROM ua UNION SELECT k, v FROM ub) t");
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution distinct UNION as an arm of UNION ALL",
+                 "[integration][gpu_execution][union_all]")
+{
+  // The arm's root is the DISTINCT's merge, an unconditional sink feeding a passthrough sink.
+  compare_gpu_vs_cpu("(SELECT k FROM ua UNION SELECT k FROM ub) UNION ALL SELECT k FROM ua");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM ((SELECT k FROM ua UNION SELECT k FROM ub) "
+    "UNION ALL SELECT k FROM ua) t");
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution distinct UNION reconciles types and keeps NULL",
+                 "[integration][gpu_execution][union_all]")
+{
+  compare_gpu_vs_cpu("SELECT k FROM ua UNION SELECT k FROM uwide");
+  compare_gpu_vs_cpu("SELECT k FROM ua UNION SELECT 3");
+  // A self-union collapses to ua's distinct keys, with one NULL.
+  compare_gpu_vs_cpu("SELECT k FROM ua UNION SELECT k FROM ua");
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution distinct UNION over a narrowed scan",
+                 "[integration][gpu_execution][union_all]")
+{
+  // As in the UNION ALL case above: the narrowed arm is restored at the union, below the DISTINCT.
+  auto pin = con->Query("CALL pin_table(format='duckdb', name='uwide', tier='gpu');");
+  REQUIRE(pin);
+  REQUIRE_FALSE(pin->HasError());
+
+  auto const before = sirius::test::get_compressed_materialization_stats(*con);
+  compare_gpu_vs_cpu("SELECT k FROM uwide UNION SELECT k FROM ua");
+  auto const after = sirius::test::get_compressed_materialization_stats(*con);
+  REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+  REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+
+  REQUIRE_FALSE(con->Query("CALL unpin_table('uwide');")->HasError());
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution distinct UNION over identical arms",
+                 "[integration][gpu_execution][union_all]")
+{
+  // DuckDB's common-subplan pass turns a subplan of two or more operators repeated across the arms
+  // into a materialized CTE under the DISTINCT. Fail loudly if it stops doing so.
+  std::string const query = "SELECT k FROM ua GROUP BY k UNION SELECT k FROM ua GROUP BY k";
+  REQUIRE_THAT(cpu_plan_text(query), Catch::Matchers::ContainsSubstring("CTE"));
+  compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution distinct UNION over a shared subplan whose definition is wider",
+                 "[integration][gpu_execution][union_all]")
+{
+  // The CTE's definition is (v VARCHAR, k INTEGER) and its body one INTEGER column, so a
+  // compressed-schema pass that read the definition would give column 0 a STRING carrier. The pin
+  // makes the pass run.
+  std::string const query =
+    "SELECT k FROM (SELECT v, k FROM ua GROUP BY v, k) s "
+    "UNION SELECT length(v)::INTEGER FROM (SELECT v, k FROM ua GROUP BY v, k) s";
+  REQUIRE_THAT(cpu_plan_text(query), Catch::Matchers::ContainsSubstring("CTE"));
+
+  auto pin = con->Query("CALL pin_table(format='duckdb', name='ua', tier='gpu');");
+  REQUIRE(pin);
+  REQUIRE_FALSE(pin->HasError());
+
+  auto const before = sirius::test::get_compressed_materialization_stats(*con);
+  compare_gpu_vs_cpu(query);
+  auto const after = sirius::test::get_compressed_materialization_stats(*con);
+  REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+
+  REQUIRE_FALSE(con->Query("CALL unpin_table('ua');")->HasError());
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution distinct UNION over HUGEINT aggregates narrowed to BIGINT",
+                 "[integration][gpu_execution][union_all]")
+{
+  // The DISTINCT groups on the union's declared HUGEINT over arms planned as BIGINT.
+  compare_gpu_vs_cpu("SELECT sum(k) FROM ua UNION SELECT sum(k) FROM ub");
+  // Equal sums must collapse to one row.
+  compare_gpu_vs_cpu("SELECT sum(k) FROM ua UNION SELECT sum(k) FROM ua");
+  compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT sum(k) FROM ua UNION SELECT sum(k) FROM ua) t");
+}
+
+namespace {
+
+/// One zero and one NaN in each table, with opposite signs, so every pair that DuckDB groups as one
+/// value reaches the merge from different arms.
+class UnionFloatFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  UnionFloatFixture()
+  {
+    run_ok("CREATE TABLE fa (d DOUBLE, f REAL);");
+    run_ok("CREATE TABLE fb (d DOUBLE, f REAL);");
+    run_ok(
+      "INSERT INTO fa VALUES "
+      "(-(0.0::DOUBLE), -(0.0::REAL)), ('NaN'::DOUBLE, 'NaN'::REAL), (1.5, 1.5);");
+    run_ok(
+      "INSERT INTO fb VALUES "
+      "(0.0, 0.0), (-('NaN'::DOUBLE), -('NaN'::REAL)), (1.5, 1.5);");
+    run_ok("CHECKPOINT;");
+
+    // A `-0.0` literal parses as DECIMAL, so prove fa stored a negative zero. Read on the CPU and
+    // restore GPU execution before asserting, since the connection is shared.
+    run_ok("SET gpu_execution = false;");
+    auto const d_zeros = con->Query("SELECT count(*) FROM fa WHERE d = 0 AND signbit(d)");
+    auto const f_zeros = con->Query("SELECT count(*) FROM fa WHERE f = 0 AND signbit(f)");
+    run_ok("SET gpu_execution = true;");
+    for (auto* zeros : {d_zeros.get(), f_zeros.get()}) {
+      REQUIRE(zeros);
+      REQUIRE_FALSE(zeros->HasError());
+      REQUIRE(zeros->GetValue(0, 0).GetValue<int64_t>() == 1);
+    }
+  }
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(UnionFloatFixture,
+                 "gpu_execution distinct UNION groups NaN and signed zero across arms",
+                 "[integration][gpu_execution][union_all]")
+{
+  // Either engine may keep either member of a pair, so the rows compare canonicalized and the
+  // count compares exactly.
+  SECTION("DOUBLE")
+  {
+    compare_gpu_vs_cpu_canonical("SELECT d FROM fa UNION SELECT d FROM fb");
+    compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT d FROM fa UNION SELECT d FROM fb) t");
+  }
+
+  SECTION("REAL")
+  {
+    compare_gpu_vs_cpu_canonical("SELECT f FROM fa UNION SELECT f FROM fb");
+    compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT f FROM fa UNION SELECT f FROM fb) t");
+  }
 }

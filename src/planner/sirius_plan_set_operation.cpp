@@ -29,11 +29,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
   // A distinct UNION usually lowers to a LOGICAL_DISTINCT above this node, but not always: a
   // WITH RECURSIVE body with no self-reference degrades to a plain LogicalSetOperation carrying
   // the CTE's `union_all`, and nothing inserts a DistinctModifier on that path (duckdb
-  // `bind_recursive_cte_node.cpp:124`-`:127`). For that shape this throw is the only thing between
+  // `bind_recursive_cte_node.cpp:265`-`:272`). For that shape this throw is the only thing between
   // a distinct UNION and duplicate rows.
   if (!op.setop_all) {
     throw duckdb::NotImplementedException(
-      "UNION (distinct) not supported yet; only UNION ALL is on the GPU path");
+      "UNION without ALL and no DISTINCT above it (a WITH RECURSIVE body with no self-reference) "
+      "is not supported on the GPU");
   }
 
   // `allow_out_of_order == false` asks for strict left-to-right evaluation, which N independently
@@ -55,12 +56,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
     sirius::from_duckdb_vec(op.types), op.estimated_cardinality);
 
   for (auto& child : op.children) {
-    // Check the binder's arity invariant before lowering each arm.
-    if (child->types.size() != op.types.size()) {
+    auto arm = create_plan(*child);
+    if (arm->get_types().size() != op.types.size()) {
       throw duckdb::NotImplementedException(
         "UNION ALL: input column count does not match the set operation output");
     }
-    union_op->children.push_back(create_plan(*child));
+    union_op->children.push_back(std::move(arm));
   }
 
   return union_op;
