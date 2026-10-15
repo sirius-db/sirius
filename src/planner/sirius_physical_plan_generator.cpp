@@ -1401,7 +1401,7 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
 }
 
 //! Terminate one UNION arm with a `PASSTHROUGH_SINK`. Where a join arm needs `PARTITION -> CONCAT`
-//! (a shuffle plus a coalesce), a bag union needs neither, so one operator does the whole job: it
+//! (a shuffle plus a coalesce), a union needs neither, so one operator does the whole job: it
 //! forwards each batch unchanged and unpartitioned into UNION's `"union_{child_idx}"` port, which
 //! keeps every batch on the GPU its scan produced it on. The sink owns that port name — the wiring
 //! descriptor and the upstream `next_port_info` both retain a `string_view` into it.
@@ -2170,7 +2170,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       // plan = create_plan(op.Cast<duckdb::LogicalPositionalJoin>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_UNION:
-      // UNION ALL only; the builder rejects `setop_all == false` and ordered arms.
+      // The builder rejects ordered arms and a union that must deduplicate itself.
       plan = create_plan(op.Cast<duckdb::LogicalSetOperation>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:

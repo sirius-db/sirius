@@ -33,30 +33,32 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::plan_union(
   duckdb::LogicalSetOperation& op)
 {
-  // A distinct UNION usually lowers to a LOGICAL_DISTINCT above this node, but not always: a
-  // WITH RECURSIVE body with no self-reference degrades to a plain LogicalSetOperation carrying
-  // the CTE's `union_all`, and nothing inserts a DistinctModifier on that path (duckdb
-  // `bind_recursive_cte_node.cpp:265`-`:272`). For that shape this throw is the only thing between
-  // a distinct UNION and duplicate rows.
+  // `UNION` and `UNION ALL` both arrive as this node. For `UNION`, DuckDB's binder plants a
+  // DISTINCT above it and sets `setop_all`, so the node itself always concatenates. The exception
+  // is a WITH RECURSIVE body that never references itself and has no USING KEY: it binds to this
+  // node with `setop_all` false and nothing above it to deduplicate (duckdb
+  // `Binder::BindNode(RecursiveCTENode&)`). This throw keeps that shape from returning duplicate
+  // rows.
   if (!op.setop_all) {
     throw duckdb::NotImplementedException(
-      "UNION without ALL and no DISTINCT above it (a WITH RECURSIVE body with no self-reference) "
-      "is not supported on the GPU");
+      "UNION that must deduplicate itself (a WITH RECURSIVE body with no self-reference) is not "
+      "supported on the GPU (falling back to CPU)");
   }
 
-  // `allow_out_of_order == false` asks for strict left-to-right evaluation, which N independently
-  // drained arms cannot honor. EXPORT DATABASE and deserialized plans carry it alongside
-  // `setop_all == true`, so the guard above does not catch them, and the result would be silently
-  // mis-ordered rather than an error.
+  // `allow_out_of_order == false` requires output in arm order, which this operator does not
+  // guarantee. It arrives with `setop_all == true`, so the guard above does not catch it, and the
+  // result would be silently mis-ordered rather than an error.
   if (!op.allow_out_of_order) {
     throw duckdb::NotImplementedException(
-      "UNION ALL with ordered arms (allow_out_of_order = false) not supported on the GPU path");
+      "UNION with ordered arms (allow_out_of_order = false) is not supported on the GPU (falling "
+      "back to CPU)");
   }
 
   // N-ary: `a UNION ALL b UNION ALL c` binds to one node with three children.
   D_ASSERT(op.children.size() >= 2);
   if (op.children.size() < 2) {
-    throw duckdb::NotImplementedException("UNION ALL with fewer than two inputs not supported");
+    throw duckdb::NotImplementedException(
+      "UNION with fewer than two inputs is not supported on the GPU (falling back to CPU)");
   }
 
   auto union_op = duckdb::make_uniq<sirius::op::sirius_physical_union>(
@@ -66,7 +68,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     auto arm = create_plan(*child);
     if (arm->get_types().size() != op.types.size()) {
       throw duckdb::NotImplementedException(
-        "UNION ALL: input column count does not match the set operation output");
+        "UNION: input column count does not match the set operation output (falling back to "
+        "CPU)");
     }
     union_op->children.push_back(std::move(arm));
   }

@@ -14,15 +14,14 @@
  * limitations under the License.
  */
 
-// Per-operator MGPU integration test for UNION ALL (physical_union).
+// Per-operator MGPU integration test for UNION (physical_union), under both
+// UNION ALL and distinct UNION.
 //
-// UNION ALL is the one wrapper-fed operator that is deliberately NOT
+// UNION is the one wrapper-fed operator that is deliberately NOT
 // partition-based. Its arms are joined by PASSTHROUGH_SINK, which forwards a
 // batch unpartitioned: the `pipelineable_operator_data` it hands on carries no
-// `partition_idx`, so the `partition_idx % num_gpus` pin every other MGPU
-// operator relies on never fires. Placement instead falls to the locality
-// block in task_creator.cpp:450-475, which reads the memory space of the
-// inbound batch and picks the GPU already holding the most bytes.
+// partition placement, so it stamps no device, and the task creator places the
+// task by data locality: the GPU already holding the most bytes.
 //
 // That makes `hash_partition_bytes` — the lever test_physical_order_mgpu.cpp
 // and test_physical_grouped_aggregate_merge_mgpu.cpp pull to force
@@ -32,7 +31,7 @@
 // the handoff between unequal arms.
 //
 // The shared integration configs cannot express that shape. Both
-// integration.yaml:22 and integration-2gpu.yaml pin scan_task_batch_size at
+// integration.yaml and integration-2gpu.yaml pin scan_task_batch_size at
 // 100 MB, so every fixture table is one batch per arm and no suite run has
 // ever driven an arm past a single round. These TEST_CASEs generate their own
 // yaml via write_mgpu_yaml instead, which is why they change no config file.
@@ -57,9 +56,8 @@
 // the GPU that produced its input batch. `tasks_executed` per executor proves
 // distribution, not locality, and the suite has no mechanism for the stronger
 // property. Demonstrating it needs either an nsys run or a negative control
-// that forces `partition_idx == 0` onto the sink, and the latter would mean a
-// behaviour hook in production code. See the union-all note set's
-// gpu-handoff.md §2.
+// that stamps a fixed device onto the sink's output, and the latter would mean a
+// behaviour hook in production code.
 
 #include "mgpu_test_utils.hpp"
 
@@ -87,9 +85,9 @@ namespace {
 // gives each file its own batch: 8 batches for the wide arm, 2 for the middle
 // one, 1 for the narrow one. That asymmetry exercises the source-at-a-time
 // handoff at a row count that keeps the CPU-oracle comparison cheap enough for
-// CI. Mirrors test/cpp/scan_manager/test_pin_table_multi_gpu.cpp:139.
-// hash_partition_bytes is left at its default: UNION ALL does not partition,
-// so shrinking it would only add noise from the scan side.
+// CI. Mirrors "pin_table - PIN-MGPU-01 multi-GPU chunk distribution".
+// hash_partition_bytes is left at its default: the union does not partition,
+// and the distinct cases spread duplicates across batches, not partitions.
 constexpr uint64_t kSmallScanBatchBytes = 1'000'000;
 
 mgpu_env_params make_params(int num_gpus)
