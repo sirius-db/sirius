@@ -62,6 +62,7 @@
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_set_operation.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
@@ -1844,4 +1845,44 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   for (auto& arm : union_op->children) {
     CHECK(arm->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
   }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a UNION arm planning another type than the union declares is "
+                 "rejected",
+                 "[plan_tree_shape][union][isolated_context]")
+{
+  // An aggregate arm plans BIGINT under the union's declared HUGEINT; that narrowing is allowed.
+  REQUIRE_NOTHROW(generate_sirius_plan(
+    *con, "SELECT sum(id) FROM big_left UNION ALL SELECT sum(rid) FROM small_right"));
+
+  // No SQL yields any other mismatch, so declare a type both INTEGER arms disagree with.
+  auto begin = con->Query("BEGIN TRANSACTION");
+  REQUIRE(begin);
+  REQUIRE_FALSE(begin->HasError());
+  auto logical = con->ExtractPlan("SELECT id FROM big_left UNION ALL SELECT rid FROM small_right");
+  REQUIRE(logical);
+  logical->ResolveOperatorTypes();
+  ColumnBindingResolver resolver;
+  resolver.VisitOperator(*logical);
+  auto* set_operation = logical.get();
+  while (set_operation->type != duckdb::LogicalOperatorType::LOGICAL_UNION) {
+    REQUIRE(set_operation->children.size() == 1);
+    set_operation = set_operation->children.front().get();
+  }
+  REQUIRE(set_operation->types.size() == 1);
+  REQUIRE(set_operation->types[0] == duckdb::LogicalType::INTEGER);
+  set_operation->types[0] = duckdb::LogicalType::DOUBLE;
+
+  // The public entry point re-resolves types, which would undo the edit; plan the union itself.
+  struct probe_generator : sirius::planner::sirius_physical_plan_generator {
+    using sirius_physical_plan_generator::create_plan;
+    using sirius_physical_plan_generator::sirius_physical_plan_generator;
+  } generator(*con->context);
+  CHECK_THROWS_WITH(generator.create_plan(set_operation->Cast<duckdb::LogicalSetOperation>()),
+                    Catch::Matchers::ContainsSubstring("UNION: arm 0 plans") &&
+                      Catch::Matchers::ContainsSubstring("for column 0 but the union declares"));
+  auto rollback = con->Query("ROLLBACK");
+  REQUIRE(rollback);
+  REQUIRE_FALSE(rollback->HasError());
 }
