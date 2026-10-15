@@ -40,7 +40,8 @@ class parquet_scan_core {
     const cucascade::memory::memory_space& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache);
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    expression_query_policy policy = {});
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& table,
@@ -49,7 +50,8 @@ class parquet_scan_core {
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
     std::unique_ptr<cudf::column>* survivors,
-    std::span<std::size_t const> elided);
+    std::span<std::size_t const> elided,
+    expression_query_policy policy = {});
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept { return *_info; }
 

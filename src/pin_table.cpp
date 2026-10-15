@@ -387,7 +387,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // A pin reads its fixed ingestible on the one ioctx it was given; route every file to it.
     auto task = ingestible.next_split_provider([io_ctx_sp](std::string_view) { return io_ctx_sp; });
     if (!task) { continue; }
-    auto info = task({});
+    auto info = task();
     if (!info) { continue; }
     for (auto& b : coalescer->push(std::move(info))) {
       handle_batch(std::move(b));

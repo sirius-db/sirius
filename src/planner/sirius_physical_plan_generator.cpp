@@ -30,6 +30,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
@@ -404,7 +405,10 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
         break;
       }
       std::optional<duckdb::Value> missing;
-      if (found->default_expression) missing = found->GetDefaultValue();
+      if (found->default_expression) {
+        auto const& constant = found->default_expression->Cast<duckdb::ConstantExpression>();
+        missing              = constant.GetLiteral().ToValue();
+      }
       requirements.push_back(
         {found->GetIdentifierFieldId(), found->type, std::move(missing), true, true});
     }

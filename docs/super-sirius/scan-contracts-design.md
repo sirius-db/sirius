@@ -87,6 +87,19 @@ Unbounded inputs, the statement deletion-vector limit, or insufficient host capa
 
 Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
 
+### Host Arrow batch source contract
+
+The shared host Arrow path has two explicit boundaries. `import_arrow_host()` consumes one
+owned `ArrowSchema` plus `ArrowArray` record batch and retains its input capacity through
+the retirement lane. `materialize_arrow_stream()` consumes a sequential internal
+`arrow_batch_source`: each item carries an independently owned batch, a contiguous
+sequence number, and declared row and byte bounds; `nullopt` is the only EOS marker.
+The verifier compares the declared row count with the imported batch, sends results
+directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink
+failure. Producers acquire preparation/output capacity and split oversized input before
+returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but
+R4 does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
+
 ### Preparation limits
 
 Preparation limits default to values derived from the scan worker count. They bound active jobs, units, pending results, and coalescing work. By default, coordinator waits check interruption every 10 ms; draining an active read can take longer. An underfilled batch becomes due 10 ms after its first retained input, without waiting for later metadata. New arrivals do not reset that deadline. Publication still requires output capacity and can be delayed by scheduling. The limits and timing values accept startup YAML overrides under [`sirius.executor.scan_manager.preparation`](configuration.md#siriusexecutorscan_managerpreparation); a zero residence disables timed publication.

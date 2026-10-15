@@ -215,4 +215,41 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
   if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
   return batch;
 }
+
+arrow_stream_result materialize_arrow_stream(arrow_batch_source& source,
+                                             materialization_program const& program,
+                                             exec::retire_lane& lane,
+                                             rmm::device_async_resource_ref mr,
+                                             arrow_batch_sink sink,
+                                             arrow_stream_limits limits)
+{
+  arrow_stream_result result;
+  try {
+    if (!sink || limits.max_batch_rows < 0)
+      throw std::invalid_argument("invalid Arrow stream limits or sink");
+    while (true) {
+      auto item = source.next();
+      if (!item) return result;
+      if (!item->input || !item->input->has_capacity())
+        throw std::invalid_argument("Arrow stream batch has no ownership capacity");
+      if (item->sequence != result.batches)
+        throw std::invalid_argument("Arrow stream batch sequence is not contiguous");
+      if (item->rows < 0 || item->rows > limits.max_batch_rows ||
+          item->bytes > limits.max_batch_bytes)
+        throw std::invalid_argument("Arrow stream batch exceeds its declared limits");
+
+      auto batch = import_arrow_host(item->input, program, lane, mr);
+      if (batch.rows != item->rows)
+        throw std::invalid_argument("Arrow stream row envelope does not match the batch");
+      if (result.rows > std::numeric_limits<std::int64_t>::max() - batch.rows)
+        throw std::overflow_error("Arrow stream row count overflow");
+      sink(std::move(batch));
+      ++result.batches;
+      result.rows += item->rows;
+    }
+  } catch (...) {
+    source.cancel();
+    throw;
+  }
+}
 }  // namespace sirius::op::scan

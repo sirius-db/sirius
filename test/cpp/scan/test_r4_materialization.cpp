@@ -17,6 +17,9 @@
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
+#include <deque>
+#include <stdexcept>
+
 using namespace sirius::op::scan;
 namespace {
 std::unique_ptr<cudf::column> constant(int32_t value, int rows, ::cuda::stream_ref stream)
@@ -67,6 +70,31 @@ struct arrow_fixture {
     };
   }
 };
+
+struct test_arrow_source final : arrow_batch_source {
+  std::deque<arrow_stream_batch> queue;
+  bool throw_when_empty = false;
+  int next_calls        = 0;
+  int cancel_calls      = 0;
+
+  std::optional<arrow_stream_batch> next() override
+  {
+    ++next_calls;
+    if (queue.empty()) {
+      if (throw_when_empty) throw std::runtime_error("test source failure");
+      return std::nullopt;
+    }
+    auto item = std::move(queue.front());
+    queue.pop_front();
+    return item;
+  }
+  void cancel() noexcept override { ++cancel_calls; }
+};
+
+std::shared_ptr<owned_arrow_batch> owned_fixture(std::shared_ptr<arrow_fixture> const& fixture)
+{
+  return std::make_shared<owned_arrow_batch>(fixture->schema, fixture->array, fixture);
+}
 }  // namespace
 
 TEST_CASE("R4 row domain preserves file offsets and refuses holes", "[r4][scan]")
@@ -128,6 +156,123 @@ TEST_CASE("R4 Arrow import owns its source through retirement and shared finish"
   REQUIRE(output.projection_complete);
   REQUIRE(lane.quiesce() == cudaSuccess);
   REQUIRE(released == 1);
+}
+
+TEST_CASE("R4 Arrow stream keeps empty batches separate from EOS", "[r4][scan]")
+{
+  rmm::cuda_stream stream;
+  sirius::exec::retire_lane lane(stream.value());
+  int released            = 0;
+  auto empty              = std::make_shared<arrow_fixture>(released);
+  empty->array.length     = 0;
+  empty->child.null_count = 0;
+  auto second             = std::make_shared<arrow_fixture>(released);
+  test_arrow_source source;
+  source.queue.push_back({owned_fixture(empty), 0, 0, 0});
+  source.queue.push_back({owned_fixture(second), 1, 3, sizeof(second->values)});
+  materialization_program program{11, 7, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
+  program.input_types = program.output_types;
+  int received        = 0;
+  auto result         = materialize_arrow_stream(source,
+                                         program,
+                                         lane,
+                                         cudf::get_current_device_resource_ref(),
+                                         [&](materialized_batch&& batch) {
+                                           ++received;
+                                           REQUIRE((batch.rows == 0 || batch.rows == 3));
+                                         });
+  REQUIRE(result.batches == 2);
+  REQUIRE(result.rows == 3);
+  REQUIRE(received == 2);
+  REQUIRE(source.next_calls == 3);
+  REQUIRE(source.cancel_calls == 0);
+  REQUIRE(lane.quiesce() == cudaSuccess);
+  REQUIRE(released == 2);
+}
+
+TEST_CASE("R4 Arrow stream validates envelopes and cancels on import or source failure",
+          "[r4][scan]")
+{
+  rmm::cuda_stream stream;
+  auto mr = cudf::get_current_device_resource_ref();
+  materialization_program program{11, 7, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
+  program.input_types = program.output_types;
+
+  SECTION("sequence and byte limits")
+  {
+    sirius::exec::retire_lane lane(stream.value());
+    int released = 0;
+    auto f       = std::make_shared<arrow_fixture>(released);
+    test_arrow_source source;
+    source.queue.push_back({owned_fixture(f), 1, 3, sizeof(f->values)});
+    REQUIRE_THROWS(materialize_arrow_stream(
+      source, program, lane, mr, [](materialized_batch&&) {}, arrow_stream_limits{3, 1}));
+    REQUIRE(source.cancel_calls == 1);
+    REQUIRE(lane.quiesce() == cudaSuccess);
+    REQUIRE(released == 1);
+  }
+
+  SECTION("second batch schema failure")
+  {
+    sirius::exec::retire_lane lane(stream.value());
+    int released             = 0;
+    auto first               = std::make_shared<arrow_fixture>(released);
+    auto bad                 = std::make_shared<arrow_fixture>(released);
+    bad->child_schema.format = "l";
+    test_arrow_source source;
+    source.queue.push_back({owned_fixture(first), 0, 3, sizeof(first->values)});
+    source.queue.push_back({owned_fixture(bad), 1, 3, sizeof(bad->values)});
+    int received = 0;
+    REQUIRE_THROWS(materialize_arrow_stream(
+      source, program, lane, mr, [&](materialized_batch&&) { ++received; }));
+    REQUIRE(received == 1);
+    REQUIRE(source.cancel_calls == 1);
+    REQUIRE(lane.quiesce() == cudaSuccess);
+    REQUIRE(released == 2);
+  }
+
+  SECTION("source failure")
+  {
+    sirius::exec::retire_lane lane(stream.value());
+    int released = 0;
+    auto f       = std::make_shared<arrow_fixture>(released);
+    test_arrow_source source;
+    source.queue.push_back({owned_fixture(f), 0, 3, sizeof(f->values)});
+    source.throw_when_empty = true;
+    REQUIRE_THROWS(
+      materialize_arrow_stream(source, program, lane, mr, [](materialized_batch&&) {}));
+    REQUIRE(source.cancel_calls == 1);
+    REQUIRE(lane.quiesce() == cudaSuccess);
+    REQUIRE(released == 1);
+  }
+
+  SECTION("row envelope mismatch")
+  {
+    sirius::exec::retire_lane lane(stream.value());
+    int released = 0;
+    auto f       = std::make_shared<arrow_fixture>(released);
+    test_arrow_source source;
+    source.queue.push_back({owned_fixture(f), 0, 2, sizeof(f->values)});
+    REQUIRE_THROWS(
+      materialize_arrow_stream(source, program, lane, mr, [](materialized_batch&&) {}));
+    REQUIRE(source.cancel_calls == 1);
+    REQUIRE(lane.quiesce() == cudaSuccess);
+    REQUIRE(released == 1);
+  }
+
+  SECTION("sink failure")
+  {
+    sirius::exec::retire_lane lane(stream.value());
+    int released = 0;
+    auto f       = std::make_shared<arrow_fixture>(released);
+    test_arrow_source source;
+    source.queue.push_back({owned_fixture(f), 0, 3, sizeof(f->values)});
+    REQUIRE_THROWS(materialize_arrow_stream(
+      source, program, lane, mr, [](materialized_batch&&) { throw std::runtime_error("sink"); }));
+    REQUIRE(source.cancel_calls == 1);
+    REQUIRE(lane.quiesce() == cudaSuccess);
+    REQUIRE(released == 1);
+  }
 }
 
 TEST_CASE("R4 direct GPU reader skips completed steps and retains zero column cardinality",

@@ -19,6 +19,7 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
 
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
@@ -184,7 +185,7 @@ bool has_unreliable_bloom_filter_probe(duckdb::LogicalType const& type)
 bool references_unreliable_bloom_filter_column(duckdb::Expression const& expr)
 {
   if (expr.GetExpressionType() == duckdb::ExpressionType::BOUND_REF) {
-    return has_unreliable_bloom_filter_probe(expr.return_type);
+    return has_unreliable_bloom_filter_probe(expr.GetReturnType());
   }
   bool found = false;
   duckdb::ExpressionIterator::EnumerateChildren(expr, [&](duckdb::Expression const& child) {
@@ -228,7 +229,7 @@ duckdb::unique_ptr<duckdb::Expression> conjuncts_without(duckdb::Expression cons
 
   auto const& conjunction = expr.Cast<duckdb::BoundConjunctionExpression>();
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> kept;
-  for (auto const& child : conjunction.children) {
+  for (auto const& child : conjunction.GetChildren()) {
     if (!is_dropped(*child)) { kept.push_back(child->Copy()); }
   }
   if (kept.empty()) { return nullptr; }
@@ -237,7 +238,7 @@ duckdb::unique_ptr<duckdb::Expression> conjuncts_without(duckdb::Expression cons
   auto out =
     duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
   for (auto& child : kept) {
-    out->children.push_back(std::move(child));
+    out->GetChildrenMutable().push_back(std::move(child));
   }
   return out;
 }
@@ -263,12 +264,14 @@ std::vector<null_prune_predicate> collect_null_prune_predicates(
   std::vector<null_prune_predicate> out;
 
   auto classify = [](duckdb::TableFilterType type) -> std::optional<bool> {
-    if (type == duckdb::TableFilterType::IS_NULL) { return true; }
-    if (type == duckdb::TableFilterType::IS_NOT_NULL) { return false; }
+    if (type == duckdb::TableFilterType::LEGACY_IS_NULL) { return true; }
+    if (type == duckdb::TableFilterType::LEGACY_IS_NOT_NULL) { return false; }
     return std::nullopt;
   };
 
-  for (auto const& [column_index, filter] : filters.filters) {
+  for (auto const& entry : filters) {
+    auto const column_index = entry.GetIndex();
+    auto const& filter      = entry.Filter();
     if (column_index >= column_ids.size() || column_ids[column_index].IsVirtualColumn()) {
       continue;
     }
@@ -280,10 +283,19 @@ std::vector<null_prune_predicate> collect_null_prune_predicates(
     if (column.status != sirius::op::filter_column_status::usable) { continue; }
     auto const index = static_cast<duckdb::idx_t>(column.batch_position);
 
-    if (auto expects_null = classify(filter->filter_type)) {
+    std::optional<bool> expects_null = classify(filter.filter_type);
+    if (!expects_null && filter.filter_type == duckdb::TableFilterType::EXPRESSION_FILTER) {
+      auto const& expression_filter = filter.Cast<duckdb::ExpressionFilter>();
+      switch (expression_filter.expr->GetExpressionType()) {
+        case duckdb::ExpressionType::OPERATOR_IS_NULL: expects_null = true; break;
+        case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL: expects_null = false; break;
+        default: break;
+      }
+    }
+    if (expects_null) {
       out.push_back(null_prune_predicate{index, *expects_null});
-    } else if (filter->filter_type == duckdb::TableFilterType::CONJUNCTION_AND) {
-      for (auto const& child : filter->Cast<duckdb::ConjunctionAndFilter>().child_filters) {
+    } else if (filter.filter_type == duckdb::TableFilterType::LEGACY_CONJUNCTION_AND) {
+      for (auto const& child : filter.Cast<duckdb::LegacyConjunctionAndFilter>().child_filters) {
         if (auto nested = classify(child->filter_type)) {
           out.push_back(null_prune_predicate{index, *nested});
         }
@@ -718,7 +730,7 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
   // column_ids with empty projection_ids, the no-pushdown sirius_read_parquet
   // case), filter pushdown, or hive-partition injection — needs column names.
   bool const needs_names = !bind.projection_ids.empty() ||
-                           (bind.table_filters && !bind.table_filters->filters.empty()) ||
+                           (bind.table_filters && bind.table_filters->HasFilters()) ||
                            !bind.partition_indices.empty() ||
                            column_ids_need_reader_projection(bind.column_ids, bind.names.size());
   if (needs_names && bind.names.empty()) {
@@ -741,8 +753,9 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
   // AST translation deferred to materialize_table so a task-local stream is used.
   // Filters on hive-partition columns are dropped — those columns aren't in the
   // parquet file (DuckDB prunes them at the file-list level already).
-  if (bind.table_filters && !bind.table_filters->filters.empty()) {
-    for (auto const& [column_index, filter] : bind.table_filters->filters) {
+  if (bind.table_filters && bind.table_filters->HasFilters()) {
+    for (auto const& entry : *bind.table_filters) {
+      auto const column_index = entry.GetIndex();
       if (column_index < bind.column_ids.size() &&
           _virtual_types.contains(bind.column_ids[column_index].GetPrimaryIndex())) {
         _has_virtual_filter = true;
@@ -775,16 +788,19 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
       // Keep virtual predicates for the residual; prune only on physical conjuncts.
       std::shared_ptr<duckdb::Expression> stats_candidate = _duckdb_filter_expression;
       if (_has_virtual_filter) {
-        duckdb::TableFilterSet physical_filters;
-        for (auto const& [column_index, filter] : bind.table_filters->filters) {
+        auto physical_filters = bind.table_filters->Copy();
+        std::vector<duckdb::ProjectionIndex> remove_columns;
+        for (auto const& entry : *bind.table_filters) {
+          auto const column_index = entry.GetIndex();
           if (column_index >= bind.column_ids.size() ||
               _virtual_types.contains(bind.column_ids[column_index].GetPrimaryIndex())) {
-            continue;
+            remove_columns.push_back(column_index);
           }
-          physical_filters.filters.emplace(column_index, filter->Copy());
         }
+        for (auto const column_index : remove_columns)
+          physical_filters->RemoveFilterByColumnIndex(column_index);
         stats_candidate =
-          sirius::op::convert_table_filters_to_expression(physical_filters,
+          sirius::op::convert_table_filters_to_expression(*physical_filters,
                                                           bind.column_ids,
                                                           bind.returned_types,
                                                           _plan->batch_position_by_column_id,
@@ -928,7 +944,7 @@ bool parquet_scan_core::has_processed_all_metadata() const
   return _next_file_idx.load(std::memory_order_relaxed) >= _file_paths.size();
 }
 
-std::function<std::unique_ptr<op::scan::scan_info>()> parquet_scan_core::next_split_provider(
+parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   io::ioctx_resolver resolve)
 {
   if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
@@ -992,7 +1008,7 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   // Probe only when the footer will actually be read: once the metadata store
   // holds this file's parsed footer, a suffix GET would download bytes nothing
   // consumes, and the open only needs the size. Mirrors describe_parquet.
-  bool const footer_cached = io_ctx->metadata_store().has_candidate(file_path);
+  bool const footer_cached = io_ctx->metadata_store().has_path(file_path);
   std::shared_ptr<io::sirius_datasource> sirius_ds;
   {
     sirius_ds = io_ctx->open_datasource(
@@ -1111,7 +1127,8 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
                                              resolved_metadata->original_logical_annotations);
     if (!checked.approved && _info->field_mapping_requirements &&
         checked.reason != verdict_reason::iceberg_schema_no_field_ids &&
-        checked.reason != verdict_reason::iceberg_schema_no_rows) {
+        checked.reason != verdict_reason::iceberg_schema_no_rows &&
+        checked.reason != verdict_reason::iceberg_schema_invalid_field_id) {
       try {
         // A missing ID is not a missing field: untagged files require name-mapping
         // semantics, which iceberg_flat_v1 deliberately does not claim.
@@ -1212,8 +1229,8 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   // a mismatched predicate incorrectly prune the very group that must refuse.
   std::set<std::size_t> pruning_columns;
   std::function<void(duckdb::Expression const&)> collect = [&](auto const& expression) {
-    if (expression.expression_class == duckdb::ExpressionClass::BOUND_REF) {
-      pruning_columns.insert(expression.template Cast<duckdb::BoundReferenceExpression>().index);
+    if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      pruning_columns.insert(expression.template Cast<duckdb::BoundReferenceExpression>().Index());
     }
     duckdb::ExpressionIterator::EnumerateChildren(expression, collect);
   };
@@ -1744,7 +1761,8 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
   const cucascade::memory::memory_space& mem_space,
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
-  std::shared_ptr<const like_multiliteral_cache> like_cache)
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  expression_query_policy policy)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
   if (split.field_mapping) {
@@ -1960,7 +1978,7 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
       sirius::expression_evaluator exec(sirius_filter_ast.get(),
                                         mr_ref,
                                         stream,
-                                        strategy_from_config(),
+                                        policy,
                                         sirius::expression_evaluator::default_min_ast_size,
                                         like_swar_fastpath,
                                         like_cache);
@@ -2011,7 +2029,8 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* survivors,
-  std::span<std::size_t const> elided)
+  std::span<std::size_t const> elided,
+  expression_query_policy policy)
 {
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
@@ -2058,7 +2077,7 @@ std::unique_ptr<cudf::table> parquet_scan_core::post_filter_and_project(
         sirius::expression_evaluator exec(sirius_filter_ast.get(),
                                           mr_ref,
                                           stream,
-                                          strategy_from_config(),
+                                          policy,
                                           sirius::expression_evaluator::default_min_ast_size,
                                           like_swar_fastpath,
                                           std::move(like_cache));

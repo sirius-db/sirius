@@ -123,12 +123,16 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
       slot->op_id,
       device,
       op::scan::scan_operator_input::prefetch_start::deferred);
-    auto bytes = input->get_estimated_size_in_bytes();
-    return preparation_coordinator::publication{std::move(input), bytes};
+    auto bytes      = input->get_estimated_size_in_bytes();
+    auto* input_ptr = input.get();
+    preparation_coordinator::publication publication{std::move(input), bytes};
+    publication.prepare = [input_ptr] {
+      static_cast<op::scan::scan_operator_input&>(*input_ptr).initialize_prefetch();
+    };
+    return publication;
   };
-  source.prepare_publish = [](preparation_coordinator::publication& publication) {
-    static_cast<op::scan::scan_operator_input&>(*publication.input).initialize_prefetch();
-  };
+  // The publication's prepare callback is installed by construct while the concrete input is
+  // still available.
   source.publish = [slot](preparation_coordinator::publication& publication) {
     slot->connector->push_split_sized(
       std::move(publication.input), publication.bytes, publication.preparation_bytes);

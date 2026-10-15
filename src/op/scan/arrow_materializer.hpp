@@ -5,6 +5,12 @@
 
 #include <duckdb/common/arrow/arrow.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <optional>
+
 namespace sirius::op::scan {
 // Ownership of the entire schema/array tree is transferred here. The producer must
 // detach any statement-affine release callbacks before publication. Capacity retains
@@ -15,6 +21,7 @@ class owned_arrow_batch {
   ~owned_arrow_batch();
   owned_arrow_batch(owned_arrow_batch const&)            = delete;
   owned_arrow_batch& operator=(owned_arrow_batch const&) = delete;
+  bool has_capacity() const noexcept { return static_cast<bool>(capacity); }
 
  private:
   friend materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch>,
@@ -33,4 +40,40 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch>,
                                      materialization_program const&,
                                      exec::retire_lane&,
                                      rmm::device_async_resource_ref);
+
+struct arrow_stream_batch {
+  std::shared_ptr<owned_arrow_batch> input;
+  std::uint64_t sequence = 0;
+  std::int64_t rows      = 0;
+  std::size_t bytes      = 0;
+};
+
+class arrow_batch_source {
+ public:
+  virtual ~arrow_batch_source()                    = default;
+  virtual std::optional<arrow_stream_batch> next() = 0;
+  virtual void cancel() noexcept                   = 0;
+};
+
+struct arrow_stream_limits {
+  std::int64_t max_batch_rows = std::numeric_limits<std::int64_t>::max();
+  std::size_t max_batch_bytes = std::numeric_limits<std::size_t>::max();
+};
+
+struct arrow_stream_result {
+  std::size_t batches = 0;
+  std::int64_t rows   = 0;
+};
+
+using arrow_batch_sink = std::function<void(materialized_batch&&)>;
+
+// Sequentially verifies and materializes a bounded source of owned Arrow batches.
+// The source owns cursor progress and backpressure; this function never creates an
+// unbounded queue and treats std::nullopt as EOS (a zero-row batch remains data).
+arrow_stream_result materialize_arrow_stream(arrow_batch_source&,
+                                             materialization_program const&,
+                                             exec::retire_lane&,
+                                             rmm::device_async_resource_ref,
+                                             arrow_batch_sink,
+                                             arrow_stream_limits = {});
 }  // namespace sirius::op::scan
