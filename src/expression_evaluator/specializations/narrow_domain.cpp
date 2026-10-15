@@ -29,8 +29,6 @@
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/scalar/scalar.hpp>
 
-#include <variant>
-
 // standard library
 #include <optional>
 #include <variant>

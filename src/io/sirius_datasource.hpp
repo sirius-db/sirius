@@ -32,8 +32,6 @@
 
 namespace sirius::io {
 
-using cudf_datasource_stream_t = ::cuda::stream_ref;
-
 // ---------------------------------------------------------------------------
 // sirius_datasource
 // ---------------------------------------------------------------------------
@@ -130,16 +128,13 @@ class sirius_datasource : public cudf::io::datasource {
 
   std::unique_ptr<datasource::buffer> device_read(size_t offset,
                                                   size_t size,
-                                                  cudf_datasource_stream_t stream) override;
-  size_t device_read(size_t offset,
-                     size_t size,
-                     uint8_t* dst,
-                     cudf_datasource_stream_t stream) override;
+                                                  ::cuda::stream_ref stream) override;
+  size_t device_read(size_t offset, size_t size, uint8_t* dst, ::cuda::stream_ref stream) override;
 
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,
-                                        cudf_datasource_stream_t stream) override;
+                                        ::cuda::stream_ref stream) override;
 
   /// \brief Vectored form of @c device_read_async: read every range into its own
   /// device destination in a single dispatch.
