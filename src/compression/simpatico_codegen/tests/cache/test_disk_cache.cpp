@@ -338,7 +338,10 @@ void cleanup(const fs::path& root)
   touch(location / "unrelated.cubin");
   touch(location / "v3" / std::string(hex_size, 'a') / request);
   touch(location / "v2" / "unknown-namespace" / request);
-  cache::clear_disk_cache(location.string());
+  const auto root_link = root / "cleanup-root-link";
+  fs::create_directory_symlink(location, root_link);
+  cache::clear_disk_cache(root_link.string());
+  require(fs::is_symlink(root_link), "cleanup removed the trusted root symlink");
   require(!fs::exists(environment / request) && !fs::exists(location / legacy),
           "recognized entries retained");
   require(!fs::exists(environment / (request + ".tmp.Abc123")), "abandoned temporary retained");
@@ -399,7 +402,10 @@ void pruning(const fs::path& root)
   fs::create_symlink(outside / request, legacy_link);
   fs::last_write_time(preserved, now - hours(6));
 
-  cache::prune_disk_cache(location.string(), cache::content_identity("current"));
+  const auto root_link = root / "prune-root-link";
+  fs::create_directory_symlink(location, root_link);
+  cache::prune_disk_cache(root_link.string(), cache::content_identity("current"));
+  require(fs::is_symlink(root_link), "pruning removed the trusted root symlink");
   require(fs::exists(current / request), "pruned the current environment");
   require(fs::last_write_time(current) >= now, "first use did not refresh the current environment");
   for (std::size_t index = 0; index < others.size(); ++index)
@@ -430,18 +436,22 @@ void pruning(const fs::path& root)
     require(fs::exists(recent[index] / request) == (index < recent.size() - 1),
             "one-hour grace or future timestamp not respected");
 
-  // Configured paths are also checked without following their final symlinks.
+  // Only the trusted root may be a symlink; descendants are never followed.
   fs::last_write_time(outside, now - hours(24));
   const auto outside_time = fs::last_write_time(outside);
-  const auto root_link    = root / "root-link";
-  fs::create_directory_symlink(outside, root_link);
   fs::create_directories(root / "version-link");
   fs::create_directory_symlink(outside, root / "version-link" / "v2");
   fs::create_directories(root / "current-link" / "v2");
   fs::create_directory_symlink(
     outside, root / "current-link" / "v2" / cache::hex_digest(cache::content_identity("current")));
-  for (const auto& path : {root_link, root / "version-link", root / "current-link"})
+  for (const auto& path : {root / "version-link", root / "current-link"}) {
     cache::prune_disk_cache(path.string(), cache::content_identity("current"));
+    cache::clear_disk_cache(path.string());
+  }
+  require(fs::is_symlink(root / "version-link" / "v2"), "maintenance removed version symlink");
+  require(fs::is_symlink(root / "current-link" / "v2" /
+                         cache::hex_digest(cache::content_identity("current"))),
+          "maintenance removed current environment symlink");
   require(fs::last_write_time(outside) == outside_time, "maintenance touched a symlink target");
   require(std::distance(fs::directory_iterator(outside), fs::directory_iterator{}) == 1,
           "maintenance created content through a symlink");

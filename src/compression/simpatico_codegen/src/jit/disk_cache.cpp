@@ -236,14 +236,16 @@ void prune_disk_cache(const std::string& root, const Digest& current_environment
 {
   if (root.empty()) return;
   try {
-    namespace fs        = std::filesystem;
-    const fs::path base = root;
-    const auto spaces   = base / kCacheFormatVersion;
-    const auto current  = spaces / hex_digest(current_environment);
+    namespace fs = std::filesystem;
     std::error_code error;
-    // Check each level separately so a root, v2, or environment symlink is
-    // neither traversed nor touched by automatic maintenance.
-    for (const auto& directory : {base, spaces, current}) {
+    fs::create_directories(root, error);
+    if (error) return;
+    const auto base = fs::canonical(root, error);
+    if (error || !is_directory_no_follow(base)) return;
+    const auto spaces  = base / kCacheFormatVersion;
+    const auto current = spaces / hex_digest(current_environment);
+    // The configured root is trusted; do not follow symlinks below it.
+    for (const auto& directory : {spaces, current}) {
       fs::create_directories(directory, error);
       if (error || !is_directory_no_follow(directory)) return;
     }
@@ -278,9 +280,11 @@ void clear_disk_cache(const std::string& root) noexcept
 {
   if (root.empty()) return;
   try {
-    if (!is_directory_no_follow(root)) return;
-    clear_legacy_files(root);
-    const auto spaces = std::filesystem::path(root) / kCacheFormatVersion;
+    std::error_code error;
+    const auto base = std::filesystem::canonical(root, error);
+    if (error || !is_directory_no_follow(base)) return;
+    clear_legacy_files(base);
+    const auto spaces = base / kCacheFormatVersion;
     visit_directory(spaces, [&](const auto& entry) {
       if (is_environment(entry)) clear_environment(entry.path());
     });

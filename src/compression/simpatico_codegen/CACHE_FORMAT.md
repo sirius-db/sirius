@@ -142,8 +142,9 @@ under the configured root:
 - `v2/<32 lowercase hex>/<32 lowercase hex>.cubin`, and their
   `.tmp.<six alphanumeric characters>` remnants.
 
-Both prune empty recognized directories but never remove the configured root,
-follow symlinks, traverse arbitrary nested directories, or remove unknown
+The configured root is trusted and may be a symlink to a directory. Both prune
+empty recognized directories but never remove that root or its alias, follow
+symlinks below it, traverse arbitrary nested directories, or remove unknown
 versions/unrelated names. Maintenance assumes a trusted directory, not a security
 boundary against a process actively replacing directories.
 
