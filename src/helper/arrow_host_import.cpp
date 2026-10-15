@@ -210,6 +210,14 @@ const std::uint8_t* validity_of(const ArrowArray& array)
            : nullptr;
 }
 
+std::int32_t string_offset(const void* buffer, std::int64_t index)
+{
+  std::int32_t value;
+  std::memcpy(
+    &value, static_cast<const std::uint8_t*>(buffer) + index * sizeof(value), sizeof(value));
+  return value;
+}
+
 void validate_batch(const ArrowArray* array,
                     const ArrowSchema* schema,
                     std::string_view error_prefix,
@@ -414,12 +422,14 @@ arrow_host_import_plan inspect_arrow_host_batch(const ArrowArray* array,
       refuse("has too many rows for string offsets");
     }
     if (strings && array->length > 0) {
-      const auto* offsets = static_cast<const std::int32_t*>(child.buffers[1]);
-      if (offsets[begin] < 0) { refuse("has negative string offsets"); }
+      if (string_offset(child.buffers[1], begin) < 0) { refuse("has negative string offsets"); }
       for (auto row = begin; row < stop; ++row) {
-        if (offsets[row + 1] < offsets[row]) { refuse("has decreasing string offsets"); }
+        if (string_offset(child.buffers[1], row + 1) < string_offset(child.buffers[1], row)) {
+          refuse("has decreasing string offsets");
+        }
       }
-      const auto chars = static_cast<std::uint64_t>(offsets[stop] - offsets[begin]);
+      const auto chars = static_cast<std::uint64_t>(string_offset(child.buffers[1], stop) -
+                                                    string_offset(child.buffers[1], begin));
       if (chars != 0 && child.buffers[2] == nullptr) { refuse("has no string data buffer"); }
       charge(chars);
     } else if (!strings) {
@@ -442,8 +452,7 @@ arrow_host_import_plan inspect_arrow_host_batch(const ArrowArray* array,
         }
       }
     }
-    arrow_host_import_plan::column_input input{&child,
-                                               begin,
+    arrow_host_import_plan::column_input input{nullptr,
                                                nulls,
                                                expected[i].target,
                                                std::pmr::vector<std::uint8_t>(&host_resource),
@@ -452,9 +461,12 @@ arrow_host_import_plan inspect_arrow_host_batch(const ArrowArray* array,
     if (strings) {
       input.offsets.resize(static_cast<std::size_t>(array->length) + 1);
       if (array->length != 0) {
-        const auto* offsets = static_cast<const std::int32_t*>(child.buffers[1]);
+        const auto first = string_offset(child.buffers[1], begin);
         for (std::int64_t row = 0; row <= array->length; ++row) {
-          input.offsets[row] = offsets[begin + row] - offsets[begin];
+          input.offsets[row] = string_offset(child.buffers[1], begin + row) - first;
+        }
+        if (input.offsets.back() != 0) {
+          input.source = static_cast<const std::uint8_t*>(child.buffers[2]) + first;
         }
       }
       charge(input.offsets.size() * sizeof(std::int32_t));
@@ -481,6 +493,9 @@ arrow_host_import_plan inspect_arrow_host_batch(const ArrowArray* array,
           std::memcpy(input.values.data() + row * width, &narrowed, width);
         }
       }
+    } else if (array->length != 0) {
+      input.source =
+        static_cast<const std::uint8_t*>(child.buffers[1]) + begin * cudf::size_of(input.target);
     }
     if (nulls != 0) {
       input.validity.resize(cudf::bitmask_allocation_size_bytes(plan.rows_), 0);
@@ -531,12 +546,7 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const arrow_host_import_pla
              input.offsets.data(),
              input.offsets.size() * sizeof(std::int32_t));
         rmm::device_buffer chars(static_cast<std::size_t>(input.offsets.back()), stream, mr);
-        if (chars.size() != 0) {
-          const auto* source_offsets = static_cast<const std::int32_t*>(input.array->buffers[1]);
-          copy(chars.data(),
-               static_cast<const char*>(input.array->buffers[2]) + source_offsets[input.offset],
-               chars.size());
-        }
+        if (chars.size() != 0) { copy(chars.data(), input.source, chars.size()); }
         column = cudf::make_strings_column(plan.rows_,
                                            std::move(offsets),
                                            std::move(chars),
@@ -546,11 +556,8 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const arrow_host_import_pla
         column = cudf::make_fixed_width_column(
           input.target, plan.rows_, cudf::mask_state::UNALLOCATED, stream, mr);
         if (plan.rows_ != 0) {
-          const auto width = cudf::size_of(input.target);
-          const auto* source =
-            input.values.empty()
-              ? static_cast<const std::uint8_t*>(input.array->buffers[1]) + input.offset * width
-              : input.values.data();
+          const auto width   = cudf::size_of(input.target);
+          const auto* source = input.values.empty() ? input.source : input.values.data();
           copy(column->mutable_view().head<std::uint8_t>(),
                source,
                static_cast<std::size_t>(plan.rows_) * width);
@@ -563,7 +570,8 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const arrow_host_import_pla
     return std::make_unique<cudf::table>(std::move(columns));
   } catch (...) {
     const auto original = std::current_exception();
-    const auto status   = cudaStreamSynchronize(stream.value());
+    columns.clear();
+    const auto status = cudaStreamSynchronize(stream.value());
     if (status != cudaSuccess) {
       throw arrow_host_import_drain_error(
         std::string(plan.error_prefix_) +

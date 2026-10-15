@@ -97,4 +97,4 @@ pixi run build/release/test/cpp/sirius_unittest '[arrow_host_import]'
 
 The helper tests do not qualify Paimon GPU execution. That requires the controlled
 native bridge, preparation/admission, authenticated binding and end-to-end adapter
-acceptance tracked in #139 (duckdb-paimon), #2211, #2212 and #2213.
+acceptance tracked in polardb/duckdb-paimon#139, #2211, #2212 and #2213.

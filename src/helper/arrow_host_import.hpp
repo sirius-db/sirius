@@ -74,8 +74,7 @@ class arrow_host_import_plan {
 
  private:
   struct column_input {
-    const ArrowArray* array;
-    std::int64_t offset;
+    const void* source;
     std::int64_t null_count;
     cudf::data_type target;
     std::pmr::vector<std::uint8_t> values;

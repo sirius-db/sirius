@@ -24,6 +24,7 @@
 #include "sirius/exception.hpp"
 #include "utils/arrow_batch_utils.hpp"
 
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -37,19 +38,73 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
 #include <memory_resource>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 using Catch::Matchers::ContainsSubstring;
 using sirius::test::arrow_batch_from_sql;
-using sirius::test::operator_utils::copy_column_to_host;
 
 namespace {
+
+template <typename T>
+class scoped_restore {
+ public:
+  explicit scoped_restore(T& target) : target_(target), saved_(target) {}
+  ~scoped_restore() { target_ = saved_; }
+  scoped_restore(const scoped_restore&)            = delete;
+  scoped_restore& operator=(const scoped_restore&) = delete;
+
+ private:
+  T& target_;
+  T saved_;
+};
+
+template <typename T>
+std::vector<T> copy_column_to_host(const cudf::column_view& column)
+{
+  if constexpr (!std::is_same_v<T, std::string>) {
+    return sirius::test::operator_utils::copy_column_to_host<T>(column, cudf::get_default_stream());
+  } else {
+    REQUIRE(column.offset() == 0);
+    if (column.size() == 0) { return {}; }
+    cudf::strings_column_view strings(column);
+    const auto offsets = sirius::test::operator_utils::copy_column_to_host<std::int32_t>(
+      strings.offsets(), cudf::get_default_stream());
+    REQUIRE(offsets.size() == static_cast<std::size_t>(column.size()) + 1);
+    REQUIRE(offsets.front() == 0);
+    REQUIRE(offsets.back() >= 0);
+    std::vector<char> chars(static_cast<std::size_t>(offsets.back()));
+    if (!chars.empty()) {
+      REQUIRE(cudaMemcpy(chars.data(),
+                         strings.chars_begin(cudf::get_default_stream()),
+                         chars.size(),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+    }
+    std::vector<std::string> result;
+    result.reserve(column.size());
+    for (cudf::size_type row = 0; row < column.size(); ++row) {
+      REQUIRE(offsets[row] >= 0);
+      REQUIRE(offsets[row] <= offsets[row + 1]);
+      REQUIRE(static_cast<std::size_t>(offsets[row + 1]) <= chars.size());
+      if (offsets[row] == offsets[row + 1]) {
+        result.emplace_back();
+      } else {
+        result.emplace_back(chars.data() + offsets[row], offsets[row + 1] - offsets[row]);
+      }
+    }
+    return result;
+  }
+}
 
 std::vector<sirius::logical_type> declared(const duckdb::vector<duckdb::LogicalType>& types)
 {
@@ -75,6 +130,8 @@ class import_test_resource {
     std::atomic<long> attempts{0};
     std::atomic<std::size_t> live_bytes{0};
     std::atomic<bool> failed{false};
+    std::atomic<int> callback_status{cudaSuccess};
+    bool delay_deallocation{false};
     long fail_at{-1};
   };
   explicit import_test_resource(
@@ -98,6 +155,12 @@ class import_test_resource {
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
+    if (counts->delay_deallocation) {
+      counts->callback_status = cudaLaunchHostFunc(
+        stream.get(),
+        [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(150)); },
+        nullptr);
+    }
     upstream_.deallocate(stream, pointer, bytes, alignment);
     counts->live_bytes -= bytes;
   }
@@ -224,6 +287,9 @@ TEST_CASE("arrow_host_import: refuses mismatched and unsupported batches before 
   const auto bigint = declared({duckdb::LogicalType::BIGINT});
   auto batch        = arrow_batch_from_sql("SELECT i::BIGINT AS a FROM range(3) t(i)");
   auto& column      = *batch->schema.children[0];
+  scoped_restore root_guard(batch->array);
+  scoped_restore child_guard(*batch->array.children[0]);
+  scoped_restore schema_guard(column);
 
   SECTION("type mismatch")
   {
@@ -324,6 +390,8 @@ TEST_CASE("arrow_host_import: a bad final column does no device allocation", "[a
   const auto types = declared({duckdb::LogicalType::BIGINT, duckdb::LogicalType::INTEGER});
   auto& child      = *batch->array.children[1];
   auto& schema     = *batch->schema.children[1];
+  scoped_restore child_guard(child);
+  scoped_restore schema_guard(schema);
   SECTION("unknown format") { schema.format = "tts"; }
   SECTION("negative child offset") { child.offset = -1; }
   SECTION("combined window overflow") { child.offset = std::numeric_limits<std::int64_t>::max(); }
@@ -370,9 +438,10 @@ TEST_CASE("arrow_host_import: checked plans keep combined slices and actual null
 
 TEST_CASE("arrow_host_import: string windows are checked before copy", "[arrow_host_import]")
 {
-  auto batch             = arrow_batch_from_sql("SELECT 'value' || i AS a FROM range(4) t(i)");
-  const auto strings     = declared({duckdb::LogicalType::VARCHAR});
-  auto& child            = *batch->array.children[0];
+  auto batch         = arrow_batch_from_sql("SELECT 'value' || i AS a FROM range(4) t(i)");
+  const auto strings = declared({duckdb::LogicalType::VARCHAR});
+  auto& child        = *batch->array.children[0];
+  scoped_restore child_guard(child);
   const void* buffers[3] = {child.buffers[0], child.buffers[1], child.buffers[2]};
   auto* saved            = child.buffers;
   SECTION("negative offsets")
@@ -407,6 +476,16 @@ TEST_CASE("arrow_host_import: string windows are checked before copy", "[arrow_h
     auto table          = import(*batch, {"a"}, strings);
     REQUIRE(copy_column_to_host<std::string>(table->get_column(0).view()) ==
             std::vector<std::string>{"value1", "value2"});
+  }
+  SECTION("unaligned offsets")
+  {
+    std::vector<std::uint8_t> storage(5 * sizeof(std::int32_t) + 1);
+    std::memcpy(storage.data() + 1, child.buffers[1], 5 * sizeof(std::int32_t));
+    buffers[1]    = storage.data() + 1;
+    child.buffers = buffers;
+    auto table    = import(*batch, {"a"}, strings);
+    REQUIRE(copy_column_to_host<std::string>(table->get_column(0).view()) ==
+            std::vector<std::string>{"value0", "value1", "value2", "value3"});
   }
 }
 
@@ -584,4 +663,232 @@ TEST_CASE("arrow_host_import: a decimal must carry the declared scale and fit it
   cudf::get_default_stream().synchronize();
   REQUIRE(copy_column_to_host<std::int64_t>(table->get_column(0).view()) ==
           std::vector<std::int64_t>{125});
+}
+
+TEST_CASE("arrow_host_import: enabled scalar boundaries and typed empties", "[arrow_host_import]")
+{
+  const auto check = []<typename T>(const std::string& sql_type,
+                                    duckdb::LogicalType type,
+                                    const std::string& low_text,
+                                    const std::string& high_text,
+                                    T low,
+                                    T high) {
+    CAPTURE(sql_type);
+    auto batch = arrow_batch_from_sql("SELECT x::" + sql_type + " AS a FROM (VALUES ('" + low_text +
+                                      "'), (NULL), ('" + high_text + "')) t(x)");
+    auto table = import(*batch, {"a"}, declared({type}));
+    REQUIRE(table->get_column(0).type() == sirius::get_cudf_type(declared({type})[0]));
+    REQUIRE(table->get_column(0).null_count() == 1);
+    const auto values = copy_column_to_host<T>(table->get_column(0).view());
+    REQUIRE(values.size() == 3);
+    REQUIRE(values[0] == low);
+    REQUIRE(values[2] == high);
+    std::uint32_t mask = 0;
+    REQUIRE(cudaMemcpy(&mask,
+                       table->get_column(0).view().null_mask(),
+                       sizeof(mask),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE((mask & 7) == 5);
+    batch->array.length = 0;
+    auto empty          = import(*batch, {"a"}, declared({type}));
+    REQUIRE(empty->num_columns() == 1);
+    REQUIRE(empty->num_rows() == 0);
+    REQUIRE(empty->get_column(0).type() == table->get_column(0).type());
+    REQUIRE(empty->get_column(0).null_count() == 0);
+  };
+  check("BOOLEAN", duckdb::LogicalType::BOOLEAN, "false", "true", false, true);
+  check(
+    "TINYINT", duckdb::LogicalType::TINYINT, "-128", "127", std::int8_t{-128}, std::int8_t{127});
+  check("UTINYINT", duckdb::LogicalType::UTINYINT, "0", "255", std::uint8_t{0}, std::uint8_t{255});
+  check("SMALLINT",
+        duckdb::LogicalType::SMALLINT,
+        "-32768",
+        "32767",
+        std::int16_t{-32768},
+        std::int16_t{32767});
+  check("USMALLINT",
+        duckdb::LogicalType::USMALLINT,
+        "0",
+        "65535",
+        std::uint16_t{0},
+        std::uint16_t{65535});
+  check("INTEGER",
+        duckdb::LogicalType::INTEGER,
+        "-2147483648",
+        "2147483647",
+        std::numeric_limits<std::int32_t>::min(),
+        std::numeric_limits<std::int32_t>::max());
+  check("UINTEGER",
+        duckdb::LogicalType::UINTEGER,
+        "0",
+        "4294967295",
+        std::uint32_t{0},
+        std::numeric_limits<std::uint32_t>::max());
+  check("BIGINT",
+        duckdb::LogicalType::BIGINT,
+        "-9223372036854775808",
+        "9223372036854775807",
+        std::numeric_limits<std::int64_t>::min(),
+        std::numeric_limits<std::int64_t>::max());
+  check("UBIGINT",
+        duckdb::LogicalType::UBIGINT,
+        "0",
+        "18446744073709551615",
+        std::uint64_t{0},
+        std::numeric_limits<std::uint64_t>::max());
+  check("FLOAT",
+        duckdb::LogicalType::FLOAT,
+        "-inf",
+        "inf",
+        -std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity());
+  check("DOUBLE",
+        duckdb::LogicalType::DOUBLE,
+        "-inf",
+        "inf",
+        -std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity());
+  check("VARCHAR", duckdb::LogicalType::VARCHAR, "", "hello", std::string{}, std::string{"hello"});
+  check("DATE",
+        duckdb::LogicalType::DATE,
+        "1969-12-31",
+        "1970-01-02",
+        std::int32_t{-1},
+        std::int32_t{1});
+  check("TIMESTAMP_S",
+        duckdb::LogicalType::TIMESTAMP_S,
+        "1969-12-31 23:59:59",
+        "1970-01-01 00:00:01",
+        std::int64_t{-1},
+        std::int64_t{1});
+  check("TIMESTAMP_MS",
+        duckdb::LogicalType::TIMESTAMP_MS,
+        "1969-12-31 23:59:59.999",
+        "1970-01-01 00:00:00.001",
+        std::int64_t{-1},
+        std::int64_t{1});
+  check("TIMESTAMP",
+        duckdb::LogicalType::TIMESTAMP,
+        "1969-12-31 23:59:59.999999",
+        "1970-01-01 00:00:00.000001",
+        std::int64_t{-1},
+        std::int64_t{1});
+  check("TIMESTAMP_NS",
+        duckdb::LogicalType::TIMESTAMP_NS,
+        "1969-12-31 23:59:59.999999999",
+        "1970-01-01 00:00:00.000000001",
+        std::int64_t{-1},
+        std::int64_t{1});
+  for (const auto precision : {5, 9, 10, 18, 19, 38}) {
+    const std::string digits(precision - 2, '9');
+    const auto high = digits + ".99";
+    __int128_t max  = 0;
+    for (int i = 0; i < precision; ++i) {
+      max = max * 10 + 9;
+    }
+    const auto type     = duckdb::LogicalType::DECIMAL(precision, 2);
+    const auto sql_type = "DECIMAL(" + std::to_string(precision) + ",2)";
+    if (precision <= 9) {
+      check(sql_type,
+            type,
+            "-" + high,
+            high,
+            static_cast<std::int32_t>(-max),
+            static_cast<std::int32_t>(max));
+    } else if (precision <= 18) {
+      check(sql_type,
+            type,
+            "-" + high,
+            high,
+            static_cast<std::int64_t>(-max),
+            static_cast<std::int64_t>(max));
+    } else {
+      check(sql_type, type, "-" + high, high, -max, max);
+    }
+  }
+  auto nan = arrow_batch_from_sql("SELECT 'nan'::FLOAT AS a, 'nan'::DOUBLE AS b");
+  auto table =
+    import(*nan, {"a", "b"}, declared({duckdb::LogicalType::FLOAT, duckdb::LogicalType::DOUBLE}));
+  REQUIRE(std::isnan(copy_column_to_host<float>(table->get_column(0).view())[0]));
+  REQUIRE(std::isnan(copy_column_to_host<double>(table->get_column(1).view())[0]));
+}
+
+TEST_CASE("arrow_host_import: failure drains asynchronous output deallocation",
+          "[arrow_host_import]")
+{
+  auto batch      = arrow_batch_from_sql("SELECT 42::BIGINT AS a, 43::BIGINT AS b");
+  const auto plan = sirius::inspect_arrow_host_batch(
+    &batch->array,
+    &batch->schema,
+    "drain",
+    {"a", "b"},
+    declared({duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT}),
+    *std::pmr::new_delete_resource());
+  rmm::mr::cuda_async_memory_resource upstream;
+  import_test_resource failing(1, rmm::device_async_resource_ref{upstream});
+  failing.counts->delay_deallocation = true;
+  rmm::cuda_stream stream;
+  REQUIRE_THROWS_AS(
+    sirius::import_arrow_host_table(plan, stream.view(), rmm::device_async_resource_ref{failing}),
+    rmm::out_of_memory);
+  REQUIRE(failing.counts->failed);
+  REQUIRE(failing.counts->callback_status == cudaSuccess);
+  REQUIRE(failing.counts->live_bytes == 0);
+  REQUIRE(cudaStreamQuery(stream.value()) == cudaSuccess);
+}
+
+TEST_CASE("arrow_host_import: cardinality and all-null batches are explicit", "[arrow_host_import]")
+{
+  auto batch = arrow_batch_from_sql("SELECT NULL::INTEGER AS a, NULL::VARCHAR AS b FROM range(9)");
+  const auto types = declared({duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR});
+  auto table       = import(*batch, {"a", "b"}, types);
+  REQUIRE(table->num_rows() == 9);
+  REQUIRE(table->get_column(0).null_count() == 9);
+  REQUIRE(table->get_column(1).null_count() == 9);
+  scoped_restore root_guard(batch->array);
+  scoped_restore schema_guard(batch->schema);
+  batch->array.n_children  = 0;
+  batch->schema.n_children = 0;
+  import_test_resource observed;
+  REQUIRE_THROWS_WITH(import(*batch, {}, {}, rmm::device_async_resource_ref{observed}),
+                      ContainsSubstring("physical row-count carrier"));
+  REQUIRE(observed.counts->attempts == 0);
+  batch->array.length = 0;
+  auto empty          = import(*batch, {}, {}, rmm::device_async_resource_ref{observed});
+  REQUIRE(empty->num_columns() == 0);
+  REQUIRE(empty->num_rows() == 0);
+  REQUIRE(observed.counts->attempts == 0);
+}
+
+TEST_CASE("arrow_host_import: null metadata is checked against selected bits",
+          "[arrow_host_import]")
+{
+  auto batch = arrow_batch_from_sql(
+    "SELECT CASE WHEN i = 1 THEN NULL ELSE i END::INTEGER AS a FROM range(3) t(i)");
+  auto& child  = *batch->array.children[0];
+  auto& schema = *batch->schema.children[0];
+  scoped_restore child_guard(child);
+  scoped_restore schema_guard(schema);
+  const auto types = declared({duckdb::LogicalType::INTEGER});
+  SECTION("unknown null count is derived")
+  {
+    child.null_count = -1;
+    auto table       = import(*batch, {"a"}, types);
+    REQUIRE(table->get_column(0).null_count() == 1);
+  }
+  SECTION("advertised zero contradicts bitmap")
+  {
+    child.null_count = 0;
+    REQUIRE_THROWS_WITH(import(*batch, {"a"}, types), ContainsSubstring("inconsistent"));
+  }
+  SECTION("advertised positive count contradicts bitmap")
+  {
+    child.null_count = 2;
+    REQUIRE_THROWS_WITH(import(*batch, {"a"}, types), ContainsSubstring("inconsistent"));
+  }
+  SECTION("nonnullable schema contradicts bitmap")
+  {
+    schema.flags &= ~ARROW_FLAG_NULLABLE;
+    REQUIRE_THROWS_WITH(import(*batch, {"a"}, types), ContainsSubstring("inconsistent"));
+  }
 }
