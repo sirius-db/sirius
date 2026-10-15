@@ -1,9 +1,11 @@
 # Probe-Accumulate Join
 
-> **Experimental.** Off by default (`enable_probe_accumulate`). The operator is complete and
-> tested, but nothing produces its input shape automatically yet, so today it accelerates queries
-> written in the aggregate form described in [What triggers it](#what-triggers-it). TPC-H q21 as
-> published is not one of them; see [Status and limits](#status-and-limits).
+> **Experimental.** Off by default (`enable_probe_accumulate`). It fuses aggregates written in the
+> form described in [What triggers it](#what-triggers-it), and a planner rewrite produces that form
+> from correlated `EXISTS`/`NOT EXISTS` with `=` and `<>`, merging sibling subqueries over the same
+> table into one scan and one aggregate (see
+> [Rewriting correlated EXISTS](#rewriting-correlated-exists)). TPC-H q21 as published is rewritten,
+> merged and fused: 0.603 s to 0.457 s.
 
 A probe-accumulate join computes
 
@@ -157,8 +159,10 @@ TPC-H SF1000 on one GB300, `bench/sf1000-repro` settings, best of three iteratio
 | Variant | q21 |
 |---|---|
 | Original SQL (DuckDB's decorrelated plan) | 0.603 s |
+| Original SQL, per-subquery rewrite + fusion | 0.581 s |
+| Original SQL, rewrite + sibling merge + fusion (this flag) | **0.457 s** |
 | Aggregate form above, ordinary join + group-by | 0.542 s |
-| Aggregate form above, probe-accumulate | **0.425 s** |
+| Aggregate form above, probe-accumulate | 0.425 s |
 
 Every variant returns byte-identical output. Per run, the 113 ms hash group-by kernel is replaced by
 31 ms of accumulation plus about 13 ms for initializing and emitting the records, total kernel time
@@ -167,15 +171,81 @@ about 200 ms to about 115 ms. With the setting on, the 22-query suite is unchang
 within run-to-run noise; no query other than the hand-written form is fused), and every result
 file matches the baseline apart from tie order in q11.
 
+## Rewriting correlated EXISTS
+
+`rewrite_correlated_inequality_exists` (`src/planner/sirius_plan_exists_rewrite.cpp`) runs in
+`create_plan` right after column binding, when the setting is on. It matches DuckDB's decorrelation
+of `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)`:
+
+```
+DELIM_JOIN (SEMI/ANTI or RIGHT_SEMI/RIGHT_ANTI; IS NOT DISTINCT FROM on the correlated columns)
+ ├─ outer rows
+ └─ [PROJECTION...] ← INNER JOIN(T, DELIM_GET) on  t.k = d.k  AND  t.x <> d.x
+```
+
+and replaces it with the shape DuckDB uses for a correlated scalar aggregate:
+
+```
+PROJECTION (the original output columns)
+ └─ FILTER   EXISTS:     mn <> outer.x OR mx <> outer.x
+             NOT EXISTS: (that) IS NULL OR NOT (that)
+     └─ LEFT DELIM_JOIN on outer.k IS NOT DISTINCT FROM a.k   (duplicate-eliminated column: k)
+         ├─ outer rows
+         └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x)) ← INNER JOIN(T, DELIM_GET(k))
+```
+
+`EXISTS ... t.x <> outer.x` holds exactly when `MIN(t.x) <> outer.x OR MAX(t.x) <> outer.x` over
+the rows with that key, with unknown (NULL) comparisons never counting as different, so the rewrite
+is semantics-preserving; for NOT EXISTS the filter keeps rows with no group and rows whose
+comparison is unknown. The delim scan now carries the key alone, and a one-column `DELIM_GET` is
+built from distinct values, so it is a unique build side (the fused planner accepts it as such). The
+aggregate over that join is then fused by probe-accumulate.
+
+The match is strictly structural and declines on anything unexpected: more than one `=` or `<>`,
+other inequalities, non-column conditions, a key that is not `INTEGER`/`BIGINT`, a value without a
+device atomic, or a delim join that does not echo exactly the delim columns. DuckDB's own
+"deliminator" removes the delim join for the simplest shapes and leaves a plain `SEMI`/`ANTI` join
+with the inequality as a residual, which the existing mixed-join path executes; only plans that keep
+the delim join are rewritten. A filter on the outer rows or on the subquery keeps it, which is the
+case in TPC-H q21.
+
+### Merging sibling subqueries
+
+Rewritten one at a time, each subquery would still scan the table and join its own key set, so the
+rewrite first looks for a chain of two or more matched delim joins nested through their outer child
+(q21's `EXISTS` and `NOT EXISTS`) and merges them:
+
+- each subquery's scan is peeled to its `GET` and its conditions, whether they sit in `FILTER` nodes
+  (through their projection maps) or were pushed into the scan as table filters;
+- the scans must read the same source, decided by `capture_bound_read_view`, the identity the
+  transparent execution path itself compares between plans (parquet's bind-data equality does not
+  even hold for a scan against itself), and the same base column must be the correlation key;
+- one of the scans becomes the shared scan: it is *widened* to output every column any subquery
+  needs, and its own pushed-down filters are dropped because they become predicates;
+- each subquery contributes `MIN`/`MAX` of `CASE WHEN <its filters> THEN x END` (no `CASE` when it
+  has no filter), and the filter above the LEFT delim join is the conjunction of each subquery's
+  condition. At most four subqueries fit the eight-accumulator limit.
+
+If anything does not line up (different tables or keys, a column the scan cannot read, a scan with
+a non-trivial shape) the chain is not merged and each subquery is rewritten on its own.
+
+### Read-view comparison
+
+Merging replaces two scans of one view with one. Transparent execution compares the table views a
+Sirius plan reads against those of the original plans (`compare_read_views`), and that comparison
+required equal scan counts. It now accepts a candidate that reads an identical view *fewer* times,
+because a planner pass merged scans of it, while still rejecting a candidate that reads a view the
+original did not, reads a view more often, drops the only scan of a view, or swaps views
+(`src/transparent/read_view_registry.cpp`, tested in `test_read_view_comparison.cpp`).
+
 ## Status and limits
 
-- **Original q21 does not benefit.** DuckDB decorrelates its two subqueries into two nested
-  `DELIM_JOIN`s, each with its own lineitem scan. A per-subquery rewrite into
-  `LEFT DELIM_JOIN` + aggregate + filter is possible (the delim side is a one-column `DELIM_GET`,
-  which is a unique build side), but each subquery would still scan lineitem and join the full
-  candidate set, so it is unlikely to beat today's plan. The gain above comes from sharing one scan
-  and one aggregate between `EXISTS` and `NOT EXISTS`, so an automatic rewrite has to merge sibling
-  subqueries that scan the same table on the same key. That is not implemented here.
+- **q21 as published is 0.603 s to 0.457 s** (about 24%) through the automatic rewrite, merge and
+  fusion, with byte-identical results and the rest of TPC-H unchanged. The hand-written
+  shared-scan form is 0.425 s; the remaining gap is the outer join of the candidate rows against the
+  per-key aggregate, which the hand-written form also pays but orders differently.
+- Without the merge the per-subquery rewrite gains only about 4% (0.581 s), because each subquery
+  still scans lineitem.
 - `SUM` and `AVG` are not maintained, and neither are composite keys, floating-point or string
   extrema.
 - Single GPU, single partition, unique build side on the probe's left join input.
@@ -194,6 +264,8 @@ file matches the baseline apart from tie order in q11.
 | Join accumulate mode | `src/op/sirius_physical_hash_join.cpp` (`accumulate`) |
 | Emit operator | `src/op/sirius_physical_probe_accumulate_emit.{hpp,cpp}` |
 | Detection and plan rewrite | `src/planner/sirius_plan_probe_accumulate.cpp` |
+| Correlated EXISTS rewrite and sibling merge | `src/planner/sirius_plan_exists_rewrite.cpp` |
+| Read-view comparison allowance | `src/transparent/read_view_registry.cpp` |
 | Dynamic-filter evidence for a DISTINCT over an opaque relation | `src/planner/dynamic_filter/build_filter_evidence.cpp` |
 | Config | `enable_probe_accumulate` in `sirius_config.hpp` |
 

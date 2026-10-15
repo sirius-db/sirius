@@ -128,3 +128,54 @@ TEST_CASE_METHOD(ProbeAccumulateFixture,
   sirius::test::scoped_sirius_setting off{*con, "enable_probe_accumulate", false};
   compare_gpu_vs_cpu(over_build("min(f.v), max(f.v), count(*)"));
 }
+
+// Correlated EXISTS / NOT EXISTS with an equality and an inequality. DuckDB removes the delim join
+// for the simplest shapes and keeps it when the outer rows or the subquery carry a filter, which
+// Sirius then rewrites into a MIN/MAX aggregate per key; every query here has such a filter.
+TEST_CASE_METHOD(ProbeAccumulateFixture,
+                 "gpu_execution correlated EXISTS with <> matches the CPU",
+                 "[integration][gpu_execution][probe_accumulate][exists_rewrite]")
+{
+  compare_fused_and_unfused(
+    "SELECT f.k, f.v FROM fact f WHERE f.w > f.v AND EXISTS "
+    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v)");
+  compare_fused_and_unfused(
+    "SELECT f.k, f.v FROM fact f WHERE f.late AND NOT EXISTS "
+    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v)");
+}
+
+TEST_CASE_METHOD(ProbeAccumulateFixture,
+                 "gpu_execution correlated EXISTS with <> over a nullable value",
+                 "[integration][gpu_execution][probe_accumulate][exists_rewrite]")
+{
+  // `w` has NULLs: a NULL on either side makes `<>` unknown, so it never counts as different.
+  compare_fused_and_unfused(
+    "SELECT f.k, f.w FROM fact f WHERE f.late AND EXISTS "
+    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.w <> f.w)");
+  compare_fused_and_unfused(
+    "SELECT f.k, f.w FROM fact f WHERE f.v > 0 AND NOT EXISTS "
+    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.w <> f.w)");
+}
+
+TEST_CASE_METHOD(ProbeAccumulateFixture,
+                 "gpu_execution correlated EXISTS with <> and a filter on the subquery",
+                 "[integration][gpu_execution][probe_accumulate][exists_rewrite]")
+{
+  compare_fused_and_unfused(
+    "SELECT f.k, f.v FROM fact f WHERE EXISTS "
+    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v AND g.late)");
+  compare_fused_and_unfused(
+    "SELECT f.k, f.v FROM fact f WHERE NOT EXISTS "
+    "(SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v AND g.w > 40)");
+}
+
+TEST_CASE_METHOD(ProbeAccumulateFixture,
+                 "gpu_execution EXISTS and NOT EXISTS together, in the shape of TPC-H q21",
+                 "[integration][gpu_execution][probe_accumulate][exists_rewrite]")
+{
+  compare_fused_and_unfused(
+    "SELECT f.k, count(*) AS n FROM fact f WHERE f.late "
+    "AND EXISTS (SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v) "
+    "AND NOT EXISTS (SELECT 1 FROM fact g WHERE g.k = f.k AND g.v <> f.v AND g.late) "
+    "GROUP BY f.k");
+}

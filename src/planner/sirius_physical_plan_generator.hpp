@@ -70,6 +70,13 @@ namespace sirius::planner {
 /// proven. Shared by the join planner and the probe-accumulate detection.
 std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOperator& op);
 
+/// Rewrite DuckDB's decorrelation of `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)`
+/// (a DELIM_JOIN whose subquery joins `t` to a delim scan on `=` and `<>`) in the resolved plan
+/// into a LEFT DELIM_JOIN against `MIN(t.x), MAX(t.x) GROUP BY k` plus a filter. Returns the number
+/// of subqueries rewritten.
+std::size_t rewrite_correlated_inequality_exists(duckdb::ClientContext& context,
+                                                 duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
+
 /// Attribution attached to every scan contract created by one plan build.
 /// Execution-time plans carry a window id; plans built before an execution
 /// window carry a non-zero planning/finalize generation instead.

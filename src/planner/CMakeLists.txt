@@ -22,6 +22,7 @@ target_sources(
           sirius_plan_delim_join.cpp
           sirius_plan_dummy_scan.cpp
           sirius_plan_empty_result.cpp
+          sirius_plan_exists_rewrite.cpp
           sirius_plan_expression_get.cpp
           sirius_plan_filter.cpp
           sirius_plan_get.cpp

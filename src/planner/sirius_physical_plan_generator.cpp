@@ -2000,6 +2000,15 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   resolver.VisitOperator(*op);
   profiler.EndPhase();
 
+  // The rewrite targets the probe-accumulate join, so it follows that setting.
+  if (auto const sirius_ctx =
+        context.registered_state
+          ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+          : nullptr;
+      sirius_ctx && sirius_ctx->get_config().get_operator_params().enable_probe_accumulate) {
+    rewrite_correlated_inequality_exists(context, op);
+  }
+
   // then create the main physical plan
   profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_CREATE_PLAN);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan;

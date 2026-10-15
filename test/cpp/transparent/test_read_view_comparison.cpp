@@ -86,6 +86,39 @@ TEST_CASE("Copy-origin correspondence is one-to-one", "[transparent][read_view]"
   CHECK(comparison.reason == "binding_mismatch");
 }
 
+TEST_CASE("Copy-origin read views admit a merged scan of an identical view",
+          "[transparent][read_view]")
+{
+  auto a = view("a.parquet");
+  auto b = view("b.parquet");
+  // The original plan scanned view `a` twice (scans 10 and 20) and `b` once.
+  std::vector<original_binding> logical{{10, a}, {20, a}, {30, b}};
+  std::vector<read_view_fingerprint> physical{fingerprint(a), fingerprint(a), fingerprint(b)};
+
+  // A planner pass merged scans 10 and 20, which read the same view, into scan 10.
+  std::vector<candidate_binding> merged{{10, a}, {30, b}};
+  auto comparison = compare_read_views(candidate_origin::copy, logical, physical, merged);
+  CHECK(comparison.equal);
+  CHECK(comparison.reason.empty());
+
+  // Every view the original read must still be read: dropping the only scan of `b` is a mismatch.
+  std::vector<candidate_binding> dropped_b{{10, a}, {20, a}};
+  auto missing = compare_read_views(candidate_origin::copy, logical, physical, dropped_b);
+  CHECK_FALSE(missing.equal);
+  CHECK(missing.reason == "fingerprint_mismatch");
+
+  // So is reading a view more often than the original plan did.
+  std::vector<candidate_binding> extra{{10, a}, {20, a}, {30, b}, {40, b}};
+  auto more = compare_read_views(candidate_origin::copy, logical, physical, extra);
+  CHECK_FALSE(more.equal);
+
+  // And reading a different view in place of the merged one.
+  auto c = view("c.parquet");
+  std::vector<candidate_binding> swapped{{10, c}, {30, b}};
+  auto other = compare_read_views(candidate_origin::copy, logical, physical, swapped);
+  CHECK_FALSE(other.equal);
+}
+
 TEST_CASE("Replan-origin read views admit only a single corresponding scan",
           "[transparent][read_view]")
 {
