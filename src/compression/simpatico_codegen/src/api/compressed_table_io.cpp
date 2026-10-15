@@ -20,6 +20,8 @@
 
 #include <cuda_runtime.h>
 
+#include <nvcomp/version.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -315,15 +317,16 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     std::string(cname), names, std::move(cols), stream, mr, err, ld.meta);
 }
 
-// Payload layout identifier. A reader accepts only an exact match (parse_hpln_header),
-// so this must advance whenever the meaning of the serialized bytes changes — including
-// changes that keep every field in place but reinterpret one, which no structural check
-// downstream could catch.
+// Payload layout identifier. Advance when the meaning of serialized bytes changes.
 //
 // 11: a Bitpack "packed" buffer counts its decode gather guard words in num_rows, so the
 //     stored word count is what the reader allocates and the guard needs no read-side
 //     reconstruction (see compact_bitpack_packed).
 static constexpr std::uint8_t kVersion = 11;
+#if NVCOMP_VER_MAJOR >= 6
+// 12: ANS payloads use nvCOMP 6's incompatible chunk format.
+static constexpr std::uint8_t kAns6Version = 12;
+#endif
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
@@ -435,7 +438,12 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
     return bad("not a HPLN file");
   std::uint8_t ver;
   if (!r.read_le(ver)) return bad("truncated header");
-  if (ver != kVersion)
+#if NVCOMP_VER_MAJOR >= 6
+  bool const supported_version = ver == kVersion || ver == kAns6Version;
+#else
+  bool const supported_version = ver == kVersion;
+#endif
+  if (!supported_version)
     return bad("unsupported version " + std::to_string(ver) + " (expected " +
                std::to_string(kVersion) + ")");
 
@@ -473,6 +481,14 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
       if (!r.read_le(ld.type_tag)) return bad("truncated leaf type_tag");
       if (!r.read_le(ld.num_rows)) return bad("truncated leaf num_rows");
       if (!read_meta(r, ld.meta)) return bad("truncated/unknown leaf meta");
+#if NVCOMP_VER_MAJOR >= 6
+      auto const* ans_meta = std::get_if<leaf_meta::ans>(&ld.meta);
+      if (ver == kVersion && ans_meta && (ld.num_rows != 0 || ans_meta->uncompressed_size != 0))
+        return bad("ANS payload requires nvCOMP 5");
+      auto const* cascaded_meta = std::get_if<leaf_meta::nvcomp_cascaded>(&ld.meta);
+      if (cascaded_meta && (ld.num_rows != 0 || cascaded_meta->uncompressed_size != 0))
+        return bad("Cascaded payload requires nvCOMP 5");
+#endif
 
       std::uint8_t nb;
       if (!r.read_le(nb)) return bad("truncated num_bufs");
@@ -740,6 +756,15 @@ std::string build_compressed_table_header(compressed_table const& table,
   nvtx_scoped_range nvtx_range{"simpatico::io::build_header"};
   auto const all_descs = table.describe(stream);
 
+  std::uint8_t version = kVersion;
+#if NVCOMP_VER_MAJOR >= 6
+  for (auto const& descs : all_descs) {
+    for (auto const& ld : descs) {
+      if (std::holds_alternative<leaf_meta::ans>(ld.meta)) version = kAns6Version;
+    }
+  }
+#endif
+
   out_header.clear();
   out_buffers.clear();
 
@@ -748,7 +773,7 @@ std::string build_compressed_table_header(compressed_table const& table,
   hdr.push_back('P');
   hdr.push_back('L');
   hdr.push_back('N');
-  push_le(hdr, kVersion);
+  push_le(hdr, version);
   push_le(hdr, static_cast<std::uint16_t>(table.columns.size()));
 
   std::uint64_t payload_offset = 0;
