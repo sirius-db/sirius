@@ -41,6 +41,7 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/search.hpp>
 #include <cudf/strings/attributes.hpp>
@@ -59,10 +60,12 @@
 
 // rmm
 #include <rmm/device_buffer.hpp>
+#include <rmm/resource_ref.hpp>
 
 // standard library
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <regex>
@@ -73,6 +76,32 @@
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
+
+namespace {
+
+// Whether a signed integer column holds the minimum of its type, the one value whose negation
+// does not fit. DuckDB raises an error there instead of wrapping. DECIMAL and floating point
+// values always negate. Reading the reduction synchronizes the stream.
+bool holds_signed_minimum(cudf::column_view const& column,
+                          ::cuda::stream_ref stream,
+                          rmm::device_async_resource_ref mr)
+{
+  auto const holds = [&]<typename T>() {
+    auto const min = cudf::reduce(
+      column, *cudf::make_min_aggregation<cudf::reduce_aggregation>(), column.type(), stream, mr);
+    auto const& typed = static_cast<cudf::numeric_scalar<T> const&>(*min);
+    return typed.is_valid(stream) && typed.value(stream) == std::numeric_limits<T>::min();
+  };
+  switch (column.type().id()) {
+    case cudf::type_id::INT8: return holds.template operator()<int8_t>();
+    case cudf::type_id::INT16: return holds.template operator()<int16_t>();
+    case cudf::type_id::INT32: return holds.template operator()<int32_t>();
+    case cudf::type_id::INT64: return holds.template operator()<int64_t>();
+    default: return false;
+  }
+}
+
+}  // namespace
 
 like_multiliteral_cache::entry_ptr const& expression_evaluator::get_or_classify_like(
   std::string_view pattern)
@@ -200,6 +229,21 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
   if (resolved_id == function_id::mod) {
     return execute_numeric_binary_func(cudf::binary_operator::MOD);
+  }
+
+  //----------Negation----------//
+  if (resolved_id == function_id::negate) {
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    auto const column = input.get_column_view();
+    if (holds_signed_minimum(column, _stream, _mr)) {
+      throw invalid_input_exception("Overflow in negation of numeric value!");
+    }
+    return evaluate_result(
+      cudf::unary_operation(column, cudf::unary_operator::NEGATE, _stream, _mr));
   }
 
   //----------Substring Function----------//
