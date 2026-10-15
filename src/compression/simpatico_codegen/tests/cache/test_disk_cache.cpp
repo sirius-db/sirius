@@ -95,8 +95,8 @@ void require(bool condition, const char* description)
 struct Directory {
   Directory()
   {
-    char pattern[]      = "/tmp/simpatico-disk-XXXXXX";
-    const char* created = ::mkdtemp(pattern);
+    auto pattern = (fs::absolute(fs::temp_directory_path()) / "simpatico-disk-XXXXXX").string();
+    const char* created = ::mkdtemp(pattern.data());
     if (!created) throw std::runtime_error("mkdtemp failed");
     path = created;
   }
