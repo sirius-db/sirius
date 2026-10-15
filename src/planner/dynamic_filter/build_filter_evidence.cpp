@@ -16,6 +16,7 @@
 
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
 
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
 namespace sirius::planner {
@@ -43,6 +44,12 @@ bool build_relation_is_opaque(duckdb::LogicalOperator const& op)
     case duckdb::LogicalOperatorType::LOGICAL_PROJECTION:
       return op.children.size() == 1 && op.children.front() != nullptr &&
              build_relation_is_opaque(*op.children.front());
+    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+      // A pure DISTINCT (group-by with no aggregates) of an opaque relation keeps its key domain.
+      auto const& agg = op.Cast<duckdb::LogicalAggregate>();
+      return agg.expressions.empty() && agg.children.size() == 1 &&
+             agg.children.front() != nullptr && build_relation_is_opaque(*agg.children.front());
+    }
     default: return false;
   }
 }
