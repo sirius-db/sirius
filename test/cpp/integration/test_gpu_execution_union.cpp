@@ -15,7 +15,7 @@
  */
 
 // GPU-vs-CPU correctness for `UNION ALL`: sirius_physical_union + sirius_physical_passthrough_sink,
-// and for distinct `UNION`, which runs as the DISTINCT lowering over that same bag union.
+// and for distinct `UNION`, which runs as the DISTINCT lowering over that same union.
 //
 // GpuExecutionFixture runs each query on the GPU -- asserting one GPU execution and ZERO fallbacks
 // -- and again on DuckDB CPU, then compares. The zero-fallback assertion is what makes these tests
@@ -171,7 +171,7 @@ TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL preserves NULLs",
                  "[integration][gpu_execution][union][union_all]")
 {
-  // Bag union has no key and no comparison, so a NULL must be forwarded, not dropped or coalesced.
+  // A union has no key and no comparison, so a NULL must be forwarded, not dropped or coalesced.
   compare_gpu_vs_cpu("SELECT k, v FROM ua UNION ALL SELECT k, v FROM ub");
   compare_gpu_vs_cpu(
     "SELECT count(*) FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t WHERE k IS NULL");
@@ -230,7 +230,7 @@ TEST_CASE_METHOD(UnionFixture,
   // The compressed-schema pass treats UNION as a native carrier boundary and restores every arm,
   // so two arms never present different carriers for one logical column. uwide.k is BIGINT with
   // small values (a narrowing candidate) against an INTEGER arm, and must be pinned for a sidecar
-  // to be installed at all (sirius_plan_get.cpp:633).
+  // to be installed at all (`scan_physical_schema` in sirius_plan_get.cpp).
   auto pin = con->Query("CALL pin_table(format='duckdb', name='uwide', tier='gpu');");
   REQUIRE(pin);
   REQUIRE_FALSE(pin->HasError());
@@ -255,9 +255,9 @@ TEST_CASE_METHOD(UnionFixture,
                  "[integration][gpu_execution][union][union_all]")
 {
   // EXCEPT and INTERSECT must leave the GPU path cleanly via a fallback -- not error, and not
-  // silently produce a bag union. Both are refused during plan generation (the generator switch),
-  // so this asserts a plan-time fallback. The helper also compares against the CPU result, which is
-  // what pins "still the right answer" without a hand-rolled second check.
+  // silently return the union of both inputs. Both are refused during plan generation (the
+  // generator switch), so this asserts a plan-time fallback. The helper also compares against the
+  // CPU result, which is what pins "still the right answer" without a hand-rolled second check.
   expect_plan_fallback_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
   expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
 }
@@ -292,9 +292,9 @@ TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution UNION ALL over a materialized CTE arm",
                  "[integration][gpu_execution][union][union_all]")
 {
-  // Regression for the arity guard in sirius_plan_set_operation.cpp, which reads the arm's
-  // physical `types`. Before DuckDB v2 a materialized CTE declared its materialization side, so an
-  // arm whose definition and body differ in width was declined to the CPU.
+  // Regression for the arity guard in sirius_plan_set_operation.cpp, which reads the arm's planned
+  // `types`. Before DuckDB v2 a materialized CTE declared its materialization side, so a guard
+  // reading that width declined an arm whose definition and body differ in width.
   //
   // Two traps when reshaping these. The CTE must stay MATERIALIZED, or a single-reference one is
   // inlined away and no CTE node reaches the planner. And the definition's width must be forced
@@ -350,7 +350,7 @@ TEST_CASE_METHOD(UnionFixture,
   compare_gpu_vs_cpu_ordered("SELECT k FROM ua UNION SELECT k FROM ub ORDER BY k NULLS LAST");
   compare_gpu_vs_cpu_ordered(
     "SELECT k FROM ua UNION SELECT k FROM ub ORDER BY k DESC NULLS LAST LIMIT 3");
-  // The same set written as a user's DISTINCT over a bag union.
+  // The same set written as a user's DISTINCT over a UNION ALL.
   compare_gpu_vs_cpu(
     "SELECT DISTINCT * FROM (SELECT k, v FROM ua UNION ALL SELECT k, v FROM ub) t");
   compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT k, v FROM ua UNION SELECT k, v FROM ub) t");

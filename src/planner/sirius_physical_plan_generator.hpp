@@ -230,8 +230,6 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
-  //! `UNION ALL` only; a distinct UNION arrives as a DISTINCT above this node, and the builder
-  //! rejects the `setop_all == false` shape that has none.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
     duckdb::LogicalSetOperation& op);
 
