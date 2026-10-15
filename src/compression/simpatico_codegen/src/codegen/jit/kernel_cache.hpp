@@ -19,7 +19,7 @@ namespace codegen::jit {
 // to "off" (or empty) to disable and fall back to in-memory only.
 //
 // clear_jit_disk_cache() removes recognized legacy/v2 records and abandoned
-// temporaries (best-effort, without following symlinks). Stop writers first.
+// temporaries (best-effort, following only the trusted root). Stop writers first.
 // First disk use also prunes old environments: keep current + three newest
 // others and a one-hour grace period. This is best effort, not an activity lease.
 void clear_jit_disk_cache();
