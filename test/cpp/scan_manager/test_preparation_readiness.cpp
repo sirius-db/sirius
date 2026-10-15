@@ -58,6 +58,14 @@ struct tagged : sirius::op::scan::scan_info {
   size_t rows;
   tagged(int i, size_t n = 1) : id(i), rows(n) {}
 };
+struct cleanup_tagged : tagged {
+  std::shared_ptr<test::cleanup_observation> seen;
+  explicit cleanup_tagged(std::shared_ptr<test::cleanup_observation> seen)
+    : tagged(1), seen(std::move(seen))
+  {
+  }
+  ~cleanup_tagged() override { seen->release(); }
+};
 struct accumulator : sirius::op::scan::batch_coalescer {
   size_t cap, retained = 0;
   int last      = 0;
@@ -266,6 +274,210 @@ struct fixture {
   }
 };
 }  // namespace
+TEST_CASE("Preparation input disposal is outside the gate on every terminal path",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  enum class path {
+    finished,
+    ready_unit,
+    late_worker,
+    cancelled_unit,
+    parked_result,
+    queued_batch
+  };
+  auto mode = GENERATE(path::finished,
+                       path::ready_unit,
+                       path::late_worker,
+                       path::cancelled_unit,
+                       path::parked_result,
+                       path::queued_batch);
+  CAPTURE(static_cast<int>(mode));
+  fixture f(1, 1);
+  auto out    = std::make_shared<sink>();
+  auto seen   = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  auto worker = f.make_hold();
+  struct pruning_coalescer : accumulator {
+    std::function<std::unique_ptr<sirius::op::scan::scan_info>()> emit;
+    cursor_step advance(sirius::op::scan::scan_info&, size_t&, size_t) override
+    {
+      return {emit ? emit() : nullptr, true};
+    }
+    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override { return {}; }
+  };
+  auto coalescer = std::make_shared<pruning_coalescer>();
+  if (mode == path::queued_batch) {
+    coalescer->emit = [&] {
+      f.coordinator.request_stop(stop_reason::normal_eos);
+      return std::make_unique<cleanup_tagged>(seen);
+    };
+  }
+  std::shared_ptr<preparation_unit> unit;
+  if (mode == path::ready_unit) {
+    required_input_set required;
+    required.set(static_cast<size_t>(required_input::segments));
+    required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+    unit = f.coordinator.admit_unit({93, 1}, required);
+    REQUIRE(unit);
+    auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+      new sirius::op::scan::physical_profile_table, [seen](auto* value) {
+        seen->release();
+        delete value;
+      });
+    REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+    REQUIRE(unit->complete_input(checkpoint_input{7}));
+  } else if (mode == path::cancelled_unit || mode == path::parked_result) {
+    required_input_set required;
+    required.set(static_cast<size_t>(required_input::delete_set));
+    unit = f.coordinator.admit_unit({93, 1}, required);
+    REQUIRE(unit);
+  }
+  f.source(coalescer,
+           out,
+           single_job(
+             [&, seen]() -> std::unique_ptr<sirius::op::scan::scan_info> {
+               if (mode == path::ready_unit) return std::make_unique<tagged>(1);
+               auto input = std::make_unique<cleanup_tagged>(seen);
+               if (mode == path::late_worker) worker->wait();
+               return input;
+             },
+             unit));
+  if (mode == path::ready_unit) unit.reset();
+  auto cleanup = f.shutdown_guard();
+  f.start();
+  if (mode == path::late_worker) {
+    REQUIRE(worker->await());
+    f.coordinator.request_stop(stop_reason::normal_eos);
+    worker->release();
+  } else if (unit) {
+    auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!f.coordinator.snapshot().results_peak && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    REQUIRE(f.coordinator.snapshot().results_peak == 1);
+    if (mode == path::cancelled_unit)
+      REQUIRE(unit->cancel());
+    else
+      f.coordinator.request_stop(stop_reason::normal_eos);
+  }
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK_FALSE(f.completion.has_error());
+  CHECK(seen->releases == (mode == path::queued_batch ? 2 : 1));
+  CHECK(seen->outside == seen->releases);
+  CHECK(seen->errors == 0);
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  CHECK(f.coordinator.snapshot().jobs_peak == 1);
+  CHECK(f.coordinator.snapshot().results_peak <= 1);
+  CHECK(f.coordinator.snapshot().output_peak <= 1);
+}
+
+TEST_CASE("Retiring units releases final owners but preserves external ready snapshots",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  enum class mode { pending, ready, retained_snapshot };
+  auto stage = GENERATE(mode::pending, mode::ready, mode::retained_snapshot);
+  CAPTURE(static_cast<int>(stage));
+  fixture f;
+  auto seen = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({94, 1}, required);
+  REQUIRE(unit);
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [seen](auto* value) {
+      seen->release();
+      delete value;
+    });
+  sirius::op::scan::physical_profile value;
+  value.storage_version = 77;
+  auto id               = profile->add(value);
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+  if (stage != mode::pending) REQUIRE(unit->complete_input(checkpoint_input{7}));
+  unit_record snapshot;
+  if (stage == mode::retained_snapshot) snapshot = unit->record();
+  unit.reset();
+  f.coordinator.retire_unit({94, 1});
+  CHECK_FALSE(f.coordinator.unit_state_snapshot({94, 1}));
+  if (stage == mode::retained_snapshot) {
+    CHECK(seen->releases == 0);
+    REQUIRE(snapshot.deps);
+    REQUIRE(snapshot.deps->profiles);
+    CHECK(snapshot.deps->profiles->get(id).storage_version == 77);
+    CHECK(snapshot.deps->checkpoint_iteration == 7);
+    snapshot = {};
+  } else {
+    CHECK(seen->callbacks_seen > 0);
+  }
+  CHECK(seen->releases == 1);
+  CHECK(seen->outside == 1);
+  CHECK(seen->errors == 0);
+  f.coordinator.retire_unit({94, 1});
+  CHECK(seen->releases == 1);
+}
+
+TEST_CASE("Dependency disposal keeps drain pending through terminal cleanup",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  enum class operation { cancel, fail, retire, stop };
+  auto mode = GENERATE(operation::cancel, operation::fail, operation::retire, operation::stop);
+  CAPTURE(static_cast<int>(mode));
+  fixture f(1, 1);
+  auto paused       = f.make_hold();
+  auto seen         = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  seen->after_probe = [paused] { paused->wait(); };
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({95, 1}, required);
+  REQUIRE(unit);
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [seen](auto* value) {
+      seen->release();
+      delete value;
+    });
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+  unit.reset();
+  // No preparation job protects this caller: disposal needs its own drain credit.
+  std::atomic<bool> terminal_done{false};
+  std::jthread terminal([&] {
+    if (mode == operation::retire) {
+      f.coordinator.retire_unit({95, 1});
+    } else if (mode == operation::stop) {
+      f.coordinator.request_stop(stop_reason::normal_eos);
+    } else {
+      auto pending = f.coordinator.admit_unit({95, 1}, required);
+      if (mode == operation::cancel)
+        pending->cancel();
+      else
+        pending->fail({sirius::transparent::late_failure_cause::other, {}, "cleanup failure", {}});
+    }
+    terminal_done = true;
+  });
+  // Release before joining even if a REQUIRE aborts this test.
+  auto release = std::shared_ptr<hold>(paused.get(), [paused](hold*) { paused->release(); });
+  auto cleanup = f.shutdown_guard();
+  REQUIRE(paused->await());
+  REQUIRE(seen->outside == 1);
+  CHECK(seen->callbacks_seen > 0);
+  f.start();
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  std::this_thread::sleep_for(30ms);
+  CHECK_FALSE(terminal_done);
+  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  paused->release();
+  terminal.join();
+  f.finish();
+  CHECK(terminal_done);
+  CHECK(seen->releases == 1);
+  CHECK(seen->outside == 1);
+  CHECK(seen->errors == 0);
+  CHECK_FALSE(f.owner_error);
+  CHECK(f.completion.has_error() == (mode == operation::fail));
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
 TEST_CASE("Ready partial batches publish while every preparation worker is blocked",
           "[scan_preparation][coordinator]")
 {

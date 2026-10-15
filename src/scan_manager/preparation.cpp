@@ -20,6 +20,21 @@
 #include "op/scan/iceberg_delete_set.hpp"
 
 namespace sirius::scan_manager {
+void preparation_gate::callback_use::activate_under_gate() noexcept
+{
+  if (gate_ && !active_) {
+    ++gate_->callbacks;
+    active_ = true;
+  }
+}
+preparation_gate::callback_use::~callback_use()
+{
+  if (active_) {
+    std::lock_guard lock(gate_->mutex);
+    --gate_->callbacks;
+    gate_->cv.notify_all();
+  }
+}
 void preparation_gate::check_interrupted()
 {
   if (interrupted && interrupted()) {
@@ -67,6 +82,8 @@ void preparation_unit::finish_input(required_input input)
 }
 bool preparation_unit::complete_input(footer_input input)
 {
+  preparation_gate::callback_use use(gate_);
+  op::scan::split_dependencies retired;
   std::unique_lock<std::mutex> gate_lock;
   if (gate_) {
     gate_lock = std::unique_lock(gate_->mutex);
@@ -75,14 +92,20 @@ bool preparation_unit::complete_input(footer_input input)
   std::lock_guard lock(mutex_);
   if (!accept(required_input::footer)) return false;
   if (!input.footer || !input.approval) throw std::invalid_argument("footer input lacks approval");
-  deps_.footer           = std::move(input.footer);
-  deps_.parquet_approval = std::move(input.approval);
-  deps_.datasource       = std::move(input.datasource);
+  use.activate_under_gate();
+  retired.footer           = std::move(deps_.footer);
+  retired.parquet_approval = std::move(deps_.parquet_approval);
+  retired.datasource       = std::move(deps_.datasource);
+  deps_.footer             = std::move(input.footer);
+  deps_.parquet_approval   = std::move(input.approval);
+  deps_.datasource         = std::move(input.datasource);
   finish_input(required_input::footer);
   return true;
 }
 bool preparation_unit::complete_input(segments_input input)
 {
+  preparation_gate::callback_use use(gate_);
+  op::scan::split_dependencies retired;
   std::unique_lock<std::mutex> gate_lock;
   if (gate_) {
     gate_lock = std::unique_lock(gate_->mutex);
@@ -91,12 +114,16 @@ bool preparation_unit::complete_input(segments_input input)
   std::lock_guard lock(mutex_);
   if (!accept(required_input::segments)) return false;
   if (!input.profiles) throw std::invalid_argument("segments input is absent");
-  deps_.profiles = std::move(input.profiles);
+  use.activate_under_gate();
+  retired.profiles = std::move(deps_.profiles);
+  deps_.profiles   = std::move(input.profiles);
   finish_input(required_input::segments);
   return true;
 }
 bool preparation_unit::complete_input(delete_set_input input)
 {
+  preparation_gate::callback_use use(gate_);
+  op::scan::split_dependencies retired;
   std::unique_lock<std::mutex> gate_lock;
   if (gate_) {
     gate_lock = std::unique_lock(gate_->mutex);
@@ -105,12 +132,15 @@ bool preparation_unit::complete_input(delete_set_input input)
   std::lock_guard lock(mutex_);
   if (!accept(required_input::delete_set)) return false;
   if (!input.value) throw std::invalid_argument("pending delete set is not an empty result");
-  deps_.delete_set = std::move(input.value);
+  use.activate_under_gate();
+  retired.delete_set = std::move(deps_.delete_set);
+  deps_.delete_set   = std::move(input.value);
   finish_input(required_input::delete_set);
   return true;
 }
 bool preparation_unit::complete_input(checkpoint_input input)
 {
+  preparation_gate::callback_use use(gate_);
   std::unique_lock<std::mutex> gate_lock;
   if (gate_) {
     gate_lock = std::unique_lock(gate_->mutex);
@@ -118,12 +148,15 @@ bool preparation_unit::complete_input(checkpoint_input input)
   }
   std::lock_guard lock(mutex_);
   if (!accept(required_input::checkpoint_iteration)) return false;
+  use.activate_under_gate();
   deps_.checkpoint_iteration = input.iteration;
   finish_input(required_input::checkpoint_iteration);
   return true;
 }
 bool preparation_unit::fail(preparation_failure failure)
 {
+  preparation_gate::callback_use use(gate_);
+  op::scan::split_dependencies retired;
   std::unique_lock<std::mutex> gate_lock;
   if (gate_) {
     gate_lock = std::unique_lock(gate_->mutex);
@@ -135,42 +168,31 @@ bool preparation_unit::fail(preparation_failure failure)
     failure.validate();
     record_.failure = failure;
     record_.state   = unit_state::failed;
-    deps_           = {};
+    use.activate_under_gate();
+    retired = std::move(deps_);
   }
   if (gate_) {
     // arm binds once; this callback stays stable until accepted users have drained.
     auto* report = gate_->report_failure ? &gate_->report_failure : nullptr;
-    if (report) ++gate_->callbacks;
     gate_->cv.notify_all();
     gate_lock.unlock();
-    if (report) {
-      struct callback_use {
-        std::shared_ptr<preparation_gate> gate;
-        ~callback_use()
-        {
-          std::lock_guard lock(gate->mutex);
-          --gate->callbacks;
-          gate->cv.notify_all();
-        }
-      } use{gate_};
-      (*report)(failure);
-    }
+    retired = {};
+    if (report) { (*report)(failure); }
   }
 
   return true;
 }
 bool preparation_unit::cancel()
 {
+  preparation_gate::callback_use use(gate_);
+  op::scan::split_dependencies retired;
   std::unique_lock<std::mutex> gate_lock;
   if (gate_) gate_lock = std::unique_lock(gate_->mutex);
-  return cancel_under_gate();
-}
-bool preparation_unit::cancel_under_gate()
-{
   std::lock_guard lock(mutex_);
   if (record_.state != unit_state::pending) return false;
   record_.state = unit_state::cancelled;
-  deps_         = {};
+  use.activate_under_gate();
+  retired = std::move(deps_);
   if (gate_) gate_->cv.notify_all();
   return true;
 }

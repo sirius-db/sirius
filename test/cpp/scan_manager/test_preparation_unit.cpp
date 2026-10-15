@@ -35,6 +35,51 @@ required_input_set needs(required_input input)
   return set;
 }
 }  // namespace
+TEST_CASE("Terminal preparation releases partial dependencies outside both locks",
+          "[scan_preparation][preparation_unit][preparation_cleanup]")
+{
+  auto gate     = std::make_shared<preparation_gate>();
+  auto seen     = std::make_shared<test::cleanup_observation>(gate);
+  auto required = needs(required_input::segments) | needs(required_input::checkpoint_iteration);
+  preparation_unit unit({1, 1}, required, gate);
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [seen](auto* value) {
+      seen->release();
+      delete value;
+    });
+  REQUIRE(unit.complete_input(segments_input{std::move(profile)}));
+  bool fail = false, throw_report = false;
+  SECTION("cancel") {}
+  SECTION("failure") { fail = true; }
+  SECTION("throwing failure reporter") { fail = throw_report = true; }
+  auto terminal = fail ? unit_state::failed : unit_state::cancelled;
+  if (fail) {
+    gate->report_failure = [&](preparation_failure const&) {
+      CHECK(seen->releases == 1);
+      if (throw_report) throw std::runtime_error("report injected");
+    };
+    preparation_failure failure{
+      sirius::transparent::late_failure_cause::other, {}, "first terminal", {}};
+    if (throw_report)
+      CHECK_THROWS_WITH(unit.fail(failure), "report injected");
+    else
+      CHECK(unit.fail(failure));
+    REQUIRE(unit.record().failure);
+    CHECK(unit.record().failure->detail == "first terminal");
+  } else {
+    CHECK(unit.cancel());
+  }
+  CHECK(unit.record().state == terminal);
+  CHECK_FALSE(unit.cancel());
+  CHECK_FALSE(unit.fail({sirius::transparent::late_failure_cause::other, {}, "late", {}}));
+  CHECK(seen->releases == 1);
+  CHECK(seen->outside == 1);
+  CHECK(seen->errors == 0);
+  CHECK(seen->callbacks_seen > 0);
+  std::lock_guard lock(gate->mutex);
+  CHECK(gate->callbacks == 0);
+}
+
 TEST_CASE("A pending delete set must not be interpreted as no deletes",
           "[scan_preparation][preparation_unit]")
 {
