@@ -1233,23 +1233,26 @@ std::string radius_between(std::vector<std::pair<std::string, double>> const& pa
 
 }  // namespace
 
-TEST_CASE_METHOD(KMeansFixture,
-                 "UINT8 and float16 cluster lists on the host tier give the exact join's answer",
-                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+TEST_CASE_METHOD(
+  KMeansFixture,
+  "UINT8, float16 and INT8 cluster lists on the host tier give the exact join's answer",
+  "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
 {
-  // Lists that do not fit the device are copied in a chunk at a time, still compact, and searched
-  // by the same bounded GEMMs as on the device. 70,000 rows span two chunks either way.
-  auto const bytes  = GENERATE(true, false);
-  auto const prefix = std::string(bytes ? "kmhu" : "kmhh");
+  // Lists that do not fit the device are copied in a chunk at a time, still compact, with their
+  // rows' norms, and searched by the same bounded GEMMs as on the device. 70,000 rows span two
+  // chunks either way.
+  auto const storage = GENERATE(std::string{"uint8"}, std::string{"float16"}, std::string{"int8"});
+  auto const bytes   = storage == "uint8";
+  auto const prefix  = "kmh" + storage.substr(0, 1) + storage.substr(storage.size() - 1);
   create_lists_tables(*this, prefix, "host", bytes);
   run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
          "_c', n_clusters => 16);");
-  auto built = query_ok(*con,
-                        "SELECT tier, encoding FROM sirius_kmeans_build_lists('" + prefix +
-                          "_corpus','vec','" + prefix + "_c', storage => '" +
-                          (bytes ? "uint8" : "float16") + "', tier => 'host');");
+  auto built =
+    query_ok(*con,
+             "SELECT tier, encoding FROM sirius_kmeans_build_lists('" + prefix +
+               "_corpus','vec','" + prefix + "_c', storage => '" + storage + "', tier => 'host');");
   CHECK(built->GetValue(0, 0).ToString() == "host");
-  CHECK(built->GetValue(1, 0).ToString() == (bytes ? "uint8" : "float16"));
+  CHECK(built->GetValue(1, 0).ToString() == storage);
 
   auto const fetch = [&](const std::string& mode) {
     std::vector<std::pair<std::string, double>> out;

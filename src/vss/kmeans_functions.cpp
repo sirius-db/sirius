@@ -49,6 +49,7 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/mr/pinned_host_memory_resource.hpp>
 
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/cudf/host_table.hpp>
@@ -133,6 +134,13 @@ bool exact_copy_asked()
   return v != nullptr && std::string_view{v} == "1";
 }
 
+/// Pinned host memory a kernel reads and writes in place, through the same pointer.
+rmm::device_async_resource_ref mapped_host_resource()
+{
+  static rmm::mr::pinned_host_memory_resource mr;
+  return mr;
+}
+
 }  // namespace
 
 const cudf::column* find_clustering_centroids(duckdb::SiriusContext& ctx, const std::string& name)
@@ -161,25 +169,45 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
 
   auto const metric     = ann_distance_type_from_metric(req.metric);
   auto const n_clusters = resolve_n_clusters(req.spec.n_clusters, n_rows);
-  auto const train_rows = resolve_train_rows(req.spec.train_rows, n_rows, n_clusters);
+  auto train_rows       = resolve_train_rows(req.spec.train_rows, n_rows, n_clusters);
 
   // Over-reserved to cover the sample, the concatenated copy train_centroids makes of it, and
   // k-means' own scratch; shrunk to the centroids alone once the fit is done.
-  auto const vec_bytes        = static_cast<std::size_t>(req.dim) * sizeof(float);
-  std::size_t const footprint = static_cast<std::size_t>(train_rows) * vec_bytes * 3 +
-                                static_cast<std::size_t>(n_clusters) * vec_bytes * 2 +
-                                (std::size_t{1} << 20);
+  auto const vec_bytes = static_cast<std::size_t>(req.dim) * sizeof(float);
+  auto const fixed_bytes =
+    static_cast<std::size_t>(n_clusters) * vec_bytes * 2 + (std::size_t{1} << 20);
+  auto const footprint_of = [&](std::int64_t rows) {
+    return static_cast<std::size_t>(rows) * vec_bytes * 3 + fixed_bytes;
+  };
 
   auto& index_cache = ctx.get_cuvs_index_cache();
   // Free the old clustering's reservation before asking for the new one, so re-fitting under
   // the same name does not have to fit both at once.
   index_cache.erase(req.name);
   index_cache.erase(lists_key(req.name));
-  auto reservation = index_cache.reserve_index_memory(footprint, c.target_gpu);
+  auto reservation = index_cache.reserve_index_memory(footprint_of(train_rows), c.target_gpu);
+  // The default sample (256 rows a centroid) shrinks to what the device can train on, down to 32 a
+  // centroid; the rows it took are what the function reports. A sample asked for is not shrunk.
+  constexpr std::int64_t kMinRowsPerCentroid = 32;
+  if (!reservation && req.spec.train_rows <= 0) {
+    auto const room =
+      static_cast<std::size_t>(0.9 * static_cast<double>(c.space->get_available_memory()));
+    auto const fit_rows =
+      room > fixed_bytes ? static_cast<std::int64_t>((room - fixed_bytes) / (vec_bytes * 3)) : 0;
+    if (fit_rows >= std::min(n_rows, n_clusters * kMinRowsPerCentroid)) {
+      train_rows  = std::min(train_rows, fit_rows);
+      reservation = index_cache.reserve_index_memory(footprint_of(train_rows), c.target_gpu);
+    }
+  }
   if (!reservation) {
-    throw duckdb::InvalidInputException(fn + ": not enough free GPU memory to train " +
-                                        std::to_string(n_clusters) + " centroids: need ~" +
-                                        std::to_string(footprint >> 20) + " MiB");
+    throw duckdb::InvalidInputException(
+      fn + ": not enough free GPU memory to train " + std::to_string(n_clusters) +
+      " centroids: need ~" +
+      std::to_string(footprint_of(req.spec.train_rows > 0
+                                    ? train_rows
+                                    : std::min(n_rows, n_clusters * kMinRowsPerCentroid)) >>
+                     20) +
+      " MiB");
   }
   // The reservation is the admission check for the training footprint; the centroids themselves
   // are ordinary GPU memory the cache entry owns, so they are drawn from the space, not from it.
@@ -685,8 +713,11 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   });
   phase("counting sort");
 
-  // Storage. The row map is device-resident on both tiers because the fold reads it per slice;
-  // the vectors go to the device when the pin is there and they fit, else to pinned host blocks.
+  // Storage. The vectors go to the device when the pin is there and they fit, else to pinned host
+  // blocks. The per-row arrays (row map, norms) go with them: lists that did not fit the device
+  // keep none of their size there, so a corpus far larger than the device costs it nothing per row.
+  // The search reads those arrays in place only per candidate; the norms it reads per row travel to
+  // the device with each staged chunk.
   auto const elem_bytes = list_encoding_bytes(encoding);
   auto const vec_bytes =
     static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(dim) * elem_bytes;
@@ -727,11 +758,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     if (host_mr == nullptr || block_bytes == 0) {
       throw duckdb::InvalidInputException(fn + ": no pinned host memory pool to hold the lists");
     }
-    reservation =
-      index_cache.reserve_index_memory(row_bytes + (std::size_t{1} << 24), c.target_gpu);
+    reservation = index_cache.reserve_index_memory(std::size_t{1} << 24, c.target_gpu);
     if (!reservation) {
-      throw duckdb::InvalidInputException(fn + ": not enough free GPU memory for the lists' " +
-                                          std::to_string(row_bytes >> 20) + " MiB row map");
+      throw duckdb::InvalidInputException(fn + ": not enough free GPU memory to build the lists");
     }
   }
   // The reservation above is only the admission check. A reservation charges the allocations
@@ -768,10 +797,21 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         static_cast<std::size_t>(dim) * elem_bytes));
     }
   }
-  lists.row_ids = std::make_unique<rmm::device_buffer>(row_bytes, persistent, persistent_mr);
+  auto const per_row_mr = on_device ? persistent_mr : mapped_host_resource();
+  lists.row_ids         = std::make_unique<rmm::device_buffer>(row_bytes, persistent, per_row_mr);
   if (encoding == list_encoding::uint8 || encoding == list_encoding::int8) {
     lists.row_sq = std::make_unique<rmm::device_buffer>(
-      static_cast<std::size_t>(n_rows) * sizeof(std::int32_t), persistent, persistent_mr);
+      static_cast<std::size_t>(n_rows) * sizeof(std::int32_t), persistent, per_row_mr);
+  }
+  // A host row map is written here rather than by the device: its writes land in pin order, one
+  // scattered PCIe write per row, which cost ~4 s at 100M rows.
+  if (!on_device) {
+    auto* ids = static_cast<std::int64_t*>(lists.row_ids->data());
+    parallel([&](std::int64_t, std::int64_t lo, std::int64_t hi) {
+      for (auto r = lo; r < hi; ++r) {
+        ids[dest[static_cast<std::size_t>(r)]] = r;
+      }
+    });
   }
   // FLOAT16 and INT8 lists need the FP32 rows for the bounded search to re-score against. Without
   // them FLOAT16 lists could only answer from rounded rows and INT8 lists not at all. They read
@@ -831,8 +871,11 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     }
   }
   if (lists.has_exact_rows()) {
-    lists.row_sq_f32 = std::make_unique<rmm::device_buffer>(
-      static_cast<std::size_t>(n_rows) * sizeof(float), persistent, persistent_mr);
+    // Only the FP16 search reads the FP32 norms per row; INT8 lists need just their maximum.
+    if (encoding == list_encoding::float16) {
+      lists.row_sq_f32 = std::make_unique<rmm::device_buffer>(
+        static_cast<std::size_t>(n_rows) * sizeof(float), persistent, per_row_mr);
+    }
     max_norm_bits.emplace(1, persistent, persistent_mr);
     CUDF_CUDA_TRY(
       cudaMemsetAsync(max_norm_bits->data(), 0, sizeof(unsigned int), persistent.value()));
@@ -1070,7 +1113,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
           float_row_sq_norms(
             grouped.data(), rows, dim, grouped_sqf->data(), max_norm_bits->data(), stream);
         }
-        scatter(grouped_sqf->data(), sizeof(float), lists.row_sq_f32->data());
+        if (lists.row_sq_f32) {
+          scatter(grouped_sqf->data(), sizeof(float), lists.row_sq_f32->data());
+        }
         if (lists.exact_vectors) {
           download(exact_stage,
                    reinterpret_cast<std::byte const*>(grouped.data()),
@@ -1101,9 +1146,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         grouped_bytes = reinterpret_cast<std::byte const*>(grouped_i8->data());
         scatter(grouped_sq->data(), sizeof(std::int32_t), lists.row_sq->data());
       }
-      scatter_row_ids(
-        chunk_dest.data(), rows, base, static_cast<std::int64_t*>(lists.row_ids->data()), stream);
       if (on_device) {
+        scatter_row_ids(
+          chunk_dest.data(), rows, base, static_cast<std::int64_t*>(lists.row_ids->data()), stream);
         scatter(grouped_bytes, row_bytes_v, lists.device_vectors->data());
       } else {
         download(row_stage, grouped_bytes, static_cast<std::size_t>(rows) * row_bytes_v);

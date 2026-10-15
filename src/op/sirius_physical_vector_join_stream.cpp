@@ -1536,7 +1536,7 @@ void sirius_physical_vector_join_stream::ensure_earlier_keys(
     // would drop pairs otherwise.
     std::vector<std::int64_t> host(static_cast<std::size_t>(_right_total_rows));
     CUDF_CUDA_TRY(
-      cudaMemcpyAsync(host.data(), layout_keys, bytes, cudaMemcpyDeviceToHost, stream.value()));
+      cudaMemcpyAsync(host.data(), layout_keys, bytes, cudaMemcpyDefault, stream.value()));
     stream.synchronize();
     bool ascending = true;
     for (std::size_t c = 0; ascending && c + 1 < _lists->offsets.size(); ++c) {
@@ -2612,9 +2612,19 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // lists in place copies each needed chunk's stored rows in as they are, still compact, and
     // points the search at the copy. Four rows of slack, as on the device.
     bool const lists_on_host = _lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST;
-    auto stage_compact       = [&](std::size_t j) {
-      auto const rows  = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
-      auto const bytes = static_cast<std::size_t>(rows + 4) * _lists->row_bytes();
+    // The per-row norms the searches read (INT32 for byte rows, FP32 for half rows) are copied in
+    // behind the rows, so lists on the host keep none of their size on the device.
+    void const* const list_norms = _lists == nullptr ? nullptr
+                                   : _lists->encoding == vss::list_encoding::float16
+                                     ? (_lists->row_sq_f32 ? _lists->row_sq_f32->data() : nullptr)
+                                     : (_lists->row_sq ? _lists->row_sq->data() : nullptr);
+    auto const staged_rows_bytes = [&](std::int64_t rows) {
+      return (static_cast<std::size_t>(rows + 4) * _lists->row_bytes() + 255) / 256 * 256;
+    };
+    auto stage_compact = [&](std::size_t j) {
+      auto const rows = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
+      auto const bytes =
+        staged_rows_bytes(rows) + (list_norms != nullptr ? static_cast<std::size_t>(rows) * 4 : 0);
       std::shared_ptr<cucascade::memory::reservation> reservation{
         mem_space->make_reservation_or_null(bytes)};
       if (!reservation) {
@@ -2628,6 +2638,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       auto* out       = static_cast<std::byte*>(buffer->data());
       auto const lock = vss::lock_host_list_chunk(*_lists, j, stage_on);
       vss::copy_host_list_rows(*_lists, lock, 0, rows, out, stage_on);
+      if (list_norms != nullptr) {
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          out + staged_rows_bytes(rows),
+          static_cast<std::byte const*>(list_norms) +
+            static_cast<std::size_t>(static_cast<std::int64_t>(j) * _lists->chunk_rows) * 4,
+          static_cast<std::size_t>(rows) * 4,
+          cudaMemcpyDefault,
+          stage_on.value()));
+      }
       // As the chunk sources do: the host waits on the copy while the device runs what the
       // previous chunk issued, and the copy is complete before anything reads it. The read lock
       // ends with it.
@@ -2905,8 +2924,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         auto const chunk_base   = _chunk_row_base[j];
         float const* chunk_data = nullptr;
         std::int64_t chunk_n    = 0;
-        // Chunk j's stored rows, where a direct sweep reads them.
-        std::byte const* compact = nullptr;
+        // Chunk j's stored rows and their norms, where a direct sweep reads them.
+        std::byte const* compact     = nullptr;
+        std::byte const* chunk_norms = nullptr;
         std::optional<rmm::device_buffer> widened;
         if (direct) {
           chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
@@ -2914,6 +2934,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           compact = copy_compact ? static_cast<std::byte const*>(staged.buffer->data())
                                  : static_cast<std::byte const*>(_lists->device_vectors->data()) +
                                      static_cast<std::size_t>(chunk_base) * _lists->row_bytes();
+          if (list_norms != nullptr) {
+            chunk_norms = copy_compact ? compact + staged_rows_bytes(chunk_n)
+                                       : static_cast<std::byte const*>(list_norms) +
+                                           static_cast<std::size_t>(chunk_base) * 4;
+          }
         } else if (widen_compact) {
           chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
           check_chunk_base(j, chunk_base);
@@ -2986,14 +3011,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             bounded_slice const sl =
               f16_bounded
                 ? bounded_slice{reinterpret_cast<std::uint16_t const*>(compact) + slice.begin * dim,
-                                static_cast<float const*>(_lists->row_sq_f32->data()) + id_base,
+                                reinterpret_cast<float const*>(chunk_norms) + slice.begin,
                                 slice_rows,
                                 id_base,
                                 nullptr,
                                 rows_c,
                                 m}
                 : bounded_slice{reinterpret_cast<std::int8_t const*>(compact) + slice.begin * dim,
-                                static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
+                                reinterpret_cast<std::int32_t const*>(chunk_norms) + slice.begin,
                                 slice_rows,
                                 id_base,
                                 rescore ? nullptr : id_map,
@@ -3079,7 +3104,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
               return vss::gemm_f16_topk(
                 res,
                 reinterpret_cast<std::uint16_t const*>(compact) + slice.begin * dim,
-                static_cast<float const*>(_lists->row_sq_f32->data()) + id_base,
+                reinterpret_cast<float const*>(chunk_norms) + slice.begin,
                 slice_rows,
                 routed_f16->data(),
                 routed_sqf->data(),
@@ -3095,7 +3120,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
               return vss::gemm_int8_topk(
                 res,
                 reinterpret_cast<std::int8_t const*>(compact) + slice.begin * dim,
-                static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
+                reinterpret_cast<std::int32_t const*>(chunk_norms) + slice.begin,
                 slice_rows,
                 routed_i8->data(),
                 routed_sq->data(),
