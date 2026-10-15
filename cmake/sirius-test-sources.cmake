@@ -7,6 +7,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_preparation_config.cpp
     test/cpp/scan/test_native_physical_matrix.cpp
     test/cpp/scan/test_parquet_physical_profile.cpp
+    test/cpp/memory/test_numa_small_pinned_mr.cpp
     test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp
     test/cpp/transparent/test_read_view_scaling.cpp
