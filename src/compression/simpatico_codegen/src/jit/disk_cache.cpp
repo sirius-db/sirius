@@ -9,11 +9,14 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <optional>
 #include <regex>
 #include <span>
 #include <string_view>
@@ -77,6 +80,28 @@ bool write_all(int fd, std::span<const char> bytes)
     bytes = bytes.subspan(static_cast<std::size_t>(size));
   }
   return true;
+}
+
+std::optional<mode_t> record_permissions()
+{
+  // Read per publication: never change the host process's umask or cache a
+  // value that could become stale. Unavailable/malformed status keeps the
+  // owner-only temporary permissions unchanged.
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    const std::string_view field = line;
+    if (!field.starts_with("Umask:")) continue;
+    const auto first = field.find_first_not_of(" \t", 6);
+    if (first == std::string_view::npos) break;
+    unsigned mask = 0;
+    const auto [end, error] =
+      std::from_chars(field.data() + first, field.data() + field.size(), mask, 8);
+    if (error == std::errc{} && end == field.data() + field.size() && mask <= 0777)
+      return static_cast<mode_t>(0666 & ~mask);
+    break;
+  }
+  return std::nullopt;
 }
 
 bool is_directory_no_follow(const std::filesystem::path& path)
@@ -196,7 +221,9 @@ void write_cubin_file_atomic(const std::string& path, const std::vector<char>& b
       temporary.path.clear();
       return;
     }
-    if (!write_all(file.get(), header) || !write_all(file.get(), bytes) || !file.close()) return;
+    if (!write_all(file.get(), header) || !write_all(file.get(), bytes)) return;
+    if (const auto mode = record_permissions(); mode && ::fchmod(file.get(), *mode) != 0) return;
+    if (!file.close()) return;
     // No fsync: this is a recoverable cache, not durable user data. Rename
     // publishes a complete record; crash/torn-write damage becomes a miss.
     if (::rename(temporary.path.c_str(), path.c_str()) == 0) temporary.path.clear();

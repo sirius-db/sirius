@@ -15,7 +15,7 @@ add_executable(test_disk_cache test_disk_cache.cpp ../../src/jit/disk_cache.cpp)
 target_link_libraries(test_disk_cache PRIVATE simpatico_cache_identity
                                               Threads::Threads)
 target_link_options(test_disk_cache PRIVATE "-Wl,--wrap=write"
-                    "-Wl,--wrap=close" "-Wl,--wrap=rename")
+                    "-Wl,--wrap=fchmod" "-Wl,--wrap=close" "-Wl,--wrap=rename")
 add_test(NAME simpatico_disk_cache COMMAND test_disk_cache)
 add_test(
   NAME simpatico_header_manifests
