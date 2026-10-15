@@ -19,6 +19,58 @@ use crate::fragment_executor::KeyStats;
 use crate::local_exchange::ExchangeKey;
 use crate::result_store::FragmentInstanceId;
 
+/// Logs that this CN applies runtime filter `filter_id` to a scan of `instance`.
+///
+/// Every filter a fragment on this CN builds or probes gets one `runtime filter` line per place
+/// it could apply, applied or skipped with a reason, so a run's filters can be tallied from the
+/// logs alone (`docs/scripts/rf_logs.py`).
+pub(crate) fn log_applied(
+    query: Option<FragmentInstanceId>,
+    instance: Option<FragmentInstanceId>,
+    filter_id: i32,
+    stats: &KeyStats,
+    waited_ms: u64,
+) {
+    tracing::info!(
+        query = %display_id(query),
+        instance = %display_id(instance),
+        filter_id,
+        outcome = "applied",
+        rows = stats.rows,
+        distinct = stats.distinct,
+        min = stats.min,
+        max = stats.max,
+        waited_ms,
+        "runtime filter"
+    );
+}
+
+/// Logs that this CN leaves runtime filter `filter_id` unapplied at `node` (the building join or
+/// the probing target, when known), and why. See [`log_applied`].
+pub(crate) fn log_skipped(
+    query: Option<FragmentInstanceId>,
+    instance: Option<FragmentInstanceId>,
+    filter_id: i32,
+    node: Option<i32>,
+    reason: &str,
+    detail: &str,
+) {
+    tracing::info!(
+        query = %display_id(query),
+        instance = %display_id(instance),
+        filter_id,
+        node = node.unwrap_or(-1),
+        outcome = "skipped",
+        reason,
+        detail,
+        "runtime filter"
+    );
+}
+
+fn display_id(id: Option<FragmentInstanceId>) -> String {
+    id.map_or_else(|| "-".to_string(), |id| id.to_string())
+}
+
 /// Engine stream ids at and above this carry runtime filter keys: `FILTER_STREAM_BASE + filter
 /// id`. Exchange node ids are plan node ids, far below.
 pub(crate) const FILTER_STREAM_BASE: i32 = 1_000_000;
@@ -137,21 +189,27 @@ impl RuntimeFilters {
     }
 }
 
-/// Key sets this small are always applied: the join against them costs next to nothing.
+/// Key sets with this few distinct keys are always applied: the join against them costs next to
+/// nothing.
 pub(crate) const SMALL_KEY_SET: u64 = 1 << 20;
 
 /// Whether a filter with these keys is worth applying: a small key set always is, and a larger
 /// one must cover at most `max_density` of its value range. Keys that fill their range (every
 /// supplier, say) would keep almost every probe row while costing a join.
+///
+/// Both tests count distinct keys, not rows: a build side that repeats a few keys (q05's five
+/// ASIA nations over two million suppliers) is small and selective. `distinct` is summed per
+/// batch, so it can only overstate the keys, which skips a filter rather than wrongly applying
+/// a dense one.
 pub(crate) fn selective(stats: &KeyStats, max_density: f64) -> bool {
-    if stats.rows <= SMALL_KEY_SET {
+    if stats.distinct <= SMALL_KEY_SET {
         return true;
     }
     if stats.max < stats.min {
         return false;
     }
     let range = (stats.max as f64) - (stats.min as f64) + 1.0;
-    (stats.rows as f64) / range <= max_density
+    (stats.distinct as f64) / range <= max_density
 }
 
 /// `SIRIUS_CN_RUNTIME_FILTERS=0` turns runtime filters off.
@@ -270,14 +328,30 @@ mod tests {
 
     #[test]
     fn only_keys_that_leave_most_of_their_range_out_are_selective() {
-        let stats = |rows, min, max| KeyStats { rows, min, max };
+        let stats = |rows, distinct, min, max| KeyStats {
+            rows,
+            distinct,
+            min,
+            max,
+        };
         // q09's green parts: 5% of part keys.
-        assert!(selective(&stats(32_000_000, 1, 600_000_000), 0.5));
+        assert!(selective(
+            &stats(32_000_000, 32_000_000, 1, 600_000_000),
+            0.5
+        ));
         // Every supplier.
-        assert!(!selective(&stats(30_000_000, 1, 30_000_000), 0.5));
+        assert!(!selective(
+            &stats(30_000_000, 30_000_000, 1, 30_000_000),
+            0.5
+        ));
         // An empty build side keeps nothing, which is the best filter there is.
-        assert!(selective(&stats(0, i64::MAX, i64::MIN), 0.5));
+        assert!(selective(&stats(0, 0, i64::MAX, i64::MIN), 0.5));
         // A small key set is cheap to join against even when it fills its range.
-        assert!(selective(&stats(1000, 1, 1000), 0.5));
+        assert!(selective(&stats(1000, 1000, 1, 1000), 0.5));
+        // q05 rf1: two million suppliers' nation keys, five distinct nations in [8, 21].
+        assert!(selective(&stats(1_999_620, 5, 8, 21), 0.5));
+        // Many distinct keys repeated: judged on the distinct ones.
+        assert!(!selective(&stats(8_000_000, 2_000_000, 1, 2_000_000), 0.5));
+        assert!(selective(&stats(8_000_000, 2_000_000, 1, 40_000_000), 0.5));
     }
 }

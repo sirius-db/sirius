@@ -318,8 +318,8 @@ impl Fragment<'_> {
         })
     }
 
-    /// Add the non-null rows, minimum and maximum of signed integer column `column` over every
-    /// batch parked on output stream `stream_id` to `stats`, without draining it.
+    /// Add the non-null rows, distinct keys, minimum and maximum of signed integer column `column`
+    /// over every batch parked on output stream `stream_id` to `stats`, without draining it.
     pub fn output_key_stats(
         &self,
         stream_id: u64,
@@ -330,6 +330,7 @@ impl Fragment<'_> {
             stream_id,
             column,
             &mut stats.rows,
+            &mut stats.distinct,
             &mut stats.min,
             &mut stats.max,
         )
@@ -436,10 +437,14 @@ pub struct ExportedBatch {
     pub src: Vec<(u64, u64)>,
 }
 
-/// Non-null rows, minimum and maximum of an integer key column, accumulated over batches.
+/// Non-null rows, distinct keys, minimum and maximum of an integer key column, accumulated over
+/// batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyStats {
     pub rows: u64,
+    /// Distinct keys of each batch, summed: exact for one batch, at least the true count across
+    /// batches.
+    pub distinct: u64,
     pub min: i64,
     pub max: i64,
 }
@@ -449,6 +454,7 @@ impl Default for KeyStats {
     fn default() -> Self {
         Self {
             rows: 0,
+            distinct: 0,
             min: i64::MAX,
             max: i64::MIN,
         }
@@ -556,8 +562,8 @@ impl DirectExchange {
         self.inner.outstanding()
     }
 
-    /// Add the non-null rows, minimum and maximum of signed integer column `column` of the sealed
-    /// batch under `token` to `stats`, leaving the batch for its receiver.
+    /// Add the non-null rows, distinct keys, minimum and maximum of signed integer column `column`
+    /// of the sealed batch under `token` to `stats`, leaving the batch for its receiver.
     pub fn key_stats(
         &self,
         token: u64,
@@ -568,6 +574,7 @@ impl DirectExchange {
             token,
             column,
             &mut stats.rows,
+            &mut stats.distinct,
             &mut stats.min,
             &mut stats.max,
         )

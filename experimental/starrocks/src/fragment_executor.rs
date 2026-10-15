@@ -86,10 +86,12 @@ pub struct FilterKeys {
     pub sources: Vec<KeySource>,
 }
 
-/// Non-null rows, minimum and maximum of a key column.
+/// Non-null rows, distinct keys, minimum and maximum of a key column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyStats {
     pub rows: u64,
+    /// Distinct keys of each batch, summed: at least the true count.
+    pub distinct: u64,
     pub min: i64,
     pub max: i64,
 }
@@ -99,6 +101,7 @@ impl Default for KeyStats {
     fn default() -> Self {
         Self {
             rows: 0,
+            distinct: 0,
             min: i64::MAX,
             max: i64::MIN,
         }

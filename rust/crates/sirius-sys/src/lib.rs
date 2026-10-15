@@ -120,13 +120,15 @@ mod ffi {
         /// Tokens neither released nor consumed.
         fn outstanding(self: &DirectExchange) -> Result<usize>;
 
-        /// Add the non-null rows, minimum and maximum of a signed integer
-        /// column of the sealed batch under `token`, leaving it in place.
+        /// Add the non-null rows, distinct keys (per batch, summed), minimum
+        /// and maximum of a signed integer column of the sealed batch under
+        /// `token`, leaving it in place.
         fn key_stats(
             self: &DirectExchange,
             token: u64,
             column: u32,
             rows: &mut u64,
+            distinct: &mut u64,
             min: &mut i64,
             max: &mut i64,
         ) -> Result<()>;
@@ -205,14 +207,15 @@ mod ffi {
         /// the fragment runs. Take it after `build` and before `run`.
         fn output_drain(self: &Fragment, stream_id: u64) -> Result<UniquePtr<OutputDrain>>;
 
-        /// Add the non-null rows, minimum and maximum of a signed integer
-        /// column over every batch parked on an output stream, without
-        /// draining it.
+        /// Add the non-null rows, distinct keys (per batch, summed), minimum
+        /// and maximum of a signed integer column over every batch parked on
+        /// an output stream, without draining it.
         fn output_key_stats(
             self: &Fragment,
             stream_id: u64,
             column: u32,
             rows: &mut u64,
+            distinct: &mut u64,
             min: &mut i64,
             max: &mut i64,
         ) -> Result<()>;
