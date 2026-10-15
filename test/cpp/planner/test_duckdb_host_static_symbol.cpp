@@ -34,7 +34,9 @@
 extern "C" int sirius_test_host_static_symbol_probe(int value) { return value + 1; }
 extern "C" {
 static __attribute__((noinline, used)) int sirius_test_host_static_symbol_local_probe(int value)
-{ return value + 2; }
+{
+  return value + 2;
+}
 }
 
 namespace {
