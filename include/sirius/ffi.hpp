@@ -210,7 +210,9 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @return the layout to pass to the receiver's DirectExchange::allocate, or null once the
   /// stream is drained.
   /// @throws before run(), on an unknown stream, without a DirectExchange, or on a batch it
-  /// cannot send (spilled, or a column neither fixed-width nor string).
+  /// cannot send (spilled, or a column neither fixed-width nor string). A throw after the batch
+  /// was pulled drops it, and a later call exports the next one, so the caller must fail the
+  /// query rather than retry.
   std::unique_ptr<std::vector<std::uint8_t>> export_direct(std::uint64_t stream_id,
                                                            std::uint64_t& token,
                                                            std::uint64_t& rows,

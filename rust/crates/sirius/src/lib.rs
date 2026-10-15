@@ -236,7 +236,9 @@ impl Fragment<'_> {
 
     /// Export the next batch with rows parked on output stream `stream_id` for a
     /// [`DirectExchange`] peer, or `None` once the stream is drained. Release `token` on this
-    /// context's exchange once the buffers in `src` were written.
+    /// context's exchange once the buffers in `src` were written. An error after the batch was
+    /// pulled drops it and the next call moves on to the next batch, so fail the query instead of
+    /// retrying.
     pub fn export_direct(&mut self, stream_id: u64) -> Result<Option<ExportedBatch>, Exception> {
         let (mut token, mut rows) = (0, 0);
         let mut src = CxxVector::new();
