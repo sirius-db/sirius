@@ -117,7 +117,7 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 
 Candidates are fetched lazily via `convertible_data_provider` implementations:
 
-1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
+1. **Data repositories** are reached through the per-query managers: the downgrade executor snapshots every query's `shared_data_repository_manager` from the `data_repository_manager_registry` (`get_all()`, ascending by query id) and walks the snapshot in reverse, so the newest query's data is downgraded first. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
 2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. Tasks are returned to the queue via RAII on all code paths.
 
 Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.

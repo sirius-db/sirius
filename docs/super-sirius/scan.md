@@ -298,6 +298,8 @@ Validity (null) masks decode from `UNCOMPRESSED`, `EMPTY` (all-null), and `CONST
 
 The metadata walk (below) rejects any codec or type the decoder cannot handle and falls the query back to DuckDB CPU before staging. The decoder's own `throw`s on unsupported codecs/types are a defensive backstop, not the primary gate. Unsupported cases include 128-bit (`HUGEINT`/`DECIMAL128`) and nested (`STRUCT`/`LIST`) types, and a varchar column whose summed max-string-length upper bound would overflow cuDF's int32 string-offset limit.
 
+**Overflow (big-string) refusal.** DuckDB stores any single string at or over `StringUncompressed::GetStringBlockLimit` (4,096 B at the default block size) in a separate overflow block, leaving only a 12-byte `BIG_STRING_MARKER` in the segment dictionary — which the GPU string decoder would silently emit as string content. Detection is exact and metadata-only: the per-string max-string-length statistic proves a row group marker-free when it is below the limit. The refusal is layered coarsest-first — `prepare_duckdb_native_walk` refuses per column from row-group stats, and the per-segment walk re-checks each varchar segment as a stats-drift guard. The stat is codec-blind, so DICT_FSST row groups (which inline strings up to 16 KiB without markers) between the limit and 16 KiB are refused unnecessarily — rare in practice.
+
 ## DuckDB-Native Metadata Walk
 
 **Files:** `src/include/op/scan/duckdb_native_metadata.hpp`, `src/op/scan/duckdb_native_metadata.cpp`, `src/include/op/scan/duckdb_native_decoder.hpp`
@@ -339,7 +341,9 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
 Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
-**Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER`, `IS_NOT_NULL`, and partition-column filters) -> `gpu_expression_translator` -> cuDF AST tree.
+**Stats-safe predicate splitting.** cuDF's statistics filter evaluates a predicate against per-row-group stats by rewriting every column reference into that row group's `(min, max)` pair. Two predicate shapes have no valid rewrite and would fault rather than mis-prune: a **null test** (`v IS NULL` asks about the *absence* of values, answerable only from `null_count`) and a **bare column reference used as the predicate** (`WHERE flag`). The ingestible constructor therefore keeps two expressions: the full coalesced filter (`_duckdb_filter_expression`) and the pushdown-safe subset (`_static_pushdown_expression`). When the full predicate is unsafe (`is_unsafe_for_stats_filter()`), `stats_safe_conjuncts()` keeps only the safe **top-level AND conjuncts** — a compound conjunct (an OR, or nested AND) containing anything unsafe is dropped whole. Only the safe subset is pushed into stats pruning and reader `set_filter`; dropping conjuncts is sound because pruning on part of a conjunction can only keep extra row groups, never drop wanted ones (`v IS NULL AND id > 3000` still prunes on `id`). A partial pushdown clears `_static_pushdown_is_complete`, so `materialize_table` does not report the filter as fully applied and the **full** predicate is evaluated post-decode. The bare-reference check deliberately does not recurse — `WHERE flag AND v > 5000` prunes fine; only a reference that *is* the predicate is unsafe.
+
+**Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER`, `IS_NOT_NULL`, and partition-column filters) -> stats-safe conjunct split -> `gpu_expression_translator` -> cuDF AST tree.
 
 ### DuckDB-native path
 
@@ -408,6 +412,8 @@ The scan manager builds one ioctx for the run: `uring_ioctx` when `use_sirius_da
 DuckDB still decodes Hive partition values, so `col=a%20b/` yields `a b`. Glob syntax is unchanged: `?` in a pattern is still a wildcard. A concrete key whose directory segment contains both `=` and a literal `?` is rejected, because DuckDB would drop that partition column; encode it as `%3F`. A `?` in the final filename is allowed.
 
 **Opening objects.** A generic open issues a blocking HEAD to obtain the object size. A `parquet_footer_probe` open uses a suffix-range GET to obtain both the size and the footer bytes; those bytes stay on the resulting `rest_io_object` and serve the binder's footer reads. If the suffix response cannot be used, the open falls back to HEAD. Parsed footer metadata is stored separately in the ioctx's `metadata_store`.
+
+**Validation ETags.** Every open captures the object's HTTP ETag (quotes preserved) on the `io_object` as an opaque `validation_etag()`; `sirius_httpfs` exposes it to DuckDB through `GetVersionTag()`. DuckDB's external file cache requires validation metadata to cache external reads, so the tag is what lets repeated transparent S3 binds hit DuckDB's cache instead of re-issuing GETs. Consumers compare tags only for equality; an empty tag (backend sent none) keeps the safe uncached bypass — degraded performance, never wrong bytes.
 
 **Reads.** Each `rest_reactor` runs a libcurl multi handle on one epoll worker thread and reuses a pool of easy handles. Ranged GETs are asynchronous and can scatter one response across adjacent destination segments. The response's `Content-Range` and byte count are checked before the request completes. HEAD, LIST, and footer-probe requests use blocking easy handles on the caller thread; they share DNS and TLS-session caches with the workers.
 

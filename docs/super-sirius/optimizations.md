@@ -95,6 +95,18 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 - `src/op/aggregate/gpu_aggregate_impl.cpp` — `cudf::approx_distinct_count` usage
 - `src/op/aggregate/aggregate_op_util.cpp` — `has_count_distinct` flag
 
+### Group-Key Label Encoding for COUNT DISTINCT (PR #1375)
+
+**Motivation:** cuDF's sorted groupby finds group boundaries via `stable_sorted_order(keys)`, which takes its radix fast path only when the key table has exactly one column. A multi-column group key falls into a lexicographic merge sort — on TPC-H q16 that was 118.8M rows and 92% of the aggregate's time.
+
+**Mechanism:** `cudf::encode` collapses the whole key table into one dense INT32 label column, the groupby runs on that single radix-sortable label, and the original key columns are recovered after the aggregate with a gather at group cardinality. `cudf::encode` returns the distinct key rows in sorted order plus the per-row index into them, so label ordering matches the lexicographic key ordering; NULL key tuples get their own label (`null_policy::INCLUDE`).
+
+**Guards:** applies only when a `COLLECT_SET` (count-distinct) aggregation is present, the input has ≥ 1M rows (`label_encode_min_rows`), the key is multi-column, non-nested, and not already radix-sortable — and only when a HyperLogLog estimate (`cudf::approx_distinct_count`) puts group cardinality below 1% of rows (`label_encode_max_group_ratio`): `cudf::encode` sorts the distinct rows, so on a high-cardinality key it would cost as much as the sort it replaces.
+
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — label encoding in `local_grouped_agg`
+
+**Result:** TPC-H SF1000 q16 0.490 → 0.298 s (−39%), byte-identical results.
+
 ### Distinct Hash Join (PR #558)
 
 **Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.

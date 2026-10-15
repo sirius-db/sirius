@@ -208,6 +208,12 @@ while running:
 
 The `mark_task_created()` call before data popping prevents a race condition where the pipeline could appear finished between data check and task creation.
 
+### Look-ahead Scan Warm-up
+
+The creator config `strategy` (`sirius.executor.creator`, enum `active` | `lookahead`, default `active`) sets the most speculative request type the task creator may use. Under `active`, every task is demand-driven. Under `lookahead`, the task scheduler's management loop calls `task_creator::schedule_lookahead()` whenever a device is ready but the pipeline-task queue is empty, warming up not-yet-activated scans **one task at a time**.
+
+At query setup the creator snapshots every scan operator after the first into a `_lookahead_queue` (the first scan is scheduled normally at startup). `schedule_lookahead()` walks the queue from a persistent cursor: a scan whose `get_next_task_hint()` reports `READY` gets exactly one `lookahead`-typed task-creation request pushed, and the call returns — one speculative task per empty-queue event. A scan with no hint on an unfinished pipeline stops the walk (it may still produce demand-driven work); scans on finished pipelines are skipped past. The queue and cursor are cleared at query end and on `reset()`, so a racing `schedule_lookahead()` from the management loop finds an empty queue instead of dangling operator pointers.
+
 ## Device Assignment for GPU Tasks
 
 **File:** `src/creator/task_creator.cpp`

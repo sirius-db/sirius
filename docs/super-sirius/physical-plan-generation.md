@@ -37,6 +37,8 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 **Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
 `LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_CROSS_PRODUCT`, `LOGICAL_RECURSIVE_CTE`
 
+**Unsupported expressions.** `sirius::ast::from_duckdb()` returns `nullptr` for any expression it cannot translate (unmapped scalar functions, struct/list/map extraction, etc.). Plan construction checks that result wherever an expression enters the plan — projections (including sort keys computed by a projection), pushed-down scan filters, ordinary filters, and join conditions — and rejects the plan rather than installing a null expression node, so transparent execution falls back to DuckDB CPU during planning instead of crashing or failing mid-query. Scan-side checks distinguish an intentionally skipped filter from a failed translation, so an unsupported predicate cannot be silently dropped.
+
 ### Join Planning
 
 **File:** `src/planner/sirius_plan_comparison_join.cpp`

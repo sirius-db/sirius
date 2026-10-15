@@ -22,7 +22,7 @@ graph TD
 
     GPE -->|"unified GPU scan source"| SM
     GPE -->|"memory reservations"| MRM["sirius_memory_reservation_manager"]
-    GPE -->|"consume/produce"| DRM["shared_data_repository_manager"]
+    GPE -->|"consume/produce"| DRM["data_repository_manager_registry<br/>(one manager per query)"]
 
     DE["downgrade_executor(s)"] -->|"monitor pressure"| MRM
     DE -->|"move GPU→Host"| DRM
@@ -46,7 +46,7 @@ SiriusContext
 ├── sirius_config                       # Configuration (thread counts, memory sizes, operator params)
 ├── sirius_memory_reservation_manager   # GPU/Host/Disk memory management via cuCascade
 ├── small_pinned_host_memory_resource   # Pinned host memory allocator
-├── shared_data_repository_manager      # Central registry of all data repositories
+├── data_repository_manager_registry    # One shared_data_repository_manager per in-flight query
 ├── task_scheduler                      # Top-level executor (owns the GPU pipeline executors)
 ├── sirius_scan_manager                 # Scan-side preparation + I/O (io_context, prefetch cache, split providers)
 ├── downgrade_executor[]                # Per-memory-space monitors for GPU→Host spilling

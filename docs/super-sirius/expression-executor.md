@@ -151,6 +151,8 @@ The following translate directly into cuDF AST nodes:
 
 Anything outside this set is an AST breaker and forces materialization at that node.
 
+SQL `AND`/`OR` follow Kleene three-valued logic (`TRUE OR NULL = TRUE`, `FALSE AND NULL = FALSE`), so conjunctions translate to cuDF's `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR` — never the null-propagating `LOGICAL_*` operators — at all three translation sites: the conjunction specialization's AST and `cudf::binary_operation` paths, and `gpu_expression_translator`. The Kleene operators behave identically to `LOGICAL_*` on non-null operands, so no nullability-based selection is needed.
+
 ## GPU Expression Translator
 
 **File:** `src/include/expression_evaluator/gpu_expression_translator_internal.hpp`

@@ -306,6 +306,16 @@ queue, one `gpu_pipeline_executor` per active GPU, and the management thread tha
 tasks to ready devices. Scan execution is reached through `task_creator`; there is no scan
 sub-executor or scan-priority queue owned here.
 
+The shared queue is a `sirius::exec::multi_index_priority_queue`
+(`src/include/exec/multi_index_priority_queue.hpp`): a thread-safe priority queue whose tasks are
+additionally reachable through secondary indexes on **operator type**, **pipeline id**, and
+**query id**. Tasks are stored once in a pointer-stable backing container and referenced from one
+global priority order plus one bucket per key; every index sorts by `(priority, insertion-seq)` —
+ascending priority, FIFO among equals. Alongside the blocking `pop()` and non-blocking `try_pop()`
+family, per-index `try_pop_from()` pops the best task for one operator/pipeline/query key,
+`drain(query_index)` drops a single query's tasks, and `mutable_pop_if` supports the downgrade
+executor's temporary task extraction.
+
 ### Key Methods
 
 | Method | Purpose |
@@ -436,27 +446,32 @@ Thread-safe signaling for query completion using promise/future:
 
 All methods are idempotent — subsequent calls after the first are no-ops.
 
-## OOM Handling
+## Task Rescheduling (OOM and transient launch failures)
 
 **File:** `src/include/pipeline/oom_reschedule_exception.hpp`
 
-When a GPU operator runs out of memory during execution, it throws `oom_reschedule_exception` carrying:
+A task can request to be re-run instead of failing the query by throwing a `task_reschedule_exception`, carrying:
 
 - `intermediate_data` — partial results computed so far
 - `_resume_operator_index` — which operator to resume from
 
-The GPU executor catches this and:
+Two subclasses exist:
+
+- `oom_reschedule_exception` — a GPU operator ran out of memory during execution.
+- `cuda_launch_reschedule_exception` — a transient CUDA kernel-launch failure. With several concurrent streams per GPU, simultaneous kernel launches (e.g. inside `cudf::hash_partition`) can exhaust the GPU's launch-scheduling resources and fail synchronously with `cudaErrorLaunchOutOfResources` or `cudaErrorInvalidValue`. `compute_task()`'s operator loop catches the `thrust::system_error` for exactly those two retryable codes and converts it to this exception (also carrying the CUDA error code); any other CUDA error still propagates as a real failure.
+
+The GPU executor catches the base exception and:
 
 1. Checks if the completion handler already has an error (skip if so)
-2. Increments `retry_count` (max 10 retries, `MAX_OOM_RETRIES`)
+2. Increments `retry_count` (max 100 retries, `MAX_RETRIES`)
 3. Logs the retry attempt
 4. Marks the original task as rescheduled (skips pipeline completion tracking)
 5. Transitions intermediate data from idle to `task_created` state
 6. Creates a new rescheduled task via `create_rescheduled_task()` virtual factory
-7. Sleeps 5ms for backoff
+7. Sleeps 50ms for backoff
 8. Reschedules the new task back through the manager loop
 
-If max retries are exceeded, the error propagates and terminates the query.
+If max retries are exceeded, the error propagates and terminates the query. The 100 × 50ms budget (~5s) is sized for cross-GPU batch-lock contention, where each convert-release cycle a retry waits on is O(100ms).
 
 ## Error Handling and Draining
 
@@ -483,7 +498,7 @@ This ensures that when `drain_after_error()` returns, no tasks are referencing o
 | `src/include/pipeline/gpu_pipeline_task.hpp` | GPU task class |
 | `src/pipeline/gpu_pipeline_task.cpp` | Task execution |
 | `src/include/pipeline/completion_handler.hpp` | Promise/future completion |
-| `src/include/pipeline/oom_reschedule_exception.hpp` | OOM retry mechanism |
+| `src/include/pipeline/oom_reschedule_exception.hpp` | Task-reschedule exceptions (OOM, transient launch failure) |
 | `src/include/pipeline/sirius_pipeline.hpp` | Pipeline structure |
 | `src/include/pipeline/sirius_pipeline_itask.hpp` | Task interface |
 | `src/include/pipeline/task_request.hpp` | Executor↔pipeline request |

@@ -59,13 +59,19 @@ Data repositories are thread-safe containers managed by the `shared_data_reposit
 - Support partitioned storage (multiple partitions per repository)
 - Provide `add_data_batch()` for producers and `pop_next_data_batch()` for consumers (non-blocking; returns `nullptr` if empty)
 - Track total size and per-partition sizes
-- Registered centrally in `shared_data_repository_manager` for downgrade candidate selection
+- Registered in the owning query's `shared_data_repository_manager` for downgrade candidate selection
 
-### `shared_data_repository_manager`
+### `shared_data_repository_manager` and the per-query registry
 
-Central registry of all repositories in query execution:
+**File:** `src/include/data/data_repository_manager_registry.hpp`
+
+Each in-flight query owns its own `cucascade::shared_data_repository_manager`:
 - Provides `for_each_repository()` iterator for downgrade candidate selection
-- Thread-safe access to all active repositories
+- Thread-safe access to that query's active repositories
+
+The managers are held in a `data_repository_manager_registry` owned by `SiriusContext`, keyed by `query_id_t`. Operator ids restart at 0 for every query (`pipeline::assign_operator_ids` assigns them after all operators are constructed), so the `{operator_id, port_id}` repository keys are unique only *within* a query — each concurrent query therefore needs its own manager, and ending a query drops only that query's repositories instead of wiping every in-flight query's data. Managers are handed out as `shared_ptr`: a downgrade worker may be sweeping a manager while its query ends, and shared ownership keeps the manager alive until the last borrower releases it. The registry's `get_all()` returns a snapshot built under the lock so long memory-pressure sweeps never serialize query begin/end behind spilling.
+
+`query_id_t` (`src/include/query_id.hpp`) is the strongly-typed query identity — a `uint32_t` enum minted once per execution window (`SiriusContext::StandaloneQueryScope`) and threaded through everything downstream: which repository manager the query owns, which repositories its cleanup drops, its task-scheduling priority (packed into the high bits so earlier queries dispatch first, with pipeline order in the low bits), and its log/telemetry correlation key. It is a distinct enum type rather than an integer alias so it cannot be silently mixed with operator, pipeline, or connection ids.
 
 ## Port System
 
