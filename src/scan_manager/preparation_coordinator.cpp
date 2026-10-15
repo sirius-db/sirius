@@ -56,6 +56,7 @@ struct preparation_coordinator::state {
   std::map<unit_key, std::shared_ptr<preparation_unit>> units;
   std::deque<pending_batch> batches;
   lifecycle phase = lifecycle::constructed;
+  bool stopping   = false;
   size_t jobs = 0, results = 0, output = 0, external = 0;
   size_t next_result = 0, next_deadline_source = 0;
   statistics stats;
@@ -93,9 +94,14 @@ struct preparation_coordinator::state {
   {
     preparation_gate::callback_use use(gate);
     lock_type lock(gate->mutex);
-    use.activate_under_gate();
     gate->closed = true;
-    auto next    = units.begin();
+    gate->cv.notify_all();
+    // A release may notify stop again. One sweep owns cancellation and discarded
+    // dispatcher captures; nested callers must not recurse or wait for that sweep.
+    if (stopping) return;
+    stopping = true;
+    use.activate_under_gate();
+    auto next = units.begin();
     while (next != units.end()) {
       auto key  = next->first;
       auto unit = next->second;
@@ -106,6 +112,10 @@ struct preparation_coordinator::state {
       // Release callbacks may retire another unit while the gate is unlocked.
       next = units.upper_bound(key);
     }
+    lock.unlock();
+    dispatcher->request_stop();
+    lock.lock();
+    stopping = false;
     gate->cv.notify_all();
   }
   void reserve_slot(size_t index, size_t source_id)
@@ -338,7 +348,6 @@ void preparation_coordinator::request_stop(stop_reason reason) noexcept
     }
   }
   state_->stop();
-  state_->dispatcher->request_stop();
 }
 void preparation_coordinator::drain()
 {
@@ -611,7 +620,6 @@ preparation_coordinator::state::nearest_deadline() const
 void preparation_coordinator::state::shutdown()
 {
   stop();
-  dispatcher->request_stop();
   dispatcher->wait_for_all();
   {
     std::unique_lock lock(gate->mutex);

@@ -20,6 +20,7 @@
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "utils/host_allocation_fault.hpp"
 
 #include <algorithm>
 #include <array>
@@ -463,6 +464,10 @@ TEST_CASE("Dependency disposal keeps drain pending through terminal cleanup",
   CHECK(seen->callbacks_seen > 0);
   f.start();
   f.coordinator.request_stop(stop_reason::normal_eos);
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!f.coordinator.snapshot().wakes && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  REQUIRE(f.coordinator.snapshot().wakes > 0);
   std::this_thread::sleep_for(30ms);
   CHECK_FALSE(terminal_done);
   CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
@@ -476,6 +481,239 @@ TEST_CASE("Dependency disposal keeps drain pending through terminal cleanup",
   CHECK_FALSE(f.owner_error);
   CHECK(f.completion.has_error() == (mode == operation::fail));
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Final release stop notifications coalesce while units retire themselves",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  fixture f(1, 32);
+  size_t depth = 0, peak = 0;
+  std::array<size_t, 32> releases{};
+  std::vector<std::shared_ptr<preparation_unit>> units;
+  auto cleanup = f.shutdown_guard();
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  for (size_t index = 0; index < releases.size(); ++index) {
+    unit_key key{96, index};
+    auto unit = f.coordinator.admit_unit(key, required);
+    REQUIRE(unit);
+    auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+      new sirius::op::scan::physical_profile_table, [&, key, index](auto* value) {
+        peak = std::max(peak, ++depth);
+        ++releases[index];
+        f.coordinator.request_stop(stop_reason::normal_eos);
+        f.coordinator.retire_unit(key);
+        --depth;
+        delete value;
+      });
+    REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+    units.push_back(std::move(unit));
+  }
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK(depth == 0);
+  CHECK(peak == 1);
+  for (size_t index = 0; index < releases.size(); ++index) {
+    CHECK(releases[index] == 1);
+    CHECK(units[index]->record().state == unit_state::cancelled);
+    CHECK_FALSE(f.coordinator.unit_state_snapshot({96, index}));
+  }
+  f.start();
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK_FALSE(f.completion.has_error());
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Preparation cancel retirement and stop bookkeeping allocate no host memory",
+          "[.][host_allocation_fault][preparation_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  enum class operation { cancel, retire, stop };
+  auto mode = GENERATE(operation::cancel, operation::retire, operation::stop);
+  CAPTURE(static_cast<int>(mode));
+  fixture f;
+  std::atomic<size_t> released{0};
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({98, 1}, required);
+  REQUIRE(unit);
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [&](auto* value) {
+      ++released;
+      delete value;
+    });
+  auto cleanup = f.shutdown_guard();
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+  if (mode != operation::cancel) unit.reset();
+  size_t allocations = 0;
+  {
+    // The deleter only updates an atomic: observer thread creation is not counted.
+    fault counting{fault::every_allocation_scope, 0};
+    if (mode == operation::cancel)
+      unit->cancel();
+    else if (mode == operation::retire)
+      f.coordinator.retire_unit({98, 1});
+    else
+      f.coordinator.request_stop(stop_reason::normal_eos);
+    allocations = counting.stop();
+  }
+  CHECK(allocations == 0);
+  CHECK(released == 1);
+}
+
+TEST_CASE("Queue allocation failure unwinds every caller payload outside the gate",
+          "[.][host_allocation_fault][preparation_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  enum class path { advance, partial, flush };
+  auto mode = GENERATE(path::advance, path::partial, path::flush);
+  CAPTURE(static_cast<int>(mode));
+  fixture f(1, 1);
+  auto failure = f.completion.get_awaitable();
+  auto out     = std::make_shared<sink>();
+  auto seen    = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  std::optional<fault> armed;
+  size_t made = 0, refused_id = 0, observed_allocations = 0;
+  auto disarm = [&](size_t id) {
+    if (armed) {
+      observed_allocations += armed->stop();
+      if (armed->fired()) refused_id = id;
+      armed.reset();
+    }
+  };
+  struct queued_payload : tagged {
+    std::shared_ptr<test::cleanup_observation> seen;
+    std::function<void()> disarm;
+    queued_payload(int id,
+                   std::shared_ptr<test::cleanup_observation> seen,
+                   std::function<void()> disarm)
+      : tagged(id), seen(std::move(seen)), disarm(std::move(disarm))
+    {
+    }
+    ~queued_payload() override
+    {
+      disarm();
+      seen->release();
+    }
+  };
+  auto make_batch = [&]() -> std::unique_ptr<sirius::op::scan::scan_info> {
+    auto id = ++made;
+    return std::make_unique<queued_payload>(static_cast<int>(id), seen, [&, id] { disarm(id); });
+  };
+  struct fault_coalescer : accumulator {
+    path mode;
+    std::function<std::unique_ptr<sirius::op::scan::scan_info>()> make;
+    std::function<void()> arm;
+    size_t advance_calls = 0, partial_calls = 0, flush_calls = 0;
+    explicit fault_coalescer(path mode) : mode(mode) {}
+    cursor_step advance(sirius::op::scan::scan_info&, size_t&, size_t) override
+    {
+      ++advance_calls;
+      if (mode == path::partial) {
+        note_retained(clock::now() - 1s);
+        return {nullptr, true};
+      }
+      auto batch = make();
+      arm();
+      return {std::move(batch), true};
+    }
+    std::unique_ptr<sirius::op::scan::scan_info> partial_emit() override
+    {
+      if (!first_retained_time()) return {};
+      ++partial_calls;
+      clear_retained();
+      auto batch = make();
+      arm();
+      return batch;
+    }
+    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override
+    {
+      ++flush_calls;
+      std::vector<std::unique_ptr<sirius::op::scan::scan_info>> batches;
+      if (mode == path::flush) {
+        batches.push_back(make());
+        // Construct the vector and payload before arming the queue allocation.
+        arm();
+      }
+      return batches;
+    }
+  };
+  constexpr size_t attempts = 1024;
+  const size_t sources      = mode == path::flush ? attempts : 1;
+  std::vector<std::shared_ptr<fault_coalescer>> coalescers;
+  for (size_t index = 0; index < sources; ++index) {
+    auto coalescer  = std::make_shared<fault_coalescer>(mode);
+    coalescer->make = make_batch;
+    coalescer->arm  = [&] { armed.emplace(fault::every_allocation_scope, 1); };
+    coalescers.push_back(coalescer);
+    preparation_coordinator::source source;
+    source.coalescer = coalescer;
+    source.claim     = finite_jobs(mode == path::flush ? 0 : attempts,
+                               [](int id) { return std::make_unique<tagged>(id); });
+    source.construct = [&](std::unique_ptr<sirius::op::scan::scan_info> batch) {
+      disarm(static_cast<tagged&>(*batch).id);
+      using sirius::op::scan::scan_operator_input;
+      auto input = std::make_unique<scan_operator_input>(
+        std::move(batch), nullptr, 0, std::nullopt, scan_operator_input::prefetch_start::deferred);
+      return preparation_coordinator::publication{std::move(input), 0};
+    };
+    source.publish = [out](preparation_coordinator::publication& publication) {
+      auto& input = static_cast<sirius::op::scan::scan_operator_input&>(*publication.input);
+      auto metadata =
+        std::get<std::shared_ptr<sirius::op::scan::scan_info>>(input.materialization_info);
+      std::lock_guard lock(out->mutex);
+      out->published.push_back(static_cast<tagged&>(*metadata).id);
+      out->cv.notify_all();
+    };
+    source.close = [out, sources] {
+      std::lock_guard lock(out->mutex);
+      if (++out->close_calls == sources) out->closed = true;
+      out->cv.notify_all();
+    };
+    source.bind_consumption = [out](std::function<void()> consume) {
+      out->consumed = std::move(consume);
+    };
+    f.coordinator.add_source(std::move(source));
+  }
+  auto cleanup = f.shutdown_guard();
+  f.start();
+  size_t consumed = 0;
+  while (!f.completion.has_error() && !out->closed) {
+    if (out->await(consumed + 1)) {
+      out->consume();
+      ++consumed;
+    } else {
+      REQUIRE((f.completion.has_error() || out->closed));
+    }
+  }
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  REQUIRE(f.completion.has_error());
+  CHECK_THROWS_AS(failure.get(), std::bad_alloc);
+  REQUIRE(refused_id > 0);
+  CHECK(observed_allocations == 1);
+  CHECK(made > 1);
+  CHECK(made <= attempts);
+  CHECK(std::count(out->published.begin(), out->published.end(), static_cast<int>(refused_id)) ==
+        0);
+  CHECK(seen->releases == made);
+  CHECK(seen->outside == made);
+  CHECK(seen->errors == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  if (mode == path::partial)
+    CHECK(coalescers.front()->partial_calls == made);
+  else if (mode == path::advance)
+    CHECK(coalescers.front()->advance_calls == made);
+  else {
+    size_t flushes = 0;
+    for (auto const& coalescer : coalescers)
+      flushes += coalescer->flush_calls;
+    CHECK(flushes == made);
+  }
 }
 
 TEST_CASE("Ready partial batches publish while every preparation worker is blocked",

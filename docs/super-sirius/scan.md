@@ -226,7 +226,8 @@ Preparation payloads are finally released outside the publication gate and live 
 Slot credits remain occupied until that local disposal finishes; out-of-lock unit cleanup
 and failure reporting are also counted until completion. Release callbacks may make bounded,
 nonthrowing gate observations or notifications, but must not synchronously drain or destroy
-their own coordinator. Explicit unit retirement returns registry membership, not a physical
+their own coordinator. Normal stop notifications coalesce with an active cancellation sweep.
+Explicit unit retirement returns registry membership, not a physical
 byte reservation. External ready snapshots, provider caches and published consumer inputs
 keep their existing ownership; preparation quiescence does not invalidate them.
 
