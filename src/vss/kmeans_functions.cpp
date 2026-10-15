@@ -125,6 +125,14 @@ const pinned_index_entry* find_clustering_entry(duckdb::SiriusContext& ctx, cons
 /// can drop them without the cache knowing the two are related.
 std::string lists_key(const std::string& clustering) { return clustering + "::lists"; }
 
+/// SIRIUS_VSS_EXACT_COPY=1: FLOAT16 and INT8 lists keep their own FP32 copy instead of reading the
+/// pin.
+bool exact_copy_asked()
+{
+  auto const* v = std::getenv("SIRIUS_VSS_EXACT_COPY");
+  return v != nullptr && std::string_view{v} == "1";
+}
+
 }  // namespace
 
 const cudf::column* find_clustering_centroids(duckdb::SiriusContext& ctx, const std::string& name)
@@ -557,6 +565,26 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                         req.column + "' to be an integer in [0, 255]; " +
                                         std::to_string(non_uint8_host) + " are not");
   }
+  // 'auto' is the planner's choice, the one a statement that builds its own lists makes ('exact'):
+  // bytes as UINT8, anything else as FLOAT16 that the bounded search re-scores in FP32 -- where the
+  // width allows it and the FP32 rows can be read, in place from the pin or as a host copy that
+  // fits. Where they cannot, FP32 lists, which answer without a re-score.
+  std::optional<pinned_rows_map> early_pin;
+  if (storage == list_storage::automatic) {
+    bool const bytes = check_uint8 && non_uint8_host == 0;
+    bool f16         = !bytes && bound_filter_f16_supports(req.dim);
+    if (f16 && !unit_rows && !exact_copy_asked()) {
+      early_pin = map_pinned_rows(
+        *c.pin, req.column, dim, *c.space, persistent, c.space->get_default_allocator());
+      if (early_pin && early_pin->n_rows() != n_rows) { early_pin.reset(); }
+    }
+    if (f16 && !early_pin) {
+      auto const copy_bytes =
+        static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(dim) * sizeof(float);
+      f16 = c.host_space->get_available_memory() >= copy_bytes + (std::size_t{1} << 28);
+    }
+    storage = bytes ? list_storage::uint8 : f16 ? list_storage::exact : list_storage::float32;
+  }
   auto const encoding = storage == list_storage::float16     ? list_encoding::float16
                         : want_int8                          ? list_encoding::int8
                         : check_uint8 && non_uint8_host == 0 ? list_encoding::uint8
@@ -756,12 +784,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     host_mr != nullptr
       ? static_cast<std::int64_t>(block_bytes / (static_cast<std::size_t>(dim) * sizeof(float)))
       : std::int64_t{0};
-  auto const copy_asked = [] {
-    auto const* v = std::getenv("SIRIUS_VSS_EXACT_COPY");
-    return v != nullptr && std::string_view{v} == "1";
-  }();
-  if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) && !unit_rows &&
-      !copy_asked) {
+  if (early_pin) {
+    lists.exact_pin = std::move(early_pin);
+  } else if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) &&
+             !unit_rows && !exact_copy_asked()) {
     lists.exact_pin = map_pinned_rows(*c.pin, req.column, dim, *c.space, persistent, persistent_mr);
     if (lists.exact_pin && lists.exact_pin->n_rows() != n_rows) { lists.exact_pin.reset(); }
   }

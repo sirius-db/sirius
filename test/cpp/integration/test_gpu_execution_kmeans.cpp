@@ -929,10 +929,11 @@ TEST_CASE_METHOD(KMeansFixture,
 
   run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
          "_c', n_clusters => 16);");
-  auto built =
-    query_ok(*con,
-             "SELECT n_rows, n_clusters, tier, encoding FROM sirius_kmeans_build_lists('" + prefix +
-               "_corpus','vec','" + prefix + "_c');");
+  // FP32 lists are asked for: left to choose, the build would make FLOAT16 ones.
+  auto built = query_ok(
+    *con,
+    "SELECT n_rows, n_clusters, tier, encoding FROM sirius_kmeans_build_lists('" + prefix +
+      "_corpus','vec','" + prefix + "_c'" + (bytes ? "" : ", storage => 'float32'") + ");");
   CHECK(built->GetValue(0, 0).GetValue<std::int64_t>() == 70000);
   CHECK(built->GetValue(1, 0).GetValue<std::int64_t>() == 16);
   CHECK(built->GetValue(2, 0).ToString() == (bytes ? std::string("gpu") : tier));
@@ -1004,10 +1005,42 @@ TEST_CASE_METHOD(KMeansFixture,
                "SELECT * FROM sirius_kmeans_build_lists('kmu_corpus','vec','kmu_c', "
                "storage => 'uint8');",
                "integer in [0, 255]");
-  // ...and left to choose, the build keeps FP32.
-  auto built =
-    query_ok(*con, "SELECT encoding FROM sirius_kmeans_build_lists('kmu_corpus','vec','kmu_c');");
-  CHECK(built->GetValue(0, 0).ToString() == "float32");
+  // ...and left to choose, the build makes the planner's choice: FLOAT16, re-scored from the pin.
+  auto built = query_ok(
+    *con,
+    "SELECT encoding, exact_rows FROM sirius_kmeans_build_lists('kmu_corpus','vec','kmu_c');");
+  CHECK(built->GetValue(0, 0).ToString() == "float16");
+  CHECK(built->GetValue(1, 0).ToString() == "pin");
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "lists left to choose take the format a statement would build",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Bytes: UINT8, lossless and nothing to re-score.
+  create_lists_tables(*this, "kma", "gpu", /*bytes=*/true);
+  run_ok("SELECT * FROM sirius_kmeans_fit('kma_corpus','vec', name => 'kma_c', n_clusters => 8);");
+  auto bytes = query_ok(
+    *con,
+    "SELECT encoding, exact_rows FROM sirius_kmeans_build_lists('kma_corpus','vec','kma_c');");
+  CHECK(bytes->GetValue(0, 0).ToString() == "uint8");
+  CHECK(bytes->GetValue(1, 0).ToString() == "none");
+  // A width the FLOAT16 filter cannot take (not a multiple of 16): FP32 rather than a refusal.
+  run_ok(
+    "CREATE TABLE kma_odd AS SELECT i::INTEGER AS id, list_transform(range(20), lambda d: "
+    "((hash(i * 1000 + d) % 1000)::FLOAT / 1000.0))::FLOAT[20] AS vec FROM range(4000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'kma_odd', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_kmeans_fit('kma_odd','vec', name => 'kma_o', n_clusters => 8);");
+  auto odd =
+    query_ok(*con, "SELECT encoding FROM sirius_kmeans_build_lists('kma_odd','vec','kma_o');");
+  CHECK(odd->GetValue(0, 0).ToString() == "float32");
+  // An explicit format is still a hint the build follows.
+  auto f32 = query_ok(*con,
+                      "SELECT encoding FROM sirius_kmeans_build_lists('kma_corpus','vec','kma_c', "
+                      "storage => 'float32');");
+  CHECK(f32->GetValue(0, 0).ToString() == "float32");
+  run_ok("SELECT * FROM unpin_table('kma_odd');");
 }
 
 TEST_CASE_METHOD(KMeansFixture,
