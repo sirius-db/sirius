@@ -6031,6 +6031,68 @@ fn filters_a_join_cant_build_are_reported_with_their_reason() {
 }
 
 #[test]
+fn partitioned_filters_a_join_cant_build_name_their_merge_node() {
+    use starrocks_plan_translator::runtime_filter::{SkipReason, UnbuiltShare, unbuilt_shares};
+    use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
+    let filter = |id, mode| {
+        let mut filter = runtime_filter(
+            id,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            mode,
+        );
+        filter.expr_order = Some(0);
+        filter.runtime_filter_merge_nodes = Some(vec![merge_node()]);
+        filter
+    };
+    let mut unmerged = filter(3, Mode::PARTITIONED);
+    unmerged.runtime_filter_merge_nodes = Some(Vec::new());
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![
+        filter(1, Mode::PARTITIONED),
+        filter(2, Mode::BROADCAST),
+        unmerged,
+    ]);
+    let plan = |build| {
+        params(
+            Some(TPlan::new(vec![
+                join.clone(),
+                exchange_node(10, vec![0]),
+                build,
+            ])),
+            Some(join_desc()),
+            None,
+        )
+    };
+    // Built from an exchange: nothing to tell anyone.
+    assert_eq!(
+        unbuilt_shares(&plan(exchange_node(11, vec![1]))).unwrap(),
+        Vec::new()
+    );
+    // Built from another join's output, as q17's filter 1 is once the FE plans it: only the
+    // partitioned filter with a merge node is listed. A broadcast filter's probers are on the
+    // builder's CN and don't wait for it.
+    let mut build_join = hash_join_node(TJoinOp::INNER_JOIN);
+    build_join.node_id = 11;
+    build_join.num_children = 0;
+    build_join
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .build_runtime_filters = None;
+    assert_eq!(
+        unbuilt_shares(&plan(build_join)).unwrap(),
+        vec![UnbuiltShare {
+            filter_id: 1,
+            join_node_id: 2,
+            merge_node: merge_node(),
+            reason: SkipReason::BuildNotExchange,
+        }]
+    );
+}
+
+#[test]
 fn probes_no_compute_node_filters_are_reported_and_the_rest_are_probed() {
     use starrocks_plan_translator::runtime_filter::{SkipReason, SkippedFilter, skipped_probes};
     use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
