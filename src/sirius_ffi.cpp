@@ -19,7 +19,6 @@
 
 #include "config.hpp"                                    // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                  // duckdb::CoreFunctionsExtension
-#include "cudf/cudf_utils.hpp"                           // sirius::get_cudf_type
 #include "data/data_batch_utils.hpp"                     // sirius::make_data_batch
 #include "data/sirius_converter_registry.hpp"            // sirius::converter_registry
 #include "duckdb/common/enums/optimizer_type.hpp"        // duckdb::OptimizerType
@@ -49,8 +48,6 @@
 #include "sirius/ffi.hpp"
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
-
-#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_device.hpp>
 
@@ -106,30 +103,6 @@ double elapsed_ms(std::chrono::steady_clock::time_point since)
 {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since)
     .count();
-}
-
-void check_declared_schema(const sirius::exec::stream_input_spec& declared,
-                           const cudf::table_view& view,
-                           std::uint64_t stream_id,
-                           const char* what)
-{
-  if (static_cast<std::size_t>(view.num_columns()) != declared.types.size()) {
-    throw sirius::invalid_input_exception(
-      std::string("Fragment: ") + what + " for stream " + std::to_string(stream_id) + " carries " +
-      std::to_string(view.num_columns()) + " columns but the stream declares " +
-      std::to_string(declared.types.size()));
-  }
-  for (std::size_t i = 0; i < declared.types.size(); ++i) {
-    const auto expected = sirius::get_cudf_type(declared.types[i]);
-    const auto actual   = view.column(static_cast<cudf::size_type>(i)).type();
-    if (actual != expected) {
-      throw sirius::invalid_input_exception(
-        std::string("Fragment: ") + what + " for stream " + std::to_string(stream_id) + " column " +
-        std::to_string(i) + " (" + declared.names[i] + ") is declared " +
-        declared.types[i].to_string() + " (" + cudf::type_to_name(expected) + ") but carries " +
-        cudf::type_to_name(actual));
-    }
-  }
 }
 
 // Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator.
@@ -575,9 +548,9 @@ void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)
   // The batch's writer event is created on the current device and recorded on a slab stream, and
   // the table is freed into the slab, so both happen on the slab's device.
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{exchange.region().device}};
-  const auto& declared = impl_->fragment->input_spec(stream_id);
-  auto table           = exchange.take(token);
-  check_declared_schema(declared, table->view(), stream_id, "received batch");
+  // Refuses an undeclared input or a running fragment before the token is consumed.
+  impl_->fragment->require_pushable(stream_id);
+  auto table = exchange.take(token);
   auto& gpu  = exchange.space();
   auto batch = sirius::make_data_batch(
     std::move(table), gpu, gpu.acquire_stream(), telemetry::batch_telemetry_info{});

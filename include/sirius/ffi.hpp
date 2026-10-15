@@ -215,9 +215,10 @@ class SIRIUS_FFI_EXPORT Fragment {
                                                            std::vector<std::uint64_t>& src);
 
   /// Push the batch received under `token` into input stream `stream_id`. Consumes the token
-  /// unless it throws before reading it: before build() or on an undeclared input.
-  /// @throws also after run() started, without a DirectExchange, on a token that holds no
-  /// received batch, on a schema mismatch, or when the input already ended.
+  /// unless it throws before reading it: before build(), without a DirectExchange, after run()
+  /// started, or on an undeclared input.
+  /// @throws also on a token that holds no received batch, on a schema mismatch, or when the
+  /// input already ended.
   void push_received(std::uint64_t stream_id, std::uint64_t token);
 
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
