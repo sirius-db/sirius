@@ -156,18 +156,18 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   auto const output_type = sirius::require_cudf_type(alt.return_type());
 
   if (date_operation.has_value()) {
-    auto left  = evaluate(*args[0], evaluation_mode::MATERIALIZE);
-    auto right = evaluate(*args[1], evaluation_mode::MATERIALIZE);
-    if (left.is_scalar()) {
-      left = evaluate_result(
-        cudf::make_column_from_scalar(left.get_scalar(), _input_table.num_rows(), _stream, _mr));
-    }
-    if (right.is_scalar()) {
-      right = evaluate_result(
-        cudf::make_column_from_scalar(right.get_scalar(), _input_table.num_rows(), _stream, _mr));
-    }
+    auto left               = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto right              = evaluate(*args[1], evaluation_mode::MATERIALIZE);
+    auto as_transform_input = [&](evaluate_result& value) -> cudf::transform_input {
+      if (!value.is_scalar()) { return value.get_column_view(); }
+      // Retain the one-row column in the evaluation result while its view is broadcast.
+      value = evaluate_result(cudf::make_column_from_scalar(value.get_scalar(), 1, _stream, _mr));
+      return cudf::scalar_column_view{value.get_column_view()};
+    };
+    auto const left_input  = as_transform_input(left);
+    auto const right_input = as_transform_input(right);
     return evaluate_result(temporal::date_arithmetic_checked(
-      left.get_column_view(), right.get_column_view(), *date_operation, _stream, _mr));
+      left_input, right_input, *date_operation, _input_table.num_rows(), _stream, _mr));
   }
 
   //----------Numeric Binary Functions----------//

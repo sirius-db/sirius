@@ -30,6 +30,8 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <type_traits>
+#include <variant>
 
 namespace sirius::temporal {
 
@@ -133,9 +135,10 @@ std::unique_ptr<cudf::column> cast_to_microseconds_checked(cudf::column_view con
                             mr);
 }
 
-std::unique_ptr<cudf::column> date_arithmetic_checked(cudf::column_view const& left,
-                                                      cudf::column_view const& right,
+std::unique_ptr<cudf::column> date_arithmetic_checked(cudf::transform_input const& left,
+                                                      cudf::transform_input const& right,
                                                       date_arithmetic_operation operation,
+                                                      cudf::size_type row_count,
                                                       ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr)
 {
@@ -145,17 +148,29 @@ std::unique_ptr<cudf::column> date_arithmetic_checked(cudf::column_view const& l
   auto const int64_type = cudf::data_type{cudf::type_id::INT64};
   auto const reversed   = operation == recipe::days_add_date;
   auto const difference = operation == recipe::date_difference;
-  auto date             = reversed ? right : left;
-  auto days             = reversed ? left : right;
-  if (date.type() != date_type || days.type() != (difference ? date_type : int32_type) ||
-      left.size() != right.size()) {
-    throw internal_exception("[date_arithmetic] source type or shape mismatch");
-  }
-  auto date_ticks = cudf::bit_cast(date, int32_type);
-  auto days_ticks = difference ? cudf::bit_cast(days, int32_type) : days;
+  auto day_counts       = [&](cudf::transform_input const& input, cudf::data_type expected_type) {
+    return std::visit(
+      [&](auto const& view) -> cudf::transform_input {
+        using view_type       = std::decay_t<decltype(view)>;
+        constexpr bool scalar = std::is_same_v<view_type, cudf::scalar_column_view>;
+        if (view.type() != expected_type || (!scalar && view.size() != row_count)) {
+          throw internal_exception("[date_arithmetic] source type or shape mismatch");
+        }
+        if constexpr (scalar) {
+          return cudf::scalar_column_view{cudf::bit_cast(view.as_column_view(), int32_type)};
+        } else {
+          return cudf::bit_cast(view, int32_type);
+        }
+      },
+      input);
+  };
+  auto date_ticks = day_counts(reversed ? right : left, date_type);
+  auto days_ticks = day_counts(reversed ? left : right, difference ? date_type : int32_type);
   // transform_extended skips rows with either input NULL and propagates their
   // validity. Infinity must be handled before invoking checked arithmetic.
   static std::string const offset_prefix  = R"(
+#include <cuda/numeric>
+
 __device__ cudf::errc date_offset(int32_t* out, int32_t date, int32_t days)
 {
   constexpr int32_t infinity = 2147483647;
@@ -163,13 +178,12 @@ __device__ cudf::errc date_offset(int32_t* out, int32_t date, int32_t days)
     *out = date;
     return cudf::errc::SUCCESS;
   }
-  auto result = cudf::detail::ops::)";
+  auto result = cuda::)";
   static std::string const offset_suffix  = R"((date, days);
-  if (!result.has_value()) { return result.error(); }
-  if (result.value() == infinity || result.value() == -infinity) {
+  if (result.overflow || result.value == infinity || result.value == -infinity) {
     return cudf::errc::OVERFLOW;
   }
-  *out = result.value();
+  *out = result.value;
   return cudf::errc::SUCCESS;
 }
 )";
@@ -192,7 +206,7 @@ __device__ void date_difference(int64_t* out, int32_t left, int32_t right)
                                       cudf::udf_source_type::CUDA,
                                       std::nullopt,
                                       cudf::null_aware::NO,
-                                      date.size(),
+                                      row_count,
                                       cudf::output_nullability::PRESERVE,
                                       stream,
                                       mr);

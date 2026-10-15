@@ -37,26 +37,6 @@ class DateArithmeticFixture : public sirius::test::GpuExecutionFixture {
     run_ok("SET enable_duckdb_fallback = false");
     run_ok("SET expression_evaluator_strategy = '" + value + "'");
   }
-  void check(std::string const& query, bool ordered = false)
-  {
-    INFO(query);
-    run_ok("SET gpu_execution = false");
-    auto cpu = con->Query(query);
-    REQUIRE(cpu);
-    REQUIRE_FALSE(cpu->HasError());
-    auto expected_types = cpu->types;
-    run_ok("SET gpu_execution = true");
-    auto before = sirius::test::get_transparent_execution_stats(*con);
-    auto gpu    = con->Query(query);
-    REQUIRE(gpu);
-    if (gpu->HasError()) { UNSCOPED_INFO(gpu->GetError()); }
-    REQUIRE_FALSE(gpu->HasError());
-    auto after = sirius::test::get_transparent_execution_stats(*con);
-    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-    REQUIRE(gpu->types == expected_types);
-    REQUIRE(collect_rows(gpu->Cast<duckdb::MaterializedQueryResult>(), !ordered) ==
-            collect_rows(cpu->Cast<duckdb::MaterializedQueryResult>(), !ordered));
-  }
   void seed()
   {
     run_ok("CREATE TABLE dates(id INTEGER, a DATE, b DATE, n INTEGER)");
@@ -80,17 +60,17 @@ TEST_CASE_METHOD(DateArithmeticFixture,
 {
   strategy(GENERATE("materialize", "ast_interpret", "ast_jit"));
   seed();
-  check("SELECT id,a+n,n+a,a-n,a-b FROM dates");
-  check("SELECT id,a+5,5+a,a-5,a-DATE '1970-01-01',DATE '1970-01-01'-a FROM dates");
-  check(
+  compare_gpu_vs_cpu("SELECT id,a+n,n+a,a-n,a-b FROM dates");
+  compare_gpu_vs_cpu("SELECT id,a+5,5+a,a-5,a-DATE '1970-01-01',DATE '1970-01-01'-a FROM dates");
+  compare_gpu_vs_cpu(
     "SELECT id,DATE '2000-01-01'+n,n+DATE '2000-01-01',DATE '2000-01-01'-n "
     "FROM dates WHERE id IN (1,2,5,6,7,8)");
-  check("SELECT id,a+n FROM dates WHERE (a+n)>b AND (a-n)<DATE '2001-01-01'");
-  check("SELECT l.id,r.id FROM dates l JOIN dates r ON l.a+5=r.b-2");
+  compare_gpu_vs_cpu("SELECT id,a+n FROM dates WHERE (a+n)>b AND (a-n)<DATE '2001-01-01'");
+  compare_gpu_vs_cpu("SELECT l.id,r.id FROM dates l JOIN dates r ON l.a+5=r.b-2");
   run_ok("SET gpu_execution = false");
   run_ok("CREATE TABLE empty_dates AS SELECT * FROM dates WHERE false");
   run_ok("CHECKPOINT");
-  check("SELECT a+n,n+a,a-n,a-b FROM empty_dates");
+  compare_gpu_vs_cpu("SELECT a+n,n+a,a-n,a-b FROM empty_dates");
 }
 
 TEST_CASE_METHOD(DateArithmeticFixture,
@@ -108,7 +88,7 @@ TEST_CASE_METHOD(DateArithmeticFixture,
   auto reverse = statement->Execute(low, high);
   REQUIRE_FALSE(reverse->HasError());
   run_ok("CHECKPOINT");
-  check("SELECT a-b,b-a,a+n,n+a,a-n FROM dates");
+  compare_gpu_vs_cpu("SELECT a-b,b-a,a+n,n+a,a-n FROM dates");
 }
 
 TEST_CASE_METHOD(DateArithmeticFixture,
@@ -123,6 +103,7 @@ TEST_CASE_METHOD(DateArithmeticFixture,
     edge < 2 ? std::numeric_limits<int32_t>::max() - 1 : std::numeric_limits<int32_t>::min();
   int const delta = edge == 0 ? 1 : edge == 1 ? 2 : edge == 2 ? -1 : 1;
   run_ok("CREATE TABLE dates(a DATE,n INTEGER)");
+  run_ok("INSERT INTO dates SELECT DATE '2000-01-01',1 FROM range(5000)");
   // DATE's INT32_MIN carrier is finite but does not round-trip via its text parser.
   auto statement = con->Prepare("INSERT INTO dates VALUES (?, ?)");
   REQUIRE_FALSE(statement->HasError());
