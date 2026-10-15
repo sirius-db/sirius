@@ -615,8 +615,8 @@ fn translate_two_phase(
     (partial, merge)
 }
 
-/// q01 averages three DECIMAL64(15,2) columns (final type DECIMAL128(38,8), FP64 here) next to
-/// four sums and a count. The partial step ships each AVG as a sum and a count, so its 8
+/// q01 averages three DECIMAL64(15,2) columns (final type DECIMAL128(38,8)) next to four sums
+/// and a count. The partial step ships each AVG as a sum and a count, so its 8
 /// aggregates become 11 columns after the 2 keys, and the merge step reads exactly those
 /// columns: its stream is the partial step's output, column for column, not the descriptor's
 /// 10 slots with their VARBINARY AVG states.
@@ -630,12 +630,13 @@ fn q01_two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
             "sum", "sum", "sum", "sum", "sum", "count", "sum", "count", "sum", "count", "count"
         ]
     );
-    // The four sums ship as the FE's DECIMAL128(38,s); each AVG as an FP64 sum and a count.
+    // The four sums ship as the FE's DECIMAL128(38,s); each AVG as an exact DECIMAL(38,2) sum
+    // and a count.
     assert_eq!(
         measure_kinds(aggregate),
         [
-            "decimal", "decimal", "decimal", "decimal", "fp64", "i64", "fp64", "i64", "fp64",
-            "i64", "i64"
+            "decimal", "decimal", "decimal", "decimal", "decimal", "i64", "decimal", "i64",
+            "decimal", "i64", "i64"
         ]
     );
     assert_eq!(partial.output_names.len(), 13);
@@ -648,11 +649,11 @@ fn q01_two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
             "DECIMAL(38,2)",
             "DECIMAL(38,4)",
             "DECIMAL(38,6)",
-            "DOUBLE",
+            "DECIMAL(38,2)",
             "BIGINT",
-            "DOUBLE",
+            "DECIMAL(38,2)",
             "BIGINT",
-            "DOUBLE",
+            "DECIMAL(38,2)",
             "BIGINT",
             "BIGINT"
         ]
@@ -666,8 +667,29 @@ fn q01_two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
             .iter()
             .all(|name| name == "sum")
     );
-    // The merge emits its output tuple again: 2 keys and 8 aggregates, under the sort.
+    // The merge emits its output tuple again: 2 keys and 8 aggregates, under the sort. Each
+    // AVG is its summed sum divided by its summed count at the FE's scale, 8.
     assert_eq!(merge.output_names.len(), 10);
+    let quotients = calls(&merge, "sirius_decimal_divide");
+    assert_eq!(quotients.len(), 3);
+    for quotient in quotients {
+        assert_eq!(decimal_literal_scale_argument(quotient), 8);
+    }
+    assert!(!uses_fp64(&partial));
+    assert!(!uses_fp64(&merge));
+}
+
+/// The scale argument of a `sirius_decimal_divide` call.
+fn decimal_literal_scale_argument(function: &substrait::proto::expression::ScalarFunction) -> i32 {
+    use substrait::proto::expression::RexType;
+    use substrait::proto::expression::literal::LiteralType;
+    match argument(function, 2).rex_type.as_ref() {
+        Some(RexType::Literal(literal)) => match literal.literal_type.as_ref() {
+            Some(LiteralType::I32(scale)) => *scale,
+            other => panic!("expected an INTEGER scale, got {other:?}"),
+        },
+        other => panic!("expected a literal scale, got {other:?}"),
+    }
 }
 
 /// q17's `0.2 * avg(l_quantity)` per part: a grouped AVG whose merge feeds a join in the same
@@ -675,10 +697,13 @@ fn q01_two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
 #[test]
 fn q17_two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
     let (partial, merge) = translate_two_phase("q17-partial", "q17-merge", 4);
-    assert_eq!(measure_kinds(top_aggregate(&partial)), ["fp64", "i64"]);
+    assert_eq!(measure_kinds(top_aggregate(&partial)), ["decimal", "i64"]);
     // The sink still hash-partitions on the part key.
     assert_eq!(partial.output_partition_columns, Some(vec![0]));
-    assert_eq!(stream_types(&merge, 4), ["INTEGER", "DOUBLE", "BIGINT"]);
+    assert_eq!(
+        stream_types(&merge, 4),
+        ["INTEGER", "DECIMAL(38,2)", "BIGINT"]
+    );
     let names: Vec<_> = rels(&merge)
         .into_iter()
         .filter_map(|rel| match rel.rel_type.as_ref() {
@@ -698,8 +723,8 @@ fn q22_two_phase_global_avg_partial_and_merge_agree_on_the_exchange_row() {
     let (partial, merge) = translate_two_phase("q22-partial-avg", "q22-merge-avg", 6);
     let aggregate = top_aggregate(&partial);
     assert!(aggregate.groupings.is_empty());
-    assert_eq!(measure_kinds(aggregate), ["fp64", "i64"]);
-    assert_eq!(stream_types(&merge, 6), ["DOUBLE", "BIGINT"]);
+    assert_eq!(measure_kinds(aggregate), ["decimal", "i64"]);
+    assert_eq!(stream_types(&merge, 6), ["DECIMAL(38,2)", "BIGINT"]);
     assert_eq!(measure_fields(top_aggregate(&merge)), [0, 1]);
     assert_eq!(merge.output_names.len(), 1);
 }
@@ -1010,9 +1035,9 @@ fn revenue_is_computed_and_summed_in_decimal() {
 }
 
 /// q01's charge is a three-factor product, `revenue * (1 + l_tax)`, which the FE types
-/// DECIMAL128(38,6) and sums as DECIMAL128(38,6). The AVGs stay in FP64.
+/// DECIMAL128(38,6) and sums as DECIMAL128(38,6). Its AVGs' partial sums are exact decimals too.
 #[test]
-fn q01_three_factor_product_is_decimal_and_avg_stays_fp64() {
+fn q01_three_factor_product_is_decimal() {
     let plan = translate(TWO_PHASE_AVG, "q01-partial").unwrap();
     let casts = decimal_casts(&plan);
     assert!(casts.contains(&(31, 4)), "{casts:?}");
@@ -1021,8 +1046,8 @@ fn q01_three_factor_product_is_decimal_and_avg_stays_fp64() {
     assert_eq!(
         measure_kinds(aggregate),
         [
-            "decimal", "decimal", "decimal", "decimal", "fp64", "i64", "fp64", "i64", "fp64",
-            "i64", "i64"
+            "decimal", "decimal", "decimal", "decimal", "decimal", "i64", "decimal", "i64",
+            "decimal", "i64", "i64"
         ]
     );
 }
@@ -1044,27 +1069,46 @@ fn q15_revenue_equality_compares_exact_decimals() {
     assert_eq!(measure_names(&max, top_aggregate(&max)), ["max"]);
 }
 
-/// q14's `100.00 * sum / sum`: the multiplication is decimal (DECIMAL(38,6), with the literal
-/// kept at DECIMAL(5,2)), the division runs in FP64 until the engine has an exact decimal
-/// division, with a zero divisor giving NULL, and its quotient is cast to the FE's
-/// DECIMAL128(38,12), the result column's type.
+/// Decimal division is exact: `sirius_decimal_divide` at the FE's result scale, which follows
+/// StarRocks' rule (the dividend's scale plus 6 up to 6, then 12, then the dividend's scale),
+/// with no FP64 anywhere:
+/// - q14's `100.00 * sum / sum`, DECIMAL(38,6) / DECIMAL(38,4) to DECIMAL128(38,12), with the
+///   literal kept at DECIMAL(5,2);
+/// - q08's `mkt_share`, DECIMAL(38,4) / DECIMAL(38,4) to DECIMAL128(38,10);
+/// - q17's `sum(l_extendedprice) / 7.0`, DECIMAL(38,2) / DECIMAL(38,1) to DECIMAL128(38,8).
+///
+/// The function returns DECIMAL(38, scale), the FE's type.
 #[test]
-fn q14_division_runs_in_fp64_and_its_result_is_decimal() {
-    let plan = translate(DECIMAL, "q14-merge").unwrap();
-    assert_eq!(stream_types(&plan, 8), ["DECIMAL(38,4)", "DECIMAL(38,4)"]);
-    let divide = calls(&plan, "divide");
-    assert_eq!(divide.len(), 1);
-    let (numerator, denominator) = (argument(divide[0], 0), argument(divide[0], 1));
-    assert_eq!(cast_target(numerator), "DOUBLE");
-    assert_eq!(cast_target(cast_input(numerator)), "DECIMAL(38,6)");
-    // The divisor is NULL where it is zero, as StarRocks' division gives NULL.
-    assert!(matches!(
-        denominator.rex_type,
-        Some(substrait::proto::expression::RexType::IfThen(_))
-    ));
-    assert!(decimal_casts(&plan).contains(&(38, 12)));
-    assert!(decimal_literals(&plan).contains(&(5, 2)));
-    assert_eq!(plan.output_names.len(), 1);
+fn decimal_division_is_exact() {
+    for (name, scale) in [("q14-merge", 12), ("q08-merge", 10), ("q17-final", 8)] {
+        let plan = translate(DECIMAL, name).unwrap();
+        assert!(!uses_fp64(&plan), "{name}");
+        assert!(calls(&plan, "divide").is_empty(), "{name}");
+        let quotients = calls(&plan, "sirius_decimal_divide");
+        assert_eq!(quotients.len(), 1, "{name}");
+        assert_eq!(
+            decimal_literal_scale_argument(quotients[0]),
+            scale,
+            "{name}"
+        );
+        let Some(substrait::proto::r#type::Kind::Decimal(quotient_type)) = quotients[0]
+            .output_type
+            .as_ref()
+            .and_then(|ty| ty.kind.as_ref())
+        else {
+            panic!("{name}: the quotient is not a decimal");
+        };
+        assert_eq!(
+            (quotient_type.precision, quotient_type.scale),
+            (38, scale),
+            "{name}"
+        );
+    }
+    let q14 = translate(DECIMAL, "q14-merge").unwrap();
+    assert_eq!(stream_types(&q14, 8), ["DECIMAL(38,4)", "DECIMAL(38,4)"]);
+    let quotient = calls(&q14, "sirius_decimal_divide")[0];
+    assert_eq!(cast_target(argument(quotient, 0)), "DECIMAL(38,6)");
+    assert!(decimal_literals(&q14).contains(&(5, 2)));
 }
 
 /// q11 compares a DECIMAL(38,2) sum with a DECIMAL(38,12) threshold, whose common type would need
@@ -1086,9 +1130,9 @@ fn q11_keeps_the_fes_double_comparison() {
     assert!(decimal_literals(&threshold).contains(&(10, 10)));
 }
 
-/// q17's `0.2 * avg(l_quantity)`: the AVG runs in FP64 and is cast to the FE's DECIMAL128(38,8);
-/// the literal `0.2`, DECIMAL(1,1) in the FE, is widened to precision 5; the product is cast to
-/// the FE's DECIMAL128(38,9), the type the join compares `l_quantity` with.
+/// q17's `0.2 * avg(l_quantity)`: the AVG is the exact DECIMAL128(38,8) quotient of its summed
+/// sum and count; the literal `0.2`, DECIMAL(1,1) in the FE, is widened to precision 5; the
+/// product is cast to the FE's DECIMAL128(38,9), the type the join compares `l_quantity` with.
 #[test]
 fn q17_avg_feeds_a_decimal_comparison() {
     let plan = translate_after(
@@ -1097,16 +1141,18 @@ fn q17_avg_feeds_a_decimal_comparison() {
         &[(4, &translate(TWO_PHASE_AVG, "q17-partial").unwrap())],
     )
     .unwrap();
-    let casts = decimal_casts(&plan);
-    assert!(casts.contains(&(38, 8)), "{casts:?}");
-    assert!(casts.contains(&(38, 9)), "{casts:?}");
+    let quotients = calls(&plan, "sirius_decimal_divide");
+    assert_eq!(quotients.len(), 1);
+    assert_eq!(decimal_literal_scale_argument(quotients[0]), 8);
+    assert!(decimal_casts(&plan).contains(&(38, 9)));
     assert!(decimal_literals(&plan).contains(&(5, 1)));
     assert!(!calls(&plan, "lt").is_empty());
+    assert!(!uses_fp64(&plan));
 }
 
 /// q22's global AVG crosses an exchange to the fragment that compares it with each customer's
-/// balance. The merge casts the FP64 average to the FE's DECIMAL128(38,8), and the receiver
-/// declares that column DECIMAL(38,8), so the two agree.
+/// balance. The merge's exact quotient is the FE's DECIMAL128(38,8), and the receiver declares
+/// that column DECIMAL(38,8), so the two agree.
 #[test]
 fn q22_avg_crosses_the_exchange_as_the_fes_decimal() {
     let merge = translate_after(
@@ -1115,7 +1161,10 @@ fn q22_avg_crosses_the_exchange_as_the_fes_decimal() {
         &[(6, &translate(TWO_PHASE_AVG, "q22-partial-avg").unwrap())],
     )
     .unwrap();
-    assert!(decimal_casts(&merge).contains(&(38, 8)));
+    let quotients = calls(&merge, "sirius_decimal_divide");
+    assert_eq!(quotients.len(), 1);
+    assert_eq!(decimal_literal_scale_argument(quotients[0]), 8);
+    assert!(!uses_fp64(&merge));
     let receiver = translate(DECIMAL, "q22-cross-join").unwrap();
     assert_eq!(stream_types(&receiver, 8), ["DECIMAL(38,8)"]);
     let comparison = calls(&receiver, "gt");

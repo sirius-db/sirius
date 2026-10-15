@@ -388,15 +388,19 @@ fn translate_arithmetic(
                 scalar_function(anchor, children, output_type),
             ))
         }
-        // `/` and MOD stay in FP64: DuckDB divides decimals only in DOUBLE, and Substrait's
-        // `divide` binds to DuckDB's integer `//`, which has no decimal overload. A zero divisor
-        // gives NULL, as in StarRocks, instead of an infinity or NaN that the cast below would
-        // refuse. The quotient is cast to the FE's type so it meets the decimal slots around it
-        // as declared.
-        //
-        // Needs sirius-db/sirius#2124: that cast reduces a DOUBLE to a decimal scale and must
-        // round. Without it the GPU truncates, and a quotient can be one unit low in its last
-        // digit.
+        // Decimal `/` is exact: neither DuckDB nor Substrait divides decimals exactly (DuckDB's
+        // `/` returns DOUBLE, and Substrait's `divide` binds to DuckDB's integer `//`), so it is
+        // Sirius' `sirius_decimal_divide` at the FE's result scale, rounded half away from zero
+        // and NULL for a zero divisor, as StarRocks computes it.
+        TExprOpcode::DIVIDE => {
+            let mut children = children.into_iter();
+            let (dividend, divisor) = (children.next().unwrap(), children.next().unwrap());
+            decimal_divide(ctx.registry, dividend, divisor, &output_type)
+        }
+        // Decimal MOD stays in FP64, with its result cast to the FE's type (no TPC-H query has
+        // one). A zero divisor gives NULL, as in StarRocks, instead of a NaN that the cast would
+        // refuse. That cast reduces a DOUBLE to a decimal scale and must round, which needs
+        // sirius-db/sirius#2124.
         _ => {
             let fp64 = type_mapper::fp64_type(true);
             let mut children = children.into_iter().map(|input| cast(fp64.clone(), input));
@@ -411,6 +415,64 @@ fn translate_arithmetic(
                 ),
             ))
         }
+    }
+}
+
+/// Sirius' scalar functions, which the Substrait consumer resolves by name.
+const URN_SIRIUS: &str = "extension:io.sirius:functions";
+
+/// The exact decimal quotient `dividend / divisor` as `result`, a decimal type: Sirius'
+/// `sirius_decimal_divide(dividend, divisor, scale)`, which returns `DECIMAL(38, scale)`, rounds
+/// half away from zero, and gives NULL for a zero divisor, as StarRocks' DECIMALV3 division
+/// does. Either operand may be a decimal or an integer. A `result` that isn't `DECIMAL(38,
+/// scale)` gets a cast.
+pub(crate) fn decimal_divide(
+    registry: &mut ExtensionRegistry,
+    dividend: Expression,
+    divisor: Expression,
+    result: &Type,
+) -> Result<Expression> {
+    let Some(substrait::proto::r#type::Kind::Decimal(decimal)) = result.kind.as_ref() else {
+        return Err(TranslateError::malformed(
+            "a decimal division needs a decimal result type",
+        ));
+    };
+    let quotient_type = Type {
+        kind: Some(substrait::proto::r#type::Kind::Decimal(
+            substrait::proto::r#type::Decimal {
+                precision: 38,
+                ..*decimal
+            },
+        )),
+    };
+    let anchor = registry.register_function(URN_SIRIUS, "sirius_decimal_divide");
+    let quotient = scalar_function(
+        anchor,
+        vec![
+            dividend,
+            divisor,
+            literal(expression::literal::LiteralType::I32(decimal.scale)),
+        ],
+        quotient_type.clone(),
+    );
+    Ok(if decimal.precision == 38 {
+        quotient
+    } else {
+        cast(result.clone(), quotient)
+    })
+}
+
+/// Whether `expr` already has decimal type `ty` as DuckDB binds it: a cast to `ty`, or a
+/// `sirius_decimal_divide` returning `ty`, whose return type the engine fixes.
+pub(crate) fn is_typed_as(expr: &Expression, ty: &Type, registry: &ExtensionRegistry) -> bool {
+    match expr.rex_type.as_ref() {
+        Some(expression::RexType::Cast(existing)) => existing.r#type.as_ref() == Some(ty),
+        Some(expression::RexType::ScalarFunction(function)) => {
+            registry.function_anchor(URN_SIRIUS, "sirius_decimal_divide")
+                == Some(function.function_reference)
+                && function.output_type.as_ref() == Some(ty)
+        }
+        _ => false,
     }
 }
 
@@ -781,10 +843,10 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
     }
     let return_primitive = type_mapper::scalar_primitive(&function.ret_type)?;
     let decimal_result = is_decimal(&function.ret_type)?;
-    // A decimal AVG is computed in FP64 below: DuckDB's avg(DECIMAL) returns DOUBLE, and
-    // StarRocks' exact DECIMAL128(38, s+6) result needs a decimal division the engine lacks.
-    // Every other avg return type (temporal avg's StarRocks-specific rounding, in particular)
-    // has no GPU lowering. A decimal SUM stays decimal: it is exact, DECIMAL(38,s) in both.
+    // A decimal AVG is decomposed into a sum and a count by `translate_aggregation`, and a
+    // DOUBLE one is DuckDB's avg. Every other avg return type (temporal avg's StarRocks-specific
+    // rounding, in particular) has no GPU lowering. A decimal SUM stays decimal: it is exact,
+    // DECIMAL(38,s) in both.
     if name == "avg" && return_primitive != TPrimitiveType::DOUBLE && !decimal_result {
         return Err(TranslateError::UnsupportedExpression {
             node_type: root.node_type,
@@ -796,17 +858,10 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
     let mut cursor = ExprNodeCursor::new(&expr.nodes);
     // Consume the root marker; its children are the aggregate arguments.
     cursor.idx = 1;
-    let mut arguments = (0..root.num_children)
+    let arguments = (0..root.num_children)
         .map(|_| cursor.translate_next(ctx))
         .collect::<Result<Vec<_>>>()?;
     cursor.ensure_consumed()?;
-    if decimal_result && name == "avg" {
-        arguments = arguments
-            .into_iter()
-            .map(|input| cast(type_mapper::fp64_type(true), input))
-            .collect();
-    }
-
     Ok(AggregateCall {
         name: name.to_string(),
         arguments,
