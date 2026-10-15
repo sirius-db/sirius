@@ -70,7 +70,7 @@ class UnionFixture : public sirius::test::GpuExecutionFixture {
     std::string text;
     for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
       for (duckdb::idx_t column = 0; column < result->ColumnCount(); ++column) {
-        text += result->GetValue(column, row).ToString();
+        text += result->Collection().GetValue(column, row).ToString();
         text += '\n';
       }
     }
@@ -152,6 +152,8 @@ TEST_CASE_METHOD(UnionFixture,
   compare_gpu_vs_cpu("SELECT k, v FROM uwide UNION ALL SELECT k, v FROM ua");
   // A literal arm forces a second reconciliation shape.
   compare_gpu_vs_cpu("SELECT k FROM ua UNION ALL SELECT 999");
+  // BY NAME: ub's columns are reordered and ua's missing `v` is filled with NULL, inside the arms.
+  compare_gpu_vs_cpu("SELECT k FROM ua UNION ALL BY NAME SELECT v, k FROM ub");
 }
 
 TEST_CASE_METHOD(UnionFixture,
@@ -285,7 +287,7 @@ TEST_CASE_METHOD(UnionFixture,
   run_ok("SET gpu_execution = true;");
   REQUIRE(count);
   REQUIRE_FALSE(count->HasError());
-  REQUIRE(count->GetValue(0, 0).GetValue<int64_t>() == 5);
+  REQUIRE(count->Collection().GetValue(0, 0).GetValue<int64_t>() == 5);
 }
 
 TEST_CASE_METHOD(UnionFixture,
@@ -344,6 +346,9 @@ TEST_CASE_METHOD(UnionFixture,
   compare_gpu_vs_cpu("SELECT k, v FROM ua UNION SELECT k, v FROM ub");
   compare_gpu_vs_cpu("SELECT k FROM ua UNION SELECT k FROM ub");
   compare_gpu_vs_cpu("SELECT k, v FROM ua UNION BY NAME SELECT v, k FROM ub");
+  // The second arm's NULL-filled `k` turns (NULL, 'n') into a row both arms produce.
+  compare_gpu_vs_cpu("SELECT k, v FROM ua UNION BY NAME SELECT v FROM ua");
+  compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT k, v FROM ua UNION BY NAME SELECT v FROM ua) t");
   // A chain of distinct UNIONs merges into one N-ary union; a mixed chain does not.
   compare_gpu_vs_cpu("SELECT k FROM ua UNION SELECT k FROM ub UNION SELECT k FROM uc");
   compare_gpu_vs_cpu("SELECT k FROM ua UNION ALL SELECT k FROM ub UNION SELECT k FROM uc");
@@ -488,7 +493,7 @@ class UnionFloatFixture : public sirius::test::GpuExecutionFixture {
     for (auto* zeros : {d_zeros.get(), f_zeros.get()}) {
       REQUIRE(zeros);
       REQUIRE_FALSE(zeros->HasError());
-      REQUIRE(zeros->GetValue(0, 0).GetValue<int64_t>() == 1);
+      REQUIRE(zeros->Collection().GetValue(0, 0).GetValue<int64_t>() == 1);
     }
   }
 };
