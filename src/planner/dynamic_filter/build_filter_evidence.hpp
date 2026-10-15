@@ -28,7 +28,8 @@ namespace sirius::planner {
 [[nodiscard]] bool build_subtree_is_filtering(duckdb::LogicalOperator const& op);
 
 /**
- * @brief Tests for a DELIM_GET or CTE_REF root behind valid single-child projections
+ * @brief Tests for a DELIM_GET or CTE_REF root behind valid single-child projections and pure
+ * DISTINCT group-bys (no aggregate expressions), which preserve the opaque key domain
  */
 [[nodiscard]] bool build_relation_is_opaque(duckdb::LogicalOperator const& op);
 

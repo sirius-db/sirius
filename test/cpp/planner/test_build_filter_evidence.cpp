@@ -315,12 +315,36 @@ TEST_CASE("reducing operators are not opaque build roots", "[dynamic_filter][evi
   }
 }
 
+TEST_CASE("a pure DISTINCT group-by keeps an opaque leaf opaque", "[dynamic_filter][evidence]")
+{
+  SECTION("a DISTINCT group-by over a CTE_REF")
+  {
+    REQUIRE(build_relation_is_opaque(*make_aggregate_over(make_cte_ref())));
+  }
+
+  SECTION("a DISTINCT group-by over a projection over a CTE_REF")
+  {
+    auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(
+      /*table_index=*/6, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+    projection->children.push_back(make_cte_ref());
+    REQUIRE(build_relation_is_opaque(*make_aggregate_over(std::move(projection))));
+  }
+
+  SECTION("a DISTINCT group-by over a plain scan stays non-opaque")
+  {
+    REQUIRE_FALSE(build_relation_is_opaque(*make_aggregate_over(make_get())));
+  }
+}
+
 TEST_CASE("non-projection wrappers hide opaque leaves from the fallback classifier",
           "[dynamic_filter][evidence]")
 {
-  SECTION("an aggregate over a CTE_REF")
+  SECTION("an aggregate with aggregate expressions over a CTE_REF")
   {
-    REQUIRE_FALSE(build_relation_is_opaque(*make_aggregate_over(make_cte_ref())));
+    auto aggregate = make_aggregate_over(make_cte_ref());
+    aggregate->expressions.push_back(
+      duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(1)));
+    REQUIRE_FALSE(build_relation_is_opaque(*aggregate));
   }
 
   SECTION("a join over a CTE_REF")
