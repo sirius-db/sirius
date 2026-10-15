@@ -70,6 +70,7 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "vss/sirius_physical_vector_join_stream.hpp"
 
 #include <cudf/cudf_utils.hpp>
 
@@ -679,7 +680,8 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
                      duckdb::SiriusContext* compressed_materialization_observer)
 {
   D_ASSERT(join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN ||
-           join_op.type == sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
+           join_op.type == sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
+           join_op.type == sirius::op::SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM);
   auto* join_op_ptr = &join_op;
   wrap_child(
     join_op, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
@@ -754,6 +756,25 @@ void wrap_dense_count_join(sirius::op::sirius_physical_operator& dense_count_op,
                  partition->children.push_back(std::move(child_orig));
                  return partition;
                });
+  }
+}
+
+//! Wrap whichever of the vector join's sides are fed by a scan. create_plan_knn_join pushes
+//! the probe first and the corpus second, so the children follow wrap_join's probe / build
+//! order; a side still read from its pin contributes no child.
+void wrap_vector_join(sirius::op::sirius_physical_operator& join_op,
+                      const sirius::operator_params& op_params,
+                      duckdb::SiriusContext* compressed_materialization_observer)
+{
+  auto const& req       = join_op.Cast<sirius::op::sirius_physical_vector_join_stream>().request();
+  std::size_t child_idx = 0;
+  if (req.probe_from_scan) {
+    wrap_join_child(
+      join_op, child_idx++, /*is_build=*/false, op_params, compressed_materialization_observer);
+  }
+  if (req.build_from_scan) {
+    wrap_join_child(
+      join_op, child_idx++, /*is_build=*/true, op_params, compressed_materialization_observer);
   }
 }
 
@@ -959,6 +980,9 @@ void insert_gpu_pipeline_operators_recursive(
       wrap_dense_count_join(*slot, compressed_materialization_observer);
       break;
     case sirius::op::SiriusPhysicalOperatorType::UNION: wrap_union(*slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM:
+      wrap_vector_join(*slot, op_params, compressed_materialization_observer);
+      break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
       wrap_delim_join(slot, op_params, context, compressed_materialization_observer);

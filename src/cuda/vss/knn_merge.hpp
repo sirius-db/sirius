@@ -23,6 +23,7 @@
 
 #include <raft/core/device_resources.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cstdint>
@@ -63,6 +64,7 @@ knn_result knn_merge_parts_topk(
   int64_t n_samples,
   int64_t n_parts,
   int64_t k,
+  rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 }  // namespace sirius::vss

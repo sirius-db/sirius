@@ -72,6 +72,11 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
     _concat_all = false;
   } else if (downstream_join->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     _concat_all = false;
+  } else if (downstream_join->type == SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM) {
+    // Coalesce to the batch-size target and no further: folding the corpus into one batch
+    // would put the whole corpus on the GPU at once, which is the constraint the streaming
+    // fold exists to lift.
+    _concat_all = false;
   } else {
     throw std::runtime_error("sirius_physical_concat: downstream_join is not a hash/nlj: " +
                              SiriusPhysicalOperatorToString(downstream_join->type));

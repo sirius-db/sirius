@@ -15,7 +15,6 @@
     "nvjitlink",
     "nvrtc",
     "nvtx3",
-    "raft",
     "rmm",
     "spdlog"
   ],

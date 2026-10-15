@@ -2984,6 +2984,12 @@ void sirius_scan_manager::visit_pinned_entries(
   }
 }
 
+const pinned_entry* sirius_scan_manager::find_pinned_entry(std::string_view name) const
+{
+  auto it = _pinned_entries.find(std::string(name));
+  return it == _pinned_entries.end() ? nullptr : it->second.get();
+}
+
 bool pinned_native_types_match_columns(pinned_entry const& entry,
                                        duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                                        duckdb::vector<duckdb::LogicalType> const& returned_types)

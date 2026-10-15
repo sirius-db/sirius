@@ -124,6 +124,24 @@ std::vector<index_metadata> cuvs_index_cache::indexes_on_column(std::string_view
   return out;
 }
 
+std::vector<std::string> cuvs_index_cache::names_on_column(std::string_view catalog,
+                                                           std::string_view schema,
+                                                           std::string_view table,
+                                                           std::string_view column,
+                                                           index_kind kind) const
+{
+  std::scoped_lock lock(_mutex);
+  std::vector<std::string> out;
+  for (auto const& kv : _entries) {
+    auto const& meta = kv.second->meta;
+    if (meta.kind == kind && meta.catalog_name == catalog && meta.schema_name == schema &&
+        meta.table_name == table && meta.column_name == column) {
+      out.push_back(kv.first);
+    }
+  }
+  return out;
+}
+
 bool cuvs_index_cache::contains(std::string_view name) const
 {
   std::scoped_lock lock(_mutex);
