@@ -104,6 +104,140 @@ __global__ void fold_topk_rows_kernel(float* acc_d,
   }
 }
 
+// One warp per probe row, one lane per slice row: each lane takes a whole dot product, reading its
+// row from a shared tile (rows padded to an odd word stride, so the lanes' reads fall in distinct
+// banks) and the probe row from shared memory (one address, broadcast). Lanes meet only when a
+// row beats the probe's current k-th: lane 0 keeps the top k and broadcasts its threshold.
+template <bool F16>
+__global__ void nearest_cluster_topk_kernel(nearest_task const* tasks,
+                                            std::uint32_t const* compact,
+                                            int64_t row_words,
+                                            int64_t tile_rows,
+                                            void const* row_sq,
+                                            int64_t const* routed_rows,
+                                            std::uint32_t const* probes,
+                                            void const* probe_sq,
+                                            int64_t k,
+                                            float* acc_d,
+                                            int64_t* acc_n)
+{
+  constexpr int kMaxK          = 64;
+  constexpr unsigned kFullMask = 0xffffffffu;
+  extern __shared__ std::uint32_t smem[];
+  auto const task     = tasks[blockIdx.x];
+  int const warp      = static_cast<int>(threadIdx.x / 32);
+  int const lane      = static_cast<int>(threadIdx.x % 32);
+  int const n_warps   = static_cast<int>(blockDim.x / 32);
+  auto const stride   = row_words + 1;
+  auto* probe_rows    = smem;
+  auto* tile          = smem + n_warps * row_words;
+  bool const active   = warp < task.n_probes;
+  int64_t const probe = active ? routed_rows[task.edge_begin + warp] : 0;
+  auto* my_probe      = probe_rows + warp * row_words;
+  if (active) {
+    for (int64_t w = lane; w < row_words; w += 32) {
+      my_probe[w] = probes[probe * row_words + w];
+    }
+  }
+  float const qs = !active ? 0.f
+                   : F16   ? static_cast<float const*>(probe_sq)[probe]
+                           : static_cast<float>(static_cast<int32_t const*>(probe_sq)[probe]);
+
+  float best_d[kMaxK];
+  int64_t best_i[kMaxK];
+  int filled      = 0;
+  int worst_at    = 0;
+  float thr       = INFINITY;  // admits everything until k are held, then the k-th distance
+  auto const* src = compact + task.row_offset * row_words;
+  for (int64_t r0 = 0; r0 < task.n_rows; r0 += tile_rows) {
+    auto const rn = std::min<int64_t>(tile_rows, task.n_rows - r0);
+    __syncthreads();
+    for (int64_t i = threadIdx.x; i < rn * row_words; i += blockDim.x) {
+      auto const r                         = i / row_words;
+      tile[r * stride + i - r * row_words] = src[r0 * row_words + i];
+    }
+    __syncthreads();
+    if (!active) { continue; }
+    for (int64_t rb = 0; rb < rn; rb += 32) {
+      auto const r  = rb + lane;
+      bool const ok = r < rn;
+      float s       = INFINITY;
+      if (ok) {
+        auto const* row = tile + r * stride;
+        float dot;
+        if constexpr (F16) {
+          float acc = 0.f;
+          for (int64_t w = 0; w < row_words; ++w) {
+            std::uint32_t const a = row[w];
+            std::uint32_t const b = my_probe[w];
+            float2 const fa       = __half22float2(*reinterpret_cast<__half2 const*>(&a));
+            float2 const fb       = __half22float2(*reinterpret_cast<__half2 const*>(&b));
+            acc                   = fmaf(fa.x, fb.x, fmaf(fa.y, fb.y, acc));
+          }
+          dot = acc;
+        } else {
+          int acc = 0;
+          for (int64_t w = 0; w < row_words; ++w) {
+            acc = __dp4a(static_cast<int>(row[w]), static_cast<int>(my_probe[w]), acc);
+          }
+          dot = static_cast<float>(acc);
+        }
+        auto const id  = task.id_base + r0 + r;
+        float const x2 = F16 ? static_cast<float const*>(row_sq)[id]
+                             : static_cast<float>(static_cast<int32_t const*>(row_sq)[id]);
+        s              = fmaxf(x2 - 2.f * dot + qs, 0.f);
+      }
+      unsigned mask = __ballot_sync(kFullMask, s < thr);
+      while (mask != 0) {
+        int const from = __ffs(mask) - 1;
+        mask &= mask - 1;
+        float const cs = __shfl_sync(kFullMask, s, from);
+        if (lane == 0) {
+          auto const cid = task.id_base + r0 + rb + from;
+          if (filled < k) {
+            best_d[filled] = cs;
+            best_i[filled] = cid;
+            ++filled;
+            if (filled == k) {
+              worst_at = 0;
+              for (int i = 1; i < filled; ++i) {
+                if (best_d[i] > best_d[worst_at]) { worst_at = i; }
+              }
+              thr = best_d[worst_at];
+            }
+          } else if (cs < thr) {
+            best_d[worst_at] = cs;
+            best_i[worst_at] = cid;
+            worst_at         = 0;
+            for (int i = 1; i < filled; ++i) {
+              if (best_d[i] > best_d[worst_at]) { worst_at = i; }
+            }
+            thr = best_d[worst_at];
+          }
+        }
+        thr = __shfl_sync(kFullMask, thr, 0);
+      }
+    }
+  }
+  if (!active || lane != 0) { return; }
+  for (int i = 1; i < filled; ++i) {
+    auto const d  = best_d[i];
+    auto const id = best_i[i];
+    int j         = i - 1;
+    while (j >= 0 && best_d[j] > d) {
+      best_d[j + 1] = best_d[j];
+      best_i[j + 1] = best_i[j];
+      --j;
+    }
+    best_d[j + 1] = d;
+    best_i[j + 1] = id;
+  }
+  for (int i = 0; i < filled; ++i) {
+    acc_d[probe * k + i] = best_d[i];
+    acc_n[probe * k + i] = best_i[i];
+  }
+}
+
 __global__ void remap_radius_edges_kernel(int64_t const* query_rows,
                                           int64_t const* rows,
                                           int32_t* left,
@@ -741,6 +875,74 @@ void fold_topk_rows(float* acc_distances,
                                                                     m,
                                                                     id_base,
                                                                     id_map);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void nearest_cluster_topk(nearest_task const* tasks,
+                          int64_t n_tasks,
+                          bool f16,
+                          void const* compact,
+                          int64_t row_bytes,
+                          void const* row_sq,
+                          int64_t const* routed_rows,
+                          void const* probes,
+                          void const* probe_sq,
+                          int64_t k,
+                          float* acc_distances,
+                          int64_t* acc_neighbors,
+                          rmm::cuda_stream_view stream)
+{
+  if (n_tasks == 0) { return; }
+  CUDF_EXPECTS(row_bytes % 4 == 0 && row_bytes / 4 <= 32 * 16,
+               "nearest_cluster_topk: rows must be whole 32-bit words, at most 512 of them");
+  CUDF_EXPECTS(k >= 1 && k <= 64, "nearest_cluster_topk: k must be in [1, 64]");
+  auto const row_words = row_bytes / 4;
+  auto const threads   = 32 * kNearestTaskProbes;
+  // The block's probe rows, then a tile of slice rows at the padded stride: whole warps of rows,
+  // as many as fit beside the probe rows in about 48 KiB (at least one warp's worth).
+  auto const probe_bytes = static_cast<std::size_t>(kNearestTaskProbes * row_words) * 4;
+  auto const row_slot    = static_cast<std::size_t>(row_words + 1) * 4;
+  auto const fit         = (std::size_t{48} << 10) > probe_bytes
+                             ? ((std::size_t{48} << 10) - probe_bytes) / row_slot
+                             : std::size_t{0};
+  auto const tile_rows =
+    static_cast<int64_t>(std::max<std::size_t>(32, std::min<std::size_t>(256, fit / 32 * 32)));
+  auto const smem        = probe_bytes + static_cast<std::size_t>(tile_rows) * row_slot;
+  auto const* rows       = static_cast<std::uint32_t const*>(compact);
+  auto const* probe_rows = static_cast<std::uint32_t const*>(probes);
+  if (smem > (std::size_t{48} << 10)) {
+    CUDF_CUDA_TRY(cudaFuncSetAttribute(
+      f16 ? nearest_cluster_topk_kernel<true> : nearest_cluster_topk_kernel<false>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem)));
+  }
+  if (f16) {
+    nearest_cluster_topk_kernel<true>
+      <<<static_cast<unsigned>(n_tasks), threads, smem, stream.value()>>>(tasks,
+                                                                          rows,
+                                                                          row_words,
+                                                                          tile_rows,
+                                                                          row_sq,
+                                                                          routed_rows,
+                                                                          probe_rows,
+                                                                          probe_sq,
+                                                                          k,
+                                                                          acc_distances,
+                                                                          acc_neighbors);
+  } else {
+    nearest_cluster_topk_kernel<false>
+      <<<static_cast<unsigned>(n_tasks), threads, smem, stream.value()>>>(tasks,
+                                                                          rows,
+                                                                          row_words,
+                                                                          tile_rows,
+                                                                          row_sq,
+                                                                          routed_rows,
+                                                                          probe_rows,
+                                                                          probe_sq,
+                                                                          k,
+                                                                          acc_distances,
+                                                                          acc_neighbors);
+  }
   CUDF_CHECK_CUDA(stream.value());
 }
 

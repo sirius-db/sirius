@@ -2114,3 +2114,38 @@ TEST_CASE("lists stay off a device too small to also run a join over them",
   ok_rows(con, "SELECT * FROM unpin_table('lh_corpus');");
   ok_rows(con, "SELECT * FROM unpin_table('lh_probe');");
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "the grouped nearest-cluster pass answers as one call per cluster does",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Clusters of ~4,400 rows are too large to seed from a sample, so lossy lists search each probe
+  // row's nearest cluster in full first: in one launch for every cluster, or one call per cluster.
+  // 1 MiB scan batches cut the pin, and so the lists, into ~1,000-row chunks that clusters span.
+  run_ok("SET scan_task_batch_size = 1048576;");
+  create_lists_tables(*this, "kgs", "gpu");
+  run_ok("CREATE TABLE kgs_many AS SELECT id, vec FROM kgs_corpus WHERE id % 7 = 0;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'kgs_many', tier => 'gpu', format => 'duckdb');");
+  for (auto const* storage : {"int8", "float16"}) {
+    auto const name = std::string("kgs_") + storage;
+    run_ok("SELECT * FROM sirius_kmeans_fit('kgs_corpus','vec', name => '" + name +
+           "', n_clusters => 16, seed => 3);");
+    run_ok("SELECT * FROM sirius_kmeans_build_lists('kgs_corpus','vec','" + name +
+           "', storage => '" + storage + "');");
+    for (auto const probes : {1, 4, 16}) {
+      auto const sql =
+        "SELECT left_id, right_id, distance FROM sirius_knn_join('kgs_many','vec','kgs_corpus',"
+        "'vec', metric => 'l2', k => 10, search_mode => 'approx', clustering => '" +
+        name + "', n_probes => " + std::to_string(probes) + ");";
+      setenv("SIRIUS_VSS_GROUPED_SWEEP0", "0", 1);
+      auto const per_cluster = ok_rows(*con, sql);
+      unsetenv("SIRIUS_VSS_GROUPED_SWEEP0");
+      auto const grouped = ok_rows(*con, sql);
+      INFO("storage " << storage << ", n_probes " << probes);
+      REQUIRE(grouped.size() == 10000 * 10);
+      CHECK(grouped == per_cluster);
+    }
+  }
+  run_ok("SELECT * FROM unpin_table('kgs_many');");
+}

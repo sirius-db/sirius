@@ -62,6 +62,44 @@ void fold_topk_rows(float* acc_distances,
                     rmm::cuda_stream_view stream,
                     int64_t const* id_map = nullptr);
 
+/// Probe rows one task of nearest_cluster_topk serves, one warp each.
+inline constexpr int32_t kNearestTaskProbes = 16;
+
+/// Up to kNearestTaskProbes probe rows whose nearest cluster is one slice of a chunk's compact
+/// rows.
+struct nearest_task {
+  int64_t row_offset;  ///< the run's first row within the compact rows passed
+  int64_t n_rows;
+  int64_t edge_begin;  ///< the task's first entry in the routed probe rows
+  int32_t n_probes;
+  int64_t id_base;  ///< layout id of the slice's first row
+};
+
+/**
+ * @brief Every task's probe rows searched in full against their slice, in one launch: the
+ * nearest-first top-@p k by the compact rows' distance, written as accumulator row
+ * routed_rows[e] (whose first min(k, n_rows) entries it replaces), ids as layout ids.
+ *
+ * The rows are INT8 codes or, with @p f16, half precision, @p row_bytes each (a multiple of 4);
+ * @p row_sq / @p probe_sq are their squared norms (INT32, or FLOAT for half rows), indexed by
+ * layout id and probe row. Each block loads a slice's rows once into shared memory for all of a
+ * task's probe rows, which is what one call per slice could not do without its setup costing far
+ * more than the arithmetic. @p k is at most 64.
+ */
+void nearest_cluster_topk(nearest_task const* tasks,
+                          int64_t n_tasks,
+                          bool f16,
+                          void const* compact,
+                          int64_t row_bytes,
+                          void const* row_sq,
+                          int64_t const* routed_rows,
+                          void const* probes,
+                          void const* probe_sq,
+                          int64_t k,
+                          float* acc_distances,
+                          int64_t* acc_neighbors,
+                          rmm::cuda_stream_view stream);
+
 /**
  * @brief Map a slice's radius edges back to probe rows and corpus rows, in place of a cast.
  *

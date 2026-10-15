@@ -2784,7 +2784,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       bool const direct        = int8_search || (f16_bounded && (sweep == 1 || seed)) || f16_sweep0;
       bool const widen_compact = lists_on_host && f16_bounded && sweep == 0 && !direct;
       bool const copy_compact  = (direct && lists_on_host) || widen_compact;
-      auto stage_next          = [&](std::size_t j) {
+      // Sweep 0 over lossy rows only sets each probe row's bound, which sweep 1 re-searches past:
+      // every cluster in one launch over the device lists (nearest_cluster_topk) instead of one
+      // GEMM and top-k call per cluster, whose ~0.18 ms of host setup dwarfs its arithmetic once
+      // each cluster has only tens of probe rows. SIRIUS_VSS_GROUPED_SWEEP0=0 keeps the calls.
+      bool const grouped_sweep0 = sweep == 0 && rescore && !seed && !radius_join &&
+                                  earlier_cut == nullptr && k_join <= 64 && !lists_on_host &&
+                                  ((int8_search && probe_i8) || (f16_sweep0 && probe_f16)) && [] {
+                                    auto const* v = std::getenv("SIRIUS_VSS_GROUPED_SWEEP0");
+                                    return v == nullptr || std::string_view{v} != "0";
+                                  }();
+      std::vector<chunk_cluster_run> const no_runs;
+      auto stage_next = [&](std::size_t j) {
         if (copy_compact) {
           if (auto it = kept.find(j); it != kept.end()) {
             auto chunk = std::move(it->second);
@@ -2847,6 +2858,47 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                            stream,
                            mr);
       }
+      if (grouped_sweep0) {
+        // Each cluster is contiguous in the device lists, so one task group covers it whole.
+        std::vector<vss::nearest_task> tasks;
+        auto const& offsets = _lists->offsets;
+        for (std::size_t c = 0; c + 1 < offsets.size(); ++c) {
+          auto const nearest = static_cast<std::int64_t>(nearest_edges[c]);
+          auto const n_rows  = offsets[c + 1] - offsets[c];
+          if (nearest == 0 || n_rows == 0) { continue; }
+          for (std::int64_t e = 0; e < nearest; e += vss::kNearestTaskProbes) {
+            tasks.push_back({offsets[c],
+                             n_rows,
+                             edge_begin[c] + e,
+                             static_cast<std::int32_t>(
+                               std::min<std::int64_t>(vss::kNearestTaskProbes, nearest - e)),
+                             offsets[c]});
+          }
+          scanned_pairs += n_rows * nearest;
+        }
+        rmm::device_uvector<vss::nearest_task> device_tasks(tasks.size(), stream, mr);
+        // From a pageable vector, so the copy has completed when the call returns.
+        CUDF_CUDA_TRY(cudaMemcpyAsync(device_tasks.data(),
+                                      tasks.data(),
+                                      tasks.size() * sizeof(vss::nearest_task),
+                                      cudaMemcpyHostToDevice,
+                                      stream.value()));
+        bool const f16 = !int8_search;
+        vss::nearest_cluster_topk(
+          device_tasks.data(),
+          static_cast<std::int64_t>(tasks.size()),
+          f16,
+          _lists->device_vectors->data(),
+          static_cast<std::int64_t>(_lists->row_bytes()),
+          f16 ? static_cast<void const*>(_lists->row_sq_f32->data()) : _lists->row_sq->data(),
+          routed_rows,
+          f16 ? static_cast<void const*>(probe_f16->data()) : probe_i8->data(),
+          f16 ? static_cast<void const*>(probe_sqf->data()) : probe_sq->data(),
+          k_join,
+          acc_distances->mutable_view().data<float>(),
+          acc_neighbors->mutable_view().data<std::int64_t>(),
+          stream);
+      }
       for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
         auto const j            = chunks[ci];
         auto staged             = std::move(prefetched);
@@ -2877,7 +2929,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           chunk_n               = chunk_view.extent(0);
         }
 
-        for (auto const& slice : _chunk_cluster_runs[j]) {
+        for (auto const& slice : grouped_sweep0 ? no_runs : _chunk_cluster_runs[j]) {
           auto eb          = edge_begin[static_cast<std::size_t>(slice.cluster)];
           auto ee          = edge_begin[static_cast<std::size_t>(slice.cluster) + 1];
           auto const split = eb + nearest_edges[static_cast<std::size_t>(slice.cluster)];
