@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/carried_row_selector.hpp"
 #include "op/aggregate/stddev.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -27,6 +28,8 @@
 #include <cudf/merge.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+
+#include <numeric>
 
 namespace sirius {
 namespace op {
@@ -168,6 +171,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   const std::vector<cucascade::read_only_data_batch>& input,
   int num_group_cols,
   const std::vector<cudf::aggregation::Kind>& aggregates,
+  int num_carried,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
@@ -184,15 +188,27 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   for (const auto& batch : input) {
     input_cudf_table_views.push_back(get_cudf_table_view(batch));
   }
-  if (input_cudf_table_views[0].num_columns() !=
-      num_group_cols + static_cast<int>(aggregates.size())) {
+  int const num_partial_cols = num_group_cols + static_cast<int>(aggregates.size());
+  if (input_cudf_table_views[0].num_columns() != num_partial_cols + num_carried) {
     throw std::runtime_error(
-      "`num columns = num_group_cols + num aggregates` not true in `merge_grouped_aggregate()`");
+      "`num columns = num_group_cols + num aggregates + num_carried` not true in "
+      "`merge_grouped_aggregate()`");
   }
   auto concatenated =
     cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
 
   auto mr = memory_space.get_default_allocator();
+
+  if (aggregates.empty() && num_carried > 0 && num_group_cols > 0) {
+    auto deduped =
+      detail::aggregate_carried_columns_only(concatenated->view(), num_group_cols, stream, mr);
+    SIRIUS_LOG_DEBUG(
+      "merge_grouped_agg: one row per key via cudf::distinct ({} batches, {} rows in, {} rows out)",
+      input.size(),
+      concatenated->num_rows(),
+      deduped->num_rows());
+    return make_data_batch(std::move(deduped), memory_space, stream, telemetry_info);
+  }
 
   // Dictionary-encode STRING group keys when:
   //  1. Average string length >= 4 bytes (short strings hash nearly as fast as
@@ -293,6 +309,12 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
     requests.push_back(std::move(request));
   }
 
+  std::unique_ptr<cudf::column> row_positions;
+  if (num_carried > 0) {
+    row_positions =
+      detail::append_carried_row_selector(requests, concatenated->num_rows(), stream, mr);
+  }
+
   // Call cudf groupby and populate output columns
   auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
   auto output_cols    = groupby_result.first->release();
@@ -305,8 +327,27 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
     }
   }
 
-  for (auto& aggregation_result : groupby_result.second) {
-    output_cols.push_back(std::move(aggregation_result.results[0]));
+  for (std::size_t i = 0; i < aggregates.size(); ++i) {
+    output_cols.push_back(std::move(groupby_result.second[i].results[0]));
+  }
+
+  if (row_positions) {
+    // Every carried column of a partial row came from one input row, so gathering them all by one
+    // selector keeps them from one row.
+    std::vector<cudf::size_type> carried(static_cast<std::size_t>(num_carried));
+    std::iota(carried.begin(), carried.end(), num_partial_cols);
+    auto carried_columns = detail::gather_carried_columns(
+      concatenated->view().select(carried), groupby_result.second, stream, mr);
+    SIRIUS_LOG_DEBUG(
+      "merge_grouped_agg: gathered {} carried column(s) by MIN row position ({} batches, {} rows "
+      "in, {} groups)",
+      num_carried,
+      input.size(),
+      concatenated->num_rows(),
+      carried_columns.front()->size());
+    for (auto& column : carried_columns) {
+      output_cols.push_back(std::move(column));
+    }
   }
 
   // Create the output data batch

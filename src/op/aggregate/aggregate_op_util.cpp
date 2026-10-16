@@ -80,6 +80,9 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions)
 {
   CudfAggregateDefinitions result;
+  // Each FIRST's ordinal among FIRSTs, so the carried block is in slot order.
+  std::size_t next_carried_idx = 0;
+  duckdb::vector<sirius::logical_type> carried_types;
 
   // 1. Extract group_idx from groups_p
   for (const auto& group : groups_p) {
@@ -176,6 +179,19 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       continue;
     }
 
+    // FIRST adds no cuDF aggregation; it reads input_idx into the carried block.
+    if (fid == sirius::aggregate_id::first) {
+      if (children.size() != 1 || !children[0]->is_reference()) {
+        throw_unsupported_aggregate(fid, "over anything but a single column reference");
+      }
+      result.aggregate_slots.push_back(
+        first_slot{.input_idx   = static_cast<int>(children[0]->as_reference().column_index),
+                   .carried_idx = next_carried_idx++});
+      carried_types.push_back(aggr.return_type());
+      result.has_first = true;
+      continue;
+    }
+
     auto const agg_kind = to_cudf_aggregation_kind(fid);
     if (!agg_kind) { throw_unsupported_aggregate(fid); }
     size_t current_position = result.cudf_aggregates.size();
@@ -208,8 +224,21 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       result.local_types.push_back(aggr.return_type());
     }
   }
+  result.local_types.insert(result.local_types.end(), carried_types.begin(), carried_types.end());
 
   return result;
+}
+
+std::vector<int> carried_inputs(std::vector<AggregateSlot> const& aggregate_slots)
+{
+  std::vector<int> inputs;
+  for (auto const& slot : aggregate_slots) {
+    if (auto const* first = std::get_if<first_slot>(&slot)) {
+      D_ASSERT(first->carried_idx == inputs.size());
+      inputs.push_back(first->input_idx);
+    }
+  }
+  return inputs;
 }
 
 bool all_slots_plain(std::vector<AggregateSlot> const& aggregate_slots)

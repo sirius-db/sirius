@@ -82,6 +82,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;
   bool has_count_distinct = false;
+  bool has_first          = false;
 
  public:
   /// Whether the aggregate computes several grouping sets or GROUPING() functions. The local

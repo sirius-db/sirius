@@ -317,7 +317,8 @@ the finished sidecars at wrap time rather than through a propagation case:
   goes native; unused child columns may remain narrow until the aggregate discards them. Shapes whose
   partial batch layout deviates from the declared output — multiple grouping sets, grouping
   functions, AVG (SUM + COUNT decomposition adds a partial column), COUNT(DISTINCT) (LIST partial
-  column) — keep the native boundary.
+  column) — keep the native boundary. So does any `FIRST`: its carried columns are copied out of
+  the chosen row rather than aggregated, which this model does not describe.
 - Distinct- and sort-side exchanges are native because their inputs are restored at the
   boundary.
 

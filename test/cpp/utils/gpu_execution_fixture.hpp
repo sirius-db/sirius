@@ -239,6 +239,16 @@ class GpuExecutionFixture {
     compare_gpu_vs_cpu_impl(query, false, {}, 0.0, canonicalize);
   }
 
+  /// GPU-vs-CPU comparison, order-insensitive, of the row count and the cells of `columns`
+  /// (0-based) alone, each canonicalized first. Use where the other columns may legitimately differ
+  /// between engines, such as a `first()` result taken from an arbitrary row of its group.
+  void compare_gpu_vs_cpu_on_columns(const std::string& query,
+                                     const std::vector<size_t>& columns,
+                                     cell_canonicalizer canonicalize = canonical_float_key)
+  {
+    compare_gpu_vs_cpu_impl(query, false, {}, 0.0, canonicalize, columns);
+  }
+
   /// Asserts the query does NOT run purely on the GPU: it triggers a runtime
   /// fallback to DuckDB CPU (which still produces the correct result). Use for
   /// operations that are unsupported on-device -- this is a coverage fact, not a
@@ -294,9 +304,10 @@ class GpuExecutionFixture {
  private:
   void compare_gpu_vs_cpu_impl(const std::string& query,
                                bool ordered,
-                               const std::set<size_t>& approx_cols = {},
-                               double rel_tol                      = 0.0,
-                               cell_canonicalizer canonicalize     = nullptr)
+                               const std::set<size_t>& approx_cols      = {},
+                               double rel_tol                           = 0.0,
+                               cell_canonicalizer canonicalize          = nullptr,
+                               const std::vector<size_t>& compared_cols = {})
   {
     // Run on GPU (transparent, plain SQL goes through the Sirius optimizer hook).
     con->Query("SET gpu_execution = true;");
@@ -331,6 +342,17 @@ class GpuExecutionFixture {
     auto cpu_rows = collect_rows(cpu_mat, false);
     // Canonicalize before sorting: two members of one class can sort apart.
     for (auto* rows : {&gpu_rows, &cpu_rows}) {
+      if (!compared_cols.empty()) {
+        for (auto& row : *rows) {
+          std::vector<std::string> kept;
+          kept.reserve(compared_cols.size());
+          for (auto const col : compared_cols) {
+            REQUIRE(col < row.size());
+            kept.push_back(row[col]);
+          }
+          row = std::move(kept);
+        }
+      }
       if (canonicalize != nullptr) {
         for (auto& row : *rows) {
           for (auto& cell : row) {

@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "data/data_batch_utils.hpp"
+#include "duckdb/common/assert.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "telemetry/nvtx.hpp"
@@ -80,6 +81,9 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   local_types                       = std::move(cudf_defs.local_types);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+  has_first                         = cudf_defs.has_first;
+  // `create_plan(LogicalAggregate&)` refuses FIRST over several grouping sets or beside GROUPING().
+  D_ASSERT(!(has_first && has_grouping_sets()));
   // Grouping-set expansion inserts the set id and GROUPING() values before the partial
   // aggregate carriers. Keep their types from the planner's final schema; AVG may expand
   // the aggregate suffix, and STDDEV_SAMP / COUNT(DISTINCT) replace its scalar carriers.
@@ -110,9 +114,10 @@ duckdb::vector<sirius::logical_type>
 sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 {
   auto const aggregate_offset = num_output_group_columns();
-  if (!has_count_distinct || has_avg || types.size() != aggregate_offset + aggregate_slots.size()) {
+  if (!has_count_distinct || has_avg || has_first ||
+      types.size() != aggregate_offset + aggregate_slots.size()) {
     throw std::runtime_error(
-      "COUNT(DISTINCT) local schema requires a non-AVG one-slot-per-aggregate layout");
+      "COUNT(DISTINCT) local schema requires a non-AVG, non-FIRST one-slot-per-aggregate layout");
   }
 
   auto local_types = types;
@@ -136,6 +141,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
+  auto const carried = carried_inputs(aggregate_slots);
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
@@ -159,6 +165,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
                                                               cudf_aggregate_struct_col_indices,
+                                                              carried,
                                                               stream,
                                                               *space,
                                                               batch_telemetry(),
