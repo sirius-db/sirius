@@ -3,14 +3,16 @@ use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use clap::Parser;
+#[cfg(feature = "nixl-transport")]
+use sirius_starrocks_cn::NixlTransport;
 #[cfg(feature = "sirius-engine")]
 use sirius_starrocks_cn::SiriusEngine;
 #[cfg(not(feature = "sirius-engine"))]
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
     BackendServer, BrpcServer, ComputeNodeConfig, FeConfig, FragmentExecutor, HeartbeatServer,
-    SharedHeartbeatState, register_node, report_to_frontend_once, start_backend_server,
-    start_heartbeat_server,
+    NixlEndpoint, SharedHeartbeatState, register_node, report_to_frontend_once,
+    start_backend_server, start_heartbeat_server,
 };
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -69,14 +71,44 @@ impl Args {
         // before FE can route work here); otherwise it is a stub. The handle is held for the
         // process lifetime and torn down after the servers stop, below.
         #[cfg(feature = "sirius-engine")]
-        let executor: Arc<dyn FragmentExecutor> = Arc::new(
-            SiriusEngine::start(self.engine.sirius_config.clone()).map_err(|err| anyhow!(err))?,
-        );
+        let engine =
+            SiriusEngine::start(self.engine.sirius_config.clone()).map_err(|err| anyhow!(err))?;
+        #[cfg(feature = "nixl-transport")]
+        let direct_exchange = engine.direct_exchange();
+        // Declared before `nixl`: locals drop in reverse order, so even an early return drops the
+        // transport (deregistering the engine's slab) before the engine frees it.
+        #[cfg(feature = "sirius-engine")]
+        let executor: Arc<dyn FragmentExecutor> = Arc::new(engine);
         #[cfg(not(feature = "sirius-engine"))]
         let executor: Arc<dyn FragmentExecutor> = {
             warn_engine_disabled(&self.engine);
             Arc::new(StubExecutor)
         };
+        // The transport writes exchange batches straight into the engine's pool, registered once.
+        // Without a slab pool the CN still serves receivers on itself, and remote destinations
+        // fail cleanly ("this CN has no NIXL transport").
+        #[cfg(feature = "nixl-transport")]
+        let nixl: Option<Arc<dyn NixlEndpoint>> = match direct_exchange {
+            Some(exchange) => {
+                let agent_name = format!(
+                    "{}:{}",
+                    self.compute_node.advertise_host, self.compute_node.brpc_port
+                );
+                Some(Arc::new(
+                    NixlTransport::start(agent_name, exchange).map_err(|err| anyhow!(err))?,
+                ))
+            }
+            None => {
+                warn!(
+                    "the engine's GPU pool is not a slab, so this CN runs without the NIXL \
+                     transport and can't ship to other CNs; set sirius.memory.gpu.allocator: \
+                     slab in the --sirius-config YAML to enable it"
+                );
+                None
+            }
+        };
+        #[cfg(not(feature = "nixl-transport"))]
+        let nixl: Option<Arc<dyn NixlEndpoint>> = None;
 
         let state = SharedHeartbeatState::new();
 
@@ -90,7 +122,7 @@ impl Args {
         // BackendService exposes the shallow CN RPC skeleton on the normal thrift port.
         let backend_server = start_backend_server(&self.compute_node)?;
         // BRPC PInternalService dispatches plan fragments on the brpc port.
-        let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone())?;
+        let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone(), nixl.clone())?;
         self.registration
             .register_node_with_retries(&self.fe, &self.compute_node)
             .await?;
@@ -114,9 +146,13 @@ impl Args {
         .wait_until_shutdown()
         .await;
 
-        // The servers have stopped by the time `wait_until_shutdown` returns, so no in-flight RPC
-        // can touch the engine. Drop the executor last for an ordered teardown — the engine closes
-        // its thread and tears down the context (joined) here.
+        // The servers have stopped, but a blocking task the runtime abandoned at its shutdown
+        // timeout, or a detached receiver thread, may still hold clones of the transport and the
+        // executor; these drops are then not the last ones, and the service's field order keeps
+        // the transport ahead of the engine. Drop the transport first so it deregisters the
+        // engine's pool, then the executor: the engine closes its thread and tears down the
+        // context (joined) here.
+        drop(nixl);
         #[cfg(feature = "sirius-engine")]
         info!("tearing down Sirius engine");
         drop(executor);
@@ -266,9 +302,10 @@ impl BrpcRuntime {
     fn start(
         compute_node: &ComputeNodeConfig,
         executor: Arc<dyn FragmentExecutor>,
+        nixl: Option<Arc<dyn NixlEndpoint>>,
     ) -> Result<Self> {
         let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
-        let server = BrpcServer::with_executor(executor, compute_node);
+        let server = BrpcServer::with_executor(executor, compute_node, nixl);
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
         let join = tokio::task::spawn_blocking(move || {
