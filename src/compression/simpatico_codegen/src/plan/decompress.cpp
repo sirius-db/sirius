@@ -1339,13 +1339,16 @@ column_decode_caps probe_column(PlanTree const& tree)
 {
   namespace sc = sirius::codegen;
   column_decode_caps caps;
-  // A nullable column is never compacted or answered against its keys (decompress_column
-  // refuses a selection on it), so report no capability rather than let a caller reserve
-  // for a compacted decode that will not happen.
-  if (!tree.validity.empty()) { return caps; }
+  // A nullable column is never compacted (decompress_column refuses a selection on it), so it
+  // reports the `full` route and a caller reserves for a full-width decode. Equality is
+  // unaffected: the predicate result is null-free and decompress_column reattaches the
+  // column's validity to it, which is the null propagation the predicate promises.
+  bool const nullable = !tree.validity.empty();
   // The shapes are mutually exclusive: a plan has exactly one (0,0)-producer,
   // so the route is a classification, not a set of overlapping flags.
-  if (bitpack_selection_root(tree)) {
+  if (nullable) {
+    // route stays `full`
+  } else if (bitpack_selection_root(tree)) {
     caps.compact_route = sc::decode_route::bitpack_mask;
   } else if (delta_selection_root(tree)) {
     caps.compact_route = sc::decode_route::delta_mask;
