@@ -2493,7 +2493,6 @@ static void ApplyExpressionEvaluatorStrategy(ClientContext& context,
 static void SetExpressionEvaluatorStrategy(ClientContext& context, SetScope scope, Value& parameter)
 {
   // The connection owns this policy; execution takes an immutable snapshot.
-  throw_if_sirius_runtime_unavailable(context);
   ApplyExpressionEvaluatorStrategy(context, scope, StringValue::Get(parameter));
 }
 
@@ -2503,7 +2502,6 @@ static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
 {
-  throw_if_sirius_runtime_unavailable(context);
   SIRIUS_LOG_WARN(
     "The 'expression_executor_strategy' setting is deprecated; use "
     "'expression_evaluator_strategy' instead.");
@@ -2523,7 +2521,6 @@ static void SetEnableDuckdbFallback(ClientContext& /*context*/,
 
 static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value& parameter)
 {
-  throw_if_sirius_runtime_unavailable(context);
   if (scope == SetScope::GLOBAL)
     throw InvalidInputException("enable_regex_jit_impl is a session setting");
   duckdb::session_operator_params(context).enable_regex_jit = BooleanValue::Get(parameter);
@@ -2546,7 +2543,6 @@ static void SetFuseMergePipelines(ClientContext& /*context*/,
 
 static sirius::operator_params* get_operator_params(ClientContext& context, SetScope scope)
 {
-  throw_if_sirius_runtime_unavailable(context);
   if (scope == SetScope::GLOBAL)
     throw InvalidInputException("Sirius query options are session settings");
   // Session state is created on demand; this returns a non-null pointer or throws.
@@ -2725,7 +2721,6 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
 
 static void SetEnablePinTableCompression(ClientContext& context, SetScope scope, Value& parameter)
 {
-  throw_if_sirius_runtime_unavailable(context);
   if (scope == SetScope::GLOBAL)
     throw InvalidInputException("Pin compression options are session settings");
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -2739,7 +2734,6 @@ static void SetPinTableInputCompressionPlanDir(ClientContext& context,
                                                SetScope scope,
                                                Value& parameter)
 {
-  throw_if_sirius_runtime_unavailable(context);
   if (scope == SetScope::GLOBAL)
     throw InvalidInputException("Pin compression options are session settings");
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -2752,7 +2746,6 @@ static void SetPinTableCompressionMinBatchSizeBytes(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
 {
-  throw_if_sirius_runtime_unavailable(context);
   if (scope == SetScope::GLOBAL)
     throw InvalidInputException("Pin compression options are session settings");
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -2766,7 +2759,6 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
                                                         SetScope scope,
                                                         Value& parameter)
 {
-  throw_if_sirius_runtime_unavailable(context);
   if (scope == SetScope::GLOBAL)
     throw InvalidInputException("Pin compression options are session settings");
   const double fraction = DoubleValue::Get(parameter);
