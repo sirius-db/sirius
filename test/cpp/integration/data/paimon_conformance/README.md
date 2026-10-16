@@ -26,7 +26,7 @@ reading this small corpus.
 A build receipt records the source recipe, builder, shared downloader and Pixi lock hashes, compiler
 versions, target executable identity/hash, and output size/hash. The runner
 requires that receipt by default and rejects stale inputs, a changed executable,
-or changed extension bytes. This is provenance from a trusted local/CI builder,
+or changed extension bytes. This is provenance from a trusted local builder,
 not a signed attestation or a promise of byte-identical rebuilds. A successful
 build does not qualify reader correctness; conformance must pass separately.
 Receipts without the current downloader hash require a fresh build; do not update
@@ -45,10 +45,14 @@ one-column-key fixtures do not establish correctness for that workload. This
 corpus also excludes concurrent writers, schema evolution, deletion vectors,
 other merge engines, remote storage, and statement-bound snapshot guarantees.
 
-## Routine checks and reading
+## Manual checks and reading
 
-The standard-library harness tests require Python 3.11 or later; CI uses Python
-3.12. They need no native build, extension, GPU, external network, or corpus
+Paimon tests are manual-only. This corpus is not registered in the default test
+runner, and this PR adds no Paimon GitHub Actions jobs or dispatch workflow.
+CI integration is deferred until GPU Paimon support is introduced.
+
+The standard-library harness tests require Python 3.11 or later; Python 3.12 is
+recommended. They need no native build, extension, GPU, external network, or corpus
 regeneration. Download tests use a temporary loopback HTTP server:
 
 ```bash
@@ -130,8 +134,7 @@ before invoking the builder or runner, from the activated Pixi environment:
 export LD_LIBRARY_PATH="$PWD/build/release/install/lib:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
-The optional workflow sets this automatically. A local `pixi run make` build also
-records its local library paths in the binaries.
+A local `pixi run make` build records its local library paths in the binaries.
 
 Runtime-disabled and explicit-CPU modes use the same Sirius executable. Normal
 initialization, transparent fallback, and rejection checks require a working GPU
@@ -157,66 +160,6 @@ stderr. A matching error never excuses a
 crash, timeout, unexpected exit code, or successful exit. Only exit 1 plus the
 expected diagnostic passes that check. These fields record observations; they do
 not attribute a failure to a particular upstream issue.
-
-The optional `Paimon conformance` workflow accepts a completed `Test` run whose
-source head matches the dispatched revision. The CUDA 13 artifact must contain both `build/release/` (including the installed
-Sirius libraries) and `sirius-duckdb/build/release/` (CLI and extension).
-`build/release/sirius-build-sha.txt` records the build checkout before packaging. Old artifacts without this marker are rejected.
-
-For PR runs, that checkout is the synthetic PR-plus-base merge at build time,
-not the PR head alone. `build-provenance.json`, the setup log, and the workflow
-summary explicitly distinguish the source head and actual build checkout SHA.
-For manual/merge-group builds, the recorded checkout must equal the dispatched
-revision. Workflow paths with or without an `@ref` suffix are accepted.
-
-This workflow does not rebuild or rerun the ordinary test matrix. It requires an
-already-completed Test run and fails immediately if that run is still in progress;
-it does not poll or wait for completion. Artifacts expire after one day;
-missing/expired builds fail explicitly.
-
-GitHub requires the workflow file to exist on the repository's default branch
-before [`workflow_dispatch`](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onworkflow_dispatch)
-can trigger it. A newly introduced workflow therefore cannot be dispatched in
-the base repository merely by publishing a PR ref; its first run requires the
-workflow to reach the default branch. Dispatch also requires a branch/tag in the
-repository where it runs. To validate a fork PR revision in the base repository,
-a maintainer must make that revision available on a base-repository ref. A fork
-can dispatch only when its default branch contains the workflow and its required
-runners are available.
-
-For the first upstream run, ask a maintainer to agree to the bootstrap route:
-register this reviewed workflow on the default branch through the repository's
-CI contribution process, and publish the reviewed source head on a base-repository
-branch. Complete a matching `Test` run, then dispatch `Paimon conformance` on that
-same branch with its `build_run_id`. A workflow-only bootstrap does not qualify
-the tests; retain the actual `gpu-2xt4` run URL and diagnostics before claiming CI
-validation. Do not enable new PR triggers or weaken provenance to bypass this
-prerequisite.
-
-The workflow's **90-minute job budget includes** artifact retrieval, environment
-setup, the four-job reader build and conformance. It deliberately passes no
-source cache and requires a new build directory. `SCCACHE_RECACHE=1` forces
-recompilation in sccache; `CCACHE_DISABLE=1` disables ccache, including nested
-builds. These environment values are recorded in the build receipt. This is a
-cold **reader** build, not a cold Sirius/Pixi installation or a claim that proxies
-and OS caches are empty.
-
-`build-resources.txt` and `conformance-resources.txt` retain GNU time's wall time,
-maximum resident memory and exit status for each command, including a failed
-command. `resources.txt` records runner identity, initial/final filesystem usage,
-final allocated directory sizes, and elapsed time from initialization of
-diagnostics. Directory sizes are boundary measurements, not peak disk usage;
-use the GitHub job's start/end timestamps for the entire 90-minute budget.
-The always-run summary and diagnostic upload retain these records on failure;
-a forcefully terminated job can leave incomplete records, never proof of a pass.
-Local timings on other GPUs or with source/compiler caches do not establish the
-intended runner's budget. Record its cold-run duration and disk use in the PR.
-
-Build/case diagnostics, receipts and nested CMake logs are uploaded even on failure. Normal PR/merge-group
-checks run the CPU harness in its own required job, independently of lint and
-thread-sweep checks, with a Paimon-specific summary. Workflow validation requires
-a completed real run with retained reports; local checks alone do not establish
-CI delivery.
 
 ## Explicit regeneration
 

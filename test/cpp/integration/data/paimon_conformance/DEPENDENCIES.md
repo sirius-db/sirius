@@ -66,7 +66,7 @@ Arrow's Boost 1.81.0 is a trimmed Arrow-maintained bundle, with preferred URL
 A full Boost release archive is not interchangeable with that digest. An upstream
 fallback mirror returning unavailable or differently packaged bytes must fail
 rather than cause a checksum change. Source caching saves downloads only; it
-never proves a fresh compilation will fit the CI job budget.
+does not establish how long a fresh compilation will take.
 
 ## Disabled branches and environment boundary
 
@@ -104,8 +104,8 @@ The socket timeout is 30 seconds. A ten-minute elapsed-time budget is checked
 between redirect requests and before/after body `read1` operations. This is not a
 hard process deadline: blocking DNS, response-header parsing or a current socket
 operation (including HTTP chunk framing/trailer parsing inside `read1`) cannot
-be preempted by those checks. The CI job timeout remains the
-outer execution limit. Transport/body-length failures retain bounded retries;
+be preempted by those checks. Manual runs have no hard outer deadline unless
+the caller supplies one. Transport/body-length failures retain bounded retries;
 URL-policy violations, invalid headers and completed hash mismatches do not retry.
 
 These Python protections apply to the three top-level archives and the explicit
