@@ -144,14 +144,22 @@ struct build_probe_decision {
   HASH_JOIN_MODE join_mode,
   double estimated_probe_to_build_ratio);
 
-/// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
-/// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
-/// data. Once the probe upstream is finished (`probe_finished`), any slot that is still NOT_BUILT
-/// with a build batch but no probe batch will never be probed and is returned for discard. Returns
-/// empty while the probe side may still deliver data. Pure/unit-testable counterpart of
-/// discard_build_only_slots_if_probe_complete.
-[[nodiscard]] std::vector<std::size_t> broadcast_slots_to_discard(
-  std::vector<build_probe_slot_view> const& slots, bool probe_finished);
+/**
+ * @brief Reclaim unprobed BUILD_PROBE slots after the probe producer closes.
+ *
+ * Keep one orphan when no task was issued or can still be issued, so an empty result reaches
+ * downstream aggregates. All other never-probed build slots are discarded.
+ */
+struct build_probe_reclaim_plan {
+  std::vector<std::size_t> discard;
+  std::optional<std::size_t> orphan;
+};
+
+/**
+ * @brief Plan reclaim from the current slot state; an unfinished probe leaves the plan empty.
+ */
+[[nodiscard]] build_probe_reclaim_plan plan_build_probe_reclaim(
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished, bool task_issued);
 
 //===----------------------------------------------------------------------===//
 // STANDARD / MIXED_JOIN partial-barrier scheduling helpers.
@@ -397,11 +405,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// scheduler (`select_build_probe_action`). Must be called with `op_state_mutex` held.
   std::vector<build_probe_slot_view> snapshot_build_probe_slots();
 
-  /// Broadcast-mode cleanup: once the probe upstream is finished, any NOT_BUILT slot that holds a
-  /// (replicated) build batch but never received probe data is discarded — its build batch is freed
-  /// on its own GPU and the slot is marked DESTROYED so the operator can complete. No-op unless
-  /// `_broadcast`. Must be called with `op_state_mutex` held.
-  void discard_build_only_slots_if_probe_complete();
+  /**
+   * @brief Release never-probed builds and claim a single empty-output task when needed.
+   *
+   * @pre `op_state_mutex` is held.
+   * @return true when an orphan was claimed.
+   */
+  bool reclaim_build_only_slots_if_probe_complete();
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -462,6 +472,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
+
+  // Guarded by op_state_mutex; distinguishes completed task streams from zero-task joins.
+  bool _build_probe_task_issued = false;
+  std::optional<std::size_t> _build_probe_orphan_partition;
 
   bool _build_arrives_whole = false;
 
