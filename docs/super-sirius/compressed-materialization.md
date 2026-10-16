@@ -550,7 +550,9 @@ basis unchanged.
     the logical types' domains.
 12. The DATE representation tunnel is an internal physical carrier operation, not a logical cast.
     Planner-inserted AST restores carry explicit provenance; translated semantic temporal-numeric
-    casts are rejected before GPU planning. Other conversions use cuDF semantics.
+    casts are rejected before GPU planning. Casts to DECIMAL follow DuckDB (see
+    [expression-executor.md](expression-executor.md#decimal-casts)); other conversions use cuDF
+    semantics.
 13. A planned narrow target requires the recorded pin-time native mapping to match the scan's
     current native mapping. DuckDB serving applies the same check to every projected cached column
     and treats a mismatch as a clean cache miss.
