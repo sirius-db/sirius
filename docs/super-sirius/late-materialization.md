@@ -88,6 +88,10 @@ columns on inside one pipeline and a wide column rides past it for free.
 **The walk fails closed.** Any operator shape it does not model reads everything, which can only
 end a ride early.
 
+`sirius_physical_dynamic_filter` needs the values of columns registered in its consumer channel, even when no filter has been published yet. Registration is complete before lifetime analysis. `trace_through` matches `planned_target_columns()` against each column's current endpoint input position, after any projection, filter or join remapping.
+
+Registered targets end their deferred ride at that endpoint; an unscoped producer ends every column's ride there. A profitable deferral may still restore values immediately before the endpoint executes. Untargeted payload can continue through a scoped endpoint, and an endpoint with no consumer or no registered producers is transparent.
+
 Two things then decide whether the ride is taken:
 
 - **It has to repay.** Value per row and crossings saved TRADE OFF — a thin ride over many
@@ -152,6 +156,10 @@ row positions, taken from the same mask the scan filters with. It is refused whe
 are decided somewhere this path cannot see them — a compressed pin filters inside the fused
 decode (see [Compressed Pinning](compressed-pinning.md)).
 
+Dynamic membership filters cannot meet a deferral during decode today: the decode attaches them only to compressed pins, and install refuses every compressed origin (see Known limits). A guard keeps it that way should compressed origins become deferrable: `sirius_gpu_scan_operator::decode_consumer` is null once a deferral is installed, and `prepare_for_query` installs every deferral, riders included, before it builds any provider, so the scan's dynamic-filter endpoint would apply those filters after substitution instead. Should a deferring scan's decode remove rows anyway, `execute` fails with a named internal error, before any filtering or projection, rather than addressing rows the batch no longer holds.
+
+Port restoration changes values, not rows, so it keeps the payload it restores: its dynamic type, original batch IDs, preferred device, partition index and scan receipt (see [Dynamic Filters](dynamic-filters.md#scan-receipts-and-decode-history)).
+
 A column every reader only COUNTs needs no far end at all: `install_count_deferral` is the one
 deferral with a single half, admitted only over pinned columns with no nulls. Off by default.
 
@@ -168,9 +176,8 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   `materialize_compressed`'s decode routes in `materialize.cpp` do write values only, with no
   output validity buffer — but that is a secondary reason and moot in practice, since a compressed
   origin never reaches them today.
-- A compressed origin cannot skip its decode — the scan substitutes on the FINISHED output, so a
-  deferred column from a compressed pin is decompressed and then discarded.
-- Filtered scans of compressed pins are refused (above).
+- Admitting compressed origins would not make them pay on their own: the scan substitutes on the FINISHED output, so a deferred column from a compressed pin would be decompressed and then discarded. A deferring scan's decode would also give up dynamic membership compaction (`decode_consumer` withholds the probes).
+- Filtered scans of compressed pins are refused (above). Lifting that refusal, and the lost membership compaction above, both need a decode that reports its survivor positions (or a cached-view checkpoint that gathers a row-index sequence with its residual mask); that one capability would lift both limits together.
 - Deferred-value widths are ESTIMATED for variable-width columns, not measured, and the error runs
   both ways: underestimating a wide column can refuse a bundle that would have qualified, but
   overestimating a short one can just as easily admit a bundle that does not actually repay (a

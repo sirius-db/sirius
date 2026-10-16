@@ -55,11 +55,9 @@ class cross_join_slice_data : public pipelineable_operator_data {
   {
   }
 
-  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_data_batches(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches) const override
-  {
-    return std::make_unique<cross_join_slice_data>(std::move(data_batches), slice, num_slices);
-  }
+  //! Keeps the slice; see `pipelineable_operator_data::with_batches_preserving_rows`.
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const override;
 
   std::size_t slice;
   std::size_t num_slices;

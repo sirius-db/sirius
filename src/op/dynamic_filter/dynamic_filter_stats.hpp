@@ -24,7 +24,7 @@
 namespace sirius::op {
 
 /**
- * @brief The dynamic-filter publication counters, each held as a @p Counter
+ * @brief The dynamic-filter publication and application counters, each held as a @p Counter
  *
  * `dynamic_filter_stats` holds them as atomics for the lifetime of a connection.
  * `dynamic_filter_stats_snapshot` holds plain values, both for a copy of those atomics and for the
@@ -36,7 +36,9 @@ namespace sirius::op {
  * `publications_skipped_source_not_resident`; a source skip may reopen the claim window.
  * `publications_skipped_build_not_whole` is counted once per join rather than once per delivery.
  * `bindings_skipped_incompatible_probe` counts bindings whose recorded probe type no membership
- * adapter can read, which would decline every batch.
+ * adapter can read, which would decline every batch. `applications_skipped_other_device` counts
+ * batches a `sirius::op::scan::dynamic_filter_consumer` passed through unfiltered because the batch
+ * or its prepared program belongs to a device other than the current one.
  *
  * Accumulation counters: `accumulations_started` counts attempts that allocated their partial
  * arrays. `accumulations_skipped_inventory` counts builds whose input could not be certified and
@@ -89,6 +91,7 @@ struct dynamic_filter_counters {
   Counter filters_pushed{};
 
   Counter bindings_skipped_incompatible_probe{};
+  Counter applications_skipped_other_device{};
 };
 
 /**
@@ -126,7 +129,8 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::publications_skipped_build_not_whole,
   &dynamic_filter_counters<Counter>::publications_skipped_targets_drained,
   &dynamic_filter_counters<Counter>::filters_pushed,
-  &dynamic_filter_counters<Counter>::bindings_skipped_incompatible_probe};
+  &dynamic_filter_counters<Counter>::bindings_skipped_incompatible_probe,
+  &dynamic_filter_counters<Counter>::applications_skipped_other_device};
 
 static_assert(sizeof(dynamic_filter_counters<std::uint64_t>) ==
                 dynamic_filter_counter_fields<std::uint64_t>.size() * sizeof(std::uint64_t),
@@ -140,7 +144,7 @@ static_assert(sizeof(dynamic_filter_counters<std::uint64_t>) ==
 using dynamic_filter_stats_snapshot = dynamic_filter_counters<std::uint64_t>;
 
 /**
- * @brief Connection-lifetime publication counters owned by `SiriusContext`
+ * @brief Connection-lifetime dynamic-filter counters owned by `SiriusContext`
  */
 struct dynamic_filter_stats final : dynamic_filter_counters<std::atomic<std::uint64_t>> {
   /**

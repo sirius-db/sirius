@@ -70,6 +70,15 @@ class dense_count_join_input : public partitioned_operator_data {
   /** @brief Number of trailing batches that belong to the counted input. */
   [[nodiscard]] std::size_t counted_count() const noexcept { return _counted_count; }
 
+  /**
+   * @brief Keeps both side counts and the partition identity; see
+   * `pipelineable_operator_data::with_batches_preserving_rows`
+   *
+   * @throws std::invalid_argument if @p batches does not hold exactly one replacement per batch
+   */
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const override;
+
  private:
   std::size_t _preserved_count;
   std::size_t _counted_count;

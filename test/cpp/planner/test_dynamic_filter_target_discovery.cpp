@@ -153,7 +153,11 @@ duckdb::unique_ptr<sirius::op::scan::sirius_physical_dynamic_filter> make_endpoi
   return duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
     std::move(types),
     /*estimated_cardinality=*/0,
-    std::make_shared<sirius::op::sirius_dynamic_filter_set>());
+    std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      std::make_shared<sirius::op::sirius_dynamic_filter_set>(),
+      sirius::op::scan::consumer_config{
+        .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
+      std::vector<sirius::op::scan::binding>{}));
 }
 
 // A place_endpoint factory that splices in a real endpoint operator and records every splice.
