@@ -347,7 +347,7 @@ def build(cli, output, jobs, source_cache=None):
         raise ValueError("Unsupported delimiter in build path")
     config.write_text(
         f'duckdb_extension_load(paimon SOURCE_DIR [=[{output / "extension"}]=] '
-        f'EXTENSION_VERSION {recipe["extension_version"]} DONT_LINK)\n'
+        f'EXTENSION_VERSION {recipe["extension_version"]})\n'
     )
     command = [
         "cmake",
