@@ -55,7 +55,9 @@ struct stream_pool {
 /// the stream they were built on for their eventual async free, so a handle has
 /// to stay valid for as long as anything allocated on it might be freed.
 ///
-/// @throws std::runtime_error if the streams cannot be created.
+/// @throws rmm::out_of_memory if the streams cannot be created (the device is out
+///         of resources, so the caller may retry).
+/// @throws std::runtime_error if the current device cannot be queried.
 stream_pool& thread_device_stream_pool(size_t n);
 
 }  // namespace simpatico
