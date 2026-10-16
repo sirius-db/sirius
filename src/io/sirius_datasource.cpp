@@ -72,35 +72,18 @@ sirius_datasource::sirius_datasource(std::shared_ptr<ioctx> io_ctx,
 
 sirius_datasource::~sirius_datasource() {}
 
-std::shared_ptr<io_object_metadata> sirius_datasource::metadata(std::string const& profile) const
+std::shared_ptr<io_object_metadata> sirius_datasource::metadata() const
 {
   if (!_io_ctx || !_io_object) { return nullptr; }
-  auto& cache   = _io_ctx->metadata_store();
-  auto metadata = cache.get_metadata(*_io_object, profile);
-  if (metadata) return metadata;
-
-  // The identity-aware entry is scoped to the individual open for degraded
-  // local identities.  Keep the legacy lookup as a compatibility path for
-  // metadata consumers that ask a freshly opened datasource for the parsed
-  // footer: observe_locked has already retired the legacy value when the
-  // underlying object identity changes.
-  if (profile == "parquet-v1") return cache.get_metadata(_io_object->raw_file_cache_id());
-  return nullptr;
+  return _io_ctx->metadata_store().get_metadata(*_io_object);
 }
 
-[[nodiscard]] bool sirius_datasource::store_metadata(std::shared_ptr<io_object_metadata> metadata,
-                                                     std::string const& profile)
+[[nodiscard]] bool sirius_datasource::store_metadata(std::shared_ptr<io_object_metadata> metadata)
 {
   if (!_io_ctx || !_io_object) { return false; }
   auto& cache = _io_ctx->metadata_store();
-  cache.register_metadata(*_io_object, std::move(metadata), profile);
+  cache.register_metadata(*_io_object, std::move(metadata));
   return true;
-}
-
-std::unique_lock<std::mutex> sirius_datasource::lock_metadata_miss(std::string const& profile) const
-{
-  if (!_io_ctx || !_io_object) return {};
-  return _io_ctx->metadata_store().lock_metadata_miss(*_io_object, profile);
 }
 
 size_t sirius_datasource::size() const { return _io_object->size(); }

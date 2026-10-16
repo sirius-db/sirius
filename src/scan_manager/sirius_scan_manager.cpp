@@ -1413,7 +1413,7 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   // would download footer bytes we won't reuse — a plain HEAD resolves the size.
   auto const cache_key     = normalize_path(uri);
   auto const io_ctx        = ioctx_for_path(uri);
-  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_candidate(cache_key);
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
   auto const hint =
     footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
 
@@ -2180,9 +2180,12 @@ std::optional<sirius::io::io_context_type> sirius_scan_manager::planning_io_back
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
   sirius::io::io_context_type type, std::string_view path)
 {
-  auto const snapshot  = path.empty()
-                           ? std::optional<sirius::io::scoped_object_store_configs::snapshot>{}
-                           : _s3_configs.resolve(normalize_path(std::string(path)));
+  auto const canonical_path = path.empty() ? std::string{} : normalize_path(std::string(path));
+  bool const uses_object_store_config =
+    type == sirius::io::io_context_type::restful || type == sirius::io::io_context_type::kvikio;
+  auto const snapshot  = uses_object_store_config && !canonical_path.empty()
+                           ? _s3_configs.resolve(canonical_path)
+                           : std::optional<sirius::io::scoped_object_store_configs::snapshot>{};
   auto const config_id = snapshot ? snapshot->id : 0;
   // The local default `_io_ctx` already serves uring/kvikio; only an off-default
   // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
@@ -2200,12 +2203,12 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // mutex serializes builders instead, so two first-touches of the same type
   // never construct twice (a losing ioctx would need drain/stop teardown).
   std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
-  if (!path.empty()) {
-    auto latest          = _s3_configs.resolve(normalize_path(std::string(path)));
+  if (uses_object_store_config && !canonical_path.empty()) {
+    auto latest          = _s3_configs.resolve(canonical_path);
     auto const latest_id = latest ? latest->id : 0;
     if (latest_id != config_id) {
       build_lk.unlock();
-      return ioctx_for_type(type, path);
+      return ioctx_for_type(type, canonical_path);
     }
   }
   {
@@ -3256,7 +3259,7 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
   for (auto const& path : file_paths) {
     auto const cache_key     = normalize_path(path);
     auto const io_ctx        = ioctx_for_path(path);
-    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_candidate(cache_key);
+    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
     auto datasource          = create_datasource(
       path,
       footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe);

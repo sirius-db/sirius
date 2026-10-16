@@ -48,30 +48,20 @@ class metadata_store {
   void open_observed(io_object const& obj);
   std::shared_ptr<io_object_metadata> get_or_load(
     io_object const& obj,
-    std::string const& profile,
     std::function<std::shared_ptr<io_object_metadata>()> const& loader,
     bool* cache_hit      = nullptr,
     std::stop_token stop = {});
   metadata_store(metadata_store const&)            = delete;
   metadata_store& operator=(metadata_store const&) = delete;
-  void register_metadata(io_object const& obj,
-                         std::shared_ptr<io_object_metadata> metadata,
-                         std::string const& profile = "parquet-v1");
-  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(
-    io_object const& obj, std::string const& profile = "parquet-v1") const;
-  [[nodiscard]] bool has_candidate(std::string_view path) const;
-  [[nodiscard]] bool has_path(std::string_view path) const { return has_candidate(path); }
-  /// Compatibility lookup by the backend's raw cache key. New code should use
-  /// the identity-aware overload above.
-  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(std::string_view cache_key) const;
-  std::unique_lock<std::mutex> lock_metadata_miss(io_object const& obj,
-                                                  std::string const& profile = "parquet-v1") const;
+  void register_metadata(io_object const& obj, std::shared_ptr<io_object_metadata> metadata);
+  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(io_object const& obj) const;
+  [[nodiscard]] bool has_path(std::string_view path) const;
   [[nodiscard]] counters statistics() const;
   [[nodiscard]] std::string describe_metadata_store() const;
 
  private:
   struct entry {
-    std::string key, candidate_key;
+    std::string key;
     uint64_t generation;
     object_identity identity;
     std::shared_ptr<io_object_metadata> value;
@@ -80,11 +70,10 @@ class metadata_store {
   using iterator = entries::iterator;
   void observe_locked(io_object const& obj, entries& retired);
 
-  static std::string cache_key(std::string const& path, std::string const& profile);
+  static std::string cache_key(std::string const& path);
   void retire(iterator it, entries& retired);
   void clear();
   bool put_identity(std::string const& path,
-                    std::string const& profile,
                     object_identity identity,
                     uint64_t generation,
                     std::shared_ptr<io_object_metadata> value,
@@ -93,10 +82,6 @@ class metadata_store {
   mutable std::mutex _mutex;
   entries _entries;
   std::unordered_map<std::string, iterator> _index;
-  // Path-level reverse index used only to invalidate all profiles for a path.
-  // The resident cache remains keyed by the exact path + profile key above.
-  std::unordered_map<std::string, std::unordered_set<std::string>> _candidate_entries;
-  mutable std::unordered_map<std::string, std::shared_ptr<std::mutex>> _miss_locks;
   mutable counters _stats;
   struct observation {
     object_identity identity;
@@ -110,13 +95,5 @@ class metadata_store {
     std::exception_ptr error;
   };
   std::unordered_map<std::string, std::shared_ptr<flight>> _flights;
-
-  struct legacy_entry {
-    uint64_t generation;
-    std::shared_ptr<io_object_metadata> value;
-  };
-
-  std::unordered_map<std::string, legacy_entry> _legacy_by_key;
-  std::unordered_map<std::string, std::string> _legacy_key_by_path;
 };
 }  // namespace sirius::io::cache

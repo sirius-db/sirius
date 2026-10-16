@@ -457,39 +457,26 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     bool backend_available;
   };
   std::vector<remote_puffin> remote_puffins;
-  auto const& scan_manager = sirius_ctx->get_scan_manager();
-  for (auto const& c : scans) {
-    for (auto const& dv : c.discovery->deletion_vector_entries) {
-      bool remote = false;
-      std::string scheme;
-      try {
-        auto const parsed = sirius::io::parse(dv.file_path);
-        scheme            = parsed.scheme;
-        remote            = parsed.scheme != "file";
-      } catch (std::invalid_argument const&) {
-        // Preserve the legacy handling for bare local paths. A malformed URI
-        // is recorded as an unsupported remote capability only when it has a
-        // scheme marker; otherwise the local reader remains authoritative.
-        remote = dv.file_path.find("://") != std::string::npos;
-      }
-      if (!remote) continue;
-      auto const backend           = scan_manager.planning_io_backend(dv.file_path);
-      auto const backend_available = scheme == "s3" && backend.has_value() &&
-                                     (*backend == sirius::io::io_context_type::restful ||
-                                      *backend == sirius::io::io_context_type::kvikio);
-      remote_puffins.push_back(
-        {c.scan->contract_id, dv.file_path, std::move(scheme), backend_available});
+  auto const& scan_manager   = sirius_ctx->get_scan_manager();
+  auto inspect_remote_puffin = [&](scan_contract_id contract, auto const& dv) {
+    bool remote = false;
+    std::string scheme;
+    try {
+      auto const parsed = sirius::io::parse(dv.file_path);
+      scheme            = parsed.scheme;
+      remote            = parsed.scheme != "file";
+    } catch (std::invalid_argument const&) {
+      // Preserve the legacy handling for bare local paths. A malformed URI
+      // is remote only when it has an explicit scheme marker.
+      remote = dv.file_path.find("://") != std::string::npos;
     }
-  }
-  if (auto const unsupported =
-        std::ranges::find_if(remote_puffins, [](auto const& p) { return !p.backend_available; });
-      unsupported != remote_puffins.end()) {
-    sirius_ctx->record_semantic_decline(verdict_reason::iceberg_puffin_uri_unsupported);
-    throw scan_verdict_declined(
-      "iceberg_scan declines the GPU path: Puffin URI '" + unsupported->path +
-        "' has no planning-capable remote backend",
-      {{unsupported->contract, verdict_reason::iceberg_puffin_uri_unsupported}});
-  }
+    if (!remote) return;
+    auto const backend           = scan_manager.planning_io_backend(dv.file_path);
+    auto const backend_available = scheme == "s3" && backend.has_value() &&
+                                   (*backend == sirius::io::io_context_type::restful ||
+                                    *backend == sirius::io::io_context_type::kvikio);
+    remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
+  };
   std::vector<scan_dv_count> counts;
   std::vector<scan_envelope> envelopes;
   bool qualified = true;
@@ -497,6 +484,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     if (c.discovery->positional_delete_files.empty()) validate_deletion_vector_claims(*c.discovery);
     uint64_t total = 0;
     for (auto const& dv : c.discovery->deletion_vector_entries) {
+      inspect_remote_puffin(c.scan->contract_id, dv);
       if (dv.record_count < 0 ||
           static_cast<uint64_t>(dv.record_count) > std::numeric_limits<uint64_t>::max() - total) {
         qualified = false;
@@ -517,6 +505,15 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     } catch (std::overflow_error const&) {
       qualified = false;
     }
+  }
+  if (auto const unsupported =
+        std::ranges::find_if(remote_puffins, [](auto const& p) { return !p.backend_available; });
+      unsupported != remote_puffins.end()) {
+    sirius_ctx->record_semantic_decline(verdict_reason::iceberg_puffin_uri_unsupported);
+    throw scan_verdict_declined(
+      "iceberg_scan declines the GPU path: Puffin URI '" + unsupported->path +
+        "' has no planning-capable remote backend",
+      {{unsupported->contract, verdict_reason::iceberg_puffin_uri_unsupported}});
   }
   host_reservation_provider provider(sirius_ctx->get_memory_manager(),
                                      std::make_shared<decltype(sirius_ctx)>(sirius_ctx));

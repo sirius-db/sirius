@@ -202,65 +202,11 @@ uint32_t compute_crc32(const uint8_t* data, size_t length)
   return crc ^ 0xFFFFFFFFu;
 }
 
-/// Decodes one 32-bit portable-Roaring bitmap out of @p data and appends its values to @p out,
-/// returning the bytes consumed.
-///
-/// `roaring_bitmap_portable_deserialize_size` reports how many bytes a VALID bitmap occupies within
-/// @p data_len and returns 0 otherwise, so the read is bounded by the buffer rather than by numbers
-/// the file supplied -- there is no decode ceiling to tune here because the library cannot be made
-/// to over-read or over-expand. The cardinality is known before any position is materialized, so
-/// @p max_out is enforced BEFORE the allocation rather than inside an expansion loop.
-size_t deserialize_roaring32(const uint8_t* data,
-                             size_t data_len,
-                             std::vector<uint32_t>& out,
-                             size_t max_out)
-{
-  size_t const bitmap_size = roaring::api::roaring_bitmap_portable_deserialize_size(
-    reinterpret_cast<const char*>(data), data_len);
-  if (bitmap_size == 0) {
-    throw std::runtime_error("roaring: no valid portable-Roaring bitmap in the remaining " +
-                             std::to_string(data_len) +
-                             " bytes; the deletion vector is truncated or corrupt");
-  }
-
-  roaring::Roaring bitmap =
-    roaring::Roaring::readSafe(reinterpret_cast<const char*>(data), bitmap_size);
-
-  // readSafe bounds the READ; it does not check the bitmap's internal invariants. A bitset
-  // container carries its cardinality as a stored number and `bitset_container_read` copies it
-  // without recomputing the popcount, so a declared cardinality that disagrees with the bits is
-  // accepted here and only discovered by what reads it. Both directions are live:
-  // over-declaring leaves a zero-filled tail that materializes as delete position 0 and removes a
-  // row the table keeps, and under-declaring sizes the destination below what `toUint32Array`
-  // emits -- and that call takes no output-capacity argument, so it writes past the end. The
-  // record_count cross-check runs after both.
-  //
-  // The Puffin CRC does not establish trust: the file supplies it alongside the bytes it covers.
-  const char* validation_failure = nullptr;
-  if (!roaring::api::roaring_bitmap_internal_validate(&bitmap.roaring, &validation_failure)) {
-    throw std::runtime_error(
-      "roaring: inconsistent bitmap in the deletion vector: " +
-      std::string(validation_failure == nullptr ? "unknown reason" : validation_failure));
-  }
-
-  uint64_t const cardinality = bitmap.cardinality();
-  if (cardinality > max_out || out.size() > max_out - cardinality) {
-    throw std::runtime_error(
-      "roaring: decoded positions exceed the " + std::to_string(max_out) +
-      " this deletion vector declares; the blob is corrupt or was crafted to expand");
-  }
-
-  size_t const base = out.size();
-  out.resize(base + static_cast<size_t>(cardinality));
-  bitmap.toUint32Array(out.data() + base);
-  return bitmap_size;
-}
-
-// The deferred reader walks portable containers in place. CRoaring's size check is
-// allocation-free; values go straight into the charged int64 output, without a bitmap
-// object or uint32 staging vector. All container lengths/cardinalities are revalidated.
-size_t decode_roaring_charged(
-  uint8_t const* data, size_t len, int64_t high, std::span<int64_t> output, size_t& count)
+/// Walk one 32-bit portable-Roaring bitmap, validating its containers before
+/// materializing values through @p emit. Both eager and charged readers use this
+/// walker so they share the same format and corruption checks.
+template <typename Emit>
+size_t walk_roaring32(const uint8_t* data, size_t len, size_t max_out, Emit&& emit)
 {
   auto const consumed = roaring::api::roaring_bitmap_portable_deserialize_size(
     reinterpret_cast<char const*>(data), len);
@@ -280,7 +226,7 @@ size_t decode_roaring_charged(
   auto const* end = data + consumed;
   auto const* p   = data;
   auto take       = [&](size_t bytes) {
-    if (bytes > static_cast<size_t>(end - p)) fail("unknown reason");
+    if (bytes > static_cast<size_t>(end - p)) fail("container exceeds bitmap bounds");
     auto result = p;
     p += bytes;
     return result;
@@ -293,8 +239,6 @@ size_t decode_roaring_charged(
   if (!runs || containers >= 4) take(static_cast<size_t>(containers) * 4);
   auto const* payload = p;
 
-  // Match CRoaring's validation order before checking the output budget: keys, all
-  // containers, then bitmap cardinality. Keep validation allocation-free.
   for (uint32_t i = 1; i < containers; ++i)
     if (u16(headers + i * 4) <= u16(headers + (i - 1) * 4)) fail("keys not strictly increasing");
 
@@ -304,7 +248,11 @@ size_t decode_roaring_charged(
     for (uint32_t i = 0; i < containers; ++i) {
       auto key         = u16(headers + i * 4);
       auto cardinality = uint32_t(u16(headers + i * 4 + 2)) + 1;
-      auto append      = [&](uint32_t low) { output[count++] = high | (int64_t(key) << 16) | low; };
+      auto append      = [&](uint32_t low) {
+        if (total >= max_out) fail("decoded positions exceed the declared budget");
+        emit((uint32_t(key) << 16) | low);
+        ++total;
+      };
       if (run_bits && (run_bits[i / 8] & (1u << (i % 8)))) {
         auto n = u16(take(2));
         if (!n) fail("zero run count");
@@ -317,12 +265,12 @@ size_t decode_roaring_charged(
           if (first == previous_end && previous_end)
             fail("run start equal to last end, should have combined");
           previous_end = end;
-          total += end - first;
           if (materialize)
             for (uint32_t v = first; v < end; ++v)
               append(v);
+          else
+            total += end - first;
         }
-        // CRoaring derives run cardinality from the runs, not the stored header.
       } else if (cardinality <= 4096) {
         auto const* values = take(cardinality * 2);
         for (uint32_t j = 0; j < cardinality; ++j) {
@@ -331,7 +279,7 @@ size_t decode_roaring_charged(
             fail("array elements not strictly increasing");
           if (materialize) append(value);
         }
-        total += cardinality;
+        if (!materialize) total += cardinality;
       } else {
         auto const* words = take(8192);
         uint32_t actual   = 0;
@@ -346,18 +294,39 @@ size_t decode_roaring_charged(
             }
         }
         if (actual != cardinality) fail("cardinality is incorrect");
-        total += actual;
+        if (!materialize) total += actual;
       }
     }
     return total;
   };
+
   auto const cardinality = walk(false);
-  auto const remaining   = output.size() - count;
-  if (cardinality > remaining)
+  if (cardinality > max_out)
     throw std::runtime_error(
-      "roaring: decoded positions exceed the " + std::to_string(remaining) +
+      "roaring: decoded positions exceed the " + std::to_string(max_out) +
       " this deletion vector declares; the blob is corrupt or was crafted to expand");
   walk(true);
+  return consumed;
+}
+
+size_t deserialize_roaring32(const uint8_t* data,
+                             size_t data_len,
+                             std::vector<uint32_t>& out,
+                             size_t max_out)
+{
+  auto const base = out.size();
+  if (base > max_out)
+    throw std::runtime_error("roaring: decoded positions exceed the declared budget");
+  auto const consumed =
+    walk_roaring32(data, data_len, max_out - base, [&](uint32_t value) { out.push_back(value); });
+  return consumed;
+}
+
+size_t decode_roaring_charged(
+  const uint8_t* data, size_t len, int64_t high, std::span<int64_t> output, size_t& count)
+{
+  auto const consumed = walk_roaring32(
+    data, len, output.size() - count, [&](uint32_t value) { output[count++] = high | value; });
   return consumed;
 }
 
@@ -404,7 +373,8 @@ void parse_footer_descriptor(std::span<char> payload_bytes,
   yyjson_arr_foreach(blobs, idx, max, blob)
   {
     auto* offset = duckdb_yyjson::yyjson_obj_get(blob, "offset");
-    if (offset != nullptr && duckdb_yyjson::yyjson_get_sint(offset) == ref.content_offset) {
+    if (offset != nullptr && duckdb_yyjson::yyjson_is_int(offset) &&
+        duckdb_yyjson::yyjson_get_sint(offset) == ref.content_offset) {
       descriptor = blob;
       break;
     }
@@ -414,6 +384,15 @@ void parse_footer_descriptor(std::span<char> payload_bytes,
                              " in the footer of " + ref.puffin_path +
                              "; the manifest entry points into the middle of the file");
   }
+
+  auto const required_sint = [&](char const* field) -> int64_t {
+    auto* value = duckdb_yyjson::yyjson_obj_get(descriptor, field);
+    if (value == nullptr || !duckdb_yyjson::yyjson_is_int(value)) {
+      throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path +
+                               " has no integer '" + field + "'");
+    }
+    return duckdb_yyjson::yyjson_get_sint(value);
+  };
 
   auto const require = [&ref](char const* what, std::string_view got, std::string_view want) {
     if (got != want) {
@@ -428,8 +407,7 @@ void parse_footer_descriptor(std::span<char> payload_bytes,
   require(
     "type", type == nullptr ? std::string_view{} : std::string_view{type}, "deletion-vector-v1");
 
-  auto const length =
-    duckdb_yyjson::yyjson_get_sint(duckdb_yyjson::yyjson_obj_get(descriptor, "length"));
+  auto const length = required_sint("length");
   if (length != ref.content_size_in_bytes) {
     throw std::runtime_error("[puffin] Blob at offset " + std::to_string(ref.content_offset) +
                              " in " + ref.puffin_path + " is " + std::to_string(length) +
@@ -440,14 +418,10 @@ void parse_footer_descriptor(std::span<char> payload_bytes,
   // "Snapshot ID and sequence number are not known at the time the Puffin file is created", so the
   // spec fixes both at -1. A real value means the file was not written as a deletion vector.
   for (auto const* field : {"snapshot-id", "sequence-number"}) {
-    auto* val = duckdb_yyjson::yyjson_obj_get(descriptor, field);
-    if (val == nullptr) {
-      throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path + " has no '" +
-                               field + "'");
-    }
-    if (duckdb_yyjson::yyjson_get_sint(val) != -1) {
+    auto const value = required_sint(field);
+    if (value != -1) {
       throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path + " has " + field +
-                               "=" + std::to_string(duckdb_yyjson::yyjson_get_sint(val)) +
+                               "=" + std::to_string(value) +
                                ", but deletion-vector-v1 fixes it at -1");
     }
   }
@@ -505,18 +479,55 @@ void parse_footer_descriptor(std::span<char> payload_bytes,
   }
 }
 
-/// Reads the footer and returns the blob descriptor whose `offset` equals @p content_offset,
-/// checking every property the spec fixes for `deletion-vector-v1`.
-///
-/// The manifest and the footer are written by the same commit but are separate structures, so
-/// agreement between them is what proves the entry points at *its own* vector. The blob's magic
-/// and CRC only prove it is a well-formed vector — a wrong offset landing on a different valid
-/// vector passes both, and passes the cardinality check too whenever the two happen to be the
-/// same size.
-///
-/// Returns the offset of the footer's leading magic, i.e. the first byte past the blob region. The
-/// caller bounds the blob read against it: a manifest and footer are free to agree on a size that
-/// the FILE cannot hold, and believing them is a value-initialized allocation of whatever they say.
+/// Bounds discovered from a Puffin footer tail and its leading footer magic.
+struct puffin_footer_bounds {
+  std::streamoff start;
+  std::size_t payload_size;
+};
+
+template <typename Ref>
+puffin_footer_bounds read_footer_bounds(puffin_byte_source& f,
+                                        std::streamoff file_size,
+                                        Ref const& ref,
+                                        char const (&puffin_magic)[4])
+{
+  static constexpr std::streamoff kFooterTail = 12;
+  if (file_size < kFooterTail + 8) {
+    throw std::runtime_error("[puffin] File too small to hold a footer: " + ref.puffin_path);
+  }
+  if (!f.seek(file_size - kFooterTail))
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot seek to footer tail of " + ref.puffin_path);
+  uint8_t tail[kFooterTail];
+  if (!f.read(std::as_writable_bytes(std::span{tail})))
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read footer tail of " + ref.puffin_path);
+  auto const payload_size = static_cast<int32_t>(read_u32_le(tail));
+  if (payload_size < 0 || static_cast<std::streamoff>(payload_size) + kFooterTail + 4 > file_size)
+    throw std::runtime_error("[puffin] Footer payload size " + std::to_string(payload_size) +
+                             " does not fit in " + ref.puffin_path);
+  if ((tail[4] & 0x01u) != 0)
+    throw std::runtime_error("[puffin] Footer of " + ref.puffin_path +
+                             " is compressed, so its blob descriptors cannot be checked");
+  auto const footer_start = file_size - kFooterTail - payload_size - 4;
+  if (!f.seek(footer_start))
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot seek to footer magic of " + ref.puffin_path);
+  char magic[4];
+  if (!f.read(std::as_writable_bytes(std::span{magic})))
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read footer magic of " + ref.puffin_path);
+  if (std::memcmp(magic, puffin_magic, 4) != 0)
+    throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
+  return {footer_start, static_cast<std::size_t>(payload_size)};
+}
+
+/// Reads the footer payload and validates the blob descriptor whose `offset`
+/// equals @p content_offset, including all deletion-vector-v1 properties.
 template <typename Ref>
 std::streamoff validate_footer_descriptor(
   puffin_byte_source& f,
@@ -525,57 +536,14 @@ std::streamoff validate_footer_descriptor(
   char const (&puffin_magic)[4],
   sirius::scan_manager::charging_allocator* allocator = nullptr)
 {
-  // Footer = Magic | Payload | PayloadSize(4, LE) | Flags(4) | Magic
-  static constexpr std::streamoff kFooterTail = 12;  // PayloadSize + Flags + trailing Magic
-  if (file_size < kFooterTail + 8) {
-    throw std::runtime_error("[puffin] File too small to hold a footer: " + ref.puffin_path);
-  }
-
-  if (!f.seek(file_size - kFooterTail)) {
-    throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      "[puffin] Cannot seek to footer tail of " + ref.puffin_path);
-  }
-  uint8_t tail[kFooterTail];
-  if (!f.read(std::as_writable_bytes(std::span{tail}))) {
-    throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      "[puffin] Cannot read footer tail of " + ref.puffin_path);
-  }
-
-  auto const payload_size = static_cast<int32_t>(read_u32_le(tail));
-  if (payload_size < 0 || static_cast<std::streamoff>(payload_size) + kFooterTail + 4 > file_size) {
-    throw std::runtime_error("[puffin] Footer payload size " + std::to_string(payload_size) +
-                             " does not fit in " + ref.puffin_path);
-  }
-
-  // Bit 0 of the flags means the payload is LZ4-compressed. Nothing here can decompress it, and
-  // guessing would be worse than declining.
-  if ((tail[4] & 0x01u) != 0) {
-    throw std::runtime_error("[puffin] Footer of " + ref.puffin_path +
-                             " is compressed, so its blob descriptors cannot be checked");
-  }
-
-  auto const footer_start = file_size - kFooterTail - payload_size - 4;
-  if (!f.seek(footer_start)) {
-    throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      "[puffin] Cannot seek to footer magic of " + ref.puffin_path);
-  }
-  char magic[4];
-  if (!f.read(std::as_writable_bytes(std::span{magic}))) {
-    throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      "[puffin] Cannot read footer magic of " + ref.puffin_path);
-  }
-  if (std::memcmp(magic, puffin_magic, 4) != 0) {
-    throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
-  }
+  auto const bounds       = read_footer_bounds(f, file_size, ref, puffin_magic);
+  auto const footer_start = bounds.start;
+  auto const payload_size = bounds.payload_size;
 
   std::string legacy_payload;
   sirius::scan_manager::charged_block footer;
   duckdb_yyjson::yyjson_alc pool;
-  auto const size = static_cast<size_t>(payload_size);
+  auto const size = payload_size;
   char* payload;
   if (allocator) {
     // One allocation includes the JSON text and yyjson's documented maximum parser usage.
@@ -736,6 +704,28 @@ decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
 
   return result;
 }
+
+template <typename Ref>
+std::streamoff validate_puffin_container(puffin_byte_source& source,
+                                         Ref const& ref,
+                                         sirius::scan_manager::charging_allocator* allocator)
+{
+  static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
+  char magic[4];
+  if (!source.seek(0) || !source.read(std::as_writable_bytes(std::span{magic})) ||
+      std::memcmp(magic, kPuffinMagic, 4) != 0)
+    throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + ref.puffin_path);
+  auto const file_size = source.size();
+  if (file_size < 4 || !source.seek(file_size - 4) ||
+      !source.read(std::as_writable_bytes(std::span{magic})) ||
+      std::memcmp(magic, kPuffinMagic, 4) != 0)
+    throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + ref.puffin_path);
+  if (allocator && (ref.file_size_in_bytes < 0 || file_size > ref.file_size_in_bytes))
+    throw sirius::scan_manager::preparation_resource_error(
+      "Puffin container exceeds the lowering-time envelope", true);
+  return validate_footer_descriptor(source, file_size, ref, kPuffinMagic, allocator);
+}
+
 template <typename Ref>
 decoded_positions read_deletion_vector_impl(Ref const& ref,
                                             sirius::scan_manager::charging_allocator* allocator,
@@ -781,29 +771,7 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
         (local_view == puffin_path ? "" : " (from '" + puffin_path + "')"));
   }
 
-  // The blob's own magic and CRC below cannot catch a bare blob written with no container, so a
-  // wrong offset would silently yield wrong deletes. Check the framing first.
-  static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
-  char magic[4];
-  // A short leading/trailing magic read remains an input-format refusal, which
-  // preserves the legacy parser outcome. Footer and blob reads below classify
-  // short/error reads as reader_io with their site-specific text.
-  if (!source->seek(0) || !source->read(std::as_writable_bytes(std::span{magic})) ||
-      std::memcmp(magic, kPuffinMagic, 4) != 0) {
-    throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + puffin_path);
-  }
-  auto const file_size = source->size();
-  if (file_size < 4 || !source->seek(file_size - 4) ||
-      !source->read(std::as_writable_bytes(std::span{magic})) ||
-      std::memcmp(magic, kPuffinMagic, 4) != 0) {
-    throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + puffin_path);
-  }
-
-  if (allocator && (ref.file_size_in_bytes < 0 || file_size > ref.file_size_in_bytes))
-    throw sirius::scan_manager::preparation_resource_error(
-      "Puffin container exceeds the lowering-time envelope", true);
-  auto const footer_start =
-    validate_footer_descriptor(*source, file_size, ref, kPuffinMagic, allocator);
+  auto const footer_start = validate_puffin_container(*source, ref, allocator);
 
   // The blob must lie entirely between the leading magic and the footer. Both bounds are compared
   // by SUBTRACTION against a length the file actually has: `content_offset + content_size` is a
