@@ -57,6 +57,42 @@ mod ffi {
             out_stream_addr: usize,
         ) -> Result<()>;
 
+        /// Receives batches straight into a Context's GPU slab. Callable from any
+        /// thread; the contract of every method is documented on the C++ class.
+        type DirectExchange;
+
+        /// This context's direct exchange, or null unless it has one GPU memory
+        /// space using `allocator: slab`.
+        fn direct_exchange(self: &Context) -> UniquePtr<DirectExchange>;
+
+        /// CUDA device of the slab.
+        fn device(self: &DirectExchange) -> i32;
+
+        /// Device address of the slab.
+        fn region_base(self: &DirectExchange) -> usize;
+
+        /// Length of the slab in bytes.
+        fn region_len(self: &DirectExchange) -> u64;
+
+        /// Allocate buffers for a sender's layout and set `token` to them.
+        /// Returns `[address, length]` per buffer.
+        ///
+        /// # Safety
+        /// `layout_addr` must point at `layout_len` readable bytes that outlive
+        /// this call. The safe wrapper upholds this.
+        unsafe fn allocate(
+            self: &DirectExchange,
+            layout_addr: usize,
+            layout_len: usize,
+            token: &mut u64,
+        ) -> Result<UniquePtr<CxxVector<u64>>>;
+
+        /// Free what `token` holds. Unknown and consumed tokens are ignored.
+        fn release(self: &DirectExchange, token: u64) -> Result<()>;
+
+        /// Tokens neither released nor consumed.
+        fn outstanding(self: &DirectExchange) -> Result<usize>;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches) or none (a result fragment, which produces Arrow). The
@@ -116,6 +152,20 @@ mod ffi {
             sender_id: u32,
         ) -> Result<usize>;
 
+        /// Export the next batch with rows parked on an output stream: sets
+        /// `token`, `rows` and `src` (`[address, length]` per buffer) and returns
+        /// the layout, or null once the stream is drained.
+        fn export_direct(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            token: &mut u64,
+            rows: &mut u64,
+            src: Pin<&mut CxxVector<u64>>,
+        ) -> Result<UniquePtr<CxxVector<u8>>>;
+
+        /// Push the batch received under `token` into an input stream.
+        fn push_received(self: Pin<&mut Fragment>, stream_id: u64, token: u64) -> Result<()>;
+
         /// Close `sender_id` on input stream `stream_id`, for a sender that is
         /// not a local fragment.
         fn close_input(self: Pin<&mut Fragment>, stream_id: u64, sender_id: u32) -> Result<()>;
@@ -144,5 +194,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    Context, Fragment, make_context, make_context_from_config, make_fragment, stream_view_name,
+    Context, DirectExchange, Fragment, make_context, make_context_from_config, make_fragment,
+    stream_view_name,
 };

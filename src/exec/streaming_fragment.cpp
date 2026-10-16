@@ -16,6 +16,7 @@
 
 #include "exec/streaming_fragment.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_result_collector.hpp"
@@ -26,6 +27,7 @@
 #include "sirius_interface.hpp"  // sirius_prepared_statement_data
 
 #include <cudf/types.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <duckdb/main/query_result.hpp>
 
@@ -105,6 +107,29 @@ duckdb::SiriusContext& sirius_context_of(duckdb::ClientContext& context)
       "streaming_fragment: Sirius is not registered on this connection");
   }
   return *sirius_ctx;
+}
+
+void check_pushed_columns(const stream_input_spec& declared,
+                          const cudf::table_view& view,
+                          stream_id_t id)
+{
+  if (static_cast<std::size_t>(view.num_columns()) != declared.types.size()) {
+    throw sirius::invalid_input_exception(
+      "streaming_fragment: a batch pushed into stream " + std::to_string(id) + " carries " +
+      std::to_string(view.num_columns()) + " columns but the stream declares " +
+      std::to_string(declared.types.size()));
+  }
+  for (std::size_t i = 0; i < declared.types.size(); ++i) {
+    const auto expected = sirius::get_cudf_type(declared.types[i]);
+    const auto actual   = view.column(static_cast<cudf::size_type>(i)).type();
+    if (actual != expected) {
+      throw sirius::invalid_input_exception(
+        "streaming_fragment: a batch pushed into stream " + std::to_string(id) + " column " +
+        std::to_string(i) + " (" + declared.names[i] + ") is declared " +
+        declared.types[i].to_string() + " (" + cudf::type_to_name(expected) + ") but carries " +
+        cudf::type_to_name(actual));
+    }
+  }
 }
 
 }  // namespace
@@ -388,13 +413,8 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
       "QueryResult via take_result(), not a relayable stream");
   }
 
-  auto declared_it = _spec.inputs.find(input_stream_id);
-  if (declared_it == _spec.inputs.end()) {
-    throw sirius::invalid_input_exception("streaming_fragment: relay target input stream " +
-                                          std::to_string(input_stream_id) +
-                                          " was never declared on this fragment");
-  }
-  const auto& declared_senders = declared_it->second.expected_senders;
+  const auto& declared_input   = input_spec(input_stream_id);
+  const auto& declared_senders = declared_input.expected_senders;
   if (!declared_senders.empty() && declared_senders.count(sender_id) == 0) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: sender " + std::to_string(sender_id) +
@@ -402,7 +422,7 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
   }
 
   {
-    const auto& declared = declared_it->second.types;
+    const auto& declared = declared_input.types;
     const auto& produced = source.sink_types();
     if (produced.size() != declared.size()) {
       throw sirius::invalid_input_exception(
@@ -431,6 +451,39 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
   }
   _session.close_input(input_stream_id, sender_id);
   return moved;
+}
+
+void streaming_fragment::require_pushable(stream_id_t id) const
+{
+  require_built("push()");
+  if (_phase != phase::built) {
+    throw sirius::invalid_input_exception(
+      "streaming_fragment: push() must run before this fragment's run()");
+  }
+  static_cast<void>(input_spec(id));
+}
+
+bool streaming_fragment::push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch)
+{
+  require_pushable(id);
+  {
+    // Held only for the check: the shared lock must be released on this thread.
+    auto const read_only = batch->to_read_only();
+    if (read_only.get_current_tier() == cucascade::memory::Tier::GPU) {
+      check_pushed_columns(input_spec(id), get_cudf_table_view(read_only), id);
+    }
+  }
+  return _session.push(id, std::move(batch));
+}
+
+const stream_input_spec& streaming_fragment::input_spec(stream_id_t id) const
+{
+  auto it = _spec.inputs.find(id);
+  if (it == _spec.inputs.end()) {
+    throw sirius::invalid_input_exception("streaming_fragment: input stream " + std::to_string(id) +
+                                          " was never declared on this fragment");
+  }
+  return it->second;
 }
 
 void streaming_fragment::close_input(stream_id_t id, sender_id_t sender)

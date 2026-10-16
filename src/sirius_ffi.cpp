@@ -19,6 +19,7 @@
 
 #include "config.hpp"                                    // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                  // duckdb::CoreFunctionsExtension
+#include "data/data_batch_utils.hpp"                     // sirius::make_data_batch
 #include "data/sirius_converter_registry.hpp"            // sirius::converter_registry
 #include "duckdb/common/enums/optimizer_type.hpp"        // duckdb::OptimizerType
 #include "duckdb/execution/column_binding_resolver.hpp"  // duckdb::ColumnBindingResolver
@@ -34,17 +35,21 @@
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
 #include "exec/arrow_result_stream.hpp"
-#include "exec/stream_bind_catalog.hpp"   // sirius::exec::stream_bind_catalog
-#include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
-#include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
-#include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
-#include "helper/type_conversions.hpp"    // sirius::from_duckdb
-#include "log/logging.hpp"                // SIRIUS_LOG_INFO
-#include "parquet_extension.hpp"          // duckdb::ParquetExtension
+#include "exec/exchange_direct.hpp"         // sirius::exec::direct_exchange
+#include "exec/stream_bind_catalog.hpp"     // sirius::exec::stream_bind_catalog
+#include "exec/stream_plan_bindings.hpp"    // sirius::exec::register_stream_source_function
+#include "exec/streaming_fragment.hpp"      // sirius::exec::streaming_fragment, fragment_spec
+#include "from_substrait.hpp"               // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "helper/type_conversions.hpp"      // sirius::from_duckdb
+#include "log/logging.hpp"                  // SIRIUS_LOG_INFO
+#include "memory/slab_memory_resource.hpp"  // sirius::memory::find_slab
+#include "parquet_extension.hpp"            // duckdb::ParquetExtension
 #include "planner/unsupported_optimizers.hpp"
 #include "sirius/ffi.hpp"
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
+
+#include <rmm/cuda_device.hpp>
 
 #include <chrono>
 #include <cstdlib>
@@ -162,12 +167,38 @@ struct Context::Impl {
   duckdb::unique_ptr<duckdb::Connection> conn;
   // Serializes transactions on `conn`; see in_transaction().
   std::mutex conn_mutex;
+  // Shared with every DirectExchange handle, which may outlive this Context.
+  std::shared_ptr<sirius::exec::direct_exchange> exchange;
+
+  // Frees the exchange's buffers while the memory space they come from still exists.
+  ~Impl()
+  {
+    if (exchange) { exchange->close(); }
+  }
+
+  sirius::exec::direct_exchange& require_exchange() const
+  {
+    if (!exchange) {
+      throw sirius::invalid_input_exception(
+        "Fragment: direct exchange requires a single GPU memory space with allocator: slab");
+    }
+    return *exchange;
+  }
 
   void bring_up(const sirius::parsed_sirius_config& config)
   {
     install_log_sink_from_env();
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
+    auto& memory    = context->get_memory_manager();
+    auto const gpus = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    if (gpus.size() == 1) {
+      if (auto slab = sirius::memory::find_slab(*gpus.front())) {
+        exchange = std::make_shared<sirius::exec::direct_exchange>(
+          *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id()),
+          std::move(*slab));
+      }
+    }
 
     // Substrait lowering uses core functions and resolves local_files reads to parquet_scan.
     db = duckdb::make_uniq<duckdb::DuckDB>(nullptr);
@@ -268,6 +299,38 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   sirius::exec::export_arrow_result(
     std::move(result), *reinterpret_cast<ArrowArrayStream*>(out_stream_addr), kArrowBatchSize);
 }
+
+std::unique_ptr<DirectExchange> Context::direct_exchange() const
+{
+  if (!impl_->exchange) { return nullptr; }
+  // Not make_unique: the constructor is private to Context.
+  return std::unique_ptr<DirectExchange>(new DirectExchange(impl_->exchange));
+}
+
+DirectExchange::DirectExchange(std::shared_ptr<sirius::exec::direct_exchange> exchange)
+  : exchange_(std::move(exchange))
+{
+}
+
+int DirectExchange::device() const noexcept { return exchange_->region().device; }
+
+std::uintptr_t DirectExchange::region_base() const noexcept { return exchange_->region().base; }
+
+std::uint64_t DirectExchange::region_len() const noexcept { return exchange_->region().len; }
+
+std::unique_ptr<std::vector<std::uint64_t>> DirectExchange::allocate(std::uintptr_t layout_addr,
+                                                                     std::size_t layout_len,
+                                                                     std::uint64_t& token) const
+{
+  auto [allocated, dst] =
+    exchange_->allocate({reinterpret_cast<const std::uint8_t*>(layout_addr), layout_len});
+  token = allocated;
+  return std::make_unique<std::vector<std::uint64_t>>(std::move(dst));
+}
+
+void DirectExchange::release(std::uint64_t token) const { exchange_->release(token); }
+
+std::size_t DirectExchange::outstanding() const { return exchange_->outstanding(); }
 
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 
@@ -459,6 +522,43 @@ std::size_t Fragment::relay_from(Fragment& source,
   }
   return impl_->fragment->relay_from(
     *source.impl_->fragment, source_stream_id, input_stream_id, sender_id);
+}
+
+std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_direct(std::uint64_t stream_id,
+                                                                   std::uint64_t& token,
+                                                                   std::uint64_t& rows,
+                                                                   std::vector<std::uint64_t>& src)
+{
+  impl_->require_built("export_direct()");
+  auto& exchange = impl_->ctx.require_exchange();
+  while (auto batch = impl_->fragment->pull(stream_id)) {
+    if (auto exported = exchange.export_batch(std::move(*batch))) {
+      token = exported->token;
+      rows  = exported->rows;
+      src   = std::move(exported->src);
+      return std::make_unique<std::vector<std::uint8_t>>(std::move(exported->layout));
+    }
+  }
+  return nullptr;
+}
+
+void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)
+{
+  impl_->require_built("push_received()");
+  auto& exchange = impl_->ctx.require_exchange();
+  // The batch's writer event is created on the current device and recorded on a slab stream, and
+  // the table is freed into the slab, so both happen on the slab's device.
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{exchange.region().device}};
+  // Refuses an undeclared input or a running fragment before the token is consumed.
+  impl_->fragment->require_pushable(stream_id);
+  auto table = exchange.take(token);
+  auto& gpu  = exchange.space();
+  auto batch = sirius::make_data_batch(
+    std::move(table), gpu, gpu.acquire_stream(), telemetry::batch_telemetry_info{});
+  if (!impl_->fragment->push(stream_id, std::move(batch))) {
+    throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
+                                          " refused a received batch; it had already ended");
+  }
 }
 
 void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)

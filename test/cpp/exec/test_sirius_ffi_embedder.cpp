@@ -14,16 +14,19 @@
  * limitations under the License.
  */
 
-// Public sirius::ffi Context and Fragment methods only.
+// Public sirius::ffi Context, Fragment and DirectExchange methods only.
 // Builds Substrait in the test because the FFI has no SQL helper.
 // Covers a result fragment, a relay_from chain, several fragments built before any runs (on one
 // and on two threads), build() and run()/drop on different threads, drop after build(), a build()
-// that fails after setup, and execute_substrait. Spec errors and failed-build rollback live in
-// test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
+// that fails after setup, execute_substrait, and a direct exchange round trip. Spec errors and
+// failed-build rollback live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
 
+#include "exec/exchange_direct.hpp"
 #include "sirius/exception.hpp"
 #include "sirius/ffi.hpp"
 #include "utils/parquet_fixture_utils.hpp"
+
+#include <cuda_runtime_api.h>
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -32,6 +35,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <source_location>
@@ -365,4 +369,163 @@ TEST_CASE("FFI concurrent run() and execute_substrait on one Context wait for ea
   REQUIRE(result_i64s(*first) == expected);
   REQUIRE(result_i64s(*second) == expected);
   REQUIRE(collect_i64_column(direct) == expected);
+}
+
+namespace {
+
+/// A one-GPU config whose GPU space uses the slab allocator.
+std::string write_slab_config(sirius::test::scratch_dir& scratch)
+{
+  auto const config = scratch.file("slab.yaml");
+  std::ofstream(config) << "sirius:\n"
+                           "  topology:\n"
+                           "    num_gpus: 1\n"
+                           "  space:\n"
+                           "    gpu:\n"
+                           "      - device_id: 0\n"
+                           "        memory_capacity: 2147483648\n"
+                           "        allocator: slab\n"
+                           "    host:\n"
+                           "      - numa_id: 0\n"
+                           "        memory_capacity: 4294967296\n";
+  return config;
+}
+
+/// Allocates buffers for one BIGINT row on @p exchange, returning their token.
+std::uint64_t allocate_bigint_row(sirius::ffi::DirectExchange const& exchange)
+{
+  auto const layout =
+    sirius::exec::encode_layout({1, {{cudf::data_type{cudf::type_id::INT64}, 0, false}}});
+  std::uint64_t token = 0;
+  exchange.allocate(reinterpret_cast<std::uintptr_t>(layout.data()), layout.size(), token);
+  return token;
+}
+
+}  // namespace
+
+TEST_CASE("FFI direct exchange needs the slab allocator", "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_no_slab");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  CHECK(ctx->direct_exchange() == nullptr);
+
+  auto sender = sirius::ffi::make_fragment(*ctx);
+  sender->declare_output(0);
+  sender->build(local_files_plan(path));
+  sender->run();
+  std::uint64_t token = 0;
+  std::uint64_t rows  = 0;
+  std::vector<std::uint64_t> src;
+  CHECK_THROWS_WITH(sender->export_direct(0, token, rows, src),
+                    Catch::Matchers::ContainsSubstring("allocator: slab"));
+
+  auto receiver = sirius::ffi::make_fragment(*ctx);
+  receiver->declare_input_column(0, "a", "BIGINT");
+  receiver->build(stream_read_plan(0));
+  CHECK_THROWS_WITH(receiver->push_received(0, 1),
+                    Catch::Matchers::ContainsSubstring("allocator: slab"));
+}
+
+TEST_CASE("FFI DirectExchange refuses every call but the region after its Context is gone",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_exchange_outlives_context");
+  auto ctx      = sirius::ffi::make_context_from_config(write_slab_config(scratch));
+  auto exchange = ctx->direct_exchange();
+  REQUIRE(exchange != nullptr);
+  auto const token = allocate_bigint_row(*exchange);
+  auto const base  = exchange->region_base();
+  auto const len   = exchange->region_len();
+
+  ctx.reset();
+  CHECK(exchange->device() == 0);
+  CHECK(exchange->region_base() == base);
+  CHECK(exchange->region_len() == len);
+  auto const closed = Catch::Matchers::ContainsSubstring("already closed");
+  CHECK_THROWS_WITH(allocate_bigint_row(*exchange), closed);
+  CHECK_THROWS_WITH(exchange->release(token), closed);
+  CHECK_THROWS_WITH(exchange->outstanding(), closed);
+}
+
+TEST_CASE("FFI direct exchange delivers what relay_from does", "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_direct_exchange");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+  auto ctx      = sirius::ffi::make_context_from_config(write_slab_config(scratch));
+  auto exchange = ctx->direct_exchange();
+  REQUIRE(exchange != nullptr);
+
+  // Scans the parquet file into a receiver, `deliver` moving the scan's batches across.
+  auto const receive = [&](auto const& deliver) {
+    auto sender = sirius::ffi::make_fragment(*ctx);
+    sender->declare_output(0);
+    sender->build(local_files_plan(path));
+    sender->run();
+    auto receiver = sirius::ffi::make_fragment(*ctx);
+    receiver->declare_input_column(0, "a", "BIGINT");
+    receiver->build(stream_read_plan(0));
+    deliver(*sender, *receiver);
+    receiver->run();
+    return result_i64s(*receiver);
+  };
+  auto const relayed = receive(
+    [](auto& sender, auto& receiver) { REQUIRE(receiver.relay_from(sender, 0, 0, 0) > 0); });
+  auto const direct = receive([&](auto& sender, auto& receiver) {
+    std::uint64_t token = 0;
+    std::uint64_t rows  = 0;
+    std::vector<std::uint64_t> src;
+    while (auto const layout = sender.export_direct(0, token, rows, src)) {
+      std::uint64_t remote = 0;
+      auto const dst       = exchange->allocate(
+        reinterpret_cast<std::uintptr_t>(layout->data()), layout->size(), remote);
+      REQUIRE(dst->size() == src.size());
+      // Stands in for the transport's write.
+      for (std::size_t i = 0; i < src.size(); i += 2) {
+        REQUIRE((*dst)[i + 1] == src[i + 1]);
+        REQUIRE(cudaMemcpy(reinterpret_cast<void*>((*dst)[i]),
+                           reinterpret_cast<void const*>(src[i]),
+                           src[i + 1],
+                           cudaMemcpyDeviceToDevice) == cudaSuccess);
+      }
+      REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+      exchange->release(token);
+      receiver.push_received(0, remote);
+    }
+
+    auto const ints =
+      sirius::exec::encode_layout({1, {{cudf::data_type{cudf::type_id::INT32}, 0, false}}});
+    std::uint64_t mismatched = 0;
+    exchange->allocate(reinterpret_cast<std::uintptr_t>(ints.data()), ints.size(), mismatched);
+    CHECK_THROWS_WITH(receiver.push_received(0, mismatched),
+                      Catch::Matchers::ContainsSubstring("is declared BIGINT"));
+
+    // An undeclared input is refused before the token is read.
+    auto const late = allocate_bigint_row(*exchange);
+    CHECK_THROWS_WITH(receiver.push_received(99, late),
+                      Catch::Matchers::ContainsSubstring("never declared"));
+    CHECK(exchange->outstanding() == 1);
+    // An ended input refuses the batch, whose token is consumed.
+    receiver.close_input(0, 0);
+    CHECK_THROWS_WITH(receiver.push_received(0, late),
+                      Catch::Matchers::ContainsSubstring("already ended"));
+    CHECK(exchange->outstanding() == 0);
+  });
+  CHECK(direct == relayed);
+  CHECK(exchange->outstanding() == 0);
+
+  // A fragment that already ran refuses a push before the token is read.
+  auto ran = sirius::ffi::make_fragment(*ctx);
+  ran->declare_input_column(0, "a", "BIGINT");
+  ran->build(stream_read_plan(0));
+  ran->close_input(0, 0);
+  ran->run();
+  auto const token = allocate_bigint_row(*exchange);
+  CHECK_THROWS_WITH(ran->push_received(0, token),
+                    Catch::Matchers::ContainsSubstring("before this fragment's run()"));
+  CHECK(exchange->outstanding() == 1);
+  exchange->release(token);
+  CHECK(exchange->outstanding() == 0);
 }

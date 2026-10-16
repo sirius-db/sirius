@@ -120,6 +120,18 @@ class streaming_fragment {
                          stream_id_t input_stream_id,
                          sender_id_t sender_id);
 
+  /// Push one batch into input `id`, for batches that arrive from outside this process. Does not
+  /// close a sender. A batch on the GPU must carry the input's declared column types.
+  /// @return false when the input already ended; the batch is dropped.
+  /// @throws sirius::invalid_input_exception on what require_pushable() refuses, or on a batch
+  ///         whose columns differ from the declared ones.
+  [[nodiscard]] bool push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch);
+
+  /// Throws what push() refuses before it looks at the batch.
+  /// @throws sirius::invalid_input_exception before build(), after run() started, or on an
+  ///         undeclared input.
+  void require_pushable(stream_id_t id) const;
+
   /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
@@ -158,6 +170,9 @@ class streaming_fragment {
   enum class phase : std::uint8_t { declared, build_failed, built, running, ran, run_failed };
 
   void require_built(const char* what) const;
+  /// The declared spec of input `id`.
+  /// @throws sirius::invalid_input_exception on an undeclared input.
+  [[nodiscard]] const stream_input_spec& input_spec(stream_id_t id) const;
   duckdb::unique_ptr<op::sirius_physical_operator> make_streaming_sink(
     duckdb::unique_ptr<op::sirius_physical_operator> subtree);
   duckdb::unique_ptr<op::sirius_physical_operator> make_result_collector(
