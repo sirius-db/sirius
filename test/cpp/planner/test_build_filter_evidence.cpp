@@ -22,8 +22,12 @@
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
 
 #include <catch.hpp>
+#include <duckdb/function/aggregate/distributive_functions.hpp>
 #include <duckdb/function/table_function.hpp>
+#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/operator/logical_aggregate.hpp>
 #include <duckdb/planner/operator/logical_any_join.hpp>
@@ -75,6 +79,8 @@ duckdb::unique_ptr<duckdb::LogicalProjection> make_projection_over(
   auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(
     duckdb::TableIndex(/*table_index=*/7),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+  projection->expressions.push_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0));
   projection->children.push_back(std::move(child));
   return projection;
 }
@@ -103,6 +109,15 @@ duckdb::unique_ptr<duckdb::LogicalAggregate> make_aggregate_over(
     duckdb::TableIndex(/*aggregate_index=*/5),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
   aggregate->children.push_back(std::move(child));
+  return aggregate;
+}
+
+duckdb::unique_ptr<duckdb::LogicalAggregate> make_dedup_over(
+  duckdb::unique_ptr<duckdb::LogicalOperator> child)
+{
+  auto aggregate = make_aggregate_over(std::move(child));
+  aggregate->groups.push_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0));
   return aggregate;
 }
 
@@ -241,6 +256,103 @@ TEST_CASE("base-table builds carry no opaque fallback evidence", "[dynamic_filte
   REQUIRE_FALSE(build_relation_is_opaque(*make_get()));
   REQUIRE_FALSE(build_relation_is_opaque(*make_filtered_get()));
   REQUIRE_FALSE(build_relation_is_opaque(*make_projection_over(make_get())));
+  REQUIRE_FALSE(build_relation_is_opaque(*make_dedup_over(make_get())));
+  REQUIRE_FALSE(build_relation_is_opaque(*make_dedup_over(make_filtered_get())));
+}
+
+TEST_CASE("ordinary deduplication preserves opaque build evidence", "[dynamic_filter][evidence]")
+{
+  auto const cte_source = GENERATE(false, true);
+  duckdb::unique_ptr<duckdb::LogicalOperator> source =
+    cte_source ? duckdb::unique_ptr<duckdb::LogicalOperator>(make_cte_ref())
+               : duckdb::unique_ptr<duckdb::LogicalOperator>(make_delim_get());
+  auto aggregate = make_dedup_over(std::move(source));
+
+  SECTION("implicit ordinary grouping") { REQUIRE(build_relation_is_opaque(*aggregate)); }
+
+  SECTION("one complete grouping set")
+  {
+    aggregate->groups.push_back(aggregate->groups.front()->Copy());
+    aggregate->grouping_sets.push_back(
+      duckdb::GroupingSet{duckdb::ProjectionIndex(0), duckdb::ProjectionIndex(1)});
+    REQUIRE(build_relation_is_opaque(*aggregate));
+  }
+
+  SECTION("projections above and below deduplication")
+  {
+    aggregate->children.front() = make_projection_over(std::move(aggregate->children.front()));
+    REQUIRE(build_relation_is_opaque(*make_projection_over(std::move(aggregate))));
+  }
+
+  SECTION("nested deduplication")
+  {
+    REQUIRE(build_relation_is_opaque(*make_dedup_over(std::move(aggregate))));
+  }
+
+  SECTION("computed grouping keys")
+  {
+    auto expression = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
+      duckdb::ExpressionType::OPERATOR_IS_NULL, duckdb::LogicalType::BOOLEAN);
+    expression->GetChildrenMutable().push_back(std::move(aggregate->groups.front()));
+    aggregate->groups.front() = std::move(expression);
+    REQUIRE(build_relation_is_opaque(*aggregate));
+  }
+}
+
+TEST_CASE("aggregate outputs and grouping sets hide opaque build evidence",
+          "[dynamic_filter][evidence]")
+{
+  auto aggregate = make_dedup_over(make_cte_ref());
+
+  SECTION("global aggregation") { aggregate->groups.clear(); }
+
+  SECTION("aggregate output")
+  {
+    aggregate->expressions.push_back(duckdb::make_uniq<duckdb::BoundAggregateExpression>(
+      duckdb::BoundAggregateFunction(duckdb::CountStarFun::GetFunction()),
+      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+      nullptr,
+      nullptr,
+      duckdb::AggregateType::NON_DISTINCT));
+  }
+
+  SECTION("grouping function")
+  {
+    aggregate->grouping_functions.push_back({duckdb::ProjectionIndex(0)});
+  }
+
+  SECTION("empty grouping set") { aggregate->grouping_sets.push_back(duckdb::GroupingSet{}); }
+
+  SECTION("partial grouping set")
+  {
+    aggregate->groups.push_back(aggregate->groups.front()->Copy());
+    aggregate->grouping_sets.push_back(duckdb::GroupingSet{duckdb::ProjectionIndex(0)});
+  }
+
+  SECTION("out-of-range grouping index")
+  {
+    aggregate->grouping_sets.push_back(duckdb::GroupingSet{duckdb::ProjectionIndex(1)});
+  }
+
+  SECTION("multiple complete grouping sets")
+  {
+    aggregate->grouping_sets.push_back(duckdb::GroupingSet{duckdb::ProjectionIndex(0)});
+    aggregate->grouping_sets.push_back(duckdb::GroupingSet{duckdb::ProjectionIndex(0)});
+  }
+
+  REQUIRE_FALSE(build_relation_is_opaque(*aggregate));
+}
+
+TEST_CASE("malformed deduplication carries no opaque build evidence", "[dynamic_filter][evidence]")
+{
+  auto aggregate = make_dedup_over(make_cte_ref());
+
+  SECTION("no child") { aggregate->children.clear(); }
+  SECTION("null child") { aggregate->children.front().reset(); }
+  SECTION("multiple children") { aggregate->children.push_back(make_get()); }
+  SECTION("null grouping expression") { aggregate->groups.front().reset(); }
+
+  REQUIRE_FALSE(build_relation_is_opaque(*aggregate));
 }
 
 TEST_CASE("malformed projections carry no opaque fallback evidence", "[dynamic_filter][evidence]")
@@ -320,10 +432,10 @@ TEST_CASE("reducing operators are not opaque build roots", "[dynamic_filter][evi
   }
 }
 
-TEST_CASE("non-projection wrappers hide opaque leaves from the fallback classifier",
+TEST_CASE("other wrappers hide opaque leaves from the fallback classifier",
           "[dynamic_filter][evidence]")
 {
-  SECTION("an aggregate over a CTE_REF")
+  SECTION("a global aggregate over a CTE_REF")
   {
     REQUIRE_FALSE(build_relation_is_opaque(*make_aggregate_over(make_cte_ref())));
   }

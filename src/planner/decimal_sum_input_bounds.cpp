@@ -17,11 +17,11 @@
 #include "planner/decimal_sum_input_bounds.hpp"
 
 #include "expression/aggregate_id.hpp"
-#include "helper/logical_type.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "planner/scan_column_origin.hpp"
 
+#include <duckdb/common/types/hugeint.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
@@ -46,6 +46,15 @@ std::optional<std::uint64_t> unscaled_magnitude(duckdb::Value const& value)
     case duckdb::PhysicalType::INT16: return op::decimal_magnitude(value.GetValueUnsafe<int16_t>());
     case duckdb::PhysicalType::INT32: return op::decimal_magnitude(value.GetValueUnsafe<int32_t>());
     case duckdb::PhysicalType::INT64: return op::decimal_magnitude(value.GetValueUnsafe<int64_t>());
+    case duckdb::PhysicalType::INT128: {
+      // A bound beyond 64 bits proves nothing useful: such a column can be neither widened nor
+      // narrowed by it.
+      int64_t narrow = 0;
+      if (!duckdb::Hugeint::TryCast(value.GetValueUnsafe<duckdb::hugeint_t>(), narrow)) {
+        return std::nullopt;
+      }
+      return op::decimal_magnitude(narrow);
+    }
     default: return std::nullopt;
   }
 }
@@ -110,11 +119,8 @@ std::vector<std::optional<std::uint64_t>> resolve_decimal_sum_input_bounds(
     if (aggregate.GetChildren().size() != 1) { continue; }
     auto const& input = *aggregate.GetChildren()[0];
     auto const& type  = input.GetReturnType();
-    // Wider decimals already run as DECIMAL128 and are never widened.
-    if (type.id() != duckdb::LogicalTypeId::DECIMAL ||
-        duckdb::DecimalType::GetWidth(type) > sirius::logical_type::decimal_max_precision_int64) {
-      continue;
-    }
+    // DECIMAL32/64 inputs use the bound to skip widening; DECIMAL128 inputs use it to narrow.
+    if (type.id() != duckdb::LogicalTypeId::DECIMAL) { continue; }
     if (input.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
     auto const ordinal =
       static_cast<std::size_t>(input.Cast<duckdb::BoundReferenceExpression>().Index());

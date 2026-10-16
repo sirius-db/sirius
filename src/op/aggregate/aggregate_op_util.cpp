@@ -356,6 +356,105 @@ bool decimal_sum_may_overflow(cudf::data_type type, cudf::size_type num_rows, st
   return static_cast<unsigned __int128>(num_rows) * static_cast<unsigned __int128>(max_abs) > limit;
 }
 
+namespace {
+
+/// One SUM input column and its plan-time bound: the largest bound over the column's candidates, or
+/// nullopt once any candidate is unproven.
+struct column_bound {
+  int column;
+  std::optional<std::uint64_t> max_abs;
+};
+
+/// The candidates' columns in first-seen order, each with its combined bound.
+std::vector<column_bound> combine_candidate_bounds(
+  std::vector<decimal_sum_candidate> const& candidates)
+{
+  std::vector<column_bound> columns;
+  for (auto const& candidate : candidates) {
+    auto const known = std::ranges::find(columns, candidate.column, &column_bound::column);
+    if (known == columns.end()) {
+      columns.push_back({candidate.column, candidate.max_abs});
+    } else if (!known->max_abs || !candidate.max_abs) {
+      known->max_abs = std::nullopt;
+    } else {
+      known->max_abs = std::max(*known->max_abs, *candidate.max_abs);
+    }
+  }
+  return columns;
+}
+
+/// |v| of a 128-bit unscaled decimal value; the most negative value's 2^127 fits.
+constexpr unsigned __int128 decimal128_magnitude(__int128 v)
+{
+  auto const bits = static_cast<unsigned __int128>(v);
+  return v < 0 ? static_cast<unsigned __int128>(0) - bits : bits;
+}
+
+/// Whether a SUM of @p num_rows values of magnitude at most @p max_abs fits DECIMAL64 throughout.
+bool decimal_sum_fits_int64(cudf::size_type num_rows, unsigned __int128 max_abs)
+{
+  if (max_abs > static_cast<unsigned __int128>(std::numeric_limits<std::uint64_t>::max())) {
+    return false;
+  }
+  return !decimal_sum_may_overflow(
+    cudf::data_type{cudf::type_id::DECIMAL64}, num_rows, static_cast<std::uint64_t>(max_abs));
+}
+
+/// The DECIMAL128 columns among @p columns whose measured values let their SUM run over DECIMAL64.
+std::unordered_set<int> decimal128_sums_measured_narrow(cudf::table_view const& table,
+                                                        std::vector<int> const& columns,
+                                                        ::cuda::stream_ref stream,
+                                                        rmm::device_async_resource_ref mr)
+{
+  std::unordered_set<int> narrow;
+  // Per column, one slot {min (16 B), max (16 B), is_valid (8 B)}. The minmax scalars are copied
+  // into the slots on the stream, so the host waits for the device and copies back exactly once.
+  constexpr size_t value_bytes = sizeof(__int128);
+  constexpr size_t slot_bytes  = 2 * value_bytes + sizeof(int64_t);
+  rmm::device_buffer slots(columns.size() * slot_bytes, stream, mr);
+  CUDF_CUDA_TRY(cudaMemsetAsync(slots.data(), 0, slots.size(), stream.get()));
+  auto copy_to_slot = [&](size_t slot, size_t offset, void const* src, size_t bytes) {
+    auto* dst = static_cast<char*>(slots.data()) + slot * slot_bytes + offset;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream.get()));
+  };
+  // The scalars own the device memory read by the copies, so they live until the host copy ends.
+  std::vector<std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>>> extremes;
+  extremes.reserve(columns.size());
+  for (size_t i = 0; i < columns.size(); ++i) {
+    auto [lo, hi] = cudf::minmax(table.column(columns[i]), stream, mr);
+    using scalar  = cudf::fixed_point_scalar<numeric::decimal128>;
+    copy_to_slot(i, 0, static_cast<scalar&>(*lo).data(), value_bytes);
+    copy_to_slot(i, value_bytes, static_cast<scalar&>(*hi).data(), value_bytes);
+    copy_to_slot(i, 2 * value_bytes, lo->validity_data(), sizeof(bool));
+    extremes.emplace_back(std::move(lo), std::move(hi));
+  }
+  pinned_host_buffer host(slots.size(), stream);
+  CUDF_CUDA_TRY(
+    cudaMemcpyAsync(host.data(), slots.data(), slots.size(), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
+
+  auto const* bytes = reinterpret_cast<char const*>(host.data());
+  for (size_t i = 0; i < columns.size(); ++i) {
+    auto const* slot = bytes + i * slot_bytes;
+    bool is_valid    = false;
+    std::memcpy(&is_valid, slot + 2 * value_bytes, sizeof(bool));
+    // A column with no valid value sums to NULL in every group at any width.
+    if (!is_valid) {
+      narrow.insert(columns[i]);
+      continue;
+    }
+    __int128 lo_value;
+    __int128 hi_value;
+    std::memcpy(&lo_value, slot, value_bytes);
+    std::memcpy(&hi_value, slot + value_bytes, value_bytes);
+    auto const max_abs = std::max(decimal128_magnitude(lo_value), decimal128_magnitude(hi_value));
+    if (decimal_sum_fits_int64(table.num_rows(), max_abs)) { narrow.insert(columns[i]); }
+  }
+  return narrow;
+}
+
+}  // namespace
+
 std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
                                               std::vector<decimal_sum_candidate> const& candidates,
                                               ::cuda::stream_ref stream,
@@ -363,23 +462,8 @@ std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
 {
   std::unordered_set<int> widen;
   if (candidates.empty() || table.num_rows() == 0) { return widen; }
-  // Per column, in first-seen order: the largest bound over its candidates, or nullopt once any
-  // candidate is unproven.
-  std::vector<int> columns;
-  std::unordered_map<int, std::optional<std::uint64_t>> bound;
-  for (auto const& candidate : candidates) {
-    auto const [it, inserted] = bound.try_emplace(candidate.column, candidate.max_abs);
-    if (inserted) {
-      columns.push_back(candidate.column);
-    } else if (!it->second || !candidate.max_abs) {
-      it->second = std::nullopt;
-    } else {
-      it->second = std::max(*it->second, *candidate.max_abs);
-    }
-  }
   std::vector<int> measured;
-  for (int column : columns) {
-    auto const& max_abs = bound[column];
+  for (auto const& [column, max_abs] : combine_candidate_bounds(candidates)) {
     if (!max_abs) {
       measured.push_back(column);
     } else if (decimal_sum_may_overflow(table.column(column).type(), table.num_rows(), *max_abs)) {
@@ -390,6 +474,39 @@ std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
     widen.merge(decimal_sums_needing_widening(table, measured, stream, mr));
   }
   return widen;
+}
+
+std::optional<cudf::data_type> narrowed_decimal_sum_type(cudf::data_type type)
+{
+  if (type.id() != cudf::type_id::DECIMAL128) { return std::nullopt; }
+  return cudf::data_type(cudf::type_id::DECIMAL64, type.scale());
+}
+
+std::unordered_set<int> decimal_sums_to_narrow(cudf::table_view const& table,
+                                               std::vector<decimal_sum_candidate> const& candidates,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  for (auto const& candidate : candidates) {
+    if (!narrowed_decimal_sum_type(table.column(candidate.column).type())) {
+      throw sirius::internal_exception("decimal_sums_to_narrow: column {} is not DECIMAL128",
+                                       candidate.column);
+    }
+  }
+  std::unordered_set<int> narrow;
+  if (candidates.empty() || table.num_rows() == 0) { return narrow; }
+  std::vector<int> measured;
+  for (auto const& [column, max_abs] : combine_candidate_bounds(candidates)) {
+    if (!max_abs) {
+      measured.push_back(column);
+    } else if (decimal_sum_fits_int64(table.num_rows(), *max_abs)) {
+      narrow.insert(column);
+    }
+  }
+  if (!measured.empty()) {
+    narrow.merge(decimal128_sums_measured_narrow(table, measured, stream, mr));
+  }
+  return narrow;
 }
 
 }  // namespace op

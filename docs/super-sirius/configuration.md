@@ -113,7 +113,7 @@ sirius:
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     enable_runtime_size_estimation: false  # project total port input from upstream ratios
-    enable_decimal_sum_stats_bound: true  # decide decimal SUM widening from statistics at plan time
+    enable_decimal_sum_stats_bound: true  # decide decimal SUM width from statistics at plan time
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -571,7 +571,7 @@ individually.
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
-| `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input must be widened before aggregation. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
+| `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input must be widened before aggregation, or whether a DECIMAL128 SUM input can be summed as DECIMAL64. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -688,6 +688,20 @@ The task-creator, downgrade, and scan-manager pools support optional CPU affinit
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
 GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_manager`, which requires
 `> 2`.
+
+## DuckDB Settings Changed by Sirius
+
+Loading Sirius changes the database-wide default of one DuckDB setting. A session `SET` still wins, and a value the database already carries explicitly (from the connection config or a `SET GLOBAL` before `LOAD`) is left alone.
+
+| Setting | DuckDB default | Default with Sirius | Description |
+|---------|----------------|---------------------|-------------|
+| `delim_join_as_cte` | `true` | `false` | Whether DuckDB rewrites the delim joins it creates while decorrelating subqueries into materialized CTEs |
+
+DuckDB v2 rewrites decorrelated subqueries (correlated `EXISTS`, `NOT EXISTS`, `IN` and scalar subqueries) into materialized CTEs by default. Sirius does not yet plan those shapes well: at TPC-H SF1000, Q20, Q21 and Q22 ran 1.2-3.5x slower than with explicit delim joins, because Q21's `NOT EXISTS` became an anti join that hashes every late `lineitem` row and Q20/Q22 lost their dynamic filters behind mark joins. Sirius therefore keeps the explicit `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` plans. This is a stopgap until Sirius handles the CTE plan shapes, and DuckDB already marks the setting as deprecated, so it must be revisited when DuckDB removes it. To get DuckDB's CTE plans in one session:
+
+```sql
+SET delim_join_as_cte = true;
+```
 
 ## DuckDB SET Variables
 

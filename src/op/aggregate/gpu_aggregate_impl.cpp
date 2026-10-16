@@ -318,6 +318,26 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
       widened_sum_cols = decimal_sums_to_widen(input_table, candidates, stream, mr);
     }
   }
+  // A SUM over a DECIMAL128 column whose values in this batch provably keep every partial sum
+  // within 64 bits (see decimal_sums_to_narrow) is computed over the column narrowed to DECIMAL64,
+  // which cuDF aggregates much faster, and its result is widened back below. It uses the key column
+  // index + narrowed_sum_key_offset, which keeps it in a request of its own.
+  auto const narrowed_sum_key_offset = 2 * input_table.num_columns();
+  std::unordered_set<int> narrowed_sum_cols;
+  {
+    std::vector<decimal_sum_candidate> candidates;
+    for (size_t i = 0; i < aggregates.size(); ++i) {
+      bool const is_struct = has_struct_col_indices && !aggregate_struct_col_indices[i].empty();
+      if (is_struct || aggregates[i] != cudf::aggregation::Kind::SUM) { continue; }
+      auto const col_id = aggregate_idx[i];
+      if (!narrowed_decimal_sum_type(input_table.column(col_id).type())) { continue; }
+      candidates.push_back(
+        {col_id, i < aggregate_input_max_abs.size() ? aggregate_input_max_abs[i] : std::nullopt});
+    }
+    if (!candidates.empty()) {
+      narrowed_sum_cols = decimal_sums_to_narrow(input_table, candidates, stream, mr);
+    }
+  }
   // TODO: Deduplicate aggregation requests for compound aggregations.
   std::unordered_map<int, std::vector<std::unique_ptr<cudf::groupby_aggregation>>> input_col_to_agg;
   std::unordered_map<int, std::vector<size_t>> input_col_to_output_idx;
@@ -333,6 +353,9 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
       if (aggregate_kind == cudf::aggregation::Kind::SUM &&
           widened_sum_cols.contains(aggregate_col_id)) {
         aggregate_col_id += widened_sum_key_offset;
+      } else if (aggregate_kind == cudf::aggregation::Kind::SUM &&
+                 narrowed_sum_cols.contains(aggregate_col_id)) {
+        aggregate_col_id += narrowed_sum_key_offset;
       }
     }
     if (!input_col_to_agg.contains(aggregate_col_id)) {
@@ -383,6 +406,12 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
                                   memory_space.get_default_allocator());
       request.values = struct_col->view();
       temp_struct_cols.push_back(std::move(struct_col));
+    } else if (aggregate_col_id >= narrowed_sum_key_offset) {
+      auto const& col = input_table.column(aggregate_col_id - narrowed_sum_key_offset);
+      auto narrow_col = cudf::cast(
+        col, *narrowed_decimal_sum_type(col.type()), stream, memory_space.get_default_allocator());
+      request.values = narrow_col->view();
+      temp_struct_cols.push_back(std::move(narrow_col));
     } else if (aggregate_col_id >= widened_sum_key_offset) {
       auto const& col  = input_table.column(aggregate_col_id - widened_sum_key_offset);
       auto widened_col = cudf::cast(
@@ -484,6 +513,14 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
           aggregation_result.results[k] =
             cudf::cast(aggregation_result.results[k]->view(), *widened_type, stream, mr);
         }
+      }
+      // A narrowed SUM returns to the DECIMAL128 type of its input column.
+      if (requests[i].aggregations[k]->kind == cudf::aggregation::Kind::SUM &&
+          aggregate_col_id >= narrowed_sum_key_offset) {
+        auto const original_type =
+          input_table.column(aggregate_col_id - narrowed_sum_key_offset).type();
+        aggregation_result.results[k] =
+          cudf::cast(aggregation_result.results[k]->view(), original_type, stream, mr);
       }
       size_t output_col_id       = group_idx.size() + output_idx[j];
       output_cols[output_col_id] = std::move(aggregation_result.results[k]);
