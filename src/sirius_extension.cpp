@@ -88,6 +88,7 @@ extern "C" int cudaProfilerStop();
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -1238,11 +1239,39 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   if (compression_active) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
-      if (!entry.is_regular_file() || entry.path().stem() != data.args.name) continue;
+    for (fs::directory_iterator it(comp_cfg.input_plan_dir, ec), end; !ec && it != end;
+         it.increment(ec)) {
+      auto const& entry = *it;
+      if (entry.path().stem() != data.args.name) continue;
+      std::error_code status_error;
+      auto const status = entry.status(status_error);
+      if (status_error) {
+        SIRIUS_LOG_WARN("[pin_table] cannot inspect plan file '{}': {}",
+                        entry.path().string(),
+                        status_error.message());
+        continue;
+      }
+      if (!fs::is_regular_file(status)) continue;
       std::ifstream file(entry.path());
-      std::string dsl((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-      if (!dsl.empty()) plan_dsl = std::move(dsl);
+      if (!file.is_open()) {
+        SIRIUS_LOG_WARN("[pin_table] cannot open plan file '{}'", entry.path().string());
+        continue;
+      }
+      std::string dsl;
+      std::array<char, 4096> buffer;
+      while (file.read(buffer.data(), buffer.size()) || file.gcount() > 0) {
+        dsl.append(buffer.data(), static_cast<std::size_t>(file.gcount()));
+      }
+      // A partial read must not become a seemingly valid, truncated plan.
+      if (file.bad() || !file.eof()) {
+        SIRIUS_LOG_WARN("[pin_table] cannot read plan file '{}'", entry.path().string());
+        continue;
+      }
+      if (dsl.empty()) {
+        SIRIUS_LOG_WARN("[pin_table] plan file '{}' is empty", entry.path().string());
+        continue;
+      }
+      plan_dsl = std::move(dsl);
       break;
     }
     if (ec)
@@ -1280,7 +1309,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       }
     } else {
       SIRIUS_LOG_WARN(
-        "[pin_table] '{}': compression was requested but no plan file was found in '{}'; "
+        "[pin_table] '{}': compression was requested but no readable nonempty plan file was found "
+        "in '{}'; "
         "pinning uncompressed",
         data.args.name,
         comp_cfg.input_plan_dir);
