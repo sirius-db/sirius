@@ -2820,3 +2820,18 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   }
   require_parent_links(plan.get(), nullptr);
 }
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "limit has a full barrier before positional claims",
+                 "[plan_tree_shape][ordering][isolated_context]")
+{
+  auto plan   = generate_sirius_plan(*con, "SELECT * FROM big_left LIMIT 7 OFFSET 2");
+  auto* limit = find_first(plan.get(), SiriusPhysicalOperatorType::STREAMING_LIMIT);
+  REQUIRE(limit);
+  REQUIRE(limit->children.size() == 1);
+  auto* boundary = limit->children[0].get();
+  REQUIRE(boundary->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+  REQUIRE(boundary->is_sink());
+  REQUIRE(limit->is_source());
+  REQUIRE(limit->input_barrier_for(*boundary) == sirius::op::MemoryBarrierType::FULL);
+}
