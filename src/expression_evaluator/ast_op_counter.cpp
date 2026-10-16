@@ -42,7 +42,7 @@
 // `ast_op_count >= _min_ast_size` check.
 //
 // The method name carries the cuDF coupling: counts are tied to cuDF's
-// ast_operator set, supported_ast_cast_types, supported_ast_functions, and
+// ast_operator set, cast_lowers_to_cudf_ast, supported_ast_functions, and
 // known cuDF AST limitations (no CASE, no COALESCE, decimal-intermediate bug,
 // etc.). A new AST backend would need its own equivalent method, not a
 // generic rename.
@@ -85,14 +85,16 @@ std::size_t between::cudf_ast_op_count() const
   return 3 + input->cudf_ast_op_count() + lower->cudf_ast_op_count() + upper->cudf_ast_op_count();
 }
 
+bool cast::lowers_to_cudf_ast() const
+{
+  return kind == cast_kind::semantic &&
+         sirius::cast_lowers_to_cudf_ast(child->return_type().id(), target_type.id());
+}
+
 std::size_t cast::cudf_ast_op_count() const
 {
-  // Only target types in supported_ast_cast_types_native lower to a single
-  // CAST_TO_* cuDF AST op; others force materialize.
-  bool const supported = std::find(supported_ast_cast_types_native.begin(),
-                                   supported_ast_cast_types_native.end(),
-                                   target_type.id()) != supported_ast_cast_types_native.end();
-  return supported ? 1 + child->cudf_ast_op_count() : 0;
+  // Casts that do not lower to a single CAST_TO_* cuDF AST op force materialize.
+  return lowers_to_cudf_ast() ? 1 + child->cudf_ast_op_count() : 0;
 }
 
 std::size_t unary_op::cudf_ast_op_count() const
