@@ -55,8 +55,9 @@ namespace op {
  * STDDEV_SAMP maps to Kind::M2 as an internal marker for its count/mean/M2 STRUCT.
  * The local executor expands the marker into three cuDF aggregations and packs their results.
  *
- * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg`
- * (decomposes into SUM + COUNT_VALID) and `first` (NTH_ELEMENT, handled by the caller).
+ * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg` (decomposes
+ * into SUM + COUNT_VALID) and `first` (a carried column in the grouped aggregate, NTH_ELEMENT in
+ * the ungrouped one).
  */
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
 
@@ -186,13 +187,21 @@ struct stddev_samp_slot {
   std::size_t partial_idx{};  ///< Index in cudf_aggregates
 };
 
+/** @brief FIRST: no cuDF request; child column `input_idx` is carried at `carried_idx`. */
+struct first_slot {
+  int input_idx{-1};          ///< Child column whose value this slot carries
+  std::size_t carried_idx{};  ///< Position in the carried block that follows the partials
+};
+
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded
- * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), all others use one.
- * STDDEV_SAMP uses a count/mean/M2 STRUCT identified by Kind::M2 and finalizes after merge.
- * COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then counts list elements.
+ * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two entries), FIRST uses none,
+ * all others use one. STDDEV_SAMP uses a count/mean/M2 STRUCT identified by Kind::M2 and finalizes
+ * after merge. COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then counts
+ * list elements.
  */
-using AggregateSlot = std::variant<plain_slot, avg_slot, count_distinct_slot, stddev_samp_slot>;
+using AggregateSlot =
+  std::variant<plain_slot, avg_slot, count_distinct_slot, stddev_samp_slot, first_slot>;
 
 /**
  * @brief Result of converting DuckDB aggregate expressions to cuDF compute definitions.
@@ -208,12 +217,16 @@ struct CudfAggregateDefinitions {
   /// cudf_aggregates; empty entries mean single-column (use cudf_aggregate_idx directly).
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
 
-  /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions.
+  /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions or,
+  /// for a FIRST, to its carried column.
   std::vector<AggregateSlot> aggregate_slots;
-  /// Runtime partial schema: group keys followed by expanded aggregate carriers.
+  /// Runtime partial schema: group keys, expanded aggregate carriers, then the FIRST carried
+  /// columns.
   duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;  ///< True if any aggregate is AVG
   bool has_count_distinct = false;  ///< True if any aggregate is COUNT(DISTINCT col)
+  /// True if any aggregate is FIRST. Presence only; each FIRST is a column of the carried block.
+  bool has_first = false;
 };
 
 /// Parallel to a cudf_aggregates vector of @p num_cudf_aggregates entries: true at the SUM entry
@@ -237,6 +250,14 @@ std::vector<bool> wide_integer_sum_mask(std::vector<AggregateSlot> const& slots,
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
+
+/**
+ * @brief Child column read by each FIRST slot, indexed by its `carried_idx`
+ *
+ * @param aggregate_slots One entry per aggregate expression
+ * @return The columns a grouped aggregate carries after its partials, in carried-block order
+ */
+std::vector<int> carried_inputs(std::vector<AggregateSlot> const& aggregate_slots);
 
 /**
  * @brief Whether every slot in @p aggregate_slots holds a `plain_slot`

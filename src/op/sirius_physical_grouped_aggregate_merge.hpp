@@ -34,6 +34,7 @@
 
 #include <memory>
 #include <numeric>
+#include <variant>
 
 namespace sirius {
 namespace planner {
@@ -60,6 +61,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     std::vector<AggregateSlot> aggregate_slots,
     bool has_avg,
     bool has_count_distinct,
+    bool has_first,
     std::size_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate_merge(
@@ -89,10 +91,11 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::vector<int> cudf_aggregate_idx;
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
 
-  // AVG and COUNT DISTINCT decomposition metadata
+  // AVG, COUNT DISTINCT and FIRST slot metadata
   std::vector<AggregateSlot> aggregate_slots;
   bool has_avg            = false;
   bool has_count_distinct = false;
+  bool has_first          = false;
 
   /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG.
   /// Derived from aggregate_slots (wide_integer_sum_mask).
@@ -117,6 +120,25 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     std::vector<int> indices(num_output_group_columns());
     std::iota(indices.begin(), indices.end(), 0);
     return indices;
+  }
+
+  //! Whether the partial layout [keys..., partials..., carried...] is already the declared output:
+  //! only plain and FIRST slots, every FIRST after every plain slot, each block in slot order.
+  [[nodiscard]] bool partials_are_output() const noexcept
+  {
+    if (has_avg || has_count_distinct) { return false; }
+    std::size_t plain_count = 0;
+    std::size_t first_count = 0;
+    for (auto const& slot : aggregate_slots) {
+      if (auto const* plain = std::get_if<plain_slot>(&slot)) {
+        if (first_count > 0 || plain->partial_idx != plain_count++) { return false; }
+      } else if (auto const* first = std::get_if<first_slot>(&slot)) {
+        if (first->carried_idx != first_count++) { return false; }
+      } else {
+        return false;
+      }
+    }
+    return plain_count == cudf_aggregates.size();
   }
 
   // Source interface

@@ -99,6 +99,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
                                             grouped_aggregate->aggregate_slots,
                                             grouped_aggregate->has_avg,
                                             grouped_aggregate->has_count_distinct,
+                                            grouped_aggregate->has_first,
                                             grouped_aggregate->estimated_cardinality)
 {
   child_op              = grouped_aggregate;
@@ -116,6 +117,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   std::vector<AggregateSlot> aggregate_slots,
   bool has_avg,
   bool has_count_distinct,
+  bool has_first,
   std::size_t estimated_cardinality)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
@@ -126,6 +128,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
     aggregate_slots(std::move(aggregate_slots)),
     has_avg(has_avg),
     has_count_distinct(has_count_distinct),
+    has_first(has_first),
     cudf_aggregate_is_wide_integer_sum(
       wide_integer_sum_mask(this->aggregate_slots, this->cudf_aggregates.size()))
 {
@@ -176,6 +179,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+  has_first                         = cudf_defs.has_first;
   cudf_aggregate_is_wide_integer_sum =
     wide_integer_sum_mask(aggregate_slots, cudf_aggregates.size());
 }
@@ -257,7 +261,6 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
 
-  bool const has_stddev     = has_slot<stddev_samp_slot>(aggregate_slots);
   auto const num_group_cols = static_cast<int>(num_output_group_columns());
   // A wide integer SUM that was accumulated over DECIMAL128 is narrowed back to its INT64 result
   // in the post-merge projection; one that stayed INT64 passes through.
@@ -271,7 +274,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   };
 
   // Fast path: single batch with no post-processing needed
-  if (input_batches.size() == 1 && !has_avg && !has_count_distinct && !has_stddev &&
+  if (input_batches.size() == 1 && partials_are_output() &&
       !has_widened_sum(get_cudf_table_view(input_batches[0]))) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
@@ -285,23 +288,25 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       stream,
       telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
   } else {
-    merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
-                                                     static_cast<int>(num_output_group_columns()),
-                                                     cudf_aggregates,
-                                                     stream,
-                                                     *input_batches[0].get_memory_space(),
-                                                     batch_telemetry(),
-                                                     cudf_aggregate_is_wide_integer_sum);
+    merged = gpu_merge_impl::merge_grouped_aggregate(
+      input_batches,
+      num_group_cols,
+      cudf_aggregates,
+      static_cast<int>(carried_inputs(aggregate_slots).size()),
+      stream,
+      *input_batches[0].get_memory_space(),
+      batch_telemetry(),
+      cudf_aggregate_is_wide_integer_sum);
   }
 
   // If no post-processing needed, return merged result directly
-  if (!has_avg && !has_count_distinct && !has_stddev &&
-      !has_widened_sum(get_cudf_table_view(merged->to_read_only()))) {
+  if (partials_are_output() && !has_widened_sum(get_cudf_table_view(merged->to_read_only()))) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }
 
-  // Post-merge projection: handle AVG (SUM/COUNT) and COUNT DISTINCT (list element count).
+  // Post-merge projection: handle AVG (SUM/COUNT), STDDEV_SAMP (finalized state), COUNT DISTINCT
+  // (list element count) and carried FIRST columns (moved into declared order).
   // Release ownership of the merged table's columns so we can move (not copy) them.
   // Acquire EXCLUSIVE lock since release_table() is a mutating operation
   auto merged_mut  = merged->to_mutable();
@@ -317,7 +322,9 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
     output_cols.push_back(std::move(merged_cols[i]));
   }
 
+  // Partials follow the keys, and the carried block follows the partials.
   auto const partials_begin = static_cast<std::size_t>(num_group_cols);
+  auto const carried_begin  = partials_begin + cudf_aggregates.size();
   auto const finalize       = cucascade::utils::overloaded{
     [&](plain_slot const& slot) {
       auto column = std::move(merged_cols[partials_begin + slot.partial_idx]);
@@ -361,6 +368,9 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
         cudf::lists_column_view(merged_cols[partials_begin + slot.partial_idx]->view());
       auto count_int32 = cudf::lists::count_elements(list_view, stream, mr);
       return cudf::cast(count_int32->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+    },
+    [&](first_slot const& slot) {
+      return std::move(merged_cols[carried_begin + slot.carried_idx]);
     },
   };
   for (auto const& slot : aggregate_slots) {

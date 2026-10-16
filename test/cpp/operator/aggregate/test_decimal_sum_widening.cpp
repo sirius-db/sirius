@@ -578,6 +578,7 @@ TEST_CASE("aggregate slots - an empty list is all plain and holds no kind", "[ag
   std::vector<AggregateSlot> const none;
   CHECK(all_slots_plain(none));
   CHECK_FALSE(has_slot<plain_slot>(none));
+  CHECK_FALSE(has_slot<sirius::op::first_slot>(none));
 }
 
 TEST_CASE("aggregate slots - a list of plain slots is all plain", "[aggregate][distinct]")
@@ -589,6 +590,7 @@ TEST_CASE("aggregate slots - a list of plain slots is all plain", "[aggregate][d
   CHECK_FALSE(has_slot<sirius::op::avg_slot>(plain));
   CHECK_FALSE(has_slot<sirius::op::count_distinct_slot>(plain));
   CHECK_FALSE(has_slot<sirius::op::stddev_samp_slot>(plain));
+  CHECK_FALSE(has_slot<sirius::op::first_slot>(plain));
 }
 
 TEST_CASE("aggregate slots - every kind but plain_slot makes a list non-plain",
@@ -606,6 +608,7 @@ TEST_CASE("aggregate slots - the wide integer SUM mask marks plain and AVG SUM e
   std::vector<AggregateSlot> const slots{
     plain_slot{.partial_idx = 0},
     plain_slot{.partial_idx = 1, .is_wide_integer_sum = true},
+    sirius::op::first_slot{.input_idx = 3, .carried_idx = 0},
     sirius::op::avg_slot{.sum_idx = 2, .is_wide_integer_sum = true},
     sirius::op::avg_slot{.sum_idx = 4}};
   CHECK(sirius::op::wide_integer_sum_mask(slots, 6) ==

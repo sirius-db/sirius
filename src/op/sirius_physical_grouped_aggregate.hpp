@@ -85,6 +85,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;
   bool has_count_distinct = false;
+  bool has_first          = false;
 
  public:
   /// Whether the aggregate computes several grouping sets or GROUPING() functions. The local
@@ -116,7 +117,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   //! Alternate carriers of the local output, for set_alternate_physical_types(): DECIMAL128 for
   //! the column of each wide integer SUM, whose partial is INT64 or, where the batch could
   //! overflow INT64, DECIMAL128. Empty when no SUM is wide or `types` is not one column per cuDF
-  //! aggregate after the group columns.
+  //! aggregate after the group columns, then the FIRST carried columns.
   [[nodiscard]] std::vector<std::optional<cudf::data_type>> wide_integer_sum_partial_types() const;
 
   // Source interface
