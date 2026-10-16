@@ -65,6 +65,7 @@ struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
 // result; throws if the CPU plan itself fails.
 // DuckDB v2 shares cancellation state between executors, but not their errors:
 // the outer query can report Interrupted before receiving the nested error (#2145).
+// The nested error is recorded on the connection, whose QueryEnd reports it instead.
 duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
   duckdb::ClientContext& client,
   duckdb::PreparedStatementData& cpu_prepared,
@@ -111,6 +112,16 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
     client_config.enable_profiler = saved_enable_profiler;
     return result;
   } catch (...) {
+    // Record the error before this task ends: DuckDB drains it before QueryEnd reads it.
+    if (executor.HasError()) {
+      try {
+        if (auto state = duckdb::get_sirius_connection_state(client)) {
+          state->record_cpu_replay_error(executor.GetError(), client.GetCurrentQuery());
+        }
+      } catch (...) {
+        // Recording is best effort; the replay's error still propagates below.
+      }
+    }
     // Drain any still-registered tasks before the executor is destroyed
     // (~Executor asserts executor_tasks == 0), then restore profiling.
     executor.CancelTasks();

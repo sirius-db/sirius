@@ -832,10 +832,16 @@ def time_query(con, qnum, query_sql, use_gpu, profile_path=None):
         con.execute("PRAGMA profiling_mode='detailed';")
         con.execute(f"PRAGMA profiling_output='{profile_path}';")
     log(f"  Executing q{qnum} on {engine_label}…")
+    # Time con.execute() only: it plans and runs the query to completion and materializes the
+    # result inside DuckDB. The rows for result.txt are fetched afterwards, because converting a
+    # large result into Python objects (Q11 at SF1000 returns ~937K rows) costs far more than
+    # executing the query and is not engine time. Both the DuckDB 1.5 and the v2 Python clients
+    # support execute() + fetchall(); the v2 client has no Arrow export on execute() results.
     start = time.perf_counter()
-    rows = con.execute(query_sql).fetchall()
+    result = con.execute(query_sql)
     elapsed = time.perf_counter() - start
-    log(f"  q{qnum} fetched {len(rows)} rows in {elapsed:.4f}s")
+    rows = result.fetchall()
+    log(f"  q{qnum} executed in {elapsed:.4f}s, fetched {len(rows)} rows")
     return elapsed, rows
 
 

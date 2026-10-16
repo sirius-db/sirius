@@ -22,7 +22,7 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 # Keep the generated protobuf stack on ProtoX and Prost 0.14.
 prost = "0.14"
 prost-build = "0.14"
-protox = "0.9"
+protox = "0.10"
 parquet = { version = "60", default-features = false, features = ["arrow", "async"] }
 heck = "0.5"
 prettyplease = "0.3.0"
@@ -32,7 +32,7 @@ syn = { version = "3", features = ["full", "parsing"] }
 substrait = { version = "0.65.0", features = ["protox"] }
 thiserror = "2"
 thrift = "0.25"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
