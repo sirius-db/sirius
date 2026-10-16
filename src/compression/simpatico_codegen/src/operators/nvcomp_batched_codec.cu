@@ -83,7 +83,7 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
     h_comp_ptrs[i] = static_cast<std::uint8_t*>(scratch.data()) + i * out_stride;
 
   std::size_t temp_bytes = 0;
-  check(ops.compress_get_temp_size(num_chunks, chunk, &temp_bytes, n_bytes),
+  check(ops.compress_get_temp_size(num_chunks, chunk, &temp_bytes, n_bytes, s),
         "compress_get_temp_size");
   rmm::device_buffer temp(temp_bytes, stream, mr);
 
@@ -159,7 +159,7 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
   // Header + sizes assembled on host, one H2D.
   std::vector<std::uint8_t> h_hdr(header, 0);
   std::uint64_t const nc = num_chunks;
-  std::uint64_t const cs = chunk;
+  std::uint64_t const cs = chunk | (std::uint64_t{ops.frame_format_version} << 56);
   std::memcpy(h_hdr.data(), &nc, sizeof(nc));
   std::memcpy(h_hdr.data() + 8, &cs, sizeof(cs));
   std::memcpy(h_hdr.data() + 16, h_comp_bytes.data(), num_chunks * sizeof(std::size_t));
@@ -202,8 +202,11 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
   throw_if_cuda_error(cudaMemcpyAsync(hdr, fbase, sizeof(hdr), cudaMemcpyDeviceToHost, s),
                       "D2H frame header");
   throw_if_cuda_error(cudaStreamSynchronize(s), "sync frame header");
+  if (hdr[1] >> 56 != ops.frame_format_version) {
+    throw std::runtime_error("nvcomp batched: incompatible frame format");
+  }
   std::size_t const num_chunks = static_cast<std::size_t>(hdr[0]);
-  std::size_t const chunk      = static_cast<std::size_t>(hdr[1]);
+  std::size_t const chunk      = static_cast<std::size_t>(hdr[1] & 0x00FFFFFFFFFFFFFFULL);
   if (num_chunks == 0 || chunk == 0) {
     throw std::runtime_error("nvcomp batched: corrupt frame header");
   }
@@ -274,7 +277,7 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
     "H2D uncomp ptrs");
 
   std::size_t temp_bytes = 0;
-  check(ops.decompress_get_temp_size(num_chunks, chunk, &temp_bytes, out_bytes),
+  check(ops.decompress_get_temp_size(num_chunks, chunk, &temp_bytes, out_bytes, s),
         "decompress_get_temp_size");
   rmm::device_buffer temp(temp_bytes, stream, mr);
 
