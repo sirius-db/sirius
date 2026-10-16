@@ -191,6 +191,7 @@ Applies a predicate expression to filter rows.
 
 - **GPU execution:** `expression_evaluator::select(batch)` — evaluates the boolean expression and compacts rows using cuDF filtering
 - **Key members:** `expression` (filter predicate)
+- **Batch ordering:** Tasks may execute in any order and forward the input batch position unchanged.
 
 ### `sirius_physical_projection` — `PROJECTION`
 **File:** `src/op/sirius_physical_projection.hpp`
@@ -204,15 +205,17 @@ Evaluates a list of expressions to produce output columns.
 
   Only the entries that need evaluation are passed to the expression evaluator (via its `std::vector<sirius::ast::node const*>` constructor). See [expression evaluator](expression-executor.md).
 - **Key members:** `select_list` (output expressions)
+- **Batch ordering:** Tasks may execute in any order and forward the input batch position unchanged.
 
 ### `sirius_physical_streaming_limit` — `STREAMING_LIMIT`
 **File:** `src/op/sirius_physical_limit.hpp`
 
-Implements LIMIT/OFFSET using atomic counters for parallel execution.
+Implements LIMIT/OFFSET with a FULL input barrier and serialized slice claims during task creation.
 
-- **Key members:** `_remaining_offset` (atomic), `_remaining_limit` (atomic), `_limit_exhausted` (atomic)
-- **Mechanism:** Each task atomically claims a portion of the remaining limit via `claim()`. When the limit is exhausted, the pipeline terminates early.
-- **Empty output:** A task whose input batches yield no rows emits one 0-row batch, like a scan of an empty table, so a downstream ungrouped aggregate still returns its row. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
+- **Key members:** `_remaining_offset` and `_remaining_limit` (`size_t` counters), guarded by `_claim_mutex`.
+- **Mechanism:** After the producer finishes, `get_next_task_input_data()` consumes ordered input by ascending existing position, or unordered input in FIFO order. It snapshots existing positions for ordered input, reads the batch row count with `get_batch_rows_and_bytes()`, and claims an immutable slice under `_claim_mutex`. Unknown row counts are errors. The resulting `limiting_operator_data` carries the slice and optional position; execution and retries apply that slice without claiming again.
+- **Completion:** Every input batch is consumed, including batches whose slice is empty after the limit is satisfied. Both ordered and unordered input wait for the complete producer output before LIMIT starts consuming it.
+- **Empty output:** Zero-row outputs retain their input position. A task whose input batches yield no rows emits one 0-row batch, like a scan of an empty table, so a downstream ungrouped aggregate still returns its row. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
 
 ## Blocking Operators
 
@@ -463,13 +466,16 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE �
 
 Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op`.
 
+Each range slice is published to its original repository partition, retaining indices even when
+intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
+
 ### `sirius_physical_merge_sort` — `MERGE_SORT`
 **File:** `src/op/sirius_physical_merge_sort.hpp`
 
 Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way merge via cuDF).
 
-- Custom `get_next_task_input_data()`: drains all batches from one partition per call
-- Tracks `_current_partition_index` atomically under mutex
+- Custom `get_next_task_input_data()`: drains all batches from the next nonempty range partition per call after the SORT_PARTITION producer finishes. Empty ranges are skipped.
+- Tracks `_current_partition_index` under a mutex and uses the range index as the merged output batch position.
 
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`
@@ -486,7 +492,7 @@ Merges ungrouped aggregate results from multiple partitions.
 ### `sirius_physical_top_n_merge` — `MERGE_TOP_N`
 **File:** `src/op/sirius_physical_top_n_merge.hpp`
 
-Merges local top-N results from multiple partitions.
+Merges local top-N results from multiple partitions. The final output batch is assigned position zero.
 
 ## CTE / Delim Join Operators
 
@@ -519,6 +525,9 @@ Base interface for operators that consume partitioned data. Provides `push_data_
 
 Final sink that materializes query results into a `ColumnDataCollection`. The GPU executor checks for this operator type to determine query completion.
 
+The materialized collector builds local collections in parallel. For positioned input, it combines
+them by ascending position in `get_result()`, independently of task completion order.
+
 ### `sirius_physical_empty_result` — `EMPTY_RESULT`
 **File:** `src/op/sirius_physical_empty_result.hpp`
 
@@ -536,7 +545,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
 | PROJECTION | Relational | `expression_evaluator::evaluate()` |
-| STREAMING_LIMIT | Relational | Atomic claim-based |
+| STREAMING_LIMIT | Relational | Serial slice claims after FULL input barrier |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |
 | SORT_SAMPLE | Sort | Sample + boundary computation |

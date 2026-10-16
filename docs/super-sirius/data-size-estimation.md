@@ -150,17 +150,14 @@ measured ratio extrapolates. A row limit breaks that. `STREAMING_LIMIT` makes ou
 output, and a ratio measured before the cap binds projects a total the pipeline will never reach.
 The error is worst exactly where the operator is most useful: `SELECT * FROM huge LIMIT 10`.
 
-It compounds. `sirius_pipeline::update_pipeline_status` treats `is_limit_exhausted()` as grounds to
-finish early *without draining the source*, so the pipeline stops consuming while
-`total_source_input_bytes` still reports the whole table. The scan itself is never told to stop —
-no split is skipped and the split connector is only ever closed by its producer — but those splits
-no longer flow through a pipeline that has already finished.
+`STREAMING_LIMIT` waits for its producer to finish behind a FULL input barrier and consumes every
+input batch, even after its row quota is satisfied. Later batches produce empty slices, so draining
+the input does not restore the linear relationship between input bytes and output bytes.
 
 So a pipeline containing an operator whose `caps_pipeline_output()` is true gets no estimate at all
 while it is unfinished, in any of the four cases. Once it *is* finished, case 1 answers from the
-recorded total and is unaffected. The check is a virtual on the operator rather than a type test,
-and is deliberately distinct from the existing `is_limit_exhausted()`: the cap bounds the eventual
-total from the start, whether or not it has bound yet.
+recorded total and is unaffected. The check is a virtual on the operator rather than a type test:
+the cap bounds the eventual total from the start, whether or not it has bound yet.
 
 This is a hard stop rather than a bound because bounding needs the limit in *bytes*, and the limit
 is a row count while the history records only bytes. `LIMIT_PERCENT` would need no treatment (a
