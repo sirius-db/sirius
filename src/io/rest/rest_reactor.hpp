@@ -238,8 +238,9 @@ class rest_io_object : public io_object {
  * loop (curl_multi_socket_action), a pool of reusable easy handles, dynamic
  * CuCascade staging for device reads, a timerfd + min-heap retry
  * scheduler, and an MPSC request queue.  Models the reactor concept consumed
- * by @c templated_ioctx.  Presigned GET/HEAD URLs come from a
- * @c request_authorizer, re-issued on every attempt.
+ * by @c templated_ioctx.  Origin attempts obtain their URLs from
+ * @c request_authorizer; delegated attempts (config::cluster_redirect) reuse
+ * the admitted Location without re-authorization.
  */
 class rest_reactor {
  public:
@@ -383,6 +384,23 @@ class rest_reactor {
                         std::string_view prefix,
                         std::string_view canonical_query);
 
+  /// Per-reactor 307 policy decisions since construction: @c followed counts
+  /// approved delegations, before the target request is submitted; @c refused
+  /// counts policy rejections (each also the request's terminal error).  HEAD,
+  /// suffix and worker GET paths contribute; LIST / warm-up and other status
+  /// codes do not.  The two atomic reads are independent observations, not
+  /// proof that a target request was sent (an approval followed by
+  /// cancellation or an allocation failure still counts).
+  struct redirect_counters {
+    std::uint64_t followed{0};
+    std::uint64_t refused{0};
+  };
+  [[nodiscard]] redirect_counters redirects() const noexcept
+  {
+    return {_redirects_followed.load(std::memory_order_relaxed),
+            _redirects_refused.load(std::memory_order_relaxed)};
+  }
+
   // -- capabilities / factory ----------------------------------------------
 
   /// True iff @p path is an s3:// URL this reactor can serve.
@@ -403,7 +421,7 @@ class rest_reactor {
   void worker_loop(const std::stop_token& stop_token);
 
   // Shared services + tunables for the whole reactor pool; kept alive for this
-  // reactor's lifetime (the authorizer is used on every request).
+  // reactor's lifetime (the authorizer serves origin attempts).
   std::shared_ptr<reactor_context> _ctx;
   config _config;  // copy of _ctx->cfg() for hot-path access
   // Thread name prefix captured at construction; applied to the worker in start().
@@ -430,6 +448,22 @@ class rest_reactor {
   // Logical bytes not yet assigned to a curl slot. Retries are already claimed
   // work and therefore never get counted a second time.
   std::atomic<std::size_t> _queued_bytes{0};
+
+  // See redirects(); bumped by the blocking HEAD / suffix paths on their
+  // caller's thread and by the worker for ranged GETs.
+  std::atomic<std::uint64_t> _redirects_followed{0};
+  std::atomic<std::uint64_t> _redirects_refused{0};
+
+  /// Decide one 307 for @p obj: on follow, count it and return true; otherwise
+  /// count the refusal, WARN with the reason, and return false.  @p reason_out
+  /// receives the refusal text for the caller's error message.  May throw
+  /// (allocation, logging); callers treat that like any other failure.
+  bool delegate_redirect(object_ref const& obj,
+                         std::string_view request_url,
+                         bool already_delegated,
+                         long status,
+                         std::string_view location,
+                         std::string& reason_out);
 
   std::jthread _worker;
 };

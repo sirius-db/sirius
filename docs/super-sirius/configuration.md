@@ -412,6 +412,9 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+| `cluster_redirect.enabled` | bool | false | Delegate an object HEAD / footer probe / ranged GET once when the configured gateway answers 307 with a Location on an allowed storage node (an AIStore-style S3 front end). Off, every redirect stays a terminal error, as it always has: Amazon S3 answers 307 for region routing and a presigned URL is signed for one host. |
+| `cluster_redirect.origin` | string | — | `host[:port]` of the gateway, spelled as in `object_store.endpoint`. Only a 307 answering a request sent here is delegated. Required when enabled. |
+| `cluster_redirect.allowed_targets` | list of string | — | `host[:port]` authorities a Location may name (host case-insensitive, port literal). The delegated request repeats the same method, Range and If-Match against the Location as received — path untouched, without invoking Sirius's authorizer or forwarding its credential headers; the Location may carry the gateway's own authorization. A second 307, a 401/403 from the target, or a Location outside this list is terminal, however the error body behind it ends. LIST keeps its existing HTTP-error/retry path and connection warm-up stays best effort; neither delegates. At least one entry when enabled. |
 
 Two REST values are deliberately not YAML keys. **Connections per reactor** is
 fixed at 64 — the useful number is a property of one reactor thread, not of a

@@ -224,6 +224,19 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.optional("list_max_matches", opt.list_max_matches);
   r.optional("list_max_scanned", opt.list_max_scanned);
+  if (auto n = r.optional_node("cluster_redirect")) {
+    yaml::reader cr(*n, "rest.cluster_redirect");
+    cr.optional("enabled", opt.cluster_redirect.enabled);
+    cr.optional("origin", opt.cluster_redirect.origin);
+    cr.optional("allowed_targets", opt.cluster_redirect.allowed_targets);
+    cr.reject_unknown();
+    if (opt.cluster_redirect.enabled &&
+        (opt.cluster_redirect.origin.empty() || opt.cluster_redirect.allowed_targets.empty())) {
+      throw std::runtime_error(
+        "'sirius.executor.scan_manager.rest.cluster_redirect': enabled requires a non-empty "
+        "'origin' and at least one 'allowed_targets' entry");
+    }
+  }
   r.reject_unknown();
 }
 
