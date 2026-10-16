@@ -66,7 +66,8 @@ class batch_stream {
   void close(sender_id_t sender);
 
   /// Poison the stream (no sender identity). P1–P3: immediate, first-wins, fail-fast terminal.
-  /// S2 / P4: classifies as HAS_DATA, fires on_data, and notifies wait().
+  /// S2 / P4: classifies as HAS_DATA, fires any retained on_data hook, and notifies wait().
+  /// Ordered EOS consumes the on_data hook; a subsequent failure still notifies wait().
   /// @throws sirius::invalid_input_exception when `error` is null.
   void fail(std::exception_ptr error);
 
@@ -98,9 +99,10 @@ class batch_stream {
   // Hooks fire after unlock; may re-enter. Do not capture raw this.
   // -----------------------------------------------------------------------
 
-  /// Fires on every successful push(), fail() (P4), and ordered EOS (which makes data ready).
-  /// Not one-shot: a one-shot hook would
-  /// need re-arming, and a push between fire and re-arm would go unannounced.
+  /// Fires on every successful push(), the first fail() (P4), and ordered EOS.
+  /// Persists across pushes without re-arming. Ordered EOS consumes the hook when it makes
+  /// data ready; a later fail() does not invoke that hook, but still notifies wait().
+  /// Registration replaces the hook without firing it, including after EOS.
   void set_on_data(std::function<void()> hook);
 
   /// Replaces prior hook; if already terminal, fires immediately inside this call.
