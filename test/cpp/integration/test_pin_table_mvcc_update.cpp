@@ -63,7 +63,7 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   auto unchanged = con->Query("SELECT v FROM t;");
   REQUIRE(unchanged);
   REQUIRE_FALSE(unchanged->HasError());
-  REQUIRE(unchanged->GetValue(0, 0) == duckdb::Value::INTEGER(10));
+  REQUIRE(unchanged->Collection().GetValue(0, 0) == duckdb::Value::INTEGER(10));
 
   run_ok("CALL unpin_table('t');");
   run_ok("UPDATE t SET v = 99 WHERE k = 1;");
@@ -108,7 +108,7 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   auto unchanged = con->Query("SELECT v FROM t;");
   REQUIRE(unchanged);
   REQUIRE_FALSE(unchanged->HasError());
-  REQUIRE(unchanged->GetValue(0, 0) == duckdb::Value::INTEGER(20));
+  REQUIRE(unchanged->Collection().GetValue(0, 0) == duckdb::Value::INTEGER(20));
   run_ok("CALL unpin_table('t');");
 }
 
@@ -140,7 +140,7 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   auto prepared = con->Prepare("UPDATE t SET v = v WHERE false;");
   REQUIRE(prepared);
   REQUIRE_FALSE(prepared->HasError());
-  auto pending_update = prepared->PendingQuery();
+  auto pending_update = prepared->Submit();
   REQUIRE(pending_update);
   REQUIRE_FALSE(pending_update->HasError());
   auto connection_state = duckdb::get_sirius_connection_state(*con->context);
@@ -156,7 +156,8 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   });
   auto const wait_status = pin.wait_for(std::chrono::milliseconds(100));
 
-  auto update_result = pending_update->Execute();
+  pending_update->Complete();
+  auto update_result = std::move(pending_update);
   REQUIRE(update_result);
   REQUIRE_FALSE(update_result->HasError());
   REQUIRE(wait_status == std::future_status::timeout);
@@ -244,7 +245,8 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   run_ok("SET gpu_execution = true;");
 
-  auto attached = duckdb::DatabaseManager::Get(*con->context).GetDatabase(attach_alias);
+  auto attached =
+    duckdb::DatabaseManager::Get(*con->context).GetDatabase(duckdb::Identifier(attach_alias));
   REQUIRE(attached);
   auto checkpoint_lock = duckdb::DuckTransactionManager::Get(*attached).TryGetCheckpointLock();
   REQUIRE(checkpoint_lock);

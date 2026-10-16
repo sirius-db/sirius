@@ -47,13 +47,15 @@ static std::string tier_to_string(cucascade::memory::Tier tier)
 }
 
 downgrade_executor::downgrade_executor(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   exec::downgrade_executor_config config,
   sirius::data::data_repository_manager_registry& data_repo_registry,
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
   sirius::memory::sirius_memory_reservation_manager& reservation_manager,
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
-  : _config(std::move(config)),
+  : _query_lifecycle(lifecycle),
+    _config(std::move(config)),
     _data_repo_registry(data_repo_registry),
     _space_id(space_id),
     _memory_space(memory_space),
@@ -268,8 +270,10 @@ void downgrade_executor::processing_loop()
     // re-scanned before leaving idle. Managers are held by shared_ptr for the duration of the
     // sweep, so a query ending concurrently cannot pull one out from under this loop.
     bool pool_interrupted = false;
-    auto const managers   = _data_repo_registry.get_all();
-    for (auto const& manager : std::views::reverse(managers)) {
+    auto const managers   = _data_repo_registry.candidates();
+    for (auto const& [victim_id, manager] : std::views::reverse(managers)) {
+      auto borrow = _query_lifecycle.try_acquire_work(victim_id);
+      if (!borrow) { continue; }
       if (req->satisfied.load() || pool_interrupted || target_completed()) break;
       auto repos = manager->get_repositories();
       for (auto* repo : repos) {
@@ -301,6 +305,12 @@ void downgrade_executor::processing_loop()
           already_dispatched[*pick] = true;
           auto candidate            = std::move(candidates[*pick]);
           auto candidate_bytes      = candidate_sizes[*pick];
+          // The manager-local borrow protects candidate discovery. Transfer a separate
+          // victim claim into each candidate before handing it to another thread.
+
+          auto work = _query_lifecycle.try_acquire_work(victim_id);
+          if (!work) { break; }
+          candidate->retain_work(std::move(work));
 
           auto slot = _pool->reserve();
           if (!slot) {
@@ -373,7 +383,10 @@ void downgrade_executor::processing_loop()
       size_t max_tasks_to_convert = _pipeline_task_queue->size();
       size_t tasks_converted      = 0;
       failed_pipeline_candidates.reserve(max_tasks_to_convert);
-      convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
+      // The gate travels with the provider: each wrapper it hands out consults it before its RAII
+      // re-push, so a task extracted here cannot land back in the queue after its query's drain.
+      convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue,
+                                                               _query_lifecycle);
       while (!req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
         if (predicate_satisfied(req.get()) || wait_if_target_reached()) break;
         auto candidate =

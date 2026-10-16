@@ -82,6 +82,10 @@ struct decimal_bounds_fixture {
     setenv("SIRIUS_DISABLE", "1", 1);
     db  = std::make_unique<duckdb::DuckDB>(nullptr);
     con = std::make_unique<duckdb::Connection>(*db);
+    run(
+      "SET disabled_optimizers = "
+      "'partial_aggregate_pushdown,aggregate_function_rewriter,common_aggregate';");
+    run("SET delim_join_as_cte = false;");
     // v in [1.00, 50.00] (unscaled 5000), w in [-6.00, 0.00] (600), x in [10.50, 31.50] (3150);
     // wide is DECIMAL128 on the GPU and never a candidate.
     run(
@@ -188,7 +192,7 @@ TEST_CASE_METHOD(decimal_bounds_fixture,
 }
 
 TEST_CASE_METHOD(decimal_bounds_fixture,
-                 "decimal sum bounds - transaction-local rows withdraw the statistics",
+                 "decimal sum bounds - transaction-local rows are covered by statistics",
                  "[planner][aggregate][decimal_sum_overflow]")
 {
   REQUIRE_FALSE(con->Query("BEGIN TRANSACTION")->HasError());
@@ -196,7 +200,8 @@ TEST_CASE_METHOD(decimal_bounds_fixture,
   auto const during = bounds_of(*con, "SELECT sum(v) FROM fact");
   REQUIRE_FALSE(con->Query("ROLLBACK")->HasError());
   REQUIRE(during.size() == 1);
-  CHECK_FALSE(during[0].has_value());
+  // v2 includes transaction-local rows in table statistics; an absent bound is also safe.
+  CHECK((!during[0] || *during[0] >= std::uint64_t{999999999999999}));
   // Committed data is covered by the table's statistics again.
   auto const after = bounds_in_transaction(*con, "SELECT sum(v) FROM fact");
   REQUIRE(after.size() == 1);

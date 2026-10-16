@@ -8,3 +8,6 @@ prost.workspace = true
 starrocks-thrift = { path = "../starrocks-thrift" }
 substrait.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+thrift.workspace = true

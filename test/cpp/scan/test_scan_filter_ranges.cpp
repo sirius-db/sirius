@@ -34,10 +34,14 @@
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/null_filter.hpp>
 #include <helper/type_conversions.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <utility>
+#include <vector>
 
 using namespace sirius::op;
 
@@ -57,8 +61,9 @@ struct filter_fixture {
 
   void push(duckdb::ExpressionType comparison, duckdb::Value constant)
   {
-    filters.PushFilter(duckdb::ColumnIndex(0),
-                       duckdb::make_uniq<duckdb::ConstantFilter>(comparison, std::move(constant)));
+    filters.PushFilter(duckdb::ProjectionIndex(0),
+                       sirius::test::constant_filter(
+                         comparison, std::move(constant), sirius::to_duckdb(returned_types[0])));
   }
 
   [[nodiscard]] scan_filter_analysis analyze() const
@@ -276,7 +281,8 @@ TEST_CASE("required IS NOT NULL survives scan conversion and range analysis",
           "[scan][required_null]")
 {
   filter_fixture f{duckdb::LogicalType::BIGINT};
-  f.filters.filters[0] = duckdb::make_uniq<duckdb::IsNotNullFilter>();
+  f.filters.SetFilterByColumnIndex(duckdb::ProjectionIndex(0),
+                                   sirius::test::null_filter(duckdb::LogicalType::BIGINT, true));
 
   SECTION("standalone null rejection is not a numeric range")
   {
@@ -289,20 +295,22 @@ TEST_CASE("required IS NOT NULL survives scan conversion and range analysis",
     REQUIRE(conjuncts[0].batch_position == 2);
     auto const& expr = conjuncts[0].expr->Cast<duckdb::BoundOperatorExpression>();
     REQUIRE(expr.GetExpressionType() == duckdb::ExpressionType::OPERATOR_IS_NOT_NULL);
-    REQUIRE(expr.children[0]->Cast<duckdb::BoundReferenceExpression>().index == 2);
+    REQUIRE(expr.GetChildren()[0]->Cast<duckdb::BoundReferenceExpression>().Index() == 2);
   }
 
   SECTION("a range on another column cannot discharge null rejection")
   {
     f.column_ids.emplace_back(1);
     f.returned_types.push_back(sirius::from_duckdb(duckdb::LogicalType::INTEGER));
-    f.filters.filters[1] = duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::INTEGER(10));
+    f.filters.SetFilterByColumnIndex(
+      duckdb::ProjectionIndex(1),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                    duckdb::Value::INTEGER(10)));
     auto const result = f.analyze();
     REQUIRE(result.ranges.at(1).lo == 11);
     REQUIRE_FALSE(result.ranges_cover_whole_filter);
     std::vector<std::size_t> const slots{0, 1};
-    auto request = build_pushdown_request(result, slots);
+    auto request = build_pushdown_request(result, slots, std::nullopt);
     REQUIRE_FALSE(request.ranges_cover_whole_filter);
   }
 
@@ -325,5 +333,50 @@ TEST_CASE("required IS NOT NULL survives scan conversion and range analysis",
               .empty());
     REQUIRE(analyze_scan_filters(f.filters, f.column_ids, f.returned_types, {0})
               .ranges_cover_whole_filter);
+  }
+}
+
+TEST_CASE("build_pushdown_request records the output prefix only where it leaves a slot out",
+          "[scan]")
+{
+  // Two output columns (primary indices 0 and 1) then a pure-filter column (primary index 2) that
+  // carries the scan's only range.
+  scan_filter_analysis analysis;
+  analysis.ranges.emplace(2, sirius::decode_range{0, 99});
+  analysis.ranges_cover_whole_filter = true;
+  std::vector<std::size_t> const slots{0, 1, 2};
+
+  SECTION("a prefix that leaves the pure-filter slot out is recorded")
+  {
+    auto const width   = GENERATE(std::size_t{1}, std::size_t{2});
+    auto const request = build_pushdown_request(analysis, slots, width);
+    REQUIRE(request.output_prefix_width == width);
+    REQUIRE(request.ranges_cover_whole_filter);
+  }
+
+  SECTION("a prefix covering every slot is not recorded")
+  {
+    auto const width   = GENERATE(std::size_t{3}, std::size_t{4});
+    auto const request = build_pushdown_request(analysis, slots, width);
+    REQUIRE_FALSE(request.output_prefix_width.has_value());
+  }
+
+  SECTION("an empty prefix is not recorded")
+  {
+    REQUIRE_FALSE(build_pushdown_request(analysis, slots, 0).output_prefix_width.has_value());
+  }
+
+  SECTION("no prefix is not recorded")
+  {
+    REQUIRE_FALSE(
+      build_pushdown_request(analysis, slots, std::nullopt).output_prefix_width.has_value());
+  }
+
+  SECTION("an empty analysis still returns an empty request")
+  {
+    auto const request = build_pushdown_request(scan_filter_analysis{}, slots, 2);
+    REQUIRE(request.empty());
+    REQUIRE(request.columns.empty());
+    REQUIRE_FALSE(request.output_prefix_width.has_value());
   }
 }

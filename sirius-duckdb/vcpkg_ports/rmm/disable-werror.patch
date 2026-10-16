@@ -1,0 +1,16 @@
+--- a/cpp/CMakeLists.txt
++++ b/cpp/CMakeLists.txt
+@@ -150,11 +150,10 @@
+   target_compile_definitions(rmm PUBLIC RMM_NVTX)
+ endif()
+ 
+-set(RMM_CXX_FLAGS -Wall -Werror -Wextra -Wsign-conversion -Wno-unknown-pragmas
++set(RMM_CXX_FLAGS -Wall -Wextra -Wsign-conversion -Wno-unknown-pragmas
+                   -Wno-error=deprecated-declarations)
+ set(RMM_CUDA_FLAGS
+-    -Werror=all-warnings
+-    -Xcompiler=-Wall,-Werror,-Wextra,-Wsign-conversion,-Wno-error=deprecated-declarations)
++    -Xcompiler=-Wall,-Wextra,-Wsign-conversion,-Wno-error=deprecated-declarations)
+ target_compile_options(rmm PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RMM_CXX_FLAGS}>"
+                                    "$<$<COMPILE_LANGUAGE:CUDA>:${RMM_CUDA_FLAGS}>")
+ 

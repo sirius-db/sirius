@@ -25,6 +25,8 @@
 
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/aggregate.hpp"
+
+#include <duckdb/main/settings.hpp>
 // Reaching a join operator through these headers instantiates `vector<join_condition>`'s
 // destructor, which needs the AST node definition.
 #include "expression/ast/node.hpp"
@@ -65,6 +67,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <sstream>
 #include <string>
@@ -131,7 +134,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
 
   duckdb::unique_ptr<sirius_physical_operator> result;
   try {
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
@@ -141,7 +144,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
 
     auto plan = std::move(planner.plan);
 
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -149,7 +152,8 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
     resolver.VisitOperator(*plan);
 
     sirius::planner::sirius_physical_plan_generator gen(context);
@@ -238,14 +242,13 @@ std::string tree_to_string(sirius_physical_operator* root)
 duckdb::unique_ptr<duckdb::Expression> untranslatable_table_filter_expression()
 {
   auto expression = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
-    duckdb::LogicalType::BOOLEAN,
-    duckdb::ScalarFunction("sirius_unmapped_filter",
-                           {duckdb::LogicalType::BIGINT},
-                           duckdb::LogicalType::BOOLEAN,
-                           nullptr),
+    duckdb::BoundScalarFunction(duckdb::ScalarFunction("sirius_unmapped_filter",
+                                                       {duckdb::LogicalType::BIGINT},
+                                                       duckdb::LogicalType::BOOLEAN,
+                                                       nullptr)),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
     nullptr);
-  expression->children.push_back(
+  expression->GetChildrenMutable().push_back(
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0));
   return expression;
 }
@@ -358,6 +361,8 @@ struct plan_tree_shape_fixture {
                "minimal.yaml";
     db  = sirius::test::open_sirius_db(_db_path.path().c_str(), cfg);
     con = std::make_unique<Connection>(*db);
+    // This suite checks the explicit DELIM_JOIN operator's wiring.
+    REQUIRE_FALSE(con->Query("SET delim_join_as_cte=false")->HasError());
 
     // big_left is larger so the optimizer keeps small_right as the build side.
     con->Query("CREATE TABLE big_left (id INTEGER, val INTEGER)");
@@ -475,7 +480,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
     "JOIN small_c c ON r.other = c.ckey";
   const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
-                                              OptimizerType::BUILD_SIDE_PROBE_SIDE};
+                                              OptimizerType::BUILD_SIDE_PROBE_SIDE,
+                                              OptimizerType::OUTER_JOIN_SIMPLIFICATION};
 
   auto require_nested_join = [](sirius_physical_operator* plan) {
     auto joins = collect(plan, SiriusPhysicalOperatorType::HASH_JOIN);
@@ -956,8 +962,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("COUNT(DISTINCT) records LIST locally and BIGINT after merge")
   {
-    auto plan =
-      generate_sirius_plan(*con, "SELECT val, count(DISTINCT id) FROM big_left GROUP BY val");
+    auto plan = generate_sirius_plan(*con,
+                                     "SELECT val, count(DISTINCT id) FROM big_left GROUP BY val",
+                                     {OptimizerType::DISTINCT_AGGREGATE_REWRITE});
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
@@ -991,7 +998,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("AVG records its two-column local accumulator schema below MERGE_AGGREGATE")
   {
-    auto plan = generate_sirius_plan(*con, "SELECT avg(val) FROM big_left");
+    auto plan = generate_sirius_plan(
+      *con, "SELECT avg(val) FROM big_left", {OptimizerType::AGGREGATE_FUNCTION_REWRITER});
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
@@ -1009,7 +1017,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("AVG widens its DECIMAL local sum carrier to DECIMAL(38, scale) below MERGE_AGGREGATE")
   {
-    auto plan = generate_sirius_plan(*con, "SELECT avg(amount) FROM decimal_values");
+    auto plan = generate_sirius_plan(
+      *con, "SELECT avg(amount) FROM decimal_values", {OptimizerType::AGGREGATE_FUNCTION_REWRITER});
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
@@ -1022,6 +1031,271 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(local->get_types().size() == 2);
     CHECK(local->get_types()[0] == sirius::logical_type::make_decimal(38, 2));
     CHECK(local->get_types()[1].id() == sirius::type_id::BIGINT);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - DISTINCT lowers to a zero-aggregate grouped aggregate",
+                 "[plan_tree_shape][isolated_context]")
+{
+  // The chain every supported DISTINCT shape shares: one HASH_GROUP_BY with an empty aggregate
+  // list, wrapped as insert_gpu_pipeline_operators wraps a GROUP BY. Returns the HASH_GROUP_BY so
+  // each section can assert its own key layout.
+  auto require_distinct_wrap_chain = [](sirius_physical_operator* plan) {
+    auto* merge = find_first(plan, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    REQUIRE(merge->children.size() == 1);
+
+    auto* partition = merge->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+    REQUIRE(partition->children.size() == 1);
+
+    auto* hgb = partition->children[0].get();
+    REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    auto& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    CHECK(aggregate.aggregate_slots.empty());
+    CHECK(aggregate.cudf_aggregates.empty());
+    CHECK(aggregate.cudf_aggregate_idx.empty());
+    CHECK_FALSE(aggregate.has_avg);
+    CHECK_FALSE(aggregate.has_count_distinct);
+    CHECK(aggregate.grouping_sets.empty());
+    return &aggregate;
+  };
+
+  SECTION("plain DISTINCT keys the whole row in order and needs no projection")
+  {
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id, val FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{0, 1});
+    CHECK(aggregate->get_output_grouping_indices() == std::vector<int>{0, 1});
+
+    // Every distinct target is a bare reference at its own output index, so the builder emits no
+    // reorder projection.
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::PROJECTION).empty());
+  }
+
+  SECTION("plain DISTINCT with ORDER BY still lowers to the GPU")
+  {
+    // LogicalDistinct::order_by is populated only for DISTINCT ON under an ORDER BY. This query
+    // reaches the builder with order_by == nullptr and its ORDER BY becomes a separate
+    // LOGICAL_ORDER above the distinct, so the DISTINCT ON + ORDER BY guard must not fire.
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id, val FROM big_left ORDER BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{0, 1});
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT) != nullptr);
+  }
+
+  SECTION("DISTINCT ON keys the targets in target order and reorders above the merge")
+  {
+    // The targets are (val, id) but the output columns are (id, val), so group position 0 reads
+    // child column 1 and the builder's trailing push_projection restores the order.
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT ON (val, id) id, val FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{1, 0});
+
+    auto projections = collect(plan.get(), SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(projections.size() == 1);
+    REQUIRE(projections[0]->children.size() == 1);
+    CHECK(projections[0]->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+
+    auto const& select_list =
+      projections[0]->Cast<sirius::op::sirius_physical_projection>().select_list;
+    REQUIRE(select_list.size() == 2);
+    REQUIRE(select_list[0]->holds<sirius::ast::reference>());
+    REQUIRE(select_list[1]->holds<sirius::ast::reference>());
+    CHECK(select_list[0]->get<sirius::ast::reference>().column_index == 1);
+    CHECK(select_list[1]->get<sirius::ast::reference>().column_index == 0);
+  }
+
+  SECTION(
+    "DISTINCT ON with a key that is not an output column keeps the binder's prune "
+    "projection")
+  {
+    // `val` is not in the select list, so the binder appends it to the projection under the
+    // distinct and prunes it again above. Both columns are still distinct targets, so the builder
+    // emits no projection of its own.
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT ON (id, val) id FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{0, 1});
+
+    auto projections = collect(plan.get(), SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(projections.size() == 1);
+    CHECK(projections[0]->get_types().size() == 1);
+    REQUIRE(projections[0]->children.size() == 1);
+    CHECK(projections[0]->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+  }
+
+  SECTION("DISTINCT over an aggregate planned narrower than declared takes the child's types")
+  {
+    // The DISTINCT node declares sum()'s HUGEINT; the aggregate below is planned as BIGINT.
+    auto plan =
+      generate_sirius_plan(*con, "SELECT DISTINCT val, sum(id) FROM big_left GROUP BY val");
+    INFO(tree_to_string(plan.get()));
+
+    duckdb::vector<sirius::logical_type> const planned{
+      sirius::logical_type::make(sirius::type_id::INTEGER),
+      sirius::logical_type::make(sirius::type_id::BIGINT)};
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->get_types() == planned);
+    CHECK(aggregate->group_idx == std::vector<int>{0, 1});
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY)->get_types() ==
+          planned);
+  }
+
+  SECTION("DISTINCT ON reordering over a narrowed aggregate types the projection from the child")
+  {
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT DISTINCT ON (s, k) k, s FROM (SELECT val AS k, sum(id) AS s FROM big_left GROUP BY "
+      "val)");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{1, 0});
+
+    REQUIRE(plan->type == SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(plan->children.size() == 1);
+    CHECK(plan->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    CHECK(plan->get_types() == duckdb::vector<sirius::logical_type>{
+                                 sirius::logical_type::make(sirius::type_id::INTEGER),
+                                 sirius::logical_type::make(sirius::type_id::BIGINT)});
+  }
+
+  SECTION("DISTINCT over nested materialized CTEs checks the body's schema")
+  {
+    // `d` is read twice and joined on `other`, so its definition keeps both columns and is wider
+    // than the one-column body the DISTINCT reads.
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT DISTINCT * FROM (WITH c AS MATERIALIZED (SELECT id FROM big_left), "
+      "d AS MATERIALIZED (SELECT rid, other FROM small_right) "
+      "SELECT d1.rid FROM d d1 JOIN d d2 ON d1.other = d2.other JOIN c ON c.id = d1.rid) s");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    REQUIRE(aggregate->children.size() == 1);
+    auto* outer = aggregate->children[0].get();
+    REQUIRE(outer->type == SiriusPhysicalOperatorType::CTE);
+    auto* inner = outer->children[1].get();
+    REQUIRE(inner->type == SiriusPhysicalOperatorType::CTE);
+    CHECK(inner->children[0]->get_types().size() == 2);
+    CHECK(inner->get_types().size() == 1);
+    CHECK(outer->get_types().size() == 1);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - unsupported DISTINCT shapes are rejected at plan time",
+                 "[plan_tree_shape][isolated_context]")
+{
+  // The builder's own guards throw duckdb::NotImplementedException specifically: SiriusContext
+  // reports that type as an unsupported shape and logs the message, where a plain std::exception
+  // would still fall back but be reported as a plan failure.
+  auto require_rejected = [&](std::string const& query, std::string const& message_fragment) {
+    INFO(query);
+    try {
+      generate_sirius_plan(*con, query);
+    } catch (NotImplementedException const& e) {
+      REQUIRE_THAT(std::string(e.what()), Catch::Matchers::ContainsSubstring(message_fragment));
+      return;
+    } catch (std::exception const& e) {
+      FAIL("expected a NotImplementedException containing: " << message_fragment
+                                                             << ", got: " << e.what());
+    }
+    FAIL("expected a NotImplementedException containing: " << message_fragment);
+  };
+
+  // The shared reject_nested_column_operation() throws std::runtime_error, so this one asserts the
+  // message only.
+  auto require_rejected_any = [&](std::string const& query, std::string const& message_fragment) {
+    INFO(query);
+    try {
+      generate_sirius_plan(*con, query);
+    } catch (std::exception const& e) {
+      REQUIRE_THAT(std::string(e.what()), Catch::Matchers::ContainsSubstring(message_fragment));
+      return;
+    }
+    FAIL("expected an exception containing: " << message_fragment);
+  };
+
+  SECTION("DISTINCT ON with carried columns needs a grouped FIRST")
+  {
+    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left",
+                     "DISTINCT ON with carried (non-key) columns");
+  }
+
+  SECTION("DISTINCT ON under an ORDER BY names a specific row per group")
+  {
+    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY val",
+                     "DISTINCT ON with ORDER BY");
+  }
+
+  SECTION("plain DISTINCT ordered by a column outside the select list has an uncovered output")
+  {
+    // `val` is added to the select list after the targets were synthesized from it, so the node
+    // is two columns wide with one target. Output column 1 has no target: a different cause, and
+    // a different message, from a target that is not a column reference.
+    require_rejected("SELECT DISTINCT id FROM big_left ORDER BY val",
+                     "output column 1 has no distinct target");
+  }
+
+  SECTION("a collated distinct target is not a plain reference to any output column")
+  {
+    // Binder::BindModifiers pushes the default collation over every distinct target, so a VARCHAR
+    // key under a non-binary default_collation arrives as a call rather than as a bare reference:
+    // the only route ordinary SQL has into the not-a-bare-reference arm. The integration suite's
+    // collation case runs the same shape but can only watch the fallback counter, which both
+    // uncovered-output arms move, so this is where that arm's message is pinned.
+    //
+    // default_collation is GLOBAL_DEFAULT-scoped, but Catch2 rebuilds the fixture -- and with it
+    // the DuckDB instance -- for every leaf section, so the setting dies with this section.
+    auto collate = con->Query("SET default_collation = 'nocase'");
+    REQUIRE(collate);
+    REQUIRE_FALSE(collate->HasError());
+
+    require_rejected("SELECT DISTINCT pname FROM parts",
+                     "no distinct target is a plain reference to output column 0");
+  }
+
+  SECTION("the not-a-bare-reference message names the offending target")
+  {
+    // Target 0 reads child column 1 and target 1 is the collated call, so the uncovered output
+    // column 0 shares an index with a target that is a plain reference.
+    auto collate = con->Query("SET default_collation = 'nocase'");
+    REQUIRE(collate);
+    REQUIRE_FALSE(collate->HasError());
+
+    require_rejected("SELECT DISTINCT ON (pk, pname) 1 AS c, pk, pname FROM parts",
+                     "output column 0 (falling back to CPU); target 1 is");
+  }
+
+  SECTION("a nested distinct key is rejected before the child is planned")
+  {
+    auto create = con->Query("CREATE TABLE nested_keys (id INTEGER, s STRUCT(x INTEGER))");
+    REQUIRE(create);
+    REQUIRE_FALSE(create->HasError());
+
+    // The check runs before create_plan(*op.children[0]), so the message names the column rather
+    // than the scan failing first.
+    require_rejected_any("SELECT DISTINCT * FROM nested_keys", "is unsupported in DISTINCT");
+  }
+
+  SECTION("an expression DISTINCT ON target still leaves its own columns carried")
+  {
+    // `id + val` is appended to the select list, so the target arrives as a bare reference to that
+    // appended column. Unsupported for the same reason as above: `id` and `val` are output columns
+    // no target covers.
+    require_rejected("SELECT DISTINCT ON (id + val) id, val FROM big_left",
+                     "DISTINCT ON with carried (non-key) columns");
   }
 }
 
@@ -1161,6 +1435,16 @@ TEST_CASE("set_parent_ops accepts a GPU scan without an ingestible",
   CHECK(scan.get_parent_op() == nullptr);
 }
 
+TEST_CASE("planned_aggregate_type narrows HUGEINT only", "[plan_tree_shape]")
+{
+  using generator = sirius::planner::sirius_physical_plan_generator;
+  CHECK(generator::planned_aggregate_type(LogicalType::HUGEINT) == LogicalType::BIGINT);
+  CHECK(generator::planned_aggregate_type(LogicalType::INTEGER) == LogicalType::INTEGER);
+  CHECK(generator::planned_aggregate_type(LogicalType::UHUGEINT) == LogicalType::UHUGEINT);
+  CHECK(generator::planned_aggregate_type(LogicalType::DECIMAL(38, 0)) ==
+        LogicalType::DECIMAL(38, 0));
+}
+
 //===----------------------------------------------------------------------===//
 // Wrap-time physical-sidecar copies (compressed materialization)
 //===----------------------------------------------------------------------===//
@@ -1216,7 +1500,7 @@ duckdb::unique_ptr<sirius_physical_operator> make_wrap_hash_join(
   duckdb::unique_ptr<sirius_physical_operator> left,
   duckdb::unique_ptr<sirius_physical_operator> right)
 {
-  duckdb::LogicalDummyScan stub(0);
+  duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
   stub.types = {duckdb::LogicalType::INTEGER,
                 duckdb::LogicalType::INTEGER,
                 duckdb::LogicalType::INTEGER,
@@ -1398,7 +1682,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   // nothing to copy.
   sirius::planner::sirius_physical_plan_generator gen(*con->context);
 
-  duckdb::LogicalDummyScan stub(0);
+  duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
   stub.types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
   duckdb::unique_ptr<sirius_physical_operator> plan =
     duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(
@@ -1431,9 +1715,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     scan = scan->children.front().get();
   }
   auto& get = scan->Cast<duckdb::LogicalGet>();
-  REQUIRE(get.function.name == "seq_scan");
-  get.table_filters.filters[0] =
-    duckdb::make_uniq<duckdb::ExpressionFilter>(untranslatable_table_filter_expression());
+  REQUIRE(get.function.GetName() == "seq_scan");
+  get.table_filters.SetFilterByColumnIndex(
+    duckdb::ProjectionIndex(0),
+    duckdb::make_uniq<duckdb::ExpressionFilter>(untranslatable_table_filter_expression()));
 
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
   CHECK_THROWS_WITH(
@@ -1497,9 +1782,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - UNION arm sinks declare the union's schema, not the arm's",
                  "[plan_tree_shape][union_all][isolated_context]")
 {
-  // Each arm's sink must declare the union's schema. A materialized CTE declares its
-  // materialization side instead, so copying the arm's `types` misdeclares the sink's width --
-  // which `validate_operator_output_types` only warns about, so no end-to-end test can see it.
+  // CTE results and UNION arm sinks use the consumer schema, even when materialization
+  // stores a different number of columns.
   auto require_sinks_match_union = [&](const std::string& query) {
     auto plan = generate_sirius_plan(*con, query);
     INFO(tree_to_string(plan.get()));
@@ -1508,14 +1792,13 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(union_op != nullptr);
     REQUIRE(union_op->children.size() == 2);
 
-    // The premise, pinned: the arm is really a CTE node and its width really differs from the
-    // union's, or the sink would be right by accident. DuckDB's unused-column optimizer prunes the
-    // materialization down to what the body reads and can collapse these queries silently. If this
-    // fires, reshape so the definition is unprunable or the body widens; do not relax it.
     auto* cte = find_first(plan.get(), SiriusPhysicalOperatorType::CTE);
     REQUIRE(cte != nullptr);
-    INFO("cte width=" << cte->types.size() << " union width=" << union_op->types.size());
-    REQUIRE(cte->types.size() != union_op->types.size());
+    REQUIRE(cte->children.size() == 2);
+    REQUIRE(cte->children[0]->types.size() != union_op->types.size());
+    CHECK(cte->types == cte->children[1]->types);
+    CHECK(cte->types == union_op->types);
+    CHECK_FALSE(cte->declared_output_schema_is_runtime_schema());
 
     for (auto& child : union_op->children) {
       REQUIRE(child->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);

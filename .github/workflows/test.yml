@@ -93,7 +93,19 @@ jobs:
           CUDAARCHS: "75" # 75 for T4 capability; 89 for L4 capability
         run: |
           set -o pipefail
-          make -j$(nproc) 2>&1 | tee /tmp/build.log
+          make -j$(nproc) EXTRA_EXTENSION_CONFIGS="$PWD/sirius-duckdb/test/extension_config.cmake" 2>&1 | tee /tmp/build.log
+
+      - name: Test CUDA extension loader without a GPU
+        run: |
+          cmake -S sirius-duckdb/duckdb -B build/loader -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=OFF -DBUILD_SHELL=OFF \
+            -DEXTENSION_STATIC_BUILD=ON -DDUCKDB_LINKER=bfd \
+            -DPREBUILT_BINARY="$PWD/sirius-duckdb/build/release/src/libduckdb_static.a" \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/sirius-duckdb/config/loader.cmake" \
+            -DSIRIUS_LOADER_TESTS=ON
+          cmake --build build/loader --target sirius_loadable_extension sirius_loader_test_fixtures -j$(nproc)
+          python sirius-duckdb/loader/test/test_loader.py \
+            --duckdb sirius-duckdb/build/release/duckdb --build-dir build/loader
 
       - name: Build shared DuckDB scan host tests
         run: |
@@ -122,11 +134,16 @@ jobs:
           grep -E '(FAILED:|: error:|: fatal error:)' /tmp/build.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Build Simpatico cache GPU regression workers
+        run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} cmake --build build/release \
+            --target simpatico_cache_gpu_tests
+
       - name: Package build artifacts
         run: tar -cf build.tar build/release/ sirius-duckdb/build/release/
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-cuda-${{ matrix.cuda.version }}
           path: build.tar
@@ -167,7 +184,7 @@ jobs:
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-cuda-${{ matrix.cuda.version }}
 
@@ -185,26 +202,31 @@ jobs:
           ./build/release/scan-host/scan_host_pic
           ./build/release/scan-host/scan_host_nonpie
 
-      - name: Provision DuckDB extensions the tests load
-        # The iceberg cases LOAD without INSTALL on purpose: a test must not reach the network,
-        # and an INSTALL inside the test would silently paper over an unprovisioned runner
-        # instead of failing with the install command. So provisioning happens here, out of
-        # band. avro comes in as an iceberg dependency but is named explicitly so a failure
-        # says which extension is missing.
-        #
-        # This resolves only because OVERRIDE_GIT_DESCRIBE (sirius-duckdb/Makefile) gives the
-        # build a real DuckDB version. Against the dummy v0.0.1 a shallow submodule would
-        # otherwise produce, there is no extension repository to install from.
+      - name: Smoke-test shared GPU execution
+        if: github.event_name == 'merge_group'
+        env:
+          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml
         run: |
-          for attempt in 1 2 3; do
-            if ./sirius-duckdb/build/release/duckdb -c "INSTALL avro; INSTALL iceberg;"; then
-              exit 0
-            fi
-            echo "::warning::Extension install attempt ${attempt} failed; retrying in $((attempt * 10))s"
-            sleep $((attempt * 10))
-          done
-          echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
-          exit 1
+          timeout --kill-after=10s 180s python3 test/scripts/v2_extension_smoke.py \
+            --duckdb sirius-duckdb/build/release/duckdb \
+            --extension sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+
+      - name: Install matching test extensions
+        run: |
+          ./sirius-duckdb/build/release/duckdb -unsigned -c "
+            INSTALL './sirius-duckdb/build/release/extension/avro/avro.duckdb_extension';
+            INSTALL './sirius-duckdb/build/release/extension/iceberg/iceberg.duckdb_extension';"
+
+      - name: Test Simpatico cache across processes
+        run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} \
+            build/release/simpatico_codegen/tests/cache/test_cache_environment
+          pixi run -e ${{ matrix.cuda.pixi-environment }} python \
+            src/compression/simpatico_codegen/tests/cache/test_cache_process.py \
+            --worker build/release/simpatico_codegen/tests/cache/test_cache_worker \
+            --project-worker build/release/simpatico_codegen/tests/cache/test_cache_worker_project \
+            --cccl-worker build/release/simpatico_codegen/tests/cache/test_cache_worker_cccl \
+            --version-worker build/release/simpatico_codegen/tests/cache/test_cache_worker_version
 
       - name: Run C++ unit tests
         env:
@@ -243,7 +265,7 @@ jobs:
 
       - name: Upload unit test logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unittest-logs-cuda${{ matrix.cuda.version }}-${{ github.run_id }}
           path: build/release/test/cpp/log/
@@ -289,7 +311,7 @@ jobs:
 
       - name: Upload TPC-H run artifacts
         if: always() && steps.tpch.outputs.run_dir != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tpch-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
           path: ${{ steps.tpch.outputs.run_dir }}

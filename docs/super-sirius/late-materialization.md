@@ -199,12 +199,43 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   installed under the same name. Fail-closed here means the PORT THROWS, not that the query quietly
   re-reads: by that point the scan has emitted rowids in place of values, so no local fallback is
   possible.
-- **Multi-GPU pins are refused.** `resolve_pinned_column`/`materialize()` pass a pin's raw column
-  views and compressed-table pointers straight to a gather on the consumer's current GPU, with no
-  per-device tag and no P2P check, clone, or host-staging fallback — a chunk pinned on a different
-  GPU than the consumer could otherwise be dereferenced directly. Installation refuses outright
-  whenever more than one GPU memory space is active, matching the memory prefetcher's own
-  single-GPU prototype scope.
+- **A compressed chunk on a multi-GPU pin is refused.** Its decode runs on the GPU that holds
+  it, against a selection that lives on the consumer's; the installer declines such a pin
+  rather than stage the selection across, and the query runs as an ordinary scan. (Compressed
+  origins are refused on nullability grounds today anyway, above.) A pin whose chunks have no
+  recorded placement is refused the same way, since a consumer on another GPU could not reach
+  them. `materialize_remote_batch` still refuses such a batch if one reaches it, as an internal
+  error: by then the scan has emitted rowids, so there is nothing to fall back to.
+
+## More than one GPU
+
+A pin is spread round-robin over every GPU memory space, one coalesced batch per chunk, and the
+port may run on any GPU the scheduler hands its task to. So on a multi-GPU host most pins have
+chunks a consumer cannot dereference: pool memory on another device.
+
+Each `batch_source` therefore carries the `memory_space` its chunk lives in (the resolver reads
+it off `device_pin_chunk::memory_space` or `pinned_entry::chunk_memory_spaces`), and
+`materialize()` treats a batch on another GPU differently (`materialize_remote_batch`):
+
+1. The batch-local gather indices are peer-copied to the owning GPU, on a stream of that GPU's
+   memory space, ordered behind the consumer's selection build by an event.
+2. The gather runs THERE, with the owner's allocator, so only the surviving rows are produced.
+3. The gathered column is rebuilt on the consumer's GPU buffer by buffer (data, validity,
+   children, recursively — any dtype crosses), ordered behind the owner's gather by an event.
+4. The owner's temporaries are freed on the owner's stream only after an event records that the
+   consumer's copies have been enqueued.
+
+Both transfers are `cudaMemcpyPeerAsync`: a pair with working peer DMA takes it, and a pair
+without is staged through host by the driver (cucascade disables peer access on pairs whose
+DMA probe fails). What crosses is the size of the SELECTION, not the chunk, which is why the
+cost model is unchanged: the ride still ends at the reduced row set, and the remote gather adds
+two small transfers to it. A remote batch forces the canonical path (per-batch selections),
+because the one-pass raw gather dereferences every batch from the consumer's GPU.
+
+The `[multi_gpu]`-tagged cases in `test_materialize.cpp` and `test_late_mat_deferred_query.cpp`
+exercise this with a batch pinned on GPU 1 and a consumer on GPU 0, and the latter also pins the
+table compressed across both GPUs to show the installer declines and the query still comes back
+right; `run_unit_tests.py`'s `late_mat` step runs them with every GPU visible.
 
 ## Results
 

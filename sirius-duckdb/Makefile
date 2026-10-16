@@ -1,6 +1,5 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-OVERRIDE_GIT_DESCRIBE ?= v1.5.6
 DISABLE_SANITIZER ?= 1
 
 SIRIUS_DUCKDB_LINKAGE ?= $(if $(VCPKG_TOOLCHAIN_PATH),static,shared)
@@ -8,10 +7,12 @@ SIRIUS_DUCKDB_LINKAGE ?= $(if $(VCPKG_TOOLCHAIN_PATH),static,shared)
 override EXT_FLAGS += -DEXPORT_DYNAMIC_SYMBOLS=ON -DSIRIUS_DUCKDB_LINKAGE=$(SIRIUS_DUCKDB_LINKAGE)
 ifeq ($(SIRIUS_DUCKDB_LINKAGE),static)
 export VCPKG_CUDA_ARCHITECTURES ?= $(CUDAARCHS)
-override EXT_FLAGS += -DVCPKG_MANIFEST_FEATURES=static -DVCPKG_INSTALL_OPTIONS=--clean-buildtrees-after-build
+override EXT_FLAGS += -DVCPKG_MANIFEST_INSTALL=ON -DVCPKG_INSTALL_OPTIONS=--clean-buildtrees-after-build
+else ifneq ($(strip $(VCPKG_TOOLCHAIN_PATH)),)
+override EXT_FLAGS += -DVCPKG_MANIFEST_INSTALL=OFF
 endif
 ifneq ($(strip $(SIRIUS_INSTALL_DIR)),)
-override EXT_FLAGS += -Dsirius_DIR='$(SIRIUS_INSTALL_DIR)/lib/cmake/sirius'
+override EXT_FLAGS += -Dsirius_ROOT='$(SIRIUS_INSTALL_DIR)'
 endif
 
 GEN ?= ninja

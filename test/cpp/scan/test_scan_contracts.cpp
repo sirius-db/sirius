@@ -27,6 +27,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_extension.hpp"
 #include "transparent/read_view_registry.hpp"
+#include "transparent/sirius_optimizer_extension.hpp"
 #include "utils/child_process_environment.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 #include "utils/loadable_extension.hpp"
@@ -42,11 +43,15 @@
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/multi_file/multi_file_function.hpp>
 #include <duckdb/common/multi_file/multi_file_list.hpp>
+#include <duckdb/common/multi_file/table_function_multi_file.hpp>
 #include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/extension_helper.hpp>
 #include <duckdb/main/extension_manager.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -105,11 +110,11 @@ duckdb::unique_ptr<duckdb::FunctionData> replacement_bind(
   duckdb::ClientContext&,
   duckdb::TableFunctionBindInput& input,
   duckdb::vector<duckdb::LogicalType>& types,
-  duckdb::vector<std::string>& names)
+  duckdb::vector<duckdb::Identifier>& names)
 {
   types            = {duckdb::LogicalType::INTEGER};
   names            = {"id"};
-  auto const& name = input.table_function.name;
+  auto const& name = input.table_function.GetName();
   if (name == "seq_scan") return duckdb::make_uniq<duckdb::TableScanBindData>(*replacement_table);
   if (name == "sirius_read_parquet")
     return duckdb::make_uniq<duckdb::SiriusReadParquetBindData>("s3://bucket/a.parquet", 1);
@@ -121,11 +126,11 @@ duckdb::unique_ptr<duckdb::FunctionData> replacement_bind(
 duckdb::unique_ptr<duckdb::FunctionData> fake_bind(duckdb::ClientContext&,
                                                    duckdb::TableFunctionBindInput&,
                                                    duckdb::vector<duckdb::LogicalType>&,
-                                                   duckdb::vector<std::string>&)
+                                                   duckdb::vector<duckdb::Identifier>&)
 {
   return nullptr;
 }
-duckdb::unique_ptr<duckdb::MultiFileReader> fake_reader(duckdb::TableFunction const&)
+duckdb::unique_ptr<duckdb::MultiFileReader> fake_reader(duckdb::BoundTableFunction const&)
 {
   return nullptr;
 }
@@ -295,13 +300,14 @@ TEST_CASE("Parquet captures preserve sorted evidence and independent inventories
       shuffled.push_back(files[i]);
     bind.file_list = duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(std::move(shuffled));
     auto resolved  = sirius::planner::resolve_parquet_scan_file_paths(
-      get.function.name, get.bind_data.get(), get.parameters);
+      get.function.GetName().GetIdentifierName(), get.bind_data.get(), get.parameters);
     REQUIRE(resolved.size() == order.size());
     for (std::size_t i = 0; i < order.size(); ++i)
       CHECK(resolved[i] == paths[order[i]]);
     // Resolving the candidate's paths must not move from the actual bound inventory.
     CHECK(sirius::planner::resolve_parquet_scan_file_paths(
-            get.function.name, get.bind_data.get(), get.parameters) == resolved);
+            get.function.GetName().GetIdentifierName(), get.bind_data.get(), get.parameters) ==
+          resolved);
     auto view     = capture_bound_read_view(get, *con.context);
     auto expected = make_bound_read_identity(*view.identity, paths);
     CHECK(view.identity->fingerprint.canonical == expected->fingerprint.canonical);
@@ -432,8 +438,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto supported = certify("r2a_certified_native");
   CHECK(supported.verdict == eligibility_verdict::supported);
   REQUIRE(supported.storage_version);
-  CHECK(*supported.storage_version >= 1);
-  CHECK(*supported.storage_version <= 7);
+  CHECK(*supported.storage_version >= static_cast<uint64_t>(duckdb::StorageVersion::V0_10_2));
+  CHECK(*supported.storage_version <= static_cast<uint64_t>(duckdb::StorageVersion::V2_0_0));
   CHECK(supported.later_checks.test(static_cast<std::size_t>(later_check::segments_per_range)));
   CHECK(supported.later_checks.test(static_cast<std::size_t>(later_check::matrix_per_range)));
 
@@ -472,10 +478,11 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
                                          "iceberg_scan",
                                          "sirius_stream_source"});
   for (auto const& name : names) {
-    auto& catalog_entry =
-      duckdb::Catalog::GetSystemCatalog(*con.context)
-        .GetEntry<duckdb::TableFunctionCatalogEntry>(*con.context, DEFAULT_SCHEMA, name);
-    for (auto function : catalog_entry.functions.functions) {
+    auto& catalog_entry = duckdb::Catalog::GetSystemCatalog(*con.context)
+                            .GetEntry<duckdb::TableFunctionCatalogEntry>(
+                              *con.context, DEFAULT_SCHEMA, duckdb::Identifier(name));
+    for (auto const& registered_function : catalog_entry.functions.functions) {
+      duckdb::BoundTableFunction function(registered_function);
       duckdb::unique_ptr<duckdb::FunctionData> bind;
       if (name == "seq_scan") {
         bind = native_get.bind_data->Copy();
@@ -486,7 +493,7 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
       } else {
         bind = duckdb::make_uniq<duckdb::MultiFileBindData>();
       }
-      duckdb::LogicalGet get(1, function, std::move(bind), {}, {});
+      duckdb::LogicalGet get(duckdb::TableIndex(1), function, std::move(bind), {}, {});
       REQUIRE(sirius::planner::lookup_connector(get, *con.context));
       get.function.function = fake_scan;
       REQUIRE_FALSE(sirius::planner::lookup_connector(get, *con.context));
@@ -497,14 +504,17 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
       get.function.get_multi_file_reader = fake_reader;
       REQUIRE_FALSE(sirius::planner::lookup_connector(get, *con.context));
       get.function           = function;
-      get.function.arguments = {duckdb::LogicalType::BLOB, duckdb::LogicalType::BLOB};
+      auto altered           = *function.GetDefinition();
+      altered.GetSignature() = duckdb::FunctionSignature(
+        {duckdb::LogicalType::BLOB, duckdb::LogicalType::BLOB}, duckdb::LogicalType::TABLE);
+      get.function = duckdb::BoundTableFunction(altered);
       REQUIRE_FALSE(sirius::planner::lookup_connector(get, *con.context));
       get.function = function;
       get.bind_data.reset();
       REQUIRE_FALSE(sirius::planner::lookup_connector(get, *con.context));
     }
   }
-  native_get.function.name = "r1_unknown_scan";
+  native_get.function.SetName("r1_unknown_scan");
   REQUIRE_FALSE(sirius::planner::lookup_connector(native_get, *con.context));
   registry_test_generator generator(*con.context);
   REQUIRE_THROWS_WITH(generator.create_plan(native_get),
@@ -530,15 +540,112 @@ TEST_CASE("Scan consumption fields do not alter read identity", "[scan][contract
   auto& b     = first_get(*second);
   REQUIRE(a.GetColumnIds() != b.GetColumnIds());
   REQUIRE(a.types != b.types);
-  REQUIRE_FALSE(a.table_filters.filters.empty());
-  REQUIRE_FALSE(b.table_filters.filters.empty());
-  REQUIRE(a.table_filters.filters.begin()->second->DebugToString() !=
-          b.table_filters.filters.begin()->second->DebugToString());
+  REQUIRE(a.table_filters.HasFilters());
+  REQUIRE(b.table_filters.HasFilters());
+  REQUIRE_FALSE(a.table_filters.Equals(b.table_filters));
   auto const first_view  = capture_bound_read_view(a, *con.context);
   auto const second_view = capture_bound_read_view(b, *con.context);
   REQUIRE(first_view.identity != second_view.identity);
   CHECK(canonical_read_view_text(first_view) == canonical_read_view_text(second_view));
   CHECK(first_view.identity->fingerprint == second_view.identity->fingerprint);
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE("Parquet plan copies preserve the pruned bound file inventory",
+          "[scan][contracts][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  sirius::test::scratch_dir files("hive_plan_copy");
+  for (auto const* partition : {"part=2", "part=3"}) {
+    auto const directory = files.path() / partition;
+    std::filesystem::create_directories(directory);
+    auto const path = sirius::test::sql_literal((directory / "data.parquet").string());
+    REQUIRE_FALSE(
+      con.Query("COPY (SELECT 1::INTEGER AS id) TO " + path + " (FORMAT PARQUET)")->HasError());
+  }
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  auto const path = sirius::test::sql_literal((files.path() / "part=*" / "data.parquet").string());
+  auto plan       = con.ExtractPlan("SELECT sum(id) FROM read_parquet(" + path +
+                              ", hive_partitioning=true) WHERE part=2");
+  auto& original  = first_get(*plan);
+  auto& original_bind = original.bind_data->Cast<duckdb::MultiFileBindData>();
+  REQUIRE(original_bind.file_list->GetTotalFileCount() == 1);
+  auto copy         = sirius::transparent::copy_logical_plan(*plan, *con.context);
+  auto& copied      = first_get(*copy);
+  auto& copied_bind = copied.bind_data->Cast<duckdb::MultiFileBindData>();
+  CHECK(copied_bind.file_list.get() != original_bind.file_list.get());
+  CHECK(copied_bind.file_list->GetTotalFileCount() == 1);
+  CHECK(canonical_read_view_text(capture_bound_read_view(original, *con.context)) ==
+        canonical_read_view_text(capture_bound_read_view(copied, *con.context)));
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet byte-length expressions stay on GPU",
+                 "[scan][contracts][integration][scalar_pushdown]")
+{
+  auto const parquet =
+    std::string(SIRIUS_PROJECT_ROOT) + "/test/cpp/integration/data/parquet/nation.parquet";
+  compare_gpu_vs_cpu("SELECT sum(strlen(n_name)) FROM read_parquet('" + parquet + "')");
+}
+
+TEST_CASE("Parquet byte-length pushdown declines during planning",
+          "[scan][contracts][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con       = sirius::test::g_shared_env->make_connection();
+  auto& disabled = duckdb::DBConfig::GetConfig(*con.context).options.disabled_optimizers;
+  struct restore_optimizers {
+    std::set<duckdb::OptimizerType>& target;
+    std::set<duckdb::OptimizerType> saved;
+    ~restore_optimizers() { target.swap(saved); }
+  } restore{disabled, disabled};
+  disabled.erase(duckdb::OptimizerType::SCALAR_FN_PUSHDOWN);
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  auto const parquet =
+    std::string(SIRIUS_PROJECT_ROOT) + "/test/cpp/integration/data/parquet/nation.parquet";
+  auto plan = con.ExtractPlan("SELECT sum(strlen(n_name)) FROM read_parquet('" + parquet + "')");
+  auto& get = first_get(*plan);
+  REQUIRE(get.has_pushed_projection);
+  registry_test_generator generator(*con.context);
+  CHECK_THROWS_WITH(generator.create_plan(get),
+                    Catch::Matchers::ContainsSubstring("Expressions pushed into a scan"));
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE("Multi-column Hive predicates decline during planning",
+          "[scan][contracts][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  sirius::test::scratch_dir files("hive_multicolumn");
+  for (auto const* partition : {"part=2", "part=3"}) {
+    auto const directory = files.path() / partition;
+    std::filesystem::create_directories(directory);
+    auto const path = sirius::test::sql_literal((directory / "data.parquet").string());
+    REQUIRE_FALSE(
+      con.Query("COPY (SELECT range::BIGINT AS id FROM range(4)) TO " + path + " (FORMAT PARQUET)")
+        ->HasError());
+  }
+  auto const path = sirius::test::sql_literal((files.path() / "part=*" / "data.parquet").string());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  auto plan = con.ExtractPlan("SELECT * FROM read_parquet(" + path + ", hive_partitioning=true)");
+  auto& get = first_get(*plan);
+  REQUIRE(get.GetColumnIds().size() == 2);
+  get.table_filters.PushMultiColumnFilter(duckdb::make_uniq<duckdb::ExpressionFilter>(
+    duckdb::BoundComparisonExpression::Create(
+      duckdb::ExpressionType::COMPARE_LESSTHAN,
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0),
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 1)),
+    duckdb::vector<duckdb::ProjectionIndex>{duckdb::ProjectionIndex(0),
+                                            duckdb::ProjectionIndex(1)}));
+  registry_test_generator generator(*con.context);
+  CHECK_THROWS_WITH(generator.create_plan(get),
+                    Catch::Matchers::ContainsSubstring("Hive partition columns"));
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
@@ -556,9 +663,13 @@ TEST_CASE("Parquet identity captures bound file options", "[scan][contracts][sha
   for (auto const* option : {"hive_partitioning", "union_by_name", "filename"}) {
     CAPTURE(option);
     auto capture = [&](bool enabled) {
-      auto plan = con.ExtractPlan("SELECT * FROM read_parquet(" + path + ", " + option + "=" +
+      auto plan     = con.ExtractPlan("SELECT * FROM read_parquet(" + path + ", " + option + "=" +
                                   (enabled ? "true" : "false") + ")");
-      return capture_bound_read_view(first_get(*plan), *con.context);
+      auto original = capture_bound_read_view(first_get(*plan), *con.context);
+      auto copy     = sirius::transparent::copy_logical_plan(*plan, *con.context);
+      CHECK(canonical_read_view_text(original) ==
+            canonical_read_view_text(capture_bound_read_view(first_get(*copy), *con.context)));
+      return original;
     };
     auto const disabled = capture(false);
     auto const enabled  = capture(true);
@@ -630,8 +741,8 @@ TEST_CASE("Physical stream lowering records its window without file checks",
   auto& entry = duckdb::Catalog::GetSystemCatalog(*con.context)
                   .GetEntry<duckdb::TableFunctionCatalogEntry>(
                     *con.context, DEFAULT_SCHEMA, "sirius_stream_source");
-  auto function = entry.functions.functions.front();
-  duckdb::LogicalGet get(1,
+  duckdb::BoundTableFunction function(entry.functions.functions.front());
+  duckdb::LogicalGet get(duckdb::TableIndex(1),
                          std::move(function),
                          duckdb::make_uniq<sirius::exec::stream_source_bind_data>(1),
                          {duckdb::LogicalType::INTEGER},
@@ -824,6 +935,10 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
                             "warm_init_local",
                             "warm_serialize",
                             "warm_deserialize",
+                            "cold_nested_scan",
+                            "warm_nested_scan",
+                            "cold_nested_settings",
+                            "warm_nested_settings",
                             "preload_init_global",
                             "preload_init_local",
                             "preload_serialize",
@@ -931,7 +1046,8 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
     load_sirius();
 
   duckdb::TableFunction original;
-  if (iceberg_first) original = loader.GetTableFunction("iceberg_scan").functions.functions.front();
+  if (iceberg_first)
+    original = *loader.GetTableFunction("iceberg_scan").functions.functions.front();
   auto replacement =
     same_signature ? original
                    : duckdb::TableFunction(
@@ -991,9 +1107,9 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
   }
   {
     for (auto const& function : loader.GetTableFunction("iceberg_scan").functions.functions) {
-      if (function.function == fake_scan) continue;
+      if (function->function == fake_scan) continue;
       marker("BEGIN genuine_lookup");
-      auto const* trusted = sirius::planner::lookup_connector(function, &bind, *con.context);
+      auto const* trusted = sirius::planner::lookup_connector(*function, &bind, *con.context);
       marker("END genuine_lookup");
       CHECK(static_cast<bool>(trusted) == (!unavailable && !disabled));
     }
@@ -1047,14 +1163,14 @@ TEST_CASE("Scan registry rejects replacement before Sirius load child", "[.][reg
                     ->HasError());
   }
   duckdb::ExtensionLoader loader(*database.instance, "registry_preload_test");
-  auto original    = loader.GetTableFunction("read_parquet").functions.functions.front();
+  auto original    = *loader.GetTableFunction("read_parquet").functions.functions.front();
   auto replacement = original;
   auto const phase = std::string(std::getenv("SIRIUS_REGISTRY_TRUST_PHASE"));
   replace_callback(replacement, phase);
   duckdb::CreateTableFunctionInfo info(replacement);
   info.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
   loader.RegisterFunction(std::move(info));
-  require_registered_callbacks(loader.GetTableFunction("read_parquet").functions.functions.front(),
+  require_registered_callbacks(*loader.GetTableFunction("read_parquet").functions.functions.front(),
                                replacement);
 
   // Explicitly load Sirius only after the replacement is committed to the catalog.
@@ -1114,10 +1230,10 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
   for (auto const& source : sirius::planner::registered_connectors()) {
     INFO(source.function_name);
     auto& catalog = duckdb::Catalog::GetSystemCatalog(*con.context);
-    auto original = catalog
-                      .GetEntry<duckdb::TableFunctionCatalogEntry>(
-                        *con.context, DEFAULT_SCHEMA, source.function_name)
-                      .functions.functions.front();
+    auto original = *catalog
+                       .GetEntry<duckdb::TableFunctionCatalogEntry>(
+                         *con.context, DEFAULT_SCHEMA, duckdb::Identifier(source.function_name))
+                       .functions.functions.front();
     duckdb::unique_ptr<duckdb::FunctionData> bind;
     if (source.function_name == "seq_scan")
       bind = first_get(*native).bind_data->Copy();
@@ -1127,20 +1243,34 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
       bind = duckdb::make_uniq<sirius::exec::stream_source_bind_data>(1);
     else
       bind = duckdb::make_uniq<duckdb::MultiFileBindData>();
+    bool const nested = std::string_view(phase).find("nested_") != std::string_view::npos;
+    auto const* wrapped =
+      dynamic_cast<duckdb::TableFunctionMultiFileInfo const*>(original.function_info.get());
+    if (nested && !wrapped) continue;
     if (std::string_view(phase).starts_with("warm"))
       REQUIRE(sirius::planner::lookup_connector(original, bind.get(), *con.context));
-    if (std::string_view(phase).ends_with("_same") ||
+    if (nested || std::string_view(phase).ends_with("_same") ||
         std::string_view(phase).find("init_") != std::string_view::npos ||
         std::string_view(phase).ends_with("serialize")) {
       auto replacement = original;
-      replace_callback(replacement, phase);
+      if (nested) {
+        auto info = duckdb::make_shared_ptr<duckdb::TableFunctionMultiFileInfo>(wrapped->function,
+                                                                                wrapped->settings);
+        if (std::string_view(phase).ends_with("settings"))
+          info->settings.supports_cast_map = !info->settings.supports_cast_map;
+        else
+          info->function.function = fake_scan;
+        replacement.function_info = std::move(info);
+      } else {
+        replace_callback(replacement, phase);
+      }
       duckdb::CreateTableFunctionInfo info(replacement);
       info.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
       loader.RegisterFunction(std::move(info));
-      auto registered = catalog
-                          .GetEntry<duckdb::TableFunctionCatalogEntry>(
-                            *con.context, DEFAULT_SCHEMA, source.function_name)
-                          .functions.functions.front();
+      auto registered = *catalog
+                           .GetEntry<duckdb::TableFunctionCatalogEntry>(
+                             *con.context, DEFAULT_SCHEMA, duckdb::Identifier(source.function_name))
+                           .functions.functions.front();
       require_registered_callbacks(registered, replacement);
       CHECK_FALSE(sirius::planner::lookup_connector(registered, bind.get(), *con.context));
       CHECK_FALSE(sirius::planner::lookup_connector(original, bind.get(), *con.context));
@@ -1148,8 +1278,10 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
       restore.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
       loader.RegisterFunction(std::move(restore));
     } else {
-      duckdb::TableFunction replacement(
-        source.function_name, {duckdb::LogicalType::INTEGER}, fake_scan, replacement_bind);
+      duckdb::TableFunction replacement(duckdb::Identifier(source.function_name),
+                                        {duckdb::LogicalType::INTEGER},
+                                        fake_scan,
+                                        replacement_bind);
       loader.RegisterFunction(replacement);
       auto plan = con.ExtractPlan("SELECT * FROM " + source.function_name + "(42)");
       auto& get = first_get(*plan);

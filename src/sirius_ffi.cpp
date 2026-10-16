@@ -17,28 +17,31 @@
 // Implementation of sirius/ffi.hpp. This translation unit sees the heavy internal types so
 // consumers (e.g. the Rust bindings) never include sirius_context.hpp.
 
-#include "config.hpp"                                      // duckdb::Config::LOG_*
-#include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
-#include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
-#include "duckdb/common/enums/optimizer_type.hpp"          // duckdb::OptimizerType
-#include "duckdb/execution/column_binding_resolver.hpp"    // duckdb::ColumnBindingResolver
-#include "duckdb/main/client_context.hpp"                  // duckdb::ClientContext
-#include "duckdb/main/config.hpp"                          // duckdb::DBConfig
-#include "duckdb/main/connection.hpp"                      // duckdb::Connection
-#include "duckdb/main/database.hpp"                        // duckdb::DuckDB
-#include "duckdb/main/prepared_statement_data.hpp"         // duckdb::PreparedStatementData
-#include "duckdb/main/query_result.hpp"                    // duckdb::QueryResult
-#include "duckdb/main/relation.hpp"                        // duckdb::Relation
+#include "config.hpp"                                    // duckdb::Config::LOG_*
+#include "core_functions_extension.hpp"                  // duckdb::CoreFunctionsExtension
+#include "data/sirius_converter_registry.hpp"            // sirius::converter_registry
+#include "duckdb/common/enums/optimizer_type.hpp"        // duckdb::OptimizerType
+#include "duckdb/execution/column_binding_resolver.hpp"  // duckdb::ColumnBindingResolver
+#include "duckdb/main/client_context.hpp"                // duckdb::ClientContext
+#include "duckdb/main/config.hpp"                        // duckdb::DBConfig
+#include "duckdb/main/connection.hpp"                    // duckdb::Connection
+#include "duckdb/main/database.hpp"                      // duckdb::DuckDB
+#include "duckdb/main/prepared_statement_data.hpp"       // duckdb::PreparedStatementData
+#include "duckdb/main/query_result.hpp"                  // duckdb::QueryResult
+#include "duckdb/main/relation.hpp"                      // duckdb::Relation
+#include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
-#include "exec/stream_bind_catalog.hpp"                    // sirius::exec::stream_bind_catalog
+#include "exec/arrow_result_stream.hpp"
+#include "exec/stream_bind_catalog.hpp"   // sirius::exec::stream_bind_catalog
 #include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "log/logging.hpp"                // SIRIUS_LOG_INFO
 #include "parquet_extension.hpp"          // duckdb::ParquetExtension
+#include "planner/unsupported_optimizers.hpp"
 #include "sirius/ffi.hpp"
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
@@ -48,6 +51,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 namespace sirius::ffi {
@@ -115,13 +119,14 @@ sirius::exec::bound_plan lower_substrait(duckdb::Connection& conn,
   prepared->value_map = std::move(planner.value_map);
 
   auto logical_plan = std::move(planner.plan);
-  if (client.config.enable_optimizer) {
+  if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(client)) {
     duckdb::Optimizer optimizer(*planner.binder, client);
     logical_plan = optimizer.Optimize(std::move(logical_plan));
   }
   logical_plan->ResolveOperatorTypes();
   duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*logical_plan);
+  duckdb::ColumnBindingResolver verifier(true);
+  verifier.VisitOperator(*logical_plan);
   resolver.VisitOperator(*logical_plan);
 
   return {std::move(logical_plan), std::move(prepared)};
@@ -179,8 +184,7 @@ struct Context::Impl {
       .SetOptionByName("parquet_metadata_cache", duckdb::Value::BOOLEAN(true));
     conn = duckdb::make_uniq<duckdb::Connection>(*db);
     // Register the engine on the connection and disable DuckDB optimizer rewrites this
-    // no-fallback FFI path cannot safely execute. The transparent path only disables
-    // IN_CLAUSE and COMPRESSED_MATERIALIZATION here; this path remains more conservative.
+    // no-fallback FFI path cannot safely execute.
     auto& client = *conn->context;
     client.registered_state->Insert(kSiriusStateKey, context);
     // Per-connection Sirius state (guard depths, capture bookkeeping) for the
@@ -192,10 +196,13 @@ struct Context::Impl {
     client.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey,
                                     duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
     sirius::exec::register_stream_source_function(*db->instance);
-    client.config.enable_optimizer = true;
+    duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+      client, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(true));
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+    disabled.insert(sirius::planner::unsupported_optimizers.begin(),
+                    sirius::planner::unsupported_optimizers.end());
     // Keep this FFI-only restriction until its no-fallback execution path has
     // dedicated GPU_VALUES coverage.
     disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
@@ -258,9 +265,8 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     plan_ms,
     execute_ms);
 
-  // The stream's release callback deletes the ResultArrowArrayStreamWrapper.
-  auto* wrapper = new duckdb::ResultArrowArrayStreamWrapper(std::move(result), kArrowBatchSize);
-  *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
+  sirius::exec::export_arrow_result(
+    std::move(result), *reinterpret_cast<ArrowArrayStream*>(out_stream_addr), kArrowBatchSize);
 }
 
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
@@ -286,6 +292,7 @@ struct Fragment::Impl {
     std::vector<std::string> names;
     std::vector<std::string> type_names;
     std::set<sirius::exec::sender_id_t> expected_senders;
+    std::optional<std::uint64_t> estimated_rows;
   };
 
   std::map<sirius::exec::stream_id_t, declared_input> inputs;
@@ -325,6 +332,7 @@ struct Fragment::Impl {
       }
       spec.expected_senders = declared.expected_senders;
       if (spec.expected_senders.empty()) { spec.expected_senders.insert(0); }
+      spec.estimated_rows = declared.estimated_rows;
       resolved.emplace(id, std::move(spec));
     }
     return resolved;
@@ -365,6 +373,12 @@ void Fragment::declare_input_sender(std::uint64_t stream_id, std::uint32_t sende
 {
   impl_->require_not_built("declare_input_sender");
   impl_->inputs[stream_id].expected_senders.insert(sender_id);
+}
+
+void Fragment::declare_input_cardinality(std::uint64_t stream_id, std::uint64_t rows)
+{
+  impl_->require_not_built("declare_input_cardinality");
+  impl_->inputs[stream_id].estimated_rows = rows;
 }
 
 void Fragment::declare_output(std::uint64_t stream_id)
@@ -463,15 +477,21 @@ void Fragment::run()
 void Fragment::result_to_arrow(std::uintptr_t out_stream_addr)
 {
   impl_->require_built("result_to_arrow()");
-  auto result   = impl_->fragment->take_result();
-  auto* wrapper = new duckdb::ResultArrowArrayStreamWrapper(std::move(result), kArrowBatchSize);
-  *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
+  auto result = impl_->fragment->take_result();
+  sirius::exec::export_arrow_result(
+    std::move(result), *reinterpret_cast<ArrowArrayStream*>(out_stream_addr), kArrowBatchSize);
 }
 
 std::size_t Fragment::output_batch_count(std::uint64_t stream_id) const
 {
   if (!impl_->fragment) { return 0; }
   return impl_->fragment->output_batch_count(stream_id);
+}
+
+std::uint64_t Fragment::output_row_count(std::uint64_t stream_id) const
+{
+  impl_->require_built("output_row_count()");
+  return impl_->fragment->output_row_count(stream_id);
 }
 
 std::unique_ptr<std::vector<std::string>> Fragment::output_types() const

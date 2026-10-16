@@ -2,6 +2,7 @@
 #pragma once
 
 #include "fused_tree.hpp"
+#include "jit/cache_identity.hpp"
 #include "nvrtc_compiler.hpp"
 
 #include <cstdint>
@@ -11,30 +12,9 @@
 
 namespace codegen::jit {
 
-struct ShapeKey {
-  std::string source_hash;
-  int arch_cc;
-  uint32_t cuda_runtime;
-  uint32_t driver_version;
-
-  bool operator==(const ShapeKey& other) const noexcept
-  {
-    return arch_cc == other.arch_cc && cuda_runtime == other.cuda_runtime &&
-           driver_version == other.driver_version && source_hash == other.source_hash;
-  }
-};
-
-struct ShapeKeyHash {
-  std::size_t operator()(const ShapeKey& k) const noexcept;
-};
-
-std::string source_digest(const std::string& rendered_source);
-ShapeKey shape_key_from(const std::string& rendered_source, int arch_cc);
-
-// Persistent (on-disk) cubin cache. Compiled kernels are keyed by the same
-// (source, arch, cuda runtime, driver) tuple as the in-memory cache and stored
-// as <dir>/<hash>.cubin, so a shape compiled once is reused across processes
-// and across runs. Location resolves to $SIMPATICO_JIT_CACHE_DIR, else
+// Persistent cubins use the versioned compilation identity (see CACHE_FORMAT.md).
+// The process-local table holds the request portion for its fixed environment.
+// Location resolves to $SIMPATICO_JIT_CACHE_DIR, else
 // ${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit; set SIMPATICO_JIT_CACHE_DIR
 // to "off" (or empty) to disable and fall back to in-memory only.
 //
@@ -61,7 +41,7 @@ class KernelCache {
   ~KernelCache() = default;
 
   mutable std::mutex mu_;
-  std::unordered_map<ShapeKey, CompiledKernel, ShapeKeyHash> table_;
+  std::unordered_map<detail::Digest, CompiledKernel, detail::DigestHash> table_;
 };
 
 }  // namespace codegen::jit

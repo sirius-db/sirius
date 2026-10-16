@@ -38,8 +38,8 @@ class TimestampExtractionFixture : public sirius::test::GpuExecutionFixture {
     auto cpu = con->Query(query);
     REQUIRE(cpu);
     REQUIRE_FALSE(cpu->HasError());
-    auto expected = collect_rows(cpu->Cast<duckdb::MaterializedQueryResult>());
-    for (auto const& type : cpu->types) {
+    auto expected = collect_rows(*cpu);
+    for (auto const& type : cpu->GetTypes()) {
       REQUIRE(type == duckdb::LogicalType::BIGINT);
     }
 
@@ -52,8 +52,8 @@ class TimestampExtractionFixture : public sirius::test::GpuExecutionFixture {
     REQUIRE_FALSE(gpu->HasError());
     // A CPU fallback must not turn this regression green.
     sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-    REQUIRE(gpu->types == cpu->types);
-    CHECK(collect_rows(gpu->Cast<duckdb::MaterializedQueryResult>()) == expected);
+    REQUIRE(gpu->GetTypes() == cpu->GetTypes());
+    CHECK(collect_rows(*gpu) == expected);
   }
 
  private:
@@ -75,8 +75,8 @@ TEST_CASE_METHOD(TimestampExtractionFixture,
   run_ok(std::string("CREATE TABLE timestamps (id BIGINT, t ") + type + ")");
 
   // Materialized table columns prevent constant folding of the extraction.
-  // Keep sub-microsecond digits for NS: its implicit cast to TIMESTAMP truncates
-  // toward zero, including just before the epoch and before a minute boundary.
+  // Keep sub-microsecond digits for NS: v2 rounds its implicit cast to TIMESTAMP,
+  // including just before the epoch and before a minute boundary.
   std::vector<std::string> const values = {
     "1970-01-01 00:00:23.040000",
     "1970-01-01 00:00:07.739523",

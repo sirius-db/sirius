@@ -95,6 +95,8 @@ std::optional<resolved_pinned_column> resolve_pinned_column(late_mat::column_ori
     for (auto const& chunk : entry->device_chunks) {
       late_mat::batch_source source;
       source.num_rows = chunk_rows(chunk);
+      // Where the chunk lives, so a consumer on another GPU gathers it there.
+      source.memory_space = chunk.memory_space;
       if (chunk.compressed) {
         if (!chunk.compressed->has_table()) { return std::nullopt; }
         source.compressed   = chunk.compressed.get();
@@ -134,11 +136,15 @@ std::optional<resolved_pinned_column> resolve_pinned_column(late_mat::column_ori
   } else {
     auto const it = entry->data_batches_by_column.find(names[origin.column_pos]);
     if (it == entry->data_batches_by_column.end()) { return std::nullopt; }
-    for (auto const& col : it->second) {
+    for (std::size_t i = 0; i < it->second.size(); ++i) {
+      auto const& col = it->second[i];
       if (!col) { return std::nullopt; }
       late_mat::batch_source source;
       source.uncompressed = col->view();
       source.num_rows     = col->size();
+      // The plain pin records placement per chunk, parallel to the chunks.
+      source.memory_space =
+        i < entry->chunk_memory_spaces.size() ? entry->chunk_memory_spaces[i] : nullptr;
       view.batches.push_back(source);
       if (view.dtype.id() == cudf::type_id::EMPTY) {
         view.dtype = col->type();

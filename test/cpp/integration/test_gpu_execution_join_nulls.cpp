@@ -104,6 +104,40 @@ TEST_CASE_METHOD(JoinNullFixture,
   compare_gpu_vs_cpu("SELECT l.id, l.k IN (SELECT k FROM r WHERE k IS NOT NULL) AS m FROM l");
 }
 
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution NULL NOT IN a constant empty subquery is true",
+                 "[integration][gpu_execution][join][nulls][empty_subquery]")
+{
+  compare_gpu_vs_cpu("SELECT NULL::INTEGER IN (SELECT 1 WHERE false)");
+  compare_gpu_vs_cpu("SELECT NULL::INTEGER NOT IN (SELECT 1 WHERE false)");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution IN and NOT IN with an empty subquery have definite marks",
+                 "[integration][gpu_execution][join][nulls][empty_subquery]")
+{
+  const std::string key_type = GENERATE("INTEGER", "VARCHAR");
+  const std::string empty_source =
+    GENERATE("WHERE CAST(NULL AS BOOLEAN)", "WHERE false", "WHERE k <> k", "empty_build");
+  INFO(key_type << ": " << empty_source);
+  run_ok("CREATE TABLE mark_probe (id INTEGER, k " + key_type + ");");
+  run_ok("CREATE TABLE mark_build (k " + key_type + ");");
+  run_ok("INSERT INTO mark_probe VALUES (1, '1'), (2, NULL), (3, '2');");
+  if (empty_source != "empty_build") { run_ok("INSERT INTO mark_build VALUES ('1'), (NULL);"); }
+  run_ok("CHECKPOINT;");
+
+  // Cover an optimizer-produced EMPTY_RESULT, a runtime-empty filter and a physical empty
+  // table. NULL probe keys must still yield FALSE for IN and TRUE for NOT IN in every case.
+  const auto subquery =
+    "(SELECT k FROM mark_build " + (empty_source == "empty_build" ? "" : empty_source) + ")";
+  compare_gpu_vs_cpu("SELECT id, k IN " + subquery + " AS m FROM mark_probe");
+  compare_gpu_vs_cpu("SELECT id, k NOT IN " + subquery + " AS m FROM mark_probe");
+  // Reduced from fuzz finding 041-mismatch-89bc93ce: an erroneous NULL mark takes ELSE.
+  compare_gpu_vs_cpu("SELECT id, CASE WHEN k NOT IN " + subquery +
+                     " THEN 1.0000::DECIMAL(18,4) ELSE 573493.3702::DECIMAL(18,4) END "
+                     "FROM mark_probe");
+}
+
 TEST_CASE_METHOD(JoinNullFixture,
                  "gpu_execution mixed SEMI and ANTI joins keep matches after NULL build rows",
                  "[integration][gpu_execution][join][nulls][mixed_join]")
@@ -179,4 +213,23 @@ TEST_CASE_METHOD(JoinNullFixture,
   const std::string rhs = right_family ? "selective_big" : "selective_small";
   compare_gpu_vs_cpu("SELECT count(*) FROM " + lhs + " l " + join_type + " JOIN " + rhs +
                      " r ON l.k = r.k AND l.v <> r.v");
+}
+
+TEST_CASE_METHOD(JoinNullFixture,
+                 "gpu_execution inner join keeps residual columns until filtering",
+                 "[integration][gpu_execution][join][join_residual]")
+{
+  // The OR uses both inputs; its columns are absent from the projected result.
+  auto const key = GENERATE("l.k = r.k", "CAST(l.k AS SMALLINT) = CAST(r.k AS SMALLINT)");
+  compare_gpu_vs_cpu(std::string("SELECT r.k AS rk, l.k AS lk FROM l JOIN r ON ") + key +
+                     " AND (l.id < r.id OR l.id + r.id > 8)");
+}
+TEST_CASE_METHOD(JoinNullFixture,
+                 "gpu_execution tuple join keys fall back during planning",
+                 "[integration][gpu_execution][join][tuple]")
+{
+  run_ok("CREATE TABLE tuple_l AS SELECT row(id, k) AS k FROM l");
+  run_ok("CREATE TABLE tuple_r AS SELECT row(id, k) AS k FROM r");
+  run_ok("CHECKPOINT");
+  expect_plan_fallback_matches_cpu("SELECT count(*) FROM tuple_l l JOIN tuple_r r ON l.k = r.k");
 }

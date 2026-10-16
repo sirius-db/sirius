@@ -25,7 +25,7 @@
 #include "op/partition_placement.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
-#include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry-bridge/gen/quent.hpp"
 
 #include <cudf/types.hpp>
 
@@ -280,6 +280,22 @@ class pipelineable_operator_data : public operator_data {
    */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
     const;
+
+  /**
+   * @brief Task input of the same kind with @p data_batches in place of the batches.
+   *
+   * Late materialization calls it when it restores deferred columns just before an operator's
+   * execute(). Subclasses that carry state besides the batches, such as a cross product task's
+   * slice, override it to copy that state into the new task input.
+   *
+   * @param data_batches The batches of the new task input.
+   * @return A task input of the same type, holding @p data_batches.
+   */
+  [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_data_batches(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches) const
+  {
+    return std::make_unique<pipelineable_operator_data>(std::move(data_batches));
+  }
 
   /**
    * @brief Get read-only accessors for the batches. Returns the pin locks acquired by
@@ -725,7 +741,7 @@ class sirius_physical_operator {
     //! A UUID for a port on an operator at the beginning of a
     // pipeline. This port receives data from a prior pipeline,
     // forming an incoming edge from that pipeline.
-    uuid::UUID source_port_uuid{uuid::now_v7()};
+    quent::Uuid source_port_uuid{quent::now_v7()};
   };
 
   /// Describes a downstream operator's port to which data is pushed
@@ -745,7 +761,7 @@ class sirius_physical_operator {
     // │ └────┘   │ └─ port ──┘     │  │  │  │     └────────┘  │   └────┘ │
     // │          └─────────────────┘  │  │  └─────────────────┘          │
     // └───────────────────────────────┘  └───────────────────────────────┘
-    uuid::UUID pseudo_sink_port_uuid;
+    quent::Uuid pseudo_sink_port_uuid;
   };
 
   /**

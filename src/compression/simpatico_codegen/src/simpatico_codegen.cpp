@@ -29,6 +29,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -440,6 +441,9 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   if (k_total + (has_keep_mask ? 1 : 0) > 8) return refuse("more than 8 mask sources");
   if (request.routes.size() != selected.size())
     return refuse("request.routes not parallel to selected");
+  std::size_t const delivered = request.delivered_prefix.value_or(selected.size());
+  if (delivered == 0 || delivered > selected.size())
+    return refuse("delivered_prefix outside [1, selected.size()]");
   if (pool.streams.empty()) return refuse("stream pool empty");
   int64_t const num_rows = table.num_rows();
   if (num_rows <= 0) return refuse("num_rows <= 0");
@@ -860,11 +864,17 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // work serializes behind it on s0; the other streams run free). Built ONCE
     // per batch and SHARED by every consumer: the full-width gathers and the
     // index-list decodes (the same int32 buffer).
-    result.routes        = routes;
-    bool const any_bool8 = k_bool8 > 0;  // dual-delivery gathers need the indices too
+    result.routes.assign(routes.begin(), routes.begin() + static_cast<std::ptrdiff_t>(delivered));
+    // Only a delivered column consumes the map -- its BOOL8 answer gather, its `full` gather, or
+    // its index-list decode -- so a column past the delivered prefix never makes it worth building.
+    bool const needs_survivor_indices =
+      std::ranges::any_of(std::views::iota(std::size_t{0}, delivered), [&](std::size_t i) {
+        return is_bool8_slot[i] || routes[i] == sc::decode_route::full ||
+               (index_walk_pick && routes[i] == sc::decode_route::bitpack_mask);
+      });
     cudf::column_view survivor_indices{
       cudf::data_type{cudf::type_id::INT32}, 0, nullptr, nullptr, 0};
-    if ((any_full || index_walk_pick || any_bool8) && sel.survivor_count > 0) {
+    if (needs_survivor_indices && sel.survivor_count > 0) {
       result.row_indices = rmm::device_buffer(
         static_cast<std::size_t>(sel.survivor_count) * sizeof(std::int32_t), s0, mr);
       sc::mask_to_row_indices(sel, static_cast<std::int32_t*>(result.row_indices.data()), s0);
@@ -892,8 +902,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // decompress_column(..., decode_selection const*) contract. Everything
     // wave 2 consumes (mask, chunk_offsets) completed before the CNT host sync
     // above, so no cross-stream waits are needed.
-    std::vector<std::unique_ptr<cudf::column>> cols(selected.size());
-    run_column_workers(selected.size(), pool, [&](size_t i, ::cuda::stream_ref stream) {
+    //
+    // Only the delivered prefix runs: a column past it was a wave-1 source at most, so its value
+    // decode (or its BOOL8 answer gather) is skipped and nothing is allocated for it.
+    std::vector<std::unique_ptr<cudf::column>> cols(delivered);
+    run_column_workers(delivered, pool, [&](size_t i, ::cuda::stream_ref stream) {
       auto const& col = table.columns[selected[i]];
       if (is_bool8_slot[i]) {
         // The slot's output is the wave-1 BOOL8 gathered to survivor rows
@@ -1260,7 +1273,8 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
       }
       std::fprintf(stderr,
                    "simpatico: filtered decode applied: survivors=%lld/%lld "
-                   "routes bitpack=%d delta=%d dict=%d str_split=%d full=%d sources=%zu\n",
+                   "routes bitpack=%d delta=%d dict=%d str_split=%d full=%d sources=%zu "
+                   "delivered=%zu/%zu\n",
                    static_cast<long long>(result.survivor_count),
                    static_cast<long long>(result.num_rows),
                    n_a,
@@ -1268,7 +1282,9 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
                    n_dict,
                    n_str_split,
                    n_b,
-                   request.filters.size() + request.bool8_filters.size());
+                   request.filters.size() + request.bool8_filters.size(),
+                   result.routes.size(),
+                   selected_columns.size());
     }
     // Reconcile the wave's ragged output into one uniformly survivor-sized
     // table before it leaves: the compacted routes came back survivor-sized and

@@ -16,6 +16,7 @@
 
 #include "planner/query.hpp"
 #include "query_id.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <catch.hpp>
@@ -90,7 +91,7 @@ TEST_CASE("planner::query reports the id it was constructed with", "[query_id]")
   // window's id so repositories, scheduling and window logs all agree.
   auto tctx           = sirius::test::make_test_telemetry_context();
   const auto query_id = make_query_id(9876);
-  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
+  sirius::telemetry::query_telemetry_info tinfo{quent::now_v7(), tctx->worker_id().raw(), query_id};
 
   sirius::planner::query q(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
                            tctx->context(),
@@ -106,7 +107,7 @@ TEST_CASE("planner::query ids are not drawn from a shared counter", "[query_id]"
   // back, which is what allowed a second, independent query-id counter to exist.
   auto tctx           = sirius::test::make_test_telemetry_context();
   const auto query_id = make_query_id(11);
-  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
+  sirius::telemetry::query_telemetry_info tinfo{quent::now_v7(), tctx->worker_id().raw(), query_id};
 
   sirius::planner::query first(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
                                tctx->context(),

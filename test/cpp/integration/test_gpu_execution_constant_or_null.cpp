@@ -68,12 +68,13 @@ class ConstantOrNullFixture : public sirius::test::GpuExecutionFixture {
 }  // namespace
 
 TEST_CASE_METHOD(ConstantOrNullFixture,
-                 "constant_or_null in a filter pushed into the scan",
+                 "statistics-simplified scan filters preserve NULL semantics",
                  "[integration][gpu_execution][constant_or_null]")
 {
   for (auto const* table : {"t", "p"}) {
-    compare(std::string("SELECT i FROM ") + table +
-            " WHERE (d BETWEEN 10 AND 20) OR (d BETWEEN 150 AND 250);");
+    // DuckDB removes the redundant upper bound without retaining constant_or_null.
+    compare_gpu_vs_cpu(std::string("SELECT i FROM ") + table +
+                       " WHERE (d BETWEEN 10 AND 20) OR (d BETWEEN 150 AND 250);");
   }
 }
 

@@ -1,58 +1,112 @@
 # NVRTC cache identity format
 
-The identity primitives live in `src/jit/cache_identity.hpp`. They have no CUDA
-dependency and are tested by the standalone `tests/cache` CMake project.
+The host-only identity API is in [cache_identity.hpp](src/jit/cache_identity.hpp).
 
-## Version 2 encoding
+## Versions
 
-All numbers are unsigned 64-bit integers in big-endian byte order. A string is its
-byte length followed by that many bytes, without a terminator. Hash input is streamed
-into XXH3-128, without concatenating the rendered source. Digests use xxHash's
-canonical big-endian representation: 16 binary bytes in memory and 32 lowercase
-hexadecimal digits in paths. Runtime hashing uses xxHash's header-only mode, with
-no shared-library dependency or CLI invocation.
+One cache-format version, `kCacheFormatVersion` in
+[cache_identity.hpp](src/jit/cache_identity.hpp), controls both identity domains
+and the disk namespace. They always advance together.
 
-A request record contains, in order:
+| Component | Current version | Canonical definition |
+| --- | --- | --- |
+| Request identity | `simpatico-request-v2` | `request_identity()` |
+| Environment identity | `simpatico-environment-v2` | `environment_identity()` |
+| Disk path layout | `v2/` | `CompilationIdentity::relative_path()` |
 
-1. The string `simpatico-request-v2` (record type and schema version).
-2. Source, entry symbol, and program name, each encoded as a string.
-3. The option count, followed by each effective NVRTC option as a string, in order.
-   Architecture is included through the actual `-arch=sm_...` option.
+The domains and path are derived from that constant in
+[cache_identity.cpp](src/jit/cache_identity.cpp).
 
-An environment record contains, in order:
+### Version bumps
 
-1. The string `simpatico-environment-v2`.
-2. Provider name, project header identity, CCCL header identity, and compiler
-   identity, each encoded as a string.
-3. CUDA runtime build version and driver compatibility version, encoded as numbers.
+Bump `kCacheFormatVersion` for incompatible changes to identity fields, their
+order/encoding or meaning, the hash convention, or the disk layout/record contract.
+For example, `v2.1` would use `simpatico-request-v2.1`,
+`simpatico-environment-v2.1`, and `v2.1/` together. This is a format label, not
+automatic semantic versioning. Update lookup/cleanup consumers, format expectations,
+and this document in the same change.
 
-`CompilationIdentity` combines these records into
-`v2/<environment-xxh3-128>/<request-xxh3-128>.cubin`. The process-local table can use
-only the request digest when its environment is immutable. Once released, a
-format/semantic change must bump the namespace and record version. Legacy flat cubins must not be read
-under this scheme; they lack sufficient identity information. Different environment
-namespaces may coexist. Hash collisions remain theoretically possible.
+The host identity test uses the production request builder in
+[compilation_request.hpp](src/jit/compilation_request.hpp), including its program
+name and effective options, and the production environment encoder. Expected
+digests stay hard-coded in the test. Changes to these inputs or their encoding
+fail the test; review the format version before updating the golden vectors.
 
-## Embedded header manifests
+New source, entry/program names, options, header contents/inventory, or NVRTC
+versions change the digests automatically; they need no format bump. Neither do
+Sirius releases. An unreleased format can be revised in place.
 
-The production embedders normalize CRLF/CR to LF before both emitting and hashing
-header content. Resolve search paths first, then sort the selected logical names
-bytewise. The manifest begins with `simpatico-headers-v2` and a newline. Each record
-contains the decimal byte length of the logical name, a colon, the name, then the
-decimal byte length of the normalized contents, a colon, and the contents. Lengths
-delimit fields without additional separators or per-header digests. The packaged
-`xxhsum -H128` tool hashes the complete manifest once; its XXH3-128 digest is emitted
-beside the same header table used for compilation.
+## Identity encoding
 
-Project headers and the complete installed CCCL header inventory form separate
-bundles. The CCCL inventory includes files under `cub/`, `thrust/`, `cuda/`, and
-`nv/`, with the first include root winning duplicate logical names.
+Request and environment records start with their length-prefixed domain string
+from the table.
+Numbers are unsigned 64-bit big-endian. Strings are a byte length followed by
+those bytes, with no terminator. Remaining fields, in order:
 
-Physical installation paths are absent. Search-path reordering matters only when
-it changes the selected contents. Directory dependencies also track previously
-unsuccessful searches so a new earlier header invalidates the generated table.
+- **Request:** source, entry symbol, program name; option count; each effective
+  NVRTC option in order. Strings use the encoding above; the count is a number.
+  Target SM is included through `-arch=sm_...`.
+- **Environment:** project-header digest string, CCCL-header digest string;
+  NVRTC major, then minor, each encoded as a number.
 
-## Running host coverage
+Records are streamed into XXH3-128 without concatenating the source. Runtime
+hashing is header-only, with no shared-library dependency or CLI invocation.
+Digests are 16 canonical big-endian bytes, represented by 32 lowercase hex digits
+in paths: `v2/<environment-digest>/<request-digest>.cubin`.
+
+Memory lookup needs only the request digest while the environment is immutable.
+Different environment directories may coexist. Legacy flat cubins lack sufficient
+identity information and must not be read. Hash collisions remain possible.
+
+## Compiler and reuse policy
+
+`cache_environment()` in [nvrtc_compiler.cpp](src/jit/nvrtc_compiler.cpp) combines
+the two header-bundle digests with `nvrtcVersion()` major/minor. This is the entire
+environment identity for both shared and static builds: no NVRTC/builtins-library
+or static-archive hashes, host-object epochs, provider/linkage labels, or CUDA
+runtime/driver tags.
+
+Same-major/minor compiler patches retain reuse even if their binaries differ.
+A compatible CUDA driver is still required to load the CUBIN.
+
+We deliberately hash the source/options and named headers supplied to NVRTC.
+Host-object epochs would also invalidate on build or host-code changes with
+unchanged compilation inputs. The tradeoff is maintaining the input contract:
+include new compilation inputs and bump the shared format version under the rules
+above when its contract changes.
+
+The environment is computed once on first disk use. A failed version query
+reports its NVRTC error; it never substitutes zero or silently disables disk
+caching. Memory hits and disk-disabled compilation skip the query. Replacing
+the compiler/runtime within a process is unsupported.
+
+## Header manifests
+
+Project headers and the complete CCCL inventory (`cub/`, `thrust/`, `cuda/`, `nv/`)
+are separate bundles. The first include root wins duplicate logical names; names
+are then sorted bytewise. CRLF/CR become LF before both embedding and hashing.
+
+The manifest starts with literal `simpatico-headers-v2` followed by one LF.
+Each record is `<name-byte-length>:<name><content-byte-length>:<normalized-content>`.
+Lengths are decimal; no separators between records or per-header digests are added.
+`xxhsum -H128` hashes the complete manifest once at build time, and its digest is
+emitted beside the same header table supplied to NVRTC.
+
+This build-time manifest framing is defined by
+[embed_jit_headers.cmake](cmake/embed_jit_headers.cmake) and
+[embed_cccl_headers.cmake](cmake/embed_cccl_headers.cmake), with shared encoding in
+[jit_header_manifest.cmake](cmake/jit_header_manifest.cmake). Its prefix describes
+the bundle encoding, not another runtime cache version. A framing change must
+update both embedders together; changed bundle digests invalidate the environment.
+
+Physical paths are excluded. Include-root reordering matters only when selected
+contents change. Directory dependencies track unsuccessful searches too, so newly
+shadowing headers regenerate the table.
+
+## Coverage
+
+Host tests need no CUDA driver and exercise the production embedders, relocation,
+include ordering, and incremental content/shadowing changes:
 
 ```sh
 pixi run cmake -S src/compression/simpatico_codegen/tests/cache -B build/cache-host -G Ninja
@@ -60,7 +114,14 @@ pixi run cmake --build build/cache-host
 pixi run ctest --test-dir build/cache-host -L cache_host --output-on-failure --no-tests=error
 ```
 
-The Test workflow invokes this project on its CPU runners for both supported CUDA
-environments according to the existing matrix. These tests do not load the CUDA
-driver. They exercise the production generators, content-sensitive manifests,
-relocated prefixes, include ordering, and incremental content/shadowing updates.
+For GPU coverage, build `simpatico_cache_gpu_tests` and run CTest with
+`-L cache_gpu` in the Simpatico build directory. Workers use fresh processes and
+temporary caches with CUDA's own cache disabled. They check results and statistics
+for header changes, same-version NVRTC/builtins relocation or byte changes,
+version changes/query errors, and disk-disabled compilation. Header variants use
+the production embedders with identical kernel source; Linux version/error cases
+wrap the query while compilation still uses real NVRTC.
+
+The Test workflow runs host and GPU coverage using its configured CUDA matrix,
+independently of Sirius's Catch2 suite. Disk hits perform no compiler-file scan
+or builtins-loading probe.

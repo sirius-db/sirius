@@ -31,25 +31,31 @@
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/file_system.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <duckdb/common/multi_file/table_function_multi_file.hpp>
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/function/table/table_scan.hpp>
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
+#include <duckdb/main/extension/external_extension_provider.hpp>
 #include <duckdb/main/extension_helper.hpp>
 #include <duckdb/main/extension_manager.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <link.h>
 #include <parquet_extension.hpp>
-#include <parquet_multi_file_info.hpp>
 
 #include <array>
 #include <mutex>
 #include <tuple>
 #include <unordered_set>
+
+extern "C" int32_t duckdb_extension_parquet_describe(duckdb_extension_descriptor*);
 
 namespace sirius::planner {
 namespace {
@@ -203,14 +209,15 @@ op::scan::certification_result supported_native(op::scan::bound_table_scan const
       "duckdb-native scan rejected query: encrypted storage is not GPU-decodable";
     return result;
   }
-  if (!manager.HasStorageVersion() || manager.GetStorageVersion() < 1 ||
-      manager.GetStorageVersion() > 7) {
+  if (!manager.HasStorageVersion() ||
+      manager.GetStorageVersion() < duckdb::StorageVersion::V0_10_2 ||
+      manager.GetStorageVersion() > duckdb::StorageVersion::V2_0_0) {
     result.verdict     = op::scan::eligibility_verdict::unsupported;
     result.reason      = op::scan::verdict_reason::native_storage_version_unqualified;
     result.reason_text = "duckdb-native scan rejected query: storage version is not qualified";
     return result;
   }
-  result.storage_version = manager.GetStorageVersion();
+  result.storage_version = static_cast<uint64_t>(manager.GetStorageVersion());
   return result;
 }
 
@@ -317,6 +324,37 @@ std::array<connector, 6> const entries{make_seq_scan_connector(),
                                        make_iceberg_scan_connector(),
                                        make_sirius_stream_source_connector()};
 
+duckdb::vector<duckdb::TableFunction> copy_functions(duckdb::TableFunctionSet const& functions)
+{
+  duckdb::vector<duckdb::TableFunction> result;
+  for (auto const& function : functions.functions)
+    result.push_back(*function);
+  return result;
+}
+
+duckdb_extension_describe_t host_parquet_descriptor(duckdb::DatabaseInstance& db)
+{
+  return detail::host_factory(
+    db, &duckdb_extension_parquet_describe, "duckdb_extension_parquet_describe");
+}
+
+duckdb::vector<duckdb::TableFunction> parquet_reference_functions(duckdb::DatabaseInstance& db,
+                                                                  std::string const& name)
+{
+  auto init = host_parquet_descriptor(db);
+  if (!init) return {};
+  duckdb::DBConfig config;
+  config.options.load_extensions = false;
+  config.options.maximum_threads = 1;
+  duckdb::DuckDB reference(nullptr, &config);
+  // Register the host's implementation in a private catalog, independent of user replacements.
+  reference.LoadStaticExtension(init);
+  duckdb::ExtensionLoader loader(*reference.instance, "parquet");
+  auto entry = loader.TryGetTableFunction(duckdb::Identifier(name));
+  return entry ? copy_functions(entry->Cast<duckdb::TableFunctionCatalogEntry>().functions)
+               : duckdb::vector<duckdb::TableFunction>{};
+}
+
 duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::DatabaseInstance& db)
 {
   auto info = duckdb::ExtensionManager::Get(db).GetExtensionInfo("iceberg");
@@ -345,25 +383,23 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Databa
     duckdb::DBConfig config;
     config.options.load_extensions = false;
     config.options.maximum_threads = 1;
+    // Iceberg loads Avro into this private catalog under the host's signature policy.
+    config.SetOptionByName(
+      "allow_unsigned_extensions",
+      duckdb::Value::BOOLEAN(duckdb::Settings::Get<duckdb::AllowUnsignedExtensionsSetting>(db)));
     duckdb::DuckDB reference(nullptr, &config);
-    reference.LoadStaticExtension<duckdb::ParquetExtension>();
-    // Iceberg derives scan callbacks from Parquet; use the caller's DuckDB factory.
-    auto get_parquet = detail::host_factory(db,
-                                            &duckdb::ParquetScanFunction::GetFunctionSet,
-                                            "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv");
-    if (!get_parquet) return {};
-    duckdb::ExtensionLoader parquet_loader(*reference.instance, "parquet");
-    auto functions = get_parquet();
-    for (auto const* name : {"read_parquet", "parquet_scan"}) {
-      functions.name = name;
-      duckdb::CreateTableFunctionInfo info(functions);
-      info.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
-      parquet_loader.RegisterFunction(std::move(info));
-    }
+    // The host outlives this private catalog; reuse its provider for Iceberg's Avro dependency.
+    duckdb::DBConfig::GetConfig(*reference.instance)
+      .SetExternalExtensionProvider(duckdb::shared_ptr<duckdb::ExternalExtensionProvider>(
+        &duckdb::DBConfig::GetConfig(db).GetExternalExtensionProvider(),
+        [](duckdb::ExternalExtensionProvider*) {}));
+    auto parquet_init = host_parquet_descriptor(db);
+    if (!parquet_init) return {};
+    reference.LoadStaticExtension(parquet_init);
     duckdb::ExtensionLoader loader(*reference.instance, "iceberg");
     init(loader);
     auto entry = loader.TryGetTableFunction("iceberg_scan");
-    if (entry) return entry->Cast<duckdb::TableFunctionCatalogEntry>().functions.functions;
+    if (entry) return copy_functions(entry->Cast<duckdb::TableFunctionCatalogEntry>().functions);
   }
   return {};
 }
@@ -379,10 +415,7 @@ duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& nam
                : duckdb::vector<duckdb::TableFunction>{};
   }
   if (name == "parquet_scan" || name == "read_parquet") {
-    auto get = detail::host_factory(db,
-                                    &duckdb::ParquetScanFunction::GetFunctionSet,
-                                    "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv");
-    return get ? get().functions : duckdb::vector<duckdb::TableFunction>{};
+    return parquet_reference_functions(db, name);
   }
   if (name == "sirius_read_parquet") return {duckdb::GetSiriusReadParquetFunction()};
   if (name == "sirius_stream_source") return {exec::get_stream_source_function()};
@@ -396,7 +429,8 @@ struct verified_callbacks {
   /// Borrowed trusted definition; it must outlive this comparison object.
   duckdb::TableFunction const& reference;
 
-  bool matches(duckdb::TableFunction const& candidate) const
+  template <class Function>
+  bool matches(Function const& candidate, unsigned depth = 0) const
   {
     // Initialization, binding/copy, and optimizer callbacks can change the reader's semantics
     // even when its scan body is unchanged. Only presentation/profiling callbacks are excluded.
@@ -416,7 +450,7 @@ struct verified_callbacks {
                     reference.pushdown_expression,
                     reference.get_partition_data,
                     reference.get_bind_info,
-                    reference.type_pushdown,
+                    reference.projection_expression_pushdown,
                     reference.get_multi_file_reader,
                     reference.supports_pushdown_type,
                     reference.supports_pushdown_extract,
@@ -434,45 +468,94 @@ struct verified_callbacks {
                     reference.late_materialization,
                     reference.order_preservation_type,
                     reference.global_initialization,
-                    reference.arguments,
-                    reference.varargs,
-                    reference.named_parameters) == std::tie(candidate.function,
-                                                            candidate.bind,
-                                                            candidate.bind_replace,
-                                                            candidate.bind_operator,
-                                                            candidate.init_global,
-                                                            candidate.init_local,
-                                                            candidate.in_out_function,
-                                                            candidate.in_out_function_final,
-                                                            candidate.statistics,
-                                                            candidate.statistics_extended,
-                                                            candidate.dependency,
-                                                            candidate.cardinality,
-                                                            candidate.pushdown_complex_filter,
-                                                            candidate.pushdown_expression,
-                                                            candidate.get_partition_data,
-                                                            candidate.get_bind_info,
-                                                            candidate.type_pushdown,
-                                                            candidate.get_multi_file_reader,
-                                                            candidate.supports_pushdown_type,
-                                                            candidate.supports_pushdown_extract,
-                                                            candidate.get_partition_info,
-                                                            candidate.get_partition_stats,
-                                                            candidate.get_virtual_columns,
-                                                            candidate.get_row_id_columns,
-                                                            candidate.set_scan_order,
-                                                            candidate.serialize,
-                                                            candidate.deserialize,
-                                                            candidate.projection_pushdown,
-                                                            candidate.filter_pushdown,
-                                                            candidate.filter_prune,
-                                                            candidate.sampling_pushdown,
-                                                            candidate.late_materialization,
-                                                            candidate.order_preservation_type,
-                                                            candidate.global_initialization,
-                                                            candidate.arguments,
-                                                            candidate.varargs,
-                                                            candidate.named_parameters);
+                    reference.GetSignature(),
+                    reference.is_repeatable,
+                    reference.set_partitions_to_scan,
+                    reference.parallelism) == std::tie(candidate.function,
+                                                       candidate.bind,
+                                                       candidate.bind_replace,
+                                                       candidate.bind_operator,
+                                                       candidate.init_global,
+                                                       candidate.init_local,
+                                                       candidate.in_out_function,
+                                                       candidate.in_out_function_final,
+                                                       candidate.statistics,
+                                                       candidate.statistics_extended,
+                                                       candidate.dependency,
+                                                       candidate.cardinality,
+                                                       candidate.pushdown_complex_filter,
+                                                       candidate.pushdown_expression,
+                                                       candidate.get_partition_data,
+                                                       candidate.get_bind_info,
+                                                       candidate.projection_expression_pushdown,
+                                                       candidate.get_multi_file_reader,
+                                                       candidate.supports_pushdown_type,
+                                                       candidate.supports_pushdown_extract,
+                                                       candidate.get_partition_info,
+                                                       candidate.get_partition_stats,
+                                                       candidate.get_virtual_columns,
+                                                       candidate.get_row_id_columns,
+                                                       candidate.set_scan_order,
+                                                       candidate.serialize,
+                                                       candidate.deserialize,
+                                                       candidate.projection_pushdown,
+                                                       candidate.filter_pushdown,
+                                                       candidate.filter_prune,
+                                                       candidate.sampling_pushdown,
+                                                       candidate.late_materialization,
+                                                       candidate.order_preservation_type,
+                                                       candidate.global_initialization,
+                                                       candidate.GetSignature(),
+                                                       candidate.is_repeatable,
+                                                       candidate.set_partitions_to_scan,
+                                                       candidate.parallelism) &&
+           matches_info(candidate.function_info.get(), depth);
+  }
+
+  bool matches_info(duckdb::TableFunctionInfo const* candidate, unsigned depth) const
+  {
+    auto const* trusted = reference.function_info.get();
+    if (!trusted || !candidate) return trusted == candidate;
+    // Multi-file callbacks delegate to this nested function and its reader settings.
+    // Unknown info types and recursive wrappers cannot establish independent trust.
+    if (depth >= 2) return false;
+    auto const* left  = dynamic_cast<duckdb::TableFunctionMultiFileInfo const*>(trusted);
+    auto const* right = dynamic_cast<duckdb::TableFunctionMultiFileInfo const*>(candidate);
+    if (!left || !right) return false;
+    auto const& a = left->settings;
+    auto const& b = right->settings;
+    return std::tie(a.glob_input.behavior,
+                    a.glob_input.allow_empty,
+                    a.glob_input.extension,
+                    a.reader_type,
+                    a.maximum_sample_files,
+                    a.sample_files_parameter,
+                    a.sampled_schema_is_union,
+                    a.claim_batch,
+                    a.finish_batch,
+                    a.supports_read_ahead,
+                    a.schedule_io,
+                    a.prepare_read_ahead,
+                    a.combine_schema,
+                    a.get_file_columns,
+                    a.reuses_local_state,
+                    a.supports_cast_map) == std::tie(b.glob_input.behavior,
+                                                     b.glob_input.allow_empty,
+                                                     b.glob_input.extension,
+                                                     b.reader_type,
+                                                     b.maximum_sample_files,
+                                                     b.sample_files_parameter,
+                                                     b.sampled_schema_is_union,
+                                                     b.claim_batch,
+                                                     b.finish_batch,
+                                                     b.supports_read_ahead,
+                                                     b.schedule_io,
+                                                     b.prepare_read_ahead,
+                                                     b.combine_schema,
+                                                     b.get_file_columns,
+                                                     b.reuses_local_state,
+                                                     b.supports_cast_map) &&
+           verified_callbacks(left->function).matches(right->function, depth + 1);
   }
 };
 /// Process-wide verification state for one connector, indexed alongside entries.
@@ -538,14 +621,15 @@ void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
   initialize_iceberg_callbacks(db);
 }
 
-lookup_outcome lookup_connector_classified(duckdb::TableFunction const& function,
-                                           duckdb::FunctionData const* bind,
-                                           duckdb::ClientContext& context)
+template <class Function>
+lookup_outcome lookup_connector_classified_impl(Function const& function,
+                                                duckdb::FunctionData const* bind,
+                                                duckdb::ClientContext& context)
 {
   bool function_known = false;
   for (size_t i = 0; i < entries.size(); ++i) {
     auto const& entry = entries[i];
-    if (entry.function_name != function.name) continue;
+    if (entry.function_name != function.GetName()) continue;
     function_known = true;
     if (!entry.bind_data_matches(bind)) continue;
     // The catalog's destructor identifies its host without a loader lookup per scan.
@@ -554,7 +638,10 @@ lookup_outcome lookup_connector_classified(duckdb::TableFunction const& function
     std::lock_guard lock(cache.mutex);
     auto catalog_entry =
       duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::TableFunctionCatalogEntry>(
-        context, DEFAULT_SCHEMA, entry.function_name, duckdb::OnEntryNotFound::RETURN_NULL);
+        context,
+        DEFAULT_SCHEMA,
+        duckdb::Identifier(entry.function_name),
+        duckdb::OnEntryNotFound::RETURN_NULL);
     if (!catalog_entry) return {nullptr, lookup_decline::catalog_entry_missing};
     // A mutable catalog can confirm registration, but must never grant trust.
     auto const& references = cache.reference.get_or_resolve(
@@ -567,7 +654,7 @@ lookup_outcome lookup_connector_classified(duckdb::TableFunction const& function
             entry.function_name == "read_parquet") {
           requirement =
             "An external DuckDB host must export "
-            "TableScanFunction::GetFunction and ParquetScanFunction::GetFunctionSet.";
+            "TableScanFunction::GetFunction and duckdb_extension_parquet_describe.";
         }
         SIRIUS_LOG_WARN(
           "GPU scan source '{}' has no trusted reference definition; GPU lowering "
@@ -581,7 +668,7 @@ lookup_outcome lookup_connector_classified(duckdb::TableFunction const& function
       verified_callbacks const callbacks(reference);
       if (!callbacks.matches(function)) continue;
       for (auto const& registered : catalog_entry->functions.functions) {
-        if (callbacks.matches(registered)) return {&entry, lookup_decline::none};
+        if (callbacks.matches(*registered)) return {&entry, lookup_decline::none};
       }
     }
     return {nullptr, lookup_decline::callback_mismatch};
@@ -593,14 +680,21 @@ lookup_outcome lookup_connector_classified(duckdb::TableFunction const& function
 lookup_outcome lookup_connector_classified(duckdb::LogicalGet const& get,
                                            duckdb::ClientContext& context)
 {
-  return lookup_connector_classified(get.function, get.bind_data.get(), context);
+  return lookup_connector_classified_impl(get.function, get.bind_data.get(), context);
 }
 
 connector const* lookup_connector(duckdb::TableFunction const& function,
                                   duckdb::FunctionData const* bind,
                                   duckdb::ClientContext& context)
 {
-  return lookup_connector_classified(function, bind, context).entry;
+  return lookup_connector_classified_impl(function, bind, context).entry;
+}
+
+connector const* lookup_connector(duckdb::BoundTableFunction const& function,
+                                  duckdb::FunctionData const* bind,
+                                  duckdb::ClientContext& context)
+{
+  return lookup_connector_classified_impl(function, bind, context).entry;
 }
 
 connector const* lookup_connector(duckdb::LogicalGet const& get, duckdb::ClientContext& context)
