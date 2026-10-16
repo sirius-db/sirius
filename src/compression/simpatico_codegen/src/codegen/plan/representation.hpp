@@ -7,7 +7,6 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -142,14 +141,9 @@ struct compressed_representation {
     std::vector<compressible_output> out;
     out.reserve(channels_.size());
     for (size_t i = 0; i < channels_.size() && i < names.size(); ++i)
-      if (channels_[i]) out.push_back({names[i], channels_[i]->view()});
+      out.push_back({names[i], channels_[i]->view()});
     return out;
   }
-
-  /// Channels that MUST be routed by the plan, else the driver errors -- preventing silent data
-  /// loss. Default: none. str_split returns {"null_mask"} for a nullable input so a plan can never
-  /// silently drop validity.
-  virtual std::vector<std::string> required_channels() const { return {}; }
 
   /// SAFETY invariant: a representation owns everything it exposes — all
   /// compressors create new data during compression, and the original user
@@ -238,7 +232,7 @@ struct identity_compressor : compressor {
 /// Dictionary format: stores the encoded dictionary column and a copy of keys chars.
 /// In modern cuDF, chars are not accessible as a column_view, so we copy them into a UINT8 column.
 struct dictionary_compressed_representation : standalone_compressed_representation {
-  // Accepts the (keys_offsets, keys_chars, indices[, null_mask]) form.
+  // Accepts the (keys_offsets, keys_chars, indices) form.
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -248,17 +242,11 @@ struct dictionary_compressed_representation : standalone_compressed_representati
 
   std::unique_ptr<cudf::column> dict_column;
   mutable std::unique_ptr<cudf::column> keys_chars_copy;  // Lazily created on first access
-  // Lazily synthesized channels for shapes whose children cannot be viewed
+  // Lazily synthesized channels for a shape whose children cannot be viewed
   // directly: a childless empty dictionary (zero-row compress stores
-  // cudf::make_empty_column(DICTIONARY32)) and childless empty keys (encode of
-  // an all-null column yields zero keys). See named_channels().
+  // cudf::make_empty_column(DICTIONARY32)). See named_channels().
   mutable std::unique_ptr<cudf::column> keys_offsets_synth;
   mutable std::unique_ptr<cudf::column> indices_synth;
-  // Lazily copied validity bitmask bytes (UINT8), exposed as the optional
-  // "null_mask" channel (and marked required) so a nullable column's validity
-  // survives every channel-based path: .hpln IO and decomposed plans rebuild
-  // via from_outputs, which cannot see the mask carried on the stored columns.
-  mutable std::unique_ptr<cudf::column> null_mask_copy;
 
   // Constant key byte-width, measured lazily at first decompress (0 = variable, -1 = unmeasured).
   mutable std::int64_t constant_key_width = -1;
@@ -282,8 +270,9 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   /// The keys column is the distinct-value set (four entries for
   /// `l_shipinstruct`), so the comparison is effectively free; the only
   /// full-length pass is a 1-byte-per-row lookup over the already-materialised
-  /// INT32 indices. Nulls propagate from the dictionary column, matching the
-  /// semantics of comparing the decoded STRING column against the same values.
+  /// INT32 indices. The result carries no mask (the caller reattaches the
+  /// column's validity), matching the semantics of comparing the decoded STRING column against the
+  /// same values.
   std::unique_ptr<cudf::column> decompress_predicate(decode_predicate const& pred,
                                                      ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr) const;
@@ -292,14 +281,13 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   {
     std::vector<compressible_output> outputs;
 
-    // Expose keys_offsets, keys_chars, indices and — for a nullable column —
-    // null_mask.
+    // Expose keys_offsets, keys_chars and indices. Validity is never among them:
+    // compress_column strips it into the plan tree's sidecar, so the column this
+    // rep was built from is null-free by construction.
     auto dict_view            = dict_column->view();
     bool const childless_dict = dict_column->num_children() == 0;  // zero-row compress
-    bool const childless_keys =  // encode of an all-null column: zero keys, no offsets child
-      childless_dict || cudf::dictionary_column_view(dict_view).keys().num_children() == 0;
 
-    if (childless_keys) {
+    if (childless_dict) {
       if (!keys_offsets_synth) {
         // Canonical empty keys: a single zero offset.
         keys_offsets_synth =
@@ -357,39 +345,10 @@ struct dictionary_compressed_representation : standalone_compressed_representati
         {"indices", get_dictionary_child_view(dict_view, dictionary_view_kind::Indices)});
     }
 
-    if (dict_column->null_count() > 0) {
-      ensure_null_mask_copy(dict_view, stream);
-      outputs.push_back({"null_mask", null_mask_copy->view()});
-    }
     return outputs;
   }
 
-  std::vector<std::string> required_channels() const override
-  {
-    if (dict_column && dict_column->null_count() > 0) return {"null_mask"};
-    return {};
-  }
-
   OpId kind() const override { return OpId::Dictionary; }
-
- private:
-  // Copy `source`'s validity bitmask into the owned UINT8 null_mask_copy
-  // column (no-op if already built).
-  void ensure_null_mask_copy(cudf::column_view const& source, ::cuda::stream_ref stream) const
-  {
-    if (null_mask_copy) return;
-    auto mr   = rmm::mr::get_current_device_resource_ref();
-    auto bits = copy_bitmask_as_data(source, stream, mr);
-    auto const mask_bytes =
-      static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(source.size()));
-    null_mask_copy =
-      std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
-                                     mask_bytes,
-                                     std::move(bits),
-                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
-                                     0);
-    cudaStreamSynchronize(stream.get());
-  }
 };
 
 /// Dictionary compressor: STRING column only. Encodes via cudf dictionary encode; stores the
@@ -401,16 +360,14 @@ struct dictionary_compressor : compressor {
 };
 
 // -----------------------------------------------------------------------------
-// str_split: decompose a STRING column into {offsets, chars, null_mask} channels.
+// str_split: decompose a STRING column into {offsets, chars} channels.
 // Structural (non-codegen) operator -- byte compression is delegated to the
 // channel codecs (offsets -> delta -> bitpack; chars -> lz4). Modeled on the
 // ALP rep (dedicated struct + from_outputs); decode reassembles via
-// cudf::make_strings_column. Conditional arity: a non-null column exposes
-// {offsets, chars}; a nullable column also exposes null_mask, which is marked
-// required() so the driver errors if the plan fails to route it.
+// cudf::make_strings_column. Validity is not among the channels: it is stripped
+// into the plan tree's sidecar before the walk, so the input is always null-free.
 // -----------------------------------------------------------------------------
-// channels_[0] = offsets (INT32 or INT64), channels_[1] = chars (UINT8/UINT32/UINT64),
-// channels_[2] = null_mask (UINT8 bitmask bytes, only present when nullable).
+// channels_[0] = offsets (INT32 or INT64), channels_[1] = chars (UINT8/UINT32/UINT64).
 // decompress() copies channels into make_strings_column; channels_ is left intact.
 struct str_split_compressed_representation : standalone_compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
@@ -422,23 +379,15 @@ struct str_split_compressed_representation : standalone_compressed_representatio
 
   str_split_compressed_representation(cudf::size_type n_rows,
                                       std::unique_ptr<cudf::column> offsets,
-                                      std::unique_ptr<cudf::column> chars,
-                                      std::unique_ptr<cudf::column> null_mask)
+                                      std::unique_ptr<cudf::column> chars)
     : standalone_compressed_representation(cudf::data_type{cudf::type_id::STRING}, n_rows)
   {
     channels_.push_back(std::move(offsets));
     channels_.push_back(std::move(chars));
-    if (null_mask) channels_.push_back(std::move(null_mask));
   }
 
   std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
-
-  std::vector<std::string> required_channels() const override
-  {
-    if (channels_.size() > 2 && channels_[2]) return {"null_mask"};
-    return {};
-  }
 
   OpId kind() const override { return OpId::StrSplit; }
 };
