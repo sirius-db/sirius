@@ -35,6 +35,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_recursive_cte.cpp` (materialized CTE refs only — recursive CTEs are unsupported) |
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
+| `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (`ALL` forms only) | `REPLICATE` over `PROJECTION`, `HASH_GROUP_BY` and `UNION` | `src/planner/sirius_plan_set_operation.cpp` |
 
 `LOGICAL_DELIM_JOIN` reaches Sirius because Sirius loads with DuckDB's `delim_join_as_cte` defaulting to `false`. With the setting at DuckDB v2's own default (`true`), the same subqueries arrive as `LOGICAL_MATERIALIZED_CTE` plus `LOGICAL_CTE_REF` and ordinary semi, anti and mark joins; see [DuckDB Settings Changed by Sirius](configuration.md#duckdb-settings-changed-by-sirius).
 
@@ -79,6 +80,26 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 - **Reorder projection** — pushed above the aggregate only when a key sits at an output position other than its own (`SELECT DISTINCT ON (b, a) a, b`). Plain `SELECT DISTINCT a, b` never needs one: the binder synthesizes one target per select-list entry, so every output column is already a key at its own position
 - **Unsupported shapes** — refused during `create_plan`, so each is a plan-time CPU fallback: an output column that no distinct target covers (it would need a grouped `FIRST`, which Sirius cannot lower yet), `DISTINCT ON` under an `ORDER BY`, a node with no distinct targets, a VARCHAR key under a non-binary `default_collation`, a nested key (`reject_nested_column_operation()`), and a child whose output schema disagrees with the types the node declares other than by the aggregate builder's HUGEINT→BIGINT narrowing (`planned_aggregate_type()`)
 - **The ordered guard tests `LogicalDistinct::order_by`, not `distinct_type`** — the binder sets `order_by` only for a `DISTINCT ON` under an `ORDER BY`, so a plain `SELECT DISTINCT a, b FROM t ORDER BY a` runs on the GPU with its `ORDER BY` as a separate `LOGICAL_ORDER` above the node. A `distinct_type == DISTINCT_ON` check would also send every unordered `DISTINCT ON` (e.g. `SELECT DISTINCT ON (a) a`) to the CPU
+
+### Set Operation Planning
+
+**File:** `src/planner/sirius_plan_set_operation.cpp`
+
+`create_plan(LogicalSetOperation&)` sends `EXCEPT` and `INTERSECT` to `plan_except_intersect`. It lowers only the `ALL` forms, and it lowers them by counting rows rather than by joining, as Spark does. A distinct row seen `m` times in the left input and `n` times in the right is emitted `max(m - n, 0)` times for `EXCEPT ALL` and `min(m, n)` times for `INTERSECT ALL`:
+
+1. Each input is projected to its columns followed by constant `TINYINT` tags. `EXCEPT ALL` uses one tag (`1` on the left, `-1` on the right); `INTERSECT ALL` uses two (`1, 0` on the left, `0, 1` on the right).
+2. A `UNION` merges the two tagged inputs.
+3. A `HASH_GROUP_BY` on every column sums each tag into a `BIGINT`: `m - n` for `EXCEPT ALL`, `m` and `n` for `INTERSECT ALL`.
+4. A `PROJECTION` keeps the columns and appends the copy count as a `CASE` expression: `CASE WHEN s > 0 THEN s ELSE 0 END` or `CASE WHEN m < n THEN m ELSE n END`.
+5. `REPLICATE` repeats each row by that count and drops the count column. Its byte cap is `concat_batch_bytes` (0 means no byte cap) and its row cap is `INT32_MAX`.
+
+The builder throws `NotImplementedException`, so the query falls back to CPU, for:
+
+- the distinct forms of `EXCEPT` and `INTERSECT`;
+- nested-type and `ARRAY` columns;
+- keys DuckDB compares through a collation or normalization, such as a collated `VARCHAR` or an `INTERVAL`, because the GPU would compare raw values;
+- `FLOAT` and `DOUBLE` keys, because a group keeps only one of its `-0.0` and `+0.0` rows, where DuckDB returns the left input's own rows;
+- an input whose planned column type differs from the declared type. The one allowed difference is an aggregate result DuckDB types as `HUGEINT` and Sirius plans as `BIGINT`; when only one input narrows it, the plan carries `BIGINT`.
 
 ### Filter Pushdown
 
