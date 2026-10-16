@@ -38,12 +38,15 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -177,6 +180,10 @@ void log_operator_data(const op::sirius_physical_operator& op,
 /// receive batches from more than one producer, so a decline is ordinary — and
 /// declining is the only safe answer, since materializing against a stranger's
 /// batch reads arbitrary rows of the pinned table.
+///
+/// Restoration changes column values, never rows or their order, so the result is built by
+/// `with_batches_preserving_rows`: it keeps the input's dynamic type and everything that type
+/// records about its rows, such as original batch IDs, a partition index or a scan receipt.
 std::unique_ptr<op::operator_data> materialize_deferred_input(
   op::sirius_physical_operator const& op,
   op::operator_data const& input_data,
@@ -206,16 +213,31 @@ std::unique_ptr<op::operator_data> materialize_deferred_input(
       " received a mix of deferred and materialized batches for one deferral");
   }
 
+  // The read-only leases skip null batches, so pair them with the input's non-null batches and keep
+  // each null in its position.
+  auto const& originals = input->get_data_batches();
+  if (static_cast<std::size_t>(std::ranges::count_if(
+        originals, [](auto const& batch) { return batch != nullptr; })) != batches.size()) {
+    throw std::runtime_error("[gpu_pipeline_task] operator " +
+                             std::to_string(op.get_operator_id()) +
+                             " received an input whose leases do not match its batches");
+  }
   std::vector<std::shared_ptr<cucascade::data_batch>> output;
-  output.reserve(batches.size());
-  for (std::size_t i = 0; i < batches.size(); ++i) {
-    auto* space = batches[i].get_memory_space();
+  output.reserve(originals.size());
+  std::size_t next = 0;
+  for (auto const& original : originals) {
+    if (!original) {
+      output.push_back(nullptr);
+      continue;
+    }
+    auto const i = next++;
+    auto* space  = batches[i].get_memory_space();
     auto restored =
       late_mat::materialize_at_port(directive, views[i], stream, space->get_default_allocator());
     output.push_back(
       sirius::make_data_batch(std::move(restored), *space, stream, op.batch_telemetry()));
   }
-  return input->with_data_batches(std::move(output));
+  return input->with_batches_preserving_rows(std::move(output));
 }
 
 /// Quiesce work already submitted to a task stream without replacing the exception being handled.

@@ -26,6 +26,7 @@
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/scan_output_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -279,6 +280,43 @@ TEST_CASE("operator-data provenance retains original input order through prepara
   require_ids(input);
   auto moved = std::move(input);
   require_ids(moved);
+}
+
+TEST_CASE("scan receipt identity survives real cross-GPU replacements",
+          "[batch_lock_utils][multi_gpu][consumer_integration][scan_receipt]")
+{
+  if (skip_if_not_mgpu()) { return; }
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(2));
+  auto const source_stream = f.gpu0->acquire_stream();
+  auto source              = f.make_gpu_batch(kNumRows, *f.gpu0, source_stream);
+  auto const original_id   = source->get_batch_id();
+  auto channel             = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  class receipt_identity_filter final : public sirius::op::sirius_dynamic_filter {
+   public:
+    sirius::op::sirius_dynamic_filter_kind kind() const override
+    {
+      return sirius::op::sirius_dynamic_filter_kind::IN_LIST;
+    }
+  };
+  auto filter = std::make_shared<receipt_identity_filter>();
+  sirius::op::scan::scan_output_operator_data input(source);
+  input.install_receipt({channel, original_id, {{filter, 0}}, {{filter, 0}}});
+  std::uint64_t previous_id = original_id;
+  for (auto* target : {f.gpu1, f.gpu0}) {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{target->get_device_id()}};
+    rmm::cuda_stream stream;
+    input.prepare_for_processing(target, stream);
+    stream.synchronize();
+    REQUIRE(input.get_data_batches().front()->get_batch_id() != previous_id);
+    previous_id = input.get_data_batches().front()->get_batch_id();
+    REQUIRE(input.original_batch_ids() == std::vector<std::uint64_t>{original_id});
+    REQUIRE(input.receipt().original_batch_id == original_id);
+    REQUIRE(input.receipt().endpoint == channel);
+    REQUIRE(input.receipt().applied == std::vector<sirius::op::scan::applied_entry>{{filter, 0}});
+    REQUIRE(input.receipt().decode_attached == input.receipt().applied);
+    REQUIRE(input.get_read_only_batches().front().get_memory_space() == target);
+  }
 }
 
 TEST_CASE("operator-data provenance survives cross-GPU preparation and OOM rescheduling",

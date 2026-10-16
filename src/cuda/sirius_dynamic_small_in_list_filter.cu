@@ -188,6 +188,28 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
+  return compute_mask_impl(probe, prior_mask_words, nullptr, device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask_if(
+  cudf::column_view const& probe,
+  cudf::column_view const& prior_keep,
+  int device_id,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr) const
+{
+  return compute_mask_impl(
+    probe, nullptr, detail::checked_prior_keep(probe, prior_keep), device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask_impl(
+  cudf::column_view const& probe,
+  std::uint32_t const* prior_mask_words,
+  bool const* prior_keep,
+  int device_id,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr) const
+{
   auto const* replica =
     _store ? _store->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica) { return nullptr; }
@@ -196,8 +218,13 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
   return detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type      = decltype(key_tag);
     auto const* needles = static_cast<key_type const*>(replica->needles.data());
-    return detail::run_membership_probe<key_type>(
-      _domain, probe, prior_mask_words, stream, mr, needle_lookup<key_type>{needles, m});
+    return detail::run_membership_probe<key_type>(_domain,
+                                                  probe,
+                                                  prior_mask_words,
+                                                  stream,
+                                                  mr,
+                                                  needle_lookup<key_type>{needles, m},
+                                                  prior_keep);
   });
 }
 

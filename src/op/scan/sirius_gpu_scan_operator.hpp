@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/table_scan/scan_contract.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -33,6 +34,10 @@
 #include <optional>
 #include <vector>
 
+namespace cudf {
+class column;
+class table;
+}  // namespace cudf
 namespace sirius::scan_manager {
 class split_connector;
 class sirius_scan_manager;
@@ -41,20 +46,30 @@ namespace sirius::transparent {
 class read_view_registry;
 }
 
-namespace sirius::op {
-class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
-}
-
 namespace duckdb {
 class SiriusContext;
 }  // namespace duckdb
 
 namespace sirius::op::scan {
 class scan_operator_input;
+namespace detail {
+struct read_retirement_test_hooks;
+}  // namespace detail
 
 //===----------------------------------------------------------------------===//
 // sirius_gpu_scan_operator
 //===----------------------------------------------------------------------===//
+/**
+ * @brief Maps a scan's output ordinals to the decoder slots of @p ingestible, for the
+ * `dynamic_filter_consumer` the scan shares with its endpoint
+ *
+ * Decoder slots match output ordinals only when the output assembly of @p ingestible leads with at
+ * least @p output_width decoded columns. Otherwise the map is empty, and decodes attach no
+ * membership probes.
+ */
+[[nodiscard]] std::vector<binding> scan_decode_bindings(gpu_ingestible const& ingestible,
+                                                        std::size_t output_width);
+
 /**
  * @brief Unified GPU scan source operator.
  *
@@ -70,9 +85,10 @@ class scan_operator_input;
  * 2. prepare_for_query checks whether a pinned entry can serve the scan.
  * 3. A cache miss uses split_provider. A cache hit uses cached_databatch_provider.
  * 4. Both providers send inputs through the operator's split connector.
- * 5. execute() runs each split through materialize_table, then
- *    post_filter_and_project unless the result is already
- *    row-filtered and projected.
+ * 5. execute() takes a split's table by transfer when prepare_for_processing converted it for
+ *    this query; otherwise it runs the split through materialize_table, offers a borrowed
+ *    resident batch to the cached dynamic-filter checkpoint, and gives rows the checkpoint did not
+ *    select to post_filter_and_project unless they are already row-filtered and projected.
  *
  * The operator retains the ingestible created by the plan generator.
  */
@@ -94,15 +110,56 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    *                               narrowing observability; may be null.
    * @param read_views             Registry owning the bound scan contract; may be null
    *                               when bound contract lookup is not needed.
+   * @param consumer               Shared with the immediate sirius_physical_dynamic_filter endpoint
+   * and created with `scan_decode_bindings` over @p ingestible; null when no endpoint is planned.
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
                            std::shared_ptr<gpu_ingestible> ingestible,
                            scan_contract_id contract_id,
                            duckdb::SiriusContext* compressed_materialization_observer  = nullptr,
-                           std::shared_ptr<transparent::read_view_registry> read_views = nullptr);
+                           std::shared_ptr<transparent::read_view_registry> read_views = nullptr,
+                           std::shared_ptr<dynamic_filter_consumer> consumer           = nullptr);
 
   ~sirius_gpu_scan_operator() override;
+
+  /**
+   * @brief The consumer shared with the immediate sirius_physical_dynamic_filter endpoint
+   *
+   * It names the endpoint in the scan's receipts whether or not the decode may use it (see
+   * decode_consumer()).
+   */
+  [[nodiscard]] std::shared_ptr<dynamic_filter_consumer> const& consumer() const noexcept
+  {
+    return _dynamic_filter_consumer;
+  }
+
+  /**
+   * @brief The consumer for decode-time membership attachment, or null when the decode may not
+   * remove rows
+   *
+   * Null while a late-materialization deferral is installed on this scan: a deferral addresses
+   * whole pinned chunks, and the decode cannot report which rows survive it. Such a scan's rows are
+   * filtered by the cached dynamic-filter checkpoint, which reports the survivors' positions, or
+   * else by the endpoint after substitution. Valid once `sirius_scan_manager::prepare_for_query`
+   * has installed the query's deferrals.
+   */
+  [[nodiscard]] std::shared_ptr<dynamic_filter_consumer> decode_consumer() const noexcept
+  {
+    return deferred_output().empty() ? _dynamic_filter_consumer : nullptr;
+  }
+
+  /**
+   * @brief Whether this scan's borrowed resident splits can reach the cached dynamic-filter
+   * checkpoint
+   *
+   * True when consumer() exists with `consumer_config::cached_placement` enabled and the ingestible
+   * can describe a cached view (`gpu_ingestible::can_serve_cached_view`). Unlike
+   * decode_consumer(), a late materialization deferral does not change the decision.
+   * get_next_task_input_data() stamps it on every split as
+   * `scan_operator_input::cached_view_possible`.
+   */
+  [[nodiscard]] bool cached_view_possible() const noexcept;
 
   // -----------------------------
   // Source interface
@@ -119,11 +176,13 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /**
    * @brief Produce a data batch for one split.
    *
-   * The input is a @c scan_operator_input holding either scan metadata
-   * (fresh read) or a resident batch (pinned-cache hit). Both go through
-   * @c gpu_ingestible::materialize_table; @c post_filter_and_project runs
-   * afterwards unless materialize returned
-   * @c filter_state::ROW_FILTERED_AND_PROJECTED.
+   * The input is a @c scan_operator_input holding either scan metadata (fresh read) or a resident
+   * batch (pinned-cache hit). A resident table that prepare_for_processing converted for this query
+   * is transferred to the output without filtering. Otherwise the split goes through
+   * @c gpu_ingestible::materialize_table; a split that
+   * `scan_operator_input::cached_checkpoint_possible` admits is then offered to the cached
+   * dynamic-filter checkpoint, and @c post_filter_and_project runs on rows the checkpoint did not
+   * select unless materialize returned @c filter_state::ROW_FILTERED_AND_PROJECTED.
    *
    * Throws on any other operator_data type (programmer error: the connector
    * carries only @c scan_operator_input).
@@ -217,11 +276,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /// fresh.
   std::shared_ptr<std::atomic<bool>> _decode_selection_unprofitable =
     std::make_shared<std::atomic<bool>>(false);
-  /// The scan's dynamic-filter channel (null for non-parquet ingestibles),
-  /// resolved once at construction and stamped onto every split so
-  /// prepare_for_processing can snapshot membership filters at DECODE time
-  /// (see scan_operator_input::dynamic_filters).
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _dynamic_filters_channel;
+  std::shared_ptr<dynamic_filter_consumer> _dynamic_filter_consumer;
   /// Non-owning observer. The registered-state shared_ptr owns the context for
   /// at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer;
@@ -232,5 +287,25 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   std::size_t _emitted_bytes{0};
   std::size_t _emitted_rows{0};
 };
+
+namespace detail {
+/**
+ * @brief Borrows the output assembly owners of `sirius_gpu_scan_operator::execute` that
+ * `read_retirement_test_hooks` retained after a physically completed injected failure
+ *
+ * The hooks must outlive these pointers.
+ */
+struct retained_scan_assembly_storage {
+  cudf::table const* output;
+  cudf::column const* positions;
+};
+
+/// Test access to the scan output assembly that `read_retirement_test_hooks` retained
+struct scan_operator_test_access {
+  /// Empty when @p hooks retained nothing or a state other than a scan output assembly
+  [[nodiscard]] static std::optional<retained_scan_assembly_storage> retained_assembly(
+    read_retirement_test_hooks const& hooks) noexcept;
+};
+}  // namespace detail
 
 }  // namespace sirius::op::scan

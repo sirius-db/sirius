@@ -167,6 +167,31 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr) = 0;
 
   /**
+   * @brief Whether `view_layout` can describe any resident batch of this scan
+   *
+   * A plan-static fact that `sirius_gpu_scan_operator::cached_view_possible` reads before any
+   * batch is materialized. When false, view_layout declines every batch.
+   *
+   * @return True if this ingestible can serve a cached view, false if it cannot.
+   */
+  [[nodiscard]] virtual bool can_serve_cached_view() const noexcept { return false; }
+
+  /**
+   * @brief Prepares an owned host layout without reading device data or surrendering source
+   *        columns.
+   *
+   * @param table Materialized table/batch to describe
+   * @param elided Endpoint output positions the caller is going to overwrite (a late
+   *               materialization's deferral's rowid and placeholders).
+   * @return A cached_view_layout if the ingestible can serve a cached view, std::nullopt otherwise.
+   */
+  [[nodiscard]] virtual std::optional<cached_view_layout> view_layout(
+    filtered_table const&, std::span<std::size_t const> elided) const
+  {
+    return std::nullopt;
+  }
+
+  /**
    * @brief Apply post-decode filter and/or projection to the materialized
    *        table. Called by @c sirius_gpu_scan_operator::execute whenever
    *        @ref materialize_metadata_to_table did not return

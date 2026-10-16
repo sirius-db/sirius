@@ -368,6 +368,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     std::unique_ptr<cudf::column>* survivors,
     std::span<std::size_t const> elided) override;
 
+  [[nodiscard]] bool can_serve_cached_view() const noexcept override;
+
+  [[nodiscard]] std::optional<cached_view_layout> view_layout(
+    filtered_table const& input, std::span<std::size_t const> elided) const override;
+
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
@@ -392,6 +397,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   }
 
  private:
+  /// The remaining predicate after the ingestible has applied its pushdown filter and projection.
+  [[nodiscard]] std::unique_ptr<sirius::ast::node> remaining_residual(
+    filtered_table const& input) const;
+
   /// Read one file's footer, prune its row groups against the filter, and record
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
   /// Runs on a scan-manager dispatcher thread (the task returned by
