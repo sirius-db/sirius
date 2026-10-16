@@ -150,6 +150,14 @@ class downgrade_executor {
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
+   * @brief Set what a HOST-source executor asks first for host memory back: it is handed the
+   * bytes wanted and returns the bytes it freed. Batches go to disk only for the rest.
+   *
+   * Must be called before start(), and the callee must outlive stop().
+   */
+  void set_host_memory_releaser(std::function<std::size_t(std::size_t)> releaser);
+
+  /**
    * @brief Asynchronously request a predicate-driven downgrade.
    *
    * Dispatches batch downgrades until the predicate returns true or candidates
@@ -218,6 +226,7 @@ class downgrade_executor {
   // Non-owning pointer into task_scheduler. SiriusContext stops this executor before destroying
   // the scheduler and its queue.
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  std::function<std::size_t(std::size_t)> _host_memory_releaser;
   /// Non-owning; the runtime or test fixture must outlive this executor.
   sirius::exec::query_lifecycle_registry& _query_lifecycle;
 };

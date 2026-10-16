@@ -149,6 +149,11 @@ class buffer_pool {
   /// (0 when they already fit).  A snapshot, used to size eviction demands.
   [[nodiscard]] size_t chunks_over_cap(size_t n) const noexcept;
 
+  /// Some host space holds more than its downgrade stop threshold: spilled data
+  /// is, or soon will be, moving to disk to make room. Past its reservation the
+  /// pool refuses chunks while this holds.
+  [[nodiscard]] bool host_under_spill_pressure() const noexcept;
+
   /// The pool has no room for another chunk under its cap (and holds more than
   /// its reserved floor).  Judged on the pool's OWN resident chunks -- not on
   /// system-wide host usage, which includes spills and would keep a cache that
@@ -160,6 +165,7 @@ class buffer_pool {
     int numa_id;
     std::unique_ptr<cucascade::memory::reservation> reservation;
     cucascade::memory::fixed_size_host_memory_resource* mr;
+    cucascade::memory::memory_space const* space;
   };
 
   size_t _chunk_bytes{1};

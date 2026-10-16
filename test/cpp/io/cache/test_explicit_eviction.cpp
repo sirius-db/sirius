@@ -311,18 +311,17 @@ TEST_CASE("prepare does not publish a request the retry's eviction left short of
 
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
-  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
+  // The shortfall comes from the cache's own 40 MiB cap, not from a full host
+  // tier: a full tier is spill pressure, under which the evictor takes idle
+  // chunks only and never reaches the subscriber-ignoring pass under test.
+  auto cfg                              = constrained_lru_config();
+  cfg.cache.eviction_threshold_fraction = 40.0 / 256.0;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *memory, topology};
   auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
 
   REQUIRE(cache->chunk_size() == mib);
-  auto host_spaces = memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-  REQUIRE(host_spaces.size() == 1);
-  REQUIRE(host_spaces.front()->get_max_memory() == 256 * mib);
-  auto* host_mr = host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
-  REQUIRE(host_mr != nullptr);
-  REQUIRE(host_mr->get_block_size() == mib);
-  REQUIRE(host_mr->get_total_reserved_bytes() == 64 * mib);
+  REQUIRE(cache->max_prefetching_budget_bytes() == 40 * mib);
 
   std::vector<cudf::io::text::byte_range_info> ranges;
   ranges.emplace_back(0, static_cast<std::int64_t>(36 * mib));
@@ -341,16 +340,6 @@ TEST_CASE("prepare does not publish a request the retry's eviction left short of
   REQUIRE(target != nullptr);
   target->fadvise(target_ranges, 0);
 
-  // Fill the rest of the tier without a failed cache preparation that could
-  // enqueue an eviction before the target counts its missing buffers.
-  auto const pressure_bytes = host_mr->get_available_memory();
-  REQUIRE(pressure_bytes > 0);
-  REQUIRE(pressure_bytes % mib == 0);
-  auto pressure = host_mr->allocate_multiple_blocks(pressure_bytes);
-  REQUIRE(pressure != nullptr);
-  REQUIRE(pressure->size_bytes() == pressure_bytes);
-  REQUIRE(host_mr->get_available_memory() == 0);
-
   cache->evict_sync(mib);
   REQUIRE(cache->claimed_bytes() == 36 * mib);
 
@@ -359,12 +348,12 @@ TEST_CASE("prepare does not publish a request the retry's eviction left short of
   // eviction candidate instead of being retired the moment it is released.
   victim.reset();
 
-  // The synchronous eviction the shortfall triggers cannot meet its target from
-  // the victim's unsubscribed tail alone, so the subscriber-ignoring pass takes
-  // the target's own prefix chunks as well.  The attach loop then walks those
-  // first and spends the buffers on them, leaving the empty tail with none --
-  // and a request whose chunks cannot all be claimed for loading is not
-  // `prepared`.
+  // 36 MiB held plus 32 MiB wanted is 28 MiB over the cap.  The victim's
+  // unsubscribed tail covers 4 of them, so the subscriber-ignoring pass takes
+  // 24 of the target's own prefix chunks as well.  The attach loop then walks
+  // those first and spends the buffers on them, leaving part of the empty tail
+  // with none -- and a request whose chunks cannot all be claimed for loading
+  // is not `prepared`.
   INFO("cache: " << cache->summary());
   CHECK(target->prepare_prefetch(true) == sirius::io::prepare_result::allocation_failed);
 }

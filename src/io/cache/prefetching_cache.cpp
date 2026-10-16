@@ -662,6 +662,9 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
     // itself ran dry and the whole remainder is the shortfall.
     auto const over_cap = _pool->chunks_over_cap(n_chunks_needed);
     auto const shortage = over_cap != 0 ? over_cap : n_chunks_needed - buffers.size();
+    // Refused for the host tier's sake rather than the cache's own cap: shrink by
+    // idle chunks only, keeping what the readahead fetched for other scans.
+    bool const for_host = over_cap == 0 && _pool->host_under_spill_pressure();
     if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
     if (!wait_for_eviction) {
       // Get reclamation moving without stalling the scan-input constructor.
@@ -671,7 +674,7 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
           !_shutting_down.load(std::memory_order_acquire)) {
         auto processed = std::make_shared<std::latch>(1);
         if (_eviction_queue.enqueue(
-              cache_request{eviction_request{shortage * _chunk_size, processed}})) {
+              cache_request{eviction_request{shortage * _chunk_size, processed, for_host}})) {
           req.pending_eviction = std::move(processed);
         }
       }
@@ -689,7 +692,7 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
       req.pending_eviction->wait();
       req.pending_eviction.reset();
     } else {
-      evict_sync(shortage * _chunk_size);
+      evict_sync(shortage * _chunk_size, for_host);
     }
     if (req.has_fallen_behind()) {
       req.producer->mark_abandoned();
@@ -1313,14 +1316,35 @@ void prefetching_cache::evict(std::size_t bytes_to_free)
   _eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free, nullptr}});
 }
 
-void prefetching_cache::evict_sync(std::size_t bytes_to_free)
+void prefetching_cache::evict_sync(std::size_t bytes_to_free, bool idle_only)
 {
   if (bytes_to_free == 0 || !_armed || _shutting_down.load(std::memory_order_acquire)) { return; }
   auto processed = std::make_shared<std::latch>(1);
-  if (!_eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free, processed}})) {
+  if (!_eviction_queue.enqueue(
+        cache_request{eviction_request{bytes_to_free, processed, idle_only}})) {
     return;
   }
   processed->wait();
+}
+
+std::size_t prefetching_cache::release_idle(std::size_t bytes)
+{
+  if (bytes == 0 || !_armed || _shutting_down.load(std::memory_order_acquire)) { return 0; }
+  auto const floor       = _pool->reservation_size_for_prefetching();
+  auto const above_floor = [this, floor] {
+    auto const held = _pool->total_allocated_bytes();
+    return held > floor ? held - floor : 0;
+  };
+  auto const before = above_floor();
+  if (before == 0) { return 0; }
+  auto processed = std::make_shared<std::latch>(1);
+  if (!_eviction_queue.enqueue(
+        cache_request{eviction_request{std::min(bytes, before), processed, true}})) {
+    return 0;
+  }
+  processed->wait();
+  auto const after = above_floor();
+  return before > after ? before - after : 0;
 }
 
 void prefetching_cache::drain_and_abandon(request_queue_type& queue) noexcept
@@ -1462,6 +1486,8 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // leaves the other one still waiting.
     std::size_t requested_bytes = 0;
     bool eviction_requested     = false;
+    // Whether any demand may take chunks a live request still subscribes to.
+    bool any_demand_takes_subscribed = false;
     std::vector<std::shared_ptr<std::latch>> processed;
     auto acknowledge_evictions = [&processed] {
       for (auto const& completion : processed) {
@@ -1484,6 +1510,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
             // does nothing and the pool never recovers.
             eviction_requested = true;
             requested_bytes += r.bytes_to_free;
+            any_demand_takes_subscribed |= !r.idle_only;
             if (r.processed != nullptr) { processed.push_back(std::move(r.processed)); }
           }
         },
@@ -1579,8 +1606,11 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // dispose_on_idle the target is unbounded, so pass 1 would run every round
     // and strip chunks another live request still names — and a chunk somebody
     // is still subscribed to is not idle.
-    size_t reclaimed   = 0;
-    int const n_passes = _cfg.dispose_on_idle ? 1 : 2;
+    size_t reclaimed = 0;
+    // Idle-only demands get no second pass unless the pool is also over its own cap.
+    bool const sweep_subscribed =
+      !_cfg.dispose_on_idle && (any_demand_takes_subscribed || _pool->should_start_evicting());
+    int const n_passes = sweep_subscribed ? 2 : 1;
     for (int pass = 0; pass < n_passes && reclaimed < need; ++pass) {
       bool const respect_subscribers = (pass == 0);
       for (auto& er : eviction_batch) {

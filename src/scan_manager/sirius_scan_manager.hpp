@@ -604,6 +604,12 @@ class sirius_scan_manager {
   /// this and a registry still listing them would be lying.  Re-pin afterwards.
   void reset_caches();
 
+  /// Give the host tier back up to @p bytes from the prefetching caches' idle
+  /// chunks (@ref sirius::io::cache::prefetching_cache::release_idle), default
+  /// cache first, and return how many bytes it got back. Safe against a running
+  /// query; serialized against @ref reset_caches.
+  std::size_t release_idle_cache_memory(std::size_t bytes);
+
   /// Retain a checkpoint key until this execution window is reset. Pinning may hold
   /// keys without registering scan providers, so their lifetime is tracked separately.
   void acquire_checkpoint_key(sirius::query_id_t query_id, duckdb::AttachedDatabase& database);

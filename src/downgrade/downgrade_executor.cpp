@@ -250,6 +250,33 @@ void downgrade_executor::processing_loop()
         return predicate_satisfied(req.get()) || target_completed();
       };
 
+    // === TIER 0: idle prefetching-cache chunks ===
+    // A HOST source frees cached input before spilled batches: a chunk is fetched again in one
+    // read, while a batch moved to disk is written out and read back.
+    if (_host_memory_releaser && _space_id.tier == cucascade::memory::Tier::HOST &&
+        !predicate_satisfied(req.get())) {
+      std::size_t const wanted = req->target_bytes.has_value()
+                                   ? *req->target_bytes
+                                   : (_memory_space ? _memory_space->get_amount_to_downgrade() : 0);
+      if (wanted > 0) {
+        std::size_t released = 0;
+        try {
+          released = _host_memory_releaser(wanted);
+        } catch (const std::exception& e) {
+          SIRIUS_LOG_WARN(
+            "[downgrade] [{}] releasing cache memory failed: {}", _source_label, e.what());
+        }
+        if (released > 0) {
+          req->bytes_freed.fetch_add(released, std::memory_order_relaxed);
+          planned_bytes.fetch_add(released, std::memory_order_relaxed);
+          SIRIUS_LOG_INFO("[downgrade] [{}] released {} of {} bytes from the prefetching cache",
+                          _source_label,
+                          released,
+                          wanted);
+        }
+      }
+    }
+
     // === TIER 1: Data repositories ===
     // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
     // query: outer loop DESCENDING by query id (newest query first), inner loop in
@@ -651,6 +678,11 @@ void downgrade_executor::set_pipeline_task_queue(
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
 {
   _pipeline_task_queue = pipeline_task_queue;
+}
+
+void downgrade_executor::set_host_memory_releaser(std::function<std::size_t(std::size_t)> releaser)
+{
+  _host_memory_releaser = std::move(releaser);
 }
 
 // --- Public request API ---

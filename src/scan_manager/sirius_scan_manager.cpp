@@ -2418,6 +2418,34 @@ void sirius_scan_manager::reset_caches()
   }
 }
 
+std::size_t sirius_scan_manager::release_idle_cache_memory(std::size_t bytes)
+{
+  // The same locks reset_caches holds while it destroys and rebuilds caches.
+  std::size_t released = 0;
+  if (_io_ctx) {
+    std::lock_guard default_lk{_default_cache_mtx};
+    if (auto* cache = _io_ctx->cache()) { released += cache->release_idle(bytes); }
+  }
+  if (released >= bytes) { return released; }
+  // The build mutex keeps reset_caches out; the map mutex is held only for the copy,
+  // since every routed lookup takes it.
+  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+  std::vector<std::shared_ptr<sirius::io::ioctx>> routed;
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    for (auto const& entry : _routed_io_ctxs) {
+      routed.push_back(entry.second);
+    }
+  }
+  for (auto const& io_ctx : routed) {
+    if (released >= bytes) { break; }
+    if (auto* cache = io_ctx ? io_ctx->cache() : nullptr) {
+      released += cache->release_idle(bytes - released);
+    }
+  }
+  return released;
+}
+
 void sirius_scan_manager::acquire_checkpoint_key(sirius::query_id_t query_id,
                                                  duckdb::AttachedDatabase& database)
 {

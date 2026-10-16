@@ -58,10 +58,10 @@ buffer_pool::buffer_pool(cucascade::memory::memory_reservation_manager& reservat
     auto reservation                          = mmr->make_reservation_upto(max_reservation);
     max_reservation                           = reservation->size();  // may be less than requested
     _numa_to_arena_index[mr->get_device_id()] = _host_arenas.size();
-    _host_arenas.push_back(
-      host_arena{mr->get_device_id(),
-                 std::move(reservation),
-                 mmr->get_memory_resource_of<cucascade::memory::Tier::HOST>()});
+    _host_arenas.push_back(host_arena{mr->get_device_id(),
+                                      std::move(reservation),
+                                      mmr->get_memory_resource_of<cucascade::memory::Tier::HOST>(),
+                                      mr});
     _reserved_size += max_reservation;
     _max_allowed_budget_for_prefetching +=
       rmm::align_down(std::size_t(mmr->get_max_memory() * max_prefetching_budget_fraction),
@@ -89,9 +89,26 @@ size_t buffer_pool::chunks_over_cap(size_t n) const noexcept
   return std::min(cur, cur + n - cap_chunks);
 }
 
+bool buffer_pool::host_under_spill_pressure() const noexcept
+{
+  try {
+    return std::ranges::any_of(_host_arenas, [](host_arena const& arena) {
+      return arena.space != nullptr && !arena.space->should_stop_downgrading_memory();
+    });
+  } catch (...) {
+    return false;
+  }
+}
+
 bool buffer_pool::try_charge(size_t n) noexcept
 {
   auto cur = _n_allocated_chunks.load(std::memory_order_relaxed);
+  // Past its reservation the cache grows only while the host tier has room: under
+  // spill pressure a cached chunk would push a spilled batch to disk, and a chunk
+  // is cheaper to fetch again than a batch is to write out and read back.
+  if (cur != 0 && (cur + n) * _chunk_bytes > _reserved_size && host_under_spill_pressure()) {
+    return false;
+  }
   for (;;) {
     if (!fits(cur, n)) { return false; }
     if (_n_allocated_chunks.compare_exchange_weak(
