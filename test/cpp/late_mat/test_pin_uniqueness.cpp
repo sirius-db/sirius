@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -300,6 +301,93 @@ TEST_CASE("the exact check decides what the range test could not", "[late_mat][p
     cudf::data_type{cudf::type_id::INT64}, 4, cudf::mask_state::ALL_NULL, stream);
   std::vector<cudf::column_view> with_nulls{nullable->view()};
   REQUIRE_FALSE(exact_distinct_over_chunks(with_nulls, stream).has_value());
+}
+
+TEST_CASE("the join-key gate observes every other column automatically",
+          "[late_mat][pin_uniqueness]")
+{
+  using sirius::late_mat::pin_unique_automatic_selection;
+  std::vector<bool> const explicit_columns{true, false, false};
+  {
+    scoped_env off{"SIRIUS_EXP_PIN_UNIQUE_JOIN", nullptr};
+    REQUIRE(pin_unique_automatic_selection(explicit_columns) ==
+            std::vector<bool>{false, false, false});
+  }
+  {
+    scoped_env on{"SIRIUS_EXP_PIN_UNIQUE_JOIN", "1"};
+    REQUIRE(pin_unique_automatic_selection(explicit_columns) ==
+            std::vector<bool>{false, true, true});
+  }
+}
+
+TEST_CASE("an automatic column is settled where an explicit one is only undecided",
+          "[late_mat][pin_uniqueness]")
+{
+  // Observing every column of a fact table must not hand each of them to the exact stage's sort,
+  // so an automatic column must be an integer, and an unsorted chunk is sorted on the spot to find
+  // a repeat.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+
+  // Columns: explicit unsorted, automatic unsorted with a repeat, automatic float, automatic
+  // sorted, automatic unsorted but distinct.
+  unique_probe probe{std::vector<bool>{true, true, true, true, true},
+                     std::vector<bool>{false, true, true, true, true}};
+  auto explicit_unsorted  = int64_column({7, 5, 6}, stream);
+  auto automatic_unsorted = int64_column({7, 5, 7}, stream);
+  auto automatic_float    = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::FLOAT64}, 3, cudf::mask_state::UNALLOCATED, stream);
+  auto automatic_sorted   = int64_column({10, 11, 12}, stream);
+  auto automatic_distinct = int64_column({12, 10, 11}, stream);
+  std::vector<cudf::column_view> cols{explicit_unsorted->view(),
+                                      automatic_unsorted->view(),
+                                      automatic_float->view(),
+                                      automatic_sorted->view(),
+                                      automatic_distinct->view()};
+  probe.observe(cudf::table_view{cols}, stream);
+
+  REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided,
+                                                          unique_verdict::refused,
+                                                          unique_verdict::refused,
+                                                          unique_verdict::proven,
+                                                          unique_verdict::proven});
+  REQUIRE_FALSE(probe.candidate(1));
+  REQUIRE_FALSE(probe.candidate(2));
+  REQUIRE(probe.candidate(3));
+  REQUIRE(probe.candidate(4));
+}
+
+TEST_CASE("an automatic column with sorted, overlapping chunks is left to the exact stage",
+          "[late_mat][pin_uniqueness]")
+{
+  // SF1000 `orders`: every chunk is sorted by o_orderkey, but the chunks overlap in range.
+  ::cuda::stream_ref const stream{cudaStream_t{}};
+  using sirius::late_mat::unique_verdict;
+  unique_probe probe{std::vector<bool>{true}, std::vector<bool>{true}};
+  auto first  = int64_column({1, 5, 9}, stream);
+  auto second = int64_column({2, 6, 8}, stream);
+  for (auto const* column : {&first, &second}) {
+    std::vector<cudf::column_view> cols{(*column)->view()};
+    probe.observe(cudf::table_view{cols}, stream);
+  }
+  REQUIRE(probe.verdicts() == std::vector<unique_verdict>{unique_verdict::undecided});
+  REQUIRE(probe.candidate(0));
+}
+
+TEST_CASE("the exact-stage cap is raised for automatic columns", "[late_mat][pin_uniqueness]")
+{
+  using sirius::late_mat::exact_uniqueness_row_cap;
+  {
+    scoped_env unset{"SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS", nullptr};
+    REQUIRE(exact_uniqueness_row_cap() == 300'000'000u);
+    REQUIRE(exact_uniqueness_row_cap(true) ==
+            static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()));
+  }
+  {
+    scoped_env set{"SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS", "1000"};
+    REQUIRE(exact_uniqueness_row_cap() == 1000u);
+    REQUIRE(exact_uniqueness_row_cap(true) == 1000u);
+  }
 }
 
 TEST_CASE("a chunk of the wrong width abandons the proof", "[late_mat][pin_uniqueness]")

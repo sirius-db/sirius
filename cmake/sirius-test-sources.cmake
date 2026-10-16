@@ -69,6 +69,7 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
+    test/cpp/helper/test_natural_sort.cpp
     test/cpp/helper/test_numeric_narrowing.cpp
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_compressed_materialization_gate.cpp
@@ -134,6 +135,7 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_materialize.cpp
     test/cpp/late_mat/test_port_materialize.cpp
     test/cpp/integration/test_late_mat_deferred_query.cpp
+    test/cpp/integration/test_pin_unique_join.cpp
     test/cpp/integration/test_late_mat_native_filter.cpp
     test/cpp/late_mat/test_defer_policy.cpp
     test/cpp/late_mat/test_defer_directive.cpp
@@ -191,11 +193,13 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp
+    test/cpp/operator/aggregate/test_low_cardinality_groupby.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
     test/cpp/operator/test_crc32_partition_hash.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
+    test/cpp/operator/test_stable_hash_partition.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
     test/cpp/operator/test_physical_dense_count_join.cpp

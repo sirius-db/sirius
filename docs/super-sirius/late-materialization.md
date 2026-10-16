@@ -36,7 +36,7 @@ using `all`; without a proof there is no group-by-rowid ride and no riders.
 |---|---|---|
 | `SIRIUS_EXP_LATE_MAT` | off | The master gate. |
 | `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` | off | Columns the pin-time uniqueness probe observes: `all`, a name list, or `none`. |
-| `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS` | 300000000 | Row cap on the exact uniqueness stage, so a fact table does not buy a sort per column at pin time. |
+| `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS` | 300000000 | Row cap on the exact uniqueness stage, so a fact table does not buy a sort per column at pin time. Defaults to the largest cuDF column when `SIRIUS_EXP_PIN_UNIQUE_JOIN` observes columns automatically. |
 | `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | 4 | Port crossings a ride must save. |
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
 | `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | off | Count-on-deferred (below). |
@@ -134,6 +134,12 @@ Established once, at pin time, in two stages (`late_mat::unique_probe`): per chu
 with distinct count equal to row count and pairwise disjoint ranges; then, exactly, for what the
 ranges leave undecided, by sorting the concatenated chunks and counting runs. The exact stage is
 load-bearing rather than a fallback, because chunk ranges usually overlap.
+
+The same facts also serve joins: with the experimental `SIRIUS_EXP_PIN_UNIQUE_JOIN=1`, a pinned
+parquet column proven distinct counts as a unique build key, and the pin observes every integer
+column automatically under a stricter standard (an unsorted chunk is sorted on the spot, so a
+column that repeats a value is refused at its first chunk). See
+[Pin-Proven Unique Join Keys](optimizations.md#pin-proven-unique-join-keys-experimental).
 
 `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS` is a ROW cap only — there is no separate memory guard on the
 exact stage. It concatenates and sorts, so a wide or variable-width column just under the cap is

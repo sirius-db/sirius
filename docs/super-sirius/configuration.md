@@ -874,6 +874,21 @@ Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the coun
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
 gate table, the mechanism, and results.
 
+### Aggregation, Join and Scan Specializations (experimental)
+
+Off by default, and gated by environment variables rather than `sirius_config`/`SET`, like late materialization. Each flag enables one specialized path that is used only after the property it relies on is verified, so a flag never changes query results.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIRIUS_EXP_SORTED_PIN_FILES` | off | `pin_table` pins local parquet files in natural order (`part.2` before `part.10`) instead of directory order, so a table stored sorted across numbered files pins into sorted chunks. |
+| `SIRIUS_EXP_SORTED_GROUPBY` | off | Grouped aggregation uses cuDF's sorted-keys path for a batch whose single key is verified ascending. |
+| `SIRIUS_EXP_SORTED_MERGE` | off | Hash partitions keep their input order, and `MERGE_GROUP_BY` uses the sorted-keys path when its concatenated partials are verified sorted. |
+| `SIRIUS_EXP_LOWCARD_GROUPBY` | off | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. |
+| `SIRIUS_EXP_DECODE_TO_TARGET` | off | Compacted Simpatico decodes write narrow pinned carriers directly in the scan's restore type, removing the restore cast. |
+| `SIRIUS_EXP_PIN_UNIQUE_JOIN` | off | A pinned parquet column proven distinct at pin time counts as a unique build key, so the join uses `cudf::distinct_hash_join`; the pin probes integer columns automatically and raises the default `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS` cap to the largest cuDF column. |
+
+Set a variable to `1` to enable it; any other value leaves it off. `SIRIUS_EXP_SORTED_GROUPBY` and `SIRIUS_EXP_SORTED_MERGE` only pay off when batches arrive sorted, which for parquet tables in practice needs `SIRIUS_EXP_SORTED_PIN_FILES`. See [Optimizations](optimizations.md) for each mechanism and its measured effect.
+
 ### Runtime Data Size Estimation
 
 Runtime estimation projects the total bytes that will reach an input port from measured upstream

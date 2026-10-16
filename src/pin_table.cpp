@@ -255,7 +255,10 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
 
   // Whole-table distinctness proof, accumulated chunk by chunk. Inactive (and
   // free) unless the caller selected columns to observe.
-  late_mat::unique_probe unique_probe{options.probe_unique_columns};
+  late_mat::unique_probe unique_probe{options.probe_unique_columns, options.probe_unique_automatic};
+  bool const any_automatic = std::any_of(options.probe_unique_automatic.begin(),
+                                         options.probe_unique_automatic.end(),
+                                         [](bool automatic) { return automatic; });
 
   // The cheap per-chunk pass usually leaves a key UNDECIDED: chunk ranges
   // overlap, because the coalescer interleaves row groups rather than
@@ -335,7 +338,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       if (exact_gpu.has_value() && *exact_gpu != gpu_id) {
         abandon_exact("the pin spans devices");
       } else if (exact_rows + static_cast<std::size_t>(tbl->num_rows()) >
-                 late_mat::exact_uniqueness_row_cap()) {
+                 late_mat::exact_uniqueness_row_cap(any_automatic)) {
         abandon_exact("the pin is past the exact-stage row cap");
       } else if (static_cast<std::size_t>(tbl->num_columns()) !=
                  options.probe_unique_columns.size()) {
@@ -344,7 +347,12 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
         exact_gpu = gpu_id;
         exact_rows += static_cast<std::size_t>(tbl->num_rows());
         for (std::size_t i = 0; i < options.probe_unique_columns.size(); ++i) {
-          if (!options.probe_unique_columns[i]) { continue; }
+          // Retain only what the exact stage may still need: a column the probe already
+          // refused releases what it retained so far.
+          if (!unique_probe.candidate(i)) {
+            exact_chunks[i].clear();
+            continue;
+          }
           exact_chunks[i].push_back(
             std::make_unique<cudf::column>(tbl->view().column(static_cast<cudf::size_type>(i)),
                                            stream,

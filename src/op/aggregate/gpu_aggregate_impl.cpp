@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/group_key_labels.hpp"
+#include "op/aggregate/low_cardinality_groupby.hpp"
 #include "op/aggregate/stddev.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -40,9 +41,11 @@
 #include <rmm/error.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <new>
 #include <numeric>
 #include <optional>
+#include <string_view>
 #include <unordered_set>
 
 namespace sirius {
@@ -132,6 +135,28 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
 
 namespace {
 
+/// Whether batches with verified ascending keys use cuDF's sorted-keys group-by
+/// (SIRIUS_EXP_SORTED_GROUPBY=1).
+bool sorted_groupby_enabled()
+{
+  static bool const enabled = [] {
+    char const* value = std::getenv("SIRIUS_EXP_SORTED_GROUPBY");
+    return value != nullptr && std::string_view{value} == "1";
+  }();
+  return enabled;
+}
+
+/// Whether batches with a handful of groups use the low-cardinality kernel
+/// (SIRIUS_EXP_LOWCARD_GROUPBY=1).
+bool lowcard_groupby_enabled()
+{
+  static bool const enabled = [] {
+    char const* value = std::getenv("SIRIUS_EXP_LOWCARD_GROUPBY");
+    return value != nullptr && std::string_view{value} == "1";
+  }();
+  return enabled;
+}
+
 /// Aggregate @p input_table grouped by the `group_idx` columns. Returns the table
 /// `[keys..., aggregates...]`. See `gpu_aggregate_impl::local_grouped_aggregate()` for the
 /// parameters.
@@ -155,6 +180,23 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
 
   auto mr = memory_space.get_default_allocator();
+
+  // Experimental (SIRIUS_EXP_LOWCARD_GROUPBY=1): batches with a handful of groups, such as TPC-H
+  // Q1, use a dedicated kernel instead of cuDF's hash group-by. It returns nullptr when the batch
+  // does not qualify, and the general path below runs unchanged.
+  bool const any_struct_aggregate =
+    std::any_of(aggregate_struct_col_indices.begin(),
+                aggregate_struct_col_indices.end(),
+                [](std::vector<int> const& struct_cols) { return !struct_cols.empty(); });
+  if (lowcard_groupby_enabled() && !any_struct_aggregate) {
+    if (auto result = try_low_cardinality_groupby(
+          input_table, group_idx, aggregates, aggregate_idx, stream, mr)) {
+      SIRIUS_LOG_DEBUG("local_grouped_agg: low-cardinality path rows={} groups={}",
+                       input_table.num_rows(),
+                       result->num_rows());
+      return result;
+    }
+  }
 
   // COLLECT_SET uses cuDF's sorted groupby. Dense INT32 labels let that sort take its
   // single-column radix path while preserving the original keys' lexicographic order. A
@@ -293,6 +335,19 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   }
   if (use_label_keys) { group_cols.push_back(label_col->view()); }
 
+  // Experimental (SIRIUS_EXP_SORTED_GROUPBY=1): when a batch's single fixed-width, null-free key
+  // column is already in ascending order, as for lineitem grouped by l_orderkey, let cuDF use its
+  // sorted-keys path. That replaces hashing and global atomics with run detection and segmented
+  // reductions. The order is verified per batch, so unsorted batches keep the hash path.
+  bool keys_sorted = false;
+  if (sorted_groupby_enabled() && !has_collect_set && group_cols.size() == 1 &&
+      key_is_radix_sortable(group_cols[0]) && !cudf::is_dictionary(group_cols[0].type())) {
+    keys_sorted = cudf::is_sorted(
+      cudf::table_view(group_cols), {cudf::order::ASCENDING}, {cudf::null_order::AFTER}, stream);
+    SIRIUS_LOG_DEBUG(
+      "local_grouped_agg: sorted-key check rows={} sorted={}", input_table.num_rows(), keys_sorted);
+  }
+
   // Make aggregation requests, group aggregations on the same column in the single request.
   // For multi-column COLLECT_SET, a synthetic negative key -(i+1) is used so that each such
   // aggregate gets its own request with a freshly synthesized struct column.
@@ -404,7 +459,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   std::unique_ptr<cudf::table> sorted_input;
   std::vector<cudf::order> key_order(group_cols.size(), cudf::order::ASCENDING);
   std::vector<cudf::null_order> key_null_order(group_cols.size(), cudf::null_order::AFTER);
-  if (stable_m2) {
+  // Keys already verified ascending need no sort for the stable M2 path either.
+  if (stable_m2 && !keys_sorted) {
     auto columns = group_cols;
     for (auto const& request : requests) {
       columns.push_back(request.values);
@@ -422,11 +478,12 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
       requests[i].values = sorted_input->get_column(group_cols.size() + i).view();
     }
   }
-  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols),
-                                   cudf::null_policy::INCLUDE,
-                                   stable_m2 ? cudf::sorted::YES : cudf::sorted::NO,
-                                   key_order,
-                                   key_null_order);
+  cudf::groupby::groupby grpby_obj(
+    cudf::table_view(group_cols),
+    cudf::null_policy::INCLUDE,
+    (stable_m2 || keys_sorted) ? cudf::sorted::YES : cudf::sorted::NO,
+    key_order,
+    key_null_order);
 
   // Call cudf groupby and populate output columns
   auto groupby_result = grpby_obj.aggregate(requests, stream, mr);

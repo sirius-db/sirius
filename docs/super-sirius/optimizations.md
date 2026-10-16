@@ -151,6 +151,50 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Sorted-Key Grouped Aggregation (experimental)
+
+**Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted, with about four rows per key; the per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.
+
+**Mechanism:** Before building the `cudf::groupby` object, `grouped_aggregate_table()` checks whether the batch has a single fixed-width, null-free, non-dictionary key and no COLLECT_SET aggregate. If so, it verifies with `cudf::is_sorted` that the key is ascending and, when it is, constructs the group-by with `cudf::sorted::YES`, so cuDF finds runs of equal keys and reduces each run instead of hashing. The check runs on every batch; an unsorted batch keeps the hash path, so correctness never depends on the data layout. When the keys are verified sorted, the stable STDDEV_SAMP path skips its own sort. The keys are sorted in practice only when the table was pinned in key order (see [Natural-Order Parquet Pinning](#natural-order-parquet-pinning-experimental)).
+
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `grouped_aggregate_table()`, `sorted_groupby_enabled()`
+
+**Config:** `SIRIUS_EXP_SORTED_GROUPBY=1` (environment variable, off by default; see [Configuration](configuration.md#aggregation-join-and-scan-specializations-experimental)). TPC-H SF1000 GB300, together with natural-order pinning: q18 partial aggregation 663 ms → 325 ms wall.
+
+### Order-Preserving Partition and Sorted Merge (experimental)
+
+**Motivation:** After a sorted-key partial aggregation, each partial result is sorted, and with a table pinned in key order the partials cover consecutive key ranges. `cudf::hash_partition` scatters rows without keeping their order, so the merge still had to hash and re-aggregate everything (q18: 352 ms of merge kernels at SF1000).
+
+**Mechanism:** Two parts behind one flag, so every producer and consumer agree on each key's partition:
+1. **Partition:** `stable_hash_partition()` assigns rows to partitions by the same MurmurHash3 row hash modulo the partition count, but keeps the input order within each partition (stable radix sort of partition id and row index, then a gather). Every hash partition switches together.
+2. **Merge:** for a single INT64 group key, `merge_grouped_aggregate()` orders the incoming partials by their first key before concatenating, verifies the concatenation with `cudf::is_sorted`, and uses the sorted-keys group-by when the check passes. Any other input keeps the hash merge.
+
+**Code path:**
+- `src/cuda/stable_hash_partition.cu`, `src/op/partition/stable_hash_partition.hpp` — order-preserving partition
+- `src/op/partition/gpu_partition_impl.cpp` — dispatch in `hash_partition()`
+- `src/op/merge/gpu_merge_impl.cpp` — `merge_grouped_aggregate()`, `sorted_merge_enabled()`
+
+**Config:** `SIRIUS_EXP_SORTED_MERGE=1` (environment variable, off by default). TPC-H SF1000 GB300, on top of the sorted-key aggregation: q18 0.825 s → 0.645 s; no other query regressed.
+
+### Low-Cardinality Grouped Aggregation (experimental)
+
+**Motivation:** With only a handful of groups, cuDF's hash group-by makes thousands of threads update the same few shared-memory slots, and its DECIMAL128 sums are compare-and-swap loops. TPC-H q1 has four groups; its per-batch aggregation took about 68 ms per batch at SF1000.
+
+**Mechanism:** A custom CUDA kernel path, tried first by `grouped_aggregate_table()`:
+1. `find_groups_kernel` builds a 16-bit code from up to two one-character string keys, verifies every key length, and records the codes present and one representative row per code.
+2. The host maps the codes to at most 64 dense groups.
+3. For up to 8 groups, `group_ids_kernel` writes a one-byte group id per row and `aggregate_columns_kernel<MaxGroups>` aggregates one column at a time with per-thread register accumulators and predicated adds (no atomics), followed by 128-bit warp and block reductions. 9 to 64 groups use per-warp shared-memory accumulators instead.
+4. Per-block totals are combined into DECIMAL128 sums and INT64 counts, and the keys are gathered from the representative rows.
+
+It applies only to one or two non-null one-character STRING keys, at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
+
+**Code path:**
+- `src/cuda/low_cardinality_groupby.cu` — kernels and host orchestration
+- `src/op/aggregate/low_cardinality_groupby.hpp` — `try_low_cardinality_groupby()`
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — dispatch in `grouped_aggregate_table()`
+
+**Config:** `SIRIUS_EXP_LOWCARD_GROUPBY=1` (environment variable, off by default). TPC-H SF1000 GB300: q1 0.884 s → 0.277 s.
+
 ### Distinct Hash Join (PR #558)
 
 **Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.
@@ -163,6 +207,23 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 Only applies to INNER and LEFT joins with pure equality conditions (excludes IS NOT DISTINCT FROM due to `null_equality::UNEQUAL` semantics).
 
 **Code path:** `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_columns()`, `src/op/sirius_physical_hash_join.cpp` — distinct hash table construction
+
+Parquet scans declare no PRIMARY KEY; for them, the experimental [Pin-Proven Unique Join Keys](#pin-proven-unique-join-keys-experimental) supplies the proof from pin-time facts.
+
+### Pin-Proven Unique Join Keys (experimental)
+
+**Motivation:** The distinct hash join needs a proof that the build keys are unique, and for a base table the only proof was a declared PRIMARY KEY. Parquet tables declare none, so every join over pinned parquet took the two-pass `cudf::hash_join` (a count pass, then a retrieve pass), even for keys such as `o_orderkey` or `s_suppkey`. The runtime distinctness check is off by default (issue #1600).
+
+**Mechanism:** Two parts:
+1. **Planner:** for a `LogicalGet` without a catalog table, `prove_unique_from_pin()` resolves the scan's parquet files, finds the pinned entry for exactly those files, and reports an output column whose pinned column was proven distinct at pin time. Filters and projections above the scan keep the proof valid, because a subset of distinct values is distinct. The join then takes `cudf::distinct_hash_join` as for a PRIMARY KEY.
+2. **Pin time:** the proof is the late-materialization uniqueness probe (`late_mat::unique_probe`: no nulls, every chunk distinct, and chunk ranges disjoint or an exact sort over the whole column). With the flag on, the pin observes every column automatically, in addition to `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS`. An automatic column must be an integer, and an unsorted chunk is sorted on the spot to count its distinct values, so a column that repeats a value is refused on its first chunk and nothing is retained for the exact stage. The exact-stage row cap defaults to the largest cuDF column when automatic columns are observed.
+
+**Code path:**
+- `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_from_pin()`, `prove_unique_columns()`
+- `src/late_mat/pin_uniqueness.cpp` — `pin_unique_automatic_selection()`, `unique_probe`, `exact_uniqueness_row_cap()`
+- `src/pin_table.cpp` — probe and exact-stage retention during pinning; `src/sirius_extension.cpp` — selection and attaching the facts
+
+**Config:** `SIRIUS_EXP_PIN_UNIQUE_JOIN=1` (environment variable, off by default). TPC-H SF1000 GB300: the pin proves `c_custkey`, `n_nationkey`, `o_orderkey`, `p_partkey`, `r_regionkey` and `s_suppkey`; q9 −182 ms, q5 −53 ms, and eight more queries −10 to −29 ms; total pin time over the 22 queries +1.6 s. Composite keys are not covered (the proof is per column).
 
 ### Scan Scheduling Tuning (PR #507)
 
@@ -314,6 +375,30 @@ result materialization restore native carriers.
 **Config:** `enable_compressed_materialization` (default: `true`), settable through YAML under
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
+
+### Decode to Restore Type (experimental)
+
+**Motivation:** With compressed materialization, a pinned column stored in a narrow carrier is cast back to its native type by the scan whenever a type-sensitive consumer needs it. TPC-H q1 restores four DECIMAL32 columns to DECIMAL64 in every batch: a separate read and write of each column, about 25 ms of cast kernels at SF1000.
+
+**Mechanism:** When the scan's output assembly is a leading identity, it passes its restore targets down to the Simpatico decode (`pushdown_request::output_types` → `scan_filter_request::output_types` → `decode_selection::output_type`). For a compacted (filter-pushdown) decode whose root is a bitpack node, the JIT renderer declares the kernel's output in the wider element type (entry symbol suffix `_to_<type>`), so the kernel widens in its store, and the decode allocates the output column in the target type. The scan's restore cast then finds the column already restored. Supported widenings: signed integer to a wider signed integer, same-scale DECIMAL widening, and a raw signed integer to DECIMAL or `TIMESTAMP_DAYS`. Other decodes keep the restore cast.
+
+**Code path:**
+- `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/op/scan/sirius_gpu_scan_operator_data.cpp` — restore targets
+- `src/compression/compressed_scan.cpp` — `pushdown_request::with_output_types()`
+- `src/compression/simpatico_codegen/src/plan/decompress.cpp` — `widened_element_dtype()`, `decode_fused_subtree_impl()`
+- `src/compression/simpatico_codegen/src/decode/jit/renderer.cpp` — `out_dtype` rendering
+
+**Config:** `SIRIUS_EXP_DECODE_TO_TARGET=1` (environment variable, off by default). TPC-H SF1000 GB300: q1 −18 ms, the same as disabling compressed materialization for q1, while keeping its gains on join-heavy queries.
+
+### Natural-Order Parquet Pinning (experimental)
+
+**Motivation:** `pin_table` receives local parquet files from `GlobFiles` in directory order, and each pinned chunk packs several files. A table stored sorted across numbered files (`part.0`, `part.1`, …) therefore pins into chunks whose rows are out of order: at TPC-H SF1000 only 3 of q18's 39 lineitem batches were in `l_orderkey` order.
+
+**Mechanism:** `pin_table` sorts the file list in natural order (digit runs compared numerically, so `part.2` precedes `part.10`) before materializing. Chunks then hold consecutive files, and a table whose files are each sorted and cover consecutive key ranges pins into sorted chunks. Nothing relies on this ordering for correctness: the consumers verify sortedness themselves (see [Sorted-Key Grouped Aggregation](#sorted-key-grouped-aggregation-experimental) and [Order-Preserving Partition and Sorted Merge](#order-preserving-partition-and-sorted-merge-experimental)). The cost is one sort of the file-name list.
+
+**Code path:** `src/sirius_extension.cpp` — pin file list; `src/helper/natural_sort.hpp` — `natural_less()`
+
+**Config:** `SIRIUS_EXP_SORTED_PIN_FILES=1` (environment variable, off by default). On its own it changes little (q18 1.156 s → 1.126 s); it enables the sorted aggregation paths, with which all 39 q18 batches are sorted.
 
 ### Late Materialization (unreleased, experimental)
 

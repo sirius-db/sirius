@@ -176,6 +176,9 @@ struct pin_materialization_options {
   /// leaves the probe off, which is the default; the caller derives it from
   /// @c late_mat::pin_unique_probe_selection.
   std::vector<bool> probe_unique_columns;
+  /// Positional with @c probe_unique_columns: true = the column is observed automatically
+  /// (see @c late_mat::pin_unique_automatic_selection). Empty = none.
+  std::vector<bool> probe_unique_automatic;
 };
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,

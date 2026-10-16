@@ -286,6 +286,9 @@ class scan_operator_input : public op::operator_data {
   /// prepare, before any join build has published, so only a decode-time
   /// snapshot can see any join filters at all.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
+  /// The scan's per-output-column normalization targets, set only when a compacted decode may
+  /// write restored columns directly in their target type (SIRIUS_EXP_DECODE_TO_TARGET=1).
+  std::vector<cudf::data_type> decode_restore_types;
   /// Operator-shared latch for "compacting this scan's batches during decode
   /// does not pay off", stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data on every split it hands

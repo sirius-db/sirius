@@ -92,13 +92,37 @@ namespace sirius::late_mat {
 [[nodiscard]] std::vector<bool> pin_unique_probe_selection(
   std::span<std::string const> column_names);
 
-/// Row cap for the exact stage (SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS, default 300M).
+/// Whether pin-time uniqueness facts also serve as join-key proofs (SIRIUS_EXP_PIN_UNIQUE_JOIN=1).
+///
+/// When on, the join planner treats a build key whose pinned column was proven distinct like a
+/// PRIMARY KEY, and takes the single-pass distinct hash join. Parquet scans declare no keys, so
+/// this is their only proof. The pin then also observes every column automatically (see
+/// pin_unique_automatic_selection), so no column list has to be configured.
+[[nodiscard]] bool pin_unique_join_enabled();
+
+/// Columns the probe observes automatically, positional with @p explicitly_selected: every column
+/// not already selected explicitly when pin_unique_join_enabled(), otherwise none.
+///
+/// An automatic column is held to a stricter standard than an explicit one: it must be an integer
+/// column, and a chunk that is not sorted is sorted on the spot to count its distinct values, so a
+/// column that repeats a value is refused on its first chunk instead of being retained for the
+/// exact stage. Observing every column of a wide fact table therefore costs at most one sort of one
+/// chunk per integer column. Join keys of TPC-H pins (`o_orderkey`, `p_partkey`, `s_suppkey`, ...)
+/// pass.
+[[nodiscard]] std::vector<bool> pin_unique_automatic_selection(
+  std::vector<bool> const& explicitly_selected);
+
+/// Row cap for the exact stage (SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS). The default is 300M rows, or
+/// the largest cuDF column when @p automatic columns are observed.
 ///
 /// The exact check sorts the whole assembled column, so on a fact table it is
 /// pin-time work measured in seconds — for a fact nobody asked for, since the
 /// tables whose keys unlock a ride are dimensions. Above the cap the column
-/// stays UNKNOWN, which costs an optimization and never an answer.
-[[nodiscard]] std::size_t exact_uniqueness_row_cap();
+/// stays UNKNOWN, which costs an optimization and never an answer. Automatic
+/// columns reach the exact stage only when every chunk is distinct and the
+/// chunks overlap in range (SF1000 `orders`, 1.5B rows), and such a join key is
+/// worth one sort at pin time.
+[[nodiscard]] std::size_t exact_uniqueness_row_cap(bool automatic = false);
 
 /// What the per-chunk pass concluded about one pinned column. The distinction
 /// that matters is @c refused vs @c undecided: a refused column is one the
@@ -146,7 +170,9 @@ enum class unique_verdict : std::uint8_t {
 class unique_probe {
  public:
   /// @param selected  positional with the pinned columns; true = observe.
-  explicit unique_probe(std::vector<bool> selected);
+  /// @param automatic positional with @p selected; true = observed automatically, so held to the
+  ///                  stricter standard of pin_unique_automatic_selection. Empty = none.
+  explicit unique_probe(std::vector<bool> selected, std::vector<bool> const& automatic = {});
 
   /// True while at least one column is still a candidate — the drivers use this
   /// to skip the call (and its stream work) entirely.
@@ -160,6 +186,13 @@ class unique_probe {
 
   /// Per-column verdicts, positional with the selection.
   [[nodiscard]] std::vector<unique_verdict> verdicts() const;
+
+  /// True while the column is still possibly unique. The pin driver retains values for the exact
+  /// stage only for these columns.
+  [[nodiscard]] bool candidate(std::size_t column_pos) const
+  {
+    return column_pos < _columns.size() && _columns[column_pos].candidate;
+  }
 
   /// Shorthand for `verdicts()[i] == unique_verdict::proven`.
   [[nodiscard]] std::vector<bool> proven() const;
@@ -181,6 +214,7 @@ class unique_probe {
   struct column_state {
     bool observed{false};   ///< selected for the probe
     bool candidate{false};  ///< still possibly unique
+    bool automatic{false};  ///< observed automatically (stricter standard)
     /// The cheap stage cannot judge this column (not an integer, or its
     /// min/max could not be read). Not a refusal — the exact check may still
     /// decide it, so the verdict is `undecided` rather than `refused`.

@@ -18,13 +18,31 @@
 
 #include "data/data_batch_utils.hpp"
 #include "op/join_key_preparation.hpp"
+#include "op/partition/stable_hash_partition.hpp"
 
 #include <cudf/partitioning.hpp>
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+#include <string_view>
+
 namespace sirius {
 namespace op {
+
+namespace {
+
+/// Whether hash partitions keep their input order (SIRIUS_EXP_SORTED_MERGE=1).
+bool stable_partition_enabled()
+{
+  static bool const enabled = [] {
+    char const* value = std::getenv("SIRIUS_EXP_SORTED_MERGE");
+    return value != nullptr && std::string_view{value} == "1";
+  }();
+  return enabled;
+}
+
+}  // namespace
 
 std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
   const cucascade::read_only_data_batch& input,
@@ -73,13 +91,22 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   // error from an earlier call would be misattributed to the scan inside hash_partition.
   (void)cudaGetLastError();
 
-  auto partition_result = cudf::hash_partition(effective_table,
-                                               effective_key_idx,
-                                               num_partitions,
-                                               cudf::hash_id::HASH_MURMUR3,
-                                               cudf::DEFAULT_HASH_SEED,
-                                               stream,
-                                               memory_space.get_default_allocator());
+  // Experimental (SIRIUS_EXP_SORTED_MERGE=1): keep the input order within each partition, so a
+  // merge of partitions of sorted inputs can use the sorted-keys group-by. Every hash partition
+  // switches together, so all producers feeding one consumer agree on each key's partition.
+  auto partition_result = stable_partition_enabled()
+                            ? stable_hash_partition(effective_table,
+                                                    effective_key_idx,
+                                                    num_partitions,
+                                                    stream,
+                                                    memory_space.get_default_allocator())
+                            : cudf::hash_partition(effective_table,
+                                                   effective_key_idx,
+                                                   num_partitions,
+                                                   cudf::hash_id::HASH_MURMUR3,
+                                                   cudf::DEFAULT_HASH_SEED,
+                                                   stream,
+                                                   memory_space.get_default_allocator());
 
   // Build a column-index list for the original (non-cast) columns.
   std::vector<cudf::size_type> orig_col_indices;
