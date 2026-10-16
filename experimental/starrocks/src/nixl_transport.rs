@@ -6,7 +6,8 @@
 //! with a Packed frame. No staging copy on either side.
 //!
 //! One thread owns the [`Agent`] (nixl-sys documents a multithreading deadlock caveat), so every
-//! WRITE goes through it. What peers ask of this CN (Md, Alloc, Release) never touches that thread:
+//! WRITE goes through it. It serves all of a fragment's remote outputs at once, round robin, each
+//! with its own window of WRITEs, and ships a streamed output as its fragment produces it. What peers ask of this CN (Md, Alloc, Release) never touches that thread:
 //! it reads the cached metadata or calls the [`DirectExchange`] on the brpc thread.
 
 use std::cell::RefCell;
@@ -26,8 +27,12 @@ use prost::Message;
 use sirius::DirectExchange;
 use tracing::{info, warn};
 
-use crate::fragment_executor::{ExportedBatch, FragmentExecutor, SenderSlot};
-use crate::nixl_chunk::{AllocReply, NixlEndpoint, NixlEnvelope, control_params, packed_params};
+use crate::fragment_executor::{
+    DrainNext, ExportedBatch, FragmentExecutor, OutputDrain, SenderSlot,
+};
+use crate::nixl_chunk::{
+    AllocReply, NixlEndpoint, NixlEnvelope, StreamHop, control_params, packed_params,
+};
 use crate::proto::starrocks::{
     PTransmitChunkParams, PTransmitChunkResult,
     p_internal_service_brpc::{SERVICE_NAME, methods},
@@ -49,23 +54,56 @@ const DEFAULT_XFER_TIMEOUT_SECS: u64 = 30;
 /// [`ALLOC_MAX_BACKOFF`]: a receiver's pool frees up as it consumes earlier batches.
 const ALLOC_RETRIES: u32 = 8;
 const ALLOC_MAX_BACKOFF: Duration = Duration::from_secs(1);
+/// How long the transport waits on one streamed output when every output is waiting on its
+/// fragment and no WRITE is in flight.
+const IDLE_WAIT: Duration = Duration::from_millis(2);
+
+/// Polls of a WRITE in flight back off from [`POLL_FIRST`] to [`POLL_MAX`], so a long WRITE doesn't
+/// keep a core spinning next to the brpc and engine threads. WRITEs take 0.3-4 ms at SF1000, so a
+/// longer cap would notice one finishing that much later.
+const POLL_FIRST: Duration = Duration::from_micros(4);
+const POLL_MAX: Duration = Duration::from_micros(100);
 
 /// Handle to the transport thread.
 #[derive(Debug)]
 pub struct NixlTransport {
     /// Taken on drop to end the thread's loop.
-    requests: Option<Sender<SendRequest>>,
+    requests: Option<Sender<ShipRequest>>,
     thread: Option<JoinHandle<()>>,
     local_md: Vec<u8>,
     exchange: Arc<DirectExchange>,
 }
 
-struct SendRequest {
+/// Hops shipped together, and where to report how it went.
+struct ShipRequest {
+    hops: Vec<Hop>,
+    respond: Sender<Result<(), String>>,
+}
+
+/// One remote output and where its batches come from.
+struct Hop {
     peer: SocketAddr,
     slot: SenderSlot,
     names: Vec<String>,
-    executor: Arc<dyn FragmentExecutor>,
-    respond: Sender<Result<(), String>>,
+    source: Source,
+}
+
+enum Source {
+    /// Output parked after its fragment ran, exported through the engine thread.
+    Parked(Arc<dyn FragmentExecutor>),
+    /// Output exported while its fragment runs.
+    Streamed(Box<dyn OutputDrain>),
+}
+
+impl Source {
+    fn next(&mut self, slot: SenderSlot, timeout: Duration) -> Result<DrainNext, String> {
+        match self {
+            Source::Parked(executor) => Ok(executor
+                .export_direct_next(slot)?
+                .map_or(DrainNext::End, DrainNext::Batch)),
+            Source::Streamed(drain) => drain.next(timeout),
+        }
+    }
 }
 
 impl NixlTransport {
@@ -133,6 +171,12 @@ impl NixlEndpoint for NixlTransport {
         release(&self.exchange, token);
     }
 
+    fn seal(&self, token: u64) -> Result<(), String> {
+        self.exchange
+            .seal(token)
+            .map_err(|err| format!("failed to seal received batch {token}: {err}"))
+    }
+
     fn outstanding(&self) -> usize {
         self.exchange.outstanding().unwrap_or_else(|err| {
             warn!(error = %err, "failed to count direct-exchange buffers");
@@ -147,17 +191,35 @@ impl NixlEndpoint for NixlTransport {
         names: Vec<String>,
         executor: Arc<dyn FragmentExecutor>,
     ) -> Result<(), String> {
+        self.ship(vec![Hop {
+            peer,
+            slot,
+            names,
+            source: Source::Parked(executor),
+        }])
+    }
+
+    fn stream(&self, hops: Vec<StreamHop>) -> Result<(), String> {
+        self.ship(
+            hops.into_iter()
+                .map(|hop| Hop {
+                    peer: hop.peer,
+                    slot: hop.slot,
+                    names: hop.names,
+                    source: Source::Streamed(hop.drain),
+                })
+                .collect(),
+        )
+    }
+}
+
+impl NixlTransport {
+    fn ship(&self, hops: Vec<Hop>) -> Result<(), String> {
         let (respond, response) = channel();
         self.requests
             .as_ref()
             .ok_or_else(|| "the nixl transport is shutting down".to_string())?
-            .send(SendRequest {
-                peer,
-                slot,
-                names,
-                executor,
-                respond,
-            })
+            .send(ShipRequest { hops, respond })
             .map_err(|_| "the nixl-transport thread is not running".to_string())?;
         response
             .recv()
@@ -243,6 +305,29 @@ struct Write {
     posted: Instant,
 }
 
+/// One hop being shipped: its source, its WRITEs in flight, and its announce queue.
+struct Lane {
+    peer: SocketAddr,
+    slot: SenderSlot,
+    remote: String,
+    source: Source,
+    streamed: bool,
+    inflight: VecDeque<Write>,
+    announce: Sender<(u64, u64)>,
+    /// Set by the hop's announcer once the peer refused or missed a frame: the pump then stops
+    /// exporting, allocating and writing batches nobody will receive.
+    stop: Arc<AtomicBool>,
+    /// The source has no more batches.
+    drained: bool,
+    totals: HopTotals,
+}
+
+impl Lane {
+    fn done(&self) -> bool {
+        self.drained && self.inflight.is_empty()
+    }
+}
+
 #[derive(Default)]
 struct HopTotals {
     frames: u64,
@@ -320,121 +405,192 @@ impl Transport {
         })
     }
 
-    fn serve(&mut self, requests: Receiver<SendRequest>) {
+    fn serve(&mut self, requests: Receiver<ShipRequest>) {
         for request in requests {
-            let result = self.send(&request);
+            let result = self.ship(request.hops);
             let _ = request.respond.send(result);
         }
         info!("nixl-transport thread shutting down");
     }
 
-    /// Ships every batch parked under the request's slot, keeping a window of WRITEs in flight.
-    /// Announces leave in order from their own thread, so a WRITE never waits on the previous
-    /// batch's announce round trip.
-    fn send(&mut self, request: &SendRequest) -> Result<(), String> {
+    /// Ships every hop at once, keeping a window of WRITEs in flight per hop. Announces leave in
+    /// order from one thread per hop, so a WRITE never waits on the previous batch's announce
+    /// round trip. After the first error no hop sends its EOS.
+    fn ship(&mut self, hops: Vec<Hop>) -> Result<(), String> {
         self.reap_quarantine();
         let started = Instant::now();
-        let peer = request.peer;
-        let remote = self.remote_agent(peer)?;
+        let remotes = hops
+            .iter()
+            .map(|hop| self.remote_agent(hop.peer))
+            .collect::<Result<Vec<_>, _>>()?;
+        let peers: Vec<_> = hops
+            .iter()
+            .map(|hop| hop.peer)
+            .zip(remotes.iter().cloned())
+            .collect();
         let window = self.window;
-        let mut totals = HopTotals::default();
-        // Set by the announcer once the peer refused or missed a frame: the pump then stops
-        // exporting, allocating and writing batches nobody will receive.
-        let stop = AtomicBool::new(false);
         let shipped = std::thread::scope(|scope| {
-            let (announce, frames) = channel::<(u64, u64)>();
-            let (slot, names) = (request.slot, &request.names);
-            let stop_ref = &stop;
-            let announcer = std::thread::Builder::new()
-                .name("nixl-announce".to_string())
-                .spawn_scoped(scope, move || {
-                    announce_all(peer, slot, names, frames, stop_ref)
-                })
-                .map_err(|err| format!("failed to spawn the nixl announce thread: {err}"))?;
-            let mut inflight = VecDeque::new();
-            let pumped = self.pump(
-                request,
-                &remote,
-                &mut inflight,
-                &announce,
-                &stop,
-                &mut totals,
-            );
+            let mut lanes = Vec::with_capacity(hops.len());
+            let mut announcers = Vec::with_capacity(hops.len());
+            for (hop, remote) in hops.into_iter().zip(remotes) {
+                let (announce, frames) = channel::<(u64, u64)>();
+                let (peer, slot, names) = (hop.peer, hop.slot, hop.names);
+                let stop = Arc::new(AtomicBool::new(false));
+                let announcer_stop = Arc::clone(&stop);
+                let announcer = std::thread::Builder::new()
+                    .name("nixl-announce".to_string())
+                    .spawn_scoped(scope, move || {
+                        announce_all(peer, slot, &names, frames, &announcer_stop)
+                    })
+                    .map_err(|err| format!("failed to spawn a nixl announce thread: {err}"))?;
+                announcers.push(announcer);
+                lanes.push(Lane {
+                    peer,
+                    slot,
+                    remote,
+                    streamed: matches!(hop.source, Source::Streamed(_)),
+                    source: hop.source,
+                    inflight: VecDeque::new(),
+                    announce,
+                    stop,
+                    drained: false,
+                    totals: HopTotals::default(),
+                });
+            }
+            let pumped = self.pump(&mut lanes, window);
             // Wait out every WRITE still posted: a finished one frees the sender's batch, and the
-            // receiver's buffers it filled are never announced, so they are released. Once the
-            // peer stops answering, further Releases would each wait out `RPC_TIMEOUT`.
-            let mut peer_up = true;
-            for mut write in inflight {
-                if self.complete(&remote, &mut write).is_err() {
-                    self.quarantine(peer, write);
-                } else if peer_up {
-                    peer_up = release_remote(peer, write.remote);
+            // receiver's buffers it filled are never announced, so they are released. A peer that
+            // stops answering gets no more Releases: each would wait out `RPC_TIMEOUT`.
+            let mut down = HashSet::new();
+            for lane in &mut lanes {
+                for mut write in std::mem::take(&mut lane.inflight) {
+                    if self.complete(&lane.remote, &mut write).is_err() {
+                        self.quarantine(lane.peer, write);
+                    } else if !down.contains(&lane.peer) && !release_remote(lane.peer, write.remote)
+                    {
+                        down.insert(lane.peer);
+                    }
+                }
+                if pumped.is_ok() {
+                    let _ = lane.announce.send((0, 0));
                 }
             }
-            if pumped.is_ok() {
-                let _ = announce.send((0, 0));
+            // Dropping the lanes closes every announce queue, so the announcers can finish.
+            let shipped: Vec<_> = lanes
+                .into_iter()
+                .map(|lane| (lane.peer, lane.slot, lane.streamed, lane.totals))
+                .collect();
+            let mut announced = Ok(());
+            for announcer in announcers {
+                let result = announcer
+                    .join()
+                    .unwrap_or_else(|_| Err("the announce thread panicked".to_string()));
+                announced = announced.and(result);
             }
-            drop(announce);
-            let announced = announcer
-                .join()
-                .unwrap_or_else(|_| Err("the announce thread panicked".to_string()));
-            // The announcer's error is the cause when it stopped the pump.
+            let span_us = started.elapsed().as_micros() as u64;
+            for (peer, slot, streamed, totals) in shipped {
+                info!(
+                    peer = %peer,
+                    dest_stream = slot.node_id,
+                    sender_id = slot.sender_id,
+                    frames = totals.frames,
+                    bytes = totals.bytes,
+                    rows = totals.rows,
+                    window,
+                    streamed,
+                    write_us = totals.write_us,
+                    span_us,
+                    "shipping packed exchange hop"
+                );
+            }
+            // An announcer's error is the cause when it stopped the pump.
             announced.and(pumped)
         });
-        if let Err(err) = shipped {
-            // A restarted peer comes back under the same agent name with a new registration, so
-            // stale metadata would fail every later hop: reload it on the next one.
-            self.forget_peer(peer, &remote);
-            return Err(err);
+        if shipped.is_err() {
+            // Every hop of a failed ship failed with it. A restarted peer comes back under the
+            // same agent name with a new registration, so stale metadata would fail every later
+            // hop: reload it on the next one.
+            for (peer, remote) in peers {
+                self.forget_peer(peer, &remote);
+            }
         }
-        info!(
-            peer = %peer,
-            dest_stream = request.slot.node_id,
-            sender_id = request.slot.sender_id,
-            frames = totals.frames,
-            bytes = totals.bytes,
-            rows = totals.rows,
-            window,
-            write_us = totals.write_us,
-            span_us = started.elapsed().as_micros() as u64,
-            "shipping packed exchange hop"
-        );
-        Ok(())
+        shipped
     }
 
-    fn pump(
-        &self,
-        request: &SendRequest,
-        remote: &str,
-        inflight: &mut VecDeque<Write>,
-        announce: &Sender<(u64, u64)>,
-        stop: &AtomicBool,
-        totals: &mut HopTotals,
-    ) -> Result<(), String> {
-        let mut drained = false;
+    /// Serves every lane round robin until each source ended and its WRITEs finished.
+    fn pump(&self, lanes: &mut [Lane], window: usize) -> Result<(), String> {
+        let mut next_wait = 0;
+        let mut backoff = POLL_FIRST;
         loop {
-            if stop.load(Ordering::Acquire) {
-                return Err("the peer stopped accepting this hop's frames".to_string());
+            let mut progressed = false;
+            for lane in lanes.iter_mut() {
+                if lane.stop.load(Ordering::Acquire) {
+                    return Err("the peer stopped accepting this hop's frames".to_string());
+                }
+                progressed |= self.fill(lane, window, Duration::ZERO)?;
+                progressed |= self.retire(lane)?;
             }
-            while !drained && inflight.len() < self.window {
-                match request.executor.export_direct_next(request.slot)? {
-                    Some(batch) => inflight.push_back(self.post(request.peer, remote, batch)?),
-                    None => drained = true,
+            if lanes.iter().all(Lane::done) {
+                return Ok(());
+            }
+            if progressed {
+                backoff = POLL_FIRST;
+                continue;
+            }
+            if lanes.iter().any(|lane| !lane.inflight.is_empty()) {
+                back_off(&mut backoff);
+                continue;
+            }
+            // Every source is waiting on its fragment: block briefly on one, taking turns.
+            let waiting: Vec<usize> = (0..lanes.len()).filter(|&i| !lanes[i].drained).collect();
+            let lane = &mut lanes[waiting[next_wait % waiting.len()]];
+            next_wait += 1;
+            self.fill(lane, window, IDLE_WAIT)?;
+        }
+    }
+
+    /// Posts the lane's next batches until its window is full or its source has none ready.
+    /// Waits up to `timeout` for the first. Returns whether anything changed.
+    fn fill(&self, lane: &mut Lane, window: usize, mut timeout: Duration) -> Result<bool, String> {
+        let mut progressed = false;
+        while !lane.drained && lane.inflight.len() < window {
+            match lane.source.next(lane.slot, timeout)? {
+                DrainNext::Batch(batch) => {
+                    let write = self.post(lane.peer, &lane.remote, batch)?;
+                    lane.inflight.push_back(write);
+                }
+                DrainNext::Waiting => break,
+                DrainNext::End => lane.drained = true,
+            }
+            progressed = true;
+            timeout = Duration::ZERO;
+        }
+        Ok(progressed)
+    }
+
+    /// Announces the lane's finished WRITEs, oldest first, without waiting on one in flight.
+    fn retire(&self, lane: &mut Lane) -> Result<bool, String> {
+        let mut progressed = false;
+        while let Some(write) = lane.inflight.front_mut() {
+            match self.poll(&lane.remote, write) {
+                Ok(false) => break,
+                Ok(true) => {
+                    let write = lane.inflight.pop_front().expect("a front write");
+                    lane.totals.frames += 1;
+                    lane.totals.rows += write.rows;
+                    lane.totals.bytes += write.bytes;
+                    lane.totals.write_us += write.posted.elapsed().as_micros() as u64;
+                    let _ = lane.announce.send((write.remote, write.rows));
+                    progressed = true;
+                }
+                Err(err) => {
+                    let write = lane.inflight.pop_front().expect("a front write");
+                    self.quarantine(lane.peer, write);
+                    return Err(err);
                 }
             }
-            let Some(mut write) = inflight.pop_front() else {
-                return Ok(());
-            };
-            if let Err(err) = self.complete(remote, &mut write) {
-                self.quarantine(request.peer, write);
-                return Err(err);
-            }
-            totals.frames += 1;
-            totals.rows += write.rows;
-            totals.bytes += write.bytes;
-            totals.write_us += write.posted.elapsed().as_micros() as u64;
-            let _ = announce.send((write.remote, write.rows));
         }
+        Ok(progressed)
     }
 
     /// Allocates the receiver's buffers for `batch` and posts one WRITE of all of them.
@@ -502,24 +658,18 @@ impl Transport {
             .map_err(|err| format!("failed to create a nixl WRITE to agent '{remote}': {err}"))
     }
 
-    /// Waits for `write` to finish, then frees the sender's batch. A WRITE that fails or times out
-    /// may still be in flight, so its request stays in `write` (dropping it would release it) and
-    /// both batches stay held; the caller quarantines it.
-    fn complete(&self, remote: &str, write: &mut Write) -> Result<(), String> {
-        let timeout = self.xfer_timeout;
-        // Polls back off from a few microseconds to 100 us, so a long WRITE doesn't keep a core
-        // spinning next to the brpc and engine threads. WRITEs take 0.3-4 ms at SF1000, so a
-        // longer cap would notice one finishing that much later.
-        let mut backoff = Duration::from_micros(4);
-        while let Some(request) = &write.request {
+    /// Whether `write` finished, without waiting; a finished one frees the sender's batch. A
+    /// WRITE that fails or times out may still be in flight, so its request stays in `write`
+    /// (dropping it would release it) and both batches stay held; the caller quarantines it.
+    fn poll(&self, remote: &str, write: &mut Write) -> Result<bool, String> {
+        if let Some(request) = &write.request {
             match self.agent.get_xfer_status(request) {
                 Ok(XferStatus::Success) => write.request = None,
-                Ok(XferStatus::InProgress) if write.posted.elapsed() < timeout => {
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(Duration::from_micros(100));
+                Ok(XferStatus::InProgress) if write.posted.elapsed() < self.xfer_timeout => {
+                    return Ok(false);
                 }
                 status => {
-                    let bytes = write.bytes;
+                    let (bytes, timeout) = (write.bytes, self.xfer_timeout);
                     return Err(match status {
                         Ok(_) => format!(
                             "a {bytes}-byte nixl WRITE to agent '{remote}' did not finish within \
@@ -533,6 +683,15 @@ impl Transport {
             }
         }
         self.release(write.local);
+        Ok(true)
+    }
+
+    /// Waits for `write` to finish; see [`poll`](Self::poll).
+    fn complete(&self, remote: &str, write: &mut Write) -> Result<(), String> {
+        let mut backoff = POLL_FIRST;
+        while !self.poll(remote, write)? {
+            back_off(&mut backoff);
+        }
         Ok(())
     }
 
@@ -702,6 +861,12 @@ fn announce_all(
         }
     }
     result
+}
+
+/// Sleeps `backoff`, then doubles it up to [`POLL_MAX`].
+fn back_off(backoff: &mut Duration) {
+    std::thread::sleep(*backoff);
+    *backoff = (*backoff * 2).min(POLL_MAX);
 }
 
 /// Asks `peer` to free the receive buffers under `token`, logging a failure. Returns whether the
