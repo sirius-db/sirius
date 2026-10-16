@@ -150,8 +150,9 @@ class downgrade_executor {
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
-   * @brief Set what a HOST-source executor asks first for host memory back: it is handed the
-   * bytes wanted and returns the bytes it freed. Batches go to disk only for the rest.
+   * @brief Set what this executor asks for host memory back before data goes to disk: it is
+   * handed the bytes wanted and returns the bytes it freed. A HOST source asks before moving
+   * batches to disk; a GPU source asks when a batch would otherwise skip a full host tier.
    *
    * Must be called before start(), and the callee must outlive stop().
    */
@@ -201,6 +202,12 @@ class downgrade_executor {
    * instant conditions change -- no latched state, no missed wakeup.
    */
   bool has_viable_downgrade_target() const;
+
+  /**
+   * @brief Before a GPU batch of @p bytes is converted: when no HOST space can take it, ask the
+   * host memory releaser for that much, so the batch lands on host instead of going to disk.
+   */
+  void make_host_room(std::size_t bytes) const;
 
  private:
   exec::downgrade_executor_config _config;

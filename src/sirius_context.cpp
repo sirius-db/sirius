@@ -1164,10 +1164,9 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
                                                                 physical_counters_);
   scan_manager_->set_query_event_publisher(*query_event_publisher_);
 
-  // HOST-source executors take memory back from the prefetching caches before spilling to disk.
-  // The executors are stopped and destroyed before scan_manager_ in terminate().
+  // Executors take memory back from the prefetching caches before data goes to disk. They are
+  // stopped and destroyed before scan_manager_ in terminate().
   for (auto& executor : downgrade_executors_) {
-    if (executor->get_space_id().tier != cucascade::memory::Tier::HOST) { continue; }
     executor->set_host_memory_releaser([scan_manager = scan_manager_.get()](std::size_t bytes) {
       return scan_manager->release_idle_cache_memory(bytes);
     });

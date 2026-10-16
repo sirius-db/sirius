@@ -523,3 +523,89 @@ TEST_CASE("residency reports the loaded share of an object by path", "[cache][re
   CHECK(held.object_bytes == (8ull << 20));
   CHECK(held.resident_bytes == 2 * chunk);
 }
+
+TEST_CASE("release_idle gives back idle chunks above the reservation and keeps live ones",
+          "[cache][eviction][release_idle]")
+{
+  constexpr std::size_t mib = 1ull << 20;  // also the pool's chunk size
+  temp_data_file file(256ull << 20);
+  auto memory   = constrained_memory_manager();
+  auto topology = single_gpu_index_for_evict();
+
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
+  auto* cache = manager.ensure_default_cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->chunk_size() == mib);
+
+  auto prepare = [&](std::int64_t offset, std::int64_t bytes) {
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(offset, bytes);
+    auto ds = manager.create_datasource(file.path.string());
+    REQUIRE(ds != nullptr);
+    ds->fadvise(ranges, 0);
+    REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+    return ds;
+  };
+  // 64 MiB of the 256 MiB tier is the pool's reservation (constrained_lru_config).
+  auto live = prepare(0, static_cast<std::int64_t>(8 * mib));
+  auto idle = prepare(static_cast<std::int64_t>(8 * mib), static_cast<std::int64_t>(92 * mib));
+  REQUIRE(cache->claimed_bytes() == 100 * mib);
+  idle.reset();
+
+  // Only the 36 MiB above the reservation reach the host tier; the live request's chunks stay.
+  CHECK(cache->release_idle(1ull << 30) == 36 * mib);
+  CHECK(cache->claimed_bytes() == 64 * mib);
+  CHECK(cache->release_idle(1ull << 30) == 0);
+  live.reset();
+}
+
+TEST_CASE("the pool grows past its reservation only while the host tier is below its stop mark",
+          "[cache][eviction][release_idle]")
+{
+  constexpr std::size_t mib = 1ull << 20;
+  temp_data_file file(256ull << 20);
+  auto memory   = constrained_memory_manager();
+  auto topology = single_gpu_index_for_evict();
+
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
+  auto* cache = manager.ensure_default_cache();
+  REQUIRE(cache != nullptr);
+  auto host_spaces = memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(host_spaces.size() == 1);
+  auto* host_mr = host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host_mr != nullptr);
+
+  auto make = [&](std::int64_t offset, std::int64_t bytes) {
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(offset, bytes);
+    auto ds = manager.create_datasource(file.path.string());
+    REQUIRE(ds != nullptr);
+    ds->fadvise(ranges, 0);
+    return ds;
+  };
+  auto first = make(0, static_cast<std::int64_t>(32 * mib));
+  REQUIRE(first->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+
+  // Spilled data stand-in: everything the tier has left but a few chunks, which takes it past
+  // its downgrade stop threshold (65% by default).
+  auto const available = host_mr->get_available_memory();
+  REQUIRE(available > 8 * mib);
+  auto pressure = host_mr->allocate_multiple_blocks((available / mib - 8) * mib);
+  REQUIRE(pressure != nullptr);
+  REQUIRE_FALSE(host_spaces.front()->should_stop_downgrading_memory());
+
+  // 32 MiB held plus 48 MiB wanted is past the 64 MiB reservation: refused under pressure.
+  auto second = make(static_cast<std::int64_t>(32 * mib), static_cast<std::int64_t>(48 * mib));
+  CHECK(second->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed);
+  CHECK(cache->claimed_bytes() == 32 * mib);
+
+  // Once the pressure is gone the same request fits.
+  pressure.reset();
+  REQUIRE(host_spaces.front()->should_stop_downgrading_memory());
+  CHECK(second->prepare_prefetch(true) == sirius::io::prepare_result::prepared);
+  CHECK(cache->claimed_bytes() == 80 * mib);
+}

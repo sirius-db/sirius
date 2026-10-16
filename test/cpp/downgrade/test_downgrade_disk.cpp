@@ -46,6 +46,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -504,4 +505,138 @@ TEST_CASE("HOST-source monitor backs off when no disk is configured", "[downgrad
 
   REQUIRE(n2 == n1);  // HOST source with no disk has no target -> never fires
   REQUIRE(n1 == 0);
+}
+
+namespace {
+
+// A small HOST tier (2 MB, limit 1.5 MB) with a DISK tier behind it.
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_host_and_disk_manager(
+  std::filesystem::path const& disk_dir)
+{
+  sirius::converter_registry::reset_for_testing();
+  std::filesystem::create_directories(disk_dir);
+
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(2ull << 30)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_numa_region_capacity(2ull << 20)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.75)
+    .set_disk_mounting_point(0, 4ull << 30, disk_dir.string());
+
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  sirius::converter_registry::initialize();
+  return manager;
+}
+
+}  // namespace
+
+TEST_CASE("GPU downgrade asks the host memory releaser before skipping a full HOST",
+          "[downgrade_disk]")
+{
+  auto mem_mgr    = make_host_and_disk_manager(std::filesystem::temp_directory_path() /
+                                            "sirius_test_disk_releaser");
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto batch     = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  // The held reservations stand in for cached chunks: the releaser drops them.
+  auto held = exhaust_host_capacity(*mem_mgr);
+  REQUIRE_FALSE(held.empty());
+  std::atomic<int> calls{0};
+  std::mutex held_mtx;
+
+  auto executor = make_monitoring_executor(lifecycle, repo_registry, nullptr, *mem_mgr);
+  executor.set_host_memory_releaser([&](std::size_t) {
+    calls.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(held_mtx);
+    std::size_t released = 0;
+    for (auto& r : held) {
+      released += r->size();
+    }
+    held.clear();
+    return released;
+  });
+  executor.start();
+
+  REQUIRE(executor.request_free_memory_and_wait(1) > 0);
+  CHECK(calls.load() >= 1);
+  CHECK(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}
+
+TEST_CASE("GPU downgrade leaves the host memory releaser alone while HOST has room",
+          "[downgrade_disk]")
+{
+  auto mem_mgr    = make_host_and_disk_manager(std::filesystem::temp_directory_path() /
+                                            "sirius_test_disk_releaser_idle");
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto batch     = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  std::atomic<int> calls{0};
+  auto executor = make_monitoring_executor(lifecycle, repo_registry, nullptr, *mem_mgr);
+  executor.set_host_memory_releaser([&](std::size_t) {
+    calls.fetch_add(1, std::memory_order_relaxed);
+    return std::size_t{0};
+  });
+  executor.start();
+
+  REQUIRE(executor.request_free_memory_and_wait(1) > 0);
+  CHECK(calls.load() == 0);
+  CHECK(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}
+
+TEST_CASE("HOST downgrade counts what the host memory releaser frees before spilling batches",
+          "[downgrade_disk]")
+{
+  auto mem_mgr     = make_host_and_disk_manager(std::filesystem::temp_directory_path() /
+                                            "sirius_test_disk_releaser_host");
+  auto host_spaces = mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(host_spaces.empty());
+  auto* host_space = const_cast<cucascade::memory::memory_space*>(host_spaces.front());
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  repo_registry.create_for_query(kTestQueryId);
+
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period = std::chrono::milliseconds{10}};
+  downgrade_executor executor(
+    lifecycle, config, repo_registry, host_space->get_id(), nullptr, *mem_mgr);
+  std::atomic<std::size_t> asked{0};
+  executor.set_host_memory_releaser([&](std::size_t bytes) {
+    asked.store(bytes, std::memory_order_relaxed);
+    return bytes;
+  });
+  executor.start();
+
+  // No batches to spill: everything freed comes from the releaser.
+  CHECK(executor.request_free_memory_and_wait(4096) == 4096);
+  CHECK(asked.load() == 4096);
+
+  executor.stop();
 }

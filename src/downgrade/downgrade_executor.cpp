@@ -355,7 +355,8 @@ void downgrade_executor::processing_loop()
 
           _pool->dispatch(
             std::move(slot),
-            [cand       = std::move(candidate),
+            [this,
+             cand       = std::move(candidate),
              req_ptr    = req.get(),
              &res_mgr   = _reservation_manager,
              &targets   = target_spaces,
@@ -372,6 +373,7 @@ void downgrade_executor::processing_loop()
               };
               try {
                 nvtx3::scoped_range nvtx_range{"sirius::downgrade::convert_batch"};
+                make_host_room(candidate_bytes);
                 auto result =
                   cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
                 if (result) {
@@ -434,7 +436,8 @@ void downgrade_executor::processing_loop()
 
         _pool->dispatch(
           std::move(slot),
-          [cand       = std::move(candidate),
+          [this,
+           cand       = std::move(candidate),
            req_ptr    = req.get(),
            &res_mgr   = _reservation_manager,
            &targets   = target_spaces,
@@ -455,6 +458,7 @@ void downgrade_executor::processing_loop()
             };
             try {
               nvtx3::scoped_range nvtx_range{"sirius::downgrade::convert_task_batches"};
+              make_host_room(candidate_bytes);
               auto result =
                 cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
               if (result) {
@@ -598,6 +602,33 @@ bool downgrade_executor::has_viable_downgrade_target() const
     }
   }
   return false;
+}
+
+void downgrade_executor::make_host_room(std::size_t bytes) const
+{
+  using cucascade::memory::Tier;
+  if (!_host_memory_releaser || _space_id.tier != Tier::GPU || bytes == 0) { return; }
+  // Probe as the conversion will reserve: if any HOST space takes the batch now, there is
+  // nothing to release.
+  for (const auto* hs : _reservation_manager.get_memory_spaces_for_tier(Tier::HOST)) {
+    if (!hs) { continue; }
+    auto* host = const_cast<cucascade::memory::memory_space*>(hs);
+    if (bytes > host->get_max_memory()) { continue; }
+    try {
+      if (auto probe = host->make_reservation_or_null(bytes)) { return; }
+    } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch): treated as full
+    }
+  }
+  try {
+    if (auto const released = _host_memory_releaser(bytes); released > 0) {
+      SIRIUS_LOG_INFO("[downgrade] [{}] released {} of {} bytes from the prefetching cache",
+                      _source_label,
+                      released,
+                      bytes);
+    }
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_WARN("[downgrade] [{}] releasing cache memory failed: {}", _source_label, e.what());
+  }
 }
 
 void downgrade_executor::monitor_loop()
