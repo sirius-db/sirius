@@ -28,10 +28,13 @@
 
 #include <cuda/stream>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 namespace sirius {
@@ -103,21 +106,34 @@ std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
                                               ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr);
 
+/** @brief An aggregate answered by one cuDF request whose partial is also its output. */
+struct plain_slot {
+  std::size_t partial_idx{};  ///< Index in cudf_aggregates
+};
+
+/** @brief AVG: SUM at `sum_idx` and COUNT_VALID at `sum_idx + 1`, divided at the merge. */
+struct avg_slot {
+  std::size_t sum_idx{};                              ///< Index of the SUM in cudf_aggregates
+  cudf::data_type output_type{cudf::type_id::EMPTY};  ///< Quotient type: FLOAT64 or DECIMAL
+};
+
+/** @brief COUNT(DISTINCT): COLLECT_SET locally and MERGE_SETS at the merge, then counted. */
+struct count_distinct_slot {
+  std::size_t partial_idx{};  ///< Index in cudf_aggregates
+};
+
+/** @brief STDDEV_SAMP: a count/mean/M2 STRUCT, merged by MERGE_M2 and finalized after merge. */
+struct stddev_samp_slot {
+  std::size_t partial_idx{};  ///< Index in cudf_aggregates
+};
+
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded
  * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), all others use one.
  * STDDEV_SAMP uses a count/mean/M2 STRUCT identified by Kind::M2 and finalizes after merge.
  * COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then counts list elements.
  */
-struct AggregateSlot {
-  bool is_avg            = false;
-  bool is_count_distinct = false;  ///< True if this is a COUNT(DISTINCT col) aggregate
-  size_t cudf_idx;  ///< Index in cudf_aggregates. For AVG, this is the SUM slot; cudf_idx+1 is
-                    ///< COUNT_VALID.
-  cudf::data_type output_type{cudf::type_id::EMPTY};  ///< For AVG: the desired output cudf type
-                                                      ///< (FLOAT64 or DECIMAL).
-  bool is_stddev_samp = false;                        ///< count/mean/M2 state finalized after merge
-};
+using AggregateSlot = std::variant<plain_slot, avg_slot, count_distinct_slot, stddev_samp_slot>;
 
 /**
  * @brief Result of converting DuckDB aggregate expressions to cuDF compute definitions.
@@ -157,6 +173,26 @@ struct CudfAggregateDefinitions {
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
+
+/**
+ * @brief Whether every slot in @p aggregate_slots holds a `plain_slot`
+ *
+ * Any other `AggregateSlot` alternative, including one added later, makes the result false. An
+ * empty list is all plain.
+ */
+[[nodiscard]] bool all_slots_plain(std::vector<AggregateSlot> const& aggregate_slots);
+
+/**
+ * @brief Whether any slot in @p aggregate_slots holds the alternative `Kind`
+ *
+ * @tparam Kind One of the `AggregateSlot` alternatives; any other type does not compile
+ */
+template <typename Kind>
+[[nodiscard]] bool has_slot(std::vector<AggregateSlot> const& aggregate_slots)
+{
+  return std::ranges::any_of(
+    aggregate_slots, [](AggregateSlot const& slot) { return std::holds_alternative<Kind>(slot); });
+}
 
 }  // namespace op
 }  // namespace sirius

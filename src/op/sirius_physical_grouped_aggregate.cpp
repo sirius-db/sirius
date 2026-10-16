@@ -22,7 +22,7 @@
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <algorithm>
+#include <variant>
 
 namespace sirius {
 namespace op {
@@ -90,11 +90,18 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
                        this->types.begin() + keys_end,
                        this->types.begin() + groups_end);
   }
-  // A bound belongs to the aggregate's SUM slot; AVG's COUNT_VALID slot (cudf_idx + 1) needs none.
+  // A bound belongs to the aggregate's SUM slot; AVG's COUNT_VALID slot (sum_idx + 1) needs none.
   cudf_aggregate_input_max_abs.assign(cudf_aggregates.size(), std::nullopt);
+  auto const bounded_idx = [](AggregateSlot const& slot) -> std::optional<std::size_t> {
+    if (auto const* plain = std::get_if<plain_slot>(&slot)) { return plain->partial_idx; }
+    if (auto const* avg = std::get_if<avg_slot>(&slot)) { return avg->sum_idx; }
+    if (auto const* stddev = std::get_if<stddev_samp_slot>(&slot)) { return stddev->partial_idx; }
+    return std::nullopt;
+  };
   for (size_t i = 0; i < aggregate_slots.size() && i < aggregate_input_max_abs.size(); ++i) {
-    if (aggregate_input_max_abs[i] && !aggregate_slots[i].is_count_distinct) {
-      cudf_aggregate_input_max_abs[aggregate_slots[i].cudf_idx] = aggregate_input_max_abs[i];
+    auto const idx = bounded_idx(aggregate_slots[i]);
+    if (aggregate_input_max_abs[i] && idx) {
+      cudf_aggregate_input_max_abs[*idx] = aggregate_input_max_abs[i];
     }
   }
 }
@@ -110,7 +117,7 @@ sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 
   auto local_types = types;
   for (size_t slot_idx = 0; slot_idx < aggregate_slots.size(); ++slot_idx) {
-    if (aggregate_slots[slot_idx].is_count_distinct) {
+    if (std::holds_alternative<count_distinct_slot>(aggregate_slots[slot_idx])) {
       local_types[aggregate_offset + slot_idx] = sirius::logical_type::make(sirius::type_id::LIST);
     }
   }
@@ -119,7 +126,7 @@ sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 
 bool sirius_physical_grouped_aggregate::has_stddev_samp() const
 {
-  return std::ranges::any_of(aggregate_slots, [](auto const& slot) { return slot.is_stddev_samp; });
+  return has_slot<stddev_samp_slot>(aggregate_slots);
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
