@@ -13,7 +13,10 @@ reading the corpus. It needs no hosted Paimon binary or community installation.
 `source-build.json` pins the extension, native reader and DuckDB source archives
 by commit, size and SHA256, together with the build options. Native dependencies
 use the upstream bundled versions and checksums. The recipe supports DuckDB
-v1.5.6 on Linux x86_64; other versions/platforms require a reviewed recipe update.
+v2 development commit `88ecd0a49d7d3d838e002b2fbc0ce91ccf74110e`
+(`v2.0.0-dev87602`) on Linux x86_64; other revisions/platforms require a reviewed
+recipe update. The extension source is maintainer mrdrivingduck's v2 adaptation,
+pinned at `307fc34c04623fe18f0ac39125b6319ea0013c0f`; it is not a floating branch.
 See [dependency download evidence](DEPENDENCIES.md) for the enabled direct and
 nested downloads, exact checksum-enforcement rules, and Python download policy.
 
@@ -51,8 +54,8 @@ Paimon tests are manual-only. This corpus is not registered in the default test
 runner, and this PR adds no Paimon GitHub Actions jobs or dispatch workflow.
 CI integration is deferred until GPU Paimon support is introduced.
 
-The standard-library harness tests require Python 3.11 or later; Python 3.12 is
-recommended. They need no native build, extension, GPU, external network, or corpus
+The standard-library harness tests require Git and Python 3.11 or later; Python 3.12
+is recommended. They need no native build, extension, GPU, external network, or corpus
 regeneration. Download tests use a temporary loopback HTTP server:
 
 ```bash
@@ -65,16 +68,31 @@ the Linux CUDA environment, the same unittest command can run through an isolate
 CPU-only Pixi environment containing Python 3.12. The fake CLI tests check harness
 decisions; they do not qualify native Paimon behavior.
 
-Build Sirius and its wrapper first with `pixi run make`, then build the test
-dependency into a **new** directory (Python 3.12 is recommended):
+Build Sirius and its wrapper first with `pixi run make`. From a Git checkout,
+check that both committed Sirius DuckDB pins and the actual CLI match the recipe:
+
+```bash
+pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_extension.py \
+  --duckdb sirius-duckdb/build/release/duckdb --check-only
+```
+
+This checks the two gitlinks in `HEAD`, the CLI version/platform and its source ID,
+without loading extensions, downloading sources or creating a build directory.
+An upgrade of either Sirius DuckDB pin requires a reviewed reader recipe migration;
+a matching version string alone does not establish C++ compatibility. Missing Git
+metadata or a mismatch fails explicitly. This check does not qualify native reads.
+
+Then build the test dependency into a **new** directory (Python 3.12 is recommended):
 
 ```bash
 pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_extension.py \
   --duckdb sirius-duckdb/build/release/duckdb --output build/paimon-conformance/source-build --jobs 4
 ```
 
-The builder refuses an existing output directory, including a failed build. Use
-another directory for a retry; logs from the failed attempt remain available.
+The build command repeats the same compatibility check before downloading or
+creating its output directory. The builder refuses an existing output directory,
+including a failed build. Use another directory for a retry; logs from the failed
+attempt remain available.
 The build subprocess clears inherited `GIT_*` settings and limits Git repository
 discovery to the new output directory. This lets the pinned extension apply its
 archive-local patches even when the output is inside the Sirius checkout;
@@ -215,7 +233,14 @@ both expected answers and recorded observations still require independent review
 Review the exact extension/native/DuckDB commits, source archive checksums,
 upstream dependency pins and patches, compiler environment, and build options.
 Update the recipe deliberately; never select the newest upstream branch during
-a test run. A DuckDB upgrade requires a compatible recipe and fresh validation.
+a test run. A DuckDB upgrade requires a compatible recipe and fresh validation. Update both
+Sirius DuckDB gitlinks together, adopt a compatible fixed reader commit, and
+refresh archive hashes/sizes and the explicit development version. Keep the native
+Paimon pin unchanged unless its own compatibility requires a change. Rerun the
+manual harness, native conformance and relocated/offline checks, including old-CLI
+and same-version/wrong-source rejection. Old receipts and old test results do not
+qualify the new combination. Do not weaken identity checks or silently follow a
+branch tip to make an upgrade pass.
 
 Build in a clean directory without prebuilt dependency caches. Verify source
 retrieval from an empty archive cache, run native conformance, then repeat against

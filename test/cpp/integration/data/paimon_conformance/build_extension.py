@@ -46,6 +46,86 @@ def read_recipe():
     return recipe
 
 
+def validate_checkout_recipe(recipe):
+    """The recipe must follow both committed Sirius host pins, never a branch tip."""
+    env = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "ls-tree",
+            "HEAD",
+            "--",
+            "duckdb",
+            "sirius-duckdb/duckdb",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    expected = recipe["sources"]["duckdb"]["commit"]
+    pins = {}
+    for line in result.stdout.splitlines():
+        metadata, path = line.split("\t", 1)
+        mode, kind, commit = metadata.split()
+        if mode == "160000" and kind == "commit":
+            pins[path] = commit
+    if pins != {"duckdb": expected, "sirius-duckdb/duckdb": expected}:
+        raise ValueError(
+            f"Paimon recipe needs migration: recipe DuckDB={expected}; "
+            f"Sirius HEAD pins={pins}. Update the reader recipe and requalify it; "
+            "do not bypass this check."
+        )
+
+
+def check_compatibility(cli, recipe):
+    """Reject stale source pins and host binaries before downloads or build output."""
+    from run_conformance import probe_identity
+
+    validate_checkout_recipe(recipe)
+    with tempfile.TemporaryDirectory(prefix="paimon-host-check-") as directory:
+        identity = probe_identity(cli, Path(directory), 90)
+        expected = {"version": recipe["duckdb_version"], "platform": recipe["platform"]}
+        if identity != expected:
+            raise ValueError(
+                f"DuckDB CLI does not match the Paimon recipe: expected {expected}, "
+                f"got {identity}. Rebuild the matching Sirius host or migrate the recipe."
+            )
+        env = os.environ.copy()
+        env["SIRIUS_DISABLE"] = "1"
+        result = subprocess.run(
+            [
+                str(cli),
+                "-init",
+                "/dev/null",
+                "-json",
+                "-batch",
+                "-bail",
+                ":memory:",
+                "-c",
+                "SELECT source_id FROM pragma_version();",
+            ],
+            env=env,
+            cwd=directory,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        source_id = json.loads(result.stdout)[0]["source_id"]
+        expected_commit = recipe["sources"]["duckdb"]["commit"]
+        if not matches_source_id(source_id, expected_commit):
+            raise ValueError(
+                f"DuckDB CLI source ID mismatch: expected {expected_commit}, got {source_id}. "
+                "Rebuild the matching Sirius host; a matching version string is insufficient."
+            )
+    return identity, source_id
+
+
 def fetch_source(record, destination, *, opener=open_https, delay=time.sleep):
     """Retry transport errors, but never bypass a source checksum failure."""
     for attempt in range(1, 4):
@@ -188,8 +268,6 @@ def validate_receipt(receipt_path, extension, cli, identity):
 
 
 def build(cli, output, jobs, source_cache=None):
-    from run_conformance import probe_identity
-
     input_hashes = {
         "recipe_sha256": digest(RECIPE),
         "builder_sha256": digest(Path(__file__)),
@@ -197,6 +275,8 @@ def build(cli, output, jobs, source_cache=None):
         "pixi_lock_sha256": digest(ROOT / "pixi.lock"),
     }
     recipe = read_recipe()
+    cli_sha256 = digest(cli)
+    identity, source_id = check_compatibility(cli, recipe)
     if platform.system() != "Linux" or platform.machine() not in ("x86_64", "AMD64"):
         raise ValueError("The source recipe currently supports Linux x86_64 only")
     if ":" in str(output):
@@ -212,13 +292,6 @@ def build(cli, output, jobs, source_cache=None):
     # No reuse of old build directories or receipts, even after a failed attempt.
     output.mkdir(parents=True, exist_ok=False)
     log = output / "build.log"
-    cli_sha256 = digest(cli)
-    identity = probe_identity(cli, output, 90)
-    if identity != {
-        "version": recipe["duckdb_version"],
-        "platform": recipe["platform"],
-    }:
-        raise ValueError("No approved source recipe for this DuckDB version/platform")
     env = os.environ.copy()
     # Inherited dependency overrides must not substitute unrelated local libraries.
     for key in list(env):
@@ -238,29 +311,6 @@ def build(cli, output, jobs, source_cache=None):
     # Compiler selection is shared by DuckDB's outer build and nested native build.
     env["CC"] = str(Path(shutil.which(env["CC"]) or env["CC"]).resolve(strict=True))
     env["CXX"] = str(Path(shutil.which(env["CXX"]) or env["CXX"]).resolve(strict=True))
-    probe_env = env.copy()
-    probe_env["SIRIUS_DISABLE"] = "1"
-    result = subprocess.run(
-        [
-            str(cli),
-            "-unsigned",
-            "-json",
-            "-batch",
-            "-bail",
-            "-c",
-            "SELECT source_id FROM pragma_version();",
-        ],
-        env=probe_env,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
-    source_id = json.loads(result.stdout)[0]["source_id"]
-    if not matches_source_id(source_id, recipe["sources"]["duckdb"]["commit"]):
-        raise ValueError(
-            "DuckDB executable source ID differs from approved build source"
-        )
     toolchain = {}
     for name, executable in (
         ("cc", env["CC"]),
@@ -311,6 +361,7 @@ def build(cli, output, jobs, source_cache=None):
     command += [f"-D{key}={value}" for key, value in recipe["cmake_options"].items()]
     command += [
         f"-DDUCKDB_EXTENSION_CONFIGS={config}",
+        f"-DGIT_COMMIT_HASH={recipe['sources']['duckdb']['commit']}",
         f"-DCMAKE_C_COMPILER={env['CC']}",
         f"-DCMAKE_CXX_COMPILER={env['CXX']}",
     ]
@@ -376,7 +427,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb", type=Path, required=True)
     parser.add_argument(
-        "--output", type=Path, required=True, help="New build directory; must not exist"
+        "--output", type=Path, help="New build directory; must not exist"
+    )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Check committed Sirius pins and CLI identity without downloading or building",
     )
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument(
@@ -387,6 +443,14 @@ def main():
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
+    if args.check_only:
+        check_compatibility(args.duckdb.resolve(strict=True), read_recipe())
+        print(
+            "Compatible Sirius pins and DuckDB CLI; native conformance is still required."
+        )
+        return
+    if args.output is None:
+        parser.error("--output is required unless --check-only is used")
     build(
         args.duckdb.resolve(strict=True),
         args.output.resolve(),

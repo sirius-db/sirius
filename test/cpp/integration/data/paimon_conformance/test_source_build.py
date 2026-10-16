@@ -358,7 +358,10 @@ class SourceBuildTests(unittest.TestCase):
                     builder, "ROOT", lock_root
                 ), patch.object(builder, "__file__", str(script)), patch.object(
                     builder, "DOWNLOADER", downloader
+                ), patch.object(
+                    builder, "validate_checkout_recipe"
                 ):
+
                     with self.assertRaisesRegex(
                         ValueError, "changed during source build"
                     ):
@@ -402,3 +405,123 @@ class SourceBuildTests(unittest.TestCase):
         cached.write_bytes(b"corrupt cached source")
         with self.assertRaisesRegex(ValueError, "Cached native dependency"):
             builder.populate_dependency_cache(native, cache)
+
+
+class HostCompatibilityTests(unittest.TestCase):
+    """Exercise the real entry point with a real Git tree and an identity-only CLI."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        self.recipe = builder.read_recipe()
+        self.here = self.root / "test/cpp/integration/data/paimon_conformance"
+        self.here.mkdir(parents=True)
+        for source in builder.HERE.glob("*.py"):
+            (self.here / source.name).write_bytes(source.read_bytes())
+        (self.here / "source-build.json").write_bytes(builder.RECIPE.read_bytes())
+        (self.root / "pixi.lock").write_text("test lock")
+        self.git("init", "--quiet")
+        self.commit_pins(self.recipe["sources"]["duckdb"]["commit"])
+        self.trace = self.root / "cli-invocations"
+        self.cli = self.root / "duckdb"
+        self.write_cli()
+        self.output = self.root / "build"
+
+    def git(self, *args):
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                *args,
+            ],
+            env=self.env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def commit_pins(self, commit, wrapper=None):
+        for path, pin in (
+            ("duckdb", commit),
+            ("sirius-duckdb/duckdb", wrapper or commit),
+        ):
+            self.git("update-index", "--add", "--cacheinfo", f"160000,{pin},{path}")
+        self.git("commit", "--quiet", "--allow-empty", "-m", "test host pins")
+
+    def write_cli(self, version=None, source_id=None):
+        version = version or self.recipe["duckdb_version"]
+        source_id = source_id or self.recipe["sources"]["duckdb"]["commit"][:10]
+        self.cli.write_text(
+            f"#!{sys.executable}\nimport json,sys\nfrom pathlib import Path\n"
+            f"with Path({str(self.trace)!r}).open('a') as f: f.write(repr(sys.argv)+'\\n')\n"
+            "sql = sys.argv[sys.argv.index('-c') + 1]\n"
+            "if sql == 'SELECT version() AS version; PRAGMA platform;':\n"
+            f" print(json.dumps([{{'version':{version!r}}}]))\n"
+            f" print(json.dumps([{{'platform':{self.recipe['platform']!r}}}]))\n"
+            "elif sql == 'SELECT source_id FROM pragma_version();':\n"
+            f" print(json.dumps([{{'source_id':{source_id!r}}}]))\n"
+            "else: raise AssertionError('Preflight must not load extensions or run data queries')\n"
+        )
+        self.cli.chmod(0o755)
+
+    def invoke(self, check_only=False, env=None):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(self.here / "build_extension.py"),
+                "--duckdb",
+                str(self.cli),
+                *(["--check-only"] if check_only else ["--output", str(self.output)]),
+            ],
+            cwd=self.root,
+            env=env or self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+
+    def test_matching_pins_and_cli_check_without_build_output(self):
+        # An inherited Git override must not redirect inspection to another tree.
+        result = self.invoke(
+            True, {**self.env, "GIT_DIR": str(self.root / "wrong.git")}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("native conformance is still required", result.stdout)
+        self.assertEqual(len(self.trace.read_text().splitlines()), 2)
+        self.assertFalse(self.output.exists())
+
+    def test_source_drift_refused_before_cli_download_or_output(self):
+        pin = self.recipe["sources"]["duckdb"]["commit"]
+        for engine, wrapper in (("a" * 40, "a" * 40), (pin, "b" * 40)):
+            self.commit_pins(engine, wrapper)
+            for check_only in (False, True):
+                with self.subTest(
+                    engine=engine, wrapper=wrapper, check_only=check_only
+                ):
+                    result = self.invoke(check_only)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("recipe needs migration", result.stderr)
+                    self.assertNotIn("Fetching", result.stdout)
+                    self.assertFalse(self.output.exists())
+                    self.assertFalse(self.trace.exists())
+
+    def test_wrong_cli_version_or_source_refused_before_download_or_output(self):
+        for overrides, diagnostic in (
+            ({"version": "v1.5.6"}, "CLI does not match"),
+            ({"source_id": "deadbeef00"}, "CLI source ID mismatch"),
+        ):
+            self.write_cli(**overrides)
+            for check_only in (False, True):
+                with self.subTest(overrides=overrides, check_only=check_only):
+                    result = self.invoke(check_only)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(diagnostic, result.stderr)
+                    self.assertNotIn("Fetching", result.stdout)
+                    self.assertFalse(self.output.exists())
