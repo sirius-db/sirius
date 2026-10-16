@@ -1156,8 +1156,6 @@ std::unique_ptr<cudf::column> decode_request(column_decode_request const& reques
       auto const full = walk.run();
       if (full->size() != selection->mask->num_rows)
         throw std::invalid_argument("decode: full selection mask does not match the row domain");
-      if (full->null_count() != 0)
-        throw unsupported_nullable_selection("decode: selected nullable values unsupported");
       auto gathered = cudf::gather(cudf::table_view{{full->view()}},
                                    selection->survivor_indices,
                                    cudf::out_of_bounds_policy::DONT_CHECK,

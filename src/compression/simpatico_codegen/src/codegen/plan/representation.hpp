@@ -232,10 +232,9 @@ struct identity_compressor : compressor {
 struct dictionary_compressed_representation : standalone_compressed_representation {
   std::unique_ptr<cudf::column> dict_column;
   mutable std::unique_ptr<cudf::column> keys_chars_copy;  // Lazily created on first access
-  // Lazily synthesized channels for shapes whose children cannot be viewed
+  // Lazily synthesized channels for a shape whose children cannot be viewed
   // directly: a childless empty dictionary (zero-row compress stores
-  // cudf::make_empty_column(DICTIONARY32)) and childless empty keys (encode of
-  // an all-null column yields zero keys). See named_channels().
+  // cudf::make_empty_column(DICTIONARY32)). See named_channels().
   mutable std::unique_ptr<cudf::column> keys_offsets_synth;
   mutable std::unique_ptr<cudf::column> indices_synth;
 
@@ -273,11 +272,12 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   ///
   /// The keys column is the distinct-value set (four entries for `l_shipinstruct`), so the
   /// comparison is effectively free; the only full-length pass is a 1-byte-per-row lookup over the
-  /// already-materialised INT32 indices. Nulls propagate from the dictionary column, matching the
-  /// semantics of comparing the decoded STRING column against the same values. The strings in @p
-  /// pred are read by asynchronous uploads, so they must stay valid until session completion.
-  /// Returns the BOOL8 column, whose writes may still be pending on the frame's stream, or nullptr
-  /// when the predicate is inactive or the dictionary shape is unsupported.
+  /// already-materialised INT32 indices. The result carries no mask (the caller reattaches the
+  /// column's validity), matching the semantics of comparing the decoded STRING column against the
+  /// same values. The strings in @p pred are read by asynchronous uploads, so they must stay valid
+  /// until session completion. Returns the BOOL8 column, whose writes may still be pending on the
+  /// frame's stream, or nullptr when the predicate is inactive or the dictionary shape is
+  /// unsupported.
   [[nodiscard]] std::unique_ptr<cudf::column> decompress_predicate(decode_predicate const& pred,
                                                                    decode_frame& frame) const;
 
@@ -290,10 +290,8 @@ struct dictionary_compressed_representation : standalone_compressed_representati
     // rep was built from is null-free by construction.
     auto dict_view            = dict_column->view();
     bool const childless_dict = dict_column->num_children() == 0;  // zero-row compress
-    bool const childless_keys =  // encode of an all-null column: zero keys, no offsets child
-      childless_dict || cudf::dictionary_column_view(dict_view).keys().num_children() == 0;
 
-    if (childless_keys) {
+    if (childless_dict) {
       if (!keys_offsets_synth) {
         // Canonical empty keys: a single zero offset.
         keys_offsets_synth =
