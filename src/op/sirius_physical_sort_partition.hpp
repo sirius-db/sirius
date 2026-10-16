@@ -20,8 +20,28 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
 
+#include <mutex>
+
 namespace sirius {
 namespace op {
+
+// Each slice retains its range index even when other ranges are empty.
+class sort_partition_output : public pipelineable_operator_data {
+ public:
+  sort_partition_output(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                        std::vector<std::size_t> partitions)
+    : pipelineable_operator_data(std::move(batches)), partitions(std::move(partitions))
+  {
+  }
+  std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
+  {
+    auto result = std::make_unique<sort_partition_output>(std::move(batches), partitions);
+    result->adopt_row_identity(*this);
+    return result;
+  }
+  std::vector<std::size_t> partitions;
+};
 
 class sirius_physical_sort_sample;
 
@@ -66,10 +86,12 @@ class sirius_physical_sort_partition : public sirius_physical_operator {
   //! Get the sample operator
   sirius_physical_sort_sample* get_sample_op() const { return _sample_op; }
 
+  void sink(const operator_data& output, ::cuda::stream_ref stream) override;
   void on_finalize_operator() override;
 
  private:
   sirius_physical_sort_sample* _sample_op = nullptr;
+  std::once_flag _initialize_partitions;
 };
 
 }  // namespace op

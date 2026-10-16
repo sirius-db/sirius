@@ -59,7 +59,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
   std::lock_guard<std::mutex> lg(_drain_mutex);
 
   auto* repo = ports.begin()->second->repo;
-  if (_current_partition_index < repo->num_partitions()) {
+  while (_current_partition_index < repo->num_partitions()) {
     std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
     while (true) {
       auto batch = repo->pop_next_data_batch(_current_partition_index);
@@ -70,8 +70,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
     SIRIUS_LOG_DEBUG("merge_sort: drained {} batches for partition {}",
                      all_batches.size(),
                      _current_partition_index - 1);
-    if (all_batches.empty()) { return nullptr; }
-    return std::make_unique<pipelineable_operator_data>(all_batches);
+    if (all_batches.empty()) { continue; }
+    return std::make_unique<pipelineable_operator_data>(all_batches, _current_partition_index - 1);
   }
   return nullptr;
 }
@@ -117,7 +117,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     } else {
       outputs.push_back(apply_final_projection(input_batches[0]));
     }
-    return std::make_unique<pipelineable_operator_data>(outputs);
+    return std::make_unique<pipelineable_operator_data>(outputs, input.get_position());
   }
 
   // Build cudf order vectors from BoundOrderByNode
@@ -150,7 +150,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
       outputs.push_back(apply_final_projection(ro));
     }
   }
-  return std::make_unique<pipelineable_operator_data>(outputs);
+  return std::make_unique<pipelineable_operator_data>(outputs, input.get_position());
 }
 
 }  // namespace op

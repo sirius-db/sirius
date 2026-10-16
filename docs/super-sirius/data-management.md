@@ -61,6 +61,48 @@ Data repositories are thread-safe containers managed by a `shared_data_repositor
 - Track total size and per-partition sizes
 - Registered in the query's `shared_data_repository_manager` for downgrade candidate selection
 
+### Logical batch positions
+
+A repository has a uniform batch mode (`UNKNOWN`, `UNORDERED`, or `ORDERED`). The first
+successful insertion establishes the mode, and draining does not reset it. Positioned and
+unpositioned insertion cannot be mixed. Positions are unique among resident entries within a
+partition and may have gaps. They are logical sequence numbers, independent of batch IDs,
+physical arrival order, and the repository partition index.
+
+Plain `get_`/`pop_` methods return only the batch pointer and intentionally discard position metadata.
+Their `_with_position` variants return the batch and its optional position; order-preserving
+consumers use those variants. FIFO pops still use arrival
+order: projection, filter, and other stateless transformations can execute in any order and
+forward the position. `get_positions()` is only a complete input snapshot after **all
+producers have finished**, and consumers must coordinate to avoid invalidating that snapshot.
+
+`pipelineable_operator_data::get_position()` describes the logical destination of a unit of
+work. A multi-batch merge input can carry one destination position. Positioned publication
+requires one output batch; publishing several batches at the same position is an error.
+`partitioned_operator_data` and late-materialization replacement inputs retain this metadata.
+Operators that reorder rows or combine unrelated sequences explicitly discard it.
+
+The sort path publishes each range slice into its original repository partition, retaining
+indices even when intermediate ranges are empty. A FULL barrier separates SORT_PARTITION
+from MERGE_SORT. Each merge task drains a complete range and uses its range index as its
+output position. MERGE_TOP_N assigns position zero to its final output.
+
+STREAMING_LIMIT has a FULL input barrier. Its task creator snapshots sorted existing positions
+for ordered input (ordinary FIFO for unordered input), reads row counts with
+`get_batch_rows_and_bytes()`, and claims offset/limit rows serially. Unknown row counts are
+errors. Each `limiting_operator_data` stores an immutable slice and position; execution and
+retries apply that slice without claiming again. Zero-row outputs retain their positions and
+keep downstream empty-input aggregate behavior. All inputs are consumed before completion.
+
+The materialized result collector builds local collections in parallel and combines them by
+ascending position in `get_result()`. Positioned `batch_stream` delivery waits for successful
+end-of-stream, then traverses sorted existing positions. This keeps queued batches in the
+registered repository, where memory management can spill them. Multiple stream senders must
+share a position namespace. Hash redistribution deliberately discards global sequence.
+
+The legacy ordering declarations (`source_order()` and related policy helpers) remain in place;
+position propagation and ordered consumers implement this contract independently of them.
+
 ### Query-scoped repository managers
 
 **Files:** `src/data/data_repository_manager_registry.hpp`, `src/query_id.hpp`
