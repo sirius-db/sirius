@@ -12,9 +12,10 @@ set_target_properties(sirius_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(sirius_shared SHARED src/sirius_library_anchor.cpp
                                  $<TARGET_OBJECTS:sirius_objects>)
-# Link the public configuration implementation into both Sirius libraries.
+# Link the isolated implementations into both Sirius libraries.
 foreach(_target sirius_core sirius_shared)
-  target_sources(${_target} PRIVATE $<TARGET_OBJECTS:sirius_context_config>)
+  target_sources(${_target} PRIVATE $<TARGET_OBJECTS:sirius_context_config>
+                                    $<TARGET_OBJECTS:sirius_spdlog_sink>)
 endforeach()
 
 if(VCPKG_BUILD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")

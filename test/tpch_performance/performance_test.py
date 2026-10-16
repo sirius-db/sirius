@@ -832,9 +832,20 @@ def time_query(con, qnum, query_sql, use_gpu, profile_path=None):
         con.execute("PRAGMA profiling_mode='detailed';")
         con.execute(f"PRAGMA profiling_output='{profile_path}';")
     log(f"  Executing q{qnum} on {engine_label}…")
+    # Fetch as Arrow inside the timed region and build Python rows afterwards: fetchall()
+    # creates one Python object per value, which for large results (Q11 at SF1000 returns
+    # ~937K rows) costs far more than executing the query and is not engine time.
     start = time.perf_counter()
-    rows = con.execute(query_sql).fetchall()
+    result = con.execute(query_sql)
+    column_types = [str(column[1]).upper() for column in result.description or []]
+    table = result.to_arrow_table()
     elapsed = time.perf_counter() - start
+    columns = [column.to_pylist() for column in table.columns]
+    # Arrow carries HUGEINT as decimal128(38, 0); convert back so rows match fetchall().
+    for col_idx, column_type in enumerate(column_types):
+        if column_type in ("HUGEINT", "UHUGEINT"):
+            columns[col_idx] = [None if v is None else int(v) for v in columns[col_idx]]
+    rows = list(zip(*columns)) if columns else []
     log(f"  q{qnum} fetched {len(rows)} rows in {elapsed:.4f}s")
     return elapsed, rows
 
