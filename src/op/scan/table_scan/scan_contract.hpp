@@ -194,6 +194,8 @@ enum class verdict_reason : uint16_t {
   catalog_entry_missing,
   no_trusted_reference,
   callback_mismatch,
+  iceberg_puffin_uri_unsupported,
+  iceberg_puffin_remote_eager,
   iceberg_delete_corrupt
 };
 
@@ -211,6 +213,9 @@ struct physical_check_counters {
   std::atomic<uint64_t> iceberg_manifest_walks{0};
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
+  std::atomic<uint64_t> iceberg_delete_reader_io_failures{0};
+  std::atomic<uint64_t> iceberg_delete_identity_failures{0};
+  std::atomic<uint64_t> iceberg_delete_corrupt_inputs{0};
   std::atomic<uint64_t> iceberg_inventory_bytes_peak{0};
 
   // Installed before a test query, cleared only after its workers have joined.
@@ -271,6 +276,7 @@ struct physical_check_counters {
     rejections{};
   std::atomic<uint64_t> type_mismatches{0};
   std::atomic<uint64_t> type_refusals{0};
+  std::atomic<uint64_t> metadata_provenance_mismatches{0};
   void record(verdict_reason reason, uint64_t mismatches = 0)
   {
     checks.fetch_add(1, std::memory_order_relaxed);

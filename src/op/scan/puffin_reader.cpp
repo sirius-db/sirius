@@ -18,6 +18,7 @@
 
 #include "op/scan/iceberg_delete_set.hpp"
 
+#include <io/io_errors.hpp>
 #include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
 #include <log/logging.hpp>
@@ -42,6 +43,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 // The readers below memcpy into the target type, so a big-endian host would decode garbage.
@@ -54,7 +56,8 @@ namespace {
 
 class local_puffin_source final : public puffin_byte_source {
  public:
-  explicit local_puffin_source(std::string_view path) : file_(std::string(path), std::ios::binary)
+  explicit local_puffin_source(std::string_view path)
+    : file_(std::string(path), std::ios::binary), path_(path)
   {
     if (file_) {
       file_.seekg(0, std::ios::end);
@@ -66,12 +69,20 @@ class local_puffin_source final : public puffin_byte_source {
   {
     file_.clear();
     file_.seekg(offset);
+    if (file_.bad()) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    "[puffin] Cannot seek local file: " + path_);
+    }
     return static_cast<bool>(file_);
   }
   bool read(std::span<std::byte> destination) override
   {
     file_.read(reinterpret_cast<char*>(destination.data()),
                static_cast<std::streamsize>(destination.size()));
+    if (file_.bad()) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    "[puffin] Cannot read local file: " + path_);
+    }
     return static_cast<bool>(file_);
   }
   [[nodiscard]] std::streamoff size() const override { return size_; }
@@ -79,6 +90,7 @@ class local_puffin_source final : public puffin_byte_source {
 
  private:
   std::ifstream file_;
+  std::string path_;
   std::streamoff size_{-1};
 };
 
@@ -100,9 +112,30 @@ class datasource_puffin_source final : public puffin_byte_source {
     if (offset_ < 0 || static_cast<std::uint64_t>(offset_) > size ||
         destination.size() > size - static_cast<std::uint64_t>(offset_))
       return false;
-    auto const read = source_->host_read(static_cast<std::size_t>(offset_),
-                                         destination.size(),
-                                         reinterpret_cast<std::uint8_t*>(destination.data()));
+    std::size_t read;
+    try {
+      read = source_->host_read(static_cast<std::size_t>(offset_),
+                                destination.size(),
+                                reinterpret_cast<std::uint8_t*>(destination.data()));
+    } catch (transparent::classified_execution_error const&) {
+      throw;
+    } catch (duckdb::InterruptException const&) {
+      throw;
+    } catch (io::object_changed_error const&) {
+      // The opened object's validator is a distinct execution outcome. Do not
+      // flatten it into reader_io: the caller needs to know that the remote
+      // object changed after the datasource was opened.
+      throw;
+    } catch (std::bad_alloc const&) {
+      throw;
+    } catch (std::system_error const& error) {
+      if (error.code() == std::errc::operation_canceled) throw;
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (std::exception const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    }
     if (read != destination.size()) return false;
     offset_ += static_cast<std::streamoff>(read);
     return true;
@@ -498,7 +531,11 @@ std::streamoff validate_footer_descriptor(
     throw std::runtime_error("[puffin] File too small to hold a footer: " + ref.puffin_path);
   }
 
-  f.seek(file_size - kFooterTail);
+  if (!f.seek(file_size - kFooterTail)) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot seek to footer tail of " + ref.puffin_path);
+  }
   uint8_t tail[kFooterTail];
   if (!f.read(std::as_writable_bytes(std::span{tail}))) {
     throw sirius::transparent::classified_execution_error(
@@ -520,10 +557,18 @@ std::streamoff validate_footer_descriptor(
   }
 
   auto const footer_start = file_size - kFooterTail - payload_size - 4;
-  f.seek(footer_start);
+  if (!f.seek(footer_start)) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot seek to footer magic of " + ref.puffin_path);
+  }
   char magic[4];
-  if (!f.read(std::as_writable_bytes(std::span{magic})) ||
-      std::memcmp(magic, puffin_magic, 4) != 0) {
+  if (!f.read(std::as_writable_bytes(std::span{magic}))) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read footer magic of " + ref.puffin_path);
+  }
+  if (std::memcmp(magic, puffin_magic, 4) != 0) {
     throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
   }
 
@@ -740,6 +785,9 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
   // wrong offset would silently yield wrong deletes. Check the framing first.
   static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
   char magic[4];
+  // A short leading/trailing magic read remains an input-format refusal, which
+  // preserves the legacy parser outcome. Footer and blob reads below classify
+  // short/error reads as reader_io with their site-specific text.
   if (!source->seek(0) || !source->read(std::as_writable_bytes(std::span{magic})) ||
       std::memcmp(magic, kPuffinMagic, 4) != 0) {
     throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + puffin_path);
@@ -841,6 +889,10 @@ decoded_positions read_charged_checked(Ref const& ref,
     check_count(ref, result.count);
     return result;
   } catch (sirius::transparent::classified_execution_error const&) {
+    throw;
+  } catch (io::object_changed_error const&) {
+    // Identity changes are neither a parser refusal nor an ordinary I/O
+    // failure. Preserve the typed error for the execution boundary.
     throw;
   } catch (std::runtime_error const& error) {
     throw unsupported_physical_input(

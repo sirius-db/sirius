@@ -17,7 +17,6 @@
 #pragma once
 
 #include "exec/invocable.hpp"
-#include "io/cache/metadata_cache.hpp"
 #include "io/object_identity.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -46,6 +45,11 @@ struct cached_chunk;
 }
 
 namespace sirius::io {
+
+class io_object_metadata {
+ public:
+  virtual ~io_object_metadata() = default;
+};
 
 inline constexpr std::size_t IO_BLOCK_SIZE = 4096;
 
@@ -111,7 +115,17 @@ class io_object : public std::enable_shared_from_this<io_object> {
 
   [[nodiscard]] std::string identity_cache_key() const
   {
-    return identity().cache_key(raw_file_cache_id());
+    auto const object_identity = identity();
+    auto key                   = object_identity.cache_key(raw_file_cache_id());
+    // local_stat is obtained from fstat on the current descriptor.  Its ctime
+    // can repeat within the filesystem timestamp window, so it is not enough
+    // to authorize reuse by a later open.  Scope degraded local keys to this
+    // descriptor generation; strong opened-object validators keep cross-open
+    // reuse through their stable identity.
+    if (object_identity.kind == identity_kind::local_stat) {
+      key += ":open:" + std::to_string(open_generation());
+    }
+    return key;
   }
 
   /// Backend locator used as part of the identity-aware prefetching-cache key.  Often equal to

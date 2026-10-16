@@ -81,6 +81,7 @@
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -635,7 +636,17 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
 /// resolved by a local-file backend. Thin alias for the shared helper — kept so
 /// the cache-key and routing call sites below read as they did, while there is
 /// exactly ONE implementation of the rule (sirius::io::strip_file_scheme).
-std::string normalize_path(std::string const& p) { return sirius::io::strip_file_scheme(p); }
+std::string normalize_path(std::string const& p)
+{
+  auto normalized  = sirius::io::strip_file_scheme(p);
+  auto const delim = normalized.find("://");
+  if (delim == 2 && std::tolower(static_cast<unsigned char>(normalized[0])) == 's' &&
+      std::tolower(static_cast<unsigned char>(normalized[1])) == '3') {
+    normalized[0] = 's';
+    normalized[1] = '3';
+  }
+  return normalized;
+}
 
 /// One operator's output schema as cuDF carriers, or empty when some column has
 /// no native carrier — which is a reason not to defer, not an error.
@@ -1417,9 +1428,16 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   // lifetime. On a miss, fetch + Thrift-parse the footer once and park it so the
   // subsequent scan reuses it. Mirrors parquet_gpu_ingestible::build_file_scan_info,
   // so the footer is parsed exactly once per file per process.
-  auto const reader_options = cudf::io::parquet_reader_options::builder().build();
-  auto file_metadata =
-    op::scan::resolve_parquet_metadata(*datasource, 0, uri, reader_options)->file_metadata();
+  auto const reader_options    = cudf::io::parquet_reader_options::builder().build();
+  auto const expected_identity = datasource->get_io_object().identity_cache_key();
+  auto const resolution =
+    op::scan::resolve_parquet_metadata_with_identity(*datasource, 0, uri, reader_options);
+  if (resolution.identity != expected_identity) {
+    if (_physical_counters)
+      _physical_counters->metadata_provenance_mismatches.fetch_add(1, std::memory_order_relaxed);
+    throw duckdb::BinderException("[scan] footer identity mismatch for " + uri);
+  }
+  auto file_metadata = resolution.artifact->file_metadata();
 
   auto schema = sirius::io::parquet_helpers::extract_schema(*file_metadata);
 
@@ -2068,6 +2086,30 @@ std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datas
   return io_ctx->open_datasource(file_path, hint);
 }
 
+sirius::io::cache::metadata_store::counters sirius_scan_manager::metadata_cache_statistics() const
+{
+  sirius::io::cache::metadata_store::counters total;
+  auto add = [&total](sirius::io::cache::metadata_store::counters const& current) {
+    total.entries += current.entries;
+    total.hits += current.hits;
+    total.misses += current.misses;
+    total.replacements += current.replacements;
+    total.bypasses += current.bypasses;
+    total.joined += current.joined;
+    total.builds += current.builds;
+    total.failures += current.failures;
+    total.cancelled_waiters += current.cancelled_waiters;
+    total.stale += current.stale;
+  };
+  if (_io_ctx) add(_io_ctx->metadata_store().statistics());
+  std::lock_guard lock{_routed_io_ctxs_mtx};
+  for (auto const& [key, io_ctx] : _routed_io_ctxs) {
+    (void)key;
+    if (io_ctx) add(io_ctx->metadata_store().statistics());
+  }
+  return total;
+}
+
 void sirius_scan_manager::list_objects_paged(
   std::string const& s3_prefix_uri,
   std::size_t page_size,
@@ -2123,6 +2165,16 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::stri
   auto type      = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
   return ioctx_for_type(*type, file_path);
+}
+
+std::optional<sirius::io::io_context_type> sirius_scan_manager::planning_io_backend(
+  std::string_view path) const
+{
+  // The registry checker is deliberately the only operation here. In
+  // particular, do not call ioctx_for_path(): that starts reactors, allocates
+  // cache state, and may construct an authorizer. This method is used by the
+  // Iceberg planner before it chooses the eager/deferred Puffin route.
+  return _ioctx_registry.lookup_path(normalize_path(std::string(path)));
 }
 
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
@@ -3214,9 +3266,16 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
 
     // Same footer resolution as describe_parquet / build_file_scan_info, so a
     // file is parsed at most once per process however it is first touched.
-    auto const probe_options = cudf::io::parquet_reader_options::builder().build();
-    auto file_metadata =
-      op::scan::resolve_parquet_metadata(*datasource, 0, path, probe_options)->file_metadata();
+    auto const probe_options     = cudf::io::parquet_reader_options::builder().build();
+    auto const expected_identity = datasource->get_io_object().identity_cache_key();
+    auto const resolution =
+      op::scan::resolve_parquet_metadata_with_identity(*datasource, 0, path, probe_options);
+    if (resolution.identity != expected_identity) {
+      if (_physical_counters)
+        _physical_counters->metadata_provenance_mismatches.fetch_add(1, std::memory_order_relaxed);
+      throw duckdb::BinderException("[scan] footer identity mismatch for " + path);
+    }
+    auto file_metadata = resolution.artifact->file_metadata();
 
     if (file_metadata->row_groups.empty()) { continue; }
     std::vector<cudf::size_type> row_groups(file_metadata->row_groups.size());

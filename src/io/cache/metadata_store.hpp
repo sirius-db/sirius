@@ -18,12 +18,17 @@
 
 #include "io/types.hpp"
 
+#include <condition_variable>
 #include <cstddef>
+#include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace sirius::io::cache {
 
@@ -31,8 +36,22 @@ namespace sirius::io::cache {
 /// Path-only lookup is a candidate hint, never permission to consume metadata.
 class metadata_store {
  public:
-  metadata_store() : _scope(next_open_generation()) {}
-  ~metadata_store() { _cache.erase_scope(_scope); }
+  struct counters {
+    size_t entries = 0;
+    uint64_t hits = 0, misses = 0;
+    uint64_t replacements = 0, bypasses = 0;
+    uint64_t joined = 0, builds = 0, failures = 0, cancelled_waiters = 0, stale = 0;
+  };
+
+  metadata_store() = default;
+  ~metadata_store();
+  void open_observed(io_object const& obj);
+  std::shared_ptr<io_object_metadata> get_or_load(
+    io_object const& obj,
+    std::string const& profile,
+    std::function<std::shared_ptr<io_object_metadata>()> const& loader,
+    bool* cache_hit      = nullptr,
+    std::stop_token stop = {});
   metadata_store(metadata_store const&)            = delete;
   metadata_store& operator=(metadata_store const&) = delete;
   void register_metadata(io_object const& obj,
@@ -47,17 +66,57 @@ class metadata_store {
   [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(std::string_view cache_key) const;
   std::unique_lock<std::mutex> lock_metadata_miss(io_object const& obj,
                                                   std::string const& profile = "parquet-v1") const;
+  [[nodiscard]] counters statistics() const;
+  [[nodiscard]] std::string describe_metadata_store() const;
 
  private:
+  struct entry {
+    std::string key, candidate_key;
+    uint64_t generation;
+    object_identity identity;
+    std::shared_ptr<io_object_metadata> value;
+  };
+  using entries  = std::list<entry>;
+  using iterator = entries::iterator;
+  void observe_locked(io_object const& obj, entries& retired);
+
+  static std::string cache_key(std::string const& path, std::string const& profile);
+  void retire(iterator it, entries& retired);
+  void clear();
+  bool put_identity(std::string const& path,
+                    std::string const& profile,
+                    object_identity identity,
+                    uint64_t generation,
+                    std::shared_ptr<io_object_metadata> value,
+                    entries& retired);
+
+  mutable std::mutex _mutex;
+  entries _entries;
+  std::unordered_map<std::string, iterator> _index;
+  // Path-level reverse index used only to invalidate all profiles for a path.
+  // The resident cache remains keyed by the exact path + profile key above.
+  std::unordered_map<std::string, std::unordered_set<std::string>> _candidate_entries;
+  mutable std::unordered_map<std::string, std::shared_ptr<std::mutex>> _miss_locks;
+  mutable counters _stats;
+  struct observation {
+    object_identity identity;
+    uint64_t generation;
+  };
+  std::unordered_map<std::string, observation> _observed;
+  struct flight {
+    std::condition_variable_any ready;
+    bool done = false;
+    std::shared_ptr<io_object_metadata> value;
+    std::exception_ptr error;
+  };
+  std::unordered_map<std::string, std::shared_ptr<flight>> _flights;
+
   struct legacy_entry {
     uint64_t generation;
     std::shared_ptr<io_object_metadata> value;
   };
 
-  mutable metadata_cache _cache{};
-  mutable std::mutex _legacy_mutex;
   std::unordered_map<std::string, legacy_entry> _legacy_by_key;
   std::unordered_map<std::string, std::string> _legacy_key_by_path;
-  uint64_t _scope;
 };
 }  // namespace sirius::io::cache

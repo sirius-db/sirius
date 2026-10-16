@@ -865,6 +865,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   bool hit     = true;
   auto all     = resolve_parquet_metadata(*source, 0, path, options, &hit);
   CHECK_FALSE(hit);
+  CHECK(all->built_for_identity == source->get_io_object().identity_cache_key());
   options.set_column_names({"y"});
   auto projected = resolve_parquet_metadata(*source, 0, path, options, &hit);
   CHECK(hit);
@@ -875,4 +876,34 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto different_profile = resolve_parquet_metadata(*source, 0, path, options, &hit);
   CHECK_FALSE(hit);
   CHECK(different_profile != all);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet cache hits preserve artifact provenance",
+                 "[scan][parquet][profile][integration][metadata_retention]")
+{
+  sirius::test::scratch_dir directory("parquet_r3_provenance");
+  run_ok("SET gpu_execution=false");
+  auto path = directory.file("columns.parquet");
+  run_ok("COPY (SELECT 1::INTEGER x) TO " + sirius::test::sql_literal(path) + " (FORMAT PARQUET)");
+  auto& manager = sirius::test::get_registered_sirius_context(*con)->get_scan_manager();
+  auto source   = manager.create_datasource(path);
+  REQUIRE(source);
+  // A null payload makes any premature schema access fail: provenance must be
+  // checked at the resolver boundary, before touching the foreign footer.
+  auto foreign = std::make_shared<parquet_metadata>(nullptr,
+                                                    64,
+                                                    parquet_encryption_evidence{},
+                                                    std::vector<uint8_t>{},
+                                                    std::string{},
+                                                    std::vector<uint8_t>{},
+                                                    "foreign-open");
+  REQUIRE(source->store_metadata(foreign));
+  auto options = cudf::io::parquet_reader_options::builder().build();
+  bool hit     = false;
+  auto result  = resolve_parquet_metadata_with_identity(*source, 0, path, options, &hit);
+  REQUIRE(hit);
+  CHECK(result.artifact == foreign);
+  CHECK(result.identity == "foreign-open");
+  CHECK(result.identity != source->get_io_object().identity_cache_key());
 }
