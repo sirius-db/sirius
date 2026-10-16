@@ -20,6 +20,7 @@
 #include "exec/thread_util.hpp"
 #include "io/cache/types.hpp"
 #include "io/details/slot_pool.hpp"
+#include "io/io_errors.hpp"
 #include "io/io_request.hpp"
 #include "io/types.hpp"
 #include "io/uring/types.hpp"
@@ -592,7 +593,8 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
     if (direct) {
       object_identity direct_identity;
       if (!capture_local_identity(direct.get(), direct_identity)) {
-        throw std::runtime_error("uring_reactor::create_io_object: identity_descriptor_mismatch");
+        throw descriptor_mismatch_error(
+          "uring_reactor::create_io_object: identity_descriptor_mismatch");
       }
       if (captured.device != direct_identity.device || captured.inode != direct_identity.inode) {
         // Destroy the entire descriptor set before retrying the open.
@@ -603,7 +605,7 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
     return std::make_unique<local_io_object>(
       std::move(path), std::move(buffered), std::move(direct), file_size, "", std::move(captured));
   }
-  throw std::runtime_error("uring_reactor::create_io_object: identity_descriptor_mismatch");
+  throw descriptor_mismatch_error("uring_reactor::create_io_object: identity_descriptor_mismatch");
 }
 
 std::size_t uring_reactor::size(int native_handle)

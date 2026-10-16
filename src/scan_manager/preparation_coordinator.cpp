@@ -22,6 +22,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <system_error>
 
 namespace sirius::scan_manager {
 struct preparation_coordinator::state {
@@ -66,6 +67,7 @@ struct preparation_coordinator::state {
   size_t jobs = 0, results = 0, output = 0, external = 0;
   size_t next_deadline_source = 0;
   statistics stats;
+  std::optional<stop_reason> stop_requested;
   std::function<void()> before_submit;
   std::function<op::scan::batch_coalescer::clock::time_point()> now =
     op::scan::batch_coalescer::clock::now;
@@ -90,13 +92,19 @@ struct preparation_coordinator::state {
       if (active && !completed) st->settle(index, {});
     }
   };
-  void stop() noexcept
+  void stop(stop_reason reason = stop_reason::failure_induced) noexcept
   {
     std::lock_guard lock(gate->mutex);
+    if (!gate->closed) stop_requested = reason;
     gate->closed = true;
     for (auto& [key, u] : units)
       u->cancel_under_gate();
     gate->cv.notify_all();
+  }
+  bool normal_eos_requested() const noexcept
+  {
+    std::lock_guard lock(gate->mutex);
+    return stop_requested == stop_reason::normal_eos;
   }
   void reserve_slot(size_t index, size_t source_id)
   {
@@ -288,8 +296,9 @@ void preparation_coordinator::arm()
       state_->phase = lifecycle::armed;
     }
     std::weak_ptr<state> weak = state_;
-    state_->completion->set_preparation_stop_callback([weak](bool) {
-      if (auto st = weak.lock()) st->stop();
+    state_->completion->set_preparation_stop_callback([weak](bool error) {
+      if (auto st = weak.lock())
+        st->stop(error ? stop_reason::failure_induced : stop_reason::normal_eos);
     });
     std::optional<preparation_failure> existing;
     {
@@ -350,7 +359,7 @@ void preparation_coordinator::request_stop(stop_reason reason) noexcept
       state_->completion->report_error(std::current_exception());
     }
   }
-  state_->stop();
+  state_->stop(reason);
   state_->dispatcher->request_stop();
 }
 void preparation_coordinator::drain()
@@ -571,8 +580,19 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
         try {
           value = work.stop_work ? work.stop_work(stop) : work.work();
         } catch (...) {
-          owner.completion->report_error(std::current_exception());
-          owner.stop();
+          auto error               = std::current_exception();
+          bool expected_normal_eos = false;
+          try {
+            std::rethrow_exception(error);
+          } catch (std::system_error const& e) {
+            expected_normal_eos =
+              e.code() == std::errc::operation_canceled && owner.normal_eos_requested();
+          } catch (...) {
+          }
+          if (!expected_normal_eos) {
+            owner.completion->report_error(error);
+            owner.stop();
+          }
         }
         work = {};  // Release physical-input captures before the job ticket is returned.
         ticket->completed = true;

@@ -579,14 +579,21 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       decision = {};
     }
   }
-  if (!remote_puffins.empty() && !decision.deferred) {
-    // A supported remote Puffin may only use the deferred datasource route.
-    // The ledger owns any provisional grant and is destroyed on this throw;
-    // crucially no eager payload load or local ifstream is attempted.
-    sirius_ctx->record_semantic_decline(verdict_reason::iceberg_puffin_remote_eager);
-    throw scan_verdict_declined(
-      "iceberg_scan declines the GPU path: remote Puffin requires deferred preparation",
-      {{remote_puffins.front().contract, verdict_reason::iceberg_puffin_remote_eager}});
+  if (!remote_puffins.empty()) {
+    // Check each remote scan's final route; statement-level admission can leave a
+    // mixed positional/DV statement partly eager.
+    auto const eager_remote = std::ranges::find_if(remote_puffins, [&](auto const& remote) {
+      auto const scan = std::ranges::find_if(scans, [&](auto const& candidate) {
+        return candidate.scan->contract_id == remote.contract;
+      });
+      return scan == scans.end() || !scan->info->deferred;
+    });
+    if (eager_remote != remote_puffins.end()) {
+      sirius_ctx->record_semantic_decline(verdict_reason::iceberg_puffin_remote_eager);
+      throw scan_verdict_declined(
+        "iceberg_scan declines the GPU path: remote Puffin requires deferred preparation",
+        {{eager_remote->contract, verdict_reason::iceberg_puffin_remote_eager}});
+    }
   }
   if (counters->track_units && counters->iceberg_statement_route_for_testing)
     counters->iceberg_statement_route_for_testing(route_reason, decision);

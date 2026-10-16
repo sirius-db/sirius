@@ -862,6 +862,11 @@ decoded_positions read_charged_checked(Ref const& ref,
     // Identity changes are neither a parser refusal nor an ordinary I/O
     // failure. Preserve the typed error for the execution boundary.
     throw;
+  } catch (std::system_error const& error) {
+    // Preserve cancellation; other system errors are reader I/O failures.
+    if (error.code() == std::errc::operation_canceled) throw;
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io, error.what());
   } catch (std::runtime_error const& error) {
     throw unsupported_physical_input(
       contract, ref.puffin_path, verdict_reason::iceberg_delete_corrupt, error.what());
