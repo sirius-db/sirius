@@ -7,10 +7,10 @@
     "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
     "DUCKDB_EXPLICIT_PLATFORM": "linux_amd64",
     "DUCKDB_EXPLICIT_VERSION": "v2.0.0-dev87602",
+    "EXTENSION_STATIC_BUILD": "OFF",
     "PAIMON_ENABLE_OSS": "OFF",
     "PAIMON_ENABLE_REST": "OFF",
-    "PAIMON_ENABLE_S3": "OFF",
-    "STATICALLY_LINK_EXTENSIONS": ""
+    "PAIMON_ENABLE_S3": "OFF"
   },
   "duckdb_version": "v2.0.0-dev87602",
   "extension_version": "307fc34",
