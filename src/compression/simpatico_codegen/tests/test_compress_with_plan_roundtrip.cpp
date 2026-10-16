@@ -846,6 +846,69 @@ int main()
     }
 
     {
+      // A set-membership predicate answered off a nullable dictionary column. The dictionary
+      // is built from the null-free stripped column, so the BOOL8 answer carries no mask of
+      // its own; decompress_column must reattach the sidecar so a null row stays null (as
+      // `col = 'x'` is) rather than reading as false.
+      auto stream                              = cudf::get_default_stream();
+      auto mr                                  = rmm::mr::get_current_device_resource_ref();
+      std::vector<std::string> const pool_vals = {"alpha", "beta", "gamma", "delta"};
+      std::vector<std::string> vals;
+      std::vector<bool> valid;
+      for (int i = 0; i < 300; ++i) {
+        vals.push_back(pool_vals[static_cast<std::size_t>(i * 7 % 4)]);
+        valid.push_back(i % 5 != 0 && i % 11 != 3);
+      }
+      std::string const dict_dsl =
+        "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+        "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+      simpatico::stream_pool pool;
+      expect(pool.init(2), "dict_equality_nulls: stream_pool init");
+
+      for (bool const all_null : {false, true}) {
+        std::vector<bool> const col_valid =
+          all_null ? std::vector<bool>(vals.size(), false) : valid;
+        auto t          = make_strings_table(vals, col_valid, stream);
+        auto ct         = compress_with_plan(t->view(), dict_dsl, stream, mr);
+        auto const caps = simpatico::probe_column(*ct.columns[0].plan_tree);
+        expect(caps.can_answer_equality,
+               "dict_equality_nulls: nullable dictionary answers equality");
+        expect(caps.compact_route == sirius::codegen::decode_route::full,
+               "dict_equality_nulls: a nullable column never reports a compacted route");
+
+        for (auto const& wanted : std::vector<std::vector<std::string>>{
+               {"alpha"}, {"beta", "delta"}, {"alpha", "beta", "gamma", "delta"}, {"absent"}}) {
+          std::vector<std::size_t> const selected = {0};
+          std::vector<simpatico::decode_predicate> preds(1);
+          preds[0].equals_any = wanted;
+          auto out            = decompress(ct, selected, preds, pool, mr);
+          expect(out != nullptr && out->num_columns() == 1, "dict_equality_nulls: result shape");
+          auto const flags = out->view().column(0);
+          expect(flags.type().id() == cudf::type_id::BOOL8, "dict_equality_nulls: BOOL8 result");
+
+          // Reference: the same predicate over the original column. A null row is null.
+          std::vector<std::uint8_t> got(vals.size());
+          cudaMemcpy(got.data(), flags.head<std::uint8_t>(), got.size(), cudaMemcpyDeviceToHost);
+          auto const got_valid = host_validity_bits(flags);
+          expect(got_valid.size() == vals.size(), "dict_equality_nulls: validity size");
+          std::size_t expected_nulls = 0;
+          for (std::size_t r = 0; r < vals.size(); ++r) {
+            bool const row_valid = col_valid[r];
+            expect(got_valid[r] == row_valid, "dict_equality_nulls: null position not preserved");
+            if (!row_valid) {
+              ++expected_nulls;
+              continue;
+            }
+            bool const hit = std::find(wanted.begin(), wanted.end(), vals[r]) != wanted.end();
+            expect((got[r] != 0) == hit, "dict_equality_nulls: wrong membership answer");
+          }
+          expect(static_cast<std::size_t>(flags.null_count()) == expected_nulls,
+                 "dict_equality_nulls: null_count");
+        }
+      }
+    }
+
+    {
       // Degenerate STRING shapes: zero-row / childless-empty / all-null /
       // all-empty-string inputs through dictionary and str_split. describe()
       // runs on every rep too — the zero-row full dictionary used to segfault

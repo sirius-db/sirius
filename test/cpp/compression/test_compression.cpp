@@ -2116,6 +2116,10 @@ TEST_CASE("pin_table compression - nullable columns round-trip through every tie
            "SELECT count(*) " + from + " WHERE m IS NULL",
            "SELECT count(*) " + from + " WHERE a IS NOT NULL",
            "SELECT count(*) " + from + " WHERE s = 'yy'",
+           // Null and false must stay distinct through an equality answered off the dictionary.
+           "SELECT count(*) " + from + " WHERE NOT (s = 'yy')",
+           "SELECT count(*) " + from + " WHERE s = 'yy' OR m IS NULL",
+           "SELECT count(*) " + from + " WHERE s IN ('x', 'zzz')",
            "SELECT s, count(*) " + from + " GROUP BY s ORDER BY s",
            // A selective filter on the clean column with nullable columns projected.
            "SELECT m, s, f " + from + " WHERE k < 50 ORDER BY k"}) {
