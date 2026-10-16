@@ -1132,9 +1132,10 @@ class sirius_scan_manager {
   /// an origin holding it can never resolve.
   std::atomic<late_mat::pin_generation_t> _next_pin_generation{1};
 
-  /// Give the entry now living at @p name a fresh late-mat handle, and
-  /// invalidate whatever handle it is replacing. Called after every insert;
-  /// a no-op when the late-mat gate is off.
+  /// Finish building a pinned entry and make it available under @p name.
+  /// When late materialization is enabled, give the entry its own handle.
+  /// Queries already using the previous entry may continue using it until they finish.
+  /// The caller must hold @c _pinned_entries_mutex.
   void publish_pinned_entry(const std::string& name, pinned_entry entry);
 
   //! One entry per in-flight query. Guarded by _query_states_mutex; the shared_ptr is

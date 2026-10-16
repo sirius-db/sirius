@@ -192,9 +192,12 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   remove the old entry from the registry immediately, but do not revoke queries that already
   acquired it: each handle identifies that exact entry weakly, and resolution promotes it to an
   owning lease for the whole deferred gather. The old entry expires after its last serving query
-  releases it, while a new query sees only the replacement (or no pin). A true in-place column
-  merge still bumps the generation (`pin_entry_handle`, `column_origin.hpp`) because positional
-  metadata captured before that mutation may be stale. A consumer resolving an expired or
+  releases it, while a new query sees only the replacement (or no pin). Column merges also build
+  a replacement entry privately and publish it with a fresh handle and generation
+  (`pin_entry_handle`, `column_origin.hpp`); they do not mutate the previous entry's metadata or
+  invalidate its handle. A failure before publication leaves the previous entry intact. SQL pin
+  operations require exclusive maintenance, and the direct column-merge API rejects a merge
+  while readers retain the existing entry. A consumer resolving an expired or
   generation-mismatched origin gets `nullopt`, never a dangling pointer and never an entry later
   installed under the same name. Fail-closed here means the PORT THROWS, not that the query quietly
   re-reads: by that point the scan has emitted rowids in place of values, so no local fallback is

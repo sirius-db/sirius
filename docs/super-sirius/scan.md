@@ -373,10 +373,16 @@ pipeline completion; the normal GPU filter then removes its rows.
 
 **Statless entries and re-pinning.** Disabling the option before pinning skips the extra GPU work
 and creates an entry without zone maps. Turning the option on later does not retrofit statistics.
-A HOST re-pin replaces the entry. For an in-place GPU merge, the re-pin must cover every cached
-column and pass the normal merge-alignment checks; a strict subset cannot restore statistics.
-Unpinning and then re-pinning all required columns is the safest recovery. Merging a new GPU
-column while capture is disabled also drops the entry's existing zone maps.
+A HOST re-pin replaces the entry. A column-major GPU merge also builds a replacement generation
+privately, sharing the existing data columns and copying their metadata before appending new
+columns. To restore statistics, the re-pin must cover every cached column and pass the normal
+merge-alignment checks; a strict subset cannot restore statistics. Unpinning and then re-pinning
+all required columns is the safest recovery. Merging a new GPU column while capture is disabled
+drops the replacement generation's zone maps.
+
+Data and metadata are published together under the pin-registry lock. A failure before
+publication leaves the previous entry intact. SQL pin operations require exclusive maintenance;
+the direct column-merge API also rejects a merge while readers retain the existing entry.
 
 ## Batch Coalescing
 

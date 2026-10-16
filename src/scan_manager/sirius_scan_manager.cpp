@@ -2794,7 +2794,9 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
       entry.num_rows               = previous.num_rows;
       entry.zone_maps              = previous.zone_maps.clone();
       entry.proven_unique_columns  = previous.proven_unique_columns;
-      if (previous.mvcc) entry.mvcc = std::make_unique<duckdb_mvcc_metadata>(*previous.mvcc);
+      if (!metadata.mvcc && previous.mvcc) {
+        entry.mvcc = std::make_unique<duckdb_mvcc_metadata>(*previous.mvcc);
+      }
       if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
         throw std::runtime_error(
           "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
