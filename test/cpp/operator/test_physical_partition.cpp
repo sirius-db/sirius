@@ -424,13 +424,14 @@ class observed_build_repository final : public cucascade::shared_data_repository
     return data_repository::get_data_batch_by_id(id, partition);
   }
 
-  std::shared_ptr<data_batch> pop_next_data_batch(std::size_t partition = 0) override
+  cucascade::positioned_data_batch pop_next_data_batch_with_position(
+    std::size_t partition = 0) override
   {
     auto const counters = stats.snapshot();
     if (counters.accumulations_started == 0 && counters.accumulations_skipped_inventory == 0) {
       popped_before_decision.store(true);
     }
-    return data_repository::pop_next_data_batch(partition);
+    return data_repository::pop_next_data_batch_with_position(partition);
   }
 
   dynamic_filter_stats const& stats;

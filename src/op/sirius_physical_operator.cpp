@@ -281,9 +281,19 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 void sirius_physical_operator::sink(const operator_data& output_data, ::cuda::stream_ref stream)
 {
   auto& pipelineable_output = dynamic_cast<const pipelineable_operator_data&>(output_data);
+  auto position             = pipelineable_output.get_position();
+  if (position && pipelineable_output.get_data_batches().size() != 1) {
+    throw internal_exception("Positioned publication requires exactly one output batch");
+  }
   for (auto& batch : pipelineable_output.get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
-      next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name, batch);
+      if (position) {
+        next_port_info.next_operator->push_data_batch_at_position(
+          next_port_info.next_operator_port_name, batch, *position);
+      } else {
+        next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name,
+                                                      batch);
+      }
     }
   }
 }
@@ -308,6 +318,26 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
   if (p && p->repo) {
     if (batch) { on_input_batch_pushed(port_id, *batch); }
     p->repo->add_data_batch(std::move(batch));
+  }
+}
+
+void sirius_physical_operator::push_data_batch_to_partition(
+  std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch, std::size_t partition)
+{
+  auto* p = get_port(port_id);
+  if (p && p->repo) {
+    if (batch) { on_input_batch_pushed(port_id, *batch); }
+    p->repo->add_data_batch(std::move(batch), partition);
+  }
+}
+
+void sirius_physical_operator::push_data_batch_at_position(
+  std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch, std::size_t position)
+{
+  auto* p = get_port(port_id);
+  if (p && p->repo) {
+    if (batch) { on_input_batch_pushed(port_id, *batch); }
+    p->repo->add_data_batch_at_position(std::move(batch), position);
   }
 }
 
@@ -369,15 +399,22 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
+  std::optional<std::size_t> position;
   for (auto& [port_name, port_ptr] : ports) {
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
-    auto batch_and_handle = port_ptr->repo->pop_next_data_batch();
-    if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
+    auto [batch, batch_position] = port_ptr->repo->pop_next_data_batch_with_position();
+    if (batch) {
+      if (!input_batch.empty() && (position || batch_position)) {
+        throw internal_exception("Cannot combine independent positioned inputs in one task");
+      }
+      position = batch_position;
+      input_batch.push_back(std::move(batch));
+    }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<pipelineable_operator_data>(input_batch);
+  return std::make_unique<pipelineable_operator_data>(input_batch, position);
 }
 
 bool sirius_physical_operator::all_ports_empty()

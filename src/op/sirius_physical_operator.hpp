@@ -256,10 +256,14 @@ class pipelineable_operator_data : public operator_data {
     _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
   }
   explicit pipelineable_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
-    : _data_batches(std::move(data_batches))
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+    std::optional<std::size_t> position = std::nullopt)
+    : _data_batches(std::move(data_batches)), _position(position)
   {
   }
+
+  /// Logical destination position; may describe a multi-batch merge input.
+  [[nodiscard]] std::optional<std::size_t> get_position() const { return _position; }
 
   /**
    * @brief IDs of the non-null input batches in input order, as constructed.
@@ -294,7 +298,9 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_data_batches(
     std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches) const
   {
-    return std::make_unique<pipelineable_operator_data>(std::move(data_batches));
+    auto result = std::make_unique<pipelineable_operator_data>(std::move(data_batches), _position);
+    if (auto device = get_preferred_device_id()) { result->set_preferred_device_id(*device); }
+    return result;
   }
 
   /**
@@ -352,6 +358,7 @@ class pipelineable_operator_data : public operator_data {
 
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  std::optional<std::size_t> _position;
   /// (position, original ID) of each batch that preparation replaced with a clone; usually empty.
   std::vector<std::pair<std::size_t, std::uint64_t>> _replaced_batch_ids;
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
@@ -373,8 +380,9 @@ class partitioned_operator_data : public pipelineable_operator_data {
   /// @throws std::invalid_argument if `partition_idx >= placement.num_partitions()`.
   partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
                             std::size_t partition_idx,
-                            partition_placement const& placement)
-    : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
+                            partition_placement const& placement,
+                            std::optional<std::size_t> position = std::nullopt)
+    : pipelineable_operator_data(std::move(data_batches), position), _partition_idx(partition_idx)
   {
     if (partition_idx >= placement.num_partitions()) {
       throw std::invalid_argument("partitioned_operator_data: partition " +
@@ -390,8 +398,9 @@ class partitioned_operator_data : public pipelineable_operator_data {
   /// the GPU already holding the data. Used when a consumer produced a single partition, where no
   /// cross-task device agreement is required.
   explicit partitioned_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
-    : pipelineable_operator_data(std::move(data_batches))
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+    std::optional<std::size_t> position = std::nullopt)
+    : pipelineable_operator_data(std::move(data_batches), position)
   {
   }
 
@@ -406,6 +415,15 @@ class partitioned_operator_data : public pipelineable_operator_data {
    *         "place by data affinity", not "partition 0".
    */
   [[nodiscard]] std::optional<std::size_t> get_partition_idx() const { return _partition_idx; }
+
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_data_batches(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const override
+  {
+    auto result = std::make_unique<partitioned_operator_data>(std::move(batches), get_position());
+    result->_partition_idx = _partition_idx;
+    if (auto device = get_preferred_device_id()) { result->set_preferred_device_id(*device); }
+    return result;
+  }
 
  private:
   std::optional<std::size_t> _partition_idx;
@@ -767,6 +785,14 @@ class sirius_physical_operator {
   /**
    * @brief Pushes @p batch into port @p port_id after `on_input_batch_pushed` observes it.
    */
+  void push_data_batch_to_partition(std::string_view port_id,
+                                    std::shared_ptr<::cucascade::data_batch> batch,
+                                    std::size_t partition);
+
+  void push_data_batch_at_position(std::string_view port_id,
+                                   std::shared_ptr<::cucascade::data_batch> batch,
+                                   std::size_t position);
+
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);

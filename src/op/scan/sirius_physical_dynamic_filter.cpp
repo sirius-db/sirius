@@ -57,7 +57,8 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   // additional filters.
   auto snapshot = _filters ? _filters->snapshot() : dynamic_filter_snapshot{};
   if (!_gate.applicable(snapshot)) {
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches(),
+                                                        input.get_position());
   }
 
   auto const& idle_batches = input.get_data_batches();
@@ -85,7 +86,8 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
       output_batches.push_back(idle_batches[i]);
     }
   }
-  return std::make_unique<pipelineable_operator_data>(std::move(output_batches));
+  return std::make_unique<pipelineable_operator_data>(std::move(output_batches),
+                                                      input.get_position());
 }
 
 }  // namespace sirius::op::scan

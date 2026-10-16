@@ -33,7 +33,7 @@ using sender_id_t = std::uint32_t;
 
 /// Repository IS the queue. Owns sender-set EOS, terminal/error state, and wake hooks.
 /// Contracts: S1–S5 / P1–P4 — see docs/super-sirius/streaming-sessions.md. Borrowed repo; hold
-/// via shared_ptr. try_pull() pops outside the lock — S5: wait-then-pop is not atomic.
+/// via shared_ptr. S5: wait-then-pop is not atomic. Ordered delivery waits for EOS.
 class batch_stream {
  public:
   enum class availability {
@@ -58,14 +58,16 @@ class batch_stream {
   // -----------------------------------------------------------------------
 
   /// Push into the repository then fire on_data (S1). @return false if terminal.
-  [[nodiscard]] bool push(std::shared_ptr<cucascade::data_batch> batch);
+  [[nodiscard]] bool push(std::shared_ptr<cucascade::data_batch> batch,
+                          std::optional<std::size_t> position = std::nullopt);
 
   /// Sender-set EOS: idempotent per sender; terminal when all expected closed.
   /// @throws sirius::invalid_input_exception when `sender` is not in the expected set.
   void close(sender_id_t sender);
 
   /// Poison the stream (no sender identity). P1–P3: immediate, first-wins, fail-fast terminal.
-  /// S2 / P4: classifies as HAS_DATA, fires on_data, and notifies wait().
+  /// S2 / P4: classifies as HAS_DATA, fires any retained on_data hook, and notifies wait().
+  /// Ordered EOS consumes the on_data hook; a subsequent failure still notifies wait().
   /// @throws sirius::invalid_input_exception when `error` is null.
   void fail(std::exception_ptr error);
 
@@ -75,6 +77,10 @@ class batch_stream {
 
   /// Next batch, or nullptr. @throws pending error before popping (S4); error is never cleared.
   std::shared_ptr<cucascade::data_batch> try_pull();
+
+  /// Positioned streams wait for successful EOS, then deliver sparse positions in ascending order.
+  /// Multiple senders must use a shared partition-local position namespace.
+  cucascade::positioned_data_batch try_pull_with_position();
 
   /// Queued data / pending error (P4) beat EOS.
   [[nodiscard]] availability classify() const;
@@ -93,8 +99,10 @@ class batch_stream {
   // Hooks fire after unlock; may re-enter. Do not capture raw this.
   // -----------------------------------------------------------------------
 
-  /// Fires on every successful push() and on fail() (P4). Not one-shot: a one-shot hook would
-  /// need re-arming, and a push between fire and re-arm would go unannounced.
+  /// Fires on every successful push(), the first fail() (P4), and ordered EOS.
+  /// Persists across pushes without re-arming. Ordered EOS consumes the hook when it makes
+  /// data ready; a later fail() does not invoke that hook, but still notifies wait().
+  /// Registration replaces the hook without firing it, including after EOS.
   void set_on_data(std::function<void()> hook);
 
   /// Replaces prior hook; if already terminal, fires immediately inside this call.
@@ -122,6 +130,8 @@ class batch_stream {
   /// A set, not a counter: two closes from sender 0 must not stand in for senders {0, 1}.
   std::set<sender_id_t> _closed;
   bool _terminal{false};
+  std::optional<std::vector<std::size_t>> _positions;
+  std::size_t _next_position = 0;
   /// First non-null wins; never cleared.
   std::exception_ptr _error;
   std::function<void()> _on_data;

@@ -332,7 +332,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
     batch_id,
     std::move(output_data),
     telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id)));
-  return std::make_unique<pipelineable_operator_data>(outputs);
+  return std::make_unique<pipelineable_operator_data>(outputs, 0);
 }
 
 std::unique_ptr<operator_data> sirius_physical_top_n_merge::get_next_task_input_data()
