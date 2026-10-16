@@ -50,6 +50,9 @@ mod compute_node_service;
 mod engine;
 mod file_schema;
 mod fragment_executor;
+mod local_exchange;
+#[cfg(any(test, feature = "sirius-engine"))]
+mod parked_registry;
 mod proto;
 mod prpc;
 mod result_encoder;
