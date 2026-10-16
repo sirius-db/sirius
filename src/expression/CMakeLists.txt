@@ -6,5 +6,6 @@ target_sources(
           ast/utils.cpp
           from_duckdb.cpp
           function_id.cpp
+          gpu_regexp_replace.cpp
           join_condition.cpp
           value.cpp)

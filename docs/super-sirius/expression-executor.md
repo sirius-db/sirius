@@ -215,6 +215,51 @@ DuckDB produces `upper(lower('İ')) == I`, in contrast cuDF produces
 See cuDF's [Unicode
 limitations](https://docs.rapids.ai/api/libcudf/stable/md_doxygen_unicode)
 for its supported code points and context-sensitive conversion limitations.
+
+### Regular expression replacement
+
+`regexp_replace(s, pattern, replacement[, options])` maps to `function_id::regexp_replace`. DuckDB
+reads the pattern as RE2 and replaces only the first match unless the options contain `g`.
+`translate_gpu_regexp_replace` (`src/expression/gpu_regexp_replace.hpp`) is the shared capability
+check: planning calls it to decide whether the GPU can run the call, and the evaluator runs the cuDF
+calls it returns. The pattern, replacement and options must be constants. A column argument falls
+back to the CPU at plan time.
+
+The translation parses a subset of RE2 whose cuDF meaning matches RE2's and rewrites the parts where
+they differ:
+
+- `$` and `\z` become `\Z`, because cuDF's `$` also matches before a final newline.
+- `\d`, `\s`, `\w` and their negations become explicit ASCII classes. cuDF's versions follow Unicode,
+  and its `\s` also matches `\v`.
+- With the `i` option, each ASCII letter, in a literal or in a class range, gains its other case.
+  `k` also gains KELVIN SIGN and `s` gains LONG S, as in RE2's case folding.
+- `l` escapes the pattern, and `s` sets `DOTALL`. `c`, `m`, `n` and `p` keep the defaults.
+- The replacement follows RE2's rewrite syntax: `\0` to `\9` and `\\`.
+- A literal replacement runs `cudf::strings::replace_re` with `max_replace_count = 1` unless the
+  options contain `g`. With group references it runs `replace_with_backrefs`, which replaces every
+  match. For a first-match call the pattern `P` is wrapped as `\A([\s\S]*?)(P)`, the same lazy prefix
+  RE2 uses to search an unanchored pattern. A pattern anchored at the start matches at most once and
+  needs no prefix.
+
+Everything else falls back at plan time:
+
+- Patterns that match only the empty string, such as `^` or `(?:)`, because cuDF never replaces with
+  them.
+- Patterns that can match the empty string under `g`, because cuDF places empty matches after the
+  first differently. Without `g` the first match is at the start of the string, as in RE2.
+- `\b` and `\B`, because cuDF counts non-ASCII letters as word characters.
+- POSIX and Unicode classes, and non-ASCII letters or `\w` under `i`.
+- Inline flags, named groups, `\Q…\E`, `\x{…}` and bare braces.
+- Replacements that RE2 rejects or that reference a missing group.
+- Patterns that cuDF cannot compile, such as `a{1000}`.
+
+The ClickBench Q28 pattern runs a specialized kernel (`regex_playground`) when
+`enable_regex_jit_impl` is set and no flags apply. Like DuckDB, the kernel leaves a row unchanged when a
+newline follows the slash after the host. DuckDB v2's `expression_rewriter` turns this call, and any
+other whole-input replacement with a bare `\N`, into `regexp_extract`, which runs on the CPU
+([#2146](https://github.com/sirius-db/sirius/issues/2146)); the kernel only runs with that optimizer
+disabled.
+
 ### Temporal semantics
 
 `src/helper/timestamp_semantics.hpp` defines reusable GPU helpers in `sirius::temporal`.
