@@ -3680,9 +3680,8 @@ static void LoadInternal(ExtensionLoader& loader)
   db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
   // Register optimizer extension for transparent GPU execution. The post-hook
-  // captures the optimized plan; the pre-hook derives the single-table
-  // restrictions implied by OR-ed multi-table filters so DuckDB's own pushdown,
-  // join-order and build/probe-side passes can act on them. (The optimizer mask
+  // captures the optimized plan; the pre-hook classifies the query while every
+  // scan is still in the plan. (The optimizer mask
   // an earlier pre-hook used to write per query is published once at load — see
   // publish_transparent_optimizer_mask above.)
   OptimizerExtension opt_ext;
