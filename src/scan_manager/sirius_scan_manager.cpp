@@ -1080,6 +1080,19 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
 
   auto const rowid_type = rowid_type_for(entry);
 
+  // A port carries one ride. A scan that arrives after a bigger bundle claimed the port installs
+  // nothing of its own and is offered to the rider pass instead, which can still attach it to
+  // that ride (q10's `nation` riding along with `customer`).
+  if (!port->port_directive().empty()) {
+    SIRIUS_LOG_INFO(
+      "[late-mat] operator {}: not deferring on its own — {} (id={}) already carries a ride; "
+      "offering it as a rider",
+      scan_op.get_operator_id(),
+      port->get_name(),
+      port->get_operator_id());
+    return late_mat_outcome{.may_ride_along = true};
+  }
+
   auto pair = late_mat::make_defer_pair(scan_op.normalization_targets(),
                                         planned.positions,
                                         port_schema,
@@ -1781,6 +1794,36 @@ void sirius_scan_manager::prepare_for_query(
   // (maybe_start_memory_prefetcher, above) — until materialization is device-aware.
   bool const single_gpu_pin =
     _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size() == 1;
+  // A port carries one ride, and the scan that installs there first owns it: a later scan whose
+  // bundle lands at the same port can only ride along. Visit the scans whose own bundle would save
+  // the most (bytes per row times port crossings) first, so the plan's value decides who owns the
+  // port rather than the order the scans happen to be listed in. With DuckDB v2's TPC-H q10 join
+  // order, `nation` is listed before `customer`, and its 16 B/row ride would otherwise shut out
+  // customer's 96 B/row one. Ties keep the listed order. Only the visiting order changes; every
+  // scan is still visited exactly once.
+  if (late_mat::late_mat_enabled() && cached_assignments.size() > 1) {
+    std::vector<std::pair<std::int64_t, std::size_t>> saving_and_index;
+    saving_and_index.reserve(cached_assignments.size());
+    for (std::size_t index = 0; index < cached_assignments.size(); ++index) {
+      auto const planned  = sirius::planner::plan_deferral(*cached_assignments[index].op);
+      std::int64_t saving = 0;
+      if (planned.installable()) {
+        int const boundaries = planned.group_extension.has_value()
+                                 ? std::max(planned.boundaries, planned.group_extension->boundaries)
+                                 : planned.boundaries;
+        saving               = planned.net_value_bytes * boundaries;
+      }
+      saving_and_index.emplace_back(saving, index);
+    }
+    std::ranges::stable_sort(
+      saving_and_index, std::ranges::greater{}, [](auto const& entry) { return entry.first; });
+    std::vector<cached_assignment> ordered;
+    ordered.reserve(cached_assignments.size());
+    for (auto const& [saving, index] : saving_and_index) {
+      ordered.push_back(std::move(cached_assignments[index]));
+    }
+    cached_assignments = std::move(ordered);
+  }
   for (auto& assignment : cached_assignments) {
     mvcc_chunk_mask_set masks;  // stays empty for parquet pins
     std::vector<insert_delta_split> delta_splits;
