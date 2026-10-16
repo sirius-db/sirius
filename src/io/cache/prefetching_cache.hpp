@@ -367,6 +367,23 @@ class prefetching_cache {
   /// rather than a value to compute an exact target from.
   [[nodiscard]] std::size_t claimed_bytes() const noexcept;
 
+  /// Hard cap on the cache's resident chunk bytes (@c eviction_threshold_fraction
+  /// of the host tier, chunk aligned); the readahead's default resident-byte
+  /// bound.  0 without a pool (or uncapped).
+  [[nodiscard]] std::size_t max_prefetching_budget_bytes() const noexcept;
+
+  /// How much of one object the cache holds.
+  struct object_residency {
+    std::size_t resident_bytes = 0;  ///< bytes of chunks cached or in use
+    std::size_t object_bytes   = 0;  ///< the object's size; 0 when the cache has not seen it
+  };
+
+  /// What the cache holds of the object at @p object_path (@c io_object::object_path) in its
+  /// current generation. Takes a path rather than an @c io_object so it can be asked before the
+  /// file is opened. Read-only: subscribes, pins and reorders nothing. Chunks count whole, so
+  /// this is an estimate -- meant for choosing what to read first.
+  [[nodiscard]] object_residency residency(std::string_view object_path) const;
+
   /// Ask the evictor to free at least @p bytes_to_free bytes of staging memory.
   ///
   /// Asynchronous and best-effort: this enqueues the demand and returns.  The

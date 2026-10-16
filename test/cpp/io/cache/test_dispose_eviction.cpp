@@ -151,7 +151,7 @@ TEST_CASE("dispose_on_idle reclaims a disposed request's chunks on the next swee
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, dispose_on_idle_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 
@@ -195,7 +195,7 @@ TEST_CASE("dispose_on_idle keeps a chunk a live request still shares", "[cache][
   sirius::exec::query_lifecycle_registry scan_lifecycle;
 
   sirius_scan_manager manager{scan_lifecycle, dispose_on_idle_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 
@@ -261,7 +261,7 @@ TEST_CASE("scan inputs populate the cache without a readahead manager",
   cfg.apply_cache_mode();
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{scan_lifecycle, cfg, *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 
@@ -308,7 +308,7 @@ TEST_CASE("Deferred scan inputs initialize prefetch only when admitted",
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
     scan_lifecycle, dispose_on_idle_config(), *memory, single_gpu_index_for_dispose()};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   auto ds = manager.create_datasource(file.path.string());
   std::vector<scan_info::fadvise_entry> hints{{ds, {cudf::io::text::byte_range_info{0, 4096}}}};

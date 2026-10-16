@@ -129,6 +129,12 @@ struct config {
   /// workloads.
   std::size_t footer_probe_bytes{512UL << 10};  // 512 KiB
 
+  /// How long a read whose staging cannot be allocated waits for staging to
+  /// free before it fails with rmm::out_of_memory.  While waiting it is parked
+  /// on the reactor and retried with backoff and whenever a read completes.
+  /// 0 fails at once.
+  std::chrono::milliseconds staging_wait_timeout{std::chrono::minutes{5}};
+
   /// S3 LIST / glob safety caps (both throw "narrow the glob prefix", never
   /// truncate).  @c list_max_matches bounds the files a glob keeps / a
   /// whole-listing accumulates (result memory); @c list_max_scanned bounds the

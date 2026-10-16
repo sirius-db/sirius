@@ -25,6 +25,7 @@
 
 #include <cuda/stream>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -240,14 +241,17 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// fine.  Cheap when no cache was ever initialised.
   void pre_destroy() noexcept { shutdown_cache(); }
 
-  [[nodiscard]] cache::prefetching_cache* cache() noexcept { return _cache.get(); }
+  [[nodiscard]] cache::prefetching_cache* cache() noexcept
+  {
+    return _cache_view.load(std::memory_order_acquire);
+  }
 
   /// True iff @c host_read / @c device_read should consult the cache
   /// before falling through to the backend.  Computed live so it tracks
   /// @ref initialize_cache / @ref shutdown_cache transitions.
   [[nodiscard]] inline bool uses_prefetching_cache() const noexcept
   {
-    return can_use_prefetching_cache() && _cache;
+    return can_use_prefetching_cache() && _cache_view.load(std::memory_order_acquire) != nullptr;
   }
 
   /// Per-file metadata cache that lives independently of the prefetching
@@ -335,6 +339,10 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// though callers are expected to drive the lifecycle explicitly so
   /// reactors stay alive while workers drain).
   std::unique_ptr<cache::prefetching_cache> _cache;
+  /// What readers see of @ref _cache.  The cache may be built while datasources
+  /// on other threads already consult @ref cache() (the scan manager builds the
+  /// default one lazily), so it is published fully built through this atomic.
+  std::atomic<cache::prefetching_cache*> _cache_view{nullptr};
 
   /// Independent of the prefetching machinery — exposed via @c metadata_store().
   cache::metadata_store _metadata_store;
