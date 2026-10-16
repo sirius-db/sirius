@@ -1524,6 +1524,8 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     physical_counters_->iceberg_delete_reader_io_failures.load(std::memory_order_relaxed);
   snapshot.iceberg_delete_identity_failures =
     physical_counters_->iceberg_delete_identity_failures.load(std::memory_order_relaxed);
+  snapshot.iceberg_delete_descriptor_mismatches =
+    physical_counters_->iceberg_delete_descriptor_mismatches.load(std::memory_order_relaxed);
   snapshot.iceberg_delete_corrupt_inputs =
     physical_counters_->iceberg_delete_corrupt_inputs.load(std::memory_order_relaxed);
   snapshot.iceberg_inventory_bytes_peak =

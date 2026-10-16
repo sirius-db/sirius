@@ -181,6 +181,10 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
       throw;
     } catch (std::bad_alloc const&) {
       throw;
+    } catch (io::descriptor_mismatch_error const& error) {
+      if (counters) ++counters->iceberg_delete_descriptor_mismatches;
+      throw sirius::transparent::classified_execution_error(
+        sirius::transparent::late_failure_cause::reader_io, error.what());
     } catch (std::system_error const& error) {
       if (error.code() == std::errc::operation_canceled) throw;
       throw sirius::transparent::classified_execution_error(

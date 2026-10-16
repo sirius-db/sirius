@@ -133,6 +133,26 @@ class identity_changing_puffin_source final : public puffin_byte_source {
   std::streamoff offset_ = 0;
 };
 
+class cancelling_puffin_source final : public puffin_byte_source {
+ public:
+  explicit cancelling_puffin_source(std::streamoff size) : size_(size) {}
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || offset > size_) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte>) override
+  {
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+  }
+  [[nodiscard]] std::streamoff size() const override { return size_; }
+
+ private:
+  std::streamoff size_;
+  std::streamoff offset_ = 0;
+};
+
 /// The manifest entry as the fixture actually writes it. Each test below changes exactly one
 /// field, so a failure names the check that fired rather than "something threw".
 DeletionVectorRef fixture_ref()
@@ -690,6 +710,24 @@ TEST_CASE("Charged Puffin preserves an opened-object identity failure",
     CHECK(failure.observed_tag() == "\"v2\"");
     auto classified = sirius::transparent::classify_failure(std::current_exception());
     CHECK(classified.cause == sirius::transparent::late_failure_cause::object_changed);
+  }
+}
+
+TEST_CASE("Charged Puffin preserves cancellation instead of classifying it as corrupt input",
+          "[scan_preparation][iceberg][charged_reader][failure]")
+{
+  auto const ref = fixture_ref();
+  std::error_code error;
+  auto const size = fs::file_size(ref.puffin_path, error);
+  REQUIRE_FALSE(error);
+  cancelling_puffin_source source(static_cast<std::streamoff>(size));
+  CHECK_THROWS_AS(read_for_test(ref, true, &source), std::system_error);
+  try {
+    read_for_test(ref, true, &source);
+  } catch (...) {
+    CHECK(std::current_exception() != nullptr);
+    CHECK(sirius::transparent::classify_failure(std::current_exception()).cause ==
+          sirius::transparent::late_failure_cause::other);
   }
 }
 

@@ -255,13 +255,13 @@ TEST_CASE("Metadata store supports concurrent publication", "[metadata_store]")
   CHECK(store.statistics().entries == 400);
 }
 
-TEST_CASE("Open-local entries never suppress the next open footer probe", "[metadata_store]")
+TEST_CASE("Open-local entries do not advertise reusable path hints", "[metadata_store]")
 {
   cache::metadata_store store;
   fake_object object("file", "file:open", {identity_kind::opened_handle, 42, "1"});
   auto v = std::make_shared<value>(256);
   store.register_metadata(object, v);
-  CHECK(store.has_path("file"));
+  CHECK_FALSE(store.has_path("file"));
   CHECK(store.get_metadata(object) == v);
   fake_object reopened("file", "file:open2", {identity_kind::opened_handle, 42, "2"});
   CHECK_FALSE(store.get_metadata(reopened));
@@ -288,7 +288,7 @@ TEST_CASE("Local metadata reuse requires the observed identity", "[metadata_stor
   CHECK(store.get_metadata(replaced) == fresh);
 }
 
-TEST_CASE("Local stat identity does not authorize reuse across opens", "[metadata_store]")
+TEST_CASE("Local stat identity reuses metadata across opens", "[metadata_store]")
 {
   object_identity local{identity_kind::local_stat, 256, "same-ctime"};
   local.device   = 1;
@@ -299,15 +299,15 @@ TEST_CASE("Local stat identity does not authorize reuse across opens", "[metadat
   cache::metadata_store store;
   auto old_value = std::make_shared<value>(256);
   store.register_metadata(first, old_value);
-  CHECK_FALSE(store.get_metadata(reopened));
+  CHECK(store.get_metadata(reopened) == old_value);
   bool loaded    = false;
   auto new_value = store.get_or_load(reopened, [&] {
     loaded = true;
     return std::make_shared<value>(512);
   });
-  CHECK(loaded);
-  CHECK(new_value != old_value);
-  CHECK(store.get_metadata(reopened) == new_value);
+  CHECK_FALSE(loaded);
+  CHECK(new_value == old_value);
+  CHECK(store.get_metadata(reopened) == old_value);
 }
 
 TEST_CASE("Metadata replacement releases payloads outside the store lock", "[metadata_store]")

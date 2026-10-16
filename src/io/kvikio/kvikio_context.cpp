@@ -16,6 +16,8 @@
 
 #include "io/kvikio/kvikio_context.hpp"
 
+#include "io/io_errors.hpp"
+
 #include <kvikio/defaults.hpp>
 #include <kvikio/remote_handle.hpp>
 
@@ -169,7 +171,8 @@ std::shared_ptr<io_object> kvikio_context::create_io_object(std::string path)
       object_identity buffered_identity, direct_identity;
       if (!capture_local_identity(handle.fd(false), buffered_identity) ||
           !capture_local_identity(handle.fd(true), direct_identity)) {
-        throw std::runtime_error("kvikio_context::create_io_object: identity_descriptor_mismatch");
+        throw descriptor_mismatch_error(
+          "kvikio_context::create_io_object: identity_descriptor_mismatch");
       }
       if (buffered_identity.device != direct_identity.device ||
           buffered_identity.inode != direct_identity.inode) {
@@ -180,7 +183,7 @@ std::shared_ptr<io_object> kvikio_context::create_io_object(std::string path)
     auto const file_size = handle.nbytes();
     return std::make_shared<kvikio_io_object>(std::move(path), std::move(handle), file_size);
   }
-  throw std::runtime_error("kvikio_context::create_io_object: identity_descriptor_mismatch");
+  throw descriptor_mismatch_error("kvikio_context::create_io_object: identity_descriptor_mismatch");
 }
 
 bool kvikio_context::supports(std::string_view /*path*/) const noexcept
