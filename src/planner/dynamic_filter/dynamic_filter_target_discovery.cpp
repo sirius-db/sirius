@@ -164,6 +164,11 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     }
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER:
       return {descent_step{.child_index = 0, .child_ordinal = output_ordinal}};
+    // Copies rows without changing values. Output k is input k; the trailing copy count is not an
+    // output, so descent never reaches it.
+    case SiriusPhysicalOperatorType::REPLICATE:
+      if (output_ordinal >= node.types.size()) { return {}; }
+      return {descent_step{.child_index = 0, .child_ordinal = output_ordinal}};
     case SiriusPhysicalOperatorType::INVALID:
     case SiriusPhysicalOperatorType::ORDER_BY:
     case SiriusPhysicalOperatorType::LIMIT:
@@ -172,7 +177,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::TOP_N:
     case SiriusPhysicalOperatorType::WINDOW:
     case SiriusPhysicalOperatorType::UNNEST:
-    case SiriusPhysicalOperatorType::REPLICATE:
     case SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
     // Dense count join outputs have no child-ordinal mapping in target discovery.
     case SiriusPhysicalOperatorType::DENSE_COUNT_JOIN:
