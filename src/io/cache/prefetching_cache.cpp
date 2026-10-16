@@ -434,7 +434,11 @@ prefetching_cache::~prefetching_cache()
 
 std::shared_ptr<cache_generation> prefetching_cache::get_or_create_generation(const io_object& obj)
 {
-  const auto& key = obj.identity_cache_key();
+  // Local stat identities describe the underlying file and may be shared by
+  // separate opens; the metadata cache keeps the stricter per-open fence.
+  // Prefetch generations must still coalesce those opens so adjacent splits
+  // share their boundary chunks.
+  auto const key = obj.identity().cache_key(obj.raw_file_cache_id());
   {
     std::shared_lock lk(_map_mtx);
     if (auto it = _file_cache.find(key); it != _file_cache.end()) { return it->second; }
@@ -753,7 +757,7 @@ std::shared_ptr<cache_generation> prefetching_cache::generation_for(const io_obj
 {
   if (handle != nullptr && *handle && handle->_generation) { return handle->_generation; }
   std::shared_lock lk(_map_mtx);
-  auto const it = _file_cache.find(obj.identity_cache_key());
+  auto const it = _file_cache.find(obj.identity().cache_key(obj.raw_file_cache_id()));
   return it == _file_cache.end() ? nullptr : it->second;
 }
 

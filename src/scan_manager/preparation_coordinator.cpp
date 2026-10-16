@@ -474,28 +474,29 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
   reserve_slot(index, static_cast<size_t>(source - sources.begin()));
   ticket->active = true;
   lock.unlock();
-  auto work = source->hooks.claim();
-  if (work) {
+  auto claimed = source->hooks.claim();
+  if (claimed) {
     // Workers cannot see this slot until enqueue; source registration is already frozen.
-    free->unit = work->unit;
+    free->unit = claimed->unit;
     if (before_submit) before_submit();
     {
       std::lock_guard check(gate->mutex);
       gate->check_interrupted();
     }
-    dispatcher->enqueue([ticket = std::move(ticket), work = std::move(work->work)]() mutable {
-      auto& owner = *ticket->st;
-      std::unique_ptr<op::scan::scan_info> value;
-      try {
-        value = work();
-      } catch (...) {
-        owner.completion->report_error(std::current_exception());
-        owner.stop();
-      }
-      work              = {};  // Release physical-input captures before the job ticket is returned.
-      ticket->completed = true;
-      owner.settle(ticket->index, std::move(value));
-    });
+    dispatcher->enqueue(
+      [ticket = std::move(ticket), work = std::move(*claimed)](std::stop_token stop) mutable {
+        auto& owner = *ticket->st;
+        std::unique_ptr<op::scan::scan_info> value;
+        try {
+          value = work.stop_work ? work.stop_work(stop) : work.work();
+        } catch (...) {
+          owner.completion->report_error(std::current_exception());
+          owner.stop();
+        }
+        work = {};  // Release physical-input captures before the job ticket is returned.
+        ticket->completed = true;
+        owner.settle(ticket->index, std::move(value));
+      });
     lock.lock();
   } else {
     lock.lock();

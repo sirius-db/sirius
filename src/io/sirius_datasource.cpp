@@ -67,6 +67,7 @@ sirius_datasource::sirius_datasource(std::shared_ptr<ioctx> io_ctx,
                                      std::shared_ptr<io_object> io_obj)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_obj))
 {
+  if (_io_ctx && _io_object) _io_ctx->metadata_store().open_observed(*_io_object);
 }
 
 sirius_datasource::~sirius_datasource() {}
@@ -74,8 +75,17 @@ sirius_datasource::~sirius_datasource() {}
 std::shared_ptr<io_object_metadata> sirius_datasource::metadata(std::string const& profile) const
 {
   if (!_io_ctx || !_io_object) { return nullptr; }
-  auto& cache = _io_ctx->metadata_store();
-  return cache.get_metadata(*_io_object, profile);
+  auto& cache   = _io_ctx->metadata_store();
+  auto metadata = cache.get_metadata(*_io_object, profile);
+  if (metadata) return metadata;
+
+  // The identity-aware entry is scoped to the individual open for degraded
+  // local identities.  Keep the legacy lookup as a compatibility path for
+  // metadata consumers that ask a freshly opened datasource for the parsed
+  // footer: observe_locked has already retired the legacy value when the
+  // underlying object identity changes.
+  if (profile == "parquet-v1") return cache.get_metadata(_io_object->raw_file_cache_id());
+  return nullptr;
 }
 
 [[nodiscard]] bool sirius_datasource::store_metadata(std::shared_ptr<io_object_metadata> metadata,

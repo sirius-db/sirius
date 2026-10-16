@@ -1,9 +1,9 @@
 # cmake-format: off
 set(TEST_SOURCES
     test/cpp/scan/bench_parquet_footer_cache.cpp
-    test/cpp/io/cache/bench_metadata_cache.cpp
+    test/cpp/io/cache/bench_metadata_store.cpp
     test/cpp/io/test_parquet_metadata_retention.cpp
-    test/cpp/io/cache/test_metadata_cache.cpp
+    test/cpp/io/cache/test_metadata_store.cpp
     test/cpp/io/test_object_identity.cpp
     test/cpp/scan_manager/test_preparation_readiness.cpp
     test/cpp/scan_manager/test_preparation.cpp

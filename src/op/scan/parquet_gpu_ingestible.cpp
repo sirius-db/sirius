@@ -25,6 +25,7 @@
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
 #include <io/io_context.hpp>
+#include <io/io_errors.hpp>
 #include <io/parquet_helpers.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
@@ -51,6 +52,7 @@
 #include <cudf/strings/utilities.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 #include <cudf/version_config.hpp>
@@ -148,13 +150,11 @@ bool is_unsafe_for_stats_filter(duckdb::Expression const& expr)
          expression_has_null_predicate(expr);
 }
 
-
 /// True when the parquet reader's bloom filter probe hashes literals as the
 /// column's parquet physical type: cuDF 26.12 and later (rapidsai/cudf#24320).
 constexpr bool cudf_bloom_filter_probe_is_fixed = CUDF_VERSION_MAJOR > 26 ||
                                                   (CUDF_VERSION_MAJOR == 26 &&
                                                    CUDF_VERSION_MINOR >= 12);
-
 
 /// True when the bloom filter probe of the cuDF we build against is unreliable
 /// for a column of @p type. Always false from cuDF 26.12.
@@ -188,7 +188,6 @@ bool has_unreliable_bloom_filter_probe(duckdb::LogicalType const& type)
   }
 }
 
-
 /// True when @p expr references a column for which has_unreliable_bloom_filter_probe holds.
 bool references_unreliable_bloom_filter_column(duckdb::Expression const& expr)
 {
@@ -201,7 +200,6 @@ bool references_unreliable_bloom_filter_column(duckdb::Expression const& expr)
   });
   return found;
 }
-
 
 /// True when @p expr contains an equality that cuDF's parquet reader would probe
 /// in a bloom filter of a column for which has_unreliable_bloom_filter_probe holds.
@@ -221,7 +219,6 @@ bool has_unreliable_bloom_filter_equality(duckdb::Expression const& expr)
   return found;
 }
 
-
 /// @p expr minus every top-level AND conjunct for which @p is_dropped holds;
 /// nullptr when none survive. A non-AND @p expr is a single conjunct.
 ///
@@ -231,6 +228,7 @@ bool has_unreliable_bloom_filter_equality(duckdb::Expression const& expr)
 /// post-decode.
 ///
 /// Only the top level is split: a compound conjunct (an OR, or a nested AND)
+
 /// containing anything unsafe is dropped whole. Conservative, not wrong.
 template <typename Predicate>
 duckdb::unique_ptr<duckdb::Expression> conjuncts_without(duckdb::Expression const& expr,
@@ -242,6 +240,7 @@ duckdb::unique_ptr<duckdb::Expression> conjuncts_without(duckdb::Expression cons
 
   auto const& conjunction = expr.Cast<duckdb::BoundConjunctionExpression>();
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> kept;
+
   for (auto const& child : conjunction.GetChildren()) {
     if (!is_dropped(*child)) { kept.push_back(child->Copy()); }
   }
@@ -603,7 +602,6 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::size_t _acc_working_bytes = 0;
   std::size_t _acc_run_count     = 0;
   int64_t _acc_rows              = 0;
-  std::size_t _emit_count        = 0;  // [coalesce-debug] running count of emitted batches
   std::vector<std::string> _partition_values;
   bool _disable_pushdown = false;
   /// Reader options of the current run. Projected and natural reads cannot share
@@ -834,7 +832,9 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
         _static_pushdown_expression = std::move(stats_candidate);
       } else if (stats_candidate) {
         _static_pushdown_is_complete = false;
-        _static_pushdown_expression  = stats_safe_conjuncts(*stats_candidate);
+        _static_pushdown_expression  = conjuncts_without(
+          *stats_candidate,
+          [](duckdb::Expression const& conjunct) { return is_unsafe_for_stats_filter(conjunct); });
         // Whatever survives must itself be safe, or the crash returns.
         D_ASSERT(!_static_pushdown_expression ||
                  !is_unsafe_for_stats_filter(*_static_pushdown_expression));
@@ -848,16 +848,19 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
 
     _reader_pushdown_expression  = _static_pushdown_expression;
     _reader_pushdown_is_complete = _static_pushdown_is_complete;
-    if (_reader_pushdown_expression &&
-        has_unreliable_bloom_filter_equality(*_reader_pushdown_expression)) {
-      // Keep row-group statistics pruning, but do not hand an affected
-      // equality to cuDF's Parquet reader. The full predicate is evaluated
-      // after decode, avoiding false-negative bloom-filter probes.
-      _reader_pushdown_expression.reset();
+    if (_static_pushdown_expression &&
+        has_unreliable_bloom_filter_equality(*_static_pushdown_expression)) {
       _reader_pushdown_is_complete = false;
+      _reader_pushdown_expression =
+        conjuncts_without(*_static_pushdown_expression, [](duckdb::Expression const& conjunct) {
+          return has_unreliable_bloom_filter_equality(conjunct);
+        });
       SIRIUS_LOG_DEBUG(
-        "[parquet_gpu_ingestible] disabling reader pushdown for a pre-26.12 cuDF bloom-filter "
-        "predicate; applying the full predicate post-decode");
+        "[parquet_gpu_ingestible] Predicate has an equality on a column with an unreliable "
+        "bloom filter probe. Pushing only the other conjuncts into the reader ({}), full "
+        "predicate applied post-decode: {}",
+        _reader_pushdown_expression ? _reader_pushdown_expression->ToString() : "none",
+        _duckdb_filter_expression->ToString());
     }
 
     // Digest the pushed-down filter once: which pure-filter string columns a
@@ -953,7 +956,7 @@ bool parquet_gpu_ingestible::has_processed_all_metadata() const
   return _next_file_idx.load(std::memory_order_relaxed) >= _file_paths.size();
 }
 
-std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
+gpu_ingestible::metadata_scan_task_t parquet_gpu_ingestible::next_split_provider(
   io::ioctx_resolver resolve)
 {
   if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
@@ -966,27 +969,32 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   // parquet_batch_coalescer.
   auto const& file_path = _file_paths[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
-  return [this, file_path, idx, resolve = std::move(resolve)]() -> std::unique_ptr<scan_info> {
+  return [this, file_path, idx, resolve = std::move(resolve)](
+           std::stop_token stop) -> std::unique_ptr<scan_info> {
     auto io_ctx = resolve(file_path);
     try {
-      return build_file_scan_info(file_path, idx, io_ctx);
+      return build_file_scan_info(file_path, idx, io_ctx, stop);
     } catch (unsupported_physical_input const&) {
       throw;
     } catch (transparent::classified_execution_error const&) {
       throw;
-    } catch (duckdb::InterruptException const&) {
-      throw;
-    } catch (rmm::out_of_memory const&) {
-      throw;
-    } catch (std::bad_alloc const&) {
-      throw;
+    } catch (duckdb::IOException const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (io::credential_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
     } catch (std::system_error const& error) {
       if (error.code() == std::errc::operation_canceled) { throw; }
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
-    } catch (std::exception const& error) {
+    } catch (cudf::logic_error const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
+    } catch (duckdb::InterruptException const&) {
+      throw;
+    } catch (std::bad_alloc const&) {
+      throw;
     }
   };
 }
@@ -995,7 +1003,10 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path, std::size_t file_index, std::shared_ptr<io::ioctx> const& io_ctx)
+  std::string const& file_path,
+  std::size_t file_index,
+  std::shared_ptr<io::ioctx> const& io_ctx,
+  std::stop_token stop)
 {
   if (_execution_completion && _execution_completion->injections &&
       _execution_completion->injections->hold_footer_index == file_index + 1) {
@@ -1035,30 +1046,57 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   std::size_t footer_len = 0;
   try {
     // The carrier projection is only known to match after parsing this footer.
-    bool cache_hit = false;
-    resolved_metadata =
-      resolve_parquet_metadata(*sirius_ds,
-                               _info->contract_id,
-                               file_path,
-                               _plan->carrier_batch_index ? *_natural_reader_options : opts,
-                               &cache_hit);
+    bool cache_hit             = false;
+    auto const opened_identity = sirius_ds->get_io_object().identity_cache_key();
+    auto const resolution      = resolve_parquet_metadata_with_identity(
+      *sirius_ds,
+      _info->contract_id,
+      file_path,
+      _plan->carrier_batch_index ? *_natural_reader_options : opts,
+      &cache_hit,
+      stop);
+    if (resolution.identity != opened_identity) {
+      if (_info->profiles->counters)
+        _info->profiles->counters->metadata_provenance_mismatches.fetch_add(
+          1, std::memory_order_relaxed);
+      auto const refreshed = resolve_parquet_metadata_with_identity(
+        *sirius_ds,
+        _info->contract_id,
+        file_path,
+        _plan->carrier_batch_index ? *_natural_reader_options : opts,
+        &cache_hit,
+        stop,
+        true);
+      if (refreshed.identity != opened_identity) {
+        throw transparent::classified_execution_error(
+          transparent::late_failure_cause::physical_input,
+          "[scan] footer identity mismatch for " + file_path);
+      }
+      resolved_metadata = refreshed.artifact;
+    }
+    if (!resolved_metadata) resolved_metadata = resolution.artifact;
     if (_info->profiles->counters)
       _info->profiles->counters->parquet_metadata(file_path, cache_hit);
     file_metadata = resolved_metadata->file_metadata();
     encryption    = resolved_metadata->encryption_evidence;
     footer_len    = resolved_metadata->footer_byte_len();
+  } catch (transparent::classified_execution_error const&) {
+    throw;
   } catch (unsupported_physical_input const& error) {
     if (_info->profiles->counters && !_info->physical_schema)
       _info->profiles->counters->record(error.reason);
     throw;
-  } catch (duckdb::InterruptException const&) {
+  } catch (duckdb::IOException const&) {
     throw;
-  } catch (rmm::out_of_memory const&) {
+  } catch (io::credential_error const&) {
+    throw;
+  } catch (std::system_error const&) {
+    throw;
+  } catch (duckdb::InterruptException const&) {
     throw;
   } catch (std::bad_alloc const&) {
     throw;
-  } catch (std::system_error const& error) {
-    if (error.code() == std::errc::operation_canceled) { throw; }
+  } catch (std::logic_error const&) {
     throw;
   } catch (std::exception const& error) {
     if (_info->physical_schema && !_info->physical_schema->fields.empty()) {
@@ -1089,7 +1127,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
                                          encryption,
                                          resolved_metadata->original_schema,
                                          resolved_metadata->arrow_schema,
-                                         resolved_metadata->original_logical_annotations);
+                                         resolved_metadata->original_logical_annotations,
+                                         resolved_metadata->built_for_identity);
     file_metadata = resolved_metadata->file_metadata();
   }
   if (_info->injections.strip_encryption_evidence) encryption = {};
@@ -1602,7 +1641,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
         parquet_input_approval{footer_len,
                                std::move(retained),
                                resolved_metadata,
-                               out->datasource->get_io_object().identity_cache_key()})}});
+                               resolved_metadata->built_for_identity})}});
 
   return out;
 }

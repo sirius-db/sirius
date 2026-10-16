@@ -38,6 +38,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -91,7 +92,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     _execution_completion = std::move(completion);
   }
 
-  using metadata_scan_task_t = std::function<std::unique_ptr<scan_info>()>;
+  using metadata_scan_task_t = std::function<std::unique_ptr<scan_info>(std::stop_token)>;
 
   virtual ~gpu_ingestible() = default;
 

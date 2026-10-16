@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <limits>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <utility>
 #include <vector>
@@ -50,11 +51,13 @@ class parquet_metadata final : public sirius::io::io_object_metadata,
                    parquet_encryption_evidence encryption            = {},
                    std::vector<uint8_t> original_schema              = {},
                    std::string arrow_schema                          = {},
-                   std::vector<uint8_t> original_logical_annotations = {})
+                   std::vector<uint8_t> original_logical_annotations = {},
+                   std::string built_for_identity                    = {})
     : encryption_evidence(encryption),
       original_schema(std::move(original_schema)),
       arrow_schema(std::move(arrow_schema)),
       original_logical_annotations(std::move(original_logical_annotations)),
+      built_for_identity(std::move(built_for_identity)),
       _file_metadata(std::move(file_metadata)),
       _footer_byte_len(footer_byte_len)
   {
@@ -62,7 +65,7 @@ class parquet_metadata final : public sirius::io::io_object_metadata,
 
   [[nodiscard]] std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata() const
   {
-    // Export an alias that owns the entire evidence record, including accounting.
+    // Export an alias that owns the entire evidence record.
     // Removing the cache entry cannot free evidence still used by a split.
     return {shared_from_this(), _file_metadata.get()};
   }
@@ -76,19 +79,36 @@ class parquet_metadata final : public sirius::io::io_object_metadata,
   // One byte per raw SchemaElement; distinguishes a real logicalType from a
   // converted_type annotation synthesized by cuDF during sanitize_schema.
   std::vector<uint8_t> const original_logical_annotations;
+  // Captured by the producer before reading the footer; never re-labelled on a cache hit.
+  std::string const built_for_identity;
 
  private:
   std::shared_ptr<cudf::io::parquet::FileMetaData const> _file_metadata;
   std::size_t _footer_byte_len{0};
 };
 
+struct parquet_metadata_resolution {
+  std::shared_ptr<parquet_metadata> artifact;
+  std::string identity;
+};
+
 // The three footer producers must publish the same complete evidence. Cache hits
 // return the very same record, including the original serialized schema.
+parquet_metadata_resolution resolve_parquet_metadata_with_identity(
+  io::sirius_datasource& source,
+  scan_contract_id contract,
+  std::string const& identity,
+  cudf::io::parquet_reader_options const& options,
+  bool* cache_hit      = nullptr,
+  std::stop_token stop = {},
+  bool force_refresh   = false);
+
 std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
   io::sirius_datasource& source,
   scan_contract_id contract,
   std::string const& identity,
   cudf::io::parquet_reader_options const& options,
-  bool* cache_hit = nullptr);
+  bool* cache_hit      = nullptr,
+  std::stop_token stop = {});
 
 }  // namespace sirius::op::scan

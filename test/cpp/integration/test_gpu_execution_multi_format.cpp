@@ -4108,6 +4108,40 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Unsupported remote Puffin is declined before planning opens the sidecar",
+                 "[integration][scan_preparation][iceberg][planning]")
+{
+  // Only the Puffin URI is remote; metadata, manifests, and data stay local so
+  // discovery can complete without any network access. The unsupported scheme
+  // must be rejected by the planning-only backend lookup.
+  auto table    = inventory_fixture("dv_unsupported_uri");
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  size_t routes = 0;
+  size_t opens  = 0;
+  auto reset    = reset_after_test(counters->iceberg_preparation_route_for_testing,
+                                counters->iceberg_dv_phase_for_testing);
+  counters->iceberg_preparation_route_for_testing = [&](auto, bool) { ++routes; };
+  counters->iceberg_dv_phase_for_testing          = [&](auto const&, bool start) {
+    if (start) ++opens;
+  };
+
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("no planning-capable remote backend") != std::string::npos);
+  CHECK(routes == 0);
+  CHECK(opens == 0);
+
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto reason =
+    static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_puffin_uri_unsupported);
+  CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "Preparation routes preserve rows and delete payload loading",
                  "[integration][scan_preparation][iceberg][route_parity]")
 {

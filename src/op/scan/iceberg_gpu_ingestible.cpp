@@ -22,6 +22,7 @@
 
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
+#include <io/io_errors.hpp>
 #include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
 #include <log/logging.hpp>
@@ -32,8 +33,10 @@
 #include <cstdint>
 #include <numeric>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -140,8 +143,11 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   scan_manager::preparation_ledger* ledger,
   scan_manager::w_permit const& permit,
   io::ioctx_resolver const& resolve,
+  std::stop_token stop,
   std::shared_ptr<physical_check_counters> const& counters)
 {
+  if (stop.stop_requested())
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled));
   auto const* dv = descriptor.dv;
   if (!dv)
     return std::make_shared<iceberg_delete_set const>(
@@ -197,9 +203,19 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
                                        prepared.contract(),
                                        *source);
   } catch (unsupported_physical_input const& error) {
-    if (counters) counters->record(error.reason);
+    if (counters) {
+      counters->record(error.reason);
+      if (error.reason == verdict_reason::iceberg_delete_corrupt)
+        counters->iceberg_delete_corrupt_inputs.fetch_add(1, std::memory_order_relaxed);
+    }
     throw;
-  } catch (sirius::transparent::classified_execution_error const&) {
+  } catch (transparent::classified_execution_error const& error) {
+    if (counters && error.cause == transparent::late_failure_cause::reader_io)
+      counters->iceberg_delete_reader_io_failures.fetch_add(1, std::memory_order_relaxed);
+    throw;
+  } catch (io::object_changed_error const&) {
+    if (counters)
+      counters->iceberg_delete_identity_failures.fetch_add(1, std::memory_order_relaxed);
     throw;
   } catch (std::bad_alloc const&) {
     throw scan_manager::preparation_resource_error(
@@ -255,25 +271,27 @@ gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider
     ++_next_preparation;
     auto const& profiles = static_cast<iceberg_ingestible_table_info const&>(table_info()).profiles;
     auto counters        = profiles ? profiles->counters : nullptr;
-    return [work = std::move(work),
+    return [work    = std::move(work),
             attempt = _attempt,
-            held = std::move(held),
+            held    = std::move(held),
             index,
             counters,
-            resolve = std::move(resolve_for_dv)]() {
-      auto metadata          = work();
+            resolve = std::move(resolve_for_dv)](std::stop_token stop) {
+      auto metadata          = work(stop);
       auto& file             = dynamic_cast<parquet_file_scan_info&>(*metadata);
       auto const& prepared   = attempt->plan();
       auto const& descriptor = prepared.files()[index];
-      auto set = read_prepared_delete_set(
-        prepared, descriptor, held->ledger.get(), held->permit, resolve, counters);
+      auto set               = read_prepared_delete_set(
+        prepared, descriptor, held->ledger.get(), held->permit, resolve, stop, counters);
       attempt->record(index, set);
       attach_delete_set(file, std::move(set));
       return metadata;
     };
   }
-  return [work = std::move(work), sets = _delete_sets]() {
-    auto metadata = work();
+  return [work = std::move(work), sets = _delete_sets](std::stop_token stop) {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+    auto metadata = work(stop);
     auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
     attach_delete_set(file, sets->at(file.file_path));
     return metadata;

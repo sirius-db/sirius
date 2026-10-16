@@ -6,7 +6,6 @@ target_sources(
           sirius_datasource.cpp
           uri_parser.cpp
           cache/metadata_store.cpp
-          cache/metadata_cache.cpp
           cache/prefetching_cache.cpp
           cache/types.cpp
           kvikio/kvikio_context.cpp

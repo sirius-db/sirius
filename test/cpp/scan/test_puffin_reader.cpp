@@ -24,6 +24,7 @@
 //
 // No GPU: file IO and parsing only.
 
+#include "io/io_errors.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
@@ -105,6 +106,30 @@ class vector_puffin_source final : public puffin_byte_source {
 
  private:
   std::vector<std::byte> bytes_;
+  std::streamoff offset_ = 0;
+};
+
+class identity_changing_puffin_source final : public puffin_byte_source {
+ public:
+  identity_changing_puffin_source(std::streamoff size, std::string path)
+    : size_(size), path_(std::move(path))
+  {
+  }
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || offset > size_) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte>) override
+  {
+    throw sirius::io::object_changed_error(path_, "\"v1\"", "\"v2\"");
+  }
+  [[nodiscard]] std::streamoff size() const override { return size_; }
+
+ private:
+  std::streamoff size_;
+  std::string path_;
   std::streamoff offset_ = 0;
 };
 
@@ -645,6 +670,26 @@ TEST_CASE("Charged Puffin failures distinguish corrupt input from missing files"
       CHECK(std::string(error.what()).find("referenced-data-file") != std::string::npos);
     } else
       CHECK(std::string(error.what()).find("Cannot open file") != std::string::npos);
+  }
+}
+
+TEST_CASE("Charged Puffin preserves an opened-object identity failure",
+          "[scan_preparation][iceberg][charged_reader][failure]")
+{
+  auto const ref = fixture_ref();
+  std::error_code error;
+  auto const size = fs::file_size(ref.puffin_path, error);
+  REQUIRE_FALSE(error);
+  identity_changing_puffin_source source(static_cast<std::streamoff>(size), ref.puffin_path);
+  try {
+    read_for_test(ref, true, &source);
+    FAIL("identity change was not reported");
+  } catch (sirius::io::object_changed_error const& failure) {
+    CHECK(failure.object_path() == ref.puffin_path);
+    CHECK(failure.expected_tag() == "\"v1\"");
+    CHECK(failure.observed_tag() == "\"v2\"");
+    auto classified = sirius::transparent::classify_failure(std::current_exception());
+    CHECK(classified.cause == sirius::transparent::late_failure_cause::object_changed);
   }
 }
 
