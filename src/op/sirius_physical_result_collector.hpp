@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <map>
+#include <set>
+
 // sirius
 #include <op/sirius_physical_operator.hpp>
 #include <sirius_context.hpp>
@@ -99,6 +102,9 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
 
  private:
   duckdb::ClientContext& _client_ctx;
+  std::optional<bool> _positioned;
+  std::set<std::size_t> _seen_positions;
+  std::map<std::size_t, duckdb::unique_ptr<duckdb::ColumnDataCollection>> _positioned_collections;
 };
 
 }  // namespace op

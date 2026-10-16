@@ -21,6 +21,7 @@
 #include <helper/type_conversions.hpp>
 #include <op/sirius_physical_limit.hpp>
 
+#include <map>
 #include <numeric>
 
 using namespace duckdb;
@@ -31,6 +32,33 @@ using namespace cucascade::memory;
 namespace {
 
 using namespace sirius::test::operator_utils;
+
+// Exercise the real task-creation contract, including claims made before execution.
+std::unique_ptr<operator_data> run_limit(sirius_physical_streaming_limit& limiter,
+                                         std::vector<std::shared_ptr<data_batch>> const& batches)
+{
+  data_repository repo;
+  for (auto const& batch : batches) {
+    repo.add_data_batch(batch);
+  }
+  auto* port = limiter.try_get_port("default");
+  if (!port) {
+    limiter.add_port("default",
+                     std::make_unique<sirius_physical_operator::port>(
+                       MemoryBarrierType::FULL, &repo, nullptr, nullptr));
+    port = limiter.get_port("default");
+  }
+  port->repo = &repo;
+  std::vector<std::shared_ptr<data_batch>> output;
+  while (auto task = limiter.get_next_task_input_data()) {
+    auto result          = limiter.execute(*task, cudf::get_default_stream());
+    auto const& produced = dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches();
+    output.insert(output.end(), produced.begin(), produced.end());
+  }
+  port->repo = nullptr;
+  return std::make_unique<pipelineable_operator_data>(std::move(output));
+}
+
 }  // namespace
 
 TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
@@ -102,7 +130,7 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
                                           false);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = limiter.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  auto outputs = run_limit(limiter, inputs);
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
   auto output_table = sirius::get_cudf_table_view(
     *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
@@ -158,7 +186,7 @@ TEST_CASE("streaming_limit caps total rows across multiple batches",
                                           30,
                                           true);
 
-  auto outputs = limiter.execute(pipelineable_operator_data(batches), cudf::get_default_stream());
+  auto outputs = run_limit(limiter, batches);
   auto rows =
     collect_all_rows(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches());
 
@@ -188,7 +216,7 @@ TEST_CASE("streaming_limit spans across two batches returning correct data",
                                           300,
                                           true);
 
-  auto outputs = limiter.execute(pipelineable_operator_data(batches), cudf::get_default_stream());
+  auto outputs = run_limit(limiter, batches);
   auto rows =
     collect_all_rows(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches());
 
@@ -222,7 +250,7 @@ TEST_CASE("streaming_limit offset spans across multiple batches", "[physical_lim
                                           30,
                                           true);
 
-  auto outputs = limiter.execute(pipelineable_operator_data(batches), cudf::get_default_stream());
+  auto outputs = run_limit(limiter, batches);
   auto rows =
     collect_all_rows(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches());
 
@@ -250,13 +278,13 @@ TEST_CASE("streaming_limit with separate execute calls enforces global limit",
 
   // First call with batch [0..9]
   std::vector<std::shared_ptr<data_batch>> batch1{make_range_batch(*space, 0, 10)};
-  auto out1 = limiter.execute(pipelineable_operator_data(batch1), cudf::get_default_stream());
+  auto out1 = run_limit(limiter, batch1);
   auto rows1 =
     collect_all_rows(dynamic_cast<const pipelineable_operator_data&>(*out1).get_data_batches());
 
   // Second call with batch [10..19] — limit should already be exhausted
   std::vector<std::shared_ptr<data_batch>> batch2{make_range_batch(*space, 10, 10)};
-  auto out2 = limiter.execute(pipelineable_operator_data(batch2), cudf::get_default_stream());
+  auto out2 = run_limit(limiter, batch2);
   auto rows2 =
     collect_all_rows(dynamic_cast<const pipelineable_operator_data&>(*out2).get_data_batches());
 
@@ -267,4 +295,60 @@ TEST_CASE("streaming_limit with separate execute calls enforces global limit",
   std::vector<int64_t> expected{0, 1, 2, 3, 4};
   REQUIRE(rows1 == expected);
   REQUIRE(rows2.empty());
+}
+
+TEST_CASE("ordered limit claims sparse positions before reverse execution",
+          "[physical_limit][ordering]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  data_repository repo;
+  repo.add_data_batch_at_position(make_range_batch(*space, 30, 10), 9);
+  repo.add_data_batch_at_position(make_range_batch(*space, 10, 10), 2);
+  repo.add_data_batch_at_position(make_range_batch(*space, 20, 10), 5);
+  sirius_physical_streaming_limit limiter(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
+    duckdb::BoundLimitNode::ConstantValue(12),
+    duckdb::BoundLimitNode::ConstantValue(8),
+    30,
+    true);
+  limiter.add_port("default",
+                   std::make_unique<sirius_physical_operator::port>(
+                     MemoryBarrierType::FULL, &repo, nullptr, nullptr));
+  std::vector<std::unique_ptr<operator_data>> tasks;
+  while (auto task = limiter.get_next_task_input_data()) {
+    tasks.push_back(std::move(task));
+  }
+  REQUIRE(tasks.size() == 3);
+  std::map<size_t, std::vector<int64_t>> results;
+  for (auto it = tasks.rbegin(); it != tasks.rend(); ++it) {
+    auto result      = limiter.execute(**it, cudf::get_default_stream());
+    auto const& data = dynamic_cast<pipelineable_operator_data&>(*result);
+    REQUIRE(data.get_position().has_value());
+    results[*data.get_position()] = collect_all_rows(data.get_data_batches());
+  }
+  REQUIRE(results[2] == std::vector<int64_t>{18, 19});
+  REQUIRE(results[5] == std::vector<int64_t>{20, 21, 22, 23, 24, 25, 26, 27, 28, 29});
+  REQUIRE(results[9].empty());
+  // Reconstructing input (late materialization) and retrying must retain the same claim.
+  auto& first = dynamic_cast<limiting_operator_data&>(*tasks.front());
+  auto retry  = first.with_data_batches(first.get_data_batches());
+  REQUIRE(dynamic_cast<limiting_operator_data&>(*retry).slice_begin == 8);
+  auto result = limiter.execute(*retry, cudf::get_default_stream());
+  REQUIRE(collect_all_rows(dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches()) ==
+          results[2]);
+}
+
+TEST_CASE("operator input position describes a multi-batch destination",
+          "[ordering][operator_data]")
+{
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches(2);
+  pipelineable_operator_data input(batches, 7);
+  REQUIRE(input.get_position() == 7);
+  auto replacement = input.with_data_batches(batches);
+  REQUIRE(replacement->get_position() == 7);
+  partitioned_operator_data partitioned(batches, std::optional<std::size_t>{11});
+  REQUIRE(partitioned.with_data_batches(batches)->get_position() == 11);
+  REQUIRE_FALSE(pipelineable_operator_data(batches).get_position());
 }

@@ -67,7 +67,8 @@ std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches(),
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_position());
 }
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
@@ -113,6 +114,12 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
       duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
   }
 
+  // All producer tasks have finished before get_result(). Sparse positions are intentional.
+  for (auto& [position, collection] : _positioned_collections) {
+    result_collection->Combine(*collection);
+  }
+  _positioned_collections.clear();
+
   return duckdb::make_uniq<duckdb::QueryResult>(
     statement_type, properties, names, std::move(result_collection), props);
 }
@@ -128,8 +135,23 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     return;  // todo(kevin) we should handle this case properly
   }
 
-  auto sink_single_batch = [this,
-                            stream](std::shared_ptr<cucascade::data_batch> const& input_batch) {
+  auto position = pipelineable_input.get_position();
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    if (position && input_batches.size() != 1) {
+      throw internal_exception("Positioned result requires one output batch");
+    }
+    if (_positioned && *_positioned != position.has_value()) {
+      throw internal_exception("Cannot mix positioned and unpositioned query results");
+    }
+    _positioned = position.has_value();
+    if (position && !_seen_positions.insert(*position).second) {
+      throw internal_exception("Duplicate query result position");
+    }
+  }
+
+  auto sink_single_batch = [this, position, stream](
+                             std::shared_ptr<cucascade::data_batch> const& input_batch) {
     // Acquire read-only access to inspect the batch
     auto ro    = input_batch->to_read_only();
     auto* data = ro.get_data();
@@ -242,7 +264,14 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       result_collection =
         duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
     }
-    result_collection->Combine(local_collection);
+    if (position) {
+      auto collection =
+        duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
+      collection->Combine(local_collection);
+      _positioned_collections.emplace(*position, std::move(collection));
+    } else {
+      result_collection->Combine(local_collection);
+    }
   };
 
   std::for_each(input_batches.begin(), input_batches.end(), sink_single_batch);
