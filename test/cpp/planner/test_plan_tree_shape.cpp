@@ -338,9 +338,9 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   require_join_child_wrap(delim.join->children[1].get(), delim.join.get(), /*is_build=*/true);
 }
 
-/// The chain every supported DISTINCT shape shares: one HASH_GROUP_BY with an empty aggregate
-/// list, wrapped as insert_gpu_pipeline_operators wraps a GROUP BY. Returns the HASH_GROUP_BY so
-/// each caller can assert its own key layout.
+/// The chain every DISTINCT shape without a carried column shares: one HASH_GROUP_BY with an empty
+/// aggregate list, wrapped as insert_gpu_pipeline_operators wraps a GROUP BY. Returns the
+/// HASH_GROUP_BY so each caller can assert its own key layout.
 sirius::op::sirius_physical_grouped_aggregate* require_distinct_wrap_chain(
   sirius_physical_operator* plan)
 {
@@ -1471,6 +1471,18 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT) != nullptr);
   }
 
+  SECTION("an all-key DISTINCT ON under an ORDER BY lowers to the GPU")
+  {
+    // Nothing is carried, so the order only sorts the result above the distinct.
+    auto plan =
+      generate_sirius_plan(*con, "SELECT DISTINCT ON (id, val) id, val FROM big_left ORDER BY val");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{0, 1});
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT) != nullptr);
+  }
+
   SECTION("DISTINCT ON keys the targets in target order and reorders above the merge")
   {
     // The targets are (val, id) but the output columns are (id, val), so group position 0 reads
@@ -1574,9 +1586,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   }
 }
 
-TEST_CASE_METHOD(plan_tree_shape_fixture,
-                 "plan tree shape - grouped FIRST lowers to carried columns",
-                 "[plan_tree_shape][isolated_context][distinct]")
+TEST_CASE_METHOD(
+  plan_tree_shape_fixture,
+  "plan tree shape - carried DISTINCT columns lower to an all-FIRST grouped aggregate",
+  "[plan_tree_shape][isolated_context][distinct]")
 {
   // The chain the carried shapes share: one HASH_GROUP_BY whose aggregate list is all FIRST and
   // emits no cuDF aggregation, with the merge inheriting the FIRST flag. `first_inputs` is each
@@ -1619,6 +1632,97 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(sirius::op::carried_inputs(aggregate.aggregate_slots) == first_inputs);
     return &aggregate;
   };
+
+  // The projection the builder leaves above the merge, if any: the one whose child is the merge.
+  auto projections_over_merge = [](sirius_physical_operator* plan) {
+    std::vector<sirius_physical_operator*> out;
+    for (auto* projection : collect(plan, SiriusPhysicalOperatorType::PROJECTION)) {
+      if (projection->children.size() == 1 &&
+          projection->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
+        out.push_back(projection);
+      }
+    }
+    return out;
+  };
+
+  SECTION("DISTINCT ON carries a column after its key and needs no projection")
+  {
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT ON (id) id, val FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+    // The select list the builder writes is [#0, #1] over an operator already in that order, so
+    // push_projection drops it.
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::PROJECTION).empty());
+  }
+
+  SECTION("DISTINCT ON ordered by its key carries an unordered FIRST")
+  {
+    // An ORDER BY term that is a distinct target is dropped, as DuckDB's own builder drops it.
+    auto plan =
+      generate_sirius_plan(*con, "SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT) != nullptr);
+  }
+
+  SECTION("plain DISTINCT ordered by a column outside the select list carries that column")
+  {
+    // `val` is added to the select list after the targets were synthesized from it, so the node is
+    // two columns wide with one target, and `val` is carried.
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id FROM big_left ORDER BY val");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT) != nullptr);
+  }
+
+  SECTION("an expression DISTINCT ON target carries both of its own columns")
+  {
+    // `id + val` is appended to the select list, so the one target is a bare reference to child
+    // column 2 and `id` and `val` are carried. The builder's [#1, #2, #0] folds with the binder's
+    // two-column prune projection into one projection over the merge.
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT ON (id + val) id, val FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {0, 1});
+    CHECK(aggregate->group_idx == std::vector<int>{2});
+    CHECK(aggregate->get_types().size() == 3);
+
+    auto projections = projections_over_merge(plan.get());
+    REQUIRE(projections.size() == 1);
+    auto const& select_list =
+      projections[0]->Cast<sirius::op::sirius_physical_projection>().select_list;
+    REQUIRE(select_list.size() == 2);
+    REQUIRE(select_list[0]->holds<sirius::ast::reference>());
+    REQUIRE(select_list[1]->holds<sirius::ast::reference>());
+    CHECK(select_list[0]->get<sirius::ast::reference>().column_index == 1);
+    CHECK(select_list[1]->get<sirius::ast::reference>().column_index == 2);
+  }
+
+  SECTION("a carried column over a narrowed aggregate keeps the child's planned type")
+  {
+    // The DISTINCT node declares sum()'s HUGEINT for `s`; the aggregate below is planned as BIGINT.
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT DISTINCT ON (k) k, s FROM (SELECT val AS k, sum(id) AS s FROM big_left GROUP BY "
+      "val)");
+    INFO(tree_to_string(plan.get()));
+
+    duckdb::vector<sirius::logical_type> const planned{
+      sirius::logical_type::make(sirius::type_id::INTEGER),
+      sirius::logical_type::make(sirius::type_id::BIGINT)};
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+    CHECK(aggregate->get_types() == planned);
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY)->get_types() ==
+          planned);
+    CHECK(projections_over_merge(plan.get()).empty());
+  }
 
   SECTION("a FIRST beside another aggregate carries its column after the partials")
   {
@@ -1693,8 +1797,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(aggregate->group_idx == std::vector<int>{0});
   }
 
-  SECTION("a GROUP BY whose only aggregates are FIRST builds the all-FIRST chain")
+  SECTION("a GROUP BY whose only aggregates are FIRST takes the same route")
   {
+    // An all-FIRST GROUP BY builds the same operator.
     auto plan = generate_sirius_plan(*con, "SELECT id, first(val) FROM big_left GROUP BY id");
     INFO(tree_to_string(plan.get()));
 
@@ -1739,25 +1844,16 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     FAIL("expected an exception containing: " << message_fragment);
   };
 
-  SECTION("DISTINCT ON with carried columns needs a grouped FIRST")
-  {
-    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left",
-                     "DISTINCT ON with carried (non-key) columns");
-  }
-
   SECTION("DISTINCT ON under an ORDER BY names a specific row per group")
   {
     require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY val",
                      "DISTINCT ON with ORDER BY");
   }
 
-  SECTION("plain DISTINCT ordered by a column outside the select list has an uncovered output")
+  SECTION("a key term ahead of a carried column's term does not lift the ORDER BY refusal")
   {
-    // `val` is added to the select list after the targets were synthesized from it, so the node
-    // is two columns wide with one target. Output column 1 has no target: a different cause, and
-    // a different message, from a target that is not a column reference.
-    require_rejected("SELECT DISTINCT id FROM big_left ORDER BY val",
-                     "output column 1 has no distinct target");
+    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY id, val",
+                     "DISTINCT ON with ORDER BY");
   }
 
   SECTION("a collated distinct target is not a plain reference to any output column")
@@ -1765,8 +1861,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     // Binder::BindModifiers pushes the default collation over every distinct target, so a VARCHAR
     // key under a non-binary default_collation arrives as a call rather than as a bare reference:
     // the only route ordinary SQL has into the not-a-bare-reference arm. The integration suite's
-    // collation case runs the same shape but can only watch the fallback counter, which both
-    // uncovered-output arms move, so this is where that arm's message is pinned.
+    // collation case runs the same shape but can only watch the fallback counter, which every guard
+    // moves, so this is where that arm's message is pinned.
     //
     // default_collation is GLOBAL_DEFAULT-scoped, but Catch2 rebuilds the fixture -- and with it
     // the DuckDB instance -- for every leaf section, so the setting dies with this section.
@@ -1799,15 +1895,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     // The check runs before create_plan(*op.children[0]), so the message names the column rather
     // than the scan failing first.
     require_rejected_any("SELECT DISTINCT * FROM nested_keys", "is unsupported in DISTINCT");
-  }
-
-  SECTION("an expression DISTINCT ON target still leaves its own columns carried")
-  {
-    // `id + val` is appended to the select list, so the target arrives as a bare reference to that
-    // appended column. Unsupported for the same reason as above: `id` and `val` are output columns
-    // no target covers.
-    require_rejected("SELECT DISTINCT ON (id + val) id, val FROM big_left",
-                     "DISTINCT ON with carried (non-key) columns");
   }
 
   SECTION("an all-FIRST list over several grouping sets is refused")
