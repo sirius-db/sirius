@@ -310,6 +310,8 @@ Supported join types: INNER, LEFT, RIGHT, OUTER, MARK via `cudf::inner_join()`, 
 
 Fallback for joins not supported by cuDF hash join (pure inequality conditions). Uses `PhysicalNestedLoopJoin::IsSupported()` to validate.
 
+It runs one task per pair of left and right batches. For every join type except INNER, the CONCAT feeding the side that rows are decided against folds that side into one batch (see `CONCAT` below), so each task sees it whole; otherwise a LEFT join would pad a row once per right batch without a match.
+
 Without conditions it runs a cross product with `cudf::cross_join`. When it creates its first task, it reads the row count and size of every input batch and splits each pair of left and right batches into tasks over equal row ranges of the left batch (`cross_join_num_slices` in `src/op/cross_join_slicing.hpp`). Each task's output stays near `cross_join_task_bytes` and within the cuDF row limit, with at most one task per left row. A task carries its slice in `cross_join_slice_data` and cross joins a zero-copy `cudf::slice` of the left batch. A batch is popped after the last task that uses it. Before allocating, `execute` computes the output size of its slice and throws when it exceeds the GPU memory space, so the query falls back to CPU instead.
 
 Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
@@ -426,10 +428,16 @@ Repartitions data into N buckets based on partition keys. Partition keys are alw
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/op/sirius_physical_concat.hpp`
 
-Reassembles partitioned data back into a linear stream. Behavior depends on join type:
+Reassembles partitioned data back into a linear stream. The constructor picks the mode for its side
+from the downstream join type:
 
-- `_concat_all = true` (LEFT/ANTI/OUTER joins): waits for all data before emitting
-- `_concat_all = false` (INNER joins): emits tasks when byte threshold (`_concat_batch_bytes`) is met
+- `_concat_all = true`: waits for all data, then emits one batch. A join that decides each row of
+  one side against the whole other side needs that other side whole. For a hash join that is the
+  build for LEFT/SEMI/ANTI, the probe for the RIGHT family, and both sides for FULL OUTER; BUILD_PROBE
+  also folds the build at sizing time (`set_concat_all`). For a nested loop join it is the right side
+  for LEFT/SEMI/ANTI/MARK, the left side for RIGHT, and both sides for FULL OUTER.
+- `_concat_all = false` (INNER, and the side being decided): emits a group whenever the byte
+  threshold (`_concat_batch_bytes`) is met
 
 ### `sirius_physical_passthrough_sink` — `PASSTHROUGH_SINK`
 **File:** `src/include/op/sirius_physical_passthrough_sink.hpp`

@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -60,7 +61,21 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
                                duckdb::JoinTypeToString(hash_join->join_type));
     }
   } else if (downstream_join->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-    _concat_all = false;
+    // The join runs one task per batch pair, so the side that rows are padded, kept or marked
+    // against must arrive whole.
+    auto nested_loop_join = dynamic_cast<sirius_physical_nested_loop_join*>(downstream_join);
+    switch (nested_loop_join->join_type) {
+      case duckdb::JoinType::INNER: _concat_all = false; break;
+      case duckdb::JoinType::LEFT:
+      case duckdb::JoinType::SEMI:
+      case duckdb::JoinType::ANTI:
+      case duckdb::JoinType::MARK: _concat_all = is_build; break;
+      case duckdb::JoinType::RIGHT: _concat_all = !is_build; break;
+      case duckdb::JoinType::OUTER: _concat_all = true; break;
+      default:
+        throw std::runtime_error("sirius_physical_concat: unsupported nested loop join type: " +
+                                 duckdb::JoinTypeToString(nested_loop_join->join_type));
+    }
   } else {
     throw std::runtime_error("sirius_physical_concat: downstream_join is not a hash/nlj: " +
                              SiriusPhysicalOperatorToString(downstream_join->type));
