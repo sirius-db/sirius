@@ -77,7 +77,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   /// integer SUM input (planner::resolve_sum_input_bounds); nullopt when unproven.
   std::vector<std::optional<std::uint64_t>> cudf_aggregate_input_max_abs;
   /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG
-  /// (AggregateSlot::is_wide_integer_sum), whose partial result may be DECIMAL128.
+  /// (see wide_integer_sum_mask), whose partial result may be DECIMAL128.
   std::vector<bool> cudf_aggregate_is_wide_integer_sum;
 
   // Partial aggregate layout and finalization metadata
