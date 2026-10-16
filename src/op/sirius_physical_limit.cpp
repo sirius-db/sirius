@@ -42,104 +42,79 @@ sirius_physical_streaming_limit::sirius_physical_streaming_limit(
     _remaining_limit(0)
 {
   if (limit_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
-    _remaining_limit.store(static_cast<int64_t>(limit_val.GetConstantValue()),
-                           std::memory_order_relaxed);
+    _remaining_limit = limit_val.GetConstantValue();
   }
   if (offset_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE) {
-    _remaining_offset.store(static_cast<int64_t>(offset_val.GetConstantValue()),
-                            std::memory_order_relaxed);
+    _remaining_offset = offset_val.GetConstantValue();
   }
 }
 
-int64_t sirius_physical_streaming_limit::claim(std::atomic<int64_t>& counter, int64_t max_claim)
+std::unique_ptr<operator_data> sirius_physical_streaming_limit::get_next_task_input_data()
 {
-  int64_t current = counter.load(std::memory_order_acquire);
-  while (current > 0) {
-    int64_t to_claim = std::min(current, max_claim);
-    if (counter.compare_exchange_weak(current, current - to_claim, std::memory_order_acq_rel)) {
-      return to_claim;
-    }
-    current = counter.load(std::memory_order_acquire);
+  std::lock_guard<std::mutex> guard(_claim_mutex);
+  if (!is_source_pipeline_finished()) {
+    throw internal_exception("STREAMING_LIMIT requires a completed producer");
   }
-  return 0;
+  if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE ||
+      (offset_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE &&
+       offset_val.Type() != duckdb::LimitNodeType::UNSET)) {
+    throw not_implemented_exception("Streaming limit requires constant limit/offset");
+  }
+  auto* repo = get_port("default")->repo;
+  if (!_positions && repo->get_ordering() == cucascade::data_repository_ordering::ORDERED) {
+    _positions = repo->get_positions();
+  }
+  std::shared_ptr<cucascade::data_batch> batch;
+  std::optional<std::size_t> position;
+  if (_positions) {
+    if (_next_position == _positions->size()) { return nullptr; }
+    position = (*_positions)[_next_position];
+    batch    = repo->pop_data_batch_by_position(*position);
+    if (!batch) { throw internal_exception("STREAMING_LIMIT input position disappeared"); }
+  } else {
+    batch = repo->pop_next_data_batch();
+    if (!batch) { return nullptr; }
+  }
+  auto rows = sirius::get_batch_rows_and_bytes(*batch).rows;
+  if (!rows) { throw internal_exception("Cannot determine batch row count for STREAMING_LIMIT"); }
+  auto skip = std::min(_remaining_offset, *rows);
+  auto take = std::min(_remaining_limit, *rows - skip);
+  _remaining_offset -= skip;
+  _remaining_limit -= take;
+  if (_positions) { ++_next_position; }
+  // Retain zero-row outputs, including LIMIT 0, so downstream ungrouped aggregates see input.
+  // Every input is consumed; no early-exhaustion flag can close the pipeline before task creation.
+  return std::make_unique<limiting_operator_data>(
+    std::vector{std::move(batch)}, skip, take, position);
 }
 
 std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
   const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
-
-  if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
-    throw not_implemented_exception("Streaming limit with non-constant limit value");
+  auto const& input = dynamic_cast<const limiting_operator_data&>(input_data);
+  auto batches      = input.get_read_only_batches();
+  if (batches.size() != 1) { throw internal_exception("Limit task requires one input batch"); }
+  auto const& batch = batches.front();
+  auto view         = sirius::get_cudf_table_view(batch);
+  if (input.slice_begin > static_cast<std::size_t>(view.num_rows()) ||
+      input.slice_count > static_cast<std::size_t>(view.num_rows()) - input.slice_begin) {
+    throw internal_exception("Limit slice exceeds input rows");
   }
-  if (offset_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE &&
-      offset_val.Type() != duckdb::LimitNodeType::UNSET) {
-    throw not_implemented_exception("Streaming limit with non-constant offset value");
+  if (input.slice_begin == 0 && input.slice_count == static_cast<std::size_t>(view.num_rows())) {
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches(),
+                                                        input.get_position());
   }
-
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
-  output_batches.reserve(input_batches.size());
-
-  for (auto const& batch : input_batches) {
-    // Check if limit is already exhausted
-    if (_remaining_limit.load(std::memory_order_acquire) <= 0) { break; }
-
-    auto view     = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
-    auto num_rows = static_cast<int64_t>(view.num_rows());
-
-    if (num_rows == 0) { continue; }
-
-    // Atomically claim offset rows to skip from this batch
-    auto skip      = claim(_remaining_offset, num_rows);
-    auto available = num_rows - skip;
-    if (available <= 0) { continue; }
-
-    // Atomically claim limit rows to produce from available rows
-    auto take = claim(_remaining_limit, available);
-    if (take <= 0) { continue; }
-
-    auto start  = static_cast<cudf::size_type>(skip);
-    auto end    = static_cast<cudf::size_type>(skip + take);
-    auto slices = cudf::slice(view, {start, end}, stream);
-    if (slices.empty()) { continue; }
-
-    // cudf::slice returns a vector of table_views; materialize into a table
-    auto sliced_table = std::make_unique<cudf::table>(
-      slices.front(), stream, batch.get_memory_space()->get_default_allocator());
-    std::unique_ptr<cucascade::idata_representation> output_data =
-      std::make_unique<cucascade::gpu_table_representation>(
-        std::move(sliced_table), *batch.get_memory_space(), stream);
-
-    auto const batch_id = ::sirius::get_next_batch_id();
-    auto output_batch   = cucascade::data_batch::make(
-      batch_id,
-      std::move(output_data),
-      telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
-    output_batches.push_back(std::move(output_batch));
-  }
-
-  // Emit a 0-row batch when nothing passed, as scans and filters do for an empty input, so
-  // downstream operators still see the input. An ungrouped aggregate needs it to return its row.
-  if (output_batches.empty() && !input_batches.empty()) {
-    auto const& batch = input_batches.front();
-    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
-    std::unique_ptr<cucascade::idata_representation> output_data =
-      std::make_unique<cucascade::gpu_table_representation>(
-        cudf::empty_like(view), *batch.get_memory_space(), stream);
-    auto const batch_id = ::sirius::get_next_batch_id();
-    output_batches.push_back(cucascade::data_batch::make(
-      batch_id,
-      std::move(output_data),
-      telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id)));
-  }
-
-  if (_remaining_limit.load(std::memory_order_acquire) <= 0) {
-    _limit_exhausted.store(true, std::memory_order_release);
-  }
-
-  return std::make_unique<pipelineable_operator_data>(output_batches);
+  auto slices = cudf::slice(view,
+                            {static_cast<cudf::size_type>(input.slice_begin),
+                             static_cast<cudf::size_type>(input.slice_begin + input.slice_count)},
+                            stream);
+  auto table  = std::make_unique<cudf::table>(
+    slices.front(), stream, batch.get_memory_space()->get_default_allocator());
+  auto output =
+    sirius::make_data_batch(std::move(table), *batch.get_memory_space(), stream, batch_telemetry());
+  return std::make_unique<pipelineable_operator_data>(std::vector{std::move(output)},
+                                                      input.get_position());
 }
 
 }  // namespace op

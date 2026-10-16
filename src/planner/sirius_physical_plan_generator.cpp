@@ -1799,6 +1799,18 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN:
       wrap_dense_count_join(*slot, compressed_materialization_observer);
       break;
+    case sirius::op::SiriusPhysicalOperatorType::STREAMING_LIMIT:
+      // Claims require complete, position-addressable input before any limit task executes.
+      wrap_child(*slot, 0, [](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child) {
+        auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
+          child->types, child->estimated_cardinality, "default");
+        if (child->has_physical_overrides()) {
+          sink->set_physical_types(child->get_physical_types());
+        }
+        sink->children.push_back(std::move(child));
+        return sink;
+      });
+      break;
     case sirius::op::SiriusPhysicalOperatorType::UNION: wrap_union(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:

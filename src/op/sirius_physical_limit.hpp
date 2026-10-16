@@ -20,10 +20,36 @@
 #include "duckdb/planner/bound_result_modifier.hpp"
 #include "op/sirius_physical_operator.hpp"
 
-#include <atomic>
+#include <mutex>
 
 namespace sirius {
 namespace op {
+
+/// Slice decisions are made once, in logical order, before parallel execution or retries.
+class limiting_operator_data : public pipelineable_operator_data {
+ public:
+  limiting_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                         std::size_t begin,
+                         std::size_t count,
+                         std::optional<std::size_t> position = std::nullopt)
+    : pipelineable_operator_data(std::move(batches), position),
+      slice_begin(begin),
+      slice_count(count)
+  {
+  }
+
+  std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
+  {
+    auto result = std::make_unique<limiting_operator_data>(
+      std::move(batches), slice_begin, slice_count, get_position());
+    result->adopt_row_identity(*this);
+    return result;
+  }
+
+  const std::size_t slice_begin;
+  const std::size_t slice_count;
+};
 
 class sirius_physical_streaming_limit : public sirius_physical_operator {
  public:
@@ -44,22 +70,22 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
-  bool is_limit_exhausted() const override
+  bool is_source() const override { return true; }
+  MemoryBarrierType input_barrier_for(const sirius_physical_operator&) const override
   {
-    return _limit_exhausted.load(std::memory_order_acquire);
+    return MemoryBarrierType::FULL;
   }
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   [[nodiscard]] bool caps_pipeline_output() const override { return true; }
 
  private:
-  // Shared atomic state for coordinating limit/offset across concurrent tasks.
-  // Each task atomically claims rows to skip (offset) or produce (limit).
-  std::atomic<int64_t> _remaining_offset;
-  std::atomic<int64_t> _remaining_limit;
-  std::atomic<bool> _limit_exhausted{false};
-
-  // Atomically claim up to max_claim from counter, returns the amount actually claimed.
-  static int64_t claim(std::atomic<int64_t>& counter, int64_t max_claim);
+  // Serializes claiming independently of executor completion order.
+  std::mutex _claim_mutex;
+  std::size_t _remaining_offset;
+  std::size_t _remaining_limit;
+  std::optional<std::vector<std::size_t>> _positions;
+  std::size_t _next_position = 0;
 };
 
 }  // namespace op

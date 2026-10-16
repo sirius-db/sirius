@@ -555,3 +555,27 @@ TEST_CASE("batch_stream BSTR-17: sender_closed tracks individual senders", "[bat
   REQUIRE_FALSE(stream->sender_closed(0));
   REQUIRE_FALSE(stream->sender_closed(2));
 }
+
+TEST_CASE("batch_stream orders sparse positions only after EOS", "[batch_stream][ordering]")
+{
+  auto [stream, repo] = make_stream();
+  auto manager        = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  auto a = make_numeric_batch<int32_t>(*space, {1}, cudf::type_id::INT32);
+  auto b = make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32);
+  auto c = make_numeric_batch<int32_t>(*space, {3}, cudf::type_id::INT32);
+  REQUIRE(stream->push(c, 9));
+  REQUIRE(stream->push(a, 2));
+  REQUIRE(stream->push(b, 5));
+  REQUIRE(stream->classify() == availability::WAITING);
+  REQUIRE_FALSE(stream->try_pull());
+  stream->close(SOLE_SENDER);
+  REQUIRE(stream->classify() == availability::HAS_DATA);
+  auto [first, position] = stream->try_pull_with_position();
+  REQUIRE(first == a);
+  REQUIRE(position == 2);
+  REQUIRE(stream->try_pull() == b);
+  REQUIRE(stream->try_pull() == c);
+  REQUIRE(stream->drained());
+}

@@ -108,7 +108,9 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
     sirius::from_duckdb_vec(types), translate_expressions(std::move(exprs)), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  auto outputs =
+    projection.execute(pipelineable_operator_data(inputs, 7), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_position() == 7);
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
   auto out_view = sirius::get_cudf_table_view(
     *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
