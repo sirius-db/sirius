@@ -24,6 +24,7 @@
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 #include <sirius_context.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 
 #include <chrono>
 #include <future>
@@ -53,15 +54,8 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
                  "[integration][gpu_execution][pin_table_mvcc_update]")
 {
   using namespace std::chrono_literals;
-  duckdb::Value previous_threads;
-  REQUIRE(bool(con->context->TryGetCurrentSetting("threads", previous_threads)));
-  struct restore_threads {
-    duckdb::Connection& connection;
-    std::string previous;
-    ~restore_threads() { connection.Query("SET threads = " + previous); }
-  } restore{*con, previous_threads.ToString()};
-  // Keep the GPU source on Execute()'s thread so maintenance deterministically queues first.
-  run_ok("SET threads = 1;");
+  // With no background workers, Submit() retains the writer until Complete() drives it.
+  sirius::test::scoped_sirius_setting threads(*con, "threads", std::uint64_t{1});
   run_ok("CREATE TABLE writer_target(k INTEGER, v INTEGER);");
   run_ok("INSERT INTO writer_target VALUES (1, 10);");
   run_ok("CREATE TABLE writer_source AS SELECT 1::INTEGER AS k, 20::INTEGER AS v;");
@@ -74,7 +68,7 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
     "UPDATE writer_target SET v = s.v "
     "FROM gpu_execution('SELECT k, v FROM writer_source') s WHERE writer_target.k = s.k;");
   REQUIRE_FALSE(prepared->HasError());
-  auto pending = prepared->PendingQuery();
+  auto pending = prepared->Submit();
   REQUIRE_FALSE(pending->HasError());
   auto state   = duckdb::get_sirius_connection_state(*con->context);
   auto runtime = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -110,7 +104,8 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
     CHECK(maintenance.wait_for(2s) == std::future_status::ready);
     CHECK(state->has_pinned_update_guard());
   }
-  auto result             = pending->Execute();
+  pending->Complete();
+  auto result             = std::move(pending);
   auto maintenance_result = maintenance.get();
   finished.set_value();
   CHECK_FALSE(watchdog.get());
@@ -126,17 +121,18 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   run_ok("SET gpu_execution = false;");
   auto values = con->Query("SELECT v FROM writer_target;");
   REQUIRE_FALSE(values->HasError());
-  CHECK(values->GetValue(0, 0) == duckdb::Value::INTEGER(20));
+  CHECK(values->Collection().GetValue(0, 0) == duckdb::Value::INTEGER(20));
 }
 
 TEST_CASE_METHOD(PinMvccUpdateFixture,
                  "mvcc update guard: abandoned statements release writers before the next query",
                  "[integration][gpu_execution][pin_table_mvcc_update]")
 {
+  sirius::test::scoped_sirius_setting threads(*con, "threads", std::uint64_t{1});
   run_ok("CREATE TABLE t AS SELECT 1::INTEGER AS k, 10::INTEGER AS v;");
   auto prepared = con->Prepare("UPDATE t SET v = v WHERE false;");
   REQUIRE_FALSE(prepared->HasError());
-  auto pending = prepared->PendingQuery();
+  auto pending = prepared->Submit();
   REQUIRE_FALSE(pending->HasError());
   auto state = duckdb::get_sirius_connection_state(*con->context);
   REQUIRE(state);
