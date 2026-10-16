@@ -20,8 +20,8 @@
 
 namespace sirius {
 
-/// Immutable evaluator input copied from the query or pin operation's settings snapshot.
-/// Standalone callers may use these fixed defaults; execution paths pass their own policy.
+/// Expression policy copied from the query or pin operation's settings snapshot.
+/// Evaluators retain a const copy; standalone callers may use these fixed defaults.
 struct expression_query_policy {
   expression_evaluator_strategy strategy{expression_evaluator_strategy::AST_INTERPRET};
   bool regex_jit{true};

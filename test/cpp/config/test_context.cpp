@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "log/level.hpp"
 #include "log/sink.hpp"
+#include "sirius/ffi.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
 #include "utils/log_test_utils.hpp"
@@ -46,11 +47,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -1752,6 +1755,84 @@ TEST_CASE("Sirius startup preserves logging settings when sink construction fail
   REQUIRE(duckdb::Config::LOG_BACKEND == "spdlog");
   REQUIRE(duckdb::Config::LOG_DIR == valid_dir.string());
   REQUIRE(duckdb::Config::LOG_LEVEL == "debug");
+}
+
+TEST_CASE("FFI startup serializes logging settings and restores them on sink failure",
+          "[sirius][context][config][sirius_ffi][isolated_context]")
+{
+  auto const test_root = fs::temp_directory_path() / "sirius-ffi-log-rollback-test";
+  std::unique_lock log_lock(duckdb::Config::logging_mutex);
+  auto const previous_backend = duckdb::Config::LOG_BACKEND;
+  auto const previous_log_dir = duckdb::Config::LOG_DIR;
+  auto const previous_level   = duckdb::Config::LOG_LEVEL;
+  auto const previous_sink    = sirius::log::get_sink();
+  finally restore_logging{[&]() {
+    std::lock_guard lock(duckdb::Config::logging_mutex);
+    duckdb::Config::LOG_BACKEND = previous_backend;
+    duckdb::Config::LOG_DIR     = previous_log_dir;
+    duckdb::Config::LOG_LEVEL   = previous_level;
+    sirius::log::set_sink(previous_sink);
+    std::error_code ec;
+    fs::remove_all(test_root, ec);
+  }};
+
+  fs::remove_all(test_root);
+  fs::create_directories(test_root);
+  auto const blocker = test_root / "not-a-directory";
+  std::ofstream(blocker) << "file";
+  // Fail sink creation before FFI startup reaches GPU initialization.
+  sirius::util::env_guard backend_env{"SIRIUS_LOG_BACKEND", "spdlog"};
+  sirius::util::env_guard dir_env{"SIRIUS_LOG_DIR", (blocker / "child").string()};
+  sirius::util::env_guard level_env{"SIRIUS_LOG_LEVEL", "debug"};
+
+  SECTION("failed initialization restores all settings and the sink")
+  {
+    REQUIRE_THROWS_WITH(sirius::ffi::Context{},
+                        Catch::Matchers::ContainsSubstring(blocker.string()));
+    REQUIRE(duckdb::Config::LOG_BACKEND == previous_backend);
+    REQUIRE(duckdb::Config::LOG_DIR == previous_log_dir);
+    REQUIRE(duckdb::Config::LOG_LEVEL == previous_level);
+    REQUIRE(sirius::log::get_sink() == previous_sink);
+  }
+
+  SECTION("a waiting initialization cannot overwrite a serialized settings update")
+  {
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    auto startup        = std::async(std::launch::async, [&]() {
+      started.set_value();
+      try {
+        sirius::ffi::Context context;
+      } catch (...) {
+        return std::current_exception();
+      }
+      return std::exception_ptr{};
+    });
+    started_future.wait();
+    // Give startup a chance to reach the logging lock while we hold it. Keep the
+    // environment unchanged until the worker joins, and unlock before assertions.
+    auto const status    = startup.wait_for(std::chrono::milliseconds(100));
+    bool const unchanged = duckdb::Config::LOG_BACKEND == previous_backend &&
+                           duckdb::Config::LOG_DIR == previous_log_dir &&
+                           duckdb::Config::LOG_LEVEL == previous_level;
+    auto const updated_dir      = (test_root / "updated").string();
+    duckdb::Config::LOG_BACKEND = "noop";
+    duckdb::Config::LOG_DIR     = updated_dir;
+    duckdb::Config::LOG_LEVEL   = "warn";
+    log_lock.unlock();
+    auto error = startup.get();
+    log_lock.lock();
+
+    REQUIRE(status == std::future_status::timeout);
+    REQUIRE(unchanged);
+    REQUIRE(error != nullptr);
+    REQUIRE_THROWS_WITH(std::rethrow_exception(error),
+                        Catch::Matchers::ContainsSubstring(blocker.string()));
+    REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
+    REQUIRE(duckdb::Config::LOG_DIR == updated_dir);
+    REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
+    REQUIRE(sirius::log::get_sink() == previous_sink);
+  }
 }
 
 TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mutation",

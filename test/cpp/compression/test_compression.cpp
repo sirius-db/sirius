@@ -16,7 +16,7 @@
 
 // Tests for the Phase 2 cached-table compression infrastructure:
 //
-//  [compression][plan_register]  — plan_register unit tests (no GPU required)
+//  [compression][plan_utils]  — plan utility unit tests (no GPU required)
 //  [compression][pin_table]      — end-to-end SQL tests (GPU required):
 //    * compressed pin → cached scan result equality vs. uncompressed pin
 //    * column-subset projection correctness
@@ -24,88 +24,17 @@
 //    * fallback when no plan / chunk below threshold
 
 #include <catch.hpp>
-#include <compression/plan_register.hpp>
+#include <compression/plan_utils.hpp>
 #include <utils/log_test_utils.hpp>
 
 // standard library
 #include <string>
 #include <vector>
 
-// ─── plan_register unit tests (no GPU required) ─────────────────────────────
-
-TEST_CASE("plan_register - global singleton is the same object", "[compression][plan_register]")
-{
-  auto& a = sirius::compression::plan_register::global();
-  auto& b = sirius::compression::plan_register::global();
-  REQUIRE(&a == &b);
-}
-
-TEST_CASE("plan_register - table plan round-trips correctly", "[compression][plan_register]")
-{
-  auto& reg = sirius::compression::plan_register::global();
-  reg.clear_all();
-
-  REQUIRE_FALSE(reg.resolve_table_plan("lineitem").has_value());
-
-  const std::string dsl = "identity\n---\nidentity\n---\nidentity";
-  reg.set_table_plan("lineitem", dsl);
-  auto result = reg.resolve_table_plan("lineitem");
-  REQUIRE(result.has_value());
-  REQUIRE(result.value() == dsl);
-
-  reg.clear_table_plan("lineitem");
-  REQUIRE_FALSE(reg.resolve_table_plan("lineitem").has_value());
-
-  reg.clear_all();
-}
-
-TEST_CASE("plan_register - table plans are independent per table", "[compression][plan_register]")
-{
-  auto& reg = sirius::compression::plan_register::global();
-  reg.clear_all();
-
-  reg.set_table_plan("orders", "lz4");
-  reg.set_table_plan("lineitem", "zstd");
-
-  REQUIRE(reg.resolve_table_plan("orders").value() == "lz4");
-  REQUIRE(reg.resolve_table_plan("lineitem").value() == "zstd");
-  REQUIRE_FALSE(reg.resolve_table_plan("customer").has_value());
-
-  reg.clear_all();
-}
-
-TEST_CASE("plan_register - clear_all removes both table and column plans",
-          "[compression][plan_register]")
-{
-  auto& reg = sirius::compression::plan_register::global();
-  reg.clear_all();
-
-  reg.set_table_plan("t", "identity");
-  reg.set_plan("t", "col_a", "lz4");
-
-  reg.clear_all();
-
-  REQUIRE_FALSE(reg.resolve_table_plan("t").has_value());
-
-  reg.clear_all();
-}
-
-TEST_CASE("plan_register - per-column plans are independent from table plans",
-          "[compression][plan_register]")
-{
-  auto& reg = sirius::compression::plan_register::global();
-  reg.clear_all();
-
-  // Setting a per-column plan does not create a table-level entry
-  reg.set_plan("t", "col_a", "lz4");
-  REQUIRE_FALSE(reg.resolve_table_plan("t").has_value());
-
-  reg.clear_plan("t", "col_a");
-  reg.clear_all();
-}
+// ─── Plan utility unit tests (no GPU required) ─────────────────────────────
 
 TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order",
-          "[compression][plan_register]")
+          "[compression][plan_utils]")
 {
   using sirius::compression::select_plan_blocks;
   // Four full-table columns, one block each. select_plan_blocks re-joins the
