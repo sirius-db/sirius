@@ -63,6 +63,7 @@ mod proto;
 mod prpc;
 mod result_encoder;
 mod result_store;
+mod runtime_filters;
 
 pub use brpc::BrpcServer;
 #[cfg(feature = "sirius-engine")]
