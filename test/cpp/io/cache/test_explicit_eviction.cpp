@@ -37,6 +37,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -496,4 +497,40 @@ TEST_CASE("the evictor retires disposed requests while the pool is under its thr
   }
   INFO("cache: " << cache->summary());
   CHECK(tracked <= max_tracked);
+}
+
+TEST_CASE("residency reports the loaded share of an object by path", "[cache][residency]")
+{
+  temp_data_file file(8ull << 20);  // 8 MiB
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_evict();
+
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
+  auto* cache = manager.ensure_default_cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->is_armed());
+  auto const chunk = cache->chunk_size();
+  REQUIRE(2 * chunk <= (8ull << 20));
+
+  // A path the cache has never seen: nothing held, and no size to report either.
+  auto const unseen = cache->residency(file.path.string());
+  CHECK(unseen.resident_bytes == 0);
+  CHECK(unseen.object_bytes == 0);
+
+  // Read two chunks through the cache. Only loaded chunks count; the rest of the file does not.
+  auto ds = manager.create_datasource(file.path.string());
+  REQUIRE(ds != nullptr);
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  ranges.emplace_back(0, static_cast<std::int64_t>(2 * chunk));
+  ds->fadvise(ranges, 0);
+  REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  std::vector<std::uint8_t> bytes(2 * chunk);
+  REQUIRE(ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+
+  auto const held = cache->residency(file.path.string());
+  INFO("cache: " << cache->summary());
+  CHECK(held.object_bytes == (8ull << 20));
+  CHECK(held.resident_bytes == 2 * chunk);
 }

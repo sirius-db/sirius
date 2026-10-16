@@ -1270,6 +1270,40 @@ std::size_t prefetching_cache::max_prefetching_budget_bytes() const noexcept
   return _pool ? _pool->max_allowed_budget_for_prefetching() : 0;
 }
 
+prefetching_cache::object_residency prefetching_cache::residency(std::string_view object_path) const
+{
+  // Locked under the map mutex, inspected after it: dropping the last reference to a retired
+  // generation runs its deleter, which is no work to do while holding the map.
+  std::vector<std::shared_ptr<cache_generation>> family;
+  {
+    std::shared_lock lk(_map_mtx);
+    auto const it = _generations_by_path.find(object_path);
+    if (it == _generations_by_path.end()) { return {}; }
+    for (auto const& weak : it->second) {
+      family.push_back(weak.lock());
+    }
+  }
+  std::shared_ptr<cache_generation> current;
+  for (auto& generation : family) {
+    if (generation && !generation->retired.load(std::memory_order_acquire)) {
+      current = std::move(generation);
+    }
+  }
+  if (!current) { return {}; }
+
+  object_residency out{0, current->file_size};
+  std::shared_lock lock(current->mtx);
+  for (std::size_t slot = 0; slot < current->slots.size(); ++slot) {
+    auto const* c = current->slots[slot];
+    if (c == nullptr) { continue; }
+    auto const state = c->state.get_state();
+    if (state != chunk_state::cached && state != chunk_state::in_use) { continue; }
+    out.resident_bytes +=
+      std::min(current->chunk_size, current->file_size - slot * current->chunk_size);
+  }
+  return out;
+}
+
 void prefetching_cache::evict(std::size_t bytes_to_free)
 {
   // Nothing to free, nothing holding memory, or a cache on its way down -- in
