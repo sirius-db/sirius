@@ -2288,7 +2288,7 @@ void run_concurrent_admission(std::string const& variant,
       out.error = "CPU mixed-workload reference failed";
       return;
     }
-    expected_sum = cpu->GetValue(0, 0).ToString();
+    expected_sum = cpu->Collection().GetValue(0, 0).ToString();
   }
   if (variant == "concurrent_cache") {
     auto path = output.parent_path() / "concurrent.parquet";
@@ -2306,7 +2306,7 @@ void run_concurrent_admission(std::string const& variant,
       out.error = "CPU MVCC reference failed";
       return;
     }
-    current_sum = cpu->GetValue(0, 0).ToString();
+    current_sum = cpu->Collection().GetValue(0, 0).ToString();
   }
   auto before        = runtime->get_transparent_execution_stats();
   auto previous_sink = sirius::log::get_sink();
