@@ -213,7 +213,7 @@ TEST_CASE("gpu_replicate_impl - slices tile the expansion within both caps",
 TEST_CASE("gpu_replicate_impl - a total past INT32_MAX is planned in 64 bits",
           "[operator][replicate]")
 {
-  // Planned only: materializing 2^31 rows is the overflow the plan exists to avoid.
+  // Planned only: 2^31 INT64 copies (16 GiB) do not fit on the GPU.
   auto data_column   = int64_column({42});
   auto counts_column = int64_column({(std::int64_t{1} << 31) + 5});
   replicate::limits const caps{1 << 30, unbounded_bytes};
