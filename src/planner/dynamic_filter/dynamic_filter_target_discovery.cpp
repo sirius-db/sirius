@@ -172,6 +172,7 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::TOP_N:
     case SiriusPhysicalOperatorType::WINDOW:
     case SiriusPhysicalOperatorType::UNNEST:
+    case SiriusPhysicalOperatorType::REPLICATE:
     case SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
     // Dense count join outputs have no child-ordinal mapping in target discovery.
     case SiriusPhysicalOperatorType::DENSE_COUNT_JOIN:
