@@ -16,9 +16,12 @@
 
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "expression/aggregate_id.hpp"
+#include "expression/ast/aggregate.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"
@@ -32,10 +35,12 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
-// Lowering for `SELECT DISTINCT`: a LogicalDistinct becomes one grouped aggregate whose groups
-// are the distinct targets and whose aggregate list is empty. An output column no target covers
-// would need a grouped FIRST, which Sirius cannot execute, so those shapes throw and run on CPU.
+// Lowering for `SELECT DISTINCT`: a LogicalDistinct becomes one grouped aggregate whose groups are
+// the distinct targets. An output column no target covers is carried by a FIRST over that column,
+// as DuckDB's own builder does, and the grouped kernels run an all-FIRST list by keeping one row
+// per key.
 
 namespace {
 
@@ -77,14 +82,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
       "not on the GPU path yet");
   }
 
-  // `order_by` is populated for DISTINCT ON only, so this tests the ordered shape and not
-  // distinct_type. Relaxing it returns a plausible wrong row, not an error.
-  if (op.order_by) {
-    throw duckdb::NotImplementedException(
-      "DISTINCT ON with ORDER BY is not supported on the GPU (falling back to CPU): choosing the "
-      "first row of each group under a global order is not decomposable across the hash shuffle");
-  }
-
   // A zero-key grouped aggregate is not a shape the operator models.
   if (op.distinct_targets.empty()) {
     throw duckdb::NotImplementedException(
@@ -120,6 +117,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups;
   duckdb::vector<std::unique_ptr<sirius::ast::node>> projections;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> aggregates;
+  // One FIRST return type per carried column, in aggregate order.
+  duckdb::vector<sirius::logical_type> aggregate_types;
   // Child column index -> the group position that reads it, for bare BOUND_REF targets only.
   std::unordered_map<duckdb::idx_t, duckdb::idx_t> group_by_references;
 
@@ -136,8 +136,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
     groups.push_back(std::move(target));
   }
 
-  // Fewer targets than output columns always throws below, so what actually reaches the
-  // projection is the reorder the loop finds, as in `SELECT DISTINCT ON (b, a) a, b`.
+  // `order_by` is populated for DISTINCT ON only. A term that is a distinct target is constant
+  // within each group, so Simplify drops it, as the reference builder's OrderedAggregateOptimizer
+  // does; only a term that survives can choose a group's row.
+  bool const order_names_row = op.order_by && !op.order_by->Copy()->Simplify(groups, nullptr);
+
+  // A carried column lands after the keys in the operator's output, so a node wider than its
+  // targets needs the projection.
   bool requires_projection = op.types.size() != group_count;
 
   for (duckdb::idx_t i = 0; i < op.types.size(); i++) {
@@ -150,8 +155,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
       continue;
     }
 
-    // Output column i has no bare-reference target. Two unrelated causes reach here under either
-    // distinct_type, so branch on the cause and let distinct_type choose only the wording.
+    // Output column i has no bare-reference target, for one of two unrelated causes.
     //
     // Cause 1: some target is not a bare reference, so it maps to no output column.
     if (first_non_reference_target) {
@@ -163,20 +167,29 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
     }
 
     // Cause 2: every target is a bare reference but none reads column i, so it has to be carried
-    // out of each group.
-    if (op.distinct_type == duckdb::DistinctType::DISTINCT_ON) {
+    // out of each group by a FIRST. The reference builder also attaches op.order_by and runs
+    // OrderedAggregateOptimizer here, which leaves the FIRST unordered unless a term survives.
+    // Ignoring a surviving term returns a plausible wrong row, not an error.
+    if (order_names_row) {
       throw duckdb::NotImplementedException(
-        "DISTINCT ON with carried (non-key) columns is not supported on the GPU (falling back to "
-        "CPU): output column " +
-        std::to_string(i) + " would need a grouped FIRST aggregate");
+        "DISTINCT ON with ORDER BY is not supported on the GPU (falling back to CPU): choosing the "
+        "first row of each group under a global order is not decomposable across the hash shuffle");
     }
-    throw duckdb::NotImplementedException(
-      "DISTINCT: output column " + std::to_string(i) +
-      " has no distinct target (falling back to CPU): the node has " +
-      std::to_string(groups.size()) + (groups.size() == 1 ? " target for " : " targets for ") +
-      std::to_string(op.types.size()) +
-      (op.types.size() == 1 ? " output column" : " output columns") +
-      ", and an output column without one would need a grouped FIRST aggregate");
+
+    // The FIRST reads the column as the child plans it, which may be narrower than declared.
+    std::vector<std::unique_ptr<sirius::ast::node>> first_arguments;
+    first_arguments.push_back(std::make_unique<sirius::ast::node>(
+      sirius::ast::reference{static_cast<std::uint32_t>(i), planned_types[i]}));
+    // This FIRST's position in the operator's output, so it must be taken before the push below.
+    projections.push_back(std::make_unique<sirius::ast::node>(sirius::ast::reference{
+      static_cast<std::uint32_t>(group_count + aggregates.size()), planned_types[i]}));
+    aggregate_types.push_back(planned_types[i]);
+    aggregates.push_back(
+      std::make_unique<sirius::ast::node>(sirius::ast::aggregate{sirius::aggregate_id::first,
+                                                                 std::move(first_arguments),
+                                                                 planned_types[i],
+                                                                 /*distinct=*/false}));
+    requires_projection = true;
   }
 
   // The operator requires every group to be a bare reference to a column the child has. Checked
@@ -200,30 +213,31 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
     }
   }
 
-  // With zero aggregates the operator's output is exactly its group key columns.
-  duckdb::vector<sirius::logical_type> group_types;
+  // The operator's output is its group key columns, then one column per FIRST.
+  duckdb::vector<sirius::logical_type> output_types;
   duckdb::vector<std::unique_ptr<sirius::ast::node>> group_nodes;
-  group_types.reserve(groups.size());
+  output_types.reserve(groups.size() + aggregate_types.size());
   group_nodes.reserve(groups.size());
   for (auto const& group : groups) {
     auto const index = group->Cast<duckdb::BoundReferenceExpression>().Index();
-    group_types.push_back(planned_types[index]);
+    output_types.push_back(planned_types[index]);
     group_nodes.push_back(std::make_unique<sirius::ast::node>(
       sirius::ast::reference{static_cast<std::uint32_t>(index), planned_types[index]}));
   }
+  output_types.insert(output_types.end(), aggregate_types.begin(), aggregate_types.end());
 
-  auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
-                                         sirius::op::sirius_physical_grouped_aggregate>(
-    std::move(group_types),
-    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
-    std::move(group_nodes),
-    op.estimated_cardinality);
+  auto group_by =
+    duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
+                           sirius::op::sirius_physical_grouped_aggregate>(std::move(output_types),
+                                                                          std::move(aggregates),
+                                                                          std::move(group_nodes),
+                                                                          op.estimated_cardinality);
   group_by->children.push_back(std::move(plan));
 
   if (!requires_projection) { return group_by; }
 
-  // Restore the output order op.types declares; the select list is a permutation, not an
-  // identity, so this is never elided.
+  // Restore the output order op.types declares. push_projection drops the select list when it is
+  // the identity, as for `SELECT DISTINCT ON (k) k, v`.
   auto const estimated_cardinality = group_by->estimated_cardinality;
   return push_projection(
     std::move(group_by), planned_types, std::move(projections), estimated_cardinality);

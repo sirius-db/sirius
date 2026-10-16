@@ -241,7 +241,7 @@ class GpuExecutionFixture {
 
   /// GPU-vs-CPU comparison, order-insensitive, of the row count and the cells of `columns`
   /// (0-based) alone, each canonicalized first. Use where the other columns may legitimately differ
-  /// between engines, such as a `first()` result taken from an arbitrary row of its group.
+  /// between engines, such as a `DISTINCT ON` column carried from an arbitrary row of its group.
   void compare_gpu_vs_cpu_on_columns(const std::string& query,
                                      const std::vector<size_t>& columns,
                                      cell_canonicalizer canonicalize = canonical_float_key)
