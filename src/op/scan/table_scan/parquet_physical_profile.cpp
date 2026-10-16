@@ -168,51 +168,14 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
   std::string const& identity,
   cudf::io::parquet_reader_options const& options,
   bool* cache_hit,
-  std::stop_token stop,
-  bool force_refresh)
+  std::stop_token stop)
 {
   auto const observed_identity = source.get_io_object().identity_cache_key();
-  // Profile all schema-affecting reader options. Custom nested column schemas
-  // are not yet serialised; bypass cache instead of conflating their results.
-  bool const cacheable = !options.get_column_schema().has_value();
-  auto schema_profile  = [](auto const& o) {
-    std::string key = "parquet-v1:";
-    auto append     = [&](auto v) { key += std::to_string(v) + ":"; };
-    append(o.is_enabled_convert_strings_to_categories());
-    append(o.is_enabled_use_pandas_metadata());
-    append(o.is_enabled_use_arrow_schema());
-    append(o.is_enabled_allow_mismatched_pq_schemas());
-    append(o.is_enabled_ignore_missing_columns());
-    append(o.is_enabled_case_sensitive_names());
-    append(static_cast<int>(o.get_timestamp_type().id()));
-    append(static_cast<int>(o.get_decimal_width()));
-    return key;
-  };
-  auto default_options = cudf::io::parquet_reader_options::builder().build();
-  auto profile         = schema_profile(options);
-  bool const canonical = cacheable && profile == schema_profile(default_options);
-  // Normal bind/pin/scan callers differ only in projection. Parse the complete
-  // footer with canonical options; the consumer applies its own projection to
-  // the resulting FileMetaData. This makes reuse independent of query columns
-  // without assuming that cuDF's projected parser is option-independent.
-  if (canonical) profile = "parquet-v1";
-  auto append = [&](auto v) { profile += std::to_string(v) + ":"; };
-  if (!canonical && options.get_column_names()) {
-    profile += "names:";
-    for (auto const& name : *options.get_column_names()) {
-      profile += std::to_string(name.size()) + ":" + name;
-    }
-  }
-  if (!canonical && options.get_column_indices()) {
-    profile += "indices:";
-    for (auto index : *options.get_column_indices())
-      append(index);
-  }
-  if (!canonical && options.get_column_field_ids()) {
-    profile += "fields:";
-    for (auto id : *options.get_column_field_ids())
-      append(id);
-  }
+  // Metadata is always parsed from the complete footer with canonical reader
+  // options. Query projection and filter options belong to the data-read path,
+  // not to the metadata cache identity.
+  bool const cacheable     = !options.get_column_schema().has_value();
+  auto const metadata_opts = cudf::io::parquet_reader_options::builder().build();
   if (cache_hit) *cache_hit = false;
   auto build = [&]() -> std::shared_ptr<io::io_object_metadata> {
     auto footer = fetch_plaintext_parquet_footer(source, contract, identity);
@@ -222,8 +185,7 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
       throw std::runtime_error("incomplete Parquet footer evidence: " + identity);
     }
     cudf::io::parquet::experimental::hybrid_scan_reader reader(
-      cudf::host_span<uint8_t const>(footer->data(), footer->size()),
-      canonical ? default_options : options);
+      cudf::host_span<uint8_t const>(footer->data(), footer->size()), metadata_opts);
     auto parsed =
       std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
     std::string arrow_schema;
@@ -251,23 +213,9 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
     return result;
   };
   std::shared_ptr<io::io_object_metadata> metadata;
-  bool legacy_compatibility = false;
-  if (cacheable && source.io_ctx() && !force_refresh) {
-    // A freshly opened local datasource can still observe the compatible
-    // legacy footer entry retained by the ioctx.  Resolve that compatibility
-    // hit before starting a new identity-scoped flight so repeated opens do
-    // not reparse an unchanged footer.
-    metadata = source.io_ctx()->metadata_store().get_metadata(source.get_io_object(), profile);
-    if (!metadata) {
-      metadata             = source.metadata(profile);
-      legacy_compatibility = metadata != nullptr;
-    }
-    if (metadata) {
-      if (cache_hit) *cache_hit = true;
-    } else {
-      metadata = source.io_ctx()->metadata_store().get_or_load(
-        source.get_io_object(), profile, build, cache_hit, stop);
-    }
+  if (cacheable && source.io_ctx()) {
+    metadata =
+      source.io_ctx()->metadata_store().get_or_load(source.get_io_object(), build, cache_hit, stop);
   } else {
     metadata = build();
   }
@@ -276,34 +224,14 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
     // Preserve the existing miss behavior for a payload of another metadata type.
     if (cache_hit) *cache_hit = false;
     result = std::static_pointer_cast<parquet_metadata>(build());
-    if (cacheable) std::ignore = source.store_metadata(result, profile);
+    if (cacheable) std::ignore = source.store_metadata(result);
   }
-  if (force_refresh && cacheable) std::ignore = source.store_metadata(result, profile);
-  auto resolved_identity = result->built_for_identity;
-  if (legacy_compatibility && !result->file_metadata()) {
-    // A compatibility entry can be a deliberately foreign probe payload. It
-    // is useful to the provenance test, but it cannot seed execution; rebuild
-    // the footer for this open before any consumer touches the schema.
+  if (result->built_for_identity != observed_identity) {
+    if (cache_hit) *cache_hit = false;
     result = std::dynamic_pointer_cast<parquet_metadata>(build());
-    if (cacheable) std::ignore = source.store_metadata(result, profile);
-    resolved_identity = result->built_for_identity;
+    if (cacheable) std::ignore = source.store_metadata(result);
   }
-  // The datasource compatibility path may return a footer parsed by an
-  // earlier local open.  Rebind the immutable artifact to the current open
-  // before it is carried into a scan contract; the parsed footer and all
-  // evidence remain shared, while the contract's provenance matches the
-  // datasource that will read the bytes.
-  if (resolved_identity != observed_identity && legacy_compatibility) {
-    result            = std::make_shared<parquet_metadata>(result->file_metadata(),
-                                                result->footer_byte_len(),
-                                                result->encryption_evidence,
-                                                result->original_schema,
-                                                result->arrow_schema,
-                                                result->original_logical_annotations,
-                                                observed_identity);
-    resolved_identity = observed_identity;
-    if (cacheable) std::ignore = source.store_metadata(result, profile);
-  }
+  auto resolved_identity = result->built_for_identity;
   return {result, std::move(resolved_identity)};
 }
 

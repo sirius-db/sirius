@@ -1024,7 +1024,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // Probe only when the footer will actually be read: once the metadata store
   // holds this file's parsed footer, a suffix GET would download bytes nothing
   // consumes, and the open only needs the size. Mirrors describe_parquet.
-  bool const footer_cached = io_ctx->metadata_store().has_candidate(file_path);
+  bool const footer_cached = io_ctx->metadata_store().has_path(file_path);
   std::shared_ptr<io::sirius_datasource> sirius_ds;
   {
     sirius_ds = io_ctx->open_datasource(
@@ -1059,20 +1059,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       if (_info->profiles->counters)
         _info->profiles->counters->metadata_provenance_mismatches.fetch_add(
           1, std::memory_order_relaxed);
-      auto const refreshed = resolve_parquet_metadata_with_identity(
-        *sirius_ds,
-        _info->contract_id,
-        file_path,
-        _plan->carrier_batch_index ? *_natural_reader_options : opts,
-        &cache_hit,
-        stop,
-        true);
-      if (refreshed.identity != opened_identity) {
-        throw transparent::classified_execution_error(
-          transparent::late_failure_cause::physical_input,
-          "[scan] footer identity mismatch for " + file_path);
-      }
-      resolved_metadata = refreshed.artifact;
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::physical_input,
+        "[scan] footer identity mismatch for " + file_path);
     }
     if (!resolved_metadata) resolved_metadata = resolution.artifact;
     if (_info->profiles->counters)

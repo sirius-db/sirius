@@ -850,8 +850,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "Parquet canonical footer cache is shared across query projections",
-                 "[scan][parquet][profile][integration][metadata_retention]")
+                 "Parquet footer cache is shared across query projections and reader options",
+                 "[scan][parquet][integration][metadata_retention]")
 {
   sirius::test::scratch_dir directory("parquet_r3_projection");
   run_ok("SET gpu_execution=false");
@@ -874,13 +874,13 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(source->metadata() == all);
   options.enable_use_arrow_schema(!options.is_enabled_use_arrow_schema());
   auto different_profile = resolve_parquet_metadata(*source, 0, path, options, &hit);
-  CHECK_FALSE(hit);
-  CHECK(different_profile != all);
+  CHECK(hit);
+  CHECK(different_profile == all);
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Parquet cache hits preserve artifact provenance",
-                 "[scan][parquet][profile][integration][metadata_retention]")
+                 "[scan][parquet][integration][metadata_retention]")
 {
   sirius::test::scratch_dir directory("parquet_r3_provenance");
   run_ok("SET gpu_execution=false");
@@ -889,8 +889,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto& manager = sirius::test::get_registered_sirius_context(*con)->get_scan_manager();
   auto source   = manager.create_datasource(path);
   REQUIRE(source);
-  // A null payload makes any premature schema access fail: provenance must be
-  // checked at the resolver boundary, before touching the foreign footer.
+  // A foreign identity must not be accepted as a cache hit.
   auto foreign = std::make_shared<parquet_metadata>(nullptr,
                                                     64,
                                                     parquet_encryption_evidence{},
@@ -902,8 +901,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto options = cudf::io::parquet_reader_options::builder().build();
   bool hit     = false;
   auto result  = resolve_parquet_metadata_with_identity(*source, 0, path, options, &hit);
-  REQUIRE(hit);
-  CHECK(result.artifact == foreign);
-  CHECK(result.identity == "foreign-open");
-  CHECK(result.identity != source->get_io_object().identity_cache_key());
+  CHECK_FALSE(hit);
+  CHECK(result.artifact != foreign);
+  CHECK(result.identity == source->get_io_object().identity_cache_key());
 }

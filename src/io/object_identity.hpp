@@ -65,7 +65,9 @@ inline bool capture_local_identity(int fd, object_identity& result)
   result.ctime_ns = static_cast<uint64_t>(info.st_ctim.tv_sec) * 1'000'000'000ULL +
                     static_cast<uint64_t>(info.st_ctim.tv_nsec);
 #endif
-  result.version = std::to_string(result.ctime_ns);
+  // ctime_ns is already part of the structured identity; do not duplicate it
+  // in the free-form version field used by object-store validators.
+  result.version.clear();
   return true;
 }
 }  // namespace sirius::io

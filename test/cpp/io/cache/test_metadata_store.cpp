@@ -62,7 +62,7 @@ TEST_CASE("Metadata concurrent misses share success or failure and permit retry"
     auto gate     = release.get_future().share();
     auto payload  = std::make_shared<value>(32);
     auto producer = std::async(std::launch::async, [&] {
-      return store.get_or_load(object, "p", [&]() -> std::shared_ptr<io_object_metadata> {
+      return store.get_or_load(object, [&]() -> std::shared_ptr<io_object_metadata> {
         started.set_value();
         gate.wait();
         if (fail) throw std::runtime_error("parse failed");
@@ -72,7 +72,7 @@ TEST_CASE("Metadata concurrent misses share success or failure and permit retry"
     started.get_future().wait();
     std::atomic<int> extra_loads{0};
     auto waiter = std::async(std::launch::async, [&] {
-      return store.get_or_load(object, "p", [&] {
+      return store.get_or_load(object, [&] {
         ++extra_loads;
         return payload;
       });
@@ -83,8 +83,8 @@ TEST_CASE("Metadata concurrent misses share success or failure and permit retry"
     if (fail) {
       CHECK_THROWS_WITH(producer.get(), "parse failed");
       CHECK_THROWS_WITH(waiter.get(), "parse failed");
-      CHECK_FALSE(store.get_metadata(object, "p"));
-      CHECK(store.get_or_load(object, "p", [&] { return payload; }) == payload);
+      CHECK_FALSE(store.get_metadata(object));
+      CHECK(store.get_or_load(object, [&] { return payload; }) == payload);
       CHECK(store.statistics().failures == 1);
       CHECK(store.statistics().builds == 2);
     } else {
@@ -105,7 +105,7 @@ TEST_CASE("Cancelling a metadata waiter leaves the shared producer alive", "[met
   auto gate     = release.get_future().share();
   auto payload  = std::make_shared<value>(32);
   auto producer = std::async(std::launch::async, [&] {
-    return store.get_or_load(object, "p", [&] {
+    return store.get_or_load(object, [&] {
       started.set_value();
       gate.wait();
       return payload;
@@ -114,7 +114,7 @@ TEST_CASE("Cancelling a metadata waiter leaves the shared producer alive", "[met
   started.get_future().wait();
   std::stop_source stop;
   auto waiter = std::async(std::launch::async, [&] {
-    return store.get_or_load(object, "p", [&] { return payload; }, nullptr, stop.get_token());
+    return store.get_or_load(object, [&] { return payload; }, nullptr, stop.get_token());
   });
   bool joined = wait_for_joined(store, 1);
   stop.request_stop();
@@ -124,7 +124,7 @@ TEST_CASE("Cancelling a metadata waiter leaves the shared producer alive", "[met
   CHECK(status == std::future_status::ready);
   CHECK_THROWS_AS(waiter.get(), std::system_error);
   CHECK(producer.get() == payload);
-  CHECK(store.get_metadata(object, "p") == payload);
+  CHECK(store.get_metadata(object) == payload);
   CHECK(store.statistics().cancelled_waiters == 1);
 }
 
@@ -134,21 +134,21 @@ TEST_CASE("Observing a newer identity fences an older in-flight publication", "[
   fake_object old("file", "file:old", tag("old"));
   fake_object newer("file", "file:new", tag("new"));
   auto payload = std::make_shared<value>(32);
-  auto result  = store.get_or_load(old, "p", [&] {
+  auto result  = store.get_or_load(old, [&] {
     store.open_observed(newer);
     return payload;
   });
   CHECK(result == payload);
-  CHECK_FALSE(store.get_metadata(old, "p"));
-  CHECK_FALSE(store.has_candidate("file"));
+  CHECK_FALSE(store.get_metadata(old));
+  CHECK_FALSE(store.has_path("file"));
   CHECK(store.statistics().stale == 1);
   auto fresh = std::make_shared<value>(64);
-  store.register_metadata(newer, fresh, "p");
-  CHECK(store.get_metadata(newer, "p") == fresh);
+  store.register_metadata(newer, fresh);
+  CHECK(store.get_metadata(newer) == fresh);
   CHECK(result == payload);
 }
 
-TEST_CASE("Metadata flights do not join a different identity or profile", "[metadata_store]")
+TEST_CASE("Metadata flights do not join a different identity", "[metadata_store]")
 {
   cache::metadata_store store;
   fake_object old("file", "file:old", tag("old"));
@@ -158,7 +158,7 @@ TEST_CASE("Metadata flights do not join a different identity or profile", "[meta
   std::promise<void> started, release;
   auto gate     = release.get_future().share();
   auto producer = std::async(std::launch::async, [&] {
-    return store.get_or_load(old, "p", [&] {
+    return store.get_or_load(old, [&] {
       started.set_value();
       gate.wait();
       return payload;
@@ -166,18 +166,17 @@ TEST_CASE("Metadata flights do not join a different identity or profile", "[meta
   });
   started.get_future().wait();
   auto independent = std::async(std::launch::async, [&] {
-    auto other_profile  = store.get_or_load(old, "q", [&] { return fresh; });
-    auto other_identity = store.get_or_load(newer, "p", [&] { return fresh; });
-    return other_profile == fresh && other_identity == fresh;
+    auto other_identity = store.get_or_load(newer, [&] { return fresh; });
+    return other_identity == fresh;
   });
   auto status      = independent.wait_for(std::chrono::seconds(5));
   release.set_value();
   CHECK(status == std::future_status::ready);
   CHECK(independent.get());
   CHECK(producer.get() == payload);
-  CHECK(store.get_metadata(newer, "p") == fresh);
+  CHECK(store.get_metadata(newer) == fresh);
   CHECK(store.statistics().joined == 0);
-  CHECK(store.statistics().builds == 3);
+  CHECK(store.statistics().builds == 2);
 }
 
 TEST_CASE("Same-key opens preserve warm metadata and advance the observation fence",
@@ -193,63 +192,45 @@ TEST_CASE("Same-key opens preserve warm metadata and advance the observation fen
   store.open_observed(delayed);
   store.register_metadata(delayed, std::make_shared<value>(64));
   CHECK(store.get_metadata(latest) == payload);
-  CHECK(store.get_metadata("file:a") == payload);
   CHECK(store.statistics().replacements == 0);
   CHECK(store.statistics().stale == 1);
 }
 
-TEST_CASE("Metadata store isolates identity, profile, and ioctx", "[metadata_store]")
+TEST_CASE("Metadata store isolates identity and ioctx", "[metadata_store]")
 {
   cache::metadata_store store, other;
   auto v = std::make_shared<value>(100);
   fake_object first("file", "file:v1", tag());
-  store.register_metadata(first, v, "parser");
-  CHECK(store.get_metadata(first, "parser") == v);
-  CHECK_FALSE(other.get_metadata(first, "parser"));
-  CHECK_FALSE(store.get_metadata(first, "other"));
+  store.register_metadata(first, v);
+  CHECK(store.get_metadata(first) == v);
+  CHECK_FALSE(other.get_metadata(first));
+  CHECK(store.get_metadata(first) == v);
 
   auto next = std::make_shared<value>(200);
   fake_object replacement("file", "file:v2", tag("v2"));
-  store.register_metadata(replacement, next, "parser");
+  store.register_metadata(replacement, next);
   CHECK(store.statistics().entries == 1);
-  store.register_metadata(first, v, "parser");
-  CHECK(store.get_metadata(replacement, "parser") == next);
+  store.register_metadata(first, v);
+  CHECK(store.get_metadata(replacement) == next);
   CHECK(store.statistics().bypasses == 1);
-  store.register_metadata(replacement, next, "parser");
+  store.register_metadata(replacement, next);
   CHECK(store.statistics().entries == 1);
   CHECK(store.statistics().bypasses == 1);
   CHECK(v->bytes == 100);
 }
 
-TEST_CASE("Identity replacement invalidates every profile for a path", "[metadata_store]")
+TEST_CASE("Identity replacement invalidates entries for a path", "[metadata_store]")
 {
   cache::metadata_store store;
   fake_object first("file", "file:v1", tag("v1"));
-  store.register_metadata(first, std::make_shared<value>(100), "p");
-  store.register_metadata(first, std::make_shared<value>(200), "q");
-  CHECK(store.statistics().entries == 2);
+  store.register_metadata(first, std::make_shared<value>(100));
+  CHECK(store.statistics().entries == 1);
 
   fake_object replacement("file", "file:v2", tag("v2"));
   store.open_observed(replacement);
-  CHECK_FALSE(store.get_metadata(first, "p"));
-  CHECK_FALSE(store.get_metadata(first, "q"));
-  CHECK_FALSE(store.has_candidate("file"));
+  CHECK_FALSE(store.get_metadata(first));
+  CHECK_FALSE(store.has_path("file"));
   CHECK(store.statistics().entries == 0);
-}
-
-TEST_CASE("Metadata store preserves raw-key compatibility across generations", "[metadata_store]")
-{
-  cache::metadata_store store;
-  auto first       = std::make_shared<fake_object>("file", "file:v1", tag("v1"));
-  auto first_value = std::make_shared<value>(100);
-  store.register_metadata(*first, first_value);
-  CHECK(store.get_metadata("file:v1") == first_value);
-
-  auto second       = std::make_shared<fake_object>("file", "file:v2", tag("v2"));
-  auto second_value = std::make_shared<value>(200);
-  store.register_metadata(*second, second_value);
-  CHECK_FALSE(store.get_metadata("file:v1"));
-  CHECK(store.get_metadata("file:v2") == second_value);
 }
 
 TEST_CASE("Metadata store supports concurrent publication", "[metadata_store]")
@@ -263,8 +244,8 @@ TEST_CASE("Metadata store supports concurrent publication", "[metadata_store]")
         auto object = fake_object("file-" + std::to_string(i) + "-" + std::to_string(j),
                                   "key-" + std::to_string(i) + "-" + std::to_string(j),
                                   tag());
-        store.register_metadata(object, std::make_shared<value>(512), "p");
-        auto held = store.get_metadata(object, "p");
+        store.register_metadata(object, std::make_shared<value>(512));
+        auto held = store.get_metadata(object);
         if (!held) all_hits.store(false, std::memory_order_relaxed);
       }
     });
@@ -279,11 +260,11 @@ TEST_CASE("Open-local entries never suppress the next open footer probe", "[meta
   cache::metadata_store store;
   fake_object object("file", "file:open", {identity_kind::opened_handle, 42, "1"});
   auto v = std::make_shared<value>(256);
-  store.register_metadata(object, v, "p");
-  CHECK_FALSE(store.has_candidate("file"));
-  CHECK(store.get_metadata(object, "p") == v);
+  store.register_metadata(object, v);
+  CHECK(store.has_path("file"));
+  CHECK(store.get_metadata(object) == v);
   fake_object reopened("file", "file:open2", {identity_kind::opened_handle, 42, "2"});
-  CHECK_FALSE(store.get_metadata(reopened, "p"));
+  CHECK_FALSE(store.get_metadata(reopened));
 }
 
 TEST_CASE("Local metadata reuse requires the observed identity", "[metadata_store]")
@@ -295,16 +276,16 @@ TEST_CASE("Local metadata reuse requires the observed identity", "[metadata_stor
   fake_object object("file", "file:local", original);
   cache::metadata_store store;
   auto stable = std::make_shared<value>(256);
-  store.register_metadata(object, stable, "p");
-  CHECK(store.get_metadata(object, "p") == stable);
+  store.register_metadata(object, stable);
+  CHECK(store.get_metadata(object) == stable);
 
   auto replacement  = original;
   replacement.inode = 4;
   fake_object replaced("file", "file:local", replacement);
-  CHECK_FALSE(store.get_metadata(replaced, "p"));
+  CHECK_FALSE(store.get_metadata(replaced));
   auto fresh = std::make_shared<value>(512);
-  store.register_metadata(replaced, fresh, "p");
-  CHECK(store.get_metadata(replaced, "p") == fresh);
+  store.register_metadata(replaced, fresh);
+  CHECK(store.get_metadata(replaced) == fresh);
 }
 
 TEST_CASE("Local stat identity does not authorize reuse across opens", "[metadata_store]")
@@ -317,16 +298,16 @@ TEST_CASE("Local stat identity does not authorize reuse across opens", "[metadat
   fake_object reopened("file", "file:local", local);
   cache::metadata_store store;
   auto old_value = std::make_shared<value>(256);
-  store.register_metadata(first, old_value, "p");
-  CHECK_FALSE(store.get_metadata(reopened, "p"));
+  store.register_metadata(first, old_value);
+  CHECK_FALSE(store.get_metadata(reopened));
   bool loaded    = false;
-  auto new_value = store.get_or_load(reopened, "p", [&] {
+  auto new_value = store.get_or_load(reopened, [&] {
     loaded = true;
     return std::make_shared<value>(512);
   });
   CHECK(loaded);
   CHECK(new_value != old_value);
-  CHECK(store.get_metadata(reopened, "p") == new_value);
+  CHECK(store.get_metadata(reopened) == new_value);
 }
 
 TEST_CASE("Metadata replacement releases payloads outside the store lock", "[metadata_store]")
@@ -343,10 +324,8 @@ TEST_CASE("Metadata replacement releases payloads outside the store lock", "[met
   };
   fake_object first("file", "file:v1", tag("v1"));
   store.register_metadata(
-    first,
-    std::make_shared<reentrant_value>([&] { released = store.statistics().entries == 1; }),
-    "p");
+    first, std::make_shared<reentrant_value>([&] { released = store.statistics().entries == 1; }));
   fake_object second("file", "file:v2", tag("v2"));
-  store.register_metadata(second, std::make_shared<value>(128), "p");
+  store.register_metadata(second, std::make_shared<value>(128));
   CHECK(released);
 }

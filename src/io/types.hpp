@@ -117,11 +117,9 @@ class io_object : public std::enable_shared_from_this<io_object> {
   {
     auto const object_identity = identity();
     auto key                   = object_identity.cache_key(raw_file_cache_id());
-    // local_stat is obtained from fstat on the current descriptor.  Its ctime
-    // can repeat within the filesystem timestamp window, so it is not enough
-    // to authorize reuse by a later open.  Scope degraded local keys to this
-    // descriptor generation; strong opened-object validators keep cross-open
-    // reuse through their stable identity.
+    // Local stat identity is obtained from fstat on the current descriptor.
+    // Scope degraded local keys to this descriptor generation; strong opened
+    // object validators keep cross-open reuse through their stable identity.
     if (object_identity.kind == identity_kind::local_stat) {
       key += ":open:" + std::to_string(open_generation());
     }

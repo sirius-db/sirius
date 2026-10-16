@@ -100,8 +100,7 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
   std::string const& identity,
   cudf::io::parquet_reader_options const& options,
   bool* cache_hit      = nullptr,
-  std::stop_token stop = {},
-  bool force_refresh   = false);
+  std::stop_token stop = {});
 
 std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
   io::sirius_datasource& source,
