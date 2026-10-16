@@ -604,6 +604,13 @@ Separately from the prefetching cache, the ioctx always exposes a `metadata_stor
 - **Multi-GPU safe.** Device reads carry the caller's device id; the reactor sets the device before the H2D copy, and pinned chunks are portable across CUDA contexts.
 - **Generations.** Cache entries are keyed by the io_object's cache id (path plus strong ETag for object stores, path for local files) and shared-owned: the map holds one owner while a generation is current, and a `cache_handle`, an in-flight fill, a queued completion, or a cached-copy retirement holds another for as long as it may touch the generation's chunks. Admitting a newer generation of a path retires the older ones — they leave the map, keep serving their holders, and are reclaimed synchronously when the last owner releases. The evictor only borrows. `generation_count(path)` and `retired_generation_count()` expose the state.
 
+Cache summaries report cumulative `global` counters and `last_cycle` deltas over a cache-wide
+interval between refreshes, not work attributed to one query. A refresh samples each counter
+once and advances the reporting baseline under one mutex; formatting and logging happen after
+releasing it. The scan manager logs that same captured report. Diagnostic `summary()` calls do
+not advance the baseline. Counter writers remain lock-free with respect to this mutex, so the
+five counters are individually sampled rather than an atomic snapshot of an entire read.
+
 ### Constants
 
 | Name | Location | Role |

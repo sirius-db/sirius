@@ -1483,8 +1483,8 @@ void sirius_scan_manager::prepare_for_query(
   // just re-reads on a miss. The fix belongs in prefetching_cache (track the set of live
   // epochs rather than newest-wins), not here.
   if (_io_ctx && _io_ctx->cache()) {
-    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
-    _io_ctx->cache()->prepare_for_query();
+    auto const report = _io_ctx->cache()->prepare_for_query();
+    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", report);
   }
 
   // Routed ioctxs (e.g. the restful context serving s3://) are built lazily and
