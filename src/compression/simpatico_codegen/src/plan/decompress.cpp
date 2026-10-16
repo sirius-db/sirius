@@ -1356,10 +1356,9 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
       }
       return nullptr;
     }
-    if (static_cast<std::int64_t>(col->size()) != sel->survivor_count || col->null_count() != 0) {
+    if (static_cast<std::int64_t>(col->size()) != sel->survivor_count) {
       if (error_out) {
-        *error_out =
-          "decompress: masked str_split decode returned a non-survivor-sized or null-masked column";
+        *error_out = "decompress: masked str_split decode returned a non-survivor-sized column";
       }
       return nullptr;
     }
@@ -1399,16 +1398,10 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     // Belt and braces for the same hazard: whatever comes back from a
     // compacted-route request must already be survivor-sized (directly from
     // the mask or index walk; the dictionary route via the key gather over the
-    // compacted codes) and — per the null policy — carry no null mask.
+    // compacted codes).
     if (static_cast<std::int64_t>(col->size()) != sel->survivor_count) {
       if (error_out) {
         *error_out = "decompress: compacted decode returned a non-survivor-sized column";
-      }
-      return nullptr;
-    }
-    if (col->null_count() != 0) {
-      if (error_out) {
-        *error_out = "decompress: selection on a null-masked column is not supported";
       }
       return nullptr;
     }
@@ -1419,14 +1412,6 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   // mask→indices buffer. (Every other route came back survivor-sized from the
   // masked decode and skips this.)
   if (col && selecting && !sel->compacted()) {
-    if (col->null_count() != 0) {
-      // Selection targets NOT NULL columns only; refuse rather than risk a
-      // mask/null interaction the selection wave has not modeled.
-      if (error_out) {
-        *error_out = "decompress: selection on a null-masked column is not supported";
-      }
-      return nullptr;
-    }
     if (static_cast<std::int64_t>(sel->survivor_indices.size()) != sel->survivor_count) {
       if (error_out) {
         *error_out = "decompress: survivor_indices size does not match survivor_count";
