@@ -100,6 +100,10 @@ struct scan_contract_provenance {
 duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> extract_unpushed_scan_filters(
   duckdb::LogicalGet const& op, duckdb::TableFilterSet& table_filters);
 
+//! Whether the CONCAT feeding @p join's build (@p is_build) or probe side folds that side into one
+//! batch per partition before the join sees it.
+bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_build);
+
 //! The physical plan generator generates a physical execution plan from a
 //! logical query plan
 class sirius_physical_plan_generator {
