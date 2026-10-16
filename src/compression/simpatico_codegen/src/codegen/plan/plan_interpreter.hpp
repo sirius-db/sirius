@@ -191,7 +191,7 @@ struct column_decode_caps {
   ///                  in lockstep with the renderer's masked
   ///                  offsets-reconstruction coverage,
   ///   full         — everything else: decode full width, then gather.
-  /// Nullable plans (a `null_mask` output channel) take @c full throughout:
+  /// A nullable column (non-empty PlanTree::validity) reports @c full throughout:
   /// selection has no null model yet.
   sirius::codegen::decode_route compact_route = sirius::codegen::decode_route::full;
 

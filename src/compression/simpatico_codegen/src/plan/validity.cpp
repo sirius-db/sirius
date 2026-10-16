@@ -79,6 +79,10 @@ void attach_validity(cudf::column& col,
       // to several queries).
       col.set_null_mask(rmm::device_buffer(v.mask.data(), v.mask.size(), stream, mr),
                         static_cast<cudf::size_type>(v.null_count));
+      // The copy above is stream-ordered but v.mask belongs to the caller's tree, which it
+      // may free as soon as decompress returns. Wait for the copy to land, as every other
+      // decode route does before handing back.
+      stream.synchronize();
       return;
   }
 }

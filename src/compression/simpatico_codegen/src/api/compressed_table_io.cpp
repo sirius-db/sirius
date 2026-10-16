@@ -12,6 +12,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
@@ -340,6 +341,7 @@ static constexpr std::uint8_t kVersion = 12;
 // that stage the payload themselves need no special case for it.
 static void push_validity(std::vector<std::uint8_t>& hdr,
                           validity_sidecar const& v,
+                          std::uint64_t column_index,
                           std::vector<payload_buffer_ref>& out_buffers,
                           std::uint64_t& payload_offset)
 {
@@ -352,7 +354,8 @@ static void push_validity(std::vector<std::uint8_t>& hdr,
   auto const size_bytes = static_cast<std::uint64_t>(v.mask.size());
   push_le(hdr, size_bytes);
   push_le(hdr, payload_offset);
-  out_buffers.push_back(payload_buffer_ref{payload_offset, v.mask.data(), size_bytes, size_bytes});
+  out_buffers.push_back(
+    payload_buffer_ref{payload_offset, v.mask.data(), size_bytes, size_bytes, column_index});
   payload_offset += size_bytes;
 }
 
@@ -507,6 +510,21 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
     if (!r.read_le(cr.scale)) return bad("truncated col scale");
     if (!r.read_le(cr.num_rows)) return bad("truncated col num_rows");
     if (!read_validity(r, cr.validity)) return bad("truncated/unknown col validity");
+    // Reject an inconsistent record here: a corrupt file must not reach attach_validity
+    // with a short mask or a null_count that disagrees with the row count.
+    if (cr.validity.kind == validity_kind::mask) {
+      auto const min_mask_bytes =
+        cr.num_rows < 0 ? std::uint64_t{0}
+                        : static_cast<std::uint64_t>(
+                            cudf::num_bitmask_words(static_cast<cudf::size_type>(cr.num_rows))) *
+                            sizeof(cudf::bitmask_type);
+      if (cr.num_rows < 0 || cr.validity.size_bytes < min_mask_bytes ||
+          cr.validity.null_count < 0 || cr.validity.null_count > cr.num_rows)
+        return bad("col validity mask undersized or null_count out of range");
+    } else if (cr.validity.kind == validity_kind::all_null) {
+      if (cr.validity.null_count != cr.num_rows)
+        return bad("all-null col validity null_count != num_rows");
+    }
 
     std::uint16_t nn;
     if (!r.read_le(nn)) return bad("truncated num_nodes");
@@ -851,7 +869,7 @@ std::string build_compressed_table_header(compressed_table const& table,
 
     // Validity rides beside the tree, not inside it: it is not a leaf and has no
     // node, so it is written here rather than through describe().
-    push_validity(hdr, tree.validity, out_buffers, payload_offset);
+    push_validity(hdr, tree.validity, ci, out_buffers, payload_offset);
     push_le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
     for (auto const& node : tree.nodes)
       push_node(hdr, node);
