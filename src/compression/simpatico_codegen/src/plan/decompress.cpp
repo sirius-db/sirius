@@ -1274,9 +1274,6 @@ std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree)
   NodeId const nid = root_value_producer(tree);
   if (nid >= tree.nodes.size() || tree.nodes[nid].op != "str_split") { return std::nullopt; }
   PlanNode const& node = tree.nodes[nid];
-  for (auto const& name : node.output_names) {
-    if (name == "null_mask") { return std::nullopt; }
-  }
   str_split_shape shape;
   shape.offsets_nid = static_cast<NodeId>(tree.nodes.size());
   bool chars_ok     = false;
@@ -1326,11 +1323,6 @@ bool dict_codes_selection_root(PlanTree const& tree)
     if (sources.empty() || !(sources.front() == ValueId{0, 0})) { continue; }
     PlanNode const& node = tree.nodes[nid];
     if (node.op != "dictionary") { return false; }
-    // Nullable dictionary plans carry a trailing `null_mask` output channel;
-    // iteration-1 selection has no null model — refuse (never corrupt).
-    for (auto const& name : node.output_names) {
-      if (name == "null_mask") { return false; }
-    }
     // The mask consumer is the codes region: the `indices` channel must be
     // routed to a bitpack child so it can decode compacted.
     for (auto const& e : node.children) {
@@ -1349,6 +1341,10 @@ column_decode_caps probe_column(PlanTree const& tree)
 {
   namespace sc = sirius::codegen;
   column_decode_caps caps;
+  // A nullable column is never compacted or answered against its keys (decompress_column
+  // refuses a selection on it), so report no capability rather than let a caller reserve
+  // for a compacted decode that will not happen.
+  if (!tree.validity.empty()) { return caps; }
   // The shapes are mutually exclusive: a plan has exactly one (0,0)-producer,
   // so the route is a classification, not a set of overlapping flags.
   if (bitpack_selection_root(tree)) {

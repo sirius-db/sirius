@@ -801,6 +801,61 @@ void test_validity_sidecar_roundtrip()
   memory_roundtrip("validity_strings_mem", strs->view(), "input -> str_split\n");
 }
 
+// A nullable column's mask must be attributed to its own column (a projection sizes
+// columns from the per-buffer index), and a header whose validity record contradicts the
+// column is rejected at parse time rather than trusted.
+void test_validity_header_integrity()
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+
+  auto plain = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 128, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto nullable = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 128, cudf::mask_state::ALL_VALID, stream, mr);
+  cudf::set_null_mask(nullable->mutable_view().null_mask(), 3, 4, /*valid=*/false, stream);
+  nullable->set_null_count(1);
+  cudf::table_view tbl({plain->view(), nullable->view()});
+
+  auto ct = simpatico::compress_with_plan(
+    tbl, "input -> delta -> differences\n---\ninput -> delta -> differences\n", stream, mr);
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  auto const herr =
+    simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+  expect(herr.empty(), "validity_header_integrity: header error");
+  auto const mask_ptr = ct.columns[1].plan_tree->validity.mask.data();
+  bool found          = false;
+  for (auto const& b : buffers)
+    if (b.device_ptr == mask_ptr) {
+      found = true;
+      expect(b.column_index == 1, "validity_header_integrity: mask attributed to wrong column");
+    }
+  expect(found, "validity_header_integrity: mask buffer not listed");
+
+  // All-null column whose stored null_count disagrees with num_rows.
+  auto an = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 64, cudf::mask_state::ALL_NULL, stream, mr);
+  an->set_null_count(64);
+  cudf::table_view an_tbl({an->view()});
+  auto an_ct = simpatico::compress_with_plan(an_tbl, "input -> delta -> differences\n", stream, mr);
+  header.clear();
+  buffers.clear();
+  expect(
+    simpatico::build_compressed_table_header(an_ct, header, buffers, payload_bytes, stream).empty(),
+    "validity_header_integrity: all-null header error");
+  // num_rows (int64 64), kind (1 = all_null), null_count (int64 64).
+  std::vector<std::uint8_t> const pat = {64, 0, 0, 0, 0, 0, 0, 0, 1, 64, 0, 0, 0, 0, 0, 0, 0};
+  auto it = std::search(header.begin(), header.end(), pat.begin(), pat.end());
+  expect(it != header.end(), "validity_header_integrity: validity record not located");
+  *(it + 9)                         = 5;
+  simpatico::payload_fetch_fn fetch = [](std::uint64_t, std::size_t, void*, ::cuda::stream_ref) {};
+  std::string rerr;
+  simpatico::read_compressed_table_from_memory(header, fetch, stream, mr, &rerr);
+  expect(!rerr.empty(), "validity_header_integrity: corrupt null_count accepted");
+}
+
 }  // namespace
 
 int main()
@@ -839,6 +894,7 @@ int main()
     {"identity_string_roundtrip", test_identity_string_roundtrip},
     {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
     {"validity_sidecar", test_validity_sidecar_roundtrip},
+    {"validity_header_integrity", test_validity_header_integrity},
   };
 
   int failures = 0;
