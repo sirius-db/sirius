@@ -24,6 +24,7 @@
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_concat.hpp>
 #include <op/sirius_physical_hash_join.hpp>
+#include <op/sirius_physical_nested_loop_join.hpp>
 #include <op/sirius_physical_partition.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 
@@ -218,6 +219,70 @@ std::shared_ptr<data_batch> make_int32_batch(memory_space& space, std::size_t nu
   std::vector<int32_t> values(num_rows);
   std::iota(values.begin(), values.end(), 0);
   return make_numeric_batch<int32_t>(space, values, cudf::type_id::INT32);
+}
+
+//! A nested loop join on `left.col0 < right.col0`; `logical_join` must outlive the join.
+struct nested_loop_join_test_fixture {
+  duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
+  duckdb::unique_ptr<sirius_physical_nested_loop_join> nested_loop_join;
+};
+
+nested_loop_join_test_fixture create_test_nested_loop_join(duckdb::JoinType join_type)
+{
+  nested_loop_join_test_fixture fixture;
+  fixture.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
+  fixture.logical_join->types = {duckdb::LogicalType::INTEGER};
+
+  auto make_child = [] {
+    return duckdb::make_uniq<sirius_physical_operator>(
+      SiriusPhysicalOperatorType::PROJECTION,
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      0);
+  };
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  conditions.emplace_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_LESSTHAN);
+
+  fixture.nested_loop_join = duckdb::make_uniq<sirius_physical_nested_loop_join>(
+    *fixture.logical_join,
+    make_child(),
+    make_child(),
+    sirius::wrap_join_conditions(std::move(conditions)),
+    join_type,
+    1000);
+  size_t next_id = 0;
+  number_operator_tree(*fixture.nested_loop_join, next_id);
+  return fixture;
+}
+
+/**
+ * @brief Batches in the first group a CONCAT feeding @p downstream_join releases from five
+ * finished batches that each exceed its threshold: five when it folds its side, one otherwise.
+ */
+std::size_t first_group_size(sirius_physical_operator& downstream_join, bool is_build)
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+  constexpr int num_batches = 5;
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    &downstream_join,
+    is_build,
+    /*concat_batch_bytes=*/1024);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+  cucascade::shared_data_repository repo;
+  for (int b = 0; b < num_batches; ++b) {
+    repo.add_data_batch(make_int32_batch(*space, 1000), 0);
+  }
+  attach_concat_port(concat_op, repo);
+
+  auto group = concat_op.get_next_task_input_data();
+  REQUIRE(group != nullptr);
+  return dynamic_cast<const pipelineable_operator_data&>(*group).get_data_batches().size();
 }
 
 }  // namespace
@@ -1053,6 +1118,32 @@ TEST_CASE("sirius_physical_concat constructor sets concat_all for different join
         &non_join_op,
         false),
       std::runtime_error);
+  }
+}
+
+TEST_CASE("sirius_physical_concat folds the side a nested loop join decides rows against",
+          "[physical_concat]")
+{
+  struct expectation {
+    duckdb::JoinType join_type;
+    bool fold_build;
+    bool fold_probe;
+  };
+  for (auto const& e : {expectation{duckdb::JoinType::INNER, false, false},
+                        expectation{duckdb::JoinType::LEFT, true, false},
+                        expectation{duckdb::JoinType::SEMI, true, false},
+                        expectation{duckdb::JoinType::ANTI, true, false},
+                        expectation{duckdb::JoinType::MARK, true, false},
+                        expectation{duckdb::JoinType::RIGHT, false, true},
+                        expectation{duckdb::JoinType::OUTER, true, true}}) {
+    DYNAMIC_SECTION(duckdb::JoinTypeToString(e.join_type))
+    {
+      auto fixture = create_test_nested_loop_join(e.join_type);
+      CHECK(first_group_size(*fixture.nested_loop_join, /*is_build=*/true) ==
+            (e.fold_build ? 5 : 1));
+      CHECK(first_group_size(*fixture.nested_loop_join, /*is_build=*/false) ==
+            (e.fold_probe ? 5 : 1));
+    }
   }
 }
 
