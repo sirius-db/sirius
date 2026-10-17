@@ -1395,6 +1395,58 @@ TEST_CASE_METHOD(
 }
 
 TEST_CASE_METHOD(KMeansFixture,
+                 "a probe block over host-tier lists that overflows its candidates stays exact",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Component 0 four times wider than the rest coarsens the INT8 codes, so many pairs pass the
+  // filter and a 50,000-row block overflows its candidate buffer; the slices it replays must read
+  // their own chunk's rows, staged from the host, not whatever was staged after it. Probing every
+  // cluster makes the answer the exact one.
+  auto const gen = [](const std::string& seed) {
+    return "list_transform(range(64), lambda d: ((hash(i * 1000 + d + " + seed +
+           ") % 1000)::FLOAT / 1000.0 * CASE WHEN d = 0 THEN 4 ELSE 1 END))::FLOAT[64]";
+  };
+  run_ok("CREATE TABLE kmov_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
+         " AS vec FROM range(70000) t(i);");
+  run_ok("CREATE TABLE kmov_probe AS SELECT i::INTEGER AS id, " + gen("100000000") +
+         " AS vec FROM range(130000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'kmov_corpus', tier => 'host', format => 'duckdb');");
+  run_ok("SET scan_task_batch_size = 10000000;");
+  run_ok("SELECT * FROM pin_table(name => 'kmov_probe', tier => 'gpu', format => 'duckdb');");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_fit('kmov_corpus','vec', name => 'kmov_c', n_clusters => 16);");
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_INT8_ROTATE");
+      ::unsetenv("SIRIUS_VSS_PROBE_BLOCK_ROWS");
+    }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_INT8_ROTATE", "0", 1);
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('kmov_corpus','vec','kmov_c', storage => 'int8', "
+    "tier => 'host');");
+  ::setenv("SIRIUS_VSS_PROBE_BLOCK_ROWS", "50000", 1);
+  auto const join = [&](const std::string& extra) {
+    return "SELECT left_id, distance FROM sirius_knn_join('kmov_probe','vec','kmov_corpus','vec', "
+           "metric => 'l2', k => 10, " +
+           extra + ");";
+  };
+  auto const exact = distance_multiset(*con, join("search_mode => 'exact-gemm'"));
+  auto const lists = distance_multiset(
+    *con, join("search_mode => 'approx', clustering => 'kmov_c', n_probes => 16"));
+  REQUIRE(exact.size() == 130000u * 10u);
+  REQUIRE(lists.size() == exact.size());
+  std::size_t mismatched = 0;
+  for (std::size_t i = 0; i < exact.size(); ++i) {
+    mismatched +=
+      lists[i].first != exact[i].first || std::llabs(lists[i].second - exact[i].second) > 2;
+  }
+  CHECK(mismatched == 0);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
                  "probe blocks over host-tier lists answer as one task per probe chunk does",
                  "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
 {

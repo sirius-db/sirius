@@ -3480,10 +3480,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         if (keep_chunks && sweep == 0 && can_keep()) {
           kept.emplace(j, std::move(staged));
         } else {
+          // A group that overflowed replays its slices, which read this chunk's staged rows: check
+          // it while they are still there.
+          if (any_bounded && (staged.buffer || staged.owner || staged.reader)) { check_group(); }
           release_staged(staged);
         }
       }
     }
+    if (any_bounded && !kept.empty()) { check_group(); }
     for (auto& entry : kept) {
       release_staged(entry.second);
     }
