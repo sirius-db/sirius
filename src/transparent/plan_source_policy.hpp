@@ -39,24 +39,45 @@ struct scan_source_policy {
   bool permits_cpu_replay  = true;
   std::string reason;
 };
+/// What the executing entry point decided about Sirius-owned S3 sources when it
+/// admitted a CPU replay.  Captured once per execution and passed to every
+/// check that execution performs; the stored policy itself only records that a
+/// scan reads S3.
+struct cpu_replay_decision {
+  bool s3_allowed = false;
+};
 struct plan_source_policy {
   std::vector<scan_source_policy> scans;
   bool discovery_complete = true;
   [[nodiscard]] bool cpu_replay_permitted() const noexcept;
+  [[nodiscard]] bool cpu_replay_permitted(cpu_replay_decision) const noexcept;
   [[nodiscard]] bool reads_sirius_owned_s3() const noexcept;
   [[nodiscard]] std::string reason() const;
+  [[nodiscard]] std::string reason(cpu_replay_decision) const;
 };
 plan_source_policy derive_plan_source_policy(duckdb::PhysicalOperator const&,
                                              duckdb::ClientContext&);
 plan_source_policy derive_plan_source_policy(duckdb::LogicalOperator const&,
                                              duckdb::ClientContext&);
 // The existing S3 veto precedes the fallback setting; other source vetoes do not.
+// The overloads without a decision behave as `cpu_replay_decision{false}`.
 void require_s3_cpu_replay(plan_source_policy const&,
+                           std::string const& sql,
+                           std::string const& gpu_error);
+void require_s3_cpu_replay(plan_source_policy const&,
+                           cpu_replay_decision,
                            std::string const& sql,
                            std::string const& gpu_error);
 // Check remaining source vetoes after require_s3_cpu_replay has succeeded.
 void require_non_s3_cpu_replay(plan_source_policy const&, std::string const& gpu_error);
+void require_non_s3_cpu_replay(plan_source_policy const&,
+                               cpu_replay_decision,
+                               std::string const& gpu_error);
 void require_cpu_replay(plan_source_policy const&,
+                        std::string const& sql,
+                        std::string const& gpu_error);
+void require_cpu_replay(plan_source_policy const&,
+                        cpu_replay_decision,
                         std::string const& sql,
                         std::string const& gpu_error);
 }  // namespace sirius::transparent
