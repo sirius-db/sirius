@@ -402,7 +402,9 @@ std::optional<ring_exchange::send_job> ring_exchange::export_batch(
     std::lock_guard lock{_mutex};
     exchange = _exchange;
   }
-  if (!exchange) { throw sirius::invalid_input_exception("ring exchange: not attached"); }
+  if (!exchange) {
+    throw sirius::invalid_input_exception("ring exchange: not attached, or closed");
+  }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
   auto const stream = _send_stream.view();
 
@@ -558,7 +560,9 @@ ring_exchange::landing ring_exchange::begin(std::span<std::uint8_t const> header
     exchange = _exchange;
     tiers    = _tiers;
   }
-  if (!exchange) { throw sirius::invalid_input_exception("ring exchange: not attached"); }
+  if (!exchange) {
+    throw sirius::invalid_input_exception("ring exchange: not attached, or closed");
+  }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
   auto const frame_bytes = _recv.frame_bytes();
   st->frames = static_cast<std::uint32_t>((wire.stream_bytes + frame_bytes - 1) / frame_bytes);
@@ -943,6 +947,29 @@ void ring_exchange::abort(std::uint64_t id)
     std::error_code ignored;
     std::filesystem::remove(st->path, ignored);
   }
+}
+
+void ring_exchange::close()
+{
+  std::vector<std::uint64_t> landings;
+  {
+    std::lock_guard lock{_mutex};
+    if (_closed) { return; }
+    for (auto const& [id, st] : _landings) {
+      landings.push_back(id);
+    }
+  }
+  for (auto const id : landings) {
+    abort(id);
+  }
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
+  _send_stream.synchronize_no_throw();
+  _recv_stream.synchronize_no_throw();
+  std::lock_guard lock{_mutex};
+  _jobs.clear();
+  _tickets.clear();
+  _exchange.reset();
+  _closed = true;
 }
 
 // ---- stats ---------------------------------------------------------------------------------

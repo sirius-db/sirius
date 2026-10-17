@@ -39,13 +39,17 @@
 #endif
 
 namespace sirius::exec {
+class batch_stream;
 class exchange_inbox;
-}
+class ring_exchange;
+}  // namespace sirius::exec
 
 namespace sirius::ffi {
 
 class ExchangeInbox;
 class Fragment;
+class OutputDrain;
+class RingExchange;
 
 /// RAII handle to a Sirius engine context.
 ///
@@ -64,6 +68,17 @@ class SIRIUS_FFI_EXPORT Context {
  public:
   Context();
   explicit Context(const std::string& config_path);
+
+  /// What make_context_with_ring() passes through.
+  struct RingOptions {
+    std::uint64_t frame_bytes;
+    std::uint64_t send_bytes;
+    std::uint64_t recv_bytes;
+    double gpu_landing_fraction;
+    std::uint64_t host_landing_bytes;
+  };
+  /// A context with a ring exchange; an empty `config_path` uses built-in defaults.
+  Context(const std::string& config_path, RingOptions const& ring);
   ~Context();
 
   Context(const Context&)            = delete;
@@ -80,6 +95,9 @@ class SIRIUS_FFI_EXPORT Context {
   /// A handle to this Context's exchange inbox, or null unless the Context has one GPU memory
   /// space.
   [[nodiscard]] std::unique_ptr<ExchangeInbox> exchange_inbox() const;
+
+  /// This context's ring exchange, or null unless it was made by make_context_with_ring().
+  [[nodiscard]] std::unique_ptr<RingExchange> ring_exchange() const;
 
  private:
   struct Impl;
@@ -111,6 +129,107 @@ class SIRIUS_FFI_EXPORT ExchangeInbox {
   std::shared_ptr<sirius::exec::exchange_inbox> exchange_;
 
   friend class Context;
+};
+
+/**
+ * @brief The engine's ends of the ring exchange: a send ring and a receive ring of fixed frames,
+ * the only memory a transport registers, and the copies in and out of them.
+ *
+ * A sender exports a batch as a job (OutputDrain::export_ring_next, Fragment::export_ring),
+ * leases send frames, stage()s each frame of the job's stream into one, WRITEs it to a peer's
+ * receive frame, and releases the job once every frame is written. A receiver begin()s a landing
+ * from a job's header, copy_out()s each received frame as it arrives, returns the frame once its
+ * copy is done(), and seal()s the landing into a token for Fragment::push_received. Copies are
+ * asynchronous; done() polls a ticket without waiting.
+ *
+ * Callable from any thread. After its Context is destroyed every call but the accessors throws.
+ */
+class SIRIUS_FFI_EXPORT RingExchange {
+ public:
+  [[nodiscard]] int device() const noexcept;
+  [[nodiscard]] std::uintptr_t send_base() const noexcept;
+  [[nodiscard]] std::uint64_t send_len() const noexcept;
+  [[nodiscard]] std::uintptr_t recv_base() const noexcept;
+  [[nodiscard]] std::uint64_t recv_len() const noexcept;
+  [[nodiscard]] std::uint64_t frame_bytes() const noexcept;
+
+  /// A free send or receive frame's index, or -1 when every one is leased. Never blocks.
+  [[nodiscard]] std::int64_t lease_send() const;
+  [[nodiscard]] std::int64_t lease_recv() const;
+  /// Returns a leased frame. @throws on a frame not leased.
+  void release_send(std::uint32_t frame) const;
+  void release_recv(std::uint32_t frame) const;
+
+  /// Copy frame `k` of job `token`'s stream into send frame `frame`. @return a ticket.
+  std::uint64_t stage(std::uint64_t token, std::uint32_t k, std::uint32_t frame) const;
+  /// Free what job `token` holds once its frames were written. Unknown tokens are ignored.
+  void release_job(std::uint64_t token) const;
+
+  /// Start landing the batch whose header is the `header_len` bytes at `header_addr`, without
+  /// waiting for memory. Sets `tier` (0 GPU, 1 host, 2 disk), `rows`, `stream_bytes` and
+  /// `frames`. @return the landing.
+  /// @throws on a malformed header, or when no tier has room ("no tier has room ...").
+  std::uint64_t begin(std::uintptr_t header_addr,
+                      std::size_t header_len,
+                      std::uint8_t& tier,
+                      std::uint64_t& rows,
+                      std::uint64_t& stream_bytes,
+                      std::uint32_t& frames) const;
+  /// Copy the `len` bytes of receive frame `frame`, the stream's frame `k`, to `landing`.
+  /// @return a ticket.
+  std::uint64_t copy_out(std::uint64_t landing,
+                         std::uint32_t k,
+                         std::uint32_t frame,
+                         std::uint64_t len) const;
+  /// Hand a landing whose every copy is done to the exchange inbox. @return its token.
+  std::uint64_t seal(std::uint64_t landing) const;
+  /// Free a landing that will not be sealed. Unknown landings are ignored.
+  void abort(std::uint64_t landing) const;
+
+  /// Whether the copies of `ticket` finished; true consumes it. @throws when they failed.
+  bool done(std::uint64_t ticket) const;
+
+  /// Batches and bytes sent and landed per kind and tier, and the rings' peak occupancy.
+  [[nodiscard]] std::unique_ptr<std::string> stats_line() const;
+
+ private:
+  explicit RingExchange(std::shared_ptr<sirius::exec::ring_exchange> ring);
+
+  std::shared_ptr<sirius::exec::ring_exchange> ring_;
+
+  friend class Context;
+};
+
+/// Exports one output stream of a fragment as ring exchange jobs while the fragment is still
+/// running, so its batches ship as the sink produces them instead of after run() returns. Created
+/// by Fragment::output_drain().
+///
+/// Callable from any thread, without the Context's connection: it shares only the stream and the
+/// exchanges. One consumer per stream; do not mix with export_ring() or relay_from() on the same
+/// stream. Destroy it before its Context.
+class SIRIUS_FFI_EXPORT OutputDrain {
+ public:
+  OutputDrain(std::shared_ptr<sirius::exec::batch_stream> stream,
+              std::shared_ptr<sirius::exec::exchange_inbox> exchange,
+              std::shared_ptr<sirius::exec::ring_exchange> ring);
+
+  /// Exports the next batch with rows as a RingExchange job, waiting up to `timeout_ms` for the
+  /// sink to produce one. On a batch, sets `token`, `kind` (1 GPU columns, 2 host columns,
+  /// 3 compressed), `rows` and `stream_bytes`, and returns the job's header. Otherwise returns
+  /// null, with `ended` true at the end of the stream and false when nothing arrived in time. A
+  /// batch spilled to host is sent from host, not brought back to the GPU.
+  /// @throws the fragment's error once its run() failed, or on a batch it cannot send.
+  std::unique_ptr<std::vector<std::uint8_t>> export_ring_next(std::uint32_t timeout_ms,
+                                                              bool& ended,
+                                                              std::uint64_t& token,
+                                                              std::uint8_t& kind,
+                                                              std::uint64_t& rows,
+                                                              std::uint64_t& stream_bytes) const;
+
+ private:
+  std::shared_ptr<sirius::exec::batch_stream> stream_;
+  std::shared_ptr<sirius::exec::exchange_inbox> exchange_;
+  std::shared_ptr<sirius::exec::ring_exchange> ring_;
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
@@ -192,6 +311,22 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
 
+  /// Exports the next batch of output `stream_id` as a RingExchange job, after run() returned
+  /// (see OutputDrain::export_ring_next). @return its header, or null once the stream is drained.
+  /// @throws before run(), on an unknown stream, or without a RingExchange.
+  std::unique_ptr<std::vector<std::uint8_t>> export_ring(std::uint64_t stream_id,
+                                                         std::uint64_t& token,
+                                                         std::uint8_t& kind,
+                                                         std::uint64_t& rows,
+                                                         std::uint64_t& stream_bytes);
+
+  /// A handle that exports output stream `stream_id` from any thread, including while run()
+  /// executes. Take it after build() and before run() to ship output as it is produced. A
+  /// fragment destroyed without running fails its drains.
+  /// @throws before build(), on an unknown stream or a result fragment, or without a
+  /// RingExchange.
+  [[nodiscard]] std::unique_ptr<OutputDrain> output_drain(std::uint64_t stream_id) const;
+
   /// Push the batch received under `token` into input stream `stream_id`. Consumes the token
   /// unless it throws before reading it: before build(), without a ExchangeInbox, after run()
   /// started, or on an undeclared input.
@@ -244,6 +379,19 @@ SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context();
 
 /// Create a [`Context`] configured from the YAML file at `config_path`.
 SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(const std::string& config_path);
+
+/// Create a [`Context`] with a ring exchange (see RingExchange), configured from the YAML file at
+/// `config_path`, or from built-in defaults when it is empty. The rings, `send_bytes` and
+/// `recv_bytes` of `frame_bytes` frames, are allocated on the current CUDA device before the
+/// engine's GPU pool. Batches landing from peers may hold up to `gpu_landing_fraction` of the GPU
+/// space and `host_landing_bytes` of the host tier until their receivers take them; beyond that
+/// they land on disk, if the configuration has a disk tier.
+SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_with_ring(const std::string& config_path,
+                                                                  std::uint64_t frame_bytes,
+                                                                  std::uint64_t send_bytes,
+                                                                  std::uint64_t recv_bytes,
+                                                                  double gpu_landing_fraction,
+                                                                  std::uint64_t host_landing_bytes);
 
 /// Create a [`Fragment`] on `context`. The context must outlive it.
 SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);

@@ -165,6 +165,11 @@ class ring_exchange {
   /// first.
   void abort(std::uint64_t landing);
 
+  /// Frees every job and landing while the memory spaces they came from still exist; later
+  /// calls throw. The rings stay allocated until the last reference goes, so a transport that
+  /// registered them can deregister them first.
+  void close();
+
   // ---- both --------------------------------------------------------------------------------
 
   /// Whether ticket @p ticket's copies finished, without waiting; true consumes the ticket.
@@ -206,6 +211,7 @@ class ring_exchange {
 
   std::shared_ptr<exchange_inbox> _exchange;
   landing_tiers _tiers;
+  bool _closed{false};
   /// Bytes landed per tier and not yet taken; shared with the exchange inbox's on_gone callbacks.
   std::shared_ptr<held> _held;
 
