@@ -19,6 +19,7 @@
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_metadata.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
@@ -26,7 +27,7 @@
 #include "sirius_context.hpp"
 #include "test_utils.hpp"
 #include "transparent/read_view_registry.hpp"
-#include "utils/table_filter_test_utils.hpp"
+#include "transparent/replay_admission.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -36,6 +37,7 @@
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
@@ -143,10 +145,10 @@ std::unique_ptr<duckdb_native_ingestible_table_info> native_info(native_database
   info->projected_output_count = 1;
   if (all_pruned) {
     info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-    info->table_filters->SetFilterByColumnIndex(
+    info->table_filters->PushFilter(
       duckdb::ProjectionIndex(0),
-      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN,
-                                    duckdb::Value::INTEGER(-1)));
+      duckdb::ExpressionFilter::CreateComparisonFilter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                                       duckdb::Value::INTEGER(-1)));
   }
   return info;
 }
@@ -1153,6 +1155,33 @@ TEST_CASE("Split consumption rejects a foreign projection contract", "[scan][cer
   CHECK(after.certificate_mismatches == before.certificate_mismatches + 1);
 }
 
+TEST_CASE("Execution rejects foreign footer provenance before schema access",
+          "[scan][certificate][consumption][metadata_retention]")
+{
+  auto info    = parquet_info(81);
+  auto path    = info->resolved_file_paths.front();
+  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto source  = ioctx->open_datasource(path);
+  auto foreign = std::make_shared<parquet_metadata>(nullptr,
+                                                    64,
+                                                    parquet_encryption_evidence{},
+                                                    std::vector<uint8_t>{},
+                                                    std::string{},
+                                                    std::vector<uint8_t>{},
+                                                    "foreign-open");
+  REQUIRE(source->store_metadata(foreign));
+  auto ingestible = make_ingestible(std::move(info));
+  auto provider   = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  try {
+    auto split = provider();
+    FAIL("foreign footer was accepted");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == sirius::transparent::late_failure_cause::physical_input);
+    CHECK(std::string(error.what()).find("footer identity mismatch") != std::string::npos);
+  }
+}
+
 TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
           "[scan][certificate][consumption]")
 {
@@ -1184,6 +1213,31 @@ TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
     certificates[0].input_identity = parquet->rg_slices[0].file_path + "|footer=0";
   }
   SECTION("missing file approval") { dependencies[0].parquet_approval.reset(); }
+  SECTION("missing metadata owner")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->metadata_owner.reset();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("foreign metadata owner")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->metadata_owner         = std::make_shared<sirius::io::io_object_metadata>();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("missing object identity")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->object_identity.clear();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("foreign object identity")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->object_identity += "different-version";
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+
   SECTION("row group outside approved set")
   {
     auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
@@ -1384,10 +1438,11 @@ TEST_CASE("Production scan preparation runs and publishes on the execute owner",
     if (result->HasError()) { INFO(result->GetError()); }
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 1);
+    auto chunk = result->Fetch();
     if (std::string_view(sql).starts_with("SELECT sum"))
-      CHECK(result->Collection().GetValue(0, 0).ToString() == "499500");
+      CHECK(chunk->GetValue(0, 0).ToString() == "499500");
     else {
-      auto value = result->Collection().GetValue(0, 0).GetValue<int64_t>();
+      auto value = chunk->GetValue(0, 0).GetValue<int64_t>();
       CHECK(value >= 0);
       CHECK(value < 1000);
     }

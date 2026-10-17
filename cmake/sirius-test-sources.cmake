@@ -1,5 +1,10 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/scan/bench_parquet_footer_cache.cpp
+    test/cpp/io/cache/bench_metadata_store.cpp
+    test/cpp/io/test_parquet_metadata_retention.cpp
+    test/cpp/io/cache/test_metadata_store.cpp
+    test/cpp/io/test_object_identity.cpp
     test/cpp/scan_manager/test_preparation_readiness.cpp
     test/cpp/scan_manager/test_preparation.cpp
     test/cpp/scan_manager/test_preparation_unit.cpp
@@ -295,6 +300,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp
+    test/cpp/scan/test_r4_materialization.cpp
     test/cpp/scan/test_scan_filter_cast_ranges.cpp
     test/cpp/scan/test_scan_filter_ranges.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp

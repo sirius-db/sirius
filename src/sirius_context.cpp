@@ -1520,6 +1520,14 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     physical_counters_->iceberg_dv_manifest_reads.load(std::memory_order_relaxed);
   snapshot.iceberg_delete_payload_loads =
     physical_counters_->iceberg_delete_payload_loads.load(std::memory_order_relaxed);
+  snapshot.iceberg_delete_reader_io_failures =
+    physical_counters_->iceberg_delete_reader_io_failures.load(std::memory_order_relaxed);
+  snapshot.iceberg_delete_identity_failures =
+    physical_counters_->iceberg_delete_identity_failures.load(std::memory_order_relaxed);
+  snapshot.iceberg_delete_descriptor_mismatches =
+    physical_counters_->iceberg_delete_descriptor_mismatches.load(std::memory_order_relaxed);
+  snapshot.iceberg_delete_corrupt_inputs =
+    physical_counters_->iceberg_delete_corrupt_inputs.load(std::memory_order_relaxed);
   snapshot.iceberg_inventory_bytes_peak =
     physical_counters_->iceberg_inventory_bytes_peak.load(std::memory_order_relaxed);
   snapshot.split_physical_checks = physical_counters_->checks.load(std::memory_order_relaxed);
@@ -1529,6 +1537,21 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     physical_counters_->type_mismatches.load(std::memory_order_relaxed);
   snapshot.parquet_type_refusals =
     physical_counters_->type_refusals.load(std::memory_order_relaxed);
+  if (scan_manager_) {
+    auto const metadata                       = scan_manager_->metadata_cache_statistics();
+    snapshot.metadata_cache_entries           = metadata.entries;
+    snapshot.metadata_cache_hits              = metadata.hits;
+    snapshot.metadata_cache_misses            = metadata.misses;
+    snapshot.metadata_cache_replacements      = metadata.replacements;
+    snapshot.metadata_cache_bypasses          = metadata.bypasses;
+    snapshot.metadata_cache_joined            = metadata.joined;
+    snapshot.metadata_cache_builds            = metadata.builds;
+    snapshot.metadata_cache_failures          = metadata.failures;
+    snapshot.metadata_cache_cancelled_waiters = metadata.cancelled_waiters;
+    snapshot.metadata_cache_stale             = metadata.stale;
+  }
+  snapshot.metadata_provenance_mismatches =
+    physical_counters_->metadata_provenance_mismatches.load(std::memory_order_relaxed);
   for (std::size_t i = 0; i < snapshot.split_physical_rejections.size(); ++i)
     snapshot.split_physical_rejections[i] =
       physical_counters_->rejections[i].load(std::memory_order_relaxed);

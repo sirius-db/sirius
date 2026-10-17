@@ -12,6 +12,7 @@
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "io/sirius_datasource.hpp"
+#include "op/scan/field_id_mapping.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "scan_manager/config.hpp"
@@ -23,6 +24,10 @@
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
+
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
@@ -3558,7 +3563,7 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
   }
 }
 
-TEST_CASE("S3 Puffin open failures retain their phase and replay veto on both preparation routes",
+TEST_CASE("S3 Puffin planning refuses eager and preserves deferred open failure",
           "[s3][integration][iceberg][scan_preparation][s3_dv]")
 {
   auto env = load_s3_test_env();
@@ -3592,7 +3597,10 @@ TEST_CASE("S3 Puffin open failures retain their phase and replay veto on both pr
   auto local = directory.path() / "dv_bounded";
   for (auto const& entry : fs::recursive_directory_iterator(local)) {
     if (!entry.is_regular_file()) continue;
-    auto key = prefix + "/dv_bounded/" + fs::relative(entry.path(), local).generic_string();
+    auto relative = fs::relative(entry.path(), local);
+    // Leave the Puffin sidecar absent so this case exercises an actual open failure.
+    if (relative == fs::path("data/a.puffin")) continue;
+    auto key = prefix + "/dv_bounded/" + relative.generic_string();
     if (!sirius::test::put_s3_test_object(key, read_binary_file(entry.path()))) {
       if (sirius::test::s3::skip_or_fail_unless(false, "managed S3 backend required for DV upload"))
         return;
@@ -3647,15 +3655,29 @@ TEST_CASE("S3 Puffin open failures retain their phase and replay veto on both pr
       REQUIRE(result);
       REQUIRE(result->HasError());
       INFO(result->GetError());
-      CHECK(routes == 1);
-      CHECK(selected == deferred);
-      CHECK(opened_path == remote + "/dv_bounded/data/a.puffin");
-      CHECK(reads_started == 1);
-      CHECK(result->GetError().find("Cannot open file") != std::string::npos);
+      if (!deferred) {
+        // A remote Puffin can only use the deferred datasource route. Planning
+        // must decline before route publication, permit ownership, or a
+        // Puffin open; the CPU fallback may still report its own missing-file
+        // error when explicitly enabled.
+        CHECK(routes == 0);
+        CHECK(opened_path.empty());
+        CHECK(reads_started == 0);
+      } else {
+        CHECK(routes == 1);
+        CHECK(selected);
+        CHECK(opened_path == remote + "/dv_bounded/data/a.puffin");
+        CHECK(reads_started == 1);
+        CHECK(result->GetError().find("Cannot open file") != std::string::npos);
+      }
       auto after = context.get_transparent_execution_stats();
       auto cause = static_cast<size_t>(sirius::transparent::late_failure_cause::reader_io);
       CHECK(after.late_failures[cause] == before.late_failures[cause] + (deferred ? 1 : 0));
       CHECK(after.late_replays[cause] == before.late_replays[cause]);
+      auto eager_reason =
+        static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_puffin_remote_eager);
+      CHECK(after.semantic_declines[eager_reason] ==
+            before.semantic_declines[eager_reason] + (deferred ? 0 : 1));
       CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
       CHECK(after.fallbacks == before.fallbacks);
 
@@ -3663,4 +3685,207 @@ TEST_CASE("S3 Puffin open failures retain their phase and replay veto on both pr
       CHECK(provider->seen->allocated_bytes == 0);
     }
   }
+
+  // A supported remote Puffin must still be refused before any payload open if
+  // the deferred arena cannot be constructed after admission. This protects
+  // the planner fallback from accidentally retaining a stale deferred decision
+  // and entering the eager payload path.
+  provider->return_null           = false;
+  provider->seen->fail_allocation = true;
+  size_t allocation_routes        = 0;
+  size_t allocation_reads_started = 0;
+  std::string allocation_opened_path;
+  counters->iceberg_preparation_route_for_testing = [&](auto, bool) { ++allocation_routes; };
+  counters->iceberg_dv_phase_for_testing          = [&](auto const& path, bool start) {
+    if (start) {
+      allocation_opened_path = path;
+      ++allocation_reads_started;
+    }
+  };
+  require_query_ok(con, "SET enable_duckdb_fallback=false");
+  auto before = context.get_transparent_execution_stats();
+  auto result = con.Query(sql);
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+  CHECK(allocation_routes == 0);
+  CHECK(allocation_opened_path.empty());
+  CHECK(allocation_reads_started == 0);
+  auto after = context.get_transparent_execution_stats();
+  auto eager_reason =
+    static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_puffin_remote_eager);
+  CHECK(after.semantic_declines[eager_reason] == before.semantic_declines[eager_reason] + 1);
+  CHECK(provider->outstanding() == 0);
+  CHECK(provider->seen->allocated_bytes == 0);
+  provider->seen->fail_allocation = false;
+}
+
+TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU reference",
+          "[s3][integration][iceberg][scan_preparation][s3_dv]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  s3_sql_fixture fixture(*env);
+  auto& con = fixture.con;
+  require_query_ok(con, "LOAD avro");
+  require_query_ok(con, "LOAD iceberg");
+  require_query_ok(con, "SET unsafe_enable_version_guessing=true");
+
+  sirius::test::scratch_dir local_directory("s3_dv_cpu_reference");
+  sirius::test::scratch_dir remote_directory("s3_dv_remote_reference");
+  auto shell_quote = [](std::string const& value) {
+    std::string result(1, '\'');
+    for (char c : value) {
+      if (c == '\'') {
+        result += '\'';
+        result += '\\';
+        result += '\'';
+        result += '\'';
+      } else {
+        result += c;
+      }
+    }
+    return result + '\'';
+  };
+  auto generate = [&](std::filesystem::path const& directory, std::string const& remote) {
+    auto command = "python3 -B test/cpp/integration/data/generate_inventory_fixtures.py " +
+                   shell_quote(directory.string());
+    if (!remote.empty()) command += " " + shell_quote(remote);
+    REQUIRE(std::system(command.c_str()) == 0);
+  };
+
+  auto const prefix = std::string{"deferred-dv-positive"};
+  auto const remote = "s3://" + env->bucket + "/" + prefix;
+  generate(local_directory.path(), "");
+  generate(remote_directory.path(), remote);
+
+  auto const local        = local_directory.path() / "dv_bounded";
+  auto const remote_local = remote_directory.path() / "dv_bounded";
+  for (auto const& entry : fs::recursive_directory_iterator(remote_local)) {
+    if (!entry.is_regular_file()) continue;
+    auto relative = fs::relative(entry.path(), remote_directory.path());
+    auto key      = prefix + "/" + relative.generic_string();
+    if (!sirius::test::put_s3_test_object(key, read_binary_file(entry.path()))) {
+      if (sirius::test::s3::skip_or_fail_unless(false, "managed S3 backend required for DV upload"))
+        return;
+    }
+  }
+
+  auto metadata_bytes = read_binary_file(local / "metadata/v1.metadata.json");
+  std::string metadata(metadata_bytes.begin(), metadata_bytes.end());
+  auto key = metadata.find("current-snapshot-id");
+  REQUIRE(key != std::string::npos);
+  auto colon = metadata.find(':', key);
+  REQUIRE(colon != std::string::npos);
+  auto snapshot  = std::stoll(metadata.substr(colon + 1));
+  auto local_sql = "SELECT fruit, count FROM iceberg_scan(" +
+                   sql_quote((local / "metadata/v1.metadata.json").string()) +
+                   ", snapshot_from_id=" + std::to_string(snapshot) + ")";
+  set_gpu_execution(con, false);
+  auto local_result = require_query_ok(con, local_sql);
+  auto expected     = collect_rows(*local_result);
+
+  auto& context         = require_sirius_context(fixture);
+  auto counters         = context.physical_counters();
+  auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  provider->grant_bytes = 1024 * 1024;
+  bool deferred_route   = false;
+  std::string opened_path;
+  struct reset_hooks {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_hooks()
+    {
+      counters->preparation_provider_for_testing.reset();
+      counters->iceberg_preparation_route_for_testing = {};
+      counters->iceberg_dv_phase_for_testing          = {};
+    }
+  } reset{counters};
+  counters->preparation_provider_for_testing      = provider;
+  counters->iceberg_preparation_route_for_testing = [&](auto, bool deferred) {
+    deferred_route = deferred;
+  };
+  counters->iceberg_dv_phase_for_testing = [&](auto const& path, bool start) {
+    if (start) opened_path = path;
+  };
+
+  set_gpu_execution(con, true);
+  require_query_ok(con, "SET enable_duckdb_fallback=false");
+  auto remote_sql = "SELECT fruit, count FROM iceberg_scan(" +
+                    sql_quote(remote + "/dv_bounded/metadata/v1.metadata.json") +
+                    ", snapshot_from_id=" + std::to_string(snapshot) + ")";
+  auto remote_result = con.Query(remote_sql);
+  REQUIRE(remote_result);
+  REQUIRE_FALSE(remote_result->HasError());
+  CHECK(collect_rows(*remote_result) == expected);
+  CHECK(deferred_route);
+  CHECK(opened_path == remote + "/dv_bounded/data/a.puffin");
+}
+
+TEST_CASE("S3 R4 mapped Parquet normalizes IDs on bulk and general readers",
+          "[s3][integration][r4]")
+{
+  using namespace sirius::op::scan;
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  auto limits = large_sirius_memory_limits("sirius");
+  bool bulk   = true;
+  SECTION("REST bulk") {}
+  SECTION("kvikIO general")
+  {
+    limits.backend    = sirius::scan_manager::io_backend::kvikio;
+    limits.cache_mode = "none";
+    bulk              = false;
+  }
+  s3_sql_fixture fixture(*env, limits);
+  sirius::test::scratch_dir directory("s3_r4_mapping");
+  set_gpu_execution(fixture.con, false);
+  require_query_ok(fixture.con,
+                   "COPY (SELECT (range - 2)::INTEGER old_count FROM range(5)) TO " +
+                     directory.file_literal("data.parquet") +
+                     " (FORMAT PARQUET, FIELD_IDS {old_count: 2})");
+  REQUIRE(sirius::test::put_s3_test_object("r4-mapping/data.parquet",
+                                           read_binary_file(directory.path() / "data.parquet")));
+  auto uri    = s3_uri(env->bucket, "r4-mapping/data.parquet");
+  auto source = require_sirius_context(fixture).get_scan_manager().create_datasource(uri);
+  REQUIRE(source);
+  REQUIRE(source->prefers_bulk_io() == bulk);
+  auto options  = cudf::io::parquet_reader_options::builder().build();
+  auto resolved = resolve_parquet_metadata_with_identity(*source, 71, uri, options);
+  materialization_program program{
+    71,
+    1,
+    {cudf::data_type{cudf::type_id::INT64}, cudf::data_type{cudf::type_id::INT32}},
+    0,
+    false};
+  program.input_types = program.output_types;
+  auto mapping        = field_id_mapping::compile(
+    resolved.artifact,
+    resolved.identity,
+    program,
+    {{2, duckdb::LogicalType::BIGINT, {}, true},
+            {3, duckdb::LogicalType::INTEGER, duckdb::Value::INTEGER(42), false}});
+  bound_table_scan contract;
+  contract.contract_id = 71;
+  contract.profiles    = std::make_shared<physical_profile_table>();
+  parquet_source input{source, resolved.artifact->file_metadata(), {0}};
+  std::vector<std::size_t> groups{0};
+  rmm::cuda_stream stream;
+  auto batch = materialize_mapped_parquet(
+    input, mapping, contract, groups, stream.view(), cudf::get_current_device_resource_ref());
+  stream.synchronize();
+  REQUIRE(batch.rows == 5);
+  std::array<int64_t, 5> values;
+  std::array<int32_t, 5> defaults;
+  REQUIRE(cudaMemcpy(values.data(),
+                     batch.table.view().column(0).head<int64_t>(),
+                     sizeof(values),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(cudaMemcpy(defaults.data(),
+                     batch.table.view().column(1).head<int32_t>(),
+                     sizeof(defaults),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  CHECK(values == std::array<int64_t, 5>{-2, -1, 0, 1, 2});
+  CHECK(defaults == std::array<int32_t, 5>{42, 42, 42, 42, 42});
+  REQUIRE(batch.lineage.runs.size() == 1);
+  CHECK(batch.lineage.runs[0].file_row_offset == 0);
 }

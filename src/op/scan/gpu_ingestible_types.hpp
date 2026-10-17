@@ -51,6 +51,7 @@ class ingestible_table_info {
   std::shared_ptr<physical_profile_table> profiles = std::make_shared<physical_profile_table>();
 
   virtual ~ingestible_table_info() = default;
+  virtual bool allows_cached_rows() const { return true; }
 
   ingestible_table_info(ingestible_table_info const&)            = delete;
   ingestible_table_info& operator=(ingestible_table_info const&) = delete;

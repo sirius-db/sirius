@@ -30,6 +30,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
@@ -339,6 +340,31 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
       info->physical_schema = std::move(schema);
   }
 
+  if (iceberg_flat_mapping_supported(scan_op.bind_data.get())) {
+    auto const& bind    = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+    auto const& columns = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
+    std::vector<sirius::op::scan::field_requirement> requirements;
+    for (std::size_t p = 0; p < info->names.size(); ++p) {
+      auto found = std::find_if(columns.begin(), columns.end(), [&](auto const& column) {
+        return column.name == info->names[p] &&
+               column.type == sirius::to_duckdb(info->returned_types.at(p));
+      });
+      if (found == columns.end()) {
+        requirements.clear();
+        break;
+      }
+      std::optional<duckdb::Value> missing;
+      if (found->default_expression) {
+        auto const& constant = found->default_expression->Cast<duckdb::ConstantExpression>();
+        missing              = constant.GetLiteral().ToValue();
+      }
+      requirements.push_back(
+        {found->GetIdentifierFieldId(), found->type, std::move(missing), true, true});
+    }
+    if (requirements.size() == info->names.size())
+      info->field_mapping_requirements = std::move(requirements);
+  }
+
   if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
     throw duckdb::NotImplementedException("iceberg_scan has no table path parameter");
   }
@@ -374,6 +400,9 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   }
   auto inventory = std::move(*scan_op.delete_inventory);
   scan_op.delete_inventory.reset();
+  if (info->field_mapping_requirements)
+    info->files_without_partition_values =
+      sirius::op::scan::iceberg_files_without_partition_values(context, inventory);
   auto discovery =
     sirius::op::scan::discover_from_manifests(context, info->table_path, std::move(inventory));
   if (supplied_discovery)
@@ -421,6 +450,35 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
   };
   visit(root);
   if (scans.empty()) return;
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) throw duckdb::InternalException("iceberg scan requires a SiriusContext");
+  struct remote_puffin {
+    scan_contract_id contract;
+    std::string path;
+    std::string scheme;
+    bool backend_available;
+  };
+  std::vector<remote_puffin> remote_puffins;
+  auto const& scan_manager   = sirius_ctx->get_scan_manager();
+  auto inspect_remote_puffin = [&](scan_contract_id contract, auto const& dv) {
+    bool remote = false;
+    std::string scheme;
+    try {
+      auto const parsed = sirius::io::parse(dv.file_path);
+      scheme            = parsed.scheme;
+      remote            = parsed.scheme != "file";
+    } catch (std::invalid_argument const&) {
+      // Preserve the legacy handling for bare local paths. A malformed URI
+      // is remote only when it has an explicit scheme marker.
+      remote = dv.file_path.find("://") != std::string::npos;
+    }
+    if (!remote) return;
+    auto const backend           = scan_manager.planning_io_backend(dv.file_path);
+    auto const backend_available = scheme == "s3" && backend.has_value() &&
+                                   (*backend == sirius::io::io_context_type::restful ||
+                                    *backend == sirius::io::io_context_type::kvikio);
+    remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
+  };
   std::vector<scan_dv_count> counts;
   std::vector<scan_envelope> envelopes;
   bool qualified = true;
@@ -428,6 +486,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     if (c.discovery->positional_delete_files.empty()) validate_deletion_vector_claims(*c.discovery);
     uint64_t total = 0;
     for (auto const& dv : c.discovery->deletion_vector_entries) {
+      inspect_remote_puffin(c.scan->contract_id, dv);
       if (dv.record_count < 0 ||
           static_cast<uint64_t>(dv.record_count) > std::numeric_limits<uint64_t>::max() - total) {
         qualified = false;
@@ -449,7 +508,15 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       qualified = false;
     }
   }
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (auto const unsupported =
+        std::ranges::find_if(remote_puffins, [](auto const& p) { return !p.backend_available; });
+      unsupported != remote_puffins.end()) {
+    sirius_ctx->record_semantic_decline(verdict_reason::iceberg_puffin_uri_unsupported);
+    throw scan_verdict_declined(
+      "iceberg_scan declines the GPU path: Puffin URI '" + unsupported->path +
+        "' has no planning-capable remote backend",
+      {{unsupported->contract, verdict_reason::iceberg_puffin_uri_unsupported}});
+  }
   host_reservation_provider provider(sirius_ctx->get_memory_manager(),
                                      std::make_shared<decltype(sirius_ctx)>(sirius_ctx));
   auto counters  = sirius_ctx->physical_counters();
@@ -504,11 +571,32 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       for (auto& c : scans)
         c.info->deferred.reset();
       ledger.reset();
+      // The admission decision is only valid while all deferred arenas exist.
+      // Clear it with the ledger so a remote Puffin cannot fall through to the
+      // eager payload path after a deferred allocation failure.
+      decision = {};
     } catch (std::bad_alloc const&) {
       route_reason = "arena_allocation";
       for (auto& c : scans)
         c.info->deferred.reset();
       ledger.reset();
+      decision = {};
+    }
+  }
+  if (!remote_puffins.empty()) {
+    // Check each remote scan's final route; statement-level admission can leave a
+    // mixed positional/DV statement partly eager.
+    auto const eager_remote = std::ranges::find_if(remote_puffins, [&](auto const& remote) {
+      auto const scan = std::ranges::find_if(scans, [&](auto const& candidate) {
+        return candidate.scan->contract_id == remote.contract;
+      });
+      return scan == scans.end() || !scan->info->deferred;
+    });
+    if (eager_remote != remote_puffins.end()) {
+      sirius_ctx->record_semantic_decline(verdict_reason::iceberg_puffin_remote_eager);
+      throw scan_verdict_declined(
+        "iceberg_scan declines the GPU path: remote Puffin requires deferred preparation",
+        {{eager_remote->contract, verdict_reason::iceberg_puffin_remote_eager}});
     }
   }
   if (counters->track_units && counters->iceberg_statement_route_for_testing)

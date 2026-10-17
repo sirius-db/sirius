@@ -21,6 +21,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
+#include "op/scan/field_id_mapping.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/duckdb_host.hpp"
@@ -69,14 +70,18 @@ bool matches_bind(duckdb::FunctionData const* bind)
   return dynamic_cast<T const*>(bind) != nullptr;
 }
 
-bool collect_iceberg_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns)
+bool collect_iceberg_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns,
+                               std::unordered_set<int32_t>& field_ids)
 {
   if (columns.empty()) return false;
   for (auto const& column : columns) {
     if (column.identifier.IsNull() ||
         column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER)
       return false;
-    if (!column.children.empty() && !collect_iceberg_field_ids(column.children)) return false;
+    auto const field_id = column.identifier.GetValue<int32_t>();
+    if (field_id <= 0 || !field_ids.insert(field_id).second) return false;
+    if (!column.children.empty() && !collect_iceberg_field_ids(column.children, field_ids))
+      return false;
   }
   return true;
 }
@@ -604,12 +609,27 @@ class scan_source_extension_callback final : public duckdb::ExtensionCallback {
 
 std::span<connector const> registered_connectors() { return entries; }
 
+bool iceberg_flat_mapping_supported(duckdb::FunctionData const* bind_data)
+{
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
+  if (!bind) return false;
+  auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
+  std::unordered_set<int32_t> field_ids;
+  if (!collect_iceberg_field_ids(columns, field_ids)) return false;
+  return std::all_of(columns.begin(), columns.end(), [](auto const& column) {
+    return column.children.empty() && op::scan::field_mapping_type(column.type).has_value() &&
+           (!column.default_expression || column.default_expression->GetExpressionType() ==
+                                            duckdb::ExpressionType::VALUE_CONSTANT);
+  });
+}
+
 bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data)
 {
   auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
   if (bind == nullptr) return false;
   auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
-  return collect_iceberg_field_ids(columns);
+  std::unordered_set<int32_t> field_ids;
+  return collect_iceberg_field_ids(columns, field_ids);
 }
 
 void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
