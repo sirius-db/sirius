@@ -31,10 +31,11 @@ enum class spill_skip : std::size_t {
   not_idle,        ///< locked or being read when the sweep looked
   wrong_tier,      ///< not in the space being relieved, or already in a target
   lock_busy,       ///< its exclusive lock was taken when a worker came to convert it
+  recheck,         ///< subscribed between the pick and the lock, so given up
   no_target,       ///< no lower tier had room for it
 };
 
-inline constexpr std::size_t spill_skip_reasons = 6;
+inline constexpr std::size_t spill_skip_reasons = 7;
 
 /// Batches and bytes passed over by reason. Bytes are those known at the time: a batch that
 /// could not be read without its lock counts 0 bytes.
@@ -75,8 +76,13 @@ struct spill_skip_counts {
   /// "subscribed 3 (1.50 GiB), lock_busy 1 (0.06 GiB)" for every reason seen, or "none".
   [[nodiscard]] std::string to_string() const
   {
-    static constexpr std::array<char const*, spill_skip_reasons> names{
-      "borrow_refused", "subscribed", "not_idle", "wrong_tier", "lock_busy", "no_target"};
+    static constexpr std::array<char const*, spill_skip_reasons> names{"borrow_refused",
+                                                                       "subscribed",
+                                                                       "not_idle",
+                                                                       "wrong_tier",
+                                                                       "lock_busy",
+                                                                       "recheck",
+                                                                       "no_target"};
     std::string out;
     for (std::size_t i = 0; i < spill_skip_reasons; ++i) {
       auto const n = batches[i].load(std::memory_order_relaxed);

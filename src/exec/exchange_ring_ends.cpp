@@ -207,7 +207,18 @@ struct ring_exchange::held {
 struct ring_exchange::job {
   batch_kind kind;
   std::uint64_t stream_bytes;
+  /// Subscribed while the job holds it: the job reads its buffers without a lock, so a spill
+  /// candidate snapshotted before the batch left its repository must not convert it.
   std::shared_ptr<cucascade::data_batch> batch;
+  bool subscribed{false};
+
+  job()                      = default;
+  job(job const&)            = delete;
+  job& operator=(job const&) = delete;
+  ~job()
+  {
+    if (subscribed && batch) { batch->unsubscribe(); }
+  }
   /// A sliced batch's unsliced copy; sources point into it.
   std::unique_ptr<cudf::table> copy;
   /// gpu_columns: buffers and their device addresses, in walk order.
@@ -412,9 +423,17 @@ std::optional<ring_exchange::send_job> ring_exchange::export_batch(
   send_job described{};
   ring::wire_batch wire;
 
+  // Under a read-only lock no conversion is running; once subscribed, none may start.
+  auto const hold = [&] {
+    if (out->subscribed) { return; }
+    batch->subscribe();
+    out->subscribed = true;
+    out->batch      = batch;
+  };
   auto const describe_host = [&]() -> bool {
     auto const ro    = batch->to_read_only();
     auto const* data = ro.get_data();
+    hold();
     if (auto const* host = dynamic_cast<cucascade::host_data_representation const*>(data)) {
       auto const& table = host->get_host_table();
       if (!table || table->columns.empty()) { return false; }
@@ -453,6 +472,7 @@ std::optional<ring_exchange::send_job> ring_exchange::export_batch(
     // Anything else travels from the GPU: bring it back first (it may wait for memory).
     exchange->bring_to_gpu(*batch);
     auto const ro = batch->to_read_only();
+    hold();
     if (ro.get_current_tier() != Tier::GPU) {
       throw sirius::invalid_input_exception("ring exchange: the batch is not on the GPU");
     }
