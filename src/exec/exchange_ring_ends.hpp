@@ -234,6 +234,18 @@ class ring_exchange {
   bool _disk_stop{false};
   void* _bounce{nullptr};
   std::thread _disk_thread;
+
+  // Frames of batches sent from their disk files, read one at a time through a pinned bounce
+  // frame and copied into the send frame.
+  struct read_task;
+  void run_disk_reads();
+  std::mutex _read_mutex;
+  std::condition_variable _read_cv;
+  std::deque<std::shared_ptr<read_task>> _read_queue;
+  bool _read_stop{false};
+  void* _read_bounce{nullptr};
+  rmm::cuda_stream _read_stream;
+  std::thread _read_thread;
 };
 
 }  // namespace sirius::exec
