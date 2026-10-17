@@ -43,7 +43,7 @@
  *   compression header. It lands as a compressed batch and is decoded on its way to the GPU.
  *
  * The header rides with the batch's first frame. Columns are fixed-width or STRING, as in the
- * direct exchange.
+ * exchange inbox.
  */
 namespace sirius::exec::ring {
 
