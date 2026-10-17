@@ -812,3 +812,33 @@ TEST_CASE("sirius_config validates cluster redirect scope and rejects unknown ke
     }
   }
 }
+
+TEST_CASE("REST request logging defaults off in configuration",
+          "[scan_manager][config][rest_request_log]")
+{
+  using sirius::test::rest_redirect::request_log_enabled;
+  CHECK_FALSE(request_log_enabled(sirius::io::rest::config{}));
+  auto const absent =
+    load_scan_manager("request-log-absent.yaml", single_gpu_scan_manager_yaml(""));
+  CHECK_FALSE(request_log_enabled(absent.rest));
+}
+
+TEST_CASE("REST request logging YAML enables the collector and retains strict keys",
+          "[scan_manager][config][rest_request_log]")
+{
+  using sirius::test::rest_redirect::request_log_enabled;
+  auto const enabled =
+    load_scan_manager("request-log-enabled.yaml",
+                      single_gpu_scan_manager_yaml("      rest:\n        request_log: true\n"));
+  REQUIRE(request_log_enabled(enabled.rest));
+  auto const disabled =
+    load_scan_manager("request-log-disabled.yaml",
+                      single_gpu_scan_manager_yaml("      rest:\n        request_log: false\n"));
+  CHECK_FALSE(request_log_enabled(disabled.rest));
+  CHECK_THROWS_WITH(
+    load_scan_manager(
+      "request-log-unknown.yaml",
+      single_gpu_scan_manager_yaml(
+        "      rest:\n        request_log: true\n        request_log_unknown: 1\n")),
+    Catch::Matchers::ContainsSubstring("request_log_unknown"));
+}

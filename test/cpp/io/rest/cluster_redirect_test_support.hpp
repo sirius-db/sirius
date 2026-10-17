@@ -32,11 +32,36 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace sirius::test::rest_redirect {
+
+template <typename Config>
+constexpr bool has_request_log = requires(Config& cfg) { cfg.request_log; };
+
+template <typename Config>
+void set_request_log(Config& cfg, bool enabled)
+{
+  if constexpr (has_request_log<Config>) { cfg.request_log = enabled; }
+}
+
+template <typename Config>
+bool request_log_enabled(Config const& cfg)
+{
+  if constexpr (has_request_log<Config>) { return cfg.request_log; }
+  return false;
+}
+
+// Run the existing transport regressions in both instrumentation modes.
+template <typename Config>
+void request_log_from_test_env(Config& cfg)
+{
+  auto const* mode = std::getenv("SIRIUS_TEST_REST_REQUEST_LOG");
+  if (mode != nullptr) { set_request_log(cfg, std::string_view{mode} == "1"); }
+}
 
 template <typename Config>
 constexpr bool has_policy = requires(Config& cfg) {
