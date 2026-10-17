@@ -144,6 +144,7 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
+| `allocator` | `async` \| `slab` | `async` | `async` is a CUDA async pool. `slab` suballocates one `cudaMalloc` of the whole capacity (rounded up to 2 MiB, and at least 2 MiB) taken at startup, so a transport can register it once; it is never trimmed on OOM. Also accepted per space as `sirius.space.gpu[].allocator`. |
 
 The high-level GPU path keeps per-stream reservation tracking off. The
 diagnostic control remains available only through the explicit low-level
@@ -241,6 +242,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
 | `memory_capacity` | bytes | space default | Absolute capacity of the space. |
+| `allocator` | `async` \| `slab` | `async` | The space's GPU pool; see `sirius.memory.gpu.allocator`. |
 
 #### `sirius.space.host[]` — one entry per host (pinned) memory space
 
