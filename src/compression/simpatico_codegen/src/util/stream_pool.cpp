@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "codegen/util/stream_pool.hpp"
 
+#include <rmm/error.hpp>
+
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -19,8 +21,14 @@ stream_pool& thread_device_stream_pool(size_t n)
   auto& pool = pools[device];
   if (pool.streams.empty()) {
     if (!pool.init(n)) {
-      throw std::runtime_error("stream_pool: failed to create " + std::to_string(n) +
-                               " streams on device " + std::to_string(device));
+      // Stream creation fails when the device is out of resources, which is
+      // transient: report it as an OOM so a caller that retries on OOM does, rather
+      // than failing the work outright. Clear the error so it does not surface at
+      // the next unrelated runtime call.
+      cudaError_t const err = cudaGetLastError();
+      throw rmm::out_of_memory("stream_pool: failed to create " + std::to_string(n) +
+                               " streams on device " + std::to_string(device) + ": " +
+                               cudaGetErrorString(err));
     }
   }
   return pool;
