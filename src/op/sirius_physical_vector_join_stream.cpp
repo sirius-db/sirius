@@ -1296,9 +1296,12 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
   // searches set how often they are read. Deep100M, 9.6 GB of INT8 lists, 10M probes at 64 probes
   // each on a 24 GB device: one task per ~245k-row probe chunk 86.2 s, ~0.9M-row blocks (a quarter
   // of the device) 62.7 s, 1.25M-row blocks (a third) 59.6 s; lists on the device 53.6 s. Blocks
-  // cut and join probe chunks to that size; only top-k answers are split back.
-  bool const wanted = _lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST &&
-                      _request.mode != vss::vector_join_mode::threshold &&
+  // cut and join probe chunks to that size; only top-k answers are split back. A corpus the join
+  // scans itself is read by every task too, from wherever the engine left it, the disk tier for
+  // one larger than the host pool: SIFT100M from disk, 1M probes, ~5 passes as probe chunks.
+  bool const reread = (_lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST) ||
+                      (_lists == nullptr && _build_side != nullptr);
+  bool const wanted = reread && _request.mode != vss::vector_join_mode::threshold &&
                       _request.earlier_by.empty() && !_request.probe_scalar && _num_left > 0;
   if (!wanted) { return; }
   auto const k_join = std::max<std::int64_t>(
