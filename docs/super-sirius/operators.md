@@ -315,12 +315,24 @@ Without conditions it runs a cross product with `cudf::cross_join`. When it crea
 Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
 
 ### `sirius_physical_union` — `UNION`
-**File:** `src/include/op/sirius_physical_union.hpp`
+**File:** `src/op/sirius_physical_union.hpp`
 
-`UNION ALL` only — bag concatenation, so the operator computes nothing and `execute` is the
-identity. N-ary: `a UNION ALL b UNION ALL c` binds to one `LogicalSetOperation`, so every path loops
-over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the plan builder
-(`src/planner/sirius_plan_set_operation.cpp`), as is `allow_out_of_order = false`.
+Joins its arms' rows into one stream without inspecting them, so the operator computes nothing
+and `execute` is the identity. N-ary: every path loops over `children`.
+
+**How SQL reaches it.** SQL `UNION` and `UNION ALL` both plan a `LOGICAL_UNION`. They differ only
+in what DuckDB's binder puts around it. `UNION ALL` is the node alone, and
+`a UNION ALL b UNION ALL c` binds to one node with three children. `UNION` and `UNION BY NAME` are
+a `DISTINCT` over that same node, which Sirius lowers to a grouped aggregate. The generator's
+dispatch switch rejects `EXCEPT` and `INTERSECT`.
+
+The plan builder (`plan_union` in `src/planner/sirius_plan_set_operation.cpp`) sends three more
+shapes to the CPU. The first is `allow_out_of_order = false`, which requires output in arm order.
+The second is an arm that plans a column type other than the declared one, since arms are
+forwarded unconverted. The aggregate builder's HUGEINT→BIGINT narrowing
+(`planned_aggregate_type()`) is the one difference allowed. The third is `setop_all = false`, which
+is what a `WITH RECURSIVE` body with no self-reference binds to. That union must deduplicate
+itself, and no `DISTINCT` sits above it to do so.
 
 - **One port per arm.** `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, feeding a distinct
   `"union_{i}"` port. The distinct names are required: `add_port` is last-writer-wins and the
@@ -432,10 +444,10 @@ Reassembles partitioned data back into a linear stream. Behavior depends on join
 - `_concat_all = false` (INNER joins): emits tasks when byte threshold (`_concat_batch_bytes`) is met
 
 ### `sirius_physical_passthrough_sink` — `PASSTHROUGH_SINK`
-**File:** `src/include/op/sirius_physical_passthrough_sink.hpp`
+**File:** `src/op/sirius_physical_passthrough_sink.hpp`
 
 Terminates one arm of a `UNION`, forwarding every batch unchanged into the downstream `UNION`'s
-`"union_{i}"` port. It replaces the join arm's `PARTITION -> CONCAT` chain, which a bag union needs
+`"union_{i}"` port. It replaces the join arm's `PARTITION -> CONCAT` chain, which a union needs
 neither half of.
 
 - **Emits `pipelineable_operator_data`, not `partitioned_operator_data`.** With no partition and no
@@ -551,7 +563,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |
-| UNION | Set op | `UNION ALL` only; N-ary identity fan-in, no data touched |
+| UNION | Set op | N-ary identity fan-in, no data touched; distinct `UNION` is a DISTINCT over it |
 | PARTITION | Pipeline | Hash/range partitioning |
 | CONCAT | Pipeline | Partition reassembly |
 | PASSTHROUGH_SINK | Pipeline | UNION arm terminator; forwards batches unpartitioned |

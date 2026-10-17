@@ -111,7 +111,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_gpu_execution_unique_join.cpp
-    test/cpp/integration/test_gpu_execution_union_all.cpp
+    test/cpp/integration/test_gpu_execution_union.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp

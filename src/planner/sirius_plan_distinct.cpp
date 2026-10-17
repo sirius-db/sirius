@@ -18,7 +18,6 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"
@@ -37,45 +36,12 @@
 // are the distinct targets and whose aggregate list is empty. An output column no target covers
 // would need a grouped FIRST, which Sirius cannot execute, so those shapes throw and run on CPU.
 
-namespace {
-
-// DuckDB's optimizer puts an identity projection under a DISTINCT whose child is not one.
-// Serves only the distinct-UNION guard below; both go once distinct UNION runs on the GPU.
-duckdb::LogicalOperator const& skip_identity_projections(duckdb::LogicalOperator const& op)
-{
-  auto const* current = &op;
-  while (current->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
-    auto const& child = *current->children[0];
-    auto const& exprs = current->expressions;
-    if (exprs.size() != child.types.size()) { break; }
-    for (duckdb::idx_t i = 0; i < exprs.size(); i++) {
-      if (exprs[i]->GetExpressionType() != duckdb::ExpressionType::BOUND_REF ||
-          exprs[i]->Cast<duckdb::BoundReferenceExpression>().Index() != i) {
-        return *current;
-      }
-    }
-    current = &child;
-  }
-  return *current;
-}
-
-}  // namespace
-
 namespace sirius::planner {
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
 {
   D_ASSERT(op.children.size() == 1);
-
-  // The binder lowers a distinct UNION to this node over a UNION ALL; distinct UNION is not on
-  // the GPU path yet, so keep it on CPU.
-  if (skip_identity_projections(*op.children[0]).type ==
-      duckdb::LogicalOperatorType::LOGICAL_UNION) {
-    throw duckdb::NotImplementedException(
-      "DISTINCT over a UNION is not supported on the GPU (falling back to CPU): distinct UNION is "
-      "not on the GPU path yet");
-  }
 
   // `order_by` is populated for DISTINCT ON only, so this tests the ordered shape and not
   // distinct_type. Relaxing it returns a plausible wrong row, not an error.
@@ -109,9 +75,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
       std::to_string(declared_types.size()) + " (falling back to CPU)");
   }
   for (duckdb::idx_t i = 0; i < declared_types.size(); i++) {
-    if (planned_types[i] == declared_types[i]) { continue; }
-    // An aggregate below may plan a result narrower than its parents declare.
-    if (planned_types[i] == sirius::from_duckdb(planned_aggregate_type(op.types[i]))) { continue; }
+    if (plans_declared_type(planned_types[i], op.types[i])) { continue; }
     throw duckdb::NotImplementedException("DISTINCT: the planned child produces " +
                                           planned_types[i].to_string() + " for column " +
                                           std::to_string(i) + " but the DISTINCT node declares " +

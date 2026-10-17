@@ -144,6 +144,11 @@ class sirius_physical_plan_generator {
   //! The type an aggregate result declared as @p type is planned as; HUGEINT narrows to BIGINT.
   [[nodiscard]] static duckdb::LogicalType planned_aggregate_type(duckdb::LogicalType const& type);
 
+  //! Whether a child column planned as @p planned can stand for one declared as @p declared:
+  //! the same type, or `planned_aggregate_type` of it from an aggregate below.
+  [[nodiscard]] static bool plans_declared_type(sirius::logical_type const& planned,
+                                                duckdb::LogicalType const& declared);
+
  protected:
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
 
@@ -198,8 +203,8 @@ class sirius_physical_plan_generator {
   // create_plan(duckdb::LogicalCopyToFile &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalExplain
   // &op);
-  //! `UNION ALL` only; the builder rejects distinct UNION. EXCEPT / INTERSECT share the same
-  //! DuckDB node but keep their own throwing case in the dispatch switch, so they never arrive.
+  //! Dispatches a set operation on its type. EXCEPT / INTERSECT share the same DuckDB node but
+  //! keep their own throwing case in the dispatch switch, so they never arrive.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalSetOperation& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalUpdate
@@ -230,6 +235,8 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
+    duckdb::LogicalSetOperation& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);
