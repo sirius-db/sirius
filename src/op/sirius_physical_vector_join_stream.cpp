@@ -66,6 +66,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -315,10 +316,20 @@ class materialized_chunk_source : public vector_chunk_source {
         auto const col   = table.column(static_cast<cudf::size_type>(_column_index));
         _rows.push_back(static_cast<std::size_t>(col.size()));
         _bytes.push_back(row_bytes() * _rows.back());
-      } else {
-        if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
-          ro = host_resident(batch, std::move(ro));
+      } else if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
+        // From the file's column metadata, which stays in memory: restoring every spilled batch
+        // just to count it would bring a corpus larger than the host pool back at once.
+        auto const* data = ro.get_data();
+        if (data == nullptr) {
+          throw std::runtime_error(
+            "[sirius_physical_vector_join_stream] build-side batch has no data representation");
         }
+        auto const& col =
+          data->cast<cucascade::disk_data_representation>().get_disk_table().columns.at(
+            _column_index);
+        _bytes.push_back(column_bytes(col));
+        _rows.push_back(static_cast<std::size_t>(col.num_rows));
+      } else {
         // Rows from the column's own count: its bytes include the list offsets, and a probe
         // block is cut to exact rows.
         auto const& host = host_repr(ro);
@@ -467,6 +478,16 @@ class materialized_chunk_source : public vector_chunk_source {
         "[sirius_physical_vector_join_stream] could not restore a disk-resident build batch");
     }
     return std::visit([](auto& r) { return std::move(r.ro_lock); }, *prepared);
+  }
+
+  /// A spilled column's bytes: its own buffers and its children's (a list's offsets and values).
+  static std::size_t column_bytes(cucascade::memory::column_metadata const& col)
+  {
+    std::size_t bytes = (col.has_data ? col.data_size : 0) + col.null_mask_size;
+    for (auto const& child : col.children) {
+      bytes += column_bytes(child);
+    }
+    return bytes;
   }
 
   static const cucascade::host_data_representation& host_repr(

@@ -33,6 +33,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/search.hpp>
@@ -43,15 +44,20 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -97,6 +103,76 @@ cucascade::read_only_data_batch host_or_device_resident(
       " from disk");
   }
   return std::visit([](auto& r) { return std::move(r.ro_lock); }, *prepared);
+}
+
+/// The output columns @p cols of a batch the engine took to disk, read straight from its file.
+/// Restoring the whole batch would bring its vector column back to the host -- the bulk of it,
+/// which nothing here reads -- and with a corpus larger than the host pool that restore is what
+/// fails. Nullopt when a column is not flat fixed-width (strings, lists, decimals): the full
+/// restore handles those. The caller's read lock keeps the file in place while it is read.
+std::optional<std::vector<std::unique_ptr<cudf::column>>> read_spilled_columns(
+  cucascade::read_only_data_batch const& ro,
+  std::vector<std::size_t> const& cols,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const* disk = dynamic_cast<cucascade::disk_data_representation const*>(ro.get_data());
+  if (disk == nullptr) { return std::nullopt; }
+  auto const& table = disk->get_disk_table();
+  for (auto const c : cols) {
+    auto const& meta = table.columns.at(c);
+    auto const type  = cudf::data_type{static_cast<cudf::type_id>(meta.type_id)};
+    if (!meta.children.empty() || !cudf::is_fixed_width(type) || cudf::is_fixed_point(type)) {
+      return std::nullopt;
+    }
+  }
+  int const fd = ::open(table.file_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) { return std::nullopt; }
+  struct close_on_exit {
+    int fd;
+    ~close_on_exit() { ::close(fd); }
+  } closer{fd};
+  std::vector<std::byte> host;
+  auto upload = [&](std::size_t offset, std::size_t size) {
+    rmm::device_buffer buffer(size, stream, mr);
+    if (size == 0) { return buffer; }
+    host.resize(size);
+    for (std::size_t done = 0; done < size;) {
+      auto const n =
+        ::pread(fd, host.data() + done, size - done, static_cast<off_t>(offset + done));
+      if (n <= 0) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_materialize] reading spilled batch " + table.file_path +
+          " failed");
+      }
+      done += static_cast<std::size_t>(n);
+    }
+    CUDF_CUDA_TRY(
+      cudaMemcpyAsync(buffer.data(), host.data(), size, cudaMemcpyHostToDevice, stream.value()));
+    stream.synchronize();
+    return buffer;
+  };
+  std::vector<std::unique_ptr<cudf::column>> out;
+  out.reserve(cols.size());
+  for (auto const c : cols) {
+    auto const& meta = table.columns.at(c);
+    auto values      = upload(meta.data_offset, meta.has_data ? meta.data_size : 0);
+    auto mask        = upload(meta.null_mask_offset, meta.has_null_mask ? meta.null_mask_size : 0);
+    cudf::size_type nulls = 0;
+    if (meta.has_null_mask) {
+      nulls = meta.null_count >= 0
+                ? meta.null_count
+                : cudf::null_count(
+                    static_cast<cudf::bitmask_type const*>(mask.data()), 0, meta.num_rows, stream);
+    }
+    out.push_back(
+      std::make_unique<cudf::column>(cudf::data_type{static_cast<cudf::type_id>(meta.type_id)},
+                                     meta.num_rows,
+                                     std::move(values),
+                                     std::move(mask),
+                                     nulls));
+  }
+  return out;
 }
 }  // namespace
 
@@ -157,11 +233,17 @@ sirius_physical_vector_join_materialize::build_side_output_columns(
       throw std::runtime_error("[sirius_physical_vector_join_materialize] build-side batch " +
                                std::to_string(id) + " is no longer in the repository");
     }
-    auto ro = host_or_device_resident(batch,
-                                      batch->to_read_only(),
-                                      _sirius_ctx,
-                                      ::cuda::stream_ref{stream.value()},
-                                      "a build-side batch");
+    auto ro = batch->to_read_only();
+    if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
+      if (auto cols = read_spilled_columns(ro, out_cols, stream, mr)) {
+        for (std::size_t c = 0; c < num_output_columns; ++c) {
+          parts[c].push_back(std::move((*cols)[c]));
+        }
+        continue;
+      }
+    }
+    ro = host_or_device_resident(
+      batch, std::move(ro), _sirius_ctx, ::cuda::stream_ref{stream.value()}, "a build-side batch");
     if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
       auto const table = sirius::get_cudf_table_view(ro);
       for (std::size_t c = 0; c < num_output_columns; ++c) {
@@ -253,11 +335,18 @@ sirius_physical_vector_join_materialize::probe_side_output_views(
       throw std::runtime_error("[sirius_physical_vector_join_materialize] probe-side batch " +
                                std::to_string(id) + " is no longer in the repository");
     }
-    auto ro = host_or_device_resident(batch,
-                                      batch->to_read_only(),
-                                      _sirius_ctx,
-                                      ::cuda::stream_ref{stream.value()},
-                                      "a probe-side batch");
+    auto ro = batch->to_read_only();
+    if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
+      if (auto cols = read_spilled_columns(ro, out_cols, stream, space.get_default_allocator())) {
+        for (std::size_t c = 0; c < num_output_columns; ++c) {
+          per_column[c].push_back((*cols)[c]->view());
+          _probe_from_disk.push_back(std::move((*cols)[c]));
+        }
+        continue;
+      }
+    }
+    ro = host_or_device_resident(
+      batch, std::move(ro), _sirius_ctx, ::cuda::stream_ref{stream.value()}, "a probe-side batch");
     cudf::table_view table;
     cudf::size_type first = 0;
     if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {

@@ -159,6 +159,8 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   std::vector<::cucascade::read_only_data_batch> _probe_readers;
   std::vector<std::shared_ptr<::cucascade::data_batch>> _probe_restaged;
   std::vector<std::shared_ptr<::cucascade::memory::reservation>> _probe_reservations;
+  //! Probe-side output columns read straight from a spilled batch's file.
+  std::vector<std::unique_ptr<cudf::column>> _probe_from_disk;
   //! Build path: right output columns concatenated across batches; row i == global right id i.
   std::unique_ptr<cudf::table> _right_output_concat;
   //! Pinned corpus: the pin, and where each of its chunks ends in pin row space.
