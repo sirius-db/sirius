@@ -109,9 +109,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
       std::to_string(declared_types.size()) + " (falling back to CPU)");
   }
   for (duckdb::idx_t i = 0; i < declared_types.size(); i++) {
-    if (planned_types[i] == declared_types[i]) { continue; }
-    // An aggregate below may plan a result narrower than its parents declare.
-    if (planned_types[i] == sirius::from_duckdb(planned_aggregate_type(op.types[i]))) { continue; }
+    if (plans_declared_type(planned_types[i], op.types[i])) { continue; }
     throw duckdb::NotImplementedException("DISTINCT: the planned child produces " +
                                           planned_types[i].to_string() + " for column " +
                                           std::to_string(i) + " but the DISTINCT node declares " +

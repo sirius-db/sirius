@@ -2175,7 +2175,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       break;
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
-      throw duckdb::NotImplementedException("Set operation (EXCEPT/INTERSECT) not supported");
+      // The builder lowers the ALL forms and rejects the distinct forms.
+      plan = create_plan(op.Cast<duckdb::LogicalSetOperation>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_INSERT:
       throw duckdb::NotImplementedException("Insert not supported");
