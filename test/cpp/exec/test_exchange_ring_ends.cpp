@@ -480,3 +480,24 @@ TEST_CASE("a batch a ring job holds is not spilled under it", "[exchange_ring][e
   CHECK(stale.convert({env().disk}, stream.view(), *env().mgr, true).has_value());
   CHECK(holds<cucascade::disk_data_representation>(*batch));
 }
+
+TEST_CASE("a batch spilled to disk ships from its file", "[exchange_ring][ends]")
+{
+  auto sender         = make_ring();
+  auto receiver       = make_ring();
+  auto batch          = gpu_batch(sample_table());
+  auto const expected = digest(*batch);
+  move_to(batch, env().disk);
+  REQUIRE(holds<cucascade::disk_data_representation>(*batch));
+  auto const job = sender->export_batch(batch);
+  REQUIRE(job.has_value());
+  CHECK(job->kind == batch_kind::host_columns);
+  // Not brought back to the GPU, nor to host.
+  CHECK(holds<cucascade::disk_data_representation>(*batch));
+  batch.reset();
+
+  auto const [landing, token] = ship(*sender, *receiver, *job);
+  CHECK(landing.tier == Tier::GPU);
+  auto received = env().exchange->take_batch(token);
+  CHECK(digest(*received) == expected);
+}

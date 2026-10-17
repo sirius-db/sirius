@@ -17,6 +17,7 @@
 #include "exec/exchange_ring_ends.hpp"
 
 #include "compression/compressed_representation.hpp"
+#include "cuda/device_copy_batch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/exchange_inbox.hpp"
 #include "log/logging.hpp"
@@ -46,9 +47,13 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <utility>
@@ -72,49 +77,12 @@ constexpr std::size_t tier_index(Tier tier)
 
 constexpr std::size_t disk_alignment = 4096;
 
-/// Queues device/host copies on @p stream, in one driver call where the runtime has it.
-class copy_batch {
- public:
-  void add(void* dst, void const* src, std::size_t size)
-  {
-    if (size == 0) { return; }
-    _dsts.push_back(dst);
-    _srcs.push_back(src);
-    _sizes.push_back(size);
-  }
-
-  void flush(rmm::cuda_stream_view stream)
-  {
-    if (_dsts.empty()) { return; }
-#if CUDART_VERSION >= 13000
-    cudaMemcpyAttributes attr{};
-    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    attr.flags          = cudaMemcpyFlagDefault;
-    RMM_CUDA_TRY(cudaMemcpyBatchAsync(
-      _dsts.data(), _srcs.data(), _sizes.data(), _dsts.size(), attr, stream.value()));
-#else
-    for (std::size_t i = 0; i < _dsts.size(); ++i) {
-      RMM_CUDA_TRY(
-        cudaMemcpyAsync(_dsts[i], _srcs[i], _sizes[i], cudaMemcpyDefault, stream.value()));
-    }
-#endif
-    _dsts.clear();
-    _srcs.clear();
-    _sizes.clear();
-  }
-
- private:
-  std::vector<void*> _dsts;
-  std::vector<void const*> _srcs;
-  std::vector<std::size_t> _sizes;
-};
-
 using blocks_allocation =
   cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
 /// Copies between the device range [@p device, +@p size) and host blocks @p blocks at logical
 /// offset @p at, one piece per block the range touches.
-void add_block_copies(copy_batch& copies,
+void add_block_copies(sirius::cuda::device_copy_batch& copies,
                       blocks_allocation const& blocks,
                       std::size_t at,
                       std::uint8_t* device,
@@ -260,6 +228,9 @@ struct ring_exchange::job {
   std::vector<void const*> sources;
   /// host_columns and compressed: the host blocks the stream is, at logical offset 0.
   blocks_allocation const* blocks{nullptr};
+  /// host_columns sent from a disk file: the file is the stream, its buffers at the offsets the
+  /// disk table's metadata gives.
+  std::string disk_path;
 };
 
 struct ring_exchange::landing_state {
@@ -293,6 +264,13 @@ struct ring_exchange::disk_task {
   cucascade::memory::memory_space* space;
 };
 
+struct ring_exchange::read_task {
+  std::string path;
+  std::size_t offset;
+  std::size_t size;
+  std::uint8_t* frame;
+};
+
 struct ring_exchange::ticket {
   cudaEvent_t event{nullptr};
   /// 0 running, 1 done, 2 failed: set by the disk thread.
@@ -300,7 +278,18 @@ struct ring_exchange::ticket {
   std::shared_ptr<std::string> error;
   std::shared_ptr<std::atomic<int>> in_flight;
   std::shared_ptr<disk_task> task;
+  std::shared_ptr<read_task> read;
   int device{0};
+
+  /// A ticket a disk thread completes, instead of a CUDA event.
+  static std::shared_ptr<ticket> on_disk(int device)
+  {
+    auto t        = std::make_shared<ticket>();
+    t->device     = device;
+    t->disk_state = std::make_shared<std::atomic<int>>(0);
+    t->error      = std::make_shared<std::string>();
+    return t;
+  }
 
   ~ticket()
   {
@@ -328,9 +317,11 @@ ring_exchange::ring_exchange(int device, options const& opts)
     _send_stream{stream_on(device)},
     _recv_stream{stream_on(device)},
     _held{std::make_shared<held>()},
-    _return_spilled{opts.return_spilled}
+    _return_spilled{opts.return_spilled},
+    _read_stream{stream_on(device)}
 {
   _disk_thread = std::thread([this] { run_disk_writes(); });
+  _read_thread = std::thread([this] { run_disk_reads(); });
   SIRIUS_LOG_INFO(
     "ring exchange on device {}: send ring {} x {} bytes at {:#x}, receive ring {} x {} bytes at "
     "{:#x}",
@@ -351,6 +342,13 @@ ring_exchange::~ring_exchange()
   }
   _disk_cv.notify_all();
   if (_disk_thread.joinable()) { _disk_thread.join(); }
+  {
+    std::lock_guard lock{_read_mutex};
+    _read_stop = true;
+  }
+  _read_cv.notify_all();
+  if (_read_thread.joinable()) { _read_thread.join(); }
+  if (_read_bounce != nullptr) { static_cast<void>(cudaFreeHost(_read_bounce)); }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
   // Copies in flight read or write the rings, which go with this object.
   _send_stream.synchronize_no_throw();
@@ -468,13 +466,13 @@ std::optional<ring_exchange::send_job> ring_exchange::export_batch(
     auto const ro    = batch->to_read_only();
     auto const* data = ro.get_data();
     hold();
-    if (auto const* host = dynamic_cast<cucascade::host_data_representation const*>(data)) {
-      auto const& table = host->get_host_table();
-      if (!table || table->columns.empty()) { return false; }
+    auto const describe_columns = [&](std::vector<column_metadata> const& columns,
+                                      std::size_t data_size) {
+      if (columns.empty()) { return false; }
       wire.kind         = batch_kind::host_columns;
-      wire.columns      = table->columns;
-      wire.rows         = static_cast<std::uint64_t>(std::max(0, table->columns.front().num_rows));
-      wire.stream_bytes = table->data_size;
+      wire.columns      = columns;
+      wire.rows         = static_cast<std::uint64_t>(std::max(0, columns.front().num_rows));
+      wire.stream_bytes = data_size;
       if (wire.rows == 0) { return true; }
       // Refuse here what the receiver would: a column the ring cannot rebuild goes through the
       // GPU instead, which names it.
@@ -483,7 +481,18 @@ std::optional<ring_exchange::send_job> ring_exchange::export_batch(
       } catch (sirius::invalid_input_exception const&) {
         return false;
       }
+      return true;
+    };
+    if (auto const* host = dynamic_cast<cucascade::host_data_representation const*>(data)) {
+      auto const& table = host->get_host_table();
+      if (!table || !describe_columns(table->columns, table->data_size)) { return false; }
       out->blocks = table->allocation.get();
+      return true;
+    }
+    if (auto const* disk = dynamic_cast<cucascade::disk_data_representation const*>(data)) {
+      auto const& table = disk->get_disk_table();
+      if (!describe_columns(table.columns, table.data_size)) { return false; }
+      out->disk_path = table.file_path;
       return true;
     }
     if (auto const* packed = dynamic_cast<sirius::compressed_host_representation const*>(data)) {
@@ -501,7 +510,10 @@ std::optional<ring_exchange::send_job> ring_exchange::export_batch(
   };
 
   bool described_host = false;
-  if (batch->to_read_only().get_current_tier() == Tier::HOST) { described_host = describe_host(); }
+  if (auto const tier = batch->to_read_only().get_current_tier();
+      tier == Tier::HOST || tier == Tier::DISK) {
+    described_host = describe_host();
+  }
   if (!described_host) {
     // Anything else travels from the GPU: bring it back first (it may wait for memory).
     exchange->bring_to_gpu(*batch);
@@ -571,7 +583,18 @@ std::uint64_t ring_exchange::stage(std::uint64_t token, std::uint32_t k, std::ui
   auto const end = std::min<std::size_t>(begin + frame_bytes, j->stream_bytes);
   auto* dst      = reinterpret_cast<std::uint8_t*>(_send.frame_address(frame));
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
-  copy_batch copies;
+  if (!j->disk_path.empty()) {
+    auto t        = ticket::on_disk(_device);
+    t->read       = std::make_shared<read_task>(read_task{j->disk_path, begin, end - begin, dst});
+    auto const id = new_ticket(t);
+    {
+      std::lock_guard lock{_read_mutex};
+      _read_queue.push_back(t->read);
+    }
+    _read_cv.notify_one();
+    return id;
+  }
+  sirius::cuda::device_copy_batch copies;
   if (j->kind == batch_kind::gpu_columns) {
     for (auto const& piece : ring::pieces_in(j->buffers, begin, end)) {
       copies.add(dst + piece.range_offset,
@@ -581,7 +604,7 @@ std::uint64_t ring_exchange::stage(std::uint64_t token, std::uint32_t k, std::ui
   } else {
     add_block_copies(copies, *j->blocks, begin, dst, end - begin, /*to_device=*/true);
   }
-  copies.flush(_send_stream.view());
+  RMM_CUDA_TRY(copies.enqueue(_send_stream.view()));
   return new_ticket(record(_send_stream.view()));
 }
 
@@ -771,13 +794,10 @@ std::uint64_t ring_exchange::copy_out(std::uint64_t id,
           {piece.range_offset, st->disk_offsets[piece.buffer] + piece.buffer_offset, piece.size});
       }
     }
-    t             = std::make_shared<ticket>();
-    t->device     = _device;
-    t->disk_state = std::make_shared<std::atomic<int>>(0);
-    t->error      = std::make_shared<std::string>();
-    t->task       = task;
+    t       = ticket::on_disk(_device);
+    t->task = task;
   } else {
-    copy_batch copies;
+    sirius::cuda::device_copy_batch copies;
     if (st->tier == Tier::GPU) {
       for (auto const& piece : ring::pieces_in(st->buffers, begin, end)) {
         copies.add(
@@ -788,7 +808,7 @@ std::uint64_t ring_exchange::copy_out(std::uint64_t id,
     } else {
       add_block_copies(copies, *st->host_blocks, begin, src, expect, /*to_device=*/false);
     }
-    copies.flush(_recv_stream.view());
+    RMM_CUDA_TRY(copies.enqueue(_recv_stream.view()));
     t = record(_recv_stream.view());
   }
   t->in_flight = st->in_flight;
@@ -846,6 +866,60 @@ void ring_exchange::run_disk_writes()
     } catch (std::exception const& e) {
       *t->error = std::format(
         "ring exchange: writing a landed frame to '{}' failed: {}", task->path, e.what());
+      t->disk_state->store(2, std::memory_order_release);
+    }
+  }
+}
+
+void ring_exchange::run_disk_reads()
+{
+  for (;;) {
+    std::shared_ptr<read_task> task;
+    {
+      std::unique_lock lock{_read_mutex};
+      _read_cv.wait(lock, [&] { return _read_stop || !_read_queue.empty(); });
+      if (_read_queue.empty()) { return; }
+      task = std::move(_read_queue.front());
+      _read_queue.pop_front();
+    }
+    std::shared_ptr<ticket> t;
+    {
+      std::lock_guard lock{_mutex};
+      for (auto const& [id, candidate] : _tickets) {
+        if (candidate->read == task) {
+          t = candidate;
+          break;
+        }
+      }
+    }
+    if (!t) { continue; }
+    try {
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
+      if (_read_bounce == nullptr) {
+        RMM_CUDA_TRY(cudaMallocHost(&_read_bounce, _send.frame_bytes()));
+      }
+      int const fd = ::open(task->path.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd < 0) { throw std::runtime_error(std::format("open: {}", std::strerror(errno))); }
+      absl::Cleanup close_fd = [fd] { ::close(fd); };
+      std::size_t done       = 0;
+      auto* bounce           = static_cast<char*>(_read_bounce);
+      while (done < task->size) {
+        auto const n =
+          ::pread(fd, bounce + done, task->size - done, static_cast<off_t>(task->offset + done));
+        if (n < 0 && errno == EINTR) { continue; }
+        if (n <= 0) {
+          throw std::runtime_error(n == 0 ? std::string{"short read"}
+                                          : std::format("pread: {}", std::strerror(errno)));
+        }
+        done += static_cast<std::size_t>(n);
+      }
+      RMM_CUDA_TRY(cudaMemcpyAsync(
+        task->frame, _read_bounce, task->size, cudaMemcpyHostToDevice, _read_stream.value()));
+      _read_stream.synchronize();
+      t->disk_state->store(1, std::memory_order_release);
+    } catch (std::exception const& e) {
+      *t->error = std::format(
+        "ring exchange: reading a frame of '{}' to send failed: {}", task->path, e.what());
       t->disk_state->store(2, std::memory_order_release);
     }
   }
