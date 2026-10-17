@@ -24,6 +24,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -34,6 +35,15 @@ class telemetry_context;
 }  // namespace telemetry
 
 namespace op {
+
+/// How hash_partition brings each key to its cast type before hashing.
+enum class partition_key_cast : uint8_t {
+  /// Prepared join keys: only a proven compressed carrier may differ from its prepared type.
+  restore_prepared,
+  /// A hash type every sender of an exchange shares (DECIMAL keys hash as FLOAT64, say), so the
+  /// same value routes to the same destination whatever its width; a real conversion.
+  normalize,
+};
 
 /**
  * @brief Functionalities for partitioning the input data batch into multiple output batches.
@@ -55,6 +65,7 @@ class gpu_partition_impl {
    * @param num_partitions Number of partitions.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param key_cast How each key reaches its cast type.
    *
    * @return The output data batches.
    */
@@ -65,7 +76,8 @@ class gpu_partition_impl {
     int num_partitions,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info = {},
+    partition_key_cast key_cast                           = partition_key_cast::restore_prepared);
 
   /// Overload without cast types (all keys hashed as-is). Kept for backward compatibility.
   static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
