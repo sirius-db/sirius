@@ -436,7 +436,8 @@ so a DECIMAL128 column that narrows to DECIMAL64 becomes encodable where the nat
 not.
 
 Width coverage has to be complete rather than merely typical, because the plan is not chosen at pin
-time: it arrives from `plan_register` as a fixed DSL string authored against the unnarrowed column.
+time: it is loaded from the connection's configured plan directory as a fixed DSL string authored
+against the unnarrowed column.
 A column narrowed to INT16 is therefore handed a plan written for its INT64 original, and an
 element type the plan's ops cannot encode fails the whole batch's compression and latches
 compression off for the rest of the pin.

@@ -412,7 +412,8 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
   if (!sirius_ctx) { return nullptr; }
-  auto const& op_params = sirius_ctx->get_config().get_operator_params();
+  auto options          = duckdb::query_operator_options(context);
+  auto const& op_params = *options;
   if (!op_params.enable_dense_count_join) { return nullptr; }
 
   auto const detection = detect_dense_count_join(context, op);
@@ -751,8 +752,7 @@ bool decimal_sum_stats_bound_enabled(duckdb::ClientContext& context)
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  return !sirius_ctx ||
-         sirius_ctx->get_config().get_operator_params().enable_decimal_sum_stats_bound;
+  return !sirius_ctx || duckdb::query_operator_options(context)->enable_decimal_sum_stats_bound;
 }
 
 }  // namespace

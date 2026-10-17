@@ -691,7 +691,11 @@ GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_mana
 
 ## DuckDB SET Variables
 
-Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
+Registered in `src/sirius_extension.cpp`. The `operator_params` setters, expression settings, and
+pin-compression settings are connection-local overrides of the defaults registered for the database;
+GLOBAL writes are rejected and RESET restores the registered default. Each execution uses one
+immutable operator-options snapshot. Logging updates serialize runtime-wide. Hardware decompression
+requires startup configuration.
 
 ### Logging
 
@@ -725,11 +729,17 @@ leaving the previous sink active.
 
 ### Expression Evaluation
 
-**File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
+**File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
+| `enable_regex_jit_impl` | true | Enable the specialized JIT implementation for supported regex patterns |
+
+These settings are connection-local: use `SET` or `SET SESSION`; `SET GLOBAL` is
+rejected. `RESET` restores the registered default. Query initialization captures both
+settings in an immutable snapshot, so later changes do not affect an existing query.
+Evaluators retain their own policy values rather than reading mutable global defaults.
 
 `expression_executor_strategy` remains registered as a deprecated compatibility alias for
 `expression_evaluator_strategy`; new configuration should use the evaluator name.
@@ -912,7 +922,6 @@ Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 
 | Flag | Value | Namespace |
 |------|-------|-----------|
-| `EXPRESSION_EVALUATOR_STRATEGY` | `ast_interpret` | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |
