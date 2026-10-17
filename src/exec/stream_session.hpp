@@ -58,6 +58,15 @@ class stream_session {
   /// @throws sirius::invalid_input_exception on a duplicate input id.
   void add_source(stream_id_t id, op::sirius_physical_streaming_source& source);
 
+  /// One input id read by several plan leaves (a shared subtree the plan instantiates more than
+  /// once). Every push reaches every leaf: the first gets the pushed handle, each further leaf an
+  /// independent deep copy in the batch's memory space, so leaves never race over one handle's
+  /// residency. close_input() closes every leaf; the input is closed once all of them are.
+  /// @throws sirius::invalid_input_exception on a duplicate input id, an empty list, a null or
+  ///         repeated source.
+  void add_sources(stream_id_t id,
+                   const std::vector<op::sirius_physical_streaming_source*>& sources);
+
   /// ids[i] ↔ sink partition i ↔ repository i. All-or-nothing: every id is validated before
   /// any is inserted, so a rejected registration leaves the session exactly as it was.
   /// @throws sirius::invalid_input_exception if `ids` does not match the sink's output count,
@@ -81,6 +90,10 @@ class stream_session {
 
   /// True once every expected sender has closed the input. @throws on unknown input id.
   [[nodiscard]] bool input_closed(stream_id_t id) const;
+
+  /// True once `sender` has closed the input, or the input has ended for any reason.
+  /// @throws on unknown input id.
+  [[nodiscard]] bool input_sender_closed(stream_id_t id, sender_id_t sender) const;
 
   // -----------------------------------------------------------------------
   // Consumer side — output streams
@@ -106,10 +119,11 @@ class stream_session {
     std::size_t partition;
   };
 
-  [[nodiscard]] op::sirius_physical_streaming_source& resolve_source(stream_id_t id) const;
+  [[nodiscard]] const std::vector<op::sirius_physical_streaming_source*>& resolve_sources(
+    stream_id_t id) const;
   [[nodiscard]] const sink_output& resolve_sink(stream_id_t id) const;
 
-  std::map<stream_id_t, op::sirius_physical_streaming_source*> _sources;
+  std::map<stream_id_t, std::vector<op::sirius_physical_streaming_source*>> _sources;
   std::map<stream_id_t, sink_output> _sinks;
 };
 

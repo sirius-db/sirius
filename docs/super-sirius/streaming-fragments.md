@@ -96,7 +96,9 @@ class stream_bind_catalog : public duckdb::ClientContextState {
   void declare(stream_id_t id, stream_input_binding binding);  // overwrites same-id entry
   void erase(stream_id_t id);                                   // no-op if absent
   const stream_input_binding& get(stream_id_t id) const;        // @throws if undeclared
-  void set_built(stream_id_t id, op::sirius_physical_streaming_source* built);
+  // Declared repository for the first leaf reading `id`, a fresh one for every further leaf.
+  std::shared_ptr<cucascade::shared_data_repository> repository_for_next_leaf(stream_id_t id) const;
+  void add_built(stream_id_t id, op::sirius_physical_streaming_source* built);  // one per leaf
 };
 
 duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& context);
@@ -105,19 +107,26 @@ duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& conte
 ```
 streaming_fragment::build()      ── declare(id) ──►  catalog
 stream_source_bind()             ◄── get(id) ──      catalog   (DuckDB bind)
-create_streaming_source_plan()   ◄── get(id) ──      catalog   (builds STREAMING_SOURCE, set_built)
-streaming_fragment::build()      ◄── get(id).built   → session add_source(id, *built)
+create_streaming_source_plan()   ◄── get(id) ──      catalog   (per leaf: repository_for_next_leaf,
+                                                                builds STREAMING_SOURCE, add_built)
+streaming_fragment::build()      ◄── get(id).built   → session add_sources(id, built)
 streaming_fragment::build() exit ── erase(id) ──►    catalog   (success or failure)
 ```
 
-`create_plan()` does not return the operator to the fragment layer; `set_built()` is how it reaches
-the session.
+`create_plan()` does not return the operator to the fragment layer; `add_built()` is how its leaves
+reach the session.
 
 - **A declaration lives only for its fragment's `build()`.** `build()` erases its ids on every
   exit, so fragments on one connection can reuse an id without seeing a stale schema.
-- **A declared stream may be read by at most one plan leaf.** `set_built()` rejects a second bind.
-  Otherwise the first leaf would never see a push or close, and its pipeline would wait forever.
-  Give each reader its own stream id.
+- **A declared stream may be read by several plan leaves**, e.g. a Substrait `ReferenceRel`
+  referenced twice instantiates its subtree twice. The first leaf drains the declared repository;
+  every further leaf gets its own (`repository_for_next_leaf()`), since leaves sharing one queue
+  would split the batches between them. `stream_session::push()` fans each pushed batch out: the
+  first leaf gets the pushed handle, every other leaf an independent deep copy in the batch's
+  memory space (`clone_for_fanout()`, the same helper a broadcast `STREAMING_SINK` uses). GPU
+  copies are made on a stream from the space's pool under a reservation for all of them, and the
+  stream is synchronized before any leaf receives a copy. `close_input()` closes every leaf, and
+  the input counts as closed once all of them are.
 - **The catalog must exist before bind.** `SiriusContextExtensionCallback::OnConnectionOpened`
   installs it on transparent-path connections (and removes it on close);
   `sirius::ffi::Context::Impl::bring_up()` installs it for the embedder. Without it, `catalog_for()`

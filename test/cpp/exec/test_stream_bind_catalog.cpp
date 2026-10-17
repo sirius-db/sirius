@@ -39,7 +39,7 @@ duckdb::vector<sirius::logical_type> int_schema()
 stream_input_binding make_binding()
 {
   return stream_input_binding{
-    {"a"}, int_schema(), std::make_shared<cucascade::shared_data_repository>(), {0}, nullptr};
+    {"a"}, int_schema(), std::make_shared<cucascade::shared_data_repository>(), {0}, {}};
 }
 
 }  // namespace
@@ -64,7 +64,7 @@ TEST_CASE("stream_bind_catalog CAT-1: a declared stream resolves its schema",
   REQUIRE(binding.repository != nullptr);
   REQUIRE(binding.expected_senders == std::set<sender_id_t>{0});
   // Nothing has planned yet, so no operator has been built for this id.
-  REQUIRE(binding.built == nullptr);
+  REQUIRE(binding.built.empty());
 }
 
 // ============================================================================
@@ -75,7 +75,8 @@ TEST_CASE("stream_bind_catalog CAT-2: an undeclared id throws", "[stream_bind_ca
 {
   stream_bind_catalog catalog;
   REQUIRE_THROWS_AS(catalog.get(1), sirius::invalid_input_exception);
-  REQUIRE_THROWS_AS(catalog.set_built(1, nullptr), sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(catalog.add_built(1, nullptr), sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS((void)catalog.repository_for_next_leaf(1), sirius::invalid_input_exception);
 }
 
 // ============================================================================
@@ -115,8 +116,39 @@ TEST_CASE("stream_bind_catalog CAT-4: the built operator is recorded", "[stream_
   catalog.declare(4, make_binding());
 
   auto* fake = reinterpret_cast<sirius::op::sirius_physical_streaming_source*>(0x1234);
-  catalog.set_built(4, fake);
-  REQUIRE(catalog.get(4).built == fake);
+  // The first leaf drains the declared repository.
+  REQUIRE(catalog.repository_for_next_leaf(4) == catalog.get(4).repository);
+  catalog.add_built(4, fake);
+  REQUIRE(catalog.get(4).built == std::vector<sirius::op::sirius_physical_streaming_source*>{fake});
+  // A null leaf, or the same leaf twice, is a planner bug.
+  REQUIRE_THROWS_AS(catalog.add_built(4, nullptr), sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(catalog.add_built(4, fake), sirius::invalid_input_exception);
+}
+
+// ============================================================================
+// CAT-4b: a stream read by several plan leaves (a shared subtree inlined twice)
+// records every leaf, each with its own repository
+// ============================================================================
+
+TEST_CASE("stream_bind_catalog CAT-4b: fan-out leaves are recorded with their own repositories",
+          "[stream_bind_catalog]")
+{
+  stream_bind_catalog catalog;
+  catalog.declare(4, make_binding());
+  auto* first  = reinterpret_cast<sirius::op::sirius_physical_streaming_source*>(0x1234);
+  auto* second = reinterpret_cast<sirius::op::sirius_physical_streaming_source*>(0x5678);
+
+  auto const declared = catalog.get(4).repository;
+  REQUIRE(catalog.repository_for_next_leaf(4) == declared);
+  catalog.add_built(4, first);
+  auto const extra = catalog.repository_for_next_leaf(4);
+  REQUIRE(extra != nullptr);
+  REQUIRE(extra != declared);
+  REQUIRE(catalog.repository_for_next_leaf(4) != extra);
+  catalog.add_built(4, second);
+  REQUIRE(catalog.get(4).built ==
+          std::vector<sirius::op::sirius_physical_streaming_source*>{first, second});
+  REQUIRE(catalog.get(4).repository == declared);
 }
 
 // ============================================================================
@@ -151,7 +183,7 @@ TEST_CASE("stream_bind_catalog CAT-6: a redeclared id is replaced", "[stream_bin
 {
   stream_bind_catalog catalog;
   catalog.declare(1, make_binding());
-  catalog.set_built(1, reinterpret_cast<sirius::op::sirius_physical_streaming_source*>(0x1234));
+  catalog.add_built(1, reinterpret_cast<sirius::op::sirius_physical_streaming_source*>(0x1234));
 
   auto replacement  = make_binding();
   replacement.names = {"renamed"};
@@ -159,7 +191,7 @@ TEST_CASE("stream_bind_catalog CAT-6: a redeclared id is replaced", "[stream_bin
 
   REQUIRE(catalog.get(1).names[0] == "renamed");
   // The stale back-pointer must not survive: it refers to an operator from the previous plan.
-  REQUIRE(catalog.get(1).built == nullptr);
+  REQUIRE(catalog.get(1).built.empty());
 }
 
 // ============================================================================
@@ -183,7 +215,7 @@ TEST_CASE("stream_bind_catalog CAT-7: sirius_stream_source binds a declared stre
                            duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR}),
                          std::make_shared<cucascade::shared_data_repository>(),
                          {0},
-                         nullptr});
+                         {}});
 
   // Binding is the whole point: DuckDB must resolve names and types for a relation that has no
   // file, no catalog entry and no rows behind it. A parquet URI could not do this.

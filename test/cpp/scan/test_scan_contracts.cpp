@@ -736,7 +736,7 @@ TEST_CASE("Physical stream lowering records its window without file checks",
       sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
       std::make_shared<cucascade::shared_data_repository>(),
       {0},
-      nullptr});
+      {}});
 
   auto& entry = duckdb::Catalog::GetSystemCatalog(*con.context)
                   .GetEntry<duckdb::TableFunctionCatalogEntry>(

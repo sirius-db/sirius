@@ -16,7 +16,8 @@
 
 #include "exec/streaming_fragment.hpp"
 
-#include "data/data_batch_utils.hpp"
+#include "cudf/cudf_utils.hpp"        // sirius::make_empty_table
+#include "data/data_batch_utils.hpp"  // sirius::make_data_batch
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -27,11 +28,14 @@
 
 #include <cudf/types.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <duckdb/main/query_result.hpp>
 
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -160,14 +164,14 @@ void streaming_fragment::register_sources()
 {
   auto catalog = catalog_for(_context);
   for (const auto& [id, _] : _spec.inputs) {
-    auto* built = catalog->get(id).built;
-    if (built == nullptr) {
+    const auto& built = catalog->get(id).built;
+    if (built.empty()) {
       // Declared but unread would hang. Fail here.
       throw sirius::invalid_input_exception("streaming_fragment: input stream " +
                                             std::to_string(id) +
                                             " was declared but the plan does not read it");
     }
-    _session.add_source(id, *built);
+    _session.add_sources(id, built);
   }
 }
 
@@ -261,7 +265,7 @@ void streaming_fragment::build()
                                             input.types,
                                             std::make_shared<cucascade::shared_data_repository>(),
                                             input.expected_senders,
-                                            nullptr,
+                                            {},
                                             input.estimated_rows});
     }
 
@@ -427,16 +431,133 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
                                             std::to_string(input_stream_id) +
                                             " refused a batch; it had already ended");
     }
+    note_input_data(input_stream_id);
     ++moved;
   }
-  _session.close_input(input_stream_id, sender_id);
+  close_sender(input_stream_id, sender_id);
   return moved;
 }
 
 void streaming_fragment::close_input(stream_id_t id, sender_id_t sender)
 {
   require_built("close_input()");
+  close_sender(id, sender);
+}
+
+void streaming_fragment::note_input_data(stream_id_t id)
+{
+  std::lock_guard<std::mutex> lock(_input_mutex);
+  _inputs_with_data.insert(id);
+}
+
+void streaming_fragment::close_sender(stream_id_t id, sender_id_t sender)
+{
+  // Held across the check and the close, so two senders closing at once cannot both see the
+  // other as still open and skip the placeholder.
+  std::lock_guard<std::mutex> lock(_input_mutex);
+  auto const declared = _spec.inputs.find(id);
+  // Unknown ids and senders fall through to close_input(), which reports them.
+  if (declared != _spec.inputs.end() && _inputs_with_data.count(id) == 0 &&
+      declared->second.expected_senders.count(sender) != 0 && !_session.input_closed(id)) {
+    bool const last_sender =
+      std::all_of(declared->second.expected_senders.begin(),
+                  declared->second.expected_senders.end(),
+                  [&](sender_id_t other) {
+                    return other == sender || _session.input_sender_closed(id, other);
+                  });
+    if (last_sender) {
+      // Like a scan of an empty table, an input that ends with no data still delivers one
+      // zero-row batch. Without it no task runs on the source, and operators that must emit
+      // a row for empty input (an ungrouped aggregate: count = 0, sum = NULL) emit nothing.
+      push_empty_batch(id, declared->second.types);
+      _inputs_with_data.insert(id);
+    }
+  }
   _session.close_input(id, sender);
+}
+
+void streaming_fragment::push_empty_batch(stream_id_t id,
+                                          const duckdb::vector<sirius::logical_type>& types)
+{
+  auto& space = input_memory_space();
+  rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{space.get_device_id()}};
+  auto batch = sirius::make_data_batch(std::move(*sirius::make_empty_table(types)),
+                                       space,
+                                       cudf::get_default_stream(),
+                                       sirius::telemetry::batch_telemetry_info{});
+  // An ended input refuses it; close_input() then reports that sender as usual.
+  (void)_session.push(id, std::move(batch));
+}
+
+cucascade::memory::memory_space& streaming_fragment::input_memory_space() const
+{
+  auto& sirius_ctx  = sirius_context_of(_context);
+  auto const& gpus  = sirius_ctx.active_gpu_ids();
+  auto* const space = gpus.empty() ? nullptr
+                                   : sirius_ctx.get_memory_manager().get_memory_space(
+                                       cucascade::memory::Tier::GPU, gpus.front());
+  if (space == nullptr) {
+    throw sirius::internal_exception("streaming_fragment: the engine has no active GPU");
+  }
+  return *space;
+}
+
+const stream_input_spec* streaming_fragment::find_input(stream_id_t id) const
+{
+  auto it = _spec.inputs.find(id);
+  return it == _spec.inputs.end() ? nullptr : &it->second;
+}
+
+bool streaming_fragment::input_sender_closed(stream_id_t id, sender_id_t sender) const
+{
+  require_built("input_sender_closed()");
+  return _session.input_sender_closed(id, sender);
+}
+
+bool streaming_fragment::push_input(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch)
+{
+  if (!accepts_input()) {
+    throw sirius::invalid_input_exception(
+      "streaming_fragment: push_input() must run after build() and before run()");
+  }
+  auto const declared = _spec.inputs.find(id);
+  if (declared == _spec.inputs.end()) {
+    throw sirius::invalid_input_exception("streaming_fragment: input stream " + std::to_string(id) +
+                                          " was never declared on this fragment");
+  }
+  if (batch == nullptr) {
+    throw std::invalid_argument("streaming_fragment: push_input() into stream " +
+                                std::to_string(id) + " got a null batch");
+  }
+  {
+    auto const& types = declared->second.types;
+    auto read_only    = batch->to_read_only();
+    auto const* gpu =
+      dynamic_cast<const cucascade::gpu_table_representation*>(read_only.get_data());
+    if (gpu == nullptr) {
+      throw std::invalid_argument("streaming_fragment: push_input() into stream " +
+                                  std::to_string(id) + " needs a GPU table batch");
+    }
+    auto const view = gpu->get_table_view();
+    if (static_cast<std::size_t>(view.num_columns()) != types.size()) {
+      throw std::invalid_argument(
+        "streaming_fragment: push_input() into stream " + std::to_string(id) + " got " +
+        std::to_string(view.num_columns()) + " columns, declared " + std::to_string(types.size()));
+    }
+    for (std::size_t i = 0; i < types.size(); ++i) {
+      auto const expected = sirius::get_cudf_type(types[i]);
+      auto const actual   = view.column(static_cast<cudf::size_type>(i)).type();
+      if (actual != expected) {
+        throw std::invalid_argument(
+          "streaming_fragment: push_input() into stream " + std::to_string(id) + " column " +
+          std::to_string(i) + " has cuDF type " + std::to_string(static_cast<int>(actual.id())) +
+          " (scale " + std::to_string(actual.scale()) + "), declared " + types[i].to_string());
+      }
+    }
+  }
+  if (!_session.push(id, std::move(batch))) { return false; }
+  note_input_data(id);
+  return true;
 }
 
 std::optional<std::shared_ptr<cucascade::data_batch>> streaming_fragment::pull(stream_id_t id)

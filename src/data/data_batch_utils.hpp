@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace sirius {
@@ -83,6 +84,25 @@ struct batch_rows_and_bytes {
  *         `get_uncompressed_data_size_in_bytes()`. Empty and zero when the batch holds no data.
  */
 [[nodiscard]] batch_rows_and_bytes get_batch_rows_and_bytes(cucascade::data_batch const& batch);
+
+/**
+ * @brief Independent deep copies of @p batch for a fan-out to several destinations.
+ *
+ * One copy per entry of @p telemetry, each in the batch's current memory space with a fresh batch
+ * id and a quent probe bound to that id (clone()'s probe argument defaults to a no-op, so an
+ * omitted probe silently drops the copy from quent). Runs on the batch's device and synchronizes
+ * @p stream before returning, so the copies are complete before any destination's stream reads
+ * them. Allocations come from @p stream, so a reservation attached to it covers the copies.
+ *
+ * @param batch The read-only accessor of the batch to copy; the caller holds it for the call.
+ * @param stream The stream the copies are made on.
+ * @param telemetry Telemetry for each copy, in order; its size is the number of copies.
+ * @return The copies, in the order of @p telemetry.
+ */
+[[nodiscard]] std::vector<std::shared_ptr<cucascade::data_batch>> clone_for_fanout(
+  const cucascade::read_only_data_batch& batch,
+  ::cuda::stream_ref stream,
+  std::span<const telemetry::batch_telemetry_info> telemetry);
 
 /**
  * @brief Get a cudf::table_view from a read-only data_batch accessor.

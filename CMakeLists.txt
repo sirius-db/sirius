@@ -32,6 +32,7 @@ if(NOT SIRIUS_BUILD_SHARED AND NOT SIRIUS_BUILD_STATIC)
   message(FATAL_ERROR "Enable at least one Sirius library output")
 endif()
 option(SIRIUS_BUILD_TESTS "Build Sirius C++ tests" OFF)
+option(SIRIUS_BUILD_TOOLS "Build Sirius developer tools" OFF)
 
 # Optional features
 option(ENABLE_STREAM_CHECK
@@ -69,4 +70,10 @@ endif()
 if(SIRIUS_BUILD_TESTS)
   include(cmake/sirius-test-sources.cmake)
   include(cmake/sirius-tests.cmake)
+endif()
+
+# Tools are opt-in targets: EXCLUDE_FROM_ALL keeps `make release` (and the
+# default `all`) unchanged even when SIRIUS_BUILD_TOOLS is cached ON.
+if(SIRIUS_BUILD_TOOLS)
+  add_subdirectory(tools/substrait_gen EXCLUDE_FROM_ALL)
 endif()
