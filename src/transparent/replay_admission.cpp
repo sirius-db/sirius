@@ -105,6 +105,8 @@ failure_cause classify_failure(std::exception_ptr error, late_failure_cause fall
     return {late_failure_cause::physical_input, e.what()};
   } catch (op::scan::certificate_incomplete const& e) {
     return {late_failure_cause::certificate, e.what()};
+  } catch (io::descriptor_mismatch_error const& e) {
+    return {late_failure_cause::reader_io, e.what()};
   } catch (duckdb::IOException const& e) {
     return {late_failure_cause::reader_io, e.what()};
   } catch (io::credential_error const& e) {

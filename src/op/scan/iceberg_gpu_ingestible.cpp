@@ -217,10 +217,11 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
     if (counters && error.cause == transparent::late_failure_cause::reader_io)
       counters->iceberg_delete_reader_io_failures.fetch_add(1, std::memory_order_relaxed);
     throw;
-  } catch (io::object_changed_error const&) {
+  } catch (io::object_changed_error const& error) {
     if (counters)
       counters->iceberg_delete_identity_failures.fetch_add(1, std::memory_order_relaxed);
-    throw;
+    throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                  error.what());
   } catch (std::bad_alloc const&) {
     throw scan_manager::preparation_resource_error(
       "DV preparation control allocation failed", false, std::current_exception());

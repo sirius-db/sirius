@@ -460,6 +460,7 @@ TEST_CASE("Normal EOS does not report worker operation_canceled as a query error
       };
       return job;
     });
+  auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(ready.wait_for(1s) == std::future_status::ready);
   f.coordinator.request_stop(stop_reason::normal_eos);
@@ -487,6 +488,7 @@ TEST_CASE("Normal EOS still reports a real late worker error", "[scan_preparatio
       };
       return job;
     });
+  auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(ready.wait_for(1s) == std::future_status::ready);
   f.coordinator.request_stop(stop_reason::normal_eos);
