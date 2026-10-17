@@ -4,6 +4,7 @@
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/validity.hpp"
 #include "codegen/util/nvtx.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -1301,6 +1302,16 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
 
   bool const selecting    = sel != nullptr && sel->active();
   bool const substituting = pred != nullptr && pred->active();
+  // A selection compacts the value rows, while the stored bitmask describes
+  // every row of the chunk. Returning it verbatim would misalign validity with
+  // values, so a nullable column is refused here; a caller that wants both
+  // reattaches the mask itself against the same selection it passed in.
+  if (selecting && !tree.validity.empty()) {
+    if (error_out) {
+      *error_out = "decompress: selection on a null-masked column is not supported";
+    }
+    return nullptr;
+  }
   // The requested route must be the one this plan actually supports: a
   // mismatch would silently decode full width where the caller sized the
   // output from the survivor count.
@@ -1345,10 +1356,9 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
       }
       return nullptr;
     }
-    if (static_cast<std::int64_t>(col->size()) != sel->survivor_count || col->null_count() != 0) {
+    if (static_cast<std::int64_t>(col->size()) != sel->survivor_count) {
       if (error_out) {
-        *error_out =
-          "decompress: masked str_split decode returned a non-survivor-sized or null-masked column";
+        *error_out = "decompress: masked str_split decode returned a non-survivor-sized column";
       }
       return nullptr;
     }
@@ -1388,16 +1398,10 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     // Belt and braces for the same hazard: whatever comes back from a
     // compacted-route request must already be survivor-sized (directly from
     // the mask or index walk; the dictionary route via the key gather over the
-    // compacted codes) and — per the null policy — carry no null mask.
+    // compacted codes).
     if (static_cast<std::int64_t>(col->size()) != sel->survivor_count) {
       if (error_out) {
         *error_out = "decompress: compacted decode returned a non-survivor-sized column";
-      }
-      return nullptr;
-    }
-    if (col->null_count() != 0) {
-      if (error_out) {
-        *error_out = "decompress: selection on a null-masked column is not supported";
       }
       return nullptr;
     }
@@ -1408,14 +1412,6 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   // mask→indices buffer. (Every other route came back survivor-sized from the
   // masked decode and skips this.)
   if (col && selecting && !sel->compacted()) {
-    if (col->null_count() != 0) {
-      // Selection targets NOT NULL columns only; refuse rather than risk a
-      // mask/null interaction the selection wave has not modeled.
-      if (error_out) {
-        *error_out = "decompress: selection on a null-masked column is not supported";
-      }
-      return nullptr;
-    }
     if (static_cast<std::int64_t>(sel->survivor_indices.size()) != sel->survivor_count) {
       if (error_out) {
         *error_out = "decompress: survivor_indices size does not match survivor_count";
@@ -1434,6 +1430,10 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     // soon as we return, so the gather must have completed.
     cudaStreamSynchronize(stream.get());
   }
+  // Reattach the validity the compress side detached. The walk decodes a
+  // null-free column, so this is the only place the mask re-enters the picture;
+  // a selecting decode was refused above and reaches here only when all-valid.
+  if (col) { attach_validity(*col, tree.validity, stream, mr); }
   return col;
 }
 
@@ -1494,9 +1494,6 @@ std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree)
   NodeId const nid = root_value_producer(tree);
   if (nid >= tree.nodes.size() || tree.nodes[nid].op != "str_split") { return std::nullopt; }
   PlanNode const& node = tree.nodes[nid];
-  for (auto const& name : node.output_names) {
-    if (name == "null_mask") { return std::nullopt; }
-  }
   str_split_shape shape;
   shape.offsets_nid = static_cast<NodeId>(tree.nodes.size());
   bool chars_ok     = false;
@@ -1546,11 +1543,6 @@ bool dict_codes_selection_root(PlanTree const& tree)
     if (sources.empty() || !(sources.front() == ValueId{0, 0})) { continue; }
     PlanNode const& node = tree.nodes[nid];
     if (node.op != "dictionary") { return false; }
-    // Nullable dictionary plans carry a trailing `null_mask` output channel;
-    // iteration-1 selection has no null model — refuse (never corrupt).
-    for (auto const& name : node.output_names) {
-      if (name == "null_mask") { return false; }
-    }
     // The mask consumer is the codes region: the `indices` channel must be
     // routed to a bitpack child so it can decode compacted.
     for (auto const& e : node.children) {
@@ -1569,9 +1561,16 @@ column_decode_caps probe_column(PlanTree const& tree)
 {
   namespace sc = sirius::codegen;
   column_decode_caps caps;
+  // A nullable column is never compacted (decompress_column refuses a selection on it), so it
+  // reports the `full` route and a caller reserves for a full-width decode. Equality is
+  // unaffected: the predicate result is null-free and decompress_column reattaches the
+  // column's validity to it, which is the null propagation the predicate promises.
+  bool const nullable = !tree.validity.empty();
   // The shapes are mutually exclusive: a plan has exactly one (0,0)-producer,
   // so the route is a classification, not a set of overlapping flags.
-  if (bitpack_selection_root(tree)) {
+  if (nullable) {
+    // route stays `full`
+  } else if (bitpack_selection_root(tree)) {
     caps.compact_route = sc::decode_route::bitpack_mask;
   } else if (delta_selection_root(tree)) {
     caps.compact_route = sc::decode_route::delta_mask;
