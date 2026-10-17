@@ -62,10 +62,10 @@ int main(int argc, char** argv)
     jit::CompileOptions options{jit::arch_cc_for_current_device()};
     auto& cache        = jit::KernelCache::instance();
     const auto& source = mode == "external" ? external_source : embedded_source;
-    auto* first        = cache.get_or_compile_plain(source, "cache_test", options);
-    const int value    = launch(first);
-    auto* second       = cache.get_or_compile_plain(source, "cache_test", options);
-    if (launch(second) != value) throw std::runtime_error("second launch changed result");
+    auto first         = cache.get_or_compile_plain(source, "cache_test", options);
+    const int value    = launch(first.get());
+    auto second        = cache.get_or_compile_plain(source, "cache_test", options);
+    if (launch(second.get()) != value) throw std::runtime_error("second launch changed result");
     if (first != second || cache.size() != 1) throw std::runtime_error("unexpected memory reuse");
     std::printf("RESULT value=%d\n", value);
     return 0;
