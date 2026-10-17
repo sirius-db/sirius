@@ -20,6 +20,7 @@
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "utils/host_allocation_fault.hpp"
 
 #include <algorithm>
 #include <array>
@@ -57,6 +58,14 @@ struct tagged : sirius::op::scan::scan_info {
   int id;
   size_t rows;
   tagged(int i, size_t n = 1) : id(i), rows(n) {}
+};
+struct cleanup_tagged : tagged {
+  std::shared_ptr<test::cleanup_observation> seen;
+  explicit cleanup_tagged(std::shared_ptr<test::cleanup_observation> seen)
+    : tagged(1), seen(std::move(seen))
+  {
+  }
+  ~cleanup_tagged() override { seen->release(); }
 };
 struct accumulator : sirius::op::scan::batch_coalescer {
   size_t cap, retained = 0;
@@ -266,6 +275,615 @@ struct fixture {
   }
 };
 }  // namespace
+TEST_CASE("Preparation input disposal is outside the gate on every terminal path",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  enum class path {
+    finished,
+    ready_unit,
+    late_worker,
+    cancelled_unit,
+    parked_result,
+    queued_batch
+  };
+  auto mode = GENERATE(path::finished,
+                       path::ready_unit,
+                       path::late_worker,
+                       path::cancelled_unit,
+                       path::parked_result,
+                       path::queued_batch);
+  CAPTURE(static_cast<int>(mode));
+  fixture f(1, 1);
+  auto out    = std::make_shared<sink>();
+  auto seen   = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  auto worker = f.make_hold();
+  struct pruning_coalescer : accumulator {
+    std::function<std::unique_ptr<sirius::op::scan::scan_info>()> emit;
+    cursor_step advance(sirius::op::scan::scan_info&, size_t&, size_t) override
+    {
+      return {emit ? emit() : nullptr, true};
+    }
+    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override { return {}; }
+  };
+  auto coalescer = std::make_shared<pruning_coalescer>();
+  if (mode == path::queued_batch) {
+    coalescer->emit = [&] {
+      f.coordinator.request_stop(stop_reason::normal_eos);
+      return std::make_unique<cleanup_tagged>(seen);
+    };
+  }
+  std::shared_ptr<preparation_unit> unit;
+  if (mode == path::ready_unit) {
+    required_input_set required;
+    required.set(static_cast<size_t>(required_input::segments));
+    required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+    unit = f.coordinator.admit_unit({93, 1}, required);
+    REQUIRE(unit);
+    auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+      new sirius::op::scan::physical_profile_table, [seen](auto* value) {
+        seen->release();
+        delete value;
+      });
+    REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+    REQUIRE(unit->complete_input(checkpoint_input{7}));
+  } else if (mode == path::cancelled_unit || mode == path::parked_result) {
+    required_input_set required;
+    required.set(static_cast<size_t>(required_input::delete_set));
+    unit = f.coordinator.admit_unit({93, 1}, required);
+    REQUIRE(unit);
+  }
+  f.source(coalescer,
+           out,
+           single_job(
+             [&, seen]() -> std::unique_ptr<sirius::op::scan::scan_info> {
+               if (mode == path::ready_unit) return std::make_unique<tagged>(1);
+               auto input = std::make_unique<cleanup_tagged>(seen);
+               if (mode == path::late_worker) worker->wait();
+               return input;
+             },
+             unit));
+  if (mode == path::ready_unit) unit.reset();
+  auto cleanup = f.shutdown_guard();
+  f.start();
+  if (mode == path::late_worker) {
+    REQUIRE(worker->await());
+    f.coordinator.request_stop(stop_reason::normal_eos);
+    worker->release();
+  } else if (unit) {
+    auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!f.coordinator.snapshot().results_peak && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    REQUIRE(f.coordinator.snapshot().results_peak == 1);
+    if (mode == path::cancelled_unit)
+      REQUIRE(unit->cancel());
+    else
+      f.coordinator.request_stop(stop_reason::normal_eos);
+  }
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK_FALSE(f.completion.has_error());
+  CHECK(seen->releases == (mode == path::queued_batch ? 2 : 1));
+  CHECK(seen->outside == seen->releases);
+  CHECK(seen->errors == 0);
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  CHECK(f.coordinator.snapshot().jobs_peak == 1);
+  CHECK(f.coordinator.snapshot().results_peak <= 1);
+  CHECK(f.coordinator.snapshot().output_peak <= 1);
+}
+
+TEST_CASE("Retiring units releases final owners but preserves external ready snapshots",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  enum class mode { pending, ready, retained_snapshot };
+  auto stage = GENERATE(mode::pending, mode::ready, mode::retained_snapshot);
+  CAPTURE(static_cast<int>(stage));
+  fixture f;
+  auto seen = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({94, 1}, required);
+  REQUIRE(unit);
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [seen](auto* value) {
+      seen->release();
+      delete value;
+    });
+  sirius::op::scan::physical_profile value;
+  value.storage_version = 77;
+  auto id               = profile->add(value);
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+  if (stage != mode::pending) REQUIRE(unit->complete_input(checkpoint_input{7}));
+  unit_record snapshot;
+  if (stage == mode::retained_snapshot) snapshot = unit->record();
+  unit.reset();
+  f.coordinator.retire_unit({94, 1});
+  CHECK_FALSE(f.coordinator.unit_state_snapshot({94, 1}));
+  if (stage == mode::retained_snapshot) {
+    CHECK(seen->releases == 0);
+    REQUIRE(snapshot.deps);
+    REQUIRE(snapshot.deps->profiles);
+    CHECK(snapshot.deps->profiles->get(id).storage_version == 77);
+    CHECK(snapshot.deps->checkpoint_iteration == 7);
+    snapshot = {};
+  } else {
+    CHECK(seen->callbacks_seen > 0);
+  }
+  CHECK(seen->releases == 1);
+  CHECK(seen->outside == 1);
+  CHECK(seen->errors == 0);
+  f.coordinator.retire_unit({94, 1});
+  CHECK(seen->releases == 1);
+}
+
+TEST_CASE("Dependency disposal keeps drain pending through terminal cleanup",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  enum class operation { cancel, fail, retire, stop };
+  auto mode = GENERATE(operation::cancel, operation::fail, operation::retire, operation::stop);
+  CAPTURE(static_cast<int>(mode));
+  fixture f(1, 1);
+  auto paused       = f.make_hold();
+  auto seen         = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  seen->after_probe = [paused] { paused->wait(); };
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({95, 1}, required);
+  REQUIRE(unit);
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [seen](auto* value) {
+      seen->release();
+      delete value;
+    });
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+  unit.reset();
+  // No preparation job protects this caller: disposal needs its own drain credit.
+  std::atomic<bool> terminal_done{false};
+  std::jthread terminal([&] {
+    if (mode == operation::retire) {
+      f.coordinator.retire_unit({95, 1});
+    } else if (mode == operation::stop) {
+      f.coordinator.request_stop(stop_reason::normal_eos);
+    } else {
+      auto pending = f.coordinator.admit_unit({95, 1}, required);
+      if (mode == operation::cancel)
+        pending->cancel();
+      else
+        pending->fail({sirius::transparent::late_failure_cause::other, {}, "cleanup failure", {}});
+    }
+    terminal_done = true;
+  });
+  // Release before joining even if a REQUIRE aborts this test.
+  auto release = std::shared_ptr<hold>(paused.get(), [paused](hold*) { paused->release(); });
+  auto cleanup = f.shutdown_guard();
+  REQUIRE(paused->await());
+  REQUIRE(seen->outside == 1);
+  CHECK(seen->callbacks_seen > 0);
+  f.start();
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!f.coordinator.snapshot().wakes && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  REQUIRE(f.coordinator.snapshot().wakes > 0);
+  std::this_thread::sleep_for(30ms);
+  CHECK_FALSE(terminal_done);
+  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  paused->release();
+  terminal.join();
+  f.finish();
+  CHECK(terminal_done);
+  CHECK(seen->releases == 1);
+  CHECK(seen->outside == 1);
+  CHECK(seen->errors == 0);
+  CHECK_FALSE(f.owner_error);
+  CHECK(f.completion.has_error() == (mode == operation::fail));
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Final release stop notifications coalesce while units retire themselves",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  fixture f(1, 32);
+  size_t depth = 0, peak = 0;
+  std::array<size_t, 32> releases{};
+  std::vector<std::shared_ptr<preparation_unit>> units;
+  auto cleanup = f.shutdown_guard();
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  for (size_t index = 0; index < releases.size(); ++index) {
+    unit_key key{96, index};
+    auto unit = f.coordinator.admit_unit(key, required);
+    REQUIRE(unit);
+    auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+      new sirius::op::scan::physical_profile_table, [&, key, index](auto* value) {
+        peak = std::max(peak, ++depth);
+        ++releases[index];
+        f.coordinator.request_stop(stop_reason::normal_eos);
+        f.coordinator.retire_unit(key);
+        --depth;
+        delete value;
+      });
+    REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+    units.push_back(std::move(unit));
+  }
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK(depth == 0);
+  CHECK(peak == 1);
+  for (size_t index = 0; index < releases.size(); ++index) {
+    CHECK(releases[index] == 1);
+    CHECK(units[index]->record().state == unit_state::cancelled);
+    CHECK_FALSE(f.coordinator.unit_state_snapshot({96, index}));
+  }
+  f.start();
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK_FALSE(f.completion.has_error());
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Discarded dispatcher captures coalesce nested stop notifications",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  fixture f(1, 2, k_interrupt_check_interval, preparation_options{2, 2, 2, 2, 1, 20ms});
+  auto blocked = f.make_hold();
+  std::atomic<size_t> work_calls{0};
+  std::atomic<size_t> active{0}, peak{0};
+  std::array<std::atomic<size_t>, 2> releases{};
+  struct notify_on_release {
+    preparation_coordinator& coordinator;
+    std::atomic<size_t>&active, &peak, &releases;
+    notify_on_release(preparation_coordinator& coordinator,
+                      std::atomic<size_t>& active,
+                      std::atomic<size_t>& peak,
+                      std::atomic<size_t>& releases)
+      : coordinator(coordinator), active(active), peak(peak), releases(releases)
+    {
+    }
+    ~notify_on_release()
+    {
+      static thread_local size_t depth = 0;
+      auto nested                      = ++depth;
+      auto prior                       = peak.load();
+      while (prior < nested && !peak.compare_exchange_weak(prior, nested)) {}
+      ++active;
+      ++releases;
+      coordinator.request_stop(stop_reason::normal_eos);
+      --active;
+      --depth;
+    }
+  };
+  auto cleanup = f.shutdown_guard();
+  f.dispatcher.enqueue([blocked] { blocked->wait(); });
+  REQUIRE(blocked->await());
+  f.source(std::make_shared<accumulator>(1),
+           std::make_shared<sink>(),
+           [&, next = size_t{0}]() mutable -> std::optional<preparation_coordinator::job> {
+             if (next == releases.size()) return {};
+             auto token =
+               std::make_shared<notify_on_release>(f.coordinator, active, peak, releases[next++]);
+             return preparation_coordinator::job{[token = std::move(token), &work_calls] {
+                                                   ++work_calls;
+                                                   return std::make_unique<tagged>(1);
+                                                 },
+                                                 {}};
+           });
+  f.start();
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  // The third iteration starts only after both previous enqueue calls returned.
+  while (f.coordinator.snapshot().wakes < 3 && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  REQUIRE(f.coordinator.snapshot().wakes >= 3);
+  REQUIRE(f.coordinator.snapshot().jobs_peak == 2);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  blocked->release();
+  f.finish();
+  CHECK(active == 0);
+  CHECK(peak == 1);
+  CHECK(releases[0] == 1);
+  CHECK(releases[1] == 1);
+  CHECK(work_calls == 0);
+  CHECK_FALSE(f.owner_error);
+  CHECK_FALSE(f.completion.has_error());
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Preparation cancel retirement and stop bookkeeping allocate no host memory",
+          "[.][host_allocation_fault][preparation_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  enum class operation { cancel, retire, stop };
+  auto mode = GENERATE(operation::cancel, operation::retire, operation::stop);
+  CAPTURE(static_cast<int>(mode));
+  fixture f;
+  std::atomic<size_t> released{0};
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({98, 1}, required);
+  REQUIRE(unit);
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [&](auto* value) {
+      ++released;
+      delete value;
+    });
+  auto cleanup = f.shutdown_guard();
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+  if (mode != operation::cancel) unit.reset();
+  size_t allocations = 0;
+  {
+    // The deleter only updates an atomic: observer thread creation is not counted.
+    fault counting{fault::every_allocation_scope, 0};
+    if (mode == operation::cancel)
+      unit->cancel();
+    else if (mode == operation::retire)
+      f.coordinator.retire_unit({98, 1});
+    else
+      f.coordinator.request_stop(stop_reason::normal_eos);
+    allocations = counting.stop();
+  }
+  CHECK(allocations == 0);
+  CHECK(released == 1);
+}
+
+TEST_CASE("Rejected and abandoned job settlement allocate no host memory",
+          "[.][host_allocation_fault][preparation_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  const bool abandoned = GENERATE(false, true);
+  CAPTURE(abandoned);
+  fixture f(1, 1);
+  struct measurement {
+    std::optional<fault> counting;
+    std::thread::id owner;
+    bool control_fired = false, finished = false, same_thread = false;
+    size_t allocations = 0;
+    void arm() noexcept
+    {
+      {
+        fault control{fault::every_allocation_scope, 1};
+        try {
+          void* pointer                         = ::operator new(64);
+          *static_cast<volatile char*>(pointer) = 1;
+          ::operator delete(pointer);
+        } catch (std::bad_alloc const&) {
+          control_fired = control.fired();
+        }
+        (void)control.stop();
+      }
+      owner = std::this_thread::get_id();
+      counting.emplace(fault::every_allocation_scope, 0);
+    }
+    void finish() noexcept
+    {
+      same_thread = owner == std::this_thread::get_id();
+      if (same_thread && counting) {
+        allocations = counting->stop();
+        counting.reset();
+        finished = true;
+      }
+    }
+  };
+  auto measured = std::make_shared<measurement>();
+  auto blocked  = f.make_hold();
+  std::atomic<size_t> work_calls{0};
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::segments));
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({99, 1}, required);
+  REQUIRE(unit);
+  auto cleanup = f.shutdown_guard();
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [measured](auto* value) {
+      measured->finish();
+      delete value;
+    });
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
+  REQUIRE(unit->complete_input(checkpoint_input{7}));
+  std::function<std::unique_ptr<sirius::op::scan::scan_info>()> work;
+  if (abandoned) {
+    struct arm_on_destroy {
+      std::shared_ptr<measurement> measured;
+      explicit arm_on_destroy(std::shared_ptr<measurement> measured) : measured(std::move(measured))
+      {
+      }
+      ~arm_on_destroy() { measured->arm(); }
+    };
+    auto token = std::make_shared<arm_on_destroy>(measured);
+    work       = [token = std::move(token), &work_calls] {
+      ++work_calls;
+      return std::make_unique<tagged>(1);
+    };
+    f.dispatcher.enqueue([blocked] { blocked->wait(); });
+    REQUIRE(blocked->await());
+  } else {
+    work = [&, measured] {
+      ++work_calls;
+      auto input = std::make_unique<tagged>(1);
+      blocked->wait();
+      measured->arm();
+      return input;
+    };
+  }
+  f.source(std::make_shared<accumulator>(1),
+           std::make_shared<sink>(),
+           single_job(std::move(work), std::move(unit)));
+  f.start();
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (f.coordinator.snapshot().wakes < 2 && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  REQUIRE(f.coordinator.snapshot().wakes >= 2);
+  if (!abandoned) REQUIRE(blocked->await());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  blocked->release();
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK_FALSE(f.completion.has_error());
+  CHECK(work_calls == (abandoned ? 0 : 1));
+  CHECK(measured->control_fired);
+  CHECK(measured->same_thread);
+  CHECK(measured->finished);
+  CHECK(measured->allocations == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Queue allocation failure unwinds every caller payload outside the gate",
+          "[.][host_allocation_fault][preparation_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  enum class path { advance, partial, flush };
+  auto mode = GENERATE(path::advance, path::partial, path::flush);
+  CAPTURE(static_cast<int>(mode));
+  fixture f(1, 1);
+  auto failure = f.completion.get_awaitable();
+  auto out     = std::make_shared<sink>();
+  auto seen    = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  std::optional<fault> armed;
+  size_t made = 0, refused_id = 0, observed_allocations = 0;
+  auto disarm = [&](size_t id) {
+    if (armed) {
+      observed_allocations += armed->stop();
+      if (armed->fired()) refused_id = id;
+      armed.reset();
+    }
+  };
+  struct queued_payload : tagged {
+    std::shared_ptr<test::cleanup_observation> seen;
+    std::function<void()> disarm;
+    queued_payload(int id,
+                   std::shared_ptr<test::cleanup_observation> seen,
+                   std::function<void()> disarm)
+      : tagged(id), seen(std::move(seen)), disarm(std::move(disarm))
+    {
+    }
+    ~queued_payload() override
+    {
+      disarm();
+      seen->release();
+    }
+  };
+  auto make_batch = [&]() -> std::unique_ptr<sirius::op::scan::scan_info> {
+    auto id = ++made;
+    return std::make_unique<queued_payload>(static_cast<int>(id), seen, [&, id] { disarm(id); });
+  };
+  struct fault_coalescer : accumulator {
+    path mode;
+    std::function<std::unique_ptr<sirius::op::scan::scan_info>()> make;
+    std::function<void()> arm;
+    size_t advance_calls = 0, partial_calls = 0, flush_calls = 0;
+    explicit fault_coalescer(path mode) : mode(mode) {}
+    cursor_step advance(sirius::op::scan::scan_info&, size_t&, size_t) override
+    {
+      ++advance_calls;
+      if (mode == path::partial) {
+        note_retained(clock::now() - 1s);
+        return {nullptr, true};
+      }
+      auto batch = make();
+      arm();
+      return {std::move(batch), true};
+    }
+    std::unique_ptr<sirius::op::scan::scan_info> partial_emit() override
+    {
+      if (!first_retained_time()) return {};
+      ++partial_calls;
+      clear_retained();
+      auto batch = make();
+      arm();
+      return batch;
+    }
+    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override
+    {
+      ++flush_calls;
+      std::vector<std::unique_ptr<sirius::op::scan::scan_info>> batches;
+      if (mode == path::flush) {
+        batches.push_back(make());
+        // Construct the vector and payload before arming the queue allocation.
+        arm();
+      }
+      return batches;
+    }
+  };
+  constexpr size_t attempts = 1024;
+  const size_t sources      = mode == path::flush ? attempts : 1;
+  std::vector<std::shared_ptr<fault_coalescer>> coalescers;
+  for (size_t index = 0; index < sources; ++index) {
+    auto coalescer  = std::make_shared<fault_coalescer>(mode);
+    coalescer->make = make_batch;
+    coalescer->arm  = [&] { armed.emplace(fault::every_allocation_scope, 1); };
+    coalescers.push_back(coalescer);
+    preparation_coordinator::source source;
+    source.coalescer = coalescer;
+    source.claim     = finite_jobs(mode == path::flush ? 0 : attempts,
+                               [](int id) { return std::make_unique<tagged>(id); });
+    source.construct = [&](std::unique_ptr<sirius::op::scan::scan_info> batch) {
+      disarm(static_cast<tagged&>(*batch).id);
+      using sirius::op::scan::scan_operator_input;
+      auto input = std::make_unique<scan_operator_input>(
+        std::move(batch), nullptr, 0, std::nullopt, scan_operator_input::prefetch_start::deferred);
+      return preparation_coordinator::publication{std::move(input), 0};
+    };
+    source.publish = [out](preparation_coordinator::publication& publication) {
+      auto& input = static_cast<sirius::op::scan::scan_operator_input&>(*publication.input);
+      auto metadata =
+        std::get<std::shared_ptr<sirius::op::scan::scan_info>>(input.materialization_info);
+      std::lock_guard lock(out->mutex);
+      out->published.push_back(static_cast<tagged&>(*metadata).id);
+      out->cv.notify_all();
+    };
+    source.close = [out, sources] {
+      std::lock_guard lock(out->mutex);
+      if (++out->close_calls == sources) out->closed = true;
+      out->cv.notify_all();
+    };
+    source.bind_consumption = [out](std::function<void()> consume) {
+      out->consumed = std::move(consume);
+    };
+    f.coordinator.add_source(std::move(source));
+  }
+  auto cleanup = f.shutdown_guard();
+  f.start();
+  size_t consumed = 0;
+  while (!f.completion.has_error() && !out->closed) {
+    if (out->await(consumed + 1)) {
+      out->consume();
+      ++consumed;
+    } else {
+      REQUIRE((f.completion.has_error() || out->closed));
+    }
+  }
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  REQUIRE(f.completion.has_error());
+  CHECK_THROWS_AS(failure.get(), std::bad_alloc);
+  REQUIRE(refused_id > 0);
+  CHECK(observed_allocations == 1);
+  CHECK(made > 1);
+  CHECK(made <= attempts);
+  CHECK(std::count(out->published.begin(), out->published.end(), static_cast<int>(refused_id)) ==
+        0);
+  CHECK(seen->releases == made);
+  CHECK(seen->outside == made);
+  CHECK(seen->errors == 0);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  if (mode == path::partial)
+    CHECK(coalescers.front()->partial_calls == made);
+  else if (mode == path::advance)
+    CHECK(coalescers.front()->advance_calls == made);
+  else {
+    size_t flushes = 0;
+    for (auto const& coalescer : coalescers)
+      flushes += coalescer->flush_calls;
+    CHECK(flushes == made);
+  }
+}
+
 TEST_CASE("Ready partial batches publish while every preparation worker is blocked",
           "[scan_preparation][coordinator]")
 {

@@ -222,6 +222,27 @@ For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple p
 3. **Execution.** `start_metadata_processing` arms the coordinator; `run_preparation_on_query_thread` drives it while scan workers prepare metadata. Through `load_balancing_scan_batch_coalescer`, it coalesces ready inputs, balances each batch onto a GPU, and validates publication before initializing prefetch and pushing a `scan_operator_input` onto the operator's connector. Later scans can progress before earlier scans close. Consumers (the scan operators) block in `split_connector::get_next_split` until splits arrive.
 4. **Teardown.** The coordinator closes each connector when its source is drained (forwarding any worker-captured exception, first-writer-wins). Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. Success requires both preparation and GPU work to drain. Failure or interruption stops new preparation and publication and drains workers and consumers before resources are released. `quiesce(query_id)` stops and joins that query's preparation while retaining its providers; after execution work retires, `reset(query_id)` releases that query's state without stopping the shared pool.
 
+Preparation payloads are finally released outside the publication gate and live unit mutex.
+Slot credits remain occupied until that local disposal finishes; out-of-lock unit cleanup
+and failure reporting are also counted until completion. Release callbacks may make bounded,
+nonthrowing gate observations or notifications, but must not synchronously drain or destroy
+their own coordinator. Normal stop notifications coalesce with an active cancellation sweep.
+Explicit unit retirement returns registry membership, not a physical
+byte reservation. External ready snapshots, provider caches and published consumer inputs
+keep their existing ownership; preparation quiescence does not invalidate them.
+
+The normal C++ suite includes `[preparation_cleanup]`. Linux allocation-refusal
+tests are hidden and require the existing test-only interposer explicitly:
+
+```bash
+pixi run cmake --build --preset release --target sirius_host_allocation_fault
+pixi run env LD_PRELOAD="$PWD/build/release/libsirius_host_allocation_fault.so" \
+  build/release/test/cpp/sirius_unittest '[preparation_allocation_fault]'
+```
+
+This interposer checks ordinary `operator new` on the armed thread, not all native,
+aligned, device or process allocations. CI runs this hidden group separately.
+
 ### split_provider
 
 `split_provider` is concrete and composes a `gpu_ingestible` non-owningly (the operator owns the lifetime; the provider is always torn down first by `reset(query_id)`). Its `has_more_splits` / `next_split_provider` delegate to the ingestible. The standalone `run(scheduler, on_split)` path enqueues one task per claimed metadata unit; the connector is closed (with any captured exception) when the last enqueued task drops its reference to the shared completion state.

@@ -15,10 +15,12 @@
  */
 
 #include "catch.hpp"
+#include "io/sirius_datasource.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "scan_manager/preparation.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "utils/host_allocation_fault.hpp"
 
 #include <cudf/io/parquet_schema.hpp>
 
@@ -35,6 +37,150 @@ required_input_set needs(required_input input)
   return set;
 }
 }  // namespace
+TEST_CASE("Terminal preparation releases partial dependencies outside both locks",
+          "[scan_preparation][preparation_unit][preparation_cleanup]")
+{
+  auto gate     = std::make_shared<preparation_gate>();
+  auto seen     = std::make_shared<test::cleanup_observation>(gate);
+  auto required = needs(required_input::segments) | needs(required_input::checkpoint_iteration);
+  preparation_unit unit({1, 1}, required, gate);
+  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+    new sirius::op::scan::physical_profile_table, [seen](auto* value) {
+      seen->release();
+      delete value;
+    });
+  REQUIRE(unit.complete_input(segments_input{std::move(profile)}));
+  bool fail = false, throw_report = false;
+  SECTION("cancel") {}
+  SECTION("failure") { fail = true; }
+  SECTION("throwing failure reporter") { fail = throw_report = true; }
+  auto terminal = fail ? unit_state::failed : unit_state::cancelled;
+  if (fail) {
+    gate->report_failure = [&](preparation_failure const&) {
+      CHECK(seen->releases == 1);
+      if (throw_report) throw std::runtime_error("report injected");
+    };
+    preparation_failure failure{
+      sirius::transparent::late_failure_cause::other, {}, "first terminal", {}};
+    if (throw_report)
+      CHECK_THROWS_WITH(unit.fail(failure), "report injected");
+    else
+      CHECK(unit.fail(failure));
+    REQUIRE(unit.record().failure);
+    CHECK(unit.record().failure->detail == "first terminal");
+  } else {
+    CHECK(unit.cancel());
+  }
+  CHECK(unit.record().state == terminal);
+  CHECK_FALSE(unit.cancel());
+  CHECK_FALSE(unit.fail({sirius::transparent::late_failure_cause::other, {}, "late", {}}));
+  CHECK(seen->releases == 1);
+  CHECK(seen->outside == 1);
+  CHECK(seen->errors == 0);
+  CHECK(seen->callbacks_seen > 0);
+  std::lock_guard lock(gate->mutex);
+  CHECK(gate->callbacks == 0);
+}
+
+TEST_CASE("Failed ready snapshot retries release replaced dependency owners outside locks",
+          "[.][host_allocation_fault][preparation_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  auto family =
+    GENERATE(required_input::footer, required_input::segments, required_input::delete_set);
+  CAPTURE(static_cast<int>(family));
+  auto gate = std::make_shared<preparation_gate>();
+  std::array<std::shared_ptr<test::cleanup_observation>, 3> seen;
+  for (auto& owner : seen)
+    owner = std::make_shared<test::cleanup_observation>(gate);
+  preparation_unit unit({97, 1}, needs(family), gate);
+  sirius::op::scan::split_dependencies old, replacement;
+  size_t owners = 1;
+  if (family == required_input::footer) {
+    owners     = 3;
+    old.footer = std::shared_ptr<cudf::io::parquet::FileMetaData const>(
+      new cudf::io::parquet::FileMetaData, [observer = seen[0]](auto* value) {
+        observer->release();
+        delete value;
+      });
+    old.parquet_approval = std::shared_ptr<sirius::op::scan::parquet_input_approval const>(
+      new sirius::op::scan::parquet_input_approval, [observer = seen[1]](auto* value) {
+        observer->release();
+        delete value;
+      });
+    // Real datasource shell, with no I/O context/object: only ownership is exercised.
+    old.datasource = std::shared_ptr<sirius::io::sirius_datasource>(
+      new sirius::io::sirius_datasource(nullptr, nullptr), [observer = seen[2]](auto* value) {
+        observer->release();
+        delete value;
+      });
+    replacement.footer           = std::make_shared<cudf::io::parquet::FileMetaData>();
+    replacement.parquet_approval = std::make_shared<sirius::op::scan::parquet_input_approval>();
+    replacement.datasource = std::make_shared<sirius::io::sirius_datasource>(nullptr, nullptr);
+  } else if (family == required_input::segments) {
+    old.profiles = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+      new sirius::op::scan::physical_profile_table, [observer = seen[0]](auto* value) {
+        observer->release();
+        delete value;
+      });
+    replacement.profiles = std::make_shared<sirius::op::scan::physical_profile_table>();
+  } else {
+    old.delete_set = std::shared_ptr<sirius::op::scan::iceberg_delete_set const>(
+      new sirius::op::scan::iceberg_delete_set("old"), [observer = seen[0]](auto* value) {
+        observer->release();
+        delete value;
+      });
+    replacement.delete_set = std::make_shared<sirius::op::scan::iceberg_delete_set>("replacement");
+  }
+  auto expected = replacement;
+  auto complete = [&](sirius::op::scan::split_dependencies& input) {
+    if (family == required_input::footer)
+      return unit.complete_input(footer_input{
+        std::move(input.footer), std::move(input.parquet_approval), std::move(input.datasource)});
+    if (family == required_input::segments)
+      return unit.complete_input(segments_input{std::move(input.profiles)});
+    return unit.complete_input(delete_set_input{std::move(input.delete_set)});
+  };
+  bool refused = false, fired = false;
+  size_t allocations = 0;
+  {
+    fault injection{fault::every_allocation_scope, 1};
+    try {
+      (void)complete(old);
+    } catch (std::bad_alloc const&) {
+      refused = true;
+    }
+    allocations = injection.stop();
+    fired       = injection.fired();
+  }
+  REQUIRE(refused);
+  REQUIRE(fired);
+  REQUIRE(allocations == 1);
+  CHECK(unit.record().state == unit_state::pending);
+  CHECK(unit.record().completed.none());
+  CHECK_FALSE(unit.record().deps);
+  for (size_t index = 0; index < owners; ++index)
+    CHECK(seen[index]->releases == 0);
+  REQUIRE(complete(replacement));
+  auto ready = unit.record();
+  REQUIRE(ready.state == unit_state::ready);
+  REQUIRE(ready.deps);
+  CHECK(ready.deps->footer == expected.footer);
+  CHECK(ready.deps->parquet_approval == expected.parquet_approval);
+  CHECK(ready.deps->datasource == expected.datasource);
+  CHECK(ready.deps->profiles == expected.profiles);
+  CHECK(ready.deps->delete_set == expected.delete_set);
+  for (size_t index = 0; index < owners; ++index) {
+    CHECK(seen[index]->releases == 1);
+    CHECK(seen[index]->outside == 1);
+    CHECK(seen[index]->errors == 0);
+    CHECK(seen[index]->callbacks_seen > 0);
+  }
+  std::lock_guard lock(gate->mutex);
+  CHECK(gate->callbacks == 0);
+}
+
 TEST_CASE("A pending delete set must not be interpreted as no deletes",
           "[scan_preparation][preparation_unit]")
 {
