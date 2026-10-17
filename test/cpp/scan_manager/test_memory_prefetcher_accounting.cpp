@@ -476,3 +476,22 @@ TEST_CASE("Resident certificate refusal is invisible to an active memory prefetc
   CHECK(batch_tier(*refused) == cucascade::memory::Tier::HOST);
   CHECK(rejected_connector->peek_resident_batches().empty());
 }
+
+TEST_CASE("runtime streams remain exclusive beyond the raw pool size",
+          "[memory_prefetcher][runtime_streams]")
+{
+  prefetcher_env e;
+  std::vector<cucascade::memory::borrowed_stream> leases;
+  std::vector<cudaStream_t> streams;
+  for (int i = 0; i < 40; ++i) {
+    auto lease  = sirius::memory::runtime_stream_pool::acquire(*e.gpu_space);
+    auto stream = lease.get().get();
+    REQUIRE(std::find(streams.begin(), streams.end(), stream) == streams.end());
+    streams.push_back(stream);
+    leases.push_back(std::move(lease));
+  }
+  leases.clear();
+  // Streams survive the borrowing operation for buffers that retain a deallocation stream.
+  for (auto stream : streams)
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+}
