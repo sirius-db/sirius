@@ -138,7 +138,6 @@ class ring_exchange {
     std::uint64_t id;
     cucascade::memory::Tier tier;
     std::uint64_t rows;
-    std::uint64_t stream_bytes;
     /// Frames the stream takes: ceil(stream_bytes / frame_bytes).
     std::uint32_t frames;
   };
@@ -164,6 +163,11 @@ class ring_exchange {
   /// Frees what a landing holds; an unknown landing is ignored. Its copies still in flight finish
   /// first.
   void abort(std::uint64_t landing);
+
+  /// Frees every job and landing while the memory spaces they came from still exist; later
+  /// calls throw. The rings stay allocated until the last reference goes, so a transport that
+  /// registered them can deregister them first.
+  void close();
 
   // ---- both --------------------------------------------------------------------------------
 
@@ -206,6 +210,7 @@ class ring_exchange {
 
   std::shared_ptr<exchange_inbox> _exchange;
   landing_tiers _tiers;
+  bool _closed{false};
   /// Bytes landed per tier and not yet taken; shared with the exchange inbox's on_gone callbacks.
   std::shared_ptr<held> _held;
 

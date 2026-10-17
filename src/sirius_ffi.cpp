@@ -36,6 +36,7 @@
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
 #include "exec/arrow_result_stream.hpp"
 #include "exec/exchange_inbox.hpp"            // sirius::exec::exchange_inbox
+#include "exec/exchange_ring_ends.hpp"        // sirius::exec::ring_exchange
 #include "exec/stream_bind_catalog.hpp"       // sirius::exec::stream_bind_catalog
 #include "exec/stream_plan_bindings.hpp"      // sirius::exec::register_stream_source_function
 #include "exec/streaming_fragment.hpp"        // sirius::exec::streaming_fragment, fragment_spec
@@ -50,6 +51,8 @@
 #include "sirius_context.hpp"  // duckdb::SiriusContext
 
 #include <rmm/cuda_device.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -182,11 +185,51 @@ struct Context::Impl {
   std::mutex conn_mutex;
   // Shared with every ExchangeInbox handle, which may outlive this Context.
   std::shared_ptr<sirius::exec::exchange_inbox> exchange;
+  // The ring exchange, when the context was made with one; shared with RingExchange handles.
+  std::shared_ptr<sirius::exec::ring_exchange> ring;
 
   // Frees the exchange's buffers while the memory space they come from still exists.
   ~Impl()
   {
+    if (ring) { ring->close(); }
     if (exchange) { exchange->close(); }
+  }
+
+  /// Points the ring's landings at the GPU space, the host space nearest the GPU and the first
+  /// disk space.
+  void attach_ring(Context::RingOptions const& opts)
+  {
+    if (!exchange) {
+      throw sirius::invalid_input_exception(
+        "Context: the ring exchange needs exactly one GPU memory space");
+    }
+    auto& gpu = exchange->space();
+    if (gpu.get_device_id() != ring->device()) {
+      throw sirius::invalid_input_exception(
+        "Context: the ring exchange is on device {} but the GPU memory space on device {}",
+        ring->device(),
+        gpu.get_device_id());
+    }
+    auto& memory  = context->get_memory_manager();
+    int host_numa = -1;
+    if (cudaDeviceGetAttribute(&host_numa, cudaDevAttrHostNumaId, ring->device()) != cudaSuccess) {
+      static_cast<void>(cudaGetLastError());
+      host_numa = -1;
+    }
+    sirius::exec::ring_exchange::landing_tiers tiers;
+    for (auto const* host : memory.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+      if (tiers.host == nullptr || host->get_device_id() == host_numa) {
+        tiers.host = const_cast<cucascade::memory::memory_space*>(host);
+      }
+    }
+    if (auto const disks = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+        !disks.empty()) {
+      tiers.disk = const_cast<cucascade::memory::memory_space*>(disks.front());
+    }
+    tiers.gpu_bytes  = static_cast<std::size_t>(opts.gpu_landing_fraction *
+                                               static_cast<double>(gpu.get_max_memory()));
+    tiers.host_bytes = tiers.host ? opts.host_landing_bytes : 0;
+    ring->attach(exchange, tiers);
   }
 
   sirius::exec::exchange_inbox& require_exchange() const
@@ -198,9 +241,23 @@ struct Context::Impl {
     return *exchange;
   }
 
-  void bring_up(const sirius::parsed_sirius_config& config)
+  void bring_up(const sirius::parsed_sirius_config& config,
+                std::optional<Context::RingOptions> ring_options = std::nullopt)
   {
     install_log_sink_from_env();
+    if (ring_options) {
+      // Before the engine's pool, so the rings are not carved out of its budget.
+      int device = 0;
+      if (cudaGetDevice(&device) != cudaSuccess) {
+        static_cast<void>(cudaGetLastError());
+        throw sirius::internal_exception("Context: no current CUDA device for the ring exchange");
+      }
+      sirius::exec::ring_exchange::options opts;
+      opts.frame_bytes = ring_options->frame_bytes;
+      opts.send_bytes  = ring_options->send_bytes;
+      opts.recv_bytes  = ring_options->recv_bytes;
+      ring             = std::make_shared<sirius::exec::ring_exchange>(device, opts);
+    }
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
     auto& memory    = context->get_memory_manager();
@@ -217,6 +274,7 @@ struct Context::Impl {
           ctx->get_downgrade_executor(space).request_free_memory_and_wait(bytes);
         });
     }
+    if (ring) { attach_ring(*ring_options); }
 
     // Substrait lowering uses core functions and resolves local_files reads to parquet_scan.
     db = duckdb::make_uniq<duckdb::DuckDB>(nullptr);
@@ -274,6 +332,14 @@ Context::Context(const std::string& config_path) : impl_(std::make_unique<Impl>(
   impl_->bring_up(config);
 }
 
+Context::Context(const std::string& config_path, RingOptions const& ring)
+  : impl_(std::make_unique<Impl>())
+{
+  auto config = config_path.empty() ? sirius::parsed_sirius_config{}
+                                    : sirius::parsed_sirius_config::from_file(config_path);
+  impl_->bring_up(config, ring);
+}
+
 // Defined here, where the heavy types are complete: destroying `impl_` tears down
 // the embedded DuckDB and the initialized engine.
 Context::~Context() = default;
@@ -325,6 +391,82 @@ std::unique_ptr<ExchangeInbox> Context::exchange_inbox() const
   return std::unique_ptr<ExchangeInbox>(new ExchangeInbox(impl_->exchange));
 }
 
+std::unique_ptr<RingExchange> Context::ring_exchange() const
+{
+  if (!impl_->ring) { return nullptr; }
+  return std::unique_ptr<RingExchange>(new RingExchange(impl_->ring));
+}
+
+RingExchange::RingExchange(std::shared_ptr<sirius::exec::ring_exchange> ring)
+  : ring_(std::move(ring))
+{
+}
+
+int RingExchange::device() const noexcept { return ring_->device(); }
+std::uintptr_t RingExchange::send_base() const noexcept { return ring_->send_ring().base(); }
+std::uint64_t RingExchange::send_len() const noexcept { return ring_->send_ring().bytes(); }
+std::uintptr_t RingExchange::recv_base() const noexcept { return ring_->recv_ring().base(); }
+std::uint64_t RingExchange::recv_len() const noexcept { return ring_->recv_ring().bytes(); }
+std::uint64_t RingExchange::frame_bytes() const noexcept { return ring_->frame_bytes(); }
+
+std::int64_t RingExchange::lease_send() const
+{
+  auto const frame = ring_->send_ring().lease();
+  return frame ? static_cast<std::int64_t>(*frame) : -1;
+}
+
+std::int64_t RingExchange::lease_recv() const
+{
+  auto const frame = ring_->recv_ring().lease();
+  return frame ? static_cast<std::int64_t>(*frame) : -1;
+}
+
+void RingExchange::release_send(std::uint32_t frame) const { ring_->send_ring().release(frame); }
+
+void RingExchange::release_recv(std::uint32_t frame) const { ring_->recv_ring().release(frame); }
+
+std::uint64_t RingExchange::stage(std::uint64_t token, std::uint32_t k, std::uint32_t frame) const
+{
+  return ring_->stage(token, k, frame);
+}
+
+void RingExchange::release_job(std::uint64_t token) const { ring_->release_job(token); }
+
+std::uint64_t RingExchange::begin(std::uintptr_t header_addr,
+                                  std::size_t header_len,
+                                  std::uint8_t& tier,
+                                  std::uint64_t& rows,
+                                  std::uint32_t& frames) const
+{
+  auto const landing =
+    ring_->begin({reinterpret_cast<std::uint8_t const*>(header_addr), header_len});
+  tier   = landing.tier == cucascade::memory::Tier::GPU    ? 0
+           : landing.tier == cucascade::memory::Tier::HOST ? 1
+                                                           : 2;
+  rows   = landing.rows;
+  frames = landing.frames;
+  return landing.id;
+}
+
+std::uint64_t RingExchange::copy_out(std::uint64_t landing,
+                                     std::uint32_t k,
+                                     std::uint32_t frame,
+                                     std::uint64_t len) const
+{
+  return ring_->copy_out(landing, k, frame, len);
+}
+
+std::uint64_t RingExchange::seal(std::uint64_t landing) const { return ring_->seal(landing); }
+
+void RingExchange::abort(std::uint64_t landing) const { ring_->abort(landing); }
+
+bool RingExchange::done(std::uint64_t ticket) const { return ring_->done(ticket); }
+
+std::unique_ptr<std::string> RingExchange::stats_line() const
+{
+  return std::make_unique<std::string>(ring_->stats_line());
+}
+
 ExchangeInbox::ExchangeInbox(std::shared_ptr<sirius::exec::exchange_inbox> exchange)
   : exchange_(std::move(exchange))
 {
@@ -334,11 +476,71 @@ void ExchangeInbox::release(std::uint64_t token) const { exchange_->release(toke
 
 std::size_t ExchangeInbox::outstanding() const { return exchange_->outstanding(); }
 
+OutputDrain::OutputDrain(std::shared_ptr<sirius::exec::batch_stream> stream,
+                         std::shared_ptr<sirius::exec::exchange_inbox> exchange,
+                         std::shared_ptr<sirius::exec::ring_exchange> ring)
+  : stream_(std::move(stream)), exchange_(std::move(exchange)), ring_(std::move(ring))
+{
+}
+
+std::unique_ptr<std::vector<std::uint8_t>> OutputDrain::export_ring_next(
+  std::uint32_t timeout_ms,
+  bool& ended,
+  std::uint64_t& token,
+  std::uint8_t& kind,
+  std::uint64_t& rows,
+  std::uint64_t& stream_bytes) const
+{
+  if (!ring_) {
+    throw sirius::invalid_input_exception("OutputDrain: this context has no ring exchange");
+  }
+  using availability  = sirius::exec::batch_stream::availability;
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  ended               = false;
+  for (;;) {
+    switch (stream_->classify()) {
+      case availability::END_OF_STREAM: ended = true; return nullptr;
+      case availability::HAS_DATA:
+        // Rethrows the fragment's error; nullptr only if another consumer took the batch.
+        if (auto batch = stream_->try_pull()) {
+          if (auto job = ring_->export_batch(std::move(batch))) {
+            token        = job->token;
+            kind         = static_cast<std::uint8_t>(job->kind);
+            rows         = job->rows;
+            stream_bytes = job->stream_bytes;
+            return std::make_unique<std::vector<std::uint8_t>>(std::move(job->header));
+          }
+        }
+        break;  // a batch without rows is not sent
+      case availability::WAITING: {
+        auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now());
+        if (left.count() <= 0) { return nullptr; }
+        static_cast<void>(stream_->wait_for(left));
+        break;
+      }
+    }
+  }
+}
+
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 
 std::unique_ptr<Context> make_context_from_config(const std::string& config_path)
 {
   return std::make_unique<Context>(config_path);
+}
+
+std::unique_ptr<Context> make_context_with_ring(const std::string& config_path,
+                                                std::uint64_t frame_bytes,
+                                                std::uint64_t send_bytes,
+                                                std::uint64_t recv_bytes,
+                                                double gpu_landing_fraction,
+                                                std::uint64_t host_landing_bytes)
+{
+  return std::make_unique<Context>(
+    config_path,
+    Context::RingOptions{
+      frame_bytes, send_bytes, recv_bytes, gpu_landing_fraction, host_landing_bytes});
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +726,38 @@ std::size_t Fragment::relay_from(Fragment& source,
   }
   return impl_->fragment->relay_from(
     *source.impl_->fragment, source_stream_id, input_stream_id, sender_id);
+}
+
+std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_ring(std::uint64_t stream_id,
+                                                                 std::uint64_t& token,
+                                                                 std::uint8_t& kind,
+                                                                 std::uint64_t& rows,
+                                                                 std::uint64_t& stream_bytes)
+{
+  impl_->require_built("export_ring()");
+  if (!impl_->ctx.ring) {
+    throw sirius::invalid_input_exception("Fragment: this context has no ring exchange");
+  }
+  while (auto batch = impl_->fragment->pull(stream_id)) {
+    if (auto job = impl_->ctx.ring->export_batch(std::move(*batch))) {
+      token        = job->token;
+      kind         = static_cast<std::uint8_t>(job->kind);
+      rows         = job->rows;
+      stream_bytes = job->stream_bytes;
+      return std::make_unique<std::vector<std::uint8_t>>(std::move(job->header));
+    }
+  }
+  return nullptr;
+}
+
+std::unique_ptr<OutputDrain> Fragment::output_drain(std::uint64_t stream_id) const
+{
+  impl_->require_built("output_drain()");
+  if (!impl_->ctx.ring) {
+    throw sirius::invalid_input_exception("Fragment: output_drain() needs a ring exchange");
+  }
+  return std::make_unique<OutputDrain>(
+    impl_->fragment->output_stream(stream_id), impl_->ctx.exchange, impl_->ctx.ring);
 }
 
 void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)
