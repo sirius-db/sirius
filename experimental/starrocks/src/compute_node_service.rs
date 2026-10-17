@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -7,13 +8,16 @@ use crate::ComputeNodeConfig;
 use crate::fragment_executor::StubExecutor;
 use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot};
 use crate::local_exchange::{
-    ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, SenderSource,
+    ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, RemoteBatch, RemoteFrame,
+    SenderSource,
 };
+use crate::nixl_chunk::{self, NixlEndpoint, NixlEnvelope};
 use crate::proto::starrocks::{
     PCancelPlanFragmentRequest, PCancelPlanFragmentResult, PExecBatchPlanFragmentsRequest,
     PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest, PExecPlanFragmentResult,
     PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest, PGetFileSchemaResult,
-    PSlotDescriptor, StatusPb, p_internal_service_brpc::PInternalService,
+    PSlotDescriptor, PTransmitChunkParams, PTransmitChunkResult, StatusPb,
+    p_internal_service_brpc::PInternalService,
 };
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FragmentInstanceId, ResultStore};
@@ -47,6 +51,11 @@ const RESULT_WAIT: Duration = Duration::from_secs(if cfg!(test) { 5 } else { 600
 pub(crate) struct SiriusComputeNodeService {
     /// Reusable StarRocks thrift-to-Substrait fragment translator.
     translator: PlanTranslator,
+    /// This CN's NIXL side, when it has one: serves peers' `transmit_chunk` requests and ships
+    /// output to remote destinations. Declared before `executor` because fields drop in order:
+    /// whoever drops the last clone, the transport deregisters the engine's slab before the
+    /// engine frees it.
+    nixl: Option<Arc<dyn NixlEndpoint>>,
     /// Runs translated fragments, returning a result fragment's Arrow batches or parking a sender
     /// fragment's output. Production injects the GPU-backed `SiriusEngine` (via
     /// [`with_executor`](Self::with_executor)); tests use a stub.
@@ -69,7 +78,7 @@ impl SiriusComputeNodeService {
     /// executor via [`with_executor`](Self::with_executor).
     #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::with_executor(Arc::new(StubExecutor), &ComputeNodeConfig::default())
+        Self::with_executor(Arc::new(StubExecutor), &ComputeNodeConfig::default(), None)
     }
 
     /// Builds the service for the CN `compute_node` advertises, with a caller-provided fragment
@@ -77,6 +86,7 @@ impl SiriusComputeNodeService {
     pub(crate) fn with_executor(
         executor: Arc<dyn FragmentExecutor>,
         compute_node: &ComputeNodeConfig,
+        nixl: Option<Arc<dyn NixlEndpoint>>,
     ) -> Self {
         Self {
             translator: PlanTranslator::new(),
@@ -88,6 +98,7 @@ impl SiriusComputeNodeService {
                 resolve_ip(compute_node.advertise_host.as_str()),
                 i32::from(compute_node.brpc_port),
             ),
+            nixl,
         }
     }
 }
@@ -254,6 +265,37 @@ impl PInternalService for SiriusComputeNodeService {
         }
         .into())
     }
+
+    /// Serves a peer CN's NIXL exchange control and batch announces.
+    #[instrument(skip_all)]
+    async fn transmit_chunk(
+        &self,
+        request: PTransmitChunkParams,
+        attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<PTransmitChunkResult>, crate::prpc::Error> {
+        // Alloc and Release take the direct exchange's mutex, which the engine thread can hold
+        // while it synchronizes a stream; on the brpc runtime that would stall every other RPC.
+        let service = self.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let (reply, ready) = service.handle_nixl_chunk(&request, &attachment)?;
+            if let Some(ready) = ready {
+                service.drain_ready_async(ready);
+            }
+            Ok(reply)
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(format!("transmit_chunk task panicked: {join_err}")));
+        let (status, reply) = match outcome {
+            Ok(reply) => (Self::ok_status(), reply),
+            Err(err) => (Self::internal_error(err), Vec::new()),
+        };
+        let result = PTransmitChunkResult {
+            status: Some(status),
+            receive_timestamp: None,
+            receiver_post_process_time: None,
+        };
+        Ok(crate::prpc::Reply::with_attachment(result, reply))
+    }
 }
 
 impl SiriusComputeNodeService {
@@ -316,8 +358,95 @@ impl SiriusComputeNodeService {
             return self.drain_ready(ready.into_iter().collect());
         }
         let translated = self.translate_fragment_logged(&params, &[], dump_seq)?;
-        let ready = self.execute_fragment(&params, &translated, Vec::new())?;
+        let ready = self.execute_fragment(&params, &translated, Vec::new(), Vec::new())?;
         self.drain_ready(ready)
+    }
+
+    /// Answers one SRNX request on a blocking thread, never waiting on the engine or the transport
+    /// thread. A Packed frame returns the receiver it completed.
+    fn handle_nixl_chunk(
+        &self,
+        request: &PTransmitChunkParams,
+        attachment: &[u8],
+    ) -> std::result::Result<(Vec<u8>, Option<ReadyFragment>), String> {
+        nixl_chunk::reject_native_chunk(request)?;
+        let envelope = NixlEnvelope::decode(attachment)?;
+        let nixl = self.nixl.as_ref().ok_or("this CN has no NIXL transport")?;
+        match envelope {
+            NixlEnvelope::Md(_) => Ok((nixl.local_md(), None)),
+            NixlEnvelope::Alloc(layout) => Ok((nixl.allocate(&layout)?.encode(), None)),
+            NixlEnvelope::Release(token) => {
+                nixl.release(token);
+                Ok((Vec::new(), None))
+            }
+            NixlEnvelope::Packed { token, rows, names } => {
+                // A refused frame is never pushed, so its buffers are freed here. A duplicate is
+                // accepted as a no-op: it carries the token its first copy already delivered.
+                let ready = self
+                    .push_packed(request, token, rows, names)
+                    .inspect_err(|_| nixl.release(token))?;
+                Ok((Vec::new(), ready))
+            }
+        }
+    }
+
+    /// Hands a remote sender's batch (none under token 0) and eos to the exchange rendezvous.
+    fn push_packed(
+        &self,
+        request: &PTransmitChunkParams,
+        token: u64,
+        rows: u64,
+        names: Vec<String>,
+    ) -> std::result::Result<Option<ReadyFragment>, String> {
+        let missing = |field: &str| format!("Packed transmit_chunk is missing {field}");
+        let finst_id = request
+            .finst_id
+            .as_ref()
+            .ok_or_else(|| missing("finst_id"))?;
+        let key = ExchangeKey {
+            fragment_instance_id: FragmentInstanceId::from(finst_id),
+            node_id: request.node_id.ok_or_else(|| missing("node_id"))?,
+        };
+        self.exchanges
+            .push_remote_frame(
+                key,
+                request.sender_id.ok_or_else(|| missing("sender_id"))?,
+                request.sequence.ok_or_else(|| missing("sequence"))?,
+                request.eos.ok_or_else(|| missing("eos"))?,
+                names,
+                (token != 0).then_some(RemoteBatch { token, rows }),
+            )
+            .map(RemoteFrame::into_ready)
+    }
+
+    /// Runs a receiver a remote frame completed on its own thread, so `transmit_chunk` answers
+    /// the sender without waiting on GPU work.
+    fn drain_ready_async(&self, ready: ReadyFragment) {
+        // Shared with the thread, so a failed spawn leaves the receiver here to run inline:
+        // dropping it would leave its query waiting and its received batches held.
+        let pending = Arc::new(Mutex::new(Some(ready)));
+        let (service, thread_pending) = (self.clone(), Arc::clone(&pending));
+        let spawned = std::thread::Builder::new()
+            .name("exchange-receiver".to_string())
+            .spawn(move || {
+                if let Some(ready) = take_pending(&thread_pending) {
+                    service.drain_ready_logged(ready);
+                }
+            });
+        if let Err(err) = spawned {
+            tracing::warn!(error = %err, "cannot spawn a receiver thread; running the receiver inline");
+            if let Some(ready) = take_pending(&pending) {
+                self.drain_ready_logged(ready);
+            }
+        }
+    }
+
+    /// Runs `ready` and every receiver it completes, logging a failure: the query is failed and
+    /// purged on this CN either way.
+    fn drain_ready_logged(&self, ready: ReadyFragment) {
+        if let Err(err) = self.drain_ready(vec![ready]) {
+            tracing::warn!(error = %err, "a receiver fed by a remote sender failed");
+        }
     }
 
     /// Restores descriptor tables omitted by StarRocks's per-query cache protocol.
@@ -383,6 +512,7 @@ impl SiriusComputeNodeService {
         params: &TExecPlanFragmentParams,
         translated: &TranslatedPlan,
         inputs: Vec<(i32, Vec<SenderSlot>)>,
+        remote_inputs: Vec<(i32, i32, Vec<RemoteBatch>)>,
     ) -> std::result::Result<Vec<ReadyFragment>, String> {
         Self::injected_failure()?;
         if Self::is_mysql_result_sink(params)? {
@@ -394,6 +524,7 @@ impl SiriusComputeNodeService {
                 .run_fragment(FragmentRun {
                     plan: translated,
                     inputs,
+                    remote_inputs,
                     outputs: Vec::new(),
                     broadcast: false,
                     hash_keys: Vec::new(),
@@ -440,25 +571,54 @@ impl SiriusComputeNodeService {
             .sender_id
             .ok_or_else(|| "DATA_STREAM_SINK fragment is missing sender_id".to_string())?;
         let mut outputs = Vec::with_capacity(destinations.len());
+        let mut remote = Vec::new();
         for destination in destinations {
-            // Checked before running so a remote destination leaves no output parked.
-            self.ensure_local(destination)?;
-            outputs.push(SenderSlot {
+            let slot = SenderSlot {
                 fragment_instance_id: FragmentInstanceId::from(&destination.fragment_instance_id),
                 node_id: stream_sink.dest_node_id,
                 sender_id,
-            });
+            };
+            outputs.push(slot);
+            // Resolved before running so an unreachable destination leaves no output parked.
+            if let Some(peer) = self.remote_peer(destination)? {
+                remote.push((slot, peer));
+            }
         }
         self.executor.run_fragment(FragmentRun {
             plan: translated,
             inputs,
+            remote_inputs,
             outputs: outputs.clone(),
             broadcast,
             hash_keys,
         })?;
 
+        // Hops run until one fails; every hop's claim is released either way. After a failure the
+        // local claims are released too: their receivers can no longer complete, and nothing may
+        // stay parked.
+        let local = outputs
+            .into_iter()
+            .filter(|slot| remote.iter().all(|(remote_slot, _)| remote_slot != slot));
+        let mut shipped = Ok(());
+        for &(slot, peer) in &remote {
+            shipped = match shipped {
+                // The query is failing: shipping the rest would only write into peers' pools.
+                Err(err) => {
+                    let _ = self.executor.drop_parked(slot);
+                    Err(err)
+                }
+                Ok(()) => self.ship_remote(slot, peer, &translated.output_names),
+            };
+        }
+        if let Err(err) = shipped {
+            for slot in local {
+                let _ = self.executor.drop_parked(slot);
+            }
+            return Err(err);
+        }
+        let local: Vec<SenderSlot> = local.collect();
         let mut ready = Vec::new();
-        for (index, &slot) in outputs.iter().enumerate() {
+        for (index, &slot) in local.iter().enumerate() {
             let key = ExchangeKey {
                 fragment_instance_id: slot.fragment_instance_id,
                 node_id: slot.node_id,
@@ -472,7 +632,7 @@ impl SiriusComputeNodeService {
             match self.exchanges.push_sender(key, sender_id, source) {
                 Ok(completed) => ready.extend(completed),
                 Err(err) => {
-                    for &unpushed in &outputs[index..] {
+                    for &unpushed in &local[index..] {
                         let _ = self.executor.drop_parked(unpushed);
                     }
                     // Receivers this sender already completed were handed over, so a purge no
@@ -512,23 +672,50 @@ impl SiriusComputeNodeService {
         Ok((destinations > 1 && hash_keys.is_empty(), hash_keys))
     }
 
-    /// Errors unless `destination` is this CN: this build has no cross-node transport.
-    fn ensure_local(
+    /// `destination`'s brpc address, or `None` when it is this CN. A remote destination needs
+    /// this CN's NIXL transport.
+    fn remote_peer(
         &self,
         destination: &TPlanFragmentDestination,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<Option<SocketAddr>, String> {
         let id = FragmentInstanceId::from(&destination.fragment_instance_id);
-        match &destination.brpc_server {
-            Some(address) if *address == self.brpc_address => Ok(()),
-            Some(address) => Err(format!(
-                "DATA_STREAM_SINK destination {}:{} for fragment instance {id} is remote; no \
-                 cross-node transport in this build",
-                address.hostname, address.port
-            )),
-            None => Err(format!(
+        let address = destination.brpc_server.as_ref().ok_or_else(|| {
+            format!(
                 "DATA_STREAM_SINK destination for fragment instance {id} has no brpc_server address"
-            )),
+            )
+        })?;
+        if *address == self.brpc_address {
+            return Ok(None);
         }
+        let host = address.hostname.as_str();
+        if self.nixl.is_none() {
+            return Err(format!(
+                "DATA_STREAM_SINK destination {host}:{} for fragment instance {id} is remote, and \
+                 this CN has no NIXL transport",
+                address.port
+            ));
+        }
+        let port = u16::try_from(address.port)
+            .map_err(|_| format!("destination brpc port {} is not a TCP port", address.port))?;
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|err| format!("failed to resolve exchange peer {host}:{port}: {err}"))?
+            .next()
+            .map(Some)
+            .ok_or_else(|| format!("exchange peer {host}:{port} resolved to no address"))
+    }
+
+    /// Ships the output parked under `slot` to `peer`, then releases that claim whether or not
+    /// the hop succeeded.
+    fn ship_remote(
+        &self,
+        slot: SenderSlot,
+        peer: SocketAddr,
+        names: &[String],
+    ) -> std::result::Result<(), String> {
+        let nixl = self.nixl.as_ref().ok_or("this CN has no NIXL transport")?;
+        let sent = nixl.send(peer, slot, names.to_vec(), Arc::clone(&self.executor));
+        sent.and(self.executor.drop_parked(slot))
     }
 
     /// Runs receivers whose sender sets completed, then the receivers their outputs complete. A
@@ -559,11 +746,16 @@ impl SiriusComputeNodeService {
 
     /// Fails `query` on this CN: its waiting result slots report `error`, and everything the
     /// exchange still holds for it is freed. Without this a failed query's receivers wait forever
-    /// on senders that never finish, pinning their parked output in GPU memory for the life of
-    /// the process. Idempotent; a late fragment or frame of the query is refused.
+    /// on senders that never finish, pinning their parked output and received buffers in GPU
+    /// memory for the life of the process. Idempotent; a late frame of the query is refused.
     fn fail_and_purge(&self, query: FragmentInstanceId, error: &str) {
         self.results.fail_query(query, error);
         let purged = self.exchanges.purge_query(query, error);
+        if let Some(nixl) = &self.nixl {
+            for &token in &purged.tokens {
+                nixl.release(token);
+            }
+        }
         for &slot in &purged.slots {
             if let Err(err) = self.executor.drop_parked(slot) {
                 warn!(?slot, error = %err, "failed to drop a purged query's parked output");
@@ -571,7 +763,7 @@ impl SiriusComputeNodeService {
         }
         info!(
             %query,
-            remote_batches = purged.tokens.len(),
+            released_buffers = purged.tokens.len(),
             dropped_parked = purged.slots.len(),
             error,
             "purged a failed query's exchange state"
@@ -600,29 +792,24 @@ impl SiriusComputeNodeService {
     ) -> std::result::Result<Vec<ReadyFragment>, String> {
         let mut guard = self.ready_inputs_guard(&ready);
         let exchange_inputs = Self::exchange_inputs(&ready.inputs)?;
-        let inputs = ready
-            .inputs
-            .into_iter()
-            .map(|input| {
-                let slots = input
-                    .sources
-                    .into_iter()
-                    .map(|source| match source {
-                        SenderSource::LocalParked { slot, .. } => Ok(slot),
-                        SenderSource::Remote { sender_id, .. } => Err(format!(
-                            "exchange node {} has remote sender {sender_id}; no cross-node \
-                             transport in this build",
-                            input.node_id
-                        )),
-                    })
-                    .collect::<std::result::Result<Vec<_>, String>>()?;
-                Ok((input.node_id, slots))
-            })
-            .collect::<std::result::Result<Vec<_>, String>>()?;
+        let mut inputs = Vec::with_capacity(ready.inputs.len());
+        let mut remote_inputs = Vec::new();
+        for input in ready.inputs {
+            let mut slots = Vec::new();
+            for source in input.sources {
+                match source {
+                    SenderSource::LocalParked { slot, .. } => slots.push(slot),
+                    SenderSource::Remote {
+                        sender_id, batches, ..
+                    } => remote_inputs.push((input.node_id, sender_id, batches)),
+                }
+            }
+            inputs.push((input.node_id, slots));
+        }
         let dump_seq = Self::dump_fragment(&ready.params);
         let translated =
             self.translate_fragment_logged(&ready.params, &exchange_inputs, dump_seq)?;
-        let next = self.execute_fragment(&ready.params, &translated, inputs)?;
+        let next = self.execute_fragment(&ready.params, &translated, inputs, remote_inputs)?;
         // The engine relayed every parked input and released it.
         guard.slots.clear();
         Ok(next)
@@ -927,37 +1114,53 @@ impl SiriusComputeNodeService {
 }
 
 impl SiriusComputeNodeService {
-    /// A guard over `ready`'s parked inputs, which it frees unless disarmed.
+    /// A guard over `ready`'s inputs, which it frees unless disarmed.
     fn ready_inputs_guard(&self, ready: &ReadyFragment) -> ReadyInputsGuard {
-        ReadyInputsGuard {
+        let mut guard = ReadyInputsGuard {
+            nixl: self.nixl.clone(),
             executor: Arc::clone(&self.executor),
-            slots: ready
-                .inputs
-                .iter()
-                .flat_map(|input| &input.sources)
-                .filter_map(|source| match source {
-                    SenderSource::LocalParked { slot, .. } => Some(*slot),
-                    SenderSource::Remote { .. } => None,
-                })
-                .collect(),
+            tokens: Vec::new(),
+            slots: Vec::new(),
+        };
+        for source in ready.inputs.iter().flat_map(|input| &input.sources) {
+            match source {
+                SenderSource::Remote { batches, .. } => {
+                    guard.tokens.extend(batches.iter().map(|batch| batch.token))
+                }
+                SenderSource::LocalParked { slot, .. } => guard.slots.push(*slot),
+            }
         }
+        guard
     }
 }
 
-/// Frees a ready receiver's parked inputs when dropped, whichever step failed: translation, a
-/// pre-run check, or the engine run itself. They are released unless the run succeeded (and so
-/// relayed them); one the engine already released just errors.
+/// Frees a ready receiver's inputs when dropped, whichever step failed: translation, a pre-run
+/// check, or the engine run itself. Received batches are always released; one the engine pushed
+/// is already consumed, and releasing it is a no-op. Parked inputs are released unless the run
+/// succeeded (and so relayed them); one the engine already released just errors.
 struct ReadyInputsGuard {
+    nixl: Option<Arc<dyn NixlEndpoint>>,
     executor: Arc<dyn FragmentExecutor>,
+    tokens: Vec<u64>,
     slots: Vec<SenderSlot>,
 }
 
 impl Drop for ReadyInputsGuard {
     fn drop(&mut self) {
+        if let Some(nixl) = &self.nixl {
+            for &token in &self.tokens {
+                nixl.release(token);
+            }
+        }
         for &slot in &self.slots {
             let _ = self.executor.drop_parked(slot);
         }
     }
+}
+
+/// Takes the receiver out of `pending`, once.
+fn take_pending(pending: &Mutex<Option<ReadyFragment>>) -> Option<ReadyFragment> {
+    pending.lock().ok().and_then(|mut ready| ready.take())
 }
 
 #[cfg(test)]
@@ -983,7 +1186,8 @@ mod tests {
     use super::*;
     use crate::{
         fragment_executor::FragmentResult,
-        local_exchange::{ExchangeCounts, RemoteBatch, RemoteFrame},
+        local_exchange::ExchangeCounts,
+        nixl_chunk::AllocReply,
         proto::starrocks::{
             PFetchDataRequest, PUniqueId,
             p_internal_service_brpc::{PInternalServiceRouter, SERVICE_NAME, methods},
@@ -1005,6 +1209,209 @@ mod tests {
                 return StubExecutor.run_fragment(run);
             }
             Err("receiver exploded".to_string())
+        }
+    }
+
+    /// Records what the service asks of its NIXL side.
+    #[derive(Debug, Default)]
+    struct FakeNixl {
+        released: Mutex<Vec<u64>>,
+        sent: Mutex<Vec<(SocketAddr, SenderSlot)>>,
+        /// Every hop fails, as when the peer refuses a frame.
+        fail_sends: bool,
+    }
+
+    impl NixlEndpoint for FakeNixl {
+        fn local_md(&self) -> Vec<u8> {
+            b"local-md".to_vec()
+        }
+
+        fn allocate(&self, layout: &[u8]) -> Result<AllocReply, String> {
+            Ok(AllocReply {
+                token: 7,
+                device: 1,
+                buffers: vec![(0xB000, layout.len() as u64)],
+            })
+        }
+
+        fn release(&self, token: u64) {
+            self.released.lock().unwrap().push(token);
+        }
+
+        fn send(
+            &self,
+            peer: SocketAddr,
+            slot: SenderSlot,
+            _names: Vec<String>,
+            _executor: Arc<dyn FragmentExecutor>,
+        ) -> Result<(), String> {
+            self.sent.lock().unwrap().push((peer, slot));
+            if self.fail_sends {
+                return Err(format!("{peer} refused transmit_chunk"));
+            }
+            Ok(())
+        }
+    }
+
+    fn nixl_service(
+        executor: Arc<dyn FragmentExecutor>,
+    ) -> (SiriusComputeNodeService, Arc<FakeNixl>) {
+        let nixl = Arc::new(FakeNixl::default());
+        let service = SiriusComputeNodeService::with_executor(
+            executor,
+            &ComputeNodeConfig::default(),
+            Some(nixl.clone()),
+        );
+        (service, nixl)
+    }
+
+    fn transmit(
+        service: &SiriusComputeNodeService,
+        params: PTransmitChunkParams,
+        envelope: NixlEnvelope,
+    ) -> (StatusPb, Vec<u8>) {
+        let response = route(
+            service,
+            methods::TRANSMIT_CHUNK,
+            params.encode_to_vec(),
+            envelope.encode(),
+        );
+        let result = PTransmitChunkResult::decode(response.body.as_slice()).unwrap();
+        (result.status.unwrap(), response.attachment)
+    }
+
+    /// Frame `seq` from sender 0 to exchange node 2 of fragment instance 10 of query `query`.
+    fn packed(query: i64, seq: i64, token: u64) -> (PTransmitChunkParams, NixlEnvelope) {
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(query, 10),
+            node_id: 2,
+            sender_id: 0,
+        };
+        let envelope = NixlEnvelope::Packed {
+            token,
+            rows: 1,
+            names: vec!["id".to_string(), "name".to_string()],
+        };
+        (
+            nixl_chunk::packed_params(Some(slot), seq, token == 0),
+            envelope,
+        )
+    }
+
+    #[test]
+    fn transmit_chunk_serves_md_alloc_and_release() {
+        let (service, nixl) = nixl_service(Arc::new(StubExecutor));
+        let control = nixl_chunk::control_params;
+        let (status, md) = transmit(&service, control(), NixlEnvelope::Md(b"peer".to_vec()));
+        assert_eq!(
+            (status.status_code, md),
+            (TStatusCode::OK.0, b"local-md".to_vec())
+        );
+        let (status, reply) = transmit(&service, control(), NixlEnvelope::Alloc(vec![0; 24]));
+        assert_eq!(status.status_code, TStatusCode::OK.0);
+        assert_eq!(
+            AllocReply::decode(&reply).unwrap(),
+            AllocReply {
+                token: 7,
+                device: 1,
+                buffers: vec![(0xB000, 24)],
+            }
+        );
+        transmit(&service, control(), NixlEnvelope::Release(7));
+        assert_eq!(*nixl.released.lock().unwrap(), [7]);
+    }
+
+    #[test]
+    fn refused_packed_frame_releases_its_token_and_a_duplicate_keeps_it() {
+        let (service, nixl) = nixl_service(Arc::new(StubExecutor));
+        let (params, envelope) = packed(12, 0, 5);
+        for _ in 0..2 {
+            let (status, _) = transmit(&service, params.clone(), envelope.clone());
+            assert_eq!(status.status_code, TStatusCode::OK.0);
+        }
+        let (params, envelope) = packed(12, 2, 6);
+        let (status, _) = transmit(&service, params, envelope);
+        assert!(status.error_msgs[0].contains("lost"), "{status:?}");
+        assert_eq!(*nixl.released.lock().unwrap(), [6]);
+    }
+
+    #[test]
+    fn failed_receiver_releases_its_received_batches() {
+        // The frames arrive first, so registering the receiver runs it at once, and it fails.
+        let (service, nixl) = nixl_service(Arc::new(FailingReceivers));
+        for (seq, token) in [(0, 5), (1, 6), (2, 0)] {
+            let (params, envelope) = packed(13, seq, token);
+            assert_eq!(
+                transmit(&service, params, envelope).0.status_code,
+                TStatusCode::OK.0
+            );
+        }
+        let mut receiver = query_fragment(13, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut receiver, 2, 1);
+        assert_eq!(
+            exec(&service, &receiver).status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+        assert_eq!(*nixl.released.lock().unwrap(), [5, 6]);
+    }
+
+    #[test]
+    fn remote_stream_sink_destination_ships_over_nixl() {
+        let (service, nixl) = nixl_service(Arc::new(StubExecutor));
+        let mut sender = query_fragment(14, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 18060);
+        exec_ok(&service, &sender);
+        let sent = nixl.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!((sent[0].0.port(), sent[0].1.node_id), (18060, 2));
+    }
+
+    /// The first of two remote hops fails: the second output isn't shipped into a peer's pool for
+    /// a query that is failing, and both claims are still released.
+    #[test]
+    fn a_failed_hop_stops_the_remaining_hops_and_releases_every_claim() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let nixl = Arc::new(FakeNixl {
+            fail_sends: true,
+            ..FakeNixl::default()
+        });
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            Some(nixl.clone()),
+        );
+        let mut sender = query_fragment(23, 12, scan_node(0, 0), stream_sink(2));
+        let params = sender.params.as_mut().unwrap();
+        params.sender_id = Some(0);
+        params.destinations = Some(
+            [10, 11]
+                .iter()
+                .map(|&instance| {
+                    TPlanFragmentDestination::new(
+                        TUniqueId::new(params.query_id.hi, instance),
+                        None,
+                        Some(TNetworkAddress::new("127.0.0.1".to_string(), 18060)),
+                        None,
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(
+            exec(&service, &sender).status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+        assert_eq!(
+            nixl.sent.lock().unwrap().len(),
+            1,
+            "the second hop never ran"
+        );
+        let dropped = executor.dropped.lock().unwrap();
+        for instance in [10, 11] {
+            assert!(
+                dropped.iter().any(|slot| slot.fragment_instance_id
+                    == FragmentInstanceId::from_halves(23, instance)),
+                "the claim on instance {instance} was released: {dropped:?}"
+            );
         }
     }
 
@@ -1321,7 +1728,7 @@ mod tests {
         let status = exec(&service, &sender);
         assert_eq!(status.status_code, TStatusCode::INTERNAL_ERROR.0);
         assert!(
-            status.error_msgs[0].contains("no cross-node transport"),
+            status.error_msgs[0].contains("no NIXL transport"),
             "{:?}",
             status.error_msgs
         );
@@ -1334,6 +1741,7 @@ mod tests {
         let service = SiriusComputeNodeService::with_executor(
             Arc::new(FailingReceivers),
             &ComputeNodeConfig::default(),
+            None,
         );
         let mut result = query_fragment(10, 10, exchange_plan_node(2, 0), result_sink());
         expect_senders(&mut result, 2, 1);
@@ -1408,15 +1816,6 @@ mod tests {
         }
     }
 
-    fn recording_service() -> (SiriusComputeNodeService, Arc<RecordingExecutor>) {
-        let executor = Arc::new(RecordingExecutor::default());
-        let service = SiriusComputeNodeService::with_executor(
-            executor.clone(),
-            &ComputeNodeConfig::default(),
-        );
-        (service, executor)
-    }
-
     fn cancel(service: &SiriusComputeNodeService, query: i64) -> StatusPb {
         // As the FE sends it: the query id, and a dummy instance id.
         let request = PCancelPlanFragmentRequest {
@@ -1449,49 +1848,35 @@ mod tests {
         fetched.status.error_msgs.join("; ")
     }
 
-    /// Waits for `cancel_plan_fragment`'s purge, which runs off the BRPC task.
-    fn wait_until_purged(service: &SiriusComputeNodeService) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while service.exchanges.counts() != ExchangeCounts::default() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cancel never purged the query"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
     #[test]
     fn cancel_purges_the_query_and_frees_what_it_held() {
-        // A receiver waiting on two senders has one sender's output parked when the FE cancels.
-        let (service, executor) = recording_service();
+        // A receiver waiting on two senders has two batches from one of them when the FE cancels.
+        let (service, nixl) = nixl_service(Arc::new(StubExecutor));
         let mut result = query_fragment(15, 10, exchange_plan_node(2, 0), result_sink());
         expect_senders(&mut result, 2, 2);
         exec_ok(&service, &result);
-        let mut parked = query_fragment(15, 11, scan_node(0, 0), stream_sink(2));
-        send_to(&mut parked, 10, 8060);
-        exec_ok(&service, &parked);
-        assert_eq!(service.exchanges.counts().parked_senders, 1);
+        for (seq, token) in [(0, 5), (1, 6)] {
+            let (params, envelope) = packed(15, seq, token);
+            assert_eq!(
+                transmit(&service, params, envelope).0.status_code,
+                TStatusCode::OK.0
+            );
+        }
+        assert_eq!(service.exchanges.counts().remote_batches, 2);
 
         assert_eq!(cancel(&service, 15).status_code, TStatusCode::OK.0);
-        wait_until_purged(&service);
-        let slot = SenderSlot {
-            fragment_instance_id: FragmentInstanceId::from_halves(15, 10),
-            node_id: 2,
-            sender_id: 0,
-        };
-        assert_eq!(*executor.dropped.lock().unwrap(), [slot]);
+        assert_eq!(*nixl.released.lock().unwrap(), [5, 6]);
+        assert_eq!(service.exchanges.counts(), ExchangeCounts::default());
         assert!(fetch_error(&service, 15, 10).contains("injected"));
 
-        // A sender that arrives after the cancel is refused and its output dropped.
-        let mut late = query_fragment(15, 12, scan_node(0, 0), stream_sink(2));
-        send_to(&mut late, 10, 8060);
-        let status = exec(&service, &late);
+        // A frame that arrives after the cancel is refused, and its buffers are freed.
+        let (params, envelope) = packed(15, 2, 7);
+        let (status, _) = transmit(&service, params, envelope);
         assert!(
             status.error_msgs[0].contains("already failed: query cancelled: injected"),
             "{status:?}"
         );
-        assert_eq!(*executor.dropped.lock().unwrap(), [slot, slot]);
+        assert_eq!(*nixl.released.lock().unwrap(), [5, 6, 7]);
         // A repeated cancel, one per CN instance, is harmless.
         assert_eq!(cancel(&service, 15).status_code, TStatusCode::OK.0);
     }
@@ -1500,7 +1885,12 @@ mod tests {
     fn a_failed_fragment_purges_its_query_on_this_cn() {
         // One sender has parked its output for the waiting result when another fragment of the
         // same query fails: the parked output is dropped, not left waiting forever.
-        let (service, executor) = recording_service();
+        let executor = Arc::new(RecordingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
         let mut result = query_fragment(16, 10, exchange_plan_node(2, 0), result_sink());
         expect_senders(&mut result, 2, 2);
         exec_ok(&service, &result);
@@ -1522,27 +1912,39 @@ mod tests {
         };
         assert_eq!(*executor.dropped.lock().unwrap(), [slot]);
         assert_eq!(service.exchanges.counts(), ExchangeCounts::default());
-        assert!(fetch_error(&service, 16, 10).contains("is remote"));
+        assert!(fetch_error(&service, 16, 10).contains("no NIXL transport"));
     }
 
     #[test]
     fn a_receiver_that_fails_before_running_frees_its_parked_inputs() {
-        // One sender is remote, which this build cannot read, so the ready receiver fails before
-        // the engine ever takes its local sender's parked output.
-        let (service, executor) = recording_service();
+        // A remote sender and a local one disagree on column names, so the ready receiver fails
+        // binding its exchange, before the engine ever takes its inputs.
+        let executor = Arc::new(RecordingExecutor::default());
+        let nixl = Arc::new(FakeNixl::default());
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            Some(nixl.clone()),
+        );
         let mut result = query_fragment(17, 10, exchange_plan_node(2, 0), result_sink());
         expect_senders(&mut result, 2, 2);
         exec_ok(&service, &result);
-        let key = ExchangeKey {
+        let remote = SenderSlot {
             fragment_instance_id: FragmentInstanceId::from_halves(17, 10),
             node_id: 2,
+            sender_id: 1,
         };
-        let batch = RemoteBatch { token: 5, rows: 1 };
-        let frame = service
-            .exchanges
-            .push_remote_frame(key, 1, 0, true, vec!["c0".to_string()], Some(batch))
-            .unwrap();
-        assert!(matches!(frame, RemoteFrame::Accepted(None)));
+        let envelope = NixlEnvelope::Packed {
+            token: 5,
+            rows: 1,
+            names: vec!["not_the_scan_output".to_string()],
+        };
+        let (status, _) = transmit(
+            &service,
+            nixl_chunk::packed_params(Some(remote), 0, true),
+            envelope,
+        );
+        assert_eq!(status.status_code, TStatusCode::OK.0);
 
         let mut local = query_fragment(17, 11, scan_node(0, 0), stream_sink(2));
         send_to(&mut local, 10, 8060);
@@ -1551,11 +1953,11 @@ mod tests {
             TStatusCode::INTERNAL_ERROR.0
         );
         let parked = SenderSlot {
-            fragment_instance_id: key.fragment_instance_id,
-            node_id: 2,
             sender_id: 0,
+            ..remote
         };
         assert_eq!(*executor.dropped.lock().unwrap(), [parked]);
+        assert_eq!(*nixl.released.lock().unwrap(), [5]);
         assert_eq!(service.exchanges.counts(), ExchangeCounts::default());
     }
 
@@ -1644,6 +2046,7 @@ mod tests {
         let service = SiriusComputeNodeService::with_executor(
             executor.clone(),
             &ComputeNodeConfig::default(),
+            None,
         );
         for instance in [10, 11] {
             let mut receiver =
@@ -1665,6 +2068,16 @@ mod tests {
                 FragmentInstanceId::from_halves(19, 10)
             ]
         );
+    }
+
+    fn recording_service() -> (SiriusComputeNodeService, Arc<RecordingExecutor>) {
+        let executor = Arc::new(RecordingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        (service, executor)
     }
 
     /// A sender that completes one receiver and is then refused by another frees the completed
@@ -1760,7 +2173,8 @@ mod tests {
             advertise_host: crate::Host::new("localhost").unwrap(),
             ..ComputeNodeConfig::default()
         };
-        let service = SiriusComputeNodeService::with_executor(Arc::new(StubExecutor), &config);
+        let service =
+            SiriusComputeNodeService::with_executor(Arc::new(StubExecutor), &config, None);
         let destination = TPlanFragmentDestination::new(
             TUniqueId::new(1, 2),
             None,
@@ -1770,7 +2184,7 @@ mod tests {
             )),
             None,
         );
-        assert_eq!(service.ensure_local(&destination), Ok(()));
+        assert_eq!(service.remote_peer(&destination), Ok(None));
     }
 
     /// Makes `params` sender 0 of fragment instance `instance` of its query, served on `port`.
