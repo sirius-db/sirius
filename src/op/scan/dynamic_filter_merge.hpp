@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include <cudf/ast/expressions.hpp>
+#include "cudf/ast_compat.hpp"
+
 #include <cudf/table/table.hpp>
 
 #include <cuda/stream>

@@ -62,6 +62,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <optional>
+#include <ranges>
 #include <regex>
 #include <string>
 #include <tuple>
@@ -91,12 +92,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   auto const resolved_id = alt.function();
   auto const& args       = alt.arguments();
 
-  // Disable AST mode when the output type is decimal — cuDF ASTs choke on
-  // intermediate decimal results currently.
-  // TODO: Remove this special-case once Sirius pins cuDF >= 26.10 (cuDF PR
-  // https://github.com/rapidsai/cudf/pull/21996 merged after the 26.08 cut,
-  // so the fix will ship in 26.10).
-  auto const skip_ast      = alt.return_type().id() == sirius::type_id::DECIMAL;
+  // Materialize every decimal function: cuDF AST does not enforce DuckDB's result width and scale.
+  auto const skip_ast =
+    alt.return_type().is_decimal() ||
+    std::ranges::any_of(args, [](auto const& arg) { return arg->return_type().is_decimal(); });
   auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
                                                     supported_ast_functions.end(),
                                                     resolved_id) != supported_ast_functions.end();
