@@ -32,6 +32,7 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression/join_condition.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -1709,6 +1710,20 @@ TEST_CASE("planned_aggregate_type narrows HUGEINT only", "[plan_tree_shape]")
   CHECK(generator::planned_aggregate_type(LogicalType::UHUGEINT) == LogicalType::UHUGEINT);
   CHECK(generator::planned_aggregate_type(LogicalType::DECIMAL(38, 0)) ==
         LogicalType::DECIMAL(38, 0));
+}
+
+TEST_CASE("plans_declared_type accepts the declared type or its aggregate narrowing",
+          "[plan_tree_shape]")
+{
+  using generator    = sirius::planner::sirius_physical_plan_generator;
+  auto const bigint  = sirius::from_duckdb(LogicalType::BIGINT);
+  auto const hugeint = sirius::from_duckdb(LogicalType::HUGEINT);
+  CHECK(generator::plans_declared_type(hugeint, LogicalType::HUGEINT));
+  CHECK(generator::plans_declared_type(bigint, LogicalType::HUGEINT));
+  CHECK(generator::plans_declared_type(bigint, LogicalType::BIGINT));
+  CHECK_FALSE(generator::plans_declared_type(hugeint, LogicalType::BIGINT));
+  CHECK_FALSE(
+    generator::plans_declared_type(sirius::from_duckdb(LogicalType::INTEGER), LogicalType::BIGINT));
 }
 
 //===----------------------------------------------------------------------===//
