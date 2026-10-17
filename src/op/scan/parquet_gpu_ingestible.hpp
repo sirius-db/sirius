@@ -209,6 +209,14 @@ class parquet_split_info : public scan_info {
     return total;
   }
 
+  [[nodiscard]] std::size_t preparation_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& s : rg_slices)
+      total = memory::saturating_add(total, s.estimated_decode_working_bytes);
+    return total;
+  }
+
   [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
   {
     std::size_t total = 0;

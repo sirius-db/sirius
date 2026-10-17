@@ -347,6 +347,13 @@ std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
  */
 class parquet_batch_coalescer : public batch_coalescer {
  public:
+  std::size_t target_batch_bytes() const noexcept override { return _cap; }
+  std::size_t retained_bytes() const noexcept override
+  {
+    return _plan->has_user_virtual_columns() && _acc_run_count > 1
+             ? memory::saturating_mul(_acc_working_bytes, std::size_t{2})
+             : _acc_working_bytes;
+  }
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                           std::shared_ptr<scan_plan const> plan,

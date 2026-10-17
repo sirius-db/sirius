@@ -140,13 +140,14 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
     return preparation_coordinator::publication{std::move(input), bytes, std::move(prepare)};
   };
   source.publish = [slot](preparation_coordinator::publication& publication) {
-    slot->connector->push_split_sized(std::move(publication.input), publication.bytes);
+    slot->connector->push_split_sized(
+      std::move(publication.input), publication.bytes, publication.preparation_bytes);
   };
   source.close = [slot] {
     if (slot->readahead) slot->readahead->mark_operator_closed(slot->op_id);
     slot->connector->close();
   };
-  source.bind_consumption = [slot](std::function<void()> callback) {
+  source.bind_consumption = [slot](std::function<void(size_t)> callback) {
     slot->connector->set_consumption_callback(std::move(callback));
   };
   source.can_claim = [iceberg] { return !iceberg || iceberg->can_claim_preparation(); };
