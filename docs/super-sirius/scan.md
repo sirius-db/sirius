@@ -148,6 +148,12 @@ The datasource fills caller-owned charged buffers directly, so the deferred path
 
 **Failures throw; they never degrade to empty delete data.** An empty result is indistinguishable from "this table has no deletes", so swallowing a read error would turn *could not read the deletes* into *there are none* and return rows the table logically removed.
 
+Puffin outcome classification is site-specific. Ordinary parser short/error results at the footer or
+blob magic remain `iceberg_delete_corrupt` with the parser's original message. Backend read errors,
+including an opened-object version change, are terminal `reader_io` at the charged scan wrapper;
+the version-change counter is recorded before that classification. Cancellation, allocation
+failures, and typed planning refusals retain their own outcomes.
+
 Known unsupported bindings **decline at plan time** (`sirius_plan_get.cpp`); file-schema checks and admitted deletion-vector reads run during metadata preparation. Execution-time failures stop and drain the query before the [CPU replay policy](scan-contracts-design.md#cpu-replay-policy) is applied.
 
 Currently declined:
@@ -609,7 +615,7 @@ The cache does two things beyond classic prefetch:
 - **Partial reads.** A `device_read` over a range whose chunks are only partially cached copies the cached chunks straight to device and completes the rest from the backend in the same call, instead of treating a partial overlap as a miss.
 - **Populate-on-read.** On a backend that supports bounce-staged host-to-device reads, an uncached chunk being read for the device is loaded into a cache buffer (file → cache chunk → device) and published to the cache, so the next read of the same chunk is a hit — caching as a side effect of reading, like an OS page cache. A heavily-partial boundary chunk whose over-read would exceed ~25% of the chunk is instead read through an internal bounce slot and left uncached (zero over-read).
 
-Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The resident store has one entry per exact path and parser profile; the entry carries the object identity and the opened object's identity must match before reuse. A normal hit performs one exact index lookup and an identity check; there is no recency update or LRU scan. `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); a path-level reverse index is used only to invalidate profiles when that path's identity changes. HOST and runtime metadata residency budgets are outside the agreed R3 scope; the existing cache residency behavior is preserved.
+Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The resident store has one entry per exact path and parser profile; the entry carries the object identity and the opened object's identity must match before reuse. A normal hit performs one exact index lookup and an identity check; there is no recency update or LRU scan. `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); a path-level reverse index is used only to invalidate profiles when that path's identity changes. HOST/runtime residency budgets, byte accounting, eviction limits, and their diagnostics remain a follow-up owned by the finalized cuCascade IO lifecycle in #2108, after the #209/#2108 identity-header handoff. R3 keeps the existing ioctx-scoped residency behavior and does not claim those bounds are implemented here.
 
 **fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` registers a scan range set and stashes its `cache_handle`. The readahead manager later drives that handle through allocation and asynchronous prefetch; the consumer stage records when reading begins so stale work can be refused or awaited instead of issuing duplicate I/O.
 

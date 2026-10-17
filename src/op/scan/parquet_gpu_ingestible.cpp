@@ -978,6 +978,13 @@ gpu_ingestible::metadata_scan_task_t parquet_gpu_ingestible::next_split_provider
       throw;
     } catch (transparent::classified_execution_error const&) {
       throw;
+    } catch (io::descriptor_mismatch_error const& error) {
+      if (_info->profiles && _info->profiles->counters) {
+        _info->profiles->counters->iceberg_delete_descriptor_mismatches.fetch_add(
+          1, std::memory_order_relaxed);
+      }
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
     } catch (duckdb::IOException const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());

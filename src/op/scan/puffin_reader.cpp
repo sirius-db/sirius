@@ -122,9 +122,8 @@ class datasource_puffin_source final : public puffin_byte_source {
     } catch (duckdb::InterruptException const&) {
       throw;
     } catch (io::object_changed_error const&) {
-      // The opened object's validator is a distinct execution outcome. Do not
-      // flatten it into reader_io: the caller needs to know that the remote
-      // object changed after the datasource was opened.
+      // Preserve the typed version failure until the charged scan wrapper,
+      // which records it and classifies the terminal outcome.
       throw;
     } catch (std::bad_alloc const&) {
       throw;
@@ -518,9 +517,7 @@ puffin_footer_bounds read_footer_bounds(puffin_byte_source& f,
       "[puffin] Cannot seek to footer magic of " + ref.puffin_path);
   char magic[4];
   if (!f.read(std::as_writable_bytes(std::span{magic})))
-    throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      "[puffin] Cannot read footer magic of " + ref.puffin_path);
+    throw std::runtime_error("[puffin] Cannot read footer magic of " + ref.puffin_path);
   if (std::memcmp(magic, puffin_magic, 4) != 0)
     throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
   return {footer_start, static_cast<std::size_t>(payload_size)};
@@ -859,8 +856,7 @@ decoded_positions read_charged_checked(Ref const& ref,
   } catch (sirius::transparent::classified_execution_error const&) {
     throw;
   } catch (io::object_changed_error const&) {
-    // Identity changes are neither a parser refusal nor an ordinary I/O
-    // failure. Preserve the typed error for the execution boundary.
+    // Preserve the typed version failure until the charged scan wrapper.
     throw;
   } catch (std::system_error const& error) {
     // Preserve cancellation; other system errors are reader I/O failures.
