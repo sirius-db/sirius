@@ -30,7 +30,7 @@ namespace {
 // Forward table: DuckDB function name -> Sirius function id.
 // Symbolic SQL operators and their Substrait spellings resolve to the same ids.
 // Linear scan; called once per BoundFunctionExpression at executor entry.
-constexpr std::array<std::pair<std::string_view, function_id>, 39> kForwardTable = {{
+constexpr std::array<std::pair<std::string_view, function_id>, 40> kForwardTable = {{
   {"+", function_id::add},
   {"add", function_id::add},
   {"-", function_id::sub},
@@ -70,24 +70,25 @@ constexpr std::array<std::pair<std::string_view, function_id>, 39> kForwardTable
   {"upper", function_id::upper},
   {"lower", function_id::lower},
   {"round", function_id::round},
+  {"negate", function_id::negate},  // Substrait spelling; DuckDB's one-argument "-" maps here
 }};
 
 // Reverse table: Sirius function id -> canonical DuckDB function name.
 // Indexed directly by enum value; never searched.
-constexpr std::array<std::string_view, 33> kReverseTable = {
+constexpr std::array<std::string_view, 34> kReverseTable = {
   "+",          "-",         "*",           "/",           "//",
   "%",          "substring", "~~",          "!~~",         "contains",
   "prefix",     "suffix",    "strlen",      "length",      "regexp_replace",
   "concat",     "||",        "year",        "month",       "day",
   "hour",       "minute",    "second",      "millisecond", "microsecond",
   "date_trunc", "row",       "struct_pack", "error",       "constant_or_null",
-  "upper",      "lower",     "round"};
+  "upper",      "lower",     "round",       "negate"};
 
-static_assert(static_cast<std::size_t>(function_id::round) + 1 == 33,
-              "function_id::round must be the last entry; cardinality locked at 33.");
-static_assert(kReverseTable.size() == 33,
+static_assert(static_cast<std::size_t>(function_id::negate) + 1 == 34,
+              "function_id::negate must be the last entry; cardinality locked at 34.");
+static_assert(kReverseTable.size() == 34,
               "kReverseTable must have one slot per function_id value.");
-static_assert(kForwardTable.size() == 39,
+static_assert(kForwardTable.size() == 40,
               "kForwardTable includes SQL and Substrait aliases for supported function ids.");
 
 // Walks both tables to ensure every enum value has exactly one canonical
@@ -124,6 +125,48 @@ std::optional<function_id> from_duckdb_function_name(std::string_view name)
 std::string_view to_duckdb_function_name(function_id id)
 {
   return kReverseTable[static_cast<std::size_t>(id)];
+}
+
+bool accepts_argument_count(function_id id, std::size_t argument_count)
+{
+  switch (id) {
+    case function_id::add:
+    case function_id::sub:
+    case function_id::mul:
+    case function_id::div:
+    case function_id::int_div:
+    case function_id::mod:
+    case function_id::like:
+    case function_id::not_like:
+    case function_id::contains:
+    case function_id::prefix:
+    case function_id::suffix:
+    case function_id::concat_operator:
+    case function_id::date_trunc: return argument_count == 2;
+    case function_id::negate:
+    case function_id::strlen:
+    case function_id::length:
+    case function_id::year:
+    case function_id::month:
+    case function_id::day:
+    case function_id::hour:
+    case function_id::minute:
+    case function_id::second:
+    case function_id::millisecond:
+    case function_id::microsecond:
+    case function_id::error:
+    case function_id::upper:
+    case function_id::lower: return argument_count == 1;
+    case function_id::substring: return argument_count == 2 || argument_count == 3;
+    case function_id::round: return argument_count == 1 || argument_count == 2;
+    // The options argument of regexp_replace changes its semantics, and the GPU handler has none.
+    case function_id::regexp_replace: return argument_count == 3;
+    case function_id::concat:
+    case function_id::row:
+    case function_id::struct_pack: return argument_count >= 1;
+    case function_id::constant_or_null: return argument_count >= 2;
+  }
+  return false;
 }
 
 }  // namespace sirius

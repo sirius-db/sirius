@@ -17,6 +17,7 @@
 #pragma once
 
 // standard library
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -31,7 +32,7 @@ namespace sirius {
  * test_function_id.cpp). The order is grouped by category for human
  * readability; integer values are part of the public ABI — new entries go
  * at the end of their category, never in the middle. Cardinality is
- * exactly 33 (D-01).
+ * exactly 34 (D-01).
  */
 enum class function_id : uint16_t {
   // Arithmetic — 6 entries (also the contents of supported_ast_functions)
@@ -78,6 +79,7 @@ enum class function_id : uint16_t {
 
   // Additional numeric functions
   round,
+  negate,  // unary minus; DuckDB binds it as a one-argument "-", Substrait names it "negate"
 };
 
 /**
@@ -97,5 +99,14 @@ std::optional<function_id> from_duckdb_function_name(std::string_view name);
  * spelling is "substring" (D-SUB-1).
  */
 std::string_view to_duckdb_function_name(function_id id);
+
+/**
+ * @brief Whether the GPU evaluator's handler for @p id takes @p argument_count arguments.
+ *
+ * DuckDB overloads some names on arity (a one-argument "-" is negation, a
+ * one-argument "+" the identity), and the handlers read their arguments by
+ * position. A function_call is only valid with an arity its handler accepts.
+ */
+bool accepts_argument_count(function_id id, std::size_t argument_count);
 
 }  // namespace sirius
