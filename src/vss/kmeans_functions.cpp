@@ -553,6 +553,19 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   // INT8 codes need each component's range over every row, taken while the chunks are resident.
   bool const want_int8 = storage == list_storage::int8;
   std::optional<rmm::device_uvector<unsigned int>> col_min, col_max;
+  // INT8 rows are rotated before they are coded (cluster_lists::code_rotation), unless
+  // SIRIUS_VSS_INT8_ROTATE=0. The range pass and the coding pass both see the rotated rows.
+  std::unique_ptr<rmm::device_buffer> rotation;
+  std::optional<rmm::device_uvector<float>> rotated;
+  auto const rotated_rows = [&](float const* x, std::int64_t rows) -> float const* {
+    if (!rotation) { return x; }
+    if (!rotated || rotated->size() < static_cast<std::size_t>(rows * dim)) {
+      if (rotated) { stream.synchronize(); }  // the old buffer may still be read by queued work
+      rotated.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+    }
+    rotate_rows(x, rows, dim, static_cast<float const*>(rotation->data()), rotated->data(), stream);
+    return rotated->data();
+  };
   if (want_int8) {
     col_min.emplace(static_cast<std::size_t>(dim), stream, mr);
     col_max.emplace(static_cast<std::size_t>(dim), stream, mr);
@@ -560,6 +573,18 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       col_min->data(), 0xff, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.value()));
     CUDF_CUDA_TRY(cudaMemsetAsync(
       col_max->data(), 0, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.value()));
+    auto const* env = std::getenv("SIRIUS_VSS_INT8_ROTATE");
+    if (env == nullptr || std::string_view{env} != "0") {
+      auto const host =
+        random_rotation(dim, 0x5151'7a7e'0000'0000ull + static_cast<std::uint64_t>(dim));
+      rotation = std::make_unique<rmm::device_buffer>(host.size() * sizeof(float), stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(rotation->data(),
+                                    host.data(),
+                                    host.size() * sizeof(float),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
+      stream.synchronize();  // `host` goes out of scope
+    }
   }
   {
     // One list (the exact join's compact layout) labels nothing: every row is in it, and the
@@ -585,12 +610,13 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                         stream);
       }
       if (want_int8) {
-        column_min_max(list_column_as_dataset_view(staged.view, dim).data_handle(),
-                       rows,
-                       dim,
-                       col_min->data(),
-                       col_max->data(),
-                       stream);
+        column_min_max(
+          rotated_rows(list_column_as_dataset_view(staged.view, dim).data_handle(), rows),
+          rows,
+          dim,
+          col_min->data(),
+          col_max->data(),
+          stream);
       }
       // Before the copy below, which waits for the labels: into pageable memory it is synchronous.
       walk.prefetch_after(i);
@@ -942,6 +968,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                   code_offset_host.size() * sizeof(float),
                                   cudaMemcpyHostToDevice,
                                   persistent.value()));
+    if (rotation) {
+      lists.code_rotation = std::make_unique<rmm::device_buffer>(
+        rotation->data(), rotation->size(), persistent, persistent_mr);
+    }
     code_error_bits.emplace(1, stream, mr);
     CUDF_CUDA_TRY(
       cudaMemsetAsync(code_error_bits->data(), 0, sizeof(unsigned int), stream.value()));
@@ -1164,7 +1194,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       if (encoding == list_encoding::int8) {
         grouped_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
         grouped_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
-        quantize_rows_int8(grouped.data(),
+        quantize_rows_int8(rotated_rows(grouped.data(), rows),
                            rows,
                            dim,
                            static_cast<float const*>(lists.code_offset->data()),
@@ -1172,7 +1202,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                            grouped_i8->data(),
                            nullptr,
                            code_error_bits->data(),
-                           stream);
+                           stream,
+                           rotation ? rotation_slack(dim) : 0.f);
         int8_row_sq_norms(grouped_i8->data(), rows, dim, grouped_sq->data(), stream);
         grouped_bytes = reinterpret_cast<std::byte const*>(grouped_i8->data());
         scatter(grouped_sq->data(), sizeof(std::int32_t), lists.row_sq->data());

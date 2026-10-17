@@ -27,9 +27,12 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <random>
+#include <vector>
 
 namespace sirius::vss {
 
@@ -427,26 +430,29 @@ __global__ void quantize_rows_int8_kernel(float const* x,
                                           float scale,
                                           int8_t* out,
                                           float* row_error,
-                                          unsigned* max_error_bits)
+                                          unsigned* max_error_bits,
+                                          float norm_slack)
 {
   auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
   auto const lane  = static_cast<int64_t>(threadIdx.x % 32);
   float const inv  = 1.f / scale;
   for (int64_t r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; r < rows; r += warps) {
-    float err = 0.f;
+    float err = 0.f, sq = 0.f;
     for (int64_t j = lane; j < d; j += 32) {
       float const v  = x[r * d + j];
       float const q  = fminf(fmaxf(rintf((v - offset[j]) * inv), -127.f), 127.f);
       out[r * d + j] = static_cast<int8_t>(q);
       float const e  = v - fmaf(scale, q, offset[j]);
       err            = fmaf(e, e, err);
+      sq             = fmaf(v, v, sq);
     }
     for (int o = 16; o > 0; o /= 2) {
       err += __shfl_xor_sync(0xffffffffu, err, o);
+      sq += __shfl_xor_sync(0xffffffffu, sq, o);
     }
     if (lane == 0) {
       // Rounded up by a relative 1e-6 so the float sum cannot understate the error it bounds.
-      float const e = sqrtf(err) * (1.f + 1e-6f);
+      float const e = (sqrtf(err) + norm_slack * sqrtf(sq)) * (1.f + 1e-6f);
       if (row_error != nullptr) { row_error[r] = e; }
       if (max_error_bits != nullptr) { atomicMax(max_error_bits, __float_as_uint(e)); }
     }
@@ -733,6 +739,117 @@ float decode_ordered_float(unsigned int bits)
   return f;
 }
 
+std::vector<float> random_rotation(int64_t d, std::uint64_t seed)
+{
+  std::mt19937_64 gen{seed};
+  std::normal_distribution<double> normal{0.0, 1.0};
+  std::vector<double> m(static_cast<std::size_t>(d * d));
+  for (int64_t i = 0; i < d; ++i) {
+    double* row = m.data() + i * d;
+    // Redrawn in the (never seen) case that the row falls inside the span of the earlier ones.
+    for (double norm = 0; norm < 1e-6;) {
+      for (int64_t j = 0; j < d; ++j) {
+        row[j] = normal(gen);
+      }
+      // Modified Gram-Schmidt, twice, against the rows already made orthonormal.
+      for (int pass = 0; pass < 2; ++pass) {
+        for (int64_t p = 0; p < i; ++p) {
+          double const* prev = m.data() + p * d;
+          double dot         = 0;
+          for (int64_t j = 0; j < d; ++j) {
+            dot += row[j] * prev[j];
+          }
+          for (int64_t j = 0; j < d; ++j) {
+            row[j] -= dot * prev[j];
+          }
+        }
+      }
+      norm = 0;
+      for (int64_t j = 0; j < d; ++j) {
+        norm += row[j] * row[j];
+      }
+      norm = std::sqrt(norm);
+      if (norm >= 1e-6) {
+        for (int64_t j = 0; j < d; ++j) {
+          row[j] /= norm;
+        }
+      }
+    }
+  }
+  return std::vector<float>(m.begin(), m.end());
+}
+
+namespace {
+
+constexpr int kRotTile = 64;  // rows and output components per block
+constexpr int kRotStep = 16;  // k per shared-memory stage
+
+/// out[i, j] = sum_k r[j, k] x[i, k], one 64 x 64 output tile per block, each thread 4 x 4 of it.
+/// Every output is one fmaf chain over k = 0..d-1 in order, whatever the tile, launch or stream:
+/// a row's rotation -- and its codes -- never depends on which rows it was batched with, which
+/// cuBLAS does not promise (its kernel choice follows the shape and the streams active).
+__global__ void rotate_rows_kernel(
+  float const* __restrict__ x, int64_t rows, int64_t d, float const* __restrict__ r, float* out)
+{
+  __shared__ float xs[kRotStep][kRotTile + 1];
+  __shared__ float rs[kRotStep][kRotTile + 1];
+  auto const row0 = static_cast<int64_t>(blockIdx.x) * kRotTile;
+  auto const col0 = static_cast<int64_t>(blockIdx.y) * kRotTile;
+  int const tx    = threadIdx.x % 16;
+  int const ty    = threadIdx.x / 16;
+  float acc[4][4] = {};
+  for (int64_t k0 = 0; k0 < d; k0 += kRotStep) {
+    for (int q = 0; q < 4; ++q) {
+      int const i  = ty + 16 * q;
+      auto const k = k0 + tx;
+      xs[tx][i]    = (row0 + i < rows && k < d) ? x[(row0 + i) * d + k] : 0.f;
+      rs[tx][i]    = (col0 + i < d && k < d) ? r[(col0 + i) * d + k] : 0.f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < kRotStep; ++kk) {
+      float a[4], b[4];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        a[q] = xs[kk][ty + 16 * q];
+        b[q] = rs[kk][tx + 16 * q];
+      }
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          acc[p][q] = fmaf(a[p], b[q], acc[p][q]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  for (int p = 0; p < 4; ++p) {
+    auto const i = row0 + ty + 16 * p;
+    if (i >= rows) { continue; }
+    for (int q = 0; q < 4; ++q) {
+      auto const j = col0 + tx + 16 * q;
+      if (j < d) { out[i * d + j] = acc[p][q]; }
+    }
+  }
+}
+
+}  // namespace
+
+void rotate_rows(float const* x,
+                 int64_t rows,
+                 int64_t d,
+                 float const* rotation,
+                 float* out,
+                 rmm::cuda_stream_view stream)
+{
+  if (rows == 0) { return; }
+  dim3 const grid(static_cast<unsigned>((rows + kRotTile - 1) / kRotTile),
+                  static_cast<unsigned>((d + kRotTile - 1) / kRotTile));
+  rotate_rows_kernel<<<grid, 256, 0, stream.value()>>>(x, rows, d, rotation, out);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
 void quantize_rows_int8(float const* x,
                         int64_t rows,
                         int64_t d,
@@ -741,12 +858,13 @@ void quantize_rows_int8(float const* x,
                         int8_t* out,
                         float* row_error,
                         unsigned int* max_error_bits,
-                        rmm::cuda_stream_view stream)
+                        rmm::cuda_stream_view stream,
+                        float norm_slack)
 {
   if (rows == 0) { return; }
   auto const grid = static_cast<int>(std::min<int64_t>((rows + 7) / 8, 65535));
   quantize_rows_int8_kernel<<<grid, 256, 0, stream.value()>>>(
-    x, rows, d, offset, scale, out, row_error, max_error_bits);
+    x, rows, d, offset, scale, out, row_error, max_error_bits, norm_slack);
   CUDF_CHECK_CUDA(stream.value());
 }
 

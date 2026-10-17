@@ -1088,6 +1088,77 @@ TEST_CASE_METHOD(KMeansFixture,
 }
 
 TEST_CASE_METHOD(KMeansFixture,
+                 "int8 lists over a component 300x wider than the rest give the exact answer",
+                 "[integration][gpu_execution][array][vss][kmeans][lists][running_bound]")
+{
+  // One shared scale sized by component 0 leaves the other 63 components a code or two: the codes
+  // filter little, and the answer must still be exact, whether the rows were rotated before coding
+  // (spreading component 0 over all of them) or not. Over host lists one task per probe chunk, so
+  // chunks are searched concurrently.
+  auto const rotate = GENERATE(std::string("1"), std::string("0"));
+  auto const tier   = GENERATE(std::string("gpu"), std::string("host"));
+  auto const gen    = [](const std::string& seed) {
+    return "list_transform(range(64), lambda d: ((hash(i * 1000 + d + " + seed +
+           ") % 1000)::FLOAT / 1000.0 * CASE WHEN d = 0 THEN 300 ELSE 1 END))::FLOAT[64]";
+  };
+  auto const prefix = "kmo_" + rotate + "_" + tier;
+  run_ok("CREATE TABLE " + prefix + "_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
+         " AS vec FROM range(20000) t(i);");
+  run_ok("CREATE TABLE " + prefix + "_probe AS SELECT i::INTEGER AS id, " + gen("5555555") +
+         " AS vec FROM range(60000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SET scan_task_batch_size = 4000000;");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_probe', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 1);");
+  {
+    struct unset_on_exit {
+      ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_INT8_ROTATE"); }
+    } unset_env;
+    ::setenv("SIRIUS_VSS_INT8_ROTATE", rotate.c_str(), 1);
+    run_ok("SELECT * FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" + prefix +
+           "_c', storage => 'int8', tier => '" + (tier == "gpu" ? "auto" : "host") + "');");
+  }
+  // The oracle is DuckDB's own array_distance on the CPU, for every 300th probe row (each probe
+  // chunk has some): exact-gemm cannot be one here, as |x|^2 + |y|^2 - 2 x.y loses ~1e-2 of a
+  // distance near 3 to cancellation when component 0 makes the norms ~300.
+  struct unset_blocks_on_exit {
+    ~unset_blocks_on_exit() { ::unsetenv("SIRIUS_VSS_PROBE_BLOCK_ROWS"); }
+  } unset_blocks;
+  if (tier == "host") { ::setenv("SIRIUS_VSS_PROBE_BLOCK_ROWS", "0", 1); }
+  auto const oracle = distance_multiset(
+    *con,
+    "SELECT left_id, distance FROM (SELECT p.id AS left_id, array_distance(p.vec, c.vec) AS "
+    "distance, row_number() OVER (PARTITION BY p.id ORDER BY array_distance(p.vec, c.vec)) AS rk "
+    "FROM " +
+      prefix + "_probe p, " + prefix + "_corpus c WHERE p.id % 300 = 0) WHERE rk <= 10;");
+  auto const lists =
+    ok_rows(*con,
+            "SELECT count(*), count(*) FILTER (WHERE left_id % 300 = 0) FROM sirius_knn_join('" +
+              prefix + "_probe','vec','" + prefix +
+              "_corpus','vec', metric => 'l2', k => 10, search_mode => "
+              "'approx', clustering => '" +
+              prefix + "_c', n_probes => 1);");
+  CHECK(lists.at(0).at(0) == "600000");
+  auto const sampled = distance_multiset(
+    *con,
+    "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
+      "_corpus','vec', metric => 'l2', k => 10, search_mode => 'approx', clustering => '" + prefix +
+      "_c', n_probes => 1) WHERE left_id % 300 = 0;");
+  REQUIRE(oracle.size() == 200u * 10u);
+  REQUIRE(sampled.size() == oracle.size());
+  std::size_t mismatched = 0;
+  for (std::size_t i = 0; i < oracle.size(); ++i) {
+    mismatched +=
+      sampled[i].first != oracle[i].first || std::llabs(sampled[i].second - oracle[i].second) > 1;
+  }
+  CHECK(mismatched == 0);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
                  "cluster lists do not outlive a re-fit of their clustering",
                  "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
 {

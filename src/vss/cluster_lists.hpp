@@ -27,6 +27,7 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -151,6 +152,11 @@ struct cluster_lists {
   std::unique_ptr<rmm::device_buffer> code_offset;
   float code_scale{0};
   float code_error{0};
+  /// INT8 lists only, when set: the FP32 [dim x dim] orthogonal matrix every row (and every probe)
+  /// is rotated by before it is coded. One scale serves all components, so a component far wider
+  /// than the rest would leave the others a code or two each; a random rotation spreads the width
+  /// over all of them. Distances are unchanged, so the bounds and the FP32 re-score are too.
+  std::unique_ptr<rmm::device_buffer> code_rotation;
   /// INT32 [chunk_rows + 1] offsets 0, dim, 2 dim, ... A LIST view of any chunk borrows a
   /// prefix of these, since every list in the column has the same width.
   std::unique_ptr<rmm::device_buffer> list_offsets;
@@ -324,9 +330,33 @@ void column_min_max(float const* x,
 /// The float an order-preserving encoding from column_min_max stands for.
 float decode_ordered_float(unsigned int bits);
 
+/// A random orthogonal @p d x @p d matrix, row-major, the same for the same @p d and @p seed:
+/// Gram-Schmidt over Gaussian rows, in double precision.
+[[nodiscard]] std::vector<float> random_rotation(std::int64_t d, std::uint64_t seed);
+
+/// out[i] = rotation x[i] for @p rows rows of @p d floats (@p rotation row-major, d x d, on the
+/// device). @p out must not alias @p x.
+void rotate_rows(float const* x,
+                 std::int64_t rows,
+                 std::int64_t d,
+                 float const* rotation,
+                 float* out,
+                 rmm::cuda_stream_view stream);
+
+/// How far rotate_rows' result for a row x may sit from the exact rotation, as a multiple of |x|:
+/// each component is a d-term FP32 dot product with an orthonormal row (error at most about
+/// d u |x|, u = 2^-24), with the rotation itself rounded to FP32, over sqrt(d) components.
+[[nodiscard]] inline float rotation_slack(std::int64_t d)
+{
+  double const u = 1.0 / 16777216.0;
+  return static_cast<float>(std::sqrt(static_cast<double>(d)) * (static_cast<double>(d) + 2.0) * u *
+                            1.01);
+}
+
 /// out = clamp(round((x - offset) / scale), -127, 127) per component. Each row's error
-/// |x - (offset + scale * out)| goes to row_error[i] when it is given, and raises *max_error_bits
-/// (a non-negative float's bits) when that is given.
+/// |x - (offset + scale * out)| + norm_slack |x| goes to row_error[i] when it is given, and raises
+/// *max_error_bits (a non-negative float's bits) when that is given; norm_slack carries an error
+/// x itself already has, such as rotation_slack for rows from rotate_rows.
 void quantize_rows_int8(float const* x,
                         std::int64_t rows,
                         std::int64_t d,
@@ -335,7 +365,8 @@ void quantize_rows_int8(float const* x,
                         std::int8_t* out,
                         float* row_error,
                         unsigned int* max_error_bits,
-                        rmm::cuda_stream_view stream);
+                        rmm::cuda_stream_view stream,
+                        float norm_slack = 0.f);
 
 /// The code-space bound an int8 search filters with: a pair within squared distance bound[r] in
 /// FP32 has its code distance within ((sqrt(bound[r]) + probe_error[r] + code_error) / scale)^2,

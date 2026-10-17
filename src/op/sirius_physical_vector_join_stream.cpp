@@ -2371,7 +2371,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       l2 && dim % 4 == 0;
     std::optional<rmm::device_uvector<std::int8_t>> probe_i8, routed_i8;
     std::optional<rmm::device_uvector<std::int32_t>> probe_sq, routed_sq;
-    std::optional<rmm::device_uvector<float>> probe_code_error;
+    // The rotated probe lives as long as its codes: freed while the quantize reading it is still
+    // queued, its memory went to a concurrent task (one task per probe chunk) and corrupted them.
+    std::optional<rmm::device_uvector<float>> probe_code_error, rotated_probe;
     if (int8_search && !codes_int8) {
       rmm::device_uvector<unsigned long long> non_bytes(1, stream, mr);
       CUDF_CUDA_TRY(
@@ -2392,17 +2394,29 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       routed_i8.emplace(static_cast<std::size_t>(max_routed * dim), stream, mr);
       routed_sq.emplace(static_cast<std::size_t>(max_routed), stream, mr);
       if (codes_int8) {
-        // The probe gets the lists' codes too, and its own exact coding error per row.
+        // The probe gets the lists' codes too, and its own exact coding error per row -- rotated
+        // first, like the rows, when the lists were (the FP32 re-score keeps the unrotated probe).
         probe_code_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
-        vss::quantize_rows_int8(search_queries.data_handle(),
-                                n_left,
-                                dim,
-                                static_cast<float const*>(_lists->code_offset->data()),
-                                _lists->code_scale,
-                                probe_i8->data(),
-                                probe_code_error->data(),
-                                nullptr,
-                                stream);
+        if (_lists->code_rotation) {
+          rotated_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+          vss::rotate_rows(search_queries.data_handle(),
+                           n_left,
+                           dim,
+                           static_cast<float const*>(_lists->code_rotation->data()),
+                           rotated_probe->data(),
+                           stream);
+        }
+        vss::quantize_rows_int8(
+          rotated_probe ? rotated_probe->data() : search_queries.data_handle(),
+          n_left,
+          dim,
+          static_cast<float const*>(_lists->code_offset->data()),
+          _lists->code_scale,
+          probe_i8->data(),
+          probe_code_error->data(),
+          nullptr,
+          stream,
+          _lists->code_rotation ? vss::rotation_slack(dim) : 0.f);
       } else {
         vss::narrow_to_shifted_int8(
           search_queries.data_handle(), n_left * dim, probe_i8->data(), stream);
