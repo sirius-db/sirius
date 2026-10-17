@@ -861,6 +861,9 @@ class sirius_scan_manager {
   ///        was configured with @c backend=kvikio.
   [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
+  /// Aggregate metadata-cache diagnostics across the default and routed ioctxs.
+  [[nodiscard]] sirius::io::cache::metadata_store::counters metadata_cache_statistics() const;
+
   /// Where the readahead subscribes for execution events.  Set once at startup;
   /// the readahead itself is per-query, so it registers and unregisters around
   /// its own lifetime rather than this one.
@@ -889,6 +892,12 @@ class sirius_scan_manager {
   ///        backend @p s3_uri routes to — the glob layer bounds its match set
   ///        with it. Throws a clear error for a non-object-store path.
   [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
+
+  /// Resolve only the registered backend type for @p path. This is a planning
+  /// query: it does not construct or start an ioctx, open an object, issue a
+  /// HEAD, warm a backend, or probe credentials/network.
+  [[nodiscard]] std::optional<sirius::io::io_context_type> planning_io_backend(
+    std::string_view path) const;
 
  private:
   /**
@@ -1072,7 +1081,7 @@ class sirius_scan_manager {
   /// `_routed_io_ctxs_mtx` guards only map lookup/insert; drained + torn down
   /// in the dtor.
   std::mutex _routed_io_ctxs_build_mtx;
-  std::mutex _routed_io_ctxs_mtx;
+  mutable std::mutex _routed_io_ctxs_mtx;
   sirius::io::scoped_object_store_configs _s3_configs;
   struct routed_ioctx_key {
     sirius::io::io_context_type type;

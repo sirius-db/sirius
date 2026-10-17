@@ -22,16 +22,21 @@
 
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
+#include <io/io_errors.hpp>
+#include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
 #include <op/scan/parquet_batch_layout.hpp>
+#include <transparent/replay_admission.hpp>
 
 #include <cstdint>
 #include <numeric>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -137,8 +142,12 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   iceberg_dv_preparation::file const& descriptor,
   scan_manager::preparation_ledger* ledger,
   scan_manager::w_permit const& permit,
+  io::ioctx_resolver const& resolve,
+  std::stop_token stop,
   std::shared_ptr<physical_check_counters> const& counters)
 {
+  if (stop.stop_requested())
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled));
   auto const* dv = descriptor.dv;
   if (!dv)
     return std::make_shared<iceberg_delete_set const>(
@@ -153,6 +162,39 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
       counters->iceberg_dv_phase_for_testing(dv->file_path, true);
   }
   try {
+    std::unique_ptr<puffin_byte_source> source;
+    try {
+      auto io_ctx = resolve(dv->file_path);
+      if (!io_ctx)
+        throw std::runtime_error("[iceberg_gpu_ingestible] no ioctx for Puffin file: " +
+                                 dv->file_path);
+      auto datasource = io_ctx->open_datasource(dv->file_path, io::open_hint::generic);
+      if (!datasource)
+        throw std::runtime_error("[iceberg_gpu_ingestible] no datasource for Puffin file: " +
+                                 dv->file_path);
+      source = make_puffin_byte_source(std::move(datasource));
+    } catch (sirius::transparent::classified_execution_error const&) {
+      throw;
+    } catch (duckdb::InterruptException const&) {
+      throw;
+    } catch (rmm::out_of_memory const&) {
+      throw;
+    } catch (std::bad_alloc const&) {
+      throw;
+    } catch (io::descriptor_mismatch_error const& error) {
+      if (counters) ++counters->iceberg_delete_descriptor_mismatches;
+      throw sirius::transparent::classified_execution_error(
+        sirius::transparent::late_failure_cause::reader_io, error.what());
+    } catch (std::system_error const& error) {
+      if (error.code() == std::errc::operation_canceled) throw;
+      throw sirius::transparent::classified_execution_error(
+        sirius::transparent::late_failure_cause::reader_io,
+        "[puffin] Cannot open file: " + dv->file_path);
+    } catch (std::exception const&) {
+      throw sirius::transparent::classified_execution_error(
+        sirius::transparent::late_failure_cause::reader_io,
+        "[puffin] Cannot open file: " + dv->file_path);
+    }
     set = read_deletion_vector_charged(DeletionVectorRefView{dv->file_path,
                                                              dv->content_offset,
                                                              dv->content_size_in_bytes,
@@ -162,10 +204,24 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
                                        allocator,
                                        descriptor.path,
                                        prepared.path_owner(),
-                                       prepared.contract());
+                                       prepared.contract(),
+                                       *source);
   } catch (unsupported_physical_input const& error) {
-    if (counters) counters->record(error.reason);
+    if (counters) {
+      counters->record(error.reason);
+      if (error.reason == verdict_reason::iceberg_delete_corrupt)
+        counters->iceberg_delete_corrupt_inputs.fetch_add(1, std::memory_order_relaxed);
+    }
     throw;
+  } catch (transparent::classified_execution_error const& error) {
+    if (counters && error.cause == transparent::late_failure_cause::reader_io)
+      counters->iceberg_delete_reader_io_failures.fetch_add(1, std::memory_order_relaxed);
+    throw;
+  } catch (io::object_changed_error const& error) {
+    if (counters)
+      counters->iceberg_delete_identity_failures.fetch_add(1, std::memory_order_relaxed);
+    throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                  error.what());
   } catch (std::bad_alloc const&) {
     throw scan_manager::preparation_resource_error(
       "DV preparation control allocation failed", false, std::current_exception());
@@ -194,6 +250,7 @@ void attach_delete_set(parquet_file_scan_info& file, std::shared_ptr<iceberg_del
 gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider(
   io::ioctx_resolver resolve)
 {
+  auto resolve_for_dv = resolve;
   if (_deferred && !_attempt && _next_preparation < _deferred->files().size())
     throw std::logic_error("DV preparation claimed before the attempt started");
   auto work = parquet_gpu_ingestible::next_split_provider(std::move(resolve));
@@ -219,20 +276,27 @@ gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider
     ++_next_preparation;
     auto const& profiles = static_cast<iceberg_ingestible_table_info const&>(table_info()).profiles;
     auto counters        = profiles ? profiles->counters : nullptr;
-    return [work = std::move(work), attempt = _attempt, held = std::move(held), index, counters]() {
-      auto metadata          = work();
+    return [work    = std::move(work),
+            attempt = _attempt,
+            held    = std::move(held),
+            index,
+            counters,
+            resolve = std::move(resolve_for_dv)](std::stop_token stop) {
+      auto metadata          = work(stop);
       auto& file             = dynamic_cast<parquet_file_scan_info&>(*metadata);
       auto const& prepared   = attempt->plan();
       auto const& descriptor = prepared.files()[index];
-      auto set =
-        read_prepared_delete_set(prepared, descriptor, held->ledger.get(), held->permit, counters);
+      auto set               = read_prepared_delete_set(
+        prepared, descriptor, held->ledger.get(), held->permit, resolve, stop, counters);
       attempt->record(index, set);
       attach_delete_set(file, std::move(set));
       return metadata;
     };
   }
-  return [work = std::move(work), sets = _delete_sets]() {
-    auto metadata = work();
+  return [work = std::move(work), sets = _delete_sets](std::stop_token stop) {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+    auto metadata = work(stop);
     auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
     attach_delete_set(file, sets->at(file.file_path));
     return metadata;

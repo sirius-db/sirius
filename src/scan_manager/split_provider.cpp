@@ -34,7 +34,7 @@ split_provider::split_provider(op::scan::gpu_ingestible& ingestible, io::ioctx_r
 
 bool split_provider::has_more_splits() const { return !_ingestible->has_processed_all_metadata(); }
 
-std::function<std::unique_ptr<op::scan::scan_info>()> split_provider::next_split_provider()
+op::scan::gpu_ingestible::metadata_scan_task_t split_provider::next_split_provider()
 {
   return _ingestible->next_split_provider(_resolve);
 }
@@ -50,14 +50,15 @@ void split_provider::run(Scheduler& scheduler, const push_callback_t& on_split)
   while (has_more_splits()) {
     auto work = next_split_provider();
     if (!work) { continue; }
-    scheduler.enqueue([on_split, work = std::move(work), token = ctrl.acquire()]() mutable {
-      try {
-        auto split = work();
-        on_split(std::move(split));
-      } catch (...) {
-        on_split(std::current_exception());
-      }
-    });
+    scheduler.enqueue(
+      [on_split, work = std::move(work), token = ctrl.acquire()](std::stop_token stop) mutable {
+        try {
+          auto split = work(stop);
+          on_split(std::move(split));
+        } catch (...) {
+          on_split(std::current_exception());
+        }
+      });
   }
 }
 

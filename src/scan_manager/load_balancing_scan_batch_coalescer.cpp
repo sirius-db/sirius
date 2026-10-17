@@ -58,37 +58,36 @@ load_balancing_scan_batch_coalescer::register_pipeline(
 
 namespace {
 preparation_coordinator::job bind_preparation_unit(
-  std::function<std::unique_ptr<op::scan::scan_info>()> work,
+  op::scan::gpu_ingestible::metadata_scan_task_t work,
   std::shared_ptr<preparation_unit> unit,
   required_input_set required)
 {
-  return {
-    [work = std::move(work), unit, required] {
+  auto stop_work = [work = std::move(work), unit, required](std::stop_token stop) {
+    try {
+      auto input       = work(stop);
+      auto const& deps = input->dependencies().front();
+      unit->complete_input(footer_input{deps.footer, deps.parquet_approval, deps.datasource});
+      unit->complete_input(delete_set_input{deps.delete_set});
+      if (required.test(static_cast<size_t>(required_input::segments)))
+        unit->complete_input(segments_input{deps.profiles});
+      if (required.test(static_cast<size_t>(required_input::checkpoint_iteration)))
+        unit->complete_input(checkpoint_input{deps.checkpoint_iteration.value()});
+      return input;
+    } catch (...) {
+      auto error = std::current_exception();
+      auto cause = transparent::classify_failure(error);
+      std::optional<op::scan::verdict_reason> reason;
       try {
-        auto input       = work();
-        auto const& deps = input->dependencies().front();
-        unit->complete_input(footer_input{deps.footer, deps.parquet_approval, deps.datasource});
-        unit->complete_input(delete_set_input{deps.delete_set});
-        if (required.test(static_cast<size_t>(required_input::segments)))
-          unit->complete_input(segments_input{deps.profiles});
-        if (required.test(static_cast<size_t>(required_input::checkpoint_iteration)))
-          unit->complete_input(checkpoint_input{deps.checkpoint_iteration.value()});
-        return input;
+        std::rethrow_exception(error);
+      } catch (op::scan::unsupported_physical_input const& e) {
+        reason = e.reason;
       } catch (...) {
-        auto error = std::current_exception();
-        auto cause = transparent::classify_failure(error);
-        std::optional<op::scan::verdict_reason> reason;
-        try {
-          std::rethrow_exception(error);
-        } catch (op::scan::unsupported_physical_input const& e) {
-          reason = e.reason;
-        } catch (...) {
-        }
-        unit->fail(preparation_failure{cause.cause, reason, cause.detail, error});
-        throw;
       }
-    },
-    unit};
+      unit->fail(preparation_failure{cause.cause, reason, cause.detail, error});
+      throw;
+    }
+  };
+  return {[stop_work] { return stop_work({}); }, unit, std::move(stop_work)};
 }
 }  // namespace
 
@@ -119,7 +118,11 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
     if (deferred) key = iceberg->next_preparation_unit();
     auto work = provider.next_split_provider();
     if (!work) return {};
-    if (!key) return preparation_coordinator::job{std::move(work), {}};
+    if (!key) {
+      auto stop_work = std::move(work);
+      return preparation_coordinator::job{
+        [stop_work] { return stop_work({}); }, {}, std::move(stop_work)};
+    }
 
     auto required =
       required_inputs(bind->read_views->entry(bind->contract_id).eligibility.later_checks, true);
