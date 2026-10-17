@@ -25,11 +25,14 @@
  */
 
 #include "catch.hpp"
+#include "cuda/device_health.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "utils/telemetry_utils.hpp"
+
+#include <rmm/detail/error.hpp>
 
 #include <chrono>
 #include <future>
@@ -146,4 +149,80 @@ TEST_CASE("a global state built without a query carries no handler",
   // Reporting sites are all null-guarded, so a state built outside a query (tests) is inert
   // rather than a crash.
   CHECK(gs.get_completion_handler() == nullptr);
+}
+
+TEST_CASE("completion observer sees one error and respects string view bounds",
+          "[completion_handler][per_query]")
+{
+  unsigned errors = 0;
+  auto tasks      = std::make_shared<std::atomic<uint64_t>>(0);
+  completion_handler handler(tasks, [&](std::exception_ptr error) {
+    ++errors;
+    std::rethrow_exception(error);  // Observer failure cannot prevent completion.
+  });
+  handler.record_task_started();
+  CHECK(tasks->load() == 1);
+  auto result         = handler.get_awaitable();
+  std::string message = "first error followed by unrelated bytes";
+  handler.report_error(std::string_view(message.data(), 11));
+  handler.report_error("second error");
+  CHECK(errors == 1);
+  CHECK(handler.failure().detail == "first error");
+  CHECK_THROWS_WITH(result.get(), "first error");
+}
+
+TEST_CASE("fatal device classification requires CUDA exception evidence", "[device_health]")
+{
+  CHECK(sirius::fatal_cuda_status(cudaErrorIllegalAddress));
+  CHECK(sirius::fatal_cuda_status(cudaErrorAssert));
+  CHECK_FALSE(sirius::fatal_cuda_status(cudaErrorMemoryAllocation));
+  CHECK_FALSE(sirius::fatal_cuda_status(cudaErrorInvalidValue));
+  CHECK_FALSE(sirius::fatal_device_exception({}));
+  for (auto message :
+       {"cudaErrorUnknown",
+        "CUDA failure: cudaErrorIllegalAddress",
+        "CUDA error at: input.sql:42: cudaErrorAssert device-side assert triggered"}) {
+    CHECK_FALSE(
+      sirius::fatal_device_exception(std::make_exception_ptr(std::runtime_error(message))));
+  }
+  CHECK(sirius::fatal_device_exception(std::make_exception_ptr(
+    cudf::cuda_error("no error name in this message", cudaErrorIllegalAddress))));
+  CHECK_FALSE(sirius::fatal_device_exception(
+    std::make_exception_ptr(cudf::cuda_error("cudaErrorIllegalAddress", cudaErrorInvalidValue))));
+  CHECK(sirius::fatal_device_exception(
+    std::make_exception_ptr(sirius::fatal_device_error(cudaErrorAssert))));
+  CHECK_FALSE(sirius::fatal_device_exception(std::make_exception_ptr(std::bad_alloc())));
+  CHECK_FALSE(sirius::fatal_device_exception(
+    std::make_exception_ptr(rmm::cuda_error("operator input contains cudaErrorAssert"))));
+  CHECK_FALSE(sirius::fatal_device_exception(std::make_exception_ptr(rmm::cuda_error(
+    "CUDA error at: cudaErrorAssert.cu:7: cudaErrorInvalidValue invalid argument"))));
+}
+
+TEST_CASE("RMM CUDA macro errors preserve fatal status without a last-error probe",
+          "[device_health]")
+{
+  // Feed status values to the real macros without launching a faulty GPU operation.
+  for (auto status : {cudaErrorIllegalAddress,
+                      cudaErrorAssert,
+                      cudaErrorUnknown,
+                      cudaErrorMemoryAllocation,
+                      cudaErrorInvalidValue}) {
+    INFO("status=" << static_cast<int>(status));
+    auto capture = [](auto operation) {
+      try {
+        operation();
+      } catch (...) {
+        return std::current_exception();
+      }
+      return std::exception_ptr{};
+    };
+    auto check = [&](auto operation) {
+      auto error = capture(operation);
+      REQUIRE(error);
+      CHECK(sirius::fatal_device_exception(error) == sirius::fatal_cuda_status(status));
+    };
+    check([&] { RMM_CUDA_TRY(status); });
+    check([&] { RMM_CUDA_TRY_ALLOC(status); });
+    check([&] { RMM_CUDA_TRY_ALLOC(status, 1024); });
+  }
 }
