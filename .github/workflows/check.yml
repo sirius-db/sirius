@@ -119,12 +119,11 @@ jobs:
       fail-fast: false
     name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }})
     runs-on: >-
-      ${{ matrix.build.environment == 'vcpkg'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-xl"]')
-        || matrix.build.arch == 'x64'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-lg"]')
-        || matrix.build.arch == 'arm64'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "arm-lg"]') }}
+      ${{ fromJSON(format('["self-hosted", "ubuntu-24.04", "{0}{1}"]',
+          github.event_name == 'pull_request' && 'pr-' || '',
+          matrix.build.environment == 'vcpkg' && 'cpu-xl'
+            || matrix.build.arch == 'x64' && 'cpu-lg'
+            || matrix.build.arch == 'arm64' && 'arm-lg')) }}
     timeout-minutes: ${{ case(matrix.build.environment == 'vcpkg', 240, 60) }}
     continue-on-error: ${{ matrix.build.cudf-channel == 'nightly' }}
     steps:
