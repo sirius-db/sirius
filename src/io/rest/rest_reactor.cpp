@@ -27,6 +27,8 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
@@ -370,6 +372,132 @@ std::optional<url_authority> split_authority(std::string_view url) noexcept
   std::string_view const authority = end == std::string_view::npos ? rest : rest.substr(0, end);
   if (authority.empty()) { return std::nullopt; }
   return url_authority{scheme, authority};
+}
+
+bool is_alnum_ascii(unsigned char c) noexcept
+{
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+bool is_valid_port(std::string_view port) noexcept
+{
+  if (port.empty() || port.size() > 5) { return false; }
+  unsigned value = 0;
+  for (unsigned char const c : port) {
+    if (c < '0' || c > '9') { return false; }
+    value = value * 10 + (c - '0');
+  }
+  return value >= 1 && value <= 65535;
+}
+
+/// A DNS-style host: dot-separated non-empty labels of alnum / '-' / '_'.
+bool is_valid_hostname(std::string_view host) noexcept
+{
+  if (host.empty() || host.front() == '.' || host.back() == '.') { return false; }
+  std::size_t label = 0;
+  for (unsigned char const c : host) {
+    if (c == '.') {
+      if (label == 0) { return false; }
+      label = 0;
+      continue;
+    }
+    if (!is_alnum_ascii(c) && c != '-' && c != '_') { return false; }
+    ++label;
+  }
+  return label > 0;
+}
+
+/// The inside of a bracketed IP literal must parse as an IPv6 address
+/// (inet_pton: group widths and count, one `::`, valid embedded IPv4 octets);
+/// zone identifiers are not supported.
+bool is_valid_ipv6_literal(std::string_view addr) noexcept
+{
+  // An embedded NUL would let inet_pton validate a prefix while the caller
+  // keeps the whole view; a zone id's acceptance is libc-dependent.
+  if (addr.empty() || addr.size() >= INET6_ADDRSTRLEN ||
+      addr.find('\0') != std::string_view::npos || addr.find('%') != std::string_view::npos) {
+    return false;
+  }
+  char buffer[INET6_ADDRSTRLEN];
+  std::memcpy(buffer, addr.data(), addr.size());
+  buffer[addr.size()] = '\0';
+  in6_addr parsed{};
+  return ::inet_pton(AF_INET6, buffer, &parsed) == 1;
+}
+
+/// Logging-only validated host/port; invalid input yields "-", with userinfo omitted.
+std::string_view log_authority(std::string_view url) noexcept
+{
+  auto const parsed = split_authority(url);
+  if (!parsed) { return "-"; }
+  std::string_view authority = parsed->authority;
+  if (auto const at = authority.rfind('@'); at != std::string_view::npos) {
+    authority.remove_prefix(at + 1);
+  }
+  std::string_view port;
+  bool has_port = false;
+  if (!authority.empty() && authority.front() == '[') {
+    auto const close = authority.find(']');
+    if (close == std::string_view::npos || !is_valid_ipv6_literal(authority.substr(1, close - 1))) {
+      return "-";
+    }
+    std::string_view const rest = authority.substr(close + 1);
+    if (!rest.empty()) {
+      if (rest.front() != ':') { return "-"; }
+      has_port = true;
+      port     = rest.substr(1);
+    }
+  } else {
+    auto const colon = authority.find(':');
+    if (!is_valid_hostname(authority.substr(0, colon))) { return "-"; }
+    if (colon != std::string_view::npos) {
+      has_port = true;
+      port     = authority.substr(colon + 1);
+    }
+  }
+  if (has_port && !is_valid_port(port)) { return "-"; }
+  return authority;
+}
+
+/// Terminal transfer observation; structural Range is request-generated, not a response header.
+void log_transfer(std::string_view method,
+                  std::string_view url,
+                  std::string_view range,
+                  std::string_view outcome,
+                  long status,
+                  std::size_t bytes,
+                  std::size_t attempt,
+                  bool delegated,
+                  std::chrono::steady_clock::time_point started)
+{
+  auto const elapsed_ms =
+    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started)
+      .count();
+  SIRIUS_LOG_INFO(
+    "rest_reactor: transfer method={} authority={} range={} status={} curl={} bytes={} attempt={} "
+    "delegated={} elapsed_ms={}",
+    method,
+    log_authority(url),
+    range.empty() ? std::string_view{"-"} : range,
+    status,
+    outcome,
+    bytes,
+    attempt,
+    delegated,
+    elapsed_ms);
+}
+
+char const* curl_outcome(CURLcode rc) noexcept
+{
+  return rc == CURLE_OK ? "ok" : curl_easy_strerror(rc);
+}
+
+/// The value part of a "Range: bytes=…" header line built by range_header /
+/// suffix_range_header, for the transfer record.
+std::string_view range_value(std::string_view header_line) noexcept
+{
+  auto const sep = header_line.find(": ");
+  return sep == std::string_view::npos ? header_line : header_line.substr(sep + 2);
 }
 
 /// Whether one 307 may be delegated under @c config::cluster_redirect, and if
@@ -898,10 +1026,12 @@ bool rest_reactor::delegate_redirect(object_ref const& obj,
     // The Location may carry the gateway's own authorization in its path or
     // query; only the (allow-listed) authority is fit for a log line.
     auto const target = split_authority(location);
-    SIRIUS_LOG_DEBUG("rest_reactor: delegating {}/{} to storage node {}",
-                     obj.bucket,
-                     obj.key,
-                     target ? target->authority : std::string_view{});
+    auto const authority = target ? target->authority : std::string_view{};
+    SIRIUS_LOG_DEBUG("rest_reactor: delegating {}/{} to storage node {}", obj.bucket, obj.key, authority);
+    if (_config.request_log) {
+      SIRIUS_LOG_INFO("rest_reactor: redirect decision=follow reason=- authority={}",
+                      log_authority(location));
+    }
     return true;
   }
   _redirects_refused.fetch_add(1, std::memory_order_relaxed);
@@ -910,6 +1040,10 @@ bool rest_reactor::delegate_redirect(object_ref const& obj,
                   obj.bucket,
                   obj.key,
                   decision.reason);
+  if (_config.request_log) {
+    SIRIUS_LOG_INFO("rest_reactor: redirect decision=refuse reason=\"{}\" authority=-",
+                    decision.reason);
+  }
   reason_out = std::move(decision.reason);
   return false;
 }
@@ -949,9 +1083,14 @@ head_object_result rest_reactor::head_object(std::string_view bucket, std::strin
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &head_header_cb));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &hc));
 
-    CURLcode const rc = curl_easy_perform(h.get());
-    long status       = 0;
+    auto const started = std::chrono::steady_clock::now();
+    CURLcode const rc  = curl_easy_perform(h.get());
+    long status        = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
+    if (_config.request_log) {
+      log_transfer(
+        "HEAD", url, {}, curl_outcome(rc), status, 0, attempt, !delegated_url.empty(), started);
+    }
 
     if (rc == CURLE_OK && status == 200) {
       curl_off_t cl = -1;
@@ -1035,9 +1174,14 @@ std::string rest_reactor::list_page(std::string_view bucket,
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &capture_header));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &hc));
 
-    CURLcode const rc = curl_easy_perform(h.get());
-    long status       = 0;
+    auto const started = std::chrono::steady_clock::now();
+    CURLcode const rc  = curl_easy_perform(h.get());
+    long status        = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
+    if (_config.request_log) {
+      log_transfer(
+        "LIST", authd.url, {}, curl_outcome(rc), status, body.size(), attempt, false, started);
+    }
 
     if (rc == CURLE_OK && status == 200) { return body; }
 
@@ -1108,9 +1252,21 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &suffix_header_cb));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &sink));
 
-    CURLcode const rc = curl_easy_perform(h.get());
-    long status       = 0;
+    auto const started = std::chrono::steady_clock::now();
+    CURLcode const rc  = curl_easy_perform(h.get());
+    long status        = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
+    if (_config.request_log) {
+      log_transfer("GET",
+                   url,
+                   range_value(range),
+                   curl_outcome(rc),
+                   status,
+                   sink.total_received,
+                   attempt,
+                   !delegated_url.empty(),
+                   started);
+    }
 
     // Final outcomes first, as in head_object.  suffix_write_cb aborts any
     // non-206 body, so a CURLE_WRITE_ERROR is our own doing; any other curl
@@ -1255,6 +1411,9 @@ struct io_slot {
   curl_slist_ptr headers;
   buf_sink sink;
   header_capture hc;
+  std::chrono::steady_clock::time_point started{};
+  // Owner lifetime spans preparation and completion; only an in-flight attempt is drain-eligible.
+  bool attempt_active{false};
 
   void reset() noexcept
   {
@@ -1263,7 +1422,9 @@ struct io_slot {
     headers.reset();
     sink = buf_sink{};
     hc.reset();
-    token = {};
+    token          = {};
+    started        = {};
+    attempt_active = false;
   }
 };
 
@@ -1728,6 +1889,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_WRITEDATA, &slot.sink));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, &capture_header));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HEADERDATA, &slot.hc));
+      slot.started = std::chrono::steady_clock::now();
     };
 
     int running  = 0;
@@ -1765,6 +1927,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
             throw std::runtime_error(std::string("rest_reactor: curl_multi_add_handle failed: ") +
                                      curl_multi_strerror(status));
           }
+          slot.attempt_active = true;
           ++inflight;
         } catch (rmm::out_of_memory const& e) {
           // Pinned staging is shared with the prefetching cache.  When it is
@@ -1790,6 +1953,20 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       auto& request     = *slot.req;
       auto& op          = *request.op;
       auto const io_rng = op.io_rng;
+      if (_config.request_log) {
+        // attempt = this operation's earlier attempts, transport and
+        // authorization retries combined; a delegated hop keeps the index and
+        // is told apart by `delegated`.
+        log_transfer("GET",
+                     slot.url,
+                     range_value(range_header(io_rng.offset, io_rng.size)),
+                     curl_outcome(curl_status),
+                     http_status,
+                     slot.sink.total_received,
+                     request.attempt + request.auth_attempt,
+                     !request.delegated_url.empty(),
+                     slot.started);
+      }
       bool const full_object =
         io_rng.offset == 0 && op.obj != nullptr && io_rng.size == op.obj->size();
       bool const range_status = http_status == 206 || (http_status == 200 && full_object);
@@ -1938,6 +2115,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         auto const index = static_cast<std::size_t>(reinterpret_cast<std::intptr_t>(private_data));
         curl_multi_remove_handle(multi.get(), handle);
         --inflight;
+        slots[index].attempt_active = false;  // observed: finish() owns the record from here
         if (!finish(index, message->data.result, http_status)) slots[index].reset();
       }
     };
@@ -1973,6 +2151,26 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
 
       for (auto& slot : slots) {
         if (slot.req == nullptr) continue;
+        // In-flight attempts only; the status is curl's snapshot (0 when no
+        // HTTP code was reported), not a claim that a response completed.
+        if (_config.request_log && slot.attempt_active) {
+          slot.attempt_active = false;
+          try {
+            long status = 0;
+            curl_easy_getinfo(slot.easy.get(), CURLINFO_RESPONSE_CODE, &status);
+            auto const& rng = slot.req->op->io_rng;
+            log_transfer("GET",
+                         slot.url,
+                         range_value(range_header(rng.offset, rng.size)),
+                         "aborted-local",
+                         status,
+                         slot.sink.total_received,
+                         slot.req->attempt + slot.req->auth_attempt,
+                         !slot.req->delegated_url.empty(),
+                         slot.started);
+          } catch (...) {  // the record is best effort inside the noexcept drain
+          }
+        }
         curl_multi_remove_handle(multi.get(), slot.easy.get());
         slot.req->op->finish_error(terminal_error);
         slot.reset();

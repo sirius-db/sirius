@@ -167,6 +167,10 @@ struct config {
   /// connection warm-up stays best effort; neither delegates or contributes to
   /// the redirect counters.
   cluster_redirect_config cluster_redirect;
+
+  /// Opt-in measurement records for REST attempts and redirect decisions.
+  /// Only sanitized authority, structural range and fixed outcome/attempt/timing fields are allowed.
+  bool request_log{false};
 };
 
 }  // namespace sirius::io::rest

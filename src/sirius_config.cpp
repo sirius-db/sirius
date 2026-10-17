@@ -224,6 +224,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.optional("list_max_matches", opt.list_max_matches);
   r.optional("list_max_scanned", opt.list_max_scanned);
+  r.optional("request_log", opt.request_log);
   if (auto n = r.optional_node("cluster_redirect")) {
     yaml::reader cr(*n, "rest.cluster_redirect");
     cr.optional("enabled", opt.cluster_redirect.enabled);
