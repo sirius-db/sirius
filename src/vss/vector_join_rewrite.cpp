@@ -871,7 +871,9 @@ class rewriter {
       choice =
         find_named_lists(ctx, setting.ToString(), catalog, schema, table, column, cosine, n_rows);
     }
-    if (!choice) { choice = find_exact_lists(ctx, catalog, schema, table, column, cosine, n_rows); }
+    if (!choice) {
+      choice = find_exact_lists(ctx, catalog, schema, table, column, cosine, n_rows, 2);
+    }
     if (!choice) {
       auto const* build_env = std::getenv("SIRIUS_VSS_BUILD_IN_QUERY");
       if (build_env != nullptr && std::strcmp(build_env, "0") == 0) { return false; }
@@ -887,7 +889,15 @@ class rewriter {
         n_clusters =
           choose_cluster_count(access_path_cost{current_device_scale()}, shape, probes).n_clusters;
       }
-      choice = build_lists_in_query(ctx, req, catalog, schema, table, column, rows, n_clusters);
+      choice = build_lists_in_query(ctx,
+                                    req,
+                                    catalog,
+                                    schema,
+                                    table,
+                                    column,
+                                    rows,
+                                    n_clusters,
+                                    auto_lists_name(table, column, cosine));
     }
     if (!choice) { return false; }
     req.search_mode = vector_join_search_mode::approx;
@@ -958,16 +968,19 @@ class rewriter {
       if (force == "cost" && build_env != nullptr && std::strcmp(build_env, "0") == 0) {
         return false;
       }
-      // Lists that would answer exactly and beat brute force: UINT8 if every value is a byte,
-      // FLOAT16 otherwise (FP32 lists hold the same bytes as the pin and never pay).
+      // The exact join's compact layout, when it beats brute force: one list of codes, UINT8 if
+      // every value is a byte, FLOAT16 otherwise (FP32 lists hold the same bytes as the pin and
+      // never pay). It is searched whole, its bound lowered as it goes, so there is no clustering
+      // to fit: partitions would only cut the corpus into smaller GEMMs.
       if (req.dim % 16 != 0) { return false; }
       shape.list_bytes_per_value = cosine ? 2 : 1;
       shape.lists_on_device      = true;
-      shape.n_clusters           = static_cast<double>(reference_cluster_count(shape.corpus_rows));
-      double const built         = cost.build(shape) + cost.lists(shape);
+      shape.n_clusters           = 1;
+      double const built         = cost.codes(shape) + cost.lists(shape);
       if (force == "cost" && built >= brute) {
         SIRIUS_LOG_INFO(
-          "[vector_join_rewrite] '{}': brute force ({:.3f} s est.) over building lists ({:.3f} s)",
+          "[vector_join_rewrite] '{}': brute force ({:.3f} s est.) over writing its codes "
+          "({:.3f} s)",
           table.name,
           brute,
           built);
@@ -980,7 +993,8 @@ class rewriter {
                                     table.name,
                                     column,
                                     rows,
-                                    reference_cluster_count(static_cast<double>(rows)));
+                                    1,
+                                    codes_lists_name(table.name, column, cosine));
       if (!choice) { return false; }
     }
     describe(*choice);
@@ -1016,8 +1030,17 @@ class rewriter {
     return "__sirius_auto_" + table + "_" + column + (cosine ? "_cosine" : "");
   }
 
-  /// Fits a clustering of the pinned column into @p n_clusters and writes its lists, under a name
-  /// later queries find them by: UINT8 when every value is a byte (the build checks), else
+  /// The name the exact join's single list of codes, built inside a query, is kept under: apart
+  /// from the approximate join's partitions, which it must not stand in for.
+  static std::string codes_lists_name(const std::string& table,
+                                      const std::string& column,
+                                      bool cosine)
+  {
+    return "__sirius_auto_codes_" + table + "_" + column + (cosine ? "_cosine" : "");
+  }
+
+  /// Fits a clustering of the pinned column into @p n_clusters and writes its lists, under @p name,
+  /// which later queries find them by: UINT8 when every value is a byte (the build checks), else
   /// FLOAT16, which keeps the FP32 rows to re-score against. Nullopt, and the join runs by brute
   /// force, when the build is refused (no room for the lists or their FP32 copy).
   std::optional<exact_lists_choice> build_lists_in_query(duckdb::SiriusContext& ctx,
@@ -1027,10 +1050,10 @@ class rewriter {
                                                          const std::string& table,
                                                          const std::string& column,
                                                          std::uint64_t rows,
-                                                         std::int64_t n_clusters)
+                                                         std::int64_t n_clusters,
+                                                         std::string const& name)
   {
-    bool const cosine      = req.metric == "cosine";
-    std::string const name = auto_lists_name(table, column, cosine);
+    bool const cosine = req.metric == "cosine";
     try {
       kmeans_fit_request fit;
       fit.name    = name;
@@ -1061,8 +1084,8 @@ class rewriter {
       name,
       n_clusters,
       table);
-    return find_exact_lists(
-      ctx, catalog, schema, table, column, cosine, static_cast<std::int64_t>(rows));
+    return find_named_lists(
+      ctx, name, catalog, schema, table, column, cosine, static_cast<std::int64_t>(rows));
   }
 
   /// DuckDB's join order can push an inner join or a filter from above a LATERAL into its subquery

@@ -68,6 +68,7 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -381,8 +382,10 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
                                                    const std::string& table,
                                                    const std::string& column,
                                                    bool cosine,
-                                                   std::int64_t n_rows)
+                                                   std::int64_t n_rows,
+                                                   std::int64_t min_clusters)
 {
+  std::optional<exact_lists_choice> found;
   for (auto const& name : ctx.get_cuvs_index_cache().names_on_column(
          catalog, schema, table, column, index_kind::kmeans_centroids)) {
     auto const* lists = find_cluster_lists(ctx, name);
@@ -395,13 +398,18 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
     auto const entry = find_clustering_entry(ctx, name);
     if (entry == nullptr) { continue; }
     auto const clusters = static_cast<std::int64_t>(lists->offsets.size()) - 1;
-    return exact_lists_choice{name,
-                              entry->meta.n_lists,
-                              lists->encoding,
-                              lists->tier == cucascade::memory::Tier::GPU,
-                              clusters > 0 && lists->offsets.back() <= clusters * 20 * kSeedSample};
+    if (clusters < min_clusters) { continue; }
+    // A single list lowers its bound as it goes, which seeds it at any size.
+    exact_lists_choice choice{
+      name,
+      entry->meta.n_lists,
+      lists->encoding,
+      lists->tier == cucascade::memory::Tier::GPU,
+      clusters == 1 || (clusters > 0 && lists->offsets.back() <= clusters * 20 * kSeedSample)};
+    if (clusters == 1) { return choice; }
+    if (!found) { found = std::move(choice); }
   }
-  return std::nullopt;
+  return found;
 }
 
 std::optional<exact_lists_choice> find_named_lists(duckdb::SiriusContext& ctx,
@@ -425,11 +433,12 @@ std::optional<exact_lists_choice> find_named_lists(duckdb::SiriusContext& ctx,
     return std::nullopt;
   }
   auto const clusters = static_cast<std::int64_t>(lists->offsets.size()) - 1;
-  return exact_lists_choice{clustering,
-                            entry->meta.n_lists,
-                            lists->encoding,
-                            lists->tier == cucascade::memory::Tier::GPU,
-                            clusters > 0 && lists->offsets.back() <= clusters * 20 * kSeedSample};
+  return exact_lists_choice{
+    clustering,
+    entry->meta.n_lists,
+    lists->encoding,
+    lists->tier == cucascade::memory::Tier::GPU,
+    clusters == 1 || (clusters > 0 && lists->offsets.back() <= clusters * 20 * kSeedSample)};
 }
 
 void erase_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clustering)
@@ -537,7 +546,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       col_max->data(), 0, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.value()));
   }
   {
-    centroid_labeler labeler{res, centroids->view(), dim, entry->meta.metric, mr};
+    // One list (the exact join's compact layout) labels nothing: every row is in it, and the
+    // labels are already zero.
+    std::optional<centroid_labeler> labeler;
+    if (n_clusters > 1) { labeler.emplace(res, centroids->view(), dim, entry->meta.metric, mr); }
     pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
@@ -547,8 +559,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       if (base + rows > n_rows) {
         throw std::runtime_error(fn + ": pinned column holds more rows than the pin reports");
       }
-      rmm::device_uvector<std::int32_t> chunk_labels(static_cast<std::size_t>(rows), stream, mr);
-      labeler.label(staged.view, chunk_labels.data());
+      rmm::device_uvector<std::int32_t> chunk_labels(
+        labeler ? static_cast<std::size_t>(rows) : 0, stream, mr);
+      if (labeler) { labeler->label(staged.view, chunk_labels.data()); }
       if (check_uint8) {
         count_non_uint8(list_column_as_dataset_view(staged.view, dim).data_handle(),
                         rows * dim,
@@ -565,11 +578,13 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       }
       // Before the copy below, which waits for the labels: into pageable memory it is synchronous.
       walk.prefetch_after(i);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(labels.data() + base,
-                                    chunk_labels.data(),
-                                    static_cast<std::size_t>(rows) * sizeof(std::int32_t),
-                                    cudaMemcpyDeviceToHost,
-                                    stream.value()));
+      if (labeler) {
+        CUDF_CUDA_TRY(cudaMemcpyAsync(labels.data() + base,
+                                      chunk_labels.data(),
+                                      static_cast<std::size_t>(rows) * sizeof(std::int32_t),
+                                      cudaMemcpyDeviceToHost,
+                                      stream.value()));
+      }
       stream.synchronize();
       base += rows;
     }
@@ -668,17 +683,21 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     }
   };
   std::atomic<bool> bad_label{false};
-  parallel([&](std::int64_t t, std::int64_t lo, std::int64_t hi) {
-    auto& h = hist[static_cast<std::size_t>(t)];
-    for (auto r = lo; r < hi; ++r) {
-      auto const l = labels[static_cast<std::size_t>(r)];
-      if (l < 0 || l >= n_clusters) {
-        bad_label = true;
-        return;
+  if (n_clusters == 1) {
+    hist.front().front() = n_rows;
+  } else {
+    parallel([&](std::int64_t t, std::int64_t lo, std::int64_t hi) {
+      auto& h = hist[static_cast<std::size_t>(t)];
+      for (auto r = lo; r < hi; ++r) {
+        auto const l = labels[static_cast<std::size_t>(r)];
+        if (l < 0 || l >= n_clusters) {
+          bad_label = true;
+          return;
+        }
+        ++h[static_cast<std::size_t>(l)];
       }
-      ++h[static_cast<std::size_t>(l)];
-    }
-  });
+    });
+  }
   if (bad_label) {
     throw std::runtime_error(fn + ": assignment produced a label outside the clustering");
   }
@@ -704,13 +723,17 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     lists.offsets.back() = run;
   }
   std::vector<std::int64_t> dest(static_cast<std::size_t>(n_rows));
-  parallel([&](std::int64_t t, std::int64_t lo, std::int64_t hi) {
-    auto& s = start[static_cast<std::size_t>(t)];
-    for (auto r = lo; r < hi; ++r) {
-      dest[static_cast<std::size_t>(r)] =
-        s[static_cast<std::size_t>(labels[static_cast<std::size_t>(r)])]++;
-    }
-  });
+  if (n_clusters == 1) {
+    std::iota(dest.begin(), dest.end(), std::int64_t{0});
+  } else {
+    parallel([&](std::int64_t t, std::int64_t lo, std::int64_t hi) {
+      auto& s = start[static_cast<std::size_t>(t)];
+      for (auto r = lo; r < hi; ++r) {
+        dest[static_cast<std::size_t>(r)] =
+          s[static_cast<std::size_t>(labels[static_cast<std::size_t>(r)])]++;
+      }
+    });
+  }
   phase("counting sort");
 
   // Storage. The vectors go to the device when the pin is there and they fit, else to pinned host

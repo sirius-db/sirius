@@ -235,14 +235,18 @@ struct exact_lists_choice {
 /// rows and answer exactly when every cluster is probed: FLOAT32 or UINT8 rows, or FLOAT16 rows
 /// searched with the bounded GEMM and re-scored from the kept FP32 rows. Lists of unit rows
 /// answer cosine joins and only those; INT8 codes are left out (their search refuses too many
-/// shapes to pick them unasked). Nullopt when there is none.
+/// shapes to pick them unasked). A single list (the exact join's compact layout, searched whole
+/// with its bound lowered as it goes) is preferred when there is one, and skipped below
+/// @p min_clusters, which an approximate join sets to 2: one list prunes nothing. Nullopt when
+/// there is none.
 [[nodiscard]] std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
                                                                  const std::string& catalog,
                                                                  const std::string& schema,
                                                                  const std::string& table,
                                                                  const std::string& column,
                                                                  bool cosine,
-                                                                 std::int64_t n_rows);
+                                                                 std::int64_t n_rows,
+                                                                 std::int64_t min_clusters = 1);
 
 /// The lists of the clustering @p clustering when it is one of (@p catalog, @p schema, @p table,
 /// @p column)'s and they hold all @p n_rows rows, unit rows exactly when @p cosine: what a join

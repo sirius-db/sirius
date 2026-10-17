@@ -978,6 +978,87 @@ TEST_CASE_METHOD(KMeansFixture,
 }
 
 TEST_CASE_METHOD(KMeansFixture,
+                 "one list searched whole, its bound lowered as it goes, equals the exact join",
+                 "[integration][gpu_execution][array][vss][kmeans][lists][running_bound]")
+{
+  // The exact join's compact layout: one list, no partitioning, whose bounded sweep lowers each
+  // probe row's bound as it goes -- from the seed's sample with the lists on the device, from an
+  // unbounded first piece in host memory. INT8 and FLOAT16 codes are re-scored in FP32, so the
+  // k distances are the exact join's whatever the bound let through.
+  auto const tier    = GENERATE(std::string("gpu"), std::string("host"));
+  auto const storage = GENERATE(std::string("uint8"), std::string("int8"), std::string("float16"));
+  auto const k       = GENERATE(1, 5, 64);
+  auto const prefix  = "kmr_" + tier + "_" + storage + "_k" + std::to_string(k);
+  create_lists_tables(*this, prefix, "gpu", storage == "uint8");
+
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 1);");
+  auto built = query_ok(*con,
+                        "SELECT n_clusters, tier, encoding FROM sirius_kmeans_build_lists('" +
+                          prefix + "_corpus','vec','" + prefix + "_c', storage => '" + storage +
+                          "', tier => '" + (tier == "gpu" ? "auto" : "host") + "');");
+  CHECK(built->GetValue(0, 0).GetValue<std::int64_t>() == 1);
+  CHECK(built->GetValue(1, 0).ToString() == tier);
+  CHECK(built->GetValue(2, 0).ToString() == storage);
+
+  auto const join = [&](const std::string& extra) {
+    return "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
+           "_corpus','vec', metric => 'l2', k => " + std::to_string(k) + ", " + extra + ");";
+  };
+  auto const exact = distance_multiset(*con, join("search_mode => 'exact-gemm'"));
+  auto const one   = distance_multiset(
+    *con, join("search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 1"));
+  REQUIRE(exact.size() == static_cast<std::size_t>(50 * k));
+  REQUIRE(one.size() == exact.size());
+  for (std::size_t i = 0; i < exact.size(); ++i) {
+    CHECK(one[i].first == exact[i].first);
+    CHECK(std::llabs(one[i].second - exact[i].second) <= 2);
+  }
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "one list answers exactly below its first piece and over many probe batches",
+                 "[integration][gpu_execution][array][vss][kmeans][lists][running_bound]")
+{
+  // 900 corpus rows, fewer than either first piece (10,000 rows on the device, 1,024 in host
+  // memory), so the first piece is the whole list; and 140k probe rows, more than one probe chunk,
+  // so each batch starts its bound afresh.
+  auto const tier = GENERATE(std::string("gpu"), std::string("host"));
+  auto const gen  = [](const std::string& seed) {
+    return "list_transform(range(64), lambda d: ((hash(i * 1000 + d + " + seed +
+           ") % 1000)::FLOAT / 1000.0))::FLOAT[64]";
+  };
+  auto const prefix = "kmr_small_" + tier;
+  run_ok("CREATE TABLE " + prefix + "_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
+         " AS vec FROM range(900) t(i);");
+  run_ok("CREATE TABLE " + prefix + "_probe AS SELECT i::INTEGER AS id, " + gen("7777777") +
+         " AS vec FROM range(140000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_probe', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 1);");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" + prefix +
+         "_c', storage => 'int8', tier => '" + (tier == "gpu" ? "auto" : "host") + "');");
+  auto const join = [&](const std::string& extra) {
+    return "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
+           "_corpus','vec', metric => 'l2', k => 10, " + extra + ");";
+  };
+  auto const exact = distance_multiset(*con, join("search_mode => 'exact-gemm'"));
+  auto const one   = distance_multiset(
+    *con, join("search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 1"));
+  REQUIRE(exact.size() == 140000u * 10u);
+  REQUIRE(one.size() == exact.size());
+  std::size_t mismatched = 0;
+  for (std::size_t i = 0; i < exact.size(); ++i) {
+    mismatched += one[i].first != exact[i].first || std::llabs(one[i].second - exact[i].second) > 2;
+  }
+  CHECK(mismatched == 0);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
                  "cluster lists do not outlive a re-fit of their clustering",
                  "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
 {

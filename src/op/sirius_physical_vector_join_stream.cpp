@@ -2298,9 +2298,37 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto const& scale      = vss::current_device_scale();
     bool const small_batch = static_cast<double>(n_left) * static_cast<double>(dim) <=
                              static_cast<double>(std::int64_t{1} << 21) * scale.fp32 / scale.int8;
-    bool const seedable = int8_search && !radius_join &&
-                          _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 &&
-                          seed_enabled && (!codes_int8 || (small_clusters && small_batch));
+    // A single list -- the exact join's compact layout, no partitioning -- lowers each row's bound
+    // as its bounded sweep goes: every slice is cut into pieces whose merge points double from the
+    // first piece, and what passes is merged before the next, so after the first pieces the filter
+    // runs under a bound near the final one (Deep10M INT8, 10k probes: 0.33 s, against 0.37 s
+    // through its best partitioning). On the device the seed's sample bounds the first piece; host
+    // lists, with no device rows to sample, start from an unbounded first piece instead. Either way
+    // the first piece is cut to the batch, so that what it lets through -- every row of an
+    // unbounded piece, about k per sample's worth under the seed -- stays near 2^24 pairs: a 1M-row
+    // probe batch over host lists would otherwise buffer a billion. Later pieces pass about k a
+    // row. SIRIUS_VSS_RUNNING_BOUND=<rows> sets the first piece for any lists, 0 turns it off.
+    std::int64_t const running_bound_rows = [&] {
+      if (auto const* v = std::getenv("SIRIUS_VSS_RUNNING_BOUND"); v != nullptr) {
+        return std::max<std::int64_t>(0, std::atoll(v));
+      }
+      if (_lists == nullptr || _lists->offsets.size() != 2) { return std::int64_t{0}; }
+      constexpr std::int64_t kFirstPiecePairs = std::int64_t{1} << 24;
+      auto const rows                         = std::max<std::int64_t>(n_left, 1);
+      auto const at_least                     = std::max<std::int64_t>(4 * k_join, 64);
+      return _lists->tier == cucascade::memory::Tier::GPU
+               ? std::clamp<std::int64_t>(
+                   kFirstPiecePairs / rows * vss::kSeedSample / std::max<std::int64_t>(k_join, 1),
+                   at_least,
+                   10'000)
+               : std::clamp<std::int64_t>(kFirstPiecePairs / rows, at_least, vss::kSeedSample);
+    }();
+    // Lists in host memory have no device rows to sample; with the bound lowered as it goes, their
+    // sweep starts from an unbounded first piece instead, which serves as the sample.
+    bool const seedable =
+      int8_search && !radius_join &&
+      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && k_join <= 64 &&
+      seed_enabled && (!codes_int8 || (small_clusters && small_batch) || running_bound_rows > 0);
     bool const bounded = int8_search && (n_probes > 1 || radius_join || codes_int8 || seedable) &&
                          vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
     // FLOAT16 lists that kept their FP32 rows get the same two sweeps with the half-precision
@@ -2364,9 +2392,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // by both sides' coding or rounding error so it bounds the FP32 distance. What passes is merged
     // (re-scored in FP32 where the rows are inexact), so sweep 1 starts from the nearest cluster's
     // exact k-th and need not search that cluster again. SIRIUS_VSS_SEED=0 keeps the GEMM.
-    bool const seed_f16 = f16_bounded && !radius_join &&
-                          _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 &&
-                          seed_enabled && small_clusters && small_batch;
+    bool const seed_f16 =
+      f16_bounded && !radius_join &&
+      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && k_join <= 64 &&
+      seed_enabled && ((small_clusters && small_batch) || running_bound_rows > 0);
     bool const seed = (bounded && seedable) || seed_f16;
     // Unseeded, sweep 0 ranks each row's nearest cluster on the half-precision tensor cores from
     // the stored rows; only the bound it leaves is used, and that is re-scored in FP32 first.
@@ -2716,6 +2745,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     };
 
     std::int64_t scanned_pairs = 0;
+    std::int64_t running_piece = running_bound_rows;
+    std::int64_t since_merge   = 0;
     staged_vector_chunk prefetched;
 
     // Lists that did not fit the device are read by the same searches: a sweep that reads the
@@ -2944,7 +2975,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       prefetched = chunks.empty() ? staged_vector_chunk{} : stage_next(chunks[0]);
       if (sweep == 0 && seed) {
         bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
-        seed_bound();
+        if (lists_on_host) {
+          vss::fill_bound(bound->data(), n_left, std::numeric_limits<float>::infinity(), stream);
+          if (rescore) {
+            code_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
+            refresh_code_limit(bound->data());
+          }
+        } else {
+          seed_bound();
+        }
         candidates.emplace(
           std::max<std::int64_t>(std::int64_t{1} << 22, 4 * n_left * k_join), stream, mr);
       }
@@ -3140,6 +3179,32 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 rescore ? nullptr : id_map,
                                 rows_c,
                                 m};
+            if (running_bound_rows > 0) {
+              for (std::int64_t o = 0; o < slice_rows;) {
+                auto const n = std::min(slice_rows - o, running_piece - since_merge);
+                auto piece   = sl;
+                piece.x    = static_cast<std::byte const*>(sl.x) + o * dim * (f16_bounded ? 2 : 1);
+                piece.x_sq = static_cast<std::byte const*>(sl.x_sq) + o * 4;
+                piece.n    = n;
+                piece.id_base += o;
+                if (piece.id_map != nullptr) { piece.id_map += o; }
+                launch_bounded(piece);
+                ++bounded_launches;
+                bounded_padded += ((n + 127) / 128) * ((m + 127) / 128);
+                group.push_back(piece);
+                o += n;
+                since_merge += n;
+                if (since_merge >= running_piece) {
+                  check_group();
+                  flush();
+                  since_merge   = 0;
+                  running_piece = std::min<std::int64_t>(2 * running_piece, std::int64_t{1} << 22);
+                } else if (group.size() >= kBoundedGroup) {
+                  check_group();
+                }
+              }
+              continue;
+            }
             if (group_launch && (m <= group_m_max || m * slice_rows <= group_work_max)) {
               deferred.push_back(sl);
             } else {

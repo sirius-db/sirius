@@ -722,10 +722,11 @@ TEST_CASE_METHOD(SqlRewriteFixture,
                  "a join over a pinned corpus with no lists can build them inside the query",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
-  // With no lists, SIRIUS_VSS_ACCESS_PATH=lists has the rewrite fit a clustering and write lists
-  // of the pinned column first (as SIRIUS_VSS_BUILD_IN_QUERY=1 does when the cost model says the
-  // build pays), then search them in full: DuckDB's answer, and the lists stay for later queries.
-  // Byte values and a width of 16, so the lists it builds are UINT8 and searched exactly.
+  // With no lists, SIRIUS_VSS_ACCESS_PATH=lists has the rewrite write the exact join's compact
+  // layout first -- one list of codes, no clustering to fit -- (as SIRIUS_VSS_BUILD_IN_QUERY=1 does
+  // when the cost model says it pays), then search it whole: DuckDB's answer, and the list stays
+  // for later queries under its own name, apart from the approximate join's partitions.
+  // Byte values and a width of 16, so the codes are UINT8 and searched exactly.
   SqlRewriteTables tables(*this);
   auto const bytes = [](const std::string& seed) {
     return "list_transform(range(16), lambda d: (hash(i * 100 + d + " + seed +
@@ -747,10 +748,28 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "SELECT p.id, n.id, n.d FROM sr_bytes_probe p, LATERAL (SELECT c.id, "
     "array_distance(p.vec, c.vec) AS d FROM sr_bytes c ORDER BY d LIMIT 5) n;");
   CHECK(sirius::test::get_vector_join_prune_stats(*con).pairs_exhaustive > before.pairs_exhaustive);
-  auto centroids =
-    con->Query("SELECT count(*) FROM sirius_kmeans_centroids('__sirius_auto_sr_bytes_vec');");
+  auto centroids = con->Query(
+    "SELECT count(DISTINCT cluster_id) FROM "
+    "sirius_kmeans_centroids('__sirius_auto_codes_sr_bytes_vec');");
   REQUIRE_FALSE(centroids->HasError());
-  CHECK(centroids->GetValue(0, 0).GetValue<std::int64_t>() > 0);
+  CHECK(centroids->GetValue(0, 0).GetValue<std::int64_t>() == 1);
+
+  // An approximate join does not take the single list for its partitions: it builds its own.
+  run_ok("SET vector_join_probes = 2;");
+  struct reset_on_exit {
+    duckdb::Connection& c;
+    ~reset_on_exit() { c.Query("RESET vector_join_probes;"); }
+  } reset_probes{*con};
+  auto const approx = con->Query(
+    "SELECT count(*) FROM (SELECT p.id, n.id FROM sr_bytes_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_bytes c ORDER BY d LIMIT 5) n);");
+  REQUIRE_FALSE(approx->HasError());
+  CHECK(approx->GetValue(0, 0).GetValue<std::int64_t>() == 30 * 5);
+  auto partitions = con->Query(
+    "SELECT count(DISTINCT cluster_id) FROM "
+    "sirius_kmeans_centroids('__sirius_auto_sr_bytes_vec');");
+  REQUIRE_FALSE(partitions->HasError());
+  CHECK(partitions->GetValue(0, 0).GetValue<std::int64_t>() > 1);
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,

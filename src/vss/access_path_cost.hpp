@@ -58,7 +58,9 @@ struct access_path_cost {
       assign_gemm{25e12 * d.f16},
       fit_per_value{3.7e-9 / d.fp32},
       write_per_value_u8{0.55e-9 / d.hbm},
-      write_per_value_f16{1.55e-9 / d.hbm}
+      write_per_value_f16{1.55e-9 / d.hbm},
+      codes_per_value_device{0.3e-9 / d.hbm},
+      codes_per_value_host{0.62e-9 / d.pcie}
   {
   }
 
@@ -72,6 +74,8 @@ struct access_path_cost {
   double fit_per_value;
   double write_per_value_u8;
   double write_per_value_f16;
+  double codes_per_value_device;
+  double codes_per_value_host;
 
   [[nodiscard]] double brute(access_path_shape const& s) const
   {
@@ -123,6 +127,15 @@ struct access_path_cost {
     double const assign = 2.0 * values * s.n_clusters / assign_gemm;
     return fit + assign +
            (s.list_bytes_per_value == 1 ? write_per_value_u8 : write_per_value_f16) * values;
+  }
+
+  /// Writing the exact join's compact layout: one list of codes, with no clustering to fit and no
+  /// rows to assign, so one pass over the rows. Fitted 2026-10-17 on 1M-100M-row single-list
+  /// builds: ~0.3 ns a value into device lists, ~0.6 ns into host lists, plus the one-centroid fit.
+  [[nodiscard]] double codes(access_path_shape const& s) const
+  {
+    double const values = s.corpus_rows * s.dim;
+    return 0.06 + values * (s.lists_on_device ? codes_per_value_device : codes_per_value_host);
   }
 };
 
