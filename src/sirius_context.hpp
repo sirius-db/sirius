@@ -140,6 +140,18 @@ class SiriusConnectionState : public ClientContextState {
   /// \brief Record the error that failed this query's CPU replay, from the replaying thread.
   void record_cpu_replay_error(ErrorData error, string query);
 
+  /// \brief Report @p error, not the interrupt it raised, when the CPU replay failed.
+  ///
+  /// The transparent CPU replay runs a nested DuckDB Executor on this connection. When it fails,
+  /// Executor::PushError raises the connection's shared interrupt flag before the error reaches the
+  /// outer query's executor. A client thread polling the outer query can see the flag in between
+  /// and fail the query with InterruptException (#2145). DuckDB drains the outer query's tasks
+  /// before QueryEnd, so the replay's error is recorded by then and replaces that interrupt.
+  void QueryEnd(ClientContext& context, optional_ptr<ErrorData> error) final;
+
+  /// \brief Record the error that failed this query's CPU replay, from the replaying thread.
+  void record_cpu_replay_error(ErrorData error, string query);
+
   [[nodiscard]] bool has_pinned_update_guard() const noexcept
   {
     return pinned_update_guard_.has_value();
