@@ -765,6 +765,13 @@ duckdb::LogicalType sirius_physical_plan_generator::planned_aggregate_type(
   return type == duckdb::LogicalType::HUGEINT ? duckdb::LogicalType::BIGINT : type;
 }
 
+bool sirius_physical_plan_generator::plans_declared_type(sirius::logical_type const& planned,
+                                                         duckdb::LogicalType const& declared)
+{
+  return planned == sirius::from_duckdb(declared) ||
+         planned == sirius::from_duckdb(planned_aggregate_type(declared));
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 {
