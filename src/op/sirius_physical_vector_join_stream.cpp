@@ -38,6 +38,7 @@
 #include "vss/join_result_shaping.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/size_limits.hpp"
+#include "vss/spilled_read.hpp"
 #include "vss/staging_shortfall.hpp"
 #include "vss/vector_clustering.hpp"
 
@@ -334,24 +335,9 @@ cudf::column_view read_spilled_column(cucascade::read_only_data_batch const& ro,
     int fd;
     ~close_on_exit() { ::close(fd); }
   } closer{fd};
-  std::vector<std::byte> host;
   auto copy = [&](cucascade::memory::column_metadata const& m, std::size_t at) {
-    host.resize(m.data_size);
-    for (std::size_t done = 0; done < m.data_size;) {
-      auto const n = ::pread(
-        fd, host.data() + done, m.data_size - done, static_cast<off_t>(m.data_offset + done));
-      if (n <= 0) {
-        throw std::runtime_error("[sirius_physical_vector_join_stream] reading spilled batch " +
-                                 path + " failed");
-      }
-      done += static_cast<std::size_t>(n);
-    }
-    CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<std::byte*>(buffer.data()) + at,
-                                  host.data(),
-                                  m.data_size,
-                                  cudaMemcpyHostToDevice,
-                                  stream.value()));
-    stream.synchronize();  // `host` is reused for the next buffer
+    vss::copy_file_to_device(
+      fd, m.data_offset, m.data_size, static_cast<std::byte*>(buffer.data()) + at, stream, path);
   };
   auto const& values = *layout.values;
   if (layout.offsets != nullptr) { copy(*layout.offsets, 0); }

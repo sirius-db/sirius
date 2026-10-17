@@ -24,6 +24,7 @@
 #include "sirius_context.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/sirius_physical_vector_join_stream.hpp"
+#include "vss/spilled_read.hpp"
 #include "vss/staging_shortfall.hpp"
 #include "vss/vector_search_internal.hpp"
 
@@ -132,24 +133,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> read_spilled_columns(
     int fd;
     ~close_on_exit() { ::close(fd); }
   } closer{fd};
-  std::vector<std::byte> host;
   auto upload = [&](std::size_t offset, std::size_t size) {
     rmm::device_buffer buffer(size, stream, mr);
-    if (size == 0) { return buffer; }
-    host.resize(size);
-    for (std::size_t done = 0; done < size;) {
-      auto const n =
-        ::pread(fd, host.data() + done, size - done, static_cast<off_t>(offset + done));
-      if (n <= 0) {
-        throw std::runtime_error(
-          "[sirius_physical_vector_join_materialize] reading spilled batch " + table.file_path +
-          " failed");
-      }
-      done += static_cast<std::size_t>(n);
+    if (size > 0) {
+      vss::copy_file_to_device(fd, offset, size, buffer.data(), stream, table.file_path);
     }
-    CUDF_CUDA_TRY(
-      cudaMemcpyAsync(buffer.data(), host.data(), size, cudaMemcpyHostToDevice, stream.value()));
-    stream.synchronize();
     return buffer;
   };
   std::vector<std::unique_ptr<cudf::column>> out;
