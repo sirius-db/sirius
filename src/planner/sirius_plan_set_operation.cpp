@@ -78,10 +78,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     // Arms are forwarded unconverted, so each must plan the declared type or, below an
     // aggregate, its `planned_aggregate_type`.
     for (duckdb::idx_t i = 0; i < declared_types.size(); i++) {
-      if (planned_types[i] == declared_types[i]) { continue; }
-      if (planned_types[i] == sirius::from_duckdb(planned_aggregate_type(op.types[i]))) {
-        continue;
-      }
+      if (plans_declared_type(planned_types[i], op.types[i])) { continue; }
       throw duckdb::NotImplementedException(
         "UNION: arm " + std::to_string(arm_index) + " plans " + planned_types[i].to_string() +
         " for column " + std::to_string(i) + " but the union declares " +
