@@ -38,6 +38,10 @@
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
 #endif
 
+namespace cucascade {
+class data_batch;
+}  // namespace cucascade
+
 namespace sirius::exec {
 class batch_stream;
 class exchange_inbox;
@@ -218,7 +222,8 @@ class SIRIUS_FFI_EXPORT OutputDrain {
   /// 3 compressed), `rows` and `stream_bytes`, and returns the job's header. Otherwise returns
   /// null, with `ended` true at the end of the stream and false when nothing arrived in time. A
   /// batch spilled to host is sent from host, not brought back to the GPU.
-  /// @throws the fragment's error once its run() failed, or on a batch it cannot send.
+  /// @throws the fragment's error once its run() failed, or on a batch it cannot send; a
+  ///         `std::bad_alloc: out_of_memory` keeps the batch, which the next call exports first.
   std::unique_ptr<std::vector<std::uint8_t>> export_ring_next(std::uint32_t timeout_ms,
                                                               bool& ended,
                                                               std::uint64_t& token,
@@ -230,6 +235,9 @@ class SIRIUS_FFI_EXPORT OutputDrain {
   std::shared_ptr<sirius::exec::batch_stream> stream_;
   std::shared_ptr<sirius::exec::exchange_inbox> exchange_;
   std::shared_ptr<sirius::exec::ring_exchange> ring_;
+  /// A batch export_ring_next() pulled but could not export for want of GPU memory; the next
+  /// call exports it first. One consumer per drain, so no lock.
+  mutable std::shared_ptr<cucascade::data_batch> ring_retry_;
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
