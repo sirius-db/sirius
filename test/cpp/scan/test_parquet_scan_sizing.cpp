@@ -430,8 +430,11 @@ TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
   {
     auto reader    = make_reader(std::numeric_limits<std::size_t>::max());
     auto coalescer = reader->create_batch_coalescer();
+    CHECK(coalescer->retained_bytes() == 0);
     CHECK(coalescer->push(make_file()).empty());
+    CHECK(coalescer->retained_bytes() == 240);
     auto splits = coalescer->flush();
+    CHECK(coalescer->retained_bytes() == 0);
     REQUIRE(splits.size() == 1);
     CHECK(splits.front()->estimated_working_set_bytes() == 240);
     CHECK(splits.front()->preparation_bytes() == 120);
@@ -462,8 +465,11 @@ TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
       return coalescer->push(std::move(file));
     };
     CHECK(push_one().empty());
+    CHECK(coalescer->retained_bytes() == 60);
     CHECK(push_one().empty());
+    CHECK(coalescer->retained_bytes() == 240);
     auto full = push_one();
+    CHECK(coalescer->retained_bytes() == 60);
     REQUIRE(full.size() == 1);
     CHECK(full.front()->estimated_working_set_bytes() == 240);
     CHECK(full.front()->preparation_bytes() == 120);

@@ -37,14 +37,15 @@ TEST_CASE("Preparation options default to unlimited jobs and preserve post-resol
   CHECK(defaults.max_control_work > 0);
   CHECK(defaults.drain_quantum > 0);
   CHECK(defaults.interrupt_check_interval == std::chrono::milliseconds(10));
-  CHECK_FALSE(defaults.underfilled_batch_residence);
-  config.preparation.interrupt_check_interval    = std::chrono::milliseconds(3);
-  config.preparation.max_inflight_metadata_jobs  = 2;
-  config.preparation.max_inflight_dv_jobs        = 7;
-  config.preparation.lookahead_batches           = 7;
-  config.preparation.max_control_work            = 4;
-  config.preparation.drain_quantum               = 5;
-  config.preparation.underfilled_batch_residence = std::chrono::milliseconds(11);
+  CHECK_FALSE(defaults.partial_batch);
+  config.preparation.interrupt_check_interval   = std::chrono::milliseconds(3);
+  config.preparation.max_inflight_metadata_jobs = 2;
+  config.preparation.max_inflight_dv_jobs       = 7;
+  config.preparation.lookahead_batches          = 7;
+  config.preparation.max_control_work           = 4;
+  config.preparation.drain_quantum              = 5;
+  config.preparation.partial_batch              = sirius::scan_manager::partial_batch_options{
+    50, std::chrono::milliseconds(11), std::chrono::milliseconds(11)};
   // Resolve defaults against deterministic capacities before applying internal overrides.
   // apply_defaults() replaces all settings and discovers the machine's actual topology.
   cucascade::memory::system_topology_info topology{};
@@ -63,7 +64,8 @@ TEST_CASE("Preparation options default to unlimited jobs and preserve post-resol
   CHECK(snapshot.max_control_work == 4);
   CHECK(snapshot.drain_quantum == 5);
   CHECK(snapshot.interrupt_check_interval == std::chrono::milliseconds(3));
-  CHECK(snapshot.underfilled_batch_residence == std::chrono::milliseconds(11));
+  REQUIRE(snapshot.partial_batch);
+  CHECK(snapshot.partial_batch->max_residence == std::chrono::milliseconds(11));
   config.preparation.max_inflight_metadata_jobs = 1;
   CHECK(snapshot.max_inflight_metadata_jobs == 2);  // independent attempt value
 }
@@ -74,14 +76,6 @@ TEST_CASE("Invalid preparation options fail before constructing a scan manager",
   SECTION("zero lookahead") { config.preparation.lookahead_batches = 0; }
   SECTION("zero control") { config.preparation.max_control_work = 0; }
   SECTION("zero quantum") { config.preparation.drain_quantum = 0; }
-  SECTION("zero duration")
-  {
-    config.preparation.underfilled_batch_residence = std::chrono::milliseconds(0);
-  }
-  SECTION("negative duration")
-  {
-    config.preparation.underfilled_batch_residence = std::chrono::milliseconds(-1);
-  }
   SECTION("zero interrupt interval")
   {
     config.preparation.interrupt_check_interval = std::chrono::milliseconds(0);
@@ -109,5 +103,34 @@ TEST_CASE("Manager construction validates preparation before creating worker or 
   config.preparation.lookahead_batches = 0;
   sirius::exec::query_lifecycle_registry lifecycle;
   CHECK_THROWS_WITH(sirius::scan_manager::sirius_scan_manager(lifecycle, config, memory, nullptr),
-                    "preparation limits and configured residence must be positive");
+                    "preparation limits must be positive");
+}
+
+TEST_CASE("Size-based partial batching is opt-in with validated bounds",
+          "[scan_preparation][preparation_config][partial_batch]")
+{
+  using namespace sirius::scan_manager;
+  using namespace std::chrono_literals;
+  preparation_config config;
+  REQUIRE_FALSE(config.resolve(4).partial_batch);
+  config.partial_batch = partial_batch_options{};
+  auto defaults        = config.resolve(4);
+  REQUIRE(defaults.partial_batch);
+  CHECK(defaults.partial_batch->min_fill_percent == 50);
+  CHECK(defaults.partial_batch->min_residence == 50ms);
+  CHECK(defaults.partial_batch->max_residence == 1s);
+  config.partial_batch = partial_batch_options{25, 20ms, 500ms};
+  auto changed         = config.resolve(4);
+  CHECK(changed.partial_batch->min_fill_percent == 25);
+  CHECK(changed.partial_batch->min_residence == 20ms);
+  CHECK(changed.partial_batch->max_residence == 500ms);
+  CHECK(defaults.partial_batch->min_fill_percent == 50);
+  config.partial_batch = partial_batch_options{};
+  SECTION("zero fill") { config.partial_batch->min_fill_percent = 0; }
+  SECTION("fill above target") { config.partial_batch->min_fill_percent = 101; }
+  SECTION("negative minimum time") { config.partial_batch->min_residence = -1ms; }
+  SECTION("zero maximum time") { config.partial_batch->max_residence = 0ms; }
+  SECTION("zero minimum time") { config.partial_batch->min_residence = 0ms; }
+  SECTION("maximum precedes minimum") { config.partial_batch->max_residence = 49ms; }
+  CHECK_THROWS_AS(config.resolve(4), std::invalid_argument);
 }

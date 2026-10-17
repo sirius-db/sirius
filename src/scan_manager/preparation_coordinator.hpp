@@ -53,7 +53,7 @@ class preparation_coordinator {
   enum class lifecycle { constructed, armed, running, quiescent };
   struct statistics {
     size_t runs = 0, jobs_peak = 0, results_peak = 0, output_peak = 0, wakes = 0,
-           partial_emissions = 0;
+           partial_emissions = 0, size_emissions = 0, normal_emissions = 0;
     std::thread::id owner, runner, publisher;
     std::chrono::microseconds max_residence{0}, max_deadline_lateness{0};
 

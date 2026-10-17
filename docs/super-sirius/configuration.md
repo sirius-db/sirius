@@ -494,8 +494,13 @@ These settings are loaded at initialization. Job limits default to unlimited; `0
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
-| `underfilled_batch_residence` | disabled | Time from the first retained input until an underfilled batch becomes due. New arrivals do not reset it. `0` disables timed publication; negative values are rejected. Output backpressure and scheduling can delay publication. |
+| `partial_batch` | disabled | Optional partial-publication policy. Omit the block to disable it; an empty block enables the defaults below. |
+| `partial_batch.min_fill_percent` | 50 | Minimum retained size as a percentage of the normal batch target for early publication. Integer from 1 to 100. Uses the coalescer's batch-size accounting. |
+| `partial_batch.min_residence` | 50 ms | Minimum age before early publication. Also requires the size threshold and no batch from this scan waiting for downstream consumption. Must be positive. |
+| `partial_batch.max_residence` | 1 s | Maximum wait for more metadata, even below the size threshold or with a batch waiting downstream. Must be at least `min_residence`. Output backpressure and scheduling can delay publication. |
 | `interrupt_check_interval` | 10 ms | Maximum wait between interruption checks while preparation is idle. Must be positive. Draining an active read can take longer. |
+
+Both residence times start when the first input enters an empty accumulator; later arrivals do not reset them. Normal full-batch, compatibility-boundary, final-flush, and window-progress publication still apply. Downstream consumption means taking the batch from the connector, not completing GPU execution. To express a fixed time limit, set both residence values to the same duration.
 
 A file with a DV currently reads its footer and prepares its DV in the same job, so it uses a metadata job slot and a DV permit. The metadata limit does not size the DV reservation: admission reserves retained results plus K temporary workspaces, where K is bounded by the DV unit count, `scan_manager.num_threads`, and the DV limit when nonzero. Insufficient HOST memory may reduce K further. Neither setting changes the worker thread count. The previous `max_inflight_jobs` key is no longer accepted; use `max_inflight_metadata_jobs`.
 
@@ -509,7 +514,10 @@ sirius:
         lookahead_batches: 2
         max_control_work: 4
         drain_quantum: 4
-        underfilled_batch_residence: 20ms
+        partial_batch:
+          min_fill_percent: 50
+          min_residence: 50ms
+          max_residence: 1s
         interrupt_check_interval: 5ms
 ```
 

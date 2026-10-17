@@ -40,7 +40,7 @@ struct preparation_coordinator::state {
       tail_flushed,
       closed
     } status           = phase::enumerating;
-    size_t outstanding = 0;
+    size_t outstanding = 0, pending_batches = 0;
     // Completed work remains charged through coalescing and publication until downstream pop.
     size_t work_bytes = 0, output_bytes = 0, window_bytes = 0;
     std::optional<size_t> active_result;
@@ -50,6 +50,7 @@ struct preparation_coordinator::state {
     std::unique_ptr<op::scan::scan_info> batch;
     size_t preparation_bytes;
     std::optional<op::scan::batch_coalescer::clock::time_point> deadline_retained;
+    bool size_triggered = false;
   };
   std::shared_ptr<preparation_gate> gate = std::make_shared<preparation_gate>();
   preparation_options options;
@@ -160,7 +161,22 @@ struct preparation_coordinator::state {
   using lock_type = std::unique_lock<std::mutex>;
   // These steps enter and return with the gate locked; callbacks run unlocked,
   // except the final visible push. On exception the lock may be released.
+  std::optional<op::scan::batch_coalescer::clock::time_point> size_deadline(size_t id) const
+  {
+    auto const& source = sources[id];
+    if (!options.partial_batch || source.pending_batches || !can_emit(id)) return {};
+    auto const& coalescer = *source.hooks.coalescer;
+    auto first            = coalescer.first_retained_time();
+    if (!first) return {};
+    auto cap     = coalescer.target_batch_bytes();
+    auto percent = options.partial_batch->min_fill_percent;
+    // Round up without overflowing when the target is near SIZE_MAX.
+    auto threshold = (cap / 100) * percent + ((cap % 100) * percent + 99) / 100;
+    if (coalescer.retained_bytes() < threshold) return {};
+    return *first + options.partial_batch->min_residence;
+  }
   bool emit_due_batch(lock_type&);
+  bool emit_sized_batch(lock_type&);
   bool publish_batch(lock_type&);
   bool advance_result(lock_type&);
   bool submit_job(lock_type&, std::shared_ptr<state> const&);
@@ -168,7 +184,8 @@ struct preparation_coordinator::state {
   bool emit_full_window(lock_type&);
   void queue_batch(size_t,
                    std::unique_ptr<op::scan::scan_info>,
-                   std::optional<op::scan::batch_coalescer::clock::time_point> = {});
+                   std::optional<op::scan::batch_coalescer::clock::time_point> = {},
+                   bool size_triggered                                         = false);
   bool inputs_settled() const;
   std::optional<op::scan::batch_coalescer::clock::time_point> nearest_deadline() const;
   void shutdown();
@@ -191,9 +208,9 @@ preparation_coordinator::preparation_coordinator(pipeline::completion_handler& c
                                                  preparation_options options)
   : state_(std::make_shared<state>(options, completion, dispatcher))
 {
+  if (options.partial_batch) options.partial_batch->validate();
   if (!options.lookahead_batches || !options.max_control_work || !options.drain_quantum ||
-      options.interrupt_check_interval.count() <= 0 ||
-      (options.underfilled_batch_residence && options.underfilled_batch_residence->count() <= 0))
+      options.interrupt_check_interval.count() <= 0)
     throw std::invalid_argument("query driver needs positive limits");
 }
 preparation_coordinator::~preparation_coordinator() { drain(); }
@@ -213,6 +230,7 @@ void preparation_coordinator::add_source(source s)
     if (auto st = weak.lock()) {
       std::lock_guard lock(st->gate->mutex);
       auto& source = st->sources[id];
+      --source.pending_batches;
       source.work_bytes -= bytes;
       source.output_bytes -= bytes;
       if (st->output) --st->output;
@@ -378,11 +396,13 @@ void preparation_coordinator::wake_for_testing()
 void preparation_coordinator::state::queue_batch(
   size_t source_id,
   std::unique_ptr<op::scan::scan_info> batch,
-  std::optional<op::scan::batch_coalescer::clock::time_point> first)
+  std::optional<op::scan::batch_coalescer::clock::time_point> first,
+  bool size_triggered)
 {
   if (!batch) return;
   auto const bytes = batch->preparation_bytes();
-  batches.push_back({source_id, std::move(batch), bytes, first});
+  batches.push_back({source_id, std::move(batch), bytes, first, size_triggered});
+  ++sources[source_id].pending_batches;
   sources[source_id].output_bytes += bytes;
   ++output;
   stats.output_peak = std::max(stats.output_peak, output);
@@ -390,17 +410,37 @@ void preparation_coordinator::state::queue_batch(
 
 bool preparation_coordinator::state::emit_due_batch(lock_type& lock)
 {
-  if (!options.underfilled_batch_residence) return false;
-  auto time = now();
+  if (!options.partial_batch) return false;
+  auto limit = options.partial_batch->max_residence;
+  auto time  = now();
   for (size_t n = 0; n < sources.size(); ++n) {
     auto id      = (next_deadline_source + n) % sources.size();
     auto& source = sources[id];
     auto first   = source.hooks.coalescer->first_retained_time();
-    if (!can_emit(id) || !first || time < *first + *options.underfilled_batch_residence) continue;
+    if (!can_emit(id) || !first || time < *first + limit) continue;
     lock.unlock();
     auto batch = source.hooks.coalescer->partial_emit();
     lock.lock();
     queue_batch(id, std::move(batch), first);
+    next_deadline_source = id + 1;
+    return true;
+  }
+  return false;
+}
+
+bool preparation_coordinator::state::emit_sized_batch(lock_type& lock)
+{
+  if (!options.partial_batch) return false;
+  auto time = now();
+  for (size_t n = 0; n < sources.size(); ++n) {
+    auto id       = (next_deadline_source + n) % sources.size();
+    auto deadline = size_deadline(id);
+    if (!deadline || time < *deadline) continue;
+    auto first = sources[id].hooks.coalescer->first_retained_time();
+    lock.unlock();
+    auto batch = sources[id].hooks.coalescer->partial_emit();
+    lock.lock();
+    queue_batch(id, std::move(batch), first, true);
     next_deadline_source = id + 1;
     return true;
   }
@@ -431,8 +471,13 @@ bool preparation_coordinator::state::publish_batch(lock_type& lock)
             std::chrono::duration_cast<std::chrono::microseconds>(now() - *batch.deadline_retained);
           ++stats.partial_emissions;
           stats.max_residence = std::max(stats.max_residence, residence);
-          stats.max_deadline_lateness =
-            std::max(stats.max_deadline_lateness, residence - *options.underfilled_batch_residence);
+          if (batch.size_triggered)
+            ++stats.size_emissions;
+          else
+            stats.max_deadline_lateness = std::max(
+              stats.max_deadline_lateness, residence - options.partial_batch->max_residence);
+        } else {
+          ++stats.normal_emissions;
         }
       }
     }
@@ -474,11 +519,14 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
                   ? source.hooks.coalescer->advance(*slot.input, slot.cursor, options.drain_quantum)
                   : op::scan::batch_coalescer::cursor_step{nullptr, true};
     lock.lock();
+    bool const emitted = static_cast<bool>(step.batch);
     queue_batch(slot.source_id, std::move(step.batch));
     if (step.finished)
       release_slot(index);
     else
       ready_results.push_back(index);
+    // Give ready metadata a bounded advance before considering an early partial batch.
+    if (!emitted) emit_sized_batch(lock);
     return true;
   }
   return false;
@@ -600,14 +648,16 @@ std::optional<op::scan::batch_coalescer::clock::time_point>
 preparation_coordinator::state::nearest_deadline() const
 {
   std::optional<op::scan::batch_coalescer::clock::time_point> deadline;
-  if (options.underfilled_batch_residence)
-    for (size_t id = 0; id < sources.size(); ++id) {
-      if (!can_emit(id)) continue;
-      if (auto first = sources[id].hooks.coalescer->first_retained_time()) {
-        auto next = *first + *options.underfilled_batch_residence;
-        if (!deadline || next < *deadline) deadline = next;
-      }
-    }
+  if (!options.partial_batch) return {};
+  auto limit = options.partial_batch->max_residence;
+  for (size_t id = 0; id < sources.size(); ++id) {
+    if (!can_emit(id)) continue;
+    auto first = sources[id].hooks.coalescer->first_retained_time();
+    if (!first) continue;
+    auto next = size_deadline(id);
+    if (!next || *first + limit < *next) next = *first + limit;
+    if (next && (!deadline || *next < *deadline)) deadline = next;
+  }
   return deadline;
 }
 
@@ -678,7 +728,7 @@ void preparation_coordinator::run_on_query_thread()
         return true;
       };
       if (available() && st->publish_batch(lock)) ++actions;
-      if (available() && st->advance_result(lock)) ++actions;
+      if (available() && (st->advance_result(lock) || st->emit_sized_batch(lock))) ++actions;
       if (available() && st->submit_job(lock, st)) ++actions;
       if (available() && st->close_finished_source(lock)) ++actions;
       if (available() && st->emit_full_window(lock)) ++actions;

@@ -313,11 +313,18 @@ static void from_yaml(const YAML::Node& node, scan_manager::preparation_config& 
   limit("lookahead_batches", opt.lookahead_batches);
   limit("max_control_work", opt.max_control_work);
   limit("drain_quantum", opt.drain_quantum);
-  auto residence = opt.underfilled_batch_residence.value_or(std::chrono::milliseconds{0});
-  r.optional(
-    "underfilled_batch_residence", residence, [](auto value) { return value.count() >= 0; });
-  opt.underfilled_batch_residence =
-    residence.count() == 0 ? std::nullopt : std::optional{residence};
+  if (auto node = r.optional_node("partial_batch")) {
+    auto& policy = opt.partial_batch.emplace();
+    yaml::reader partial(*node, "preparation.partial_batch");
+    int64_t fill = policy.min_fill_percent;
+    partial.optional(
+      "min_fill_percent", fill, [](auto value) { return value >= 1 && value <= 100; });
+    policy.min_fill_percent = static_cast<size_t>(fill);
+    partial.optional("min_residence", policy.min_residence);
+    partial.optional("max_residence", policy.max_residence);
+    policy.validate();
+    partial.reject_unknown();
+  }
   r.optional("interrupt_check_interval", opt.interrupt_check_interval, [](auto value) {
     return value.count() > 0;
   });

@@ -69,6 +69,7 @@ struct accumulator : sirius::op::scan::batch_coalescer {
   std::function<void()> on_retained;
   explicit accumulator(size_t cap = 1000) : cap(cap) {}
   size_t target_batch_bytes() const noexcept override { return cap; }
+  size_t retained_bytes() const noexcept override { return retained; }
   cursor_step advance(sirius::op::scan::scan_info& input, size_t& cursor, size_t quantum) override
   {
     auto& data   = dynamic_cast<tagged&>(input);
@@ -184,8 +185,13 @@ struct fixture {
       dispatcher(pool),
       coordinator(completion,
                   dispatcher,
-                  options.value_or(
-                    preparation_options{workers, lookahead, workers, 1, 20ms, interrupt_interval}))
+                  options.value_or(preparation_options{workers,
+                                                       lookahead,
+                                                       workers,
+                                                       1,
+                                                       interrupt_interval,
+                                                       0,
+                                                       partial_batch_options{50, 20ms, 20ms}}))
   {
   }
   std::thread owner;
@@ -583,7 +589,7 @@ TEST_CASE("Production defaults retain a small batch until more metadata or EOS",
           "[scan_preparation][coordinator]")
 {
   auto options = preparation_config{}.resolve(2);
-  REQUIRE_FALSE(options.underfilled_batch_residence);
+  REQUIRE_FALSE(options.partial_batch);
   fixture f(2, 4, k_interrupt_check_interval, options);
   auto out       = std::make_shared<sink>();
   auto a         = std::make_shared<accumulator>();
@@ -613,16 +619,19 @@ TEST_CASE("Cancellation racing with a deadline never publishes after recognition
           "[scan_preparation][coordinator]")
 {
   auto use_interrupt_signal = GENERATE(false, true);
+  auto size_triggered       = GENERATE(false, true);
+  auto options              = preparation_config{}.resolve(2);
+  options.partial_batch     = partial_batch_options{50, 20ms, size_triggered ? 1s : 20ms};
   for (int iteration = 0; iteration < 12; ++iteration) {
     std::atomic<bool> interrupted{false};
-    fixture f;
+    fixture f(2, 4, k_interrupt_check_interval, options);
     if (use_interrupt_signal) {
       f.coordinator.set_interrupt_check([&] { return interrupted.load(); });
     }
     auto out = std::make_shared<sink>();
     auto h   = f.make_hold();
 
-    f.source(std::make_shared<accumulator>(), out, finite_jobs(2, [=](int id) {
+    f.source(std::make_shared<accumulator>(2), out, finite_jobs(2, [=](int id) {
                if (id == 1) h->wait();
                return std::make_unique<tagged>(id);
              }));
@@ -1310,4 +1319,131 @@ TEST_CASE("Pruned preparation results do not consume the lookahead window",
   REQUIRE(out->await_closed());
   f.finish();
   CHECK(out->count() == 1);
+}
+
+TEST_CASE("Size-based partial emission respects fill and minimum residence",
+          "[scan_preparation][coordinator][partial_batch]")
+{
+  auto bytes               = GENERATE(49, 50, 100);
+  auto options             = preparation_config{}.resolve(2);
+  options.partial_batch    = partial_batch_options{};
+  options.drain_quantum    = GENERATE(1u, 100u);
+  options.max_control_work = 1;
+  fixture f(2, 2, k_interrupt_check_interval, options);
+  auto a        = std::make_shared<accumulator>(100);
+  auto out      = std::make_shared<sink>();
+  auto retained = f.make_hold(), blocked = f.make_hold();
+  std::atomic<int> milliseconds{100};
+  auto clock = [&] {
+    return accumulator::clock::time_point{} + std::chrono::milliseconds(milliseconds.load());
+  };
+  a->fake_clock = clock;
+  f.coordinator.clock_for_testing(clock);
+  a->on_retained = [a = a.get(), bytes, retained] {
+    if (a->retained + 1 == static_cast<size_t>(bytes)) retained->wait();
+  };
+  f.source(a, out, finite_jobs(2, [=](int id) {
+             if (id == 1) blocked->wait();
+             return std::make_unique<tagged>(id, id ? 0 : bytes);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(retained->await());
+  milliseconds = 149;
+  retained->release();
+  REQUIRE(blocked->await());
+  if (bytes == 100) {
+    REQUIRE(out->await(1));  // Normal full batches do not wait for the minimum residence.
+  } else {
+    std::this_thread::sleep_for(20ms);
+    CHECK(out->count() == 0);
+    milliseconds = 150;
+    f.coordinator.wake_for_testing();
+    if (bytes == 50) {
+      REQUIRE(out->await(1));
+    } else {
+      std::this_thread::sleep_for(20ms);
+      CHECK(out->count() == 0);
+      milliseconds = 1100;
+      f.coordinator.wake_for_testing();
+      REQUIRE(out->await(1));
+    }
+  }
+  CHECK_FALSE(out->closed.load());
+  {
+    std::lock_guard lock(out->mutex);
+    CHECK(out->pending_bytes.front() == bytes);
+  }
+  auto stats = f.coordinator.snapshot();
+  CHECK(stats.normal_emissions == (bytes == 100 ? 1 : 0));
+  CHECK(stats.size_emissions == (bytes == 50 ? 1 : 0));
+  CHECK(stats.partial_emissions == (bytes == 100 ? 0 : 1));
+}
+
+TEST_CASE("Size-based partial emission waits for consumption but timeout can use spare capacity",
+          "[scan_preparation][coordinator][partial_batch]")
+{
+  auto timeout          = GENERATE(false, true);
+  auto options          = preparation_config{}.resolve(1);
+  options.partial_batch = partial_batch_options{};
+  options.drain_quantum = 100;
+  fixture f(1, 2, k_interrupt_check_interval, options);
+  auto a    = std::make_shared<accumulator>(100);
+  auto out  = std::make_shared<sink>();
+  auto next = f.make_hold(), retained = f.make_hold(), tail = f.make_hold();
+  std::atomic<int> milliseconds{100};
+  auto clock = [&] {
+    return accumulator::clock::time_point{} + std::chrono::milliseconds(milliseconds.load());
+  };
+  a->fake_clock = clock;
+  f.coordinator.clock_for_testing(clock);
+  std::atomic<bool> second{false};
+  a->on_retained = [&] {
+    if (second && a->retained == 49) retained->wait();
+  };
+  f.source(a, out, finite_jobs(3, [=](int id) {
+             if (id == 1) next->wait();
+             if (id == 2) tail->wait();
+             return std::make_unique<tagged>(id, id == 0 ? 100 : id == 1 ? 50 : 0);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await(1));
+  second = true;
+  next->release();
+  REQUIRE(retained->await());
+  milliseconds = 150;
+  retained->release();
+  std::this_thread::sleep_for(20ms);
+  CHECK(out->count() == 1);
+  if (timeout) {
+    milliseconds = 1100;
+    f.coordinator.wake_for_testing();
+  } else {
+    out->consume();  // The existing callback must wake the owner without new metadata.
+  }
+  REQUIRE(out->await(2));
+  CHECK_FALSE(out->closed.load());
+}
+
+TEST_CASE("Partial batch deadlines wake while all preparation workers are held",
+          "[scan_preparation][coordinator][partial_batch]")
+{
+  auto bytes            = GENERATE(1, 50);
+  auto options          = preparation_config{}.resolve(1);
+  options.partial_batch = partial_batch_options{50, 10ms, 40ms};
+  fixture f(1, 2, k_interrupt_check_interval, options);
+  auto out     = std::make_shared<sink>();
+  auto blocked = f.make_hold();
+  f.source(std::make_shared<accumulator>(100), out, finite_jobs(2, [=](int id) {
+             if (id == 1) blocked->wait();
+             return std::make_unique<tagged>(id, id ? 0 : bytes);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(blocked->await());
+  REQUIRE(out->await(1));
+  auto stats = f.coordinator.snapshot();
+  CHECK(stats.partial_emissions == 1);
+  CHECK_FALSE(out->closed.load());
 }

@@ -100,19 +100,33 @@ std::string single_gpu_scan_manager_yaml(std::string const& body)
 TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
           "[scan_manager][config][preparation_config]")
 {
-  auto [body, residence_ms, interrupt_ms] = GENERATE(table<std::string, int, int>({
-    {"", 0, 10},
-    {"      preparation: {}\n", 0, 10},
-    {"      preparation:\n        max_inflight_metadata_jobs: 0\n", 0, 10},
-    {"      preparation:\n        max_inflight_dv_jobs: 0\n", 0, 10},
-    {"      preparation:\n        underfilled_batch_residence: 25ms\n", 25, 10},
-    {"      preparation:\n        interrupt_check_interval: 3\n", 0, 3},
-    {"      preparation:\n        underfilled_batch_residence: 0\n"
-     "        interrupt_check_interval: 1s\n",
-     0,
-     1000},
-    {"      preparation:\n        underfilled_batch_residence: 0ms\n", 0, 10},
-  }));
+  auto [body, fill, min_ms, max_ms, interrupt_ms] =
+    GENERATE(table<std::string, int, int, int, int>({
+      {"", 0, 0, 0, 10},
+      {"      preparation: {}\n", 0, 0, 0, 10},
+      {"      preparation:\n        max_inflight_metadata_jobs: 0\n", 0, 0, 0, 10},
+      {"      preparation:\n        max_inflight_dv_jobs: 0\n", 0, 0, 0, 10},
+      {"      preparation:\n        interrupt_check_interval: 3\n", 0, 0, 0, 3},
+      {"      preparation:\n        interrupt_check_interval: 1s\n", 0, 0, 0, 1000},
+      {"      preparation:\n        partial_batch: {}\n", 50, 50, 1000, 10},
+      {"      preparation:\n        partial_batch:\n          min_fill_percent: 25\n",
+       25,
+       50,
+       1000,
+       10},
+      {"      preparation:\n        partial_batch:\n          min_residence: 20\n"
+       "          max_residence: 500ms\n",
+       50,
+       20,
+       500,
+       10},
+      {"      preparation:\n        partial_batch:\n          min_residence: 1s\n"
+       "          max_residence: 1s\n",
+       50,
+       1000,
+       1000,
+       10},
+    }));
   INFO(body);
   scoped_yaml yaml("sirius_preparation_timing.yaml", scan_manager_yaml(body));
   cucascade::memory::system_topology_info topology{};
@@ -123,10 +137,14 @@ TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
   auto resolved           = sirius::parsed_sirius_config::from_file(yaml.path()).resolve(topology);
   auto const& config      = resolved.get_scan_manager_config();
   auto options            = config.preparation.resolve(config.thread_pool.num_threads);
-  if (residence_ms == 0)
-    CHECK_FALSE(options.underfilled_batch_residence);
-  else
-    CHECK(options.underfilled_batch_residence == std::chrono::milliseconds{residence_ms});
+  if (fill == 0) {
+    CHECK_FALSE(options.partial_batch);
+  } else {
+    REQUIRE(options.partial_batch);
+    CHECK(options.partial_batch->min_fill_percent == static_cast<size_t>(fill));
+    CHECK(options.partial_batch->min_residence == std::chrono::milliseconds{min_ms});
+    CHECK(options.partial_batch->max_residence == std::chrono::milliseconds{max_ms});
+  }
   CHECK(options.interrupt_check_interval == std::chrono::milliseconds{interrupt_ms});
   CHECK(options.max_inflight_metadata_jobs == 0);
   CHECK(options.max_inflight_dv_jobs == 0);
@@ -135,9 +153,7 @@ TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
 TEST_CASE("Preparation timing YAML rejects invalid values and unknown keys",
           "[scan_manager][config][preparation_config]")
 {
-  auto field = GENERATE("underfilled_batch_residence: -1ms",
-                        "underfilled_batch_residence: later",
-                        "interrupt_check_interval: 0",
+  auto field = GENERATE("interrupt_check_interval: 0",
                         "interrupt_check_interval: -1ms",
                         "interrupt_check_interval: later",
                         "interrupt_check_interval: []",
@@ -146,6 +162,31 @@ TEST_CASE("Preparation timing YAML rejects invalid values and unknown keys",
   INFO(field);
   scoped_yaml yaml("sirius_preparation_timing_invalid.yaml",
                    scan_manager_yaml(std::string("      preparation:\n        ") + field + "\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
+}
+
+TEST_CASE("Partial batch YAML rejects invalid policies and unknown keys",
+          "[scan_manager][config][preparation_config][partial_batch]")
+{
+  auto field = GENERATE("min_fill_percent: 0",
+                        "min_fill_percent: -1",
+                        "min_fill_percent: 101",
+                        "min_fill_percent: 1.5",
+                        "min_fill_percent: []",
+                        "min_residence: 0ms",
+                        "min_residence: -1ms",
+                        "min_residence: later",
+                        "max_residence: 0",
+                        "max_residence: 49ms",
+                        "max_residence: []",
+                        "min_residence: 2s",
+                        "min_fill: 50");
+  INFO(field);
+  scoped_yaml yaml(
+    "sirius_partial_batch_invalid.yaml",
+    scan_manager_yaml(std::string("      preparation:\n        partial_batch:\n          ") +
+                      field + "\n"));
   CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
                   sirius::configuration_input_error);
 }
@@ -186,7 +227,7 @@ TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
     CHECK(actual[i] ==
           ((selected == 5 || selected == static_cast<int>(i)) ? values[i] : defaults[i]));
   }
-  CHECK_FALSE(options.underfilled_batch_residence);
+  CHECK_FALSE(options.partial_batch);
   CHECK(options.interrupt_check_interval == std::chrono::milliseconds{10});
 }
 
