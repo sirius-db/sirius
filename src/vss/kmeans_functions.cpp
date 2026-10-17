@@ -168,9 +168,15 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
     throw duckdb::InvalidInputException(fn + ": table '" + req.table + "' is empty");
   }
 
-  auto const metric     = ann_distance_type_from_metric(req.metric);
-  auto const n_clusters = resolve_n_clusters(req.spec.n_clusters, n_rows);
-  auto train_rows       = resolve_train_rows(req.spec.train_rows, n_rows, n_clusters);
+  auto const metric = ann_distance_type_from_metric(req.metric);
+  // Rows as the centroids: every row, in table order, row i becoming cluster i, and no training.
+  // What lets centroids kept in a table -- a clustering fitted earlier, the one a corpus was
+  // labelled with -- come back in a later session exactly as they were.
+  auto const n_clusters =
+    req.spec.rows_are_centroids ? n_rows : resolve_n_clusters(req.spec.n_clusters, n_rows);
+  auto train_rows = req.spec.rows_are_centroids
+                      ? n_rows
+                      : resolve_train_rows(req.spec.train_rows, n_rows, n_clusters);
 
   // Over-reserved to cover the sample, the concatenated copy train_centroids makes of it, and
   // k-means' own scratch; shrunk to the centroids alone once the fit is done.
@@ -268,13 +274,23 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
       views.push_back(s->view());
     }
 
-    // Both counts are already resolved against the full table; passing them through stops
-    // train_centroids from re-deriving them from the sample it is handed.
-    clustering_spec spec = req.spec;
-    spec.n_clusters      = n_clusters;
-    spec.train_rows      = sampled;
-    spec.metric          = metric;
-    centroids            = train_centroids(views, req.dim, spec, stream, mr);
+    if (req.spec.rows_are_centroids) {
+      // A sample of every row is the chunk itself, so the chunks in pin order are the centroids.
+      if (sampled != n_rows) {
+        throw std::runtime_error(fn + ": took " + std::to_string(sampled) + " of " +
+                                 std::to_string(n_rows) + " rows as centroids");
+      }
+      centroids =
+        views.size() == 1 ? std::move(samples.front()) : cudf::concatenate(views, stream, mr);
+    } else {
+      // Both counts are already resolved against the full table; passing them through stops
+      // train_centroids from re-deriving them from the sample it is handed.
+      clustering_spec spec = req.spec;
+      spec.n_clusters      = n_clusters;
+      spec.train_rows      = sampled;
+      spec.metric          = metric;
+      centroids            = train_centroids(views, req.dim, spec, stream, mr);
+    }
   }
   index_metadata meta;
   meta.kind           = index_kind::kmeans_centroids;

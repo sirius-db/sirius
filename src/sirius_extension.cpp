@@ -2553,6 +2553,8 @@ static unique_ptr<FunctionData> SiriusKMeansFitBind(ClientContext& context,
       req.metric = StringUtil::Lower(kv.second.ToString());
     } else if (key == "schema_name") {
       schema_name = kv.second.ToString();
+    } else if (key == "rows_are_centroids") {
+      req.spec.rows_are_centroids = kv.second.GetValue<bool>();
     }
   }
   if (req.name.empty()) {
@@ -3651,13 +3653,14 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                            {LogicalType::VARCHAR, LogicalType::VARCHAR},
                            SiriusKMeansFitFunction,
                            SiriusKMeansFitBind);
-  kmeans_fit.named_parameters["name"]        = LogicalType::VARCHAR;
-  kmeans_fit.named_parameters["n_clusters"]  = LogicalType::BIGINT;
-  kmeans_fit.named_parameters["train_rows"]  = LogicalType::BIGINT;
-  kmeans_fit.named_parameters["n_iters"]     = LogicalType::INTEGER;
-  kmeans_fit.named_parameters["seed"]        = LogicalType::BIGINT;
-  kmeans_fit.named_parameters["metric"]      = LogicalType::VARCHAR;
-  kmeans_fit.named_parameters["schema_name"] = LogicalType::VARCHAR;
+  kmeans_fit.named_parameters["name"]               = LogicalType::VARCHAR;
+  kmeans_fit.named_parameters["n_clusters"]         = LogicalType::BIGINT;
+  kmeans_fit.named_parameters["train_rows"]         = LogicalType::BIGINT;
+  kmeans_fit.named_parameters["n_iters"]            = LogicalType::INTEGER;
+  kmeans_fit.named_parameters["seed"]               = LogicalType::BIGINT;
+  kmeans_fit.named_parameters["metric"]             = LogicalType::VARCHAR;
+  kmeans_fit.named_parameters["schema_name"]        = LogicalType::VARCHAR;
+  kmeans_fit.named_parameters["rows_are_centroids"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo kmeans_fit_info(kmeans_fit);
   catalog.CreateTableFunction(transaction, kmeans_fit_info);
 

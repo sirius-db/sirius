@@ -58,7 +58,9 @@
 
 #include <raft/core/device_resources.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <nvtx3/nvtx3.hpp>
@@ -69,6 +71,8 @@
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -274,6 +278,105 @@ class host_pinned_chunk_source : public vector_chunk_source {
   std::size_t _column_index{0};
 };
 
+/// A column of a batch the engine took to disk, read straight from the batch's file into one
+/// device buffer: a flat fixed-width column (cluster labels), or a LIST of one (the vector
+/// column) as its offsets and values. The batch stays on disk. Restoring it instead moves it back
+/// into the host pool, where with a corpus larger than that pool every probe task's pass cycles
+/// the whole corpus disk -> host -> disk, and the restore fails once the pool is committed.
+/// Nullopt for any other shape, or nulls, which the full restore handles.
+struct spilled_column_layout {
+  cucascade::memory::column_metadata const* offsets{nullptr};  // null for a flat column
+  cucascade::memory::column_metadata const* values{nullptr};
+  std::size_t values_at{0};  // where the values start in the buffer
+  std::size_t bytes{0};
+};
+
+std::optional<spilled_column_layout> spilled_layout(cucascade::read_only_data_batch const& ro,
+                                                    std::size_t column)
+{
+  auto const* disk = dynamic_cast<cucascade::disk_data_representation const*>(ro.get_data());
+  if (disk == nullptr) { return std::nullopt; }
+  auto const& meta = disk->get_disk_table().columns.at(column);
+  auto const flat  = [](cucascade::memory::column_metadata const& m) {
+    auto const type = cudf::data_type{static_cast<cudf::type_id>(m.type_id)};
+    return m.children.empty() && cudf::is_fixed_width(type) && !cudf::is_fixed_point(type) &&
+           (!m.has_null_mask || m.null_count == 0) && (m.has_data || m.num_rows == 0);
+  };
+  if (meta.has_null_mask && meta.null_count != 0) { return std::nullopt; }
+  if (flat(meta)) { return spilled_column_layout{nullptr, &meta, 0, meta.data_size}; }
+  if (static_cast<cudf::type_id>(meta.type_id) != cudf::type_id::LIST ||
+      meta.children.size() != 2 || !flat(meta.children[0]) || !flat(meta.children[1]) ||
+      static_cast<cudf::type_id>(meta.children[0].type_id) != cudf::type_id::INT32) {
+    return std::nullopt;
+  }
+  auto const values_at = rmm::align_up(meta.children[0].data_size, std::size_t{256});
+  return spilled_column_layout{
+    &meta.children[0], &meta.children[1], values_at, values_at + meta.children[1].data_size};
+}
+
+/// Reads @p layout's buffers from the file of the spilled batch @p ro (held read-locked, which
+/// keeps the file in place) into @p buffer and returns the column's view over it.
+cudf::column_view read_spilled_column(cucascade::read_only_data_batch const& ro,
+                                      std::size_t column,
+                                      spilled_column_layout const& layout,
+                                      rmm::device_buffer& buffer,
+                                      rmm::cuda_stream_view stream)
+{
+  auto const& path = dynamic_cast<cucascade::disk_data_representation const&>(*ro.get_data())
+                       .get_disk_table()
+                       .file_path;
+  int const fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    throw std::runtime_error("[sirius_physical_vector_join_stream] cannot open spilled batch " +
+                             path);
+  }
+  struct close_on_exit {
+    int fd;
+    ~close_on_exit() { ::close(fd); }
+  } closer{fd};
+  std::vector<std::byte> host;
+  auto copy = [&](cucascade::memory::column_metadata const& m, std::size_t at) {
+    host.resize(m.data_size);
+    for (std::size_t done = 0; done < m.data_size;) {
+      auto const n = ::pread(
+        fd, host.data() + done, m.data_size - done, static_cast<off_t>(m.data_offset + done));
+      if (n <= 0) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] reading spilled batch " +
+                                 path + " failed");
+      }
+      done += static_cast<std::size_t>(n);
+    }
+    CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<std::byte*>(buffer.data()) + at,
+                                  host.data(),
+                                  m.data_size,
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    stream.synchronize();  // `host` is reused for the next buffer
+  };
+  auto const& values = *layout.values;
+  if (layout.offsets != nullptr) { copy(*layout.offsets, 0); }
+  copy(values, layout.values_at);
+  cudf::column_view const values_view{
+    cudf::data_type{static_cast<cudf::type_id>(values.type_id)},
+    values.num_rows,
+    static_cast<std::byte const*>(buffer.data()) + layout.values_at,
+    nullptr,
+    0};
+  if (layout.offsets == nullptr) { return values_view; }
+  auto const& meta = dynamic_cast<cucascade::disk_data_representation const&>(*ro.get_data())
+                       .get_disk_table()
+                       .columns.at(column);
+  cudf::column_view const offsets_view{
+    cudf::data_type{cudf::type_id::INT32}, layout.offsets->num_rows, buffer.data(), nullptr, 0};
+  return cudf::column_view{cudf::data_type{cudf::type_id::LIST},
+                           meta.num_rows,
+                           nullptr,
+                           nullptr,
+                           0,
+                           0,
+                           {offsets_view, values_view}};
+}
+
 /// Build phase: the corpus is whatever the child scan deposited in the build port, walked in
 /// the shared snapshot's order. A batch still device-resident is borrowed in place under a
 /// read lock; one the downgrade executor has spilled is copied back device-side for the fold
@@ -380,8 +483,29 @@ class materialized_chunk_source : public vector_chunk_source {
     // wire. As on the HOST-tier pin path, a chunk staged for the corpus fold reserves its own
     // copy (spilling first if it must), while the task's probe chunk draws on the task's budget.
     // The slice references the batch's host allocation, so the borrow is held across the copy.
-    // A batch the engine took all the way to disk first comes back to host through the engine.
+    // A batch the engine took all the way to disk is read from its file, the column alone, and
+    // stays there; a shape that read does not take comes back to host through the engine.
     if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
+      if (auto const layout = spilled_layout(ro, _column_index)) {
+        std::shared_ptr<cucascade::memory::reservation> reservation;
+        if (own_reservation) {
+          reservation = reserve_or_spill(space, layout->bytes);
+          if (!reservation) {
+            vss::throw_staging_shortfall(
+              space,
+              layout->bytes,
+              "[sirius_physical_vector_join_stream] batch " + std::to_string(i));
+          }
+        }
+        auto buffer = std::make_unique<rmm::device_buffer>(
+          layout->bytes,
+          stream,
+          reservation ? reservation->get_memory_resource() : space.get_default_allocator());
+        auto const view = read_spilled_column(ro, _column_index, *layout, *buffer, stream);
+        staged_vector_chunk out{view, nullptr, std::move(reservation)};
+        out.buffer = std::move(buffer);
+        return out;
+      }
       ro = host_resident(batch, std::move(ro));
     }
     std::array<std::size_t, 1> const cols{_column_index};
@@ -1400,11 +1524,14 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
     // so the cluster column's position is arithmetic rather than a name lookup -- the same
     // arrangement that puts the vector column at 0. A `dim` of 1 gives the source a four-byte
     // row width, which is what one INT32 label per row occupies.
+    // With the context, like the corpus source: a label batch the engine took to disk comes
+    // back through the host space.
     build_labels =
       make_materialized_chunk_source(*_build_side,
                                      /*column_index=*/1 + _request.right.output_columns.size(),
                                      /*dim=*/1,
-                                     batch_telemetry());
+                                     batch_telemetry(),
+                                     _sirius_ctx);
   } else {
     pin = _scan_manager->find_pinned_entry_for_duckdb_table(
       _request.right.catalog, _request.right.schema, _request.right.table);

@@ -58,6 +58,9 @@ struct clustering_spec {
   /// qualify, and both are true-distance rather than squared, which is what lets
   /// @ref assignment_spec::radius_factor be read as a plain distance ratio.
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2SqrtExpanded};
+  /// Take the table's rows themselves as the centroids, row i as cluster i, with no training:
+  /// centroids kept in a table come back exactly (n_clusters and train_rows are then ignored).
+  bool rows_are_centroids{false};
 };
 
 /**

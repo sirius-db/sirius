@@ -146,6 +146,35 @@ TEST_CASE_METHOD(KMeansFixture,
 }
 
 TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_kmeans_fit takes a table's rows as the centroids, row i as cluster i",
+                 "[integration][gpu_execution][array][vss][kmeans]")
+{
+  // Centroids kept in a table come back exactly: on each pin tier, across more than one pinned
+  // chunk, a fit with rows_are_centroids returns the rows in table order and trains nothing.
+  auto const tier = GENERATE(std::string("gpu"), std::string("host"));
+  run_ok(
+    "CREATE TABLE kmr_rows AS SELECT i::INTEGER AS id, [i::FLOAT, (i * 7 % 13)::FLOAT, "
+    "(i % 5)::FLOAT]::FLOAT[3] AS vec FROM range(150000) t(i) ORDER BY i;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'kmr_rows', tier => '" + tier +
+         "', format => 'duckdb');");
+  auto fit =
+    query_ok(*con,
+             "SELECT n_clusters, train_rows, n_rows FROM sirius_kmeans_fit('kmr_rows','vec', "
+             "name => 'kmr_rows_c', rows_are_centroids => true);");
+  CHECK(fit->GetValue(0, 0).GetValue<std::int64_t>() == 150000);
+  CHECK(fit->GetValue(1, 0).GetValue<std::int64_t>() == 150000);
+  auto const mismatched = query_ok(
+    *con,
+    "SELECT count(*) FROM sirius_kmeans_centroids('kmr_rows_c') c JOIN (SELECT id, "
+    "unnest(vec) AS v, generate_subscripts(vec, 1) - 1 AS d FROM kmr_rows) r ON c.cluster_id = "
+    "r.id AND c.dim_index = r.d WHERE c.value <> r.v;");
+  CHECK(mismatched->GetValue(0, 0).GetValue<std::int64_t>() == 0);
+  auto const values = query_ok(*con, "SELECT count(*) FROM sirius_kmeans_centroids('kmr_rows_c');");
+  CHECK(values->GetValue(0, 0).GetValue<std::int64_t>() == 150000 * 3);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
                  "sirius_kmeans_fit defaults n_clusters to sqrt(n_rows)",
                  "[integration][gpu_execution][array][vss][kmeans]")
 {
