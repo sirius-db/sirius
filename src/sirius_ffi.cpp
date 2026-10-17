@@ -51,6 +51,7 @@
 #include "sirius_context.hpp"  // duckdb::SiriusContext
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -171,6 +172,31 @@ void in_transaction(std::mutex& serial, duckdb::Connection& conn, Body&& body)
     throw;
   }
   conn.Commit();
+}
+
+// Exports `batch` as a ring job and sets the out-parameters; null for a batch without rows. An
+// out_of_memory hands the batch to `keep` before it propagates: the caller may wait and ask again.
+template <typename Keep>
+std::unique_ptr<std::vector<std::uint8_t>> export_to_ring(
+  sirius::exec::ring_exchange& ring,
+  std::shared_ptr<cucascade::data_batch> batch,
+  Keep&& keep,
+  std::uint64_t& token,
+  std::uint64_t& rows,
+  std::uint64_t& stream_bytes)
+{
+  std::optional<sirius::exec::ring_exchange::send_job> job;
+  try {
+    job = ring.export_batch(batch);
+  } catch (rmm::out_of_memory const&) {
+    keep(std::move(batch));
+    throw;
+  }
+  if (!job) { return nullptr; }
+  token        = job->token;
+  rows         = job->rows;
+  stream_bytes = job->stream_bytes;
+  return std::make_unique<std::vector<std::uint8_t>>(std::move(job->header));
 }
 
 }  // namespace
@@ -487,7 +513,6 @@ std::unique_ptr<std::vector<std::uint8_t>> OutputDrain::export_ring_next(
   std::uint32_t timeout_ms,
   bool& ended,
   std::uint64_t& token,
-  std::uint8_t& kind,
   std::uint64_t& rows,
   std::uint64_t& stream_bytes) const
 {
@@ -498,28 +523,31 @@ std::unique_ptr<std::vector<std::uint8_t>> OutputDrain::export_ring_next(
   auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
   ended               = false;
   for (;;) {
-    switch (stream_->classify()) {
-      case availability::END_OF_STREAM: ended = true; return nullptr;
-      case availability::HAS_DATA:
-        // Rethrows the fragment's error; nullptr only if another consumer took the batch.
-        if (auto batch = stream_->try_pull()) {
-          if (auto job = ring_->export_batch(std::move(batch))) {
-            token        = job->token;
-            kind         = static_cast<std::uint8_t>(job->kind);
-            rows         = job->rows;
-            stream_bytes = job->stream_bytes;
-            return std::make_unique<std::vector<std::uint8_t>>(std::move(job->header));
-          }
+    // A batch whose export ran out of GPU memory last time goes first, whatever the stream says.
+    std::shared_ptr<cucascade::data_batch> batch = std::move(ring_retry_);
+    ring_retry_.reset();
+    if (!batch) {
+      switch (stream_->classify()) {
+        case availability::END_OF_STREAM: ended = true; return nullptr;
+        case availability::HAS_DATA:
+          // Rethrows the fragment's error; nullptr only if another consumer took the batch.
+          batch = stream_->try_pull();
+          break;
+        case availability::WAITING: {
+          auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+          if (left.count() <= 0) { return nullptr; }
+          static_cast<void>(stream_->wait_for(left));
+          continue;
         }
-        break;  // a batch without rows is not sent
-      case availability::WAITING: {
-        auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(
-          deadline - std::chrono::steady_clock::now());
-        if (left.count() <= 0) { return nullptr; }
-        static_cast<void>(stream_->wait_for(left));
-        break;
       }
+      if (!batch) { continue; }
     }
+    auto const keep = [&](auto kept) { ring_retry_ = std::move(kept); };
+    if (auto header = export_to_ring(*ring_, std::move(batch), keep, token, rows, stream_bytes)) {
+      return header;
+    }
+    // A batch without rows is not sent.
   }
 }
 
@@ -569,6 +597,10 @@ struct Fragment::Impl {
 
   // One streaming_fragment for both terminals. Empty outputs is a RESULT_COLLECTOR.
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
+
+  // Per output stream, a batch pulled for export_ring() whose export ran out of GPU memory
+  // (bringing a spilled batch back): it is exported first on the next call.
+  std::map<std::uint64_t, std::shared_ptr<cucascade::data_batch>> ring_pending;
 
   void require_not_built(const char* what) const
   {
@@ -730,7 +762,6 @@ std::size_t Fragment::relay_from(Fragment& source,
 
 std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_ring(std::uint64_t stream_id,
                                                                  std::uint64_t& token,
-                                                                 std::uint8_t& kind,
                                                                  std::uint64_t& rows,
                                                                  std::uint64_t& stream_bytes)
 {
@@ -738,16 +769,22 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_ring(std::uint64_t s
   if (!impl_->ctx.ring) {
     throw sirius::invalid_input_exception("Fragment: this context has no ring exchange");
   }
-  while (auto batch = impl_->fragment->pull(stream_id)) {
-    if (auto job = impl_->ctx.ring->export_batch(std::move(*batch))) {
-      token        = job->token;
-      kind         = static_cast<std::uint8_t>(job->kind);
-      rows         = job->rows;
-      stream_bytes = job->stream_bytes;
-      return std::make_unique<std::vector<std::uint8_t>>(std::move(job->header));
+  for (;;) {
+    std::shared_ptr<cucascade::data_batch> batch;
+    if (auto pending = impl_->ring_pending.find(stream_id); pending != impl_->ring_pending.end()) {
+      batch = std::move(pending->second);
+      impl_->ring_pending.erase(pending);
+    } else if (auto pulled = impl_->fragment->pull(stream_id)) {
+      batch = std::move(*pulled);
+    } else {
+      return nullptr;
+    }
+    auto const keep = [&](auto kept) { impl_->ring_pending[stream_id] = std::move(kept); };
+    auto& ring      = *impl_->ctx.ring;
+    if (auto header = export_to_ring(ring, std::move(batch), keep, token, rows, stream_bytes)) {
+      return header;
     }
   }
-  return nullptr;
 }
 
 std::unique_ptr<OutputDrain> Fragment::output_drain(std::uint64_t stream_id) const

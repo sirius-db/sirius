@@ -184,13 +184,10 @@ mod ffi {
 
         fn output_drain(self: &Fragment, stream_id: u64) -> Result<UniquePtr<OutputDrain>>;
 
-        /// Export the next batch of a parked output as a ring job and return its
-        /// header, or null once drained.
         fn export_ring(
             self: Pin<&mut Fragment>,
             stream_id: u64,
             token: &mut u64,
-            kind: &mut u8,
             rows: &mut u64,
             stream_bytes: &mut u64,
         ) -> Result<UniquePtr<CxxVector<u8>>>;
@@ -226,16 +223,11 @@ mod ffi {
         /// any thread; the contract is documented on the C++ class.
         type OutputDrain;
 
-        /// Export the next batch, waiting up to `timeout_ms`: sets `token`,
-        /// `kind`, `rows` and `stream_bytes` and returns the job's header, or
-        /// returns null with `ended` set at the end of the stream and clear when
-        /// nothing arrived in time.
         fn export_ring_next(
             self: &OutputDrain,
             timeout_ms: u32,
             ended: &mut bool,
             token: &mut u64,
-            kind: &mut u8,
             rows: &mut u64,
             stream_bytes: &mut u64,
         ) -> Result<UniquePtr<CxxVector<u8>>>;

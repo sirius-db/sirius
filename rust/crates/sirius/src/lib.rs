@@ -264,24 +264,14 @@ impl Fragment<'_> {
     /// The next batch parked on output `stream_id` as a [`RingJob`], or `None` once the stream is
     /// drained.
     pub fn export_ring(&mut self, stream_id: u64) -> Result<Option<RingJob>, Exception> {
-        let (mut token, mut kind, mut rows, mut stream_bytes) = (0, 0, 0, 0);
+        let (mut token, mut rows, mut stream_bytes) = (0, 0, 0);
         let header = self.inner.pin_mut().export_ring(
             stream_id,
             &mut token,
-            &mut kind,
             &mut rows,
             &mut stream_bytes,
         )?;
-        if header.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(RingJob {
-            token,
-            kind,
-            rows,
-            stream_bytes,
-            header: header.as_slice().to_vec(),
-        }))
+        Ok(RingJob::from_ffi(token, rows, stream_bytes, header))
     }
 
     /// A handle that exports output stream `stream_id` from any thread, including while
@@ -375,23 +365,16 @@ impl OutputDrain {
     /// produce one. Errors once the fragment's run failed.
     pub fn next_ring(&mut self, timeout: std::time::Duration) -> Result<RingDrainNext, Exception> {
         let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
-        let (mut ended, mut token, mut kind, mut rows, mut stream_bytes) = (false, 0, 0, 0, 0);
+        let (mut ended, mut token, mut rows, mut stream_bytes) = (false, 0, 0, 0);
         let header = self.inner.export_ring_next(
             timeout_ms,
             &mut ended,
             &mut token,
-            &mut kind,
             &mut rows,
             &mut stream_bytes,
         )?;
-        if !header.is_null() {
-            return Ok(RingDrainNext::Job(RingJob {
-                token,
-                kind,
-                rows,
-                stream_bytes,
-                header: header.as_slice().to_vec(),
-            }));
+        if let Some(job) = RingJob::from_ffi(token, rows, stream_bytes, header) {
+            return Ok(RingDrainNext::Job(job));
         }
         Ok(if ended {
             RingDrainNext::End
@@ -424,13 +407,28 @@ pub struct RingOptions {
 pub struct RingJob {
     /// Released on the sender's [`RingExchange`] once every frame was written.
     pub token: u64,
-    /// 1 GPU columns, 2 host columns, 3 compressed.
-    pub kind: u8,
     pub rows: u64,
     /// Bytes the job's frames carry.
     pub stream_bytes: u64,
     /// What the receiver passes to [`RingExchange::begin`].
     pub header: Vec<u8>,
+}
+
+impl RingJob {
+    /// The job an export's out-parameters describe, or `None` for a null header.
+    fn from_ffi(
+        token: u64,
+        rows: u64,
+        stream_bytes: u64,
+        header: UniquePtr<cxx::CxxVector<u8>>,
+    ) -> Option<Self> {
+        (!header.is_null()).then(|| RingJob {
+            token,
+            rows,
+            stream_bytes,
+            header: header.as_slice().to_vec(),
+        })
+    }
 }
 
 /// Where a batch is landing on its receiver, from [`RingExchange::begin`].
