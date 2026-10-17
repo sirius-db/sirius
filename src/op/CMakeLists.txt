@@ -3,6 +3,7 @@ target_sources(
   PRIVATE aggregate/aggregate_op_util.cpp
           aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
+          aggregate/carried_row_selector.cpp
           aggregate/gpu_aggregate_impl.cpp
           merge/gpu_merge_impl.cpp
           order/gpu_order_impl.cpp

@@ -19,6 +19,7 @@
 #include "duckdb/common/assert.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
@@ -417,13 +418,10 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       if (slot->children.size() != 1) { break; }
       auto& aggregate = slot->Cast<sirius::op::sirius_physical_grouped_aggregate>();
       if (aggregate.has_grouping_sets()) { break; }
-      // AVG decomposes into SUM + COUNT_VALID partial columns and COUNT(DISTINCT) keeps a LIST
-      // partial column; STDDEV_SAMP keeps a count/mean/M2 STRUCT, so the partial batch layout
-      // deviates from the declared `types` shape a sidecar describes; those shapes keep the native
+      // Only a plain slot keeps the partial batch in the declared `types` shape a sidecar describes
+      // and reads its input through cudf_aggregate_idx; any other slot kind keeps the native
       // boundary.
-      if (aggregate.has_avg || aggregate.has_count_distinct || aggregate.has_stddev_samp()) {
-        break;
-      }
+      if (!sirius::op::all_slots_plain(aggregate.aggregate_slots)) { break; }
       // Grouping functions append output columns the operator does not compute through group_idx /
       // aggregate_slots; the arity check rejects that shape along with any other layout drift.
       if (slot->types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {

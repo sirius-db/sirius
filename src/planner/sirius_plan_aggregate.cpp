@@ -763,6 +763,13 @@ duckdb::LogicalType sirius_physical_plan_generator::planned_aggregate_type(
   return type == duckdb::LogicalType::HUGEINT ? duckdb::LogicalType::BIGINT : type;
 }
 
+bool sirius_physical_plan_generator::plans_declared_type(sirius::logical_type const& planned,
+                                                         duckdb::LogicalType const& declared)
+{
+  return planned == sirius::from_duckdb(declared) ||
+         planned == sirius::from_duckdb(planned_aggregate_type(declared));
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 {
@@ -802,6 +809,28 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
                               aggregate.GetChildren()[0]->GetReturnType().IsNested())) {
       throw duckdb::NotImplementedException(
         "Ungrouped COUNT(DISTINCT) on a nested or multi-column input not supported in GPU");
+    }
+  }
+
+  // The Sirius aggregate node cannot carry an ORDER BY, so a FIRST refuses its own. FILTER is
+  // refused above for every aggregate.
+  for (auto const& expression : op.expressions) {
+    auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+    if (sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName()) !=
+        sirius::aggregate_id::first) {
+      continue;
+    }
+    if (aggregate.GetOrderBys()) {
+      throw duckdb::NotImplementedException(
+        "first() with an ORDER BY clause is not supported on the GPU (falling back to CPU): " +
+        aggregate.ToString());
+    }
+    // One carried row per key answers one grouping set, and the set expansion copies no carried
+    // columns.
+    if (has_grouping_sets) {
+      throw duckdb::NotImplementedException(
+        "grouped FIRST is not supported over several grouping sets or beside a grouping function "
+        "(falling back to CPU)");
     }
   }
 

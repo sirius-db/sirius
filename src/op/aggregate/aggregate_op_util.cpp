@@ -39,6 +39,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <variant>
 
 namespace sirius {
 namespace op {
@@ -79,6 +80,9 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions)
 {
   CudfAggregateDefinitions result;
+  // Each FIRST's ordinal among FIRSTs, so the carried block is in slot order.
+  std::size_t next_carried_idx = 0;
+  duckdb::vector<sirius::logical_type> carried_types;
 
   // 1. Extract group_idx from groups_p
   for (const auto& group : groups_p) {
@@ -112,8 +116,8 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       result.cudf_aggregates.push_back(cudf::aggregation::Kind::COUNT_VALID);
       result.cudf_aggregate_idx.push_back(col_idx);
       result.cudf_aggregate_struct_col_indices.push_back({});
-      result.aggregate_slots.push_back(
-        AggregateSlot{true, false, sum_position, sirius::get_cudf_type(aggr.return_type())});
+      result.aggregate_slots.push_back(avg_slot{
+        .sum_idx = sum_position, .output_type = sirius::get_cudf_type(aggr.return_type())});
       auto sum_type = children[0]->return_type();
       switch (sum_type.id()) {
         case sirius::type_id::TINYINT:
@@ -169,9 +173,22 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
         result.cudf_aggregate_struct_col_indices.push_back(std::move(struct_indices));
       }
 
-      result.aggregate_slots.push_back(AggregateSlot{false, true, position});
+      result.aggregate_slots.push_back(count_distinct_slot{.partial_idx = position});
       result.local_types.push_back(sirius::logical_type::make(sirius::type_id::LIST));
       result.has_count_distinct = true;
+      continue;
+    }
+
+    // FIRST adds no cuDF aggregation; it reads input_idx into the carried block.
+    if (fid == sirius::aggregate_id::first) {
+      if (children.size() != 1 || !children[0]->is_reference()) {
+        throw_unsupported_aggregate(fid, "over anything but a single column reference");
+      }
+      result.aggregate_slots.push_back(
+        first_slot{.input_idx   = static_cast<int>(children[0]->as_reference().column_index),
+                   .carried_idx = next_carried_idx++});
+      carried_types.push_back(aggr.return_type());
+      result.has_first = true;
       continue;
     }
 
@@ -199,15 +216,36 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       }
     }
     result.cudf_aggregate_struct_col_indices.push_back({});
-    AggregateSlot slot{false, false, current_position};
-    slot.is_stddev_samp = fid == sirius::aggregate_id::stddev_samp;
-    result.aggregate_slots.push_back(slot);
-    result.local_types.push_back(slot.is_stddev_samp
-                                   ? sirius::logical_type::make(sirius::type_id::STRUCT)
-                                   : aggr.return_type());
+    if (fid == sirius::aggregate_id::stddev_samp) {
+      result.aggregate_slots.push_back(stddev_samp_slot{.partial_idx = current_position});
+      result.local_types.push_back(sirius::logical_type::make(sirius::type_id::STRUCT));
+    } else {
+      result.aggregate_slots.push_back(plain_slot{.partial_idx = current_position});
+      result.local_types.push_back(aggr.return_type());
+    }
   }
+  result.local_types.insert(result.local_types.end(), carried_types.begin(), carried_types.end());
 
   return result;
+}
+
+std::vector<int> carried_inputs(std::vector<AggregateSlot> const& aggregate_slots)
+{
+  std::vector<int> inputs;
+  for (auto const& slot : aggregate_slots) {
+    if (auto const* first = std::get_if<first_slot>(&slot)) {
+      D_ASSERT(first->carried_idx == inputs.size());
+      inputs.push_back(first->input_idx);
+    }
+  }
+  return inputs;
+}
+
+bool all_slots_plain(std::vector<AggregateSlot> const& aggregate_slots)
+{
+  return std::ranges::all_of(aggregate_slots, [](AggregateSlot const& slot) {
+    return std::holds_alternative<plain_slot>(slot);
+  });
 }
 
 namespace {

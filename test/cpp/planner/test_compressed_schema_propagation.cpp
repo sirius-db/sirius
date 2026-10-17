@@ -218,15 +218,16 @@ std::unique_ptr<sirius::ast::node> make_aggregate(uint32_t input_idx, sirius::ag
                            /*distinct=*/false});
 }
 
-// A HASH_GROUP_BY over @p child grouping on @p group_columns with one @p function per entry of
-// @p aggregate_input_columns; output layout is [keys..., aggregates...].
+// A HASH_GROUP_BY over @p child grouping on @p group_columns with `functions[i]` over
+// `aggregate_input_columns[i]`; output layout is [keys..., aggregates...].
 duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_aggregate(
   std::vector<uint32_t> group_columns,
   std::vector<uint32_t> aggregate_input_columns,
   duckdb::unique_ptr<sirius_physical_operator> child,
-  duckdb::vector<duckdb::GroupingSet> grouping_sets = {},
-  sirius::aggregate_id function                     = sirius::aggregate_id::sum)
+  duckdb::vector<duckdb::GroupingSet> grouping_sets,
+  std::vector<sirius::aggregate_id> const& functions)
 {
+  REQUIRE(functions.size() == aggregate_input_columns.size());
   duckdb::vector<sirius::logical_type> output_types;
   duckdb::vector<std::unique_ptr<sirius::ast::node>> groups;
   for (auto const group_idx : group_columns) {
@@ -234,9 +235,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
     groups.push_back(make_reference(group_idx));
   }
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
-  for (auto const input_idx : aggregate_input_columns) {
+  for (std::size_t i = 0; i < aggregate_input_columns.size(); ++i) {
     output_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
-    expressions.push_back(make_aggregate(input_idx, function));
+    expressions.push_back(make_aggregate(aggregate_input_columns[i], functions[i]));
   }
   auto aggregate = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
     std::move(output_types),
@@ -249,6 +250,22 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
     duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
   aggregate->children.push_back(std::move(child));
   return aggregate;
+}
+
+// The same with one @p function for every input.
+duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_aggregate(
+  std::vector<uint32_t> group_columns,
+  std::vector<uint32_t> aggregate_input_columns,
+  duckdb::unique_ptr<sirius_physical_operator> child,
+  duckdb::vector<duckdb::GroupingSet> grouping_sets = {},
+  sirius::aggregate_id function                     = sirius::aggregate_id::sum)
+{
+  std::vector<sirius::aggregate_id> const functions(aggregate_input_columns.size(), function);
+  return make_grouped_aggregate(std::move(group_columns),
+                                std::move(aggregate_input_columns),
+                                std::move(child),
+                                std::move(grouping_sets),
+                                functions);
 }
 
 void require_restore_projection_at(sirius_physical_operator const& op,
@@ -465,6 +482,50 @@ TEST_CASE("compressed_schema_propagation - grouped aggregation keeps narrow grou
             std::vector<cudf::data_type>{k_int8, k_int16});
     // Every output column is a key, so the output schema is the child's carriers in key order.
     REQUIRE(plan->get_physical_types() == std::vector<cudf::data_type>{k_int16, k_int8});
+  }
+
+  SECTION("a FIRST keeps the native boundary even where SUM would narrow")
+  {
+    // Same shape as the first section with FIRST in place of SUM. cudf_aggregates is empty for a
+    // FIRST, so without the all_slots_plain break the pass would see no value-sensitive input and
+    // leave the carried column narrow while cudf::distinct copies it out at whatever carrier it
+    // has.
+    duckdb::unique_ptr<sirius_physical_operator> plan = make_grouped_aggregate(
+      {0}, {1}, make_scan(2, {k_int8, k_int8}), {}, sirius::aggregate_id::first);
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    auto const& restored = *plan->children[0];
+    REQUIRE(restored.type == SiriusPhysicalOperatorType::PROJECTION);
+    auto const& projection = restored.Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(projection.select_list[0]->holds<sirius::ast::cast>());
+    REQUIRE(projection.select_list[1]->holds<sirius::ast::cast>());
+    REQUIRE(!restored.has_physical_overrides());
+    REQUIRE(!plan->has_physical_overrides());
+  }
+
+  SECTION("a FIRST beside SUM keeps the native boundary")
+  {
+    // The all_slots_plain break fires before the SUM input is considered, so every column below the
+    // aggregate is restored, the key included.
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_grouped_aggregate({0},
+                             {1, 2},
+                             make_scan(3, {k_int8, k_int8, k_int8}),
+                             {},
+                             {sirius::aggregate_id::first, sirius::aggregate_id::sum});
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    auto const& restored = *plan->children[0];
+    REQUIRE(restored.type == SiriusPhysicalOperatorType::PROJECTION);
+    auto const& projection = restored.Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(projection.select_list.size() == 3);
+    for (auto const& entry : projection.select_list) {
+      REQUIRE(entry->holds<sirius::ast::cast>());
+    }
+    REQUIRE(!restored.has_physical_overrides());
+    REQUIRE(!plan->has_physical_overrides());
   }
 
   SECTION("unused payload columns remain narrow")
