@@ -153,6 +153,57 @@ class cancelling_puffin_source final : public puffin_byte_source {
   std::streamoff offset_ = 0;
 };
 
+class throwing_puffin_source final : public puffin_byte_source {
+ public:
+  explicit throwing_puffin_source(std::streamoff size) : size_(size) {}
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || offset > size_) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte>) override
+  {
+    throw std::runtime_error("injected footer read failure");
+  }
+  [[nodiscard]] std::streamoff size() const override { return size_; }
+
+ private:
+  std::streamoff size_;
+  std::streamoff offset_ = 0;
+};
+
+class footer_magic_short_source final : public puffin_byte_source {
+ public:
+  explicit footer_magic_short_source(std::vector<std::byte> bytes) : bytes_(std::move(bytes)) {}
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || static_cast<std::uint64_t>(offset) > bytes_.size()) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte> destination) override
+  {
+    ++read_count_;
+    if (read_count_ == 4) return false;
+    if (offset_ < 0 || static_cast<std::uint64_t>(offset_) > bytes_.size() ||
+        destination.size() > bytes_.size() - static_cast<std::uint64_t>(offset_))
+      return false;
+    std::copy_n(bytes_.data() + offset_, destination.size(), destination.data());
+    offset_ += static_cast<std::streamoff>(destination.size());
+    return true;
+  }
+  [[nodiscard]] std::streamoff size() const override
+  {
+    return static_cast<std::streamoff>(bytes_.size());
+  }
+
+ private:
+  std::vector<std::byte> bytes_;
+  std::streamoff offset_ = 0;
+  int read_count_        = 0;
+};
+
 /// The manifest entry as the fixture actually writes it. Each test below changes exactly one
 /// field, so a failure names the check that fired rather than "something threw".
 DeletionVectorRef fixture_ref()
@@ -728,6 +779,42 @@ TEST_CASE("Charged Puffin preserves cancellation instead of classifying it as co
     CHECK(std::current_exception() != nullptr);
     CHECK(sirius::transparent::classify_failure(std::current_exception()).cause ==
           sirius::transparent::late_failure_cause::other);
+  }
+}
+
+TEST_CASE("Charged Puffin classifies thrown magic reads as reader I/O",
+          "[scan_preparation][iceberg][charged_reader][failure]")
+{
+  auto const ref = fixture_ref();
+  std::error_code error;
+  auto const size = fs::file_size(ref.puffin_path, error);
+  REQUIRE_FALSE(error);
+  throwing_puffin_source source(static_cast<std::streamoff>(size));
+  try {
+    read_for_test(ref, true, &source);
+    FAIL("injected footer read failure was not reported");
+  } catch (sirius::transparent::classified_execution_error const& failure) {
+    CHECK(failure.cause == sirius::transparent::late_failure_cause::reader_io);
+    CHECK(std::string(failure.what()).find("injected footer read failure") != std::string::npos);
+  }
+}
+
+TEST_CASE("Charged Puffin reports a short footer magic read as missing magic",
+          "[scan_preparation][iceberg][charged_reader][failure]")
+{
+  auto const ref = fixture_ref();
+  std::ifstream input(ref.puffin_path, std::ios::binary);
+  REQUIRE(input);
+  std::vector<char> raw((std::istreambuf_iterator<char>(input)), {});
+  std::vector<std::byte> bytes(raw.size());
+  std::memcpy(bytes.data(), raw.data(), raw.size());
+  footer_magic_short_source source(std::move(bytes));
+  try {
+    read_for_test(ref, true, &source);
+    FAIL("short footer magic read was accepted");
+  } catch (sirius::op::scan::unsupported_physical_input const& failure) {
+    CHECK(failure.reason == sirius::op::scan::verdict_reason::iceberg_delete_corrupt);
+    CHECK(std::string(failure.what()).find("Missing footer magic") != std::string::npos);
   }
 }
 

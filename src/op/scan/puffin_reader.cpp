@@ -484,6 +484,28 @@ struct puffin_footer_bounds {
   std::size_t payload_size;
 };
 
+bool read_puffin_bytes(puffin_byte_source& source,
+                       std::span<std::byte> destination,
+                       std::string_view path)
+{
+  try {
+    return source.read(destination);
+  } catch (sirius::transparent::classified_execution_error const&) {
+    throw;
+  } catch (io::object_changed_error const&) {
+    throw;
+  } catch (std::system_error const& error) {
+    if (error.code() == std::errc::operation_canceled) throw;
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read " + std::string(path) + ": " + error.what());
+  } catch (std::exception const& error) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read " + std::string(path) + ": " + error.what());
+  }
+}
+
 template <typename Ref>
 puffin_footer_bounds read_footer_bounds(puffin_byte_source& f,
                                         std::streamoff file_size,
@@ -499,7 +521,8 @@ puffin_footer_bounds read_footer_bounds(puffin_byte_source& f,
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Cannot seek to footer tail of " + ref.puffin_path);
   uint8_t tail[kFooterTail];
-  if (!f.read(std::as_writable_bytes(std::span{tail})))
+  if (!read_puffin_bytes(
+        f, std::as_writable_bytes(std::span{tail}), "footer tail of " + ref.puffin_path))
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Cannot read footer tail of " + ref.puffin_path);
@@ -516,8 +539,9 @@ puffin_footer_bounds read_footer_bounds(puffin_byte_source& f,
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Cannot seek to footer magic of " + ref.puffin_path);
   char magic[4];
-  if (!f.read(std::as_writable_bytes(std::span{magic})))
-    throw std::runtime_error("[puffin] Cannot read footer magic of " + ref.puffin_path);
+  if (!read_puffin_bytes(
+        f, std::as_writable_bytes(std::span{magic}), "footer magic of " + ref.puffin_path))
+    throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
   if (std::memcmp(magic, puffin_magic, 4) != 0)
     throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
   return {footer_start, static_cast<std::size_t>(payload_size)};
@@ -557,7 +581,9 @@ std::streamoff validate_footer_descriptor(
     legacy_payload.resize(size);
     payload = legacy_payload.data();
   }
-  if (!f.read(std::as_writable_bytes(std::span{payload, size}))) {
+  if (!read_puffin_bytes(f,
+                         std::as_writable_bytes(std::span{payload, size}),
+                         "footer payload of " + ref.puffin_path)) {
     throw sirius::transparent::classified_execution_error(
       sirius::transparent::late_failure_cause::reader_io,
       "[puffin] Cannot read footer payload of " + ref.puffin_path);
@@ -709,12 +735,15 @@ std::streamoff validate_puffin_container(puffin_byte_source& source,
 {
   static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
   char magic[4];
-  if (!source.seek(0) || !source.read(std::as_writable_bytes(std::span{magic})) ||
+  if (!source.seek(0) ||
+      !read_puffin_bytes(
+        source, std::as_writable_bytes(std::span{magic}), "leading magic of " + ref.puffin_path) ||
       std::memcmp(magic, kPuffinMagic, 4) != 0)
     throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + ref.puffin_path);
   auto const file_size = source.size();
   if (file_size < 4 || !source.seek(file_size - 4) ||
-      !source.read(std::as_writable_bytes(std::span{magic})) ||
+      !read_puffin_bytes(
+        source, std::as_writable_bytes(std::span{magic}), "trailing magic of " + ref.puffin_path) ||
       std::memcmp(magic, kPuffinMagic, 4) != 0)
     throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + ref.puffin_path);
   if (allocator && (ref.file_size_in_bytes < 0 || file_size > ref.file_size_in_bytes))
