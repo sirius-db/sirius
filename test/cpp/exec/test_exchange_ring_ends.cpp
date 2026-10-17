@@ -414,3 +414,24 @@ TEST_CASE("a landing refuses frames out of order of its stream", "[exchange_ring
   sender->release_job(job->token);
   CHECK(receiver->stats().gpu_held == 0);
 }
+
+TEST_CASE("a batch a ring job holds is not spilled under it", "[exchange_ring][ends]")
+{
+  auto sender = make_ring();
+  auto batch  = gpu_batch(sample_table());
+  move_to(batch, env().host);
+  REQUIRE(holds<cucascade::host_data_representation>(*batch));
+  // A spill candidate snapshotted while the batch was still in its repository.
+  sirius::convertible_data_batch stale(batch, /*skip_subscribed=*/true);
+  auto const job = sender->export_batch(batch);
+  REQUIRE(job.has_value());
+  CHECK(batch->get_subscriber_count() == 1);
+  rmm::cuda_stream stream;
+  CHECK_FALSE(stale.convert({env().disk}, stream.view(), *env().mgr, true).has_value());
+  CHECK(holds<cucascade::host_data_representation>(*batch));
+  sender->release_job(job->token);
+  CHECK(batch->get_subscriber_count() == 0);
+  // Released, it spills as before.
+  CHECK(stale.convert({env().disk}, stream.view(), *env().mgr, true).has_value());
+  CHECK(holds<cucascade::disk_data_representation>(*batch));
+}

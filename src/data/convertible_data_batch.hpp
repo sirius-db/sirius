@@ -62,6 +62,15 @@ class convertible_data_batch : public convertible_data {
   {
   }
 
+  /// @param skip_subscribed Give the batch up, once its mutable lock is held, if it was subscribed
+  ///        since it was picked: a spill candidate snapshotted from a repository may meanwhile
+  ///        have been taken by a consumer that holds it without a lock (an exchange job reading
+  ///        its buffers), and converting it then would free them under that consumer.
+  convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch, bool skip_subscribed)
+    : _batch(std::move(batch)), _skip_subscribed(skip_subscribed)
+  {
+  }
+
   /**
    * @brief Convert this batch to reside in one of the target memory spaces.
    *
@@ -94,6 +103,7 @@ class convertible_data_batch : public convertible_data {
       if (!mut_opt) { return std::nullopt; }
     }
     auto& mut = *mut_opt;
+    if (_skip_subscribed && _batch->get_subscriber_count() > 0) { return std::nullopt; }
 
     // Check if the batch is already in the target space
     auto cur_space = mut.get_memory_space();
@@ -176,6 +186,7 @@ class convertible_data_batch : public convertible_data {
 
  private:
   std::shared_ptr<cucascade::data_batch> _batch;
+  bool _skip_subscribed{false};
 };
 
 /**
@@ -335,7 +346,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
     auto ro = batch->try_to_read_only();
     if (!ro) { return nullptr; }
     if (ro->get_memory_space() == space) {
-      return std::make_unique<convertible_data_batch>(std::move(batch));
+      return std::make_unique<convertible_data_batch>(std::move(batch), ignore_subscribed);
     }
 
     return nullptr;
