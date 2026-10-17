@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "description": "Static UCX with TCP, shared-memory and CUDA transports",
+  "homepage": "https://openucx.org/",
+  "license": "BSD-3-Clause",
+  "name": "ucx",
+  "supports": "linux & (x64 | arm64) & static",
+  "version-semver": "1.20.1"
+}

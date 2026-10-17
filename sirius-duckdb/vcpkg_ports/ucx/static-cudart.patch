@@ -1,0 +1,17 @@
+UCX 1.20.1: use the static CUDA runtime for this static package.
+
+--- a/config/m4/cuda.m4
++++ b/config/m4/cuda.m4
+@@ -216,7 +216,11 @@
+                [AC_SUBST([CUDA_CPPFLAGS], ["$CUDA_CPPFLAGS"])
+                 AC_SUBST([CUDA_LDFLAGS], ["$CUDA_LDFLAGS"])
+                 AC_SUBST([CUDA_LIBS], ["$CUDA_LIBS"])
+-                AC_SUBST([CUDART_LIBS], ["$CUDART_LIBS"])
++                AS_IF([test "x$enable_shared" = "xno"],
++                       [AS_IF([test "x$have_cuda_static" != "xyes"],
++                              [AC_MSG_ERROR([Static UCX requires libcudart_static])])
++                        CUDART_LIBS="$CUDART_STATIC_LIBS"])
++                 AC_SUBST([CUDART_LIBS], ["$CUDART_LIBS"])
+                 AC_SUBST([NVML_LIBS], ["$NVML_LIBS"])
+                 AC_SUBST([CUDART_STATIC_LIBS], ["$CUDART_STATIC_LIBS"])
+                 AC_DEFINE([HAVE_CUDA], 1, [Enable CUDA support])],
