@@ -298,6 +298,7 @@ class GpuExecutionFixture {
                                double rel_tol                      = 0.0,
                                cell_canonicalizer canonicalize     = nullptr)
   {
+    INFO(query);
     // Run on GPU (transparent, plain SQL goes through the Sirius optimizer hook).
     con->Query("SET gpu_execution = true;");
     auto before_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
@@ -320,6 +321,7 @@ class GpuExecutionFixture {
     REQUIRE(cpu_result);
     REQUIRE_FALSE(cpu_result->HasError());
 
+    REQUIRE(gpu_result->GetTypes() == cpu_result->GetTypes());
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
