@@ -108,6 +108,19 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
+/// Size STANDARD / MIXED_JOIN hash-join partitions from the larger join side, so that each
+/// partition holds at most one CONCAT batch per side and its hash table is built once (see
+/// compute_hash_join_partition_strategy). Off by default pending measurement (issue #1747
+/// follow-up, 2026-10 join investigation).
+constexpr bool DEFAULT_ENABLE_JOIN_LARGER_SIDE_PARTITIONING = false;
+
+/// Under larger-side sizing the sizing side's partitions never shrink below
+/// `hash_partition_bytes / this`, which bounds the count when the other side's estimate is high.
+constexpr uint64_t JOIN_LARGER_SIDE_MIN_PARTITION_DIVISOR = 16;
+
+/// Bytes charged per variable-width column value in planner-derived byte estimates.
+constexpr uint64_t DEFAULT_AVG_VARIABLE_COLUMN_BYTES = 32;
+
 /// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
@@ -222,6 +235,11 @@ struct operator_params {
   /// a proven magnitude bound skips the per-batch min/max scan and its stream synchronization
   /// (planner::resolve_decimal_sum_input_bounds). Off: every batch is measured.
   bool enable_decimal_sum_stats_bound = true;
+  /// Size STANDARD / MIXED_JOIN hash-join partitions from the larger side (measured sizing side vs
+  /// the other side's measured, projected or planner-estimated bytes) so every partition is one
+  /// build batch x one probe batch and its hash table is built once. See
+  /// DEFAULT_ENABLE_JOIN_LARGER_SIDE_PARTITIONING.
+  bool enable_join_larger_side_partitioning = config::DEFAULT_ENABLE_JOIN_LARGER_SIDE_PARTITIONING;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
@@ -262,7 +280,7 @@ struct operator_params {
 
   /// Bytes assumed per variable-width column (VARCHAR, LIST, etc.) when computing
   /// per-row byte estimates for admission. Only used when admission_bytes_per_gpu > 0.
-  uint64_t avg_variable_column_bytes = 32;
+  uint64_t avg_variable_column_bytes = config::DEFAULT_AVG_VARIABLE_COLUMN_BYTES;
 };
 
 constexpr std::string QUENT_NDJSON_EXPORTER = "ndjson";

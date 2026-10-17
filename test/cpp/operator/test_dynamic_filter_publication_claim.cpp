@@ -21,7 +21,8 @@
  * the build port directly, pinning the claim condition -- plus the reopening of a claimed window
  * without a usable GPU source (not GPU-resident, or resident on a GPU outside the plan's replica
  * set) and the fail-open containment of device memory exhaustion -- rather than any partitioning
- * decision.
+ * decision. The final section reuses the fixture for the one partitioning decision that depends
+ * on the filter plan: larger-side sizing's whole-build exception.
  */
 
 #include "expression/join_condition.hpp"
@@ -90,10 +91,15 @@ struct claim_fixture {
   /// The plan's replica space stays GPU 0 only regardless of @p num_gpus; extra GPUs exist so
   /// tests can build batches resident outside the replica set. @p probe_type is the channel
   /// binding's recorded probe storage type.
-  explicit claim_fixture(duckdb::JoinType join_type        = duckdb::JoinType::INNER,
-                         std::size_t num_gpus              = 1,
-                         cudf::size_type build_key_ordinal = 0,
-                         cudf::data_type probe_type        = kInt64)
+  /// @p max_build_hash_table_bytes is the join's BUILD_PROBE budget; @p add_inequality_condition
+  /// appends `left.1 < right.1` so the join runs as MIXED_JOIN (never BUILD_PROBE).
+  explicit claim_fixture(
+    duckdb::JoinType join_type          = duckdb::JoinType::INNER,
+    std::size_t num_gpus                = 1,
+    cudf::size_type build_key_ordinal   = 0,
+    cudf::data_type probe_type          = kInt64,
+    uint64_t max_build_hash_table_bytes = sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+    bool add_inequality_condition       = false)
     : memory_manager(sirius::test::operator_utils::initialize_memory_manager(num_gpus))
   {
     gpu_space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, kDeviceId);
@@ -123,7 +129,9 @@ struct claim_fixture {
     std::vector<sirius::op::dynamic_filter_replica_space> replica_spaces{{*gpu_space, *host_space}};
     dynamic_filter_publish_plan plan{{key}, std::move(targets), std::move(replica_spaces)};
 
-    duckdb::vector<duckdb::LogicalType> const output_types{duckdb::LogicalType::BIGINT};
+    duckdb::vector<duckdb::LogicalType> output_types{duckdb::LogicalType::BIGINT};
+    // cuDF's mixed join needs the inequality on a column disjoint from the hash key.
+    if (add_inequality_condition) { output_types.push_back(duckdb::LogicalType::BIGINT); }
     logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
     logical_join->types = output_types;
 
@@ -138,6 +146,13 @@ struct claim_fixture {
       duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0),
       duckdb::ExpressionType::COMPARE_EQUAL);
     conditions.push_back(std::move(condition));
+    if (add_inequality_condition) {
+      duckdb::JoinCondition inequality(
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 1),
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 1),
+        duckdb::ExpressionType::COMPARE_LESSTHAN);
+      conditions.push_back(std::move(inequality));
+    }
 
     hash_join = duckdb::make_uniq<sirius_physical_hash_join>(
       *logical_join,
@@ -149,7 +164,7 @@ struct claim_fixture {
       duckdb::vector<duckdb::idx_t>{},
       sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
       /*estimated_cardinality=*/1000,
-      sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+      max_build_hash_table_bytes,
       std::move(plan),
       sirius::config::DEFAULT_HASH_PARTITION_BYTES,
       sirius::config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
@@ -720,4 +735,114 @@ TEST_CASE("abandoning a planned session does not freeze sibling registrations",
   fixture.hash_join->cancel_dynamic_filter_publication();
   CHECK(fixture.channel->snapshot().terminal());
   CHECK(fixture.stats.publication_attempts.load() == 0);
+}
+
+//===--------------------------------------------------------------------===//
+// Larger-side sizing vs the whole-build filter exception
+//
+// `get_partition_strategy` keeps a filter-publishing build at one partition only when PARTITION
+// would fold that build whole for publication (sirius_physical_partition.cpp): build-side sizing,
+// a build-side CONCAT, a build under the hash-table budget, one natural partition. In every other
+// case a larger other side raises the STANDARD count as usual, because no filter would have been
+// published from the whole build anyway.
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+constexpr uint64_t kMiB = 1024ULL * 1024;
+/// 200 MiB fits one default partition; sixteen partitions' worth on the other side wants 16, and
+/// the sizing-side cap (one sixteenth of a partition each) bounds the raise at kRaisedCount.
+constexpr uint64_t kSizingBytes       = 200 * kMiB;
+constexpr uint64_t kOtherBytes        = 16 * sirius::config::DEFAULT_HASH_PARTITION_BYTES;
+constexpr uint64_t kMinPartitionBytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES /
+                                        sirius::config::JOIN_LARGER_SIDE_MIN_PARTITION_DIVISOR;
+constexpr int kRaisedCount =
+  static_cast<int>((kSizingBytes + kMinPartitionBytes - 1) / kMinPartitionBytes);
+static_assert(kSizingBytes < sirius::config::DEFAULT_HASH_PARTITION_BYTES);
+static_assert(kSizingBytes < sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
+static_assert(kRaisedCount > 1);
+
+/// Sizes @p fixture's join from a kSizingBytes side whose sibling is known to hold kOtherBytes.
+[[nodiscard]] sirius::op::partition_strategy size_from(claim_fixture& fixture,
+                                                       bool is_build_side,
+                                                       bool build_foldable)
+{
+  return fixture.hash_join->get_partition_strategy(
+    sirius::op::partition_sizing_input{.total_bytes                  = kSizingBytes,
+                                       .is_build_side                = is_build_side,
+                                       .build_foldable               = build_foldable,
+                                       .combined_total_bytes         = kSizingBytes,
+                                       .sibling_total_bytes_estimate = kOtherBytes});
+}
+
+}  // namespace
+
+TEST_CASE("larger-side sizing keeps a filter-publishing single-partition build whole",
+          "[dynamic_filter][hash_join][partition][gpu_execution]")
+{
+  // MIXED_JOIN never takes BUILD_PROBE, so this is a STANDARD-path build PARTITION would fold
+  // whole: build-side sizing, a build CONCAT, under the budget, one natural partition.
+  claim_fixture fixture{duckdb::JoinType::INNER,
+                        /*num_gpus=*/1,
+                        /*build_key_ordinal=*/0,
+                        kInt64,
+                        sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+                        /*add_inequality_condition=*/true};
+  fixture.hash_join->larger_side_partitioning = true;
+
+  auto const strategy = size_from(fixture, /*is_build_side=*/true, /*build_foldable=*/true);
+  CHECK_FALSE(strategy.build_probe);
+  CHECK(strategy.num_partitions == 1);
+}
+
+TEST_CASE("larger-side sizing raises a probe-driven join despite its dynamic-filter plan",
+          "[dynamic_filter][hash_join][partition][gpu_execution]")
+{
+  // A RIGHT join sizes from the probe. Its single probe partition says nothing about the build,
+  // and PARTITION folds no build whole for a probe-driven join, so the filter the exception
+  // protects would never be published: the larger build must raise the count.
+  claim_fixture fixture{duckdb::JoinType::RIGHT};
+  REQUIRE(fixture.hash_join->publishes_dynamic_filters());
+
+  auto const off = size_from(fixture, /*is_build_side=*/false, /*build_foldable=*/true);
+  CHECK(off.num_partitions == 1);
+
+  fixture.hash_join->larger_side_partitioning = true;
+  auto const on = size_from(fixture, /*is_build_side=*/false, /*build_foldable=*/true);
+  CHECK_FALSE(on.build_probe);
+  CHECK(on.num_partitions == kRaisedCount);
+}
+
+TEST_CASE("larger-side sizing raises a filter-publishing build that has no build CONCAT to fold",
+          "[dynamic_filter][hash_join][partition][gpu_execution]")
+{
+  claim_fixture fixture{duckdb::JoinType::INNER,
+                        /*num_gpus=*/1,
+                        /*build_key_ordinal=*/0,
+                        kInt64,
+                        sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+                        /*add_inequality_condition=*/true};
+  fixture.hash_join->larger_side_partitioning = true;
+
+  auto const strategy = size_from(fixture, /*is_build_side=*/true, /*build_foldable=*/false);
+  CHECK_FALSE(strategy.build_probe);
+  CHECK(strategy.num_partitions == kRaisedCount);
+}
+
+TEST_CASE("larger-side sizing raises a filter-publishing build over the hash-table budget",
+          "[dynamic_filter][hash_join][partition][gpu_execution]")
+{
+  // The budget is below the partition target here, so the build fits one natural partition yet
+  // PARTITION refuses to fold it whole (it would not be folded for BUILD_PROBE either).
+  claim_fixture fixture{duckdb::JoinType::INNER,
+                        /*num_gpus=*/1,
+                        /*build_key_ordinal=*/0,
+                        kInt64,
+                        /*max_build_hash_table_bytes=*/kSizingBytes / 2,
+                        /*add_inequality_condition=*/true};
+  fixture.hash_join->larger_side_partitioning = true;
+
+  auto const strategy = size_from(fixture, /*is_build_side=*/true, /*build_foldable=*/true);
+  CHECK_FALSE(strategy.build_probe);
+  CHECK(strategy.num_partitions == kRaisedCount);
 }

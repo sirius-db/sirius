@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -46,6 +47,12 @@ struct partition_sizing_input {
   /// the bytes are a projection). Best effort: batches whose representation does not record a
   /// row count are counted at the bytes-per-row of the batches that do.
   uint64_t total_rows = 0;
+  /// Best known total for the sibling partition's input port at sizing time: its measured bytes
+  /// once its producer has finished, else its runtime projection (see
+  /// docs/super-sirius/data-size-estimation.md) when size estimation is enabled, else nullopt
+  /// (also nullopt without a sibling). A consumer that sizes from the larger side combines it
+  /// with its own planner estimate; it never claims fewer bytes than the sibling has received.
+  std::optional<uint64_t> sibling_total_bytes_estimate = std::nullopt;
 };
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is

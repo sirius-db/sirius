@@ -225,11 +225,13 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
+    REQUIRE(setting_count(con, "enable_join_larger_side_partitioning") == 0);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
+    REQUIRE(con.Query("SET enable_join_larger_side_partitioning = true")->HasError());
     REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
     REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     auto native_option = con.Query("SET sirius_test_sync_native_checkpoint = true");
@@ -316,6 +318,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 1);
+    REQUIRE(setting_count(con, "enable_join_larger_side_partitioning") == 1);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
@@ -369,6 +372,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET enable_dense_count_join");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_join_larger_side_partitioning = true");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_join_larger_side_partitioning");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET dense_count_join_max_bytes = 1024");
@@ -2465,6 +2474,30 @@ TEST_CASE("Per-connection state isolates and expires the transparent capture",
   REQUIRE(after_prepare.successful_rebinds == before_prepare.successful_rebinds);
   REQUIRE(conn_state->take_captured_plan_if_current() == nullptr);
   REQUIRE_FALSE(conn_state->take_captured_original_views_if_current().has_value());
+}
+
+TEST_CASE(
+  "Sirius configuration keeps join larger-side partitioning off by default and accepts a "
+  "YAML override",
+  "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config defaults;
+  REQUIRE_FALSE(defaults.get_operator_params().enable_join_larger_side_partitioning);
+  REQUIRE_FALSE(sirius::config::DEFAULT_ENABLE_JOIN_LARGER_SIDE_PARTITIONING);
+
+  sirius::sirius_config enabled;
+  REQUIRE_NOTHROW(
+    enabled.load_from_file(data_dir / "valid_join_larger_side_partitioning_enable.yaml"));
+  REQUIRE(enabled.get_operator_params().enable_join_larger_side_partitioning);
+
+  sirius::sirius_config invalid_type;
+  REQUIRE_THROWS_WITH(
+    invalid_type.load_from_file(data_dir / "invalid_join_larger_side_partitioning_type.yaml"),
+    Catch::Matchers::ContainsSubstring("operator_params.enable_join_larger_side_partitioning") &&
+      Catch::Matchers::ContainsSubstring("bad conversion"));
 }
 
 TEST_CASE("Sirius configuration enables dense count join by default and accepts a YAML override",
