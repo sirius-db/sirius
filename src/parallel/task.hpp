@@ -18,6 +18,7 @@
 
 #include "exec/query_lifecycle_registry.hpp"
 #include "helper/helper.hpp"
+#include "memory/reservation_wait.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -25,6 +26,7 @@
 
 #include <cucascade/memory/memory_reservation.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 
@@ -108,6 +110,12 @@ class itask {
   {
     return std::move(_work_lease);
   }
+
+  // Pending reservations remain in the scheduler queue, visible to spilling. A short retry
+  // deadline prevents the oldest waiting task from monopolizing every dispatch opportunity.
+  std::chrono::steady_clock::time_point retry_not_before{};
+  memory::reservation_wait memory_wait;
+  exec::query_lifecycle_registry::memory_wait_guard memory_wait_activity;
 
   // Execution function.
   virtual void execute(::cuda::stream_ref stream) = 0;
