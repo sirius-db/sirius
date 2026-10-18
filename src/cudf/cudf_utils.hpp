@@ -16,14 +16,11 @@
 
 #pragma once
 
-#include <cudf/version_config.hpp>
-#define CUDF_VERSION_NUM (CUDF_VERSION_MAJOR * 100 + CUDF_VERSION_MINOR)
-
+#include "cudf/ast_compat.hpp"
 #include "helper/logical_type.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/aggregation.hpp>
-#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
@@ -71,18 +68,14 @@
 namespace sirius {
 
 /**
- * @brief Apply a boolean retention mask using the cuDF 26.08 API.
+ * @brief Apply a boolean retention mask.
  */
 inline std::unique_ptr<cudf::table> ApplyRetentionMask(cudf::table_view const& input,
                                                        cudf::column_view const& retention_mask,
                                                        ::cuda::stream_ref stream,
                                                        rmm::device_async_resource_ref mr)
 {
-#if CUDF_VERSION_NUM >= 2610
   return cudf::apply_retention_mask(input, retention_mask, stream, mr);
-#else
-  return cudf::apply_boolean_mask(input, retention_mask, stream, mr);
-#endif
 }
 
 /**

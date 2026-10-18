@@ -34,6 +34,7 @@
 // standard library
 #include <algorithm>
 #include <cstddef>
+#include <ranges>
 #include <variant>
 
 // Single source of truth for "how many cuDF AST operators does this Sirius AST
@@ -43,7 +44,7 @@
 //
 // The method name carries the cuDF coupling: counts are tied to cuDF's
 // ast_operator set, supported_ast_cast_types, supported_ast_functions, and
-// known cuDF AST limitations (no CASE, no COALESCE, decimal-intermediate bug,
+// known cuDF AST limitations (no CASE, no COALESCE, decimal arithmetic,
 // etc.). A new AST backend would need its own equivalent method, not a
 // generic rename.
 
@@ -129,9 +130,12 @@ std::size_t in_list::cudf_ast_op_count() const
 
 std::size_t function_call::cudf_ast_op_count() const
 {
-  // DECIMAL output -> 0 (cuDF AST chokes on intermediate decimal results
-  // until https://github.com/rapidsai/cudf/pull/21996 lands).
-  if (return_type().id() == sirius::type_id::DECIMAL) { return 0; }
+  // Materialize every decimal function: cuDF AST does not enforce DuckDB's result width and scale.
+  if (return_type().is_decimal() || std::ranges::any_of(arguments(), [](auto const& arg) {
+        return arg->return_type().is_decimal();
+      })) {
+    return 0;
+  }
   bool const supported =
     std::find(supported_ast_functions.begin(), supported_ast_functions.end(), function()) !=
     supported_ast_functions.end();

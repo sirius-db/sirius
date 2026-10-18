@@ -21,14 +21,10 @@
  *        column indices through scan_plan and skipping hive-partition columns.
  */
 
-// libcudf's AST header uses std::variant without including <variant>.
-// clang-format off
-#include <variant>
-#include <cudf/aggregation.hpp>
-#include <cudf/ast/expressions.hpp>
-// clang-format on
+#include "cudf/ast_compat.hpp"
 #include "utils/test_validation_utility.hpp"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>

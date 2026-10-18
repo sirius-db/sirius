@@ -28,8 +28,9 @@
  *        through 64-bit XXHash_64 fingerprints (pinned against a host reference of the same hash).
  */
 
+#include "cudf/ast_compat.hpp"
+
 #include <cudf/aggregation.hpp>
-#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/hashing.hpp>
