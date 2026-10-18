@@ -170,7 +170,8 @@ void downgrade_executor::note_failed_conversion(char const* what)
     steady_now_ns() + std::chrono::duration_cast<std::chrono::nanoseconds>(kSpillPause).count());
   SIRIUS_LOG_ERROR(
     "[downgrade] [{}] {} conversions in a row failed (last: {}); spilling paused for {} s, so "
-    "queries waiting for memory fail instead of retrying. Is the disk tier full or unwritable?",
+    "queries waiting for memory fail instead of retrying. A full or unwritable disk tier fails "
+    "every conversion this way.",
     _source_label,
     failed,
     what,
@@ -614,8 +615,10 @@ void downgrade_executor::monitor_loop()
   bool backed_off = false;
 
   while (_running.load()) {
+    // Not while spilling is paused: the request would be answered at once, and logged each period.
     if (_memory_space && _memory_space->should_downgrade_memory() &&
-        !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
+        !_monitor_request_enqueued.load(std::memory_order_relaxed) &&
+        steady_now_ns() >= _spill_paused_until_ns.load()) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
       // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
       // re-firing would just re-scan every repository and the task queue, free nothing, and spam
