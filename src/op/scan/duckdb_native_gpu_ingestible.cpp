@@ -64,6 +64,8 @@ namespace {
 //===----------Batch Coalescer----------===//
 class duckdb_native_batch_coalescer : public batch_coalescer {
  public:
+  std::size_t target_batch_bytes() const noexcept override { return _cap; }
+  std::size_t retained_bytes() const noexcept override { return _acc_bytes; }
   duckdb_native_batch_coalescer(std::size_t approximate_batch_size, std::vector<bool> is_varchar)
     : _cap(approximate_batch_size),
       _is_varchar(std::move(is_varchar)),
