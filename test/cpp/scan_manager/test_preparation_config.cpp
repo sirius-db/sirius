@@ -21,13 +21,13 @@
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
-TEST_CASE("Preparation options default to unlimited jobs and preserve post-resolution overrides",
+TEST_CASE("Preparation options bound metadata jobs and preserve post-resolution overrides",
           "[scan_preparation][preparation_config]")
 {
   sirius::scan_manager::scan_manager_config config;
   config.thread_pool.num_threads = 3;
   auto defaults                  = config.preparation.resolve(3);
-  CHECK(defaults.max_inflight_metadata_jobs == 0);
+  CHECK(defaults.max_inflight_metadata_jobs == 4096);
   CHECK(defaults.max_inflight_dv_jobs == 0);
   config.preparation.max_inflight_metadata_jobs = 0;
   config.preparation.max_inflight_dv_jobs       = 0;
@@ -37,7 +37,7 @@ TEST_CASE("Preparation options default to unlimited jobs and preserve post-resol
   CHECK(defaults.max_control_work > 0);
   CHECK(defaults.drain_quantum > 0);
   CHECK(defaults.interrupt_check_interval == std::chrono::milliseconds(10));
-  CHECK_FALSE(defaults.partial_batch);
+  CHECK(defaults.partial_batch);
   config.preparation.interrupt_check_interval   = std::chrono::milliseconds(3);
   config.preparation.max_inflight_metadata_jobs = 2;
   config.preparation.max_inflight_dv_jobs       = 7;
@@ -106,19 +106,17 @@ TEST_CASE("Manager construction validates preparation before creating worker or 
                     "preparation limits must be positive");
 }
 
-TEST_CASE("Size-based partial batching is opt-in with validated bounds",
+TEST_CASE("Size-based partial batching defaults to bounded residence with validated overrides",
           "[scan_preparation][preparation_config][partial_batch]")
 {
   using namespace sirius::scan_manager;
   using namespace std::chrono_literals;
   preparation_config config;
-  REQUIRE_FALSE(config.resolve(4).partial_batch);
-  config.partial_batch = partial_batch_options{};
-  auto defaults        = config.resolve(4);
+  auto defaults = config.resolve(4);
   REQUIRE(defaults.partial_batch);
   CHECK(defaults.partial_batch->min_fill_percent == 50);
   CHECK(defaults.partial_batch->min_residence == 50ms);
-  CHECK(defaults.partial_batch->max_residence == 1s);
+  CHECK(defaults.partial_batch->max_residence == 2s);
   config.partial_batch = partial_batch_options{25, 20ms, 500ms};
   auto changed         = config.resolve(4);
   CHECK(changed.partial_batch->min_fill_percent == 25);

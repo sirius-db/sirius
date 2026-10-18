@@ -102,17 +102,17 @@ TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
 {
   auto [body, fill, min_ms, max_ms, interrupt_ms] =
     GENERATE(table<std::string, int, int, int, int>({
-      {"", 0, 0, 0, 10},
-      {"      preparation: {}\n", 0, 0, 0, 10},
-      {"      preparation:\n        max_inflight_metadata_jobs: 0\n", 0, 0, 0, 10},
-      {"      preparation:\n        max_inflight_dv_jobs: 0\n", 0, 0, 0, 10},
-      {"      preparation:\n        interrupt_check_interval: 3\n", 0, 0, 0, 3},
-      {"      preparation:\n        interrupt_check_interval: 1s\n", 0, 0, 0, 1000},
-      {"      preparation:\n        partial_batch: {}\n", 50, 50, 1000, 10},
+      {"", 50, 50, 2000, 10},
+      {"      preparation: {}\n", 50, 50, 2000, 10},
+      {"      preparation:\n        max_inflight_metadata_jobs: 0\n", 50, 50, 2000, 10},
+      {"      preparation:\n        max_inflight_dv_jobs: 0\n", 50, 50, 2000, 10},
+      {"      preparation:\n        interrupt_check_interval: 3\n", 50, 50, 2000, 3},
+      {"      preparation:\n        interrupt_check_interval: 1s\n", 50, 50, 2000, 1000},
+      {"      preparation:\n        partial_batch: {}\n", 50, 50, 2000, 10},
       {"      preparation:\n        partial_batch:\n          min_fill_percent: 25\n",
        25,
        50,
-       1000,
+       2000,
        10},
       {"      preparation:\n        partial_batch:\n          min_residence: 20\n"
        "          max_residence: 500ms\n",
@@ -137,16 +137,13 @@ TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
   auto resolved           = sirius::parsed_sirius_config::from_file(yaml.path()).resolve(topology);
   auto const& config      = resolved.get_scan_manager_config();
   auto options            = config.preparation.resolve(config.thread_pool.num_threads);
-  if (fill == 0) {
-    CHECK_FALSE(options.partial_batch);
-  } else {
-    REQUIRE(options.partial_batch);
-    CHECK(options.partial_batch->min_fill_percent == static_cast<size_t>(fill));
-    CHECK(options.partial_batch->min_residence == std::chrono::milliseconds{min_ms});
-    CHECK(options.partial_batch->max_residence == std::chrono::milliseconds{max_ms});
-  }
+  REQUIRE(options.partial_batch);
+  CHECK(options.partial_batch->min_fill_percent == static_cast<size_t>(fill));
+  CHECK(options.partial_batch->min_residence == std::chrono::milliseconds{min_ms});
+  CHECK(options.partial_batch->max_residence == std::chrono::milliseconds{max_ms});
   CHECK(options.interrupt_check_interval == std::chrono::milliseconds{interrupt_ms});
-  CHECK(options.max_inflight_metadata_jobs == 0);
+  CHECK(options.max_inflight_metadata_jobs ==
+        (body.find("max_inflight_metadata_jobs: 0") != std::string::npos ? 0 : 4096));
   CHECK(options.max_inflight_dv_jobs == 0);
 }
 
@@ -180,7 +177,7 @@ TEST_CASE("Partial batch YAML rejects invalid policies and unknown keys",
                         "max_residence: 0",
                         "max_residence: 49ms",
                         "max_residence: []",
-                        "min_residence: 2s",
+                        "min_residence: 3s",
                         "min_fill: 50");
   INFO(field);
   scoped_yaml yaml(
@@ -221,13 +218,13 @@ TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
                     options.lookahead_batches,
                     options.max_control_work,
                     options.drain_quantum};
-  std::array<size_t, 5> defaults{0, 0, 2, 3, 3};
+  std::array<size_t, 5> defaults{4096, 0, 2, 3, 3};
   for (size_t i = 0; i < keys.size(); ++i) {
     INFO(keys[i]);
     CHECK(actual[i] ==
           ((selected == 5 || selected == static_cast<int>(i)) ? values[i] : defaults[i]));
   }
-  CHECK_FALSE(options.partial_batch);
+  CHECK(options.partial_batch);
   CHECK(options.interrupt_check_interval == std::chrono::milliseconds{10});
 }
 

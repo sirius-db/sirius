@@ -284,7 +284,7 @@ struct fixture {
   }
 };
 }  // namespace
-TEST_CASE("Omitted and zero job limits allow submission while the worker is blocked",
+TEST_CASE("Default and zero job limits allow submission while the worker is blocked",
           "[scan_preparation][coordinator]")
 {
   preparation_config config;
@@ -585,11 +585,12 @@ TEST_CASE("GPU completion without a ready event still stops preparation and sett
   f.finish();
   CHECK(out->count() == 0);
 }
-TEST_CASE("Production defaults retain a small batch until more metadata or EOS",
+TEST_CASE("Production defaults publish a small batch at the deadline while metadata is blocked",
           "[scan_preparation][coordinator]")
 {
   auto options = preparation_config{}.resolve(2);
-  REQUIRE_FALSE(options.partial_batch);
+  REQUIRE(options.partial_batch);
+  REQUIRE(options.partial_batch->max_residence == 2s);
   fixture f(2, 4, k_interrupt_check_interval, options);
   auto out       = std::make_shared<sink>();
   auto a         = std::make_shared<accumulator>();
@@ -610,10 +611,16 @@ TEST_CASE("Production defaults retain a small batch until more metadata or EOS",
   REQUIRE(h->await());
   std::this_thread::sleep_for(30ms);
   CHECK(out->count() == 0);
+  {
+    std::unique_lock lock(out->mutex);
+    REQUIRE(out->cv.wait_for(lock, 3s, [&] { return !out->published.empty(); }));
+  }
+  CHECK_FALSE(out->closed);
+  CHECK(f.coordinator.snapshot().partial_emissions == 1);
+  CHECK(f.coordinator.snapshot().max_residence >= 2s);
   h->release();
   REQUIRE(out->await_closed());
-  CHECK(out->count() == 1);
-  CHECK(f.coordinator.snapshot().partial_emissions == 0);
+  CHECK(out->count() == 2);
 }
 TEST_CASE("Cancellation racing with a deadline never publishes after recognition",
           "[scan_preparation][coordinator]")
@@ -1364,7 +1371,7 @@ TEST_CASE("Size-based partial emission respects fill and minimum residence",
     } else {
       std::this_thread::sleep_for(20ms);
       CHECK(out->count() == 0);
-      milliseconds = 1100;
+      milliseconds = 2100;
       f.coordinator.wake_for_testing();
       REQUIRE(out->await(1));
     }
@@ -1417,7 +1424,7 @@ TEST_CASE("Size-based partial emission waits for consumption but timeout can use
   std::this_thread::sleep_for(20ms);
   CHECK(out->count() == 1);
   if (timeout) {
-    milliseconds = 1100;
+    milliseconds = 2100;
     f.coordinator.wake_for_testing();
   } else {
     out->consume();  // The existing callback must wake the owner without new metadata.

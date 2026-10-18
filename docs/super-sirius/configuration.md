@@ -485,19 +485,19 @@ Those two knobs derive the settings below, which are therefore **not** individua
 
 ### `sirius.executor.scan_manager.preparation`
 
-These settings are loaded at initialization. Job limits default to unlimited; `0` also disables them. Other count limits must be positive integers. Control limits default to the scan worker count, N (`scan_manager.num_threads`); `lookahead_batches` defaults to 2. Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
+These settings are loaded at initialization. Metadata jobs default to a limit of 4096; DV jobs have no configured count cap by default. `0` disables either job limit. Other count limits must be positive integers. Control limits default to the scan worker count, N (`scan_manager.num_threads`); `lookahead_batches` defaults to 2. Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
 
 | Key | Default | Description |
 |---|---|---|
-| `max_inflight_metadata_jobs` | unlimited | Maximum submitted metadata preparation jobs, including queued work. Omitted or `0` means unlimited. Completion returns the job slot. |
+| `max_inflight_metadata_jobs` | 4096 | Maximum submitted metadata preparation jobs across the query, including queued work. `0` means unlimited. Completion returns the job slot. |
 | `max_inflight_dv_jobs` | unlimited | Maximum DV preparation jobs holding temporary-memory permits, including queued work. Omitted or `0` imposes no configured count cap. Admission may grant fewer permits when HOST memory is insufficient. |
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
-| `partial_batch` | disabled | Optional partial-publication policy. Omit the block to disable it; an empty block enables the defaults below. |
+| `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
 | `partial_batch.min_fill_percent` | 50 | Minimum retained size as a percentage of the normal batch target for early publication. Integer from 1 to 100. Uses the coalescer's batch-size accounting. |
 | `partial_batch.min_residence` | 50 ms | Minimum age before early publication. Also requires the size threshold and no batch from this scan waiting for downstream consumption. Must be positive. |
-| `partial_batch.max_residence` | 1 s | Maximum wait for more metadata, even below the size threshold or with a batch waiting downstream. Must be at least `min_residence`. Output backpressure and scheduling can delay publication. |
+| `partial_batch.max_residence` | 2 s | Maximum wait for more metadata, even below the size threshold or with a batch waiting downstream. Must be at least `min_residence`. Output backpressure and scheduling can delay publication. |
 | `interrupt_check_interval` | 10 ms | Maximum wait between interruption checks while preparation is idle. Must be positive. Draining an active read can take longer. |
 
 Both residence times start when the first input enters an empty accumulator; later arrivals do not reset them. Normal full-batch, compatibility-boundary, final-flush, and window-progress publication still apply. Downstream consumption means taking the batch from the connector, not completing GPU execution. To express a fixed time limit, set both residence values to the same duration.
@@ -509,7 +509,7 @@ sirius:
   executor:
     scan_manager:
       preparation:
-        max_inflight_metadata_jobs: 0
+        max_inflight_metadata_jobs: 4096
         max_inflight_dv_jobs: 0
         lookahead_batches: 2
         max_control_work: 4
@@ -517,7 +517,7 @@ sirius:
         partial_batch:
           min_fill_percent: 50
           min_residence: 50ms
-          max_residence: 1s
+          max_residence: 2s
         interrupt_check_interval: 5ms
 ```
 

@@ -3639,7 +3639,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(observed.routes.front().second);
   auto publication = observed.publication();
   CHECK(publication.partial_emissions == 0);
-  REQUIRE_FALSE(sirius::scan_manager::preparation_config{}.resolve(1).partial_batch);
+  auto policy = sirius::scan_manager::preparation_config{}.resolve(1).partial_batch;
+  REQUIRE(policy);
+  CHECK(policy->max_residence == std::chrono::seconds(2));
   CHECK(publication.max_residence == std::chrono::microseconds(0));
 }
 
