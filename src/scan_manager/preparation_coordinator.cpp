@@ -92,7 +92,7 @@ struct preparation_coordinator::state {
     {
       // Also order capture release before settlement when dispatch discards the task.
       work = {};
-      if (active && !completed) st->settle(index, {});
+      if (active && !completed) st->abandon(index);
     }
   };
   void stop() noexcept
@@ -160,6 +160,12 @@ struct preparation_coordinator::state {
     s.status    = slot::phase::free;
     s.next_free = free_slot;
     free_slot   = index;
+  }
+  void abandon(size_t index) noexcept
+  {
+    lock_type lock(gate->mutex);
+    release_slot(index, lock);
+    gate->cv.notify_all();
   }
   // Runs only after work and its input captures have been physically released.
   void settle(size_t index, std::unique_ptr<op::scan::scan_info> value) noexcept

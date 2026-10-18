@@ -729,8 +729,10 @@ TEST_CASE("Rejected and abandoned job settlement allocate no host memory",
 {
   using fault = sirius::test::scoped_host_allocation_fault;
   REQUIRE(fault::available());
-  const bool abandoned = GENERATE(false, true);
-  CAPTURE(abandoned);
+  enum class path { rejected, abandoned, submission_error };
+  auto mode            = GENERATE(path::rejected, path::abandoned, path::submission_error);
+  const bool abandoned = mode == path::abandoned;
+  CAPTURE(static_cast<int>(mode));
   fixture f(1, 1);
   struct measurement {
     std::optional<fault> counting;
@@ -780,7 +782,7 @@ TEST_CASE("Rejected and abandoned job settlement allocate no host memory",
   REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
   REQUIRE(unit->complete_input(checkpoint_input{7}));
   std::function<std::unique_ptr<sirius::op::scan::scan_info>()> work;
-  if (abandoned) {
+  if (mode != path::rejected) {
     struct arm_on_destroy {
       std::shared_ptr<measurement> measured;
       explicit arm_on_destroy(std::shared_ptr<measurement> measured) : measured(std::move(measured))
@@ -793,8 +795,10 @@ TEST_CASE("Rejected and abandoned job settlement allocate no host memory",
       ++work_calls;
       return std::make_unique<tagged>(1);
     };
-    f.dispatcher.enqueue([blocked] { blocked->wait(); });
-    REQUIRE(blocked->await());
+    if (abandoned) {
+      f.dispatcher.enqueue([blocked] { blocked->wait(); });
+      REQUIRE(blocked->await());
+    }
   } else {
     work = [&, measured] {
       ++work_calls;
@@ -807,22 +811,31 @@ TEST_CASE("Rejected and abandoned job settlement allocate no host memory",
   f.source(std::make_shared<accumulator>(1),
            std::make_shared<sink>(),
            single_job(std::move(work), std::move(unit)));
+  if (mode == path::submission_error) {
+    auto original = std::make_exception_ptr(std::runtime_error("submission failed before enqueue"));
+    f.coordinator.before_submission_for_testing([original] { std::rethrow_exception(original); });
+  }
   f.start();
-  auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (f.coordinator.snapshot().wakes < 2 && std::chrono::steady_clock::now() < deadline)
-    std::this_thread::yield();
-  REQUIRE(f.coordinator.snapshot().wakes >= 2);
-  if (!abandoned) REQUIRE(blocked->await());
-  f.coordinator.request_stop(stop_reason::normal_eos);
-  blocked->release();
+  if (mode != path::submission_error) {
+    auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (f.coordinator.snapshot().wakes < 2 && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    REQUIRE(f.coordinator.snapshot().wakes >= 2);
+    if (!abandoned) REQUIRE(blocked->await());
+    f.coordinator.request_stop(stop_reason::normal_eos);
+    blocked->release();
+  }
   f.finish();
   CHECK_FALSE(f.owner_error);
-  CHECK_FALSE(f.completion.has_error());
-  CHECK(work_calls == (abandoned ? 0 : 1));
+  CHECK(f.completion.has_error() == (mode == path::submission_error));
+  if (mode == path::submission_error)
+    CHECK_THROWS_WITH(f.completion.get_awaitable().get(), "submission failed before enqueue");
+  CHECK(work_calls == (mode == path::rejected ? 1 : 0));
   CHECK(measured->control_fired);
   CHECK(measured->same_thread);
   CHECK(measured->finished);
   CHECK(measured->allocations == 0);
+  CHECK(f.coordinator.snapshot().results_peak == 0);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 
