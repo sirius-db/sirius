@@ -65,7 +65,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
   // Carrier restores must reach the materialized branch, the only path authorized to use the
   // physical representation tunnel. Semantic casts may use the cuDF AST path.
   if (ast_supported && alt.kind == sirius::ast::cast_kind::semantic &&
-      _strategy != expression_evaluator_strategy::MATERIALIZE &&
+      _policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto child            = evaluate(*alt.child, evaluation_mode::AST);
     auto const& cast_expr = _ast_tree.emplace<cudf::ast::operation>(

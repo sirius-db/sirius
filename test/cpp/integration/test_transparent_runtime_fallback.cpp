@@ -192,11 +192,6 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
                  "transparent execution: specialized regex matches generic implementation",
                  "[transparent][integration][regex-jit-differential][regexp_replace]")
 {
-  struct regex_jit_restore_guard {
-    bool original;
-    ~regex_jit_restore_guard() { duckdb::Config::ENABLE_REGEX_JIT_IMPL = original; }
-  } restore_regex_jit{duckdb::Config::ENABLE_REGEX_JIT_IMPL};
-
   // Keep regexp_replace visible instead of the unsupported v2 rewrite (#2146).
   sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
 
@@ -233,7 +228,7 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
       con->Query(std::string{"SET enable_regex_jit_impl = "} + (enabled ? "true" : "false"));
     REQUIRE(setting != nullptr);
     REQUIRE_FALSE(setting->HasError());
-    REQUIRE(duckdb::Config::ENABLE_REGEX_JIT_IMPL == enabled);
+    REQUIRE(duckdb::session_operator_params(*con->context).enable_regex_jit == enabled);
 
     auto const before = sirius::test::get_transparent_execution_stats(*con);
     auto query        = std::string{R"SQL(

@@ -75,6 +75,8 @@ void install_log_sink_from_env()
   auto const* log_dir_env = std::getenv("SIRIUS_LOG_DIR");
   auto const* level_env   = std::getenv("SIRIUS_LOG_LEVEL");
   if (!backend_env && !log_dir_env && !level_env) { return; }
+  // Serialize the complete settings update, including rollback if sink creation fails.
+  std::lock_guard log_lock(duckdb::Config::logging_mutex);
   auto previous_backend = duckdb::Config::LOG_BACKEND;
   auto previous_log_dir = duckdb::Config::LOG_DIR;
   auto previous_level   = duckdb::Config::LOG_LEVEL;

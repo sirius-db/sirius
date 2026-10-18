@@ -15,7 +15,7 @@
  */
 
 #pragma once
-
+#include "expression_evaluator/query_policy.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 
 #include <cudf/types.hpp>
@@ -169,6 +169,7 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 
 /// Per-pin materialization behavior, sampled from config at pin time.
 struct pin_materialization_options {
+  expression_query_policy expression_policy;
   bool capture_chunk_stats               = true;   ///< capture zone-map statistics per chunk
   bool enable_compressed_materialization = false;  ///< narrow eligible numeric and DATE carriers
   /// Positional with the pinned columns: observe this column for whole-table

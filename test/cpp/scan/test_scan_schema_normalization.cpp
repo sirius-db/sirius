@@ -57,6 +57,7 @@
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
+#include <pipeline/sirius_pipeline.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -171,6 +172,8 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
   {
   }
 
+  std::optional<sirius::expression_query_policy> observed_policy;
+
   std::unique_ptr<cudf::table> post_filter_and_project(
     sirius::op::scan::filtered_table&&,
     const cucascade::memory::memory_space&,
@@ -178,8 +181,10 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
     bool,
     std::shared_ptr<const sirius::like_multiliteral_cache>,
     std::unique_ptr<cudf::column>*,
-    std::span<std::size_t const> /*elided*/) override
+    std::span<std::size_t const> /*elided*/,
+    sirius::expression_query_policy policy) override
   {
+    observed_policy = policy;
     return _produce();
   }
 
@@ -197,7 +202,8 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
     const cucascade::memory::memory_space&,
     ::cuda::stream_ref,
     bool,
-    std::shared_ptr<const sirius::like_multiliteral_cache>) override
+    std::shared_ptr<const sirius::like_multiliteral_cache>,
+    sirius::expression_query_policy /*policy*/) override
   {
     throw std::logic_error("stub_ingestible: a resident split never decodes scan metadata");
   }
@@ -663,4 +669,35 @@ TEST_CASE("prepare stamps the outcome of a decode another converter already ran"
   CHECK(input.pushdown_predicates_enforced);
   CHECK(input.stolen_table == nullptr);
   CHECK_FALSE(input.converted_table_steal_pending);
+}
+
+TEST_CASE("scan forwards its pipeline expression policy to residual filtering",
+          "[scan_normalization][gpu_scan][query_options]")
+{
+  auto& e         = env();
+  auto batch      = make_resident_batch(e, kRows);
+  auto ingestible = std::make_shared<stub_ingestible>([&e] {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(make_column(*e.gpu_space, cudf::data_type{cudf::type_id::INT64}, kRows));
+    return std::make_unique<cudf::table>(std::move(columns));
+  });
+  for (auto strategy : {sirius::expression_evaluator_strategy::MATERIALIZE,
+                        sirius::expression_evaluator_strategy::AST_JIT}) {
+    auto scan = make_bigint_scan(ingestible);
+    sirius::operator_params options;
+    options.expression_strategy = strategy;
+    options.enable_regex_jit    = strategy != sirius::expression_evaluator_strategy::MATERIALIZE;
+    sirius::pipeline::pipeline_build_context ctx{
+      nullptr, true, 1, std::make_shared<const sirius::operator_params>(options)};
+    scan.set_pipeline(std::make_shared<sirius::pipeline::sirius_pipeline>(ctx));
+    sirius::op::scan::scan_operator_input input(batch);
+    input.gpu_memory_space = e.gpu_space;
+    admit_fixture_resident_input(input);
+    ingestible->observed_policy.reset();
+    auto result = scan.execute(input, e.stream());
+    REQUIRE(ingestible->observed_policy.has_value());
+    CHECK(ingestible->observed_policy->strategy == strategy);
+    CHECK(ingestible->observed_policy->regex_jit == options.enable_regex_jit);
+    e.stream().sync();
+  }
 }

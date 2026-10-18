@@ -140,11 +140,11 @@ expression_evaluator::expression_evaluator(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
-  : _strategy(strategy),
+  : _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
@@ -161,14 +161,14 @@ expression_evaluator::expression_evaluator(
   sirius::ast::node const& expression,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
   : expression_evaluator(&expression,
                          resource_ref,
                          stream,
-                         strategy,
+                         policy,
                          min_ast_size,
                          like_swar_fastpath,
                          std::move(like_cache))
@@ -179,11 +179,11 @@ expression_evaluator::expression_evaluator(
   sirius::ast::node const* expression,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
-  : _strategy(strategy),
+  : _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
@@ -197,12 +197,12 @@ expression_evaluator::expression_evaluator(
   std::vector<sirius::ast::node const*> expressions,
   rmm::device_async_resource_ref resource_ref,
   ::cuda::stream_ref stream,
-  expression_evaluator_strategy strategy,
+  expression_query_policy policy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
   std::shared_ptr<like_multiliteral_cache const> like_cache)
   : _ast_expressions(std::move(expressions)),
-    _strategy(strategy),
+    _policy(policy),
     _mr(resource_ref),
     _stream(stream),
     _min_ast_size(min_ast_size),
@@ -232,7 +232,7 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_ast(expr_ref root_e
   }
 
   cudf::table_view combined_table_view(combined_column_views);
-  if (_strategy == expression_evaluator_strategy::AST_INTERPRET) {
+  if (_policy.strategy == expression_evaluator_strategy::AST_INTERPRET) {
     return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
   } else {
     return cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);

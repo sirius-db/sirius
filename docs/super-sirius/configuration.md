@@ -485,29 +485,39 @@ Those two knobs derive the settings below, which are therefore **not** individua
 
 ### `sirius.executor.scan_manager.preparation`
 
-These settings are loaded at initialization. Count limits must be positive integers. Omitted limits are derived from the scan worker count, N (`scan_manager.num_threads`). Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
+These settings are loaded at initialization. Metadata jobs default to a limit of 4096; DV jobs have no configured count cap by default. `0` disables either job limit. Other count limits must be positive integers. Control limits default to the scan worker count, N (`scan_manager.num_threads`); `lookahead_batches` defaults to 2. Timing values accept suffixes such as `20ms` or `1s`; bare integers are milliseconds.
 
 | Key | Default | Description |
 |---|---|---|
-| `max_inflight_jobs` | N | Maximum concurrent preparation jobs. |
-| `max_active_units` | 2N | Maximum active preparation units. |
-| `max_pending_results` | 2N | Capacity for result slots and pending output batches. |
+| `max_inflight_metadata_jobs` | 4096 | Maximum submitted metadata preparation jobs across the query, including queued work. `0` means unlimited. Completion returns the job slot. |
+| `max_inflight_dv_jobs` | unlimited | Maximum DV preparation jobs holding temporary-memory permits, including queued work. Omitted or `0` imposes no configured count cap. Admission may grant fewer permits when HOST memory is insufficient. |
+| `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
-| `underfilled_batch_residence` | 10 ms | Time from the first retained input until an underfilled batch becomes due. New arrivals do not reset it. `0` disables timed publication; negative values are rejected. Output backpressure and scheduling can delay publication. |
+| `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
+| `partial_batch.min_fill_percent` | 50 | Minimum retained size as a percentage of the normal batch target for early publication. Integer from 1 to 100. Uses the coalescer's batch-size accounting. |
+| `partial_batch.min_residence` | 50 ms | Minimum age before early publication. Also requires the size threshold and no batch from this scan waiting for downstream consumption. Must be positive. |
+| `partial_batch.max_residence` | 2 s | Maximum wait for more metadata, even below the size threshold or with a batch waiting downstream. Must be at least `min_residence`. Output backpressure and scheduling can delay publication. |
 | `interrupt_check_interval` | 10 ms | Maximum wait between interruption checks while preparation is idle. Must be positive. Draining an active read can take longer. |
+
+Both residence times start when the first input enters an empty accumulator; later arrivals do not reset them. Normal full-batch, compatibility-boundary, final-flush, and window-progress publication still apply. Downstream consumption means taking the batch from the connector, not completing GPU execution. To express a fixed time limit, set both residence values to the same duration.
+
+A file with a DV currently reads its footer and prepares its DV in the same job, so it uses a metadata job slot and a DV permit. The metadata limit does not size the DV reservation: admission reserves retained results plus K temporary workspaces, where K is bounded by the DV unit count, `scan_manager.num_threads`, and the DV limit when nonzero. Insufficient HOST memory may reduce K further. Neither setting changes the worker thread count. The previous `max_inflight_jobs` key is no longer accepted; use `max_inflight_metadata_jobs`.
 
 ```yaml
 sirius:
   executor:
     scan_manager:
       preparation:
-        max_inflight_jobs: 4
-        max_active_units: 8
-        max_pending_results: 8
+        max_inflight_metadata_jobs: 4096
+        max_inflight_dv_jobs: 0
+        lookahead_batches: 2
         max_control_work: 4
         drain_quantum: 4
-        underfilled_batch_residence: 20ms
+        partial_batch:
+          min_fill_percent: 50
+          min_residence: 50ms
+          max_residence: 2s
         interrupt_check_interval: 5ms
 ```
 
@@ -691,7 +701,11 @@ GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_mana
 
 ## DuckDB SET Variables
 
-Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
+Registered in `src/sirius_extension.cpp`. The `operator_params` setters, expression settings, and
+pin-compression settings are connection-local overrides of the defaults registered for the database;
+GLOBAL writes are rejected and RESET restores the registered default. Each execution uses one
+immutable operator-options snapshot. Logging updates serialize runtime-wide. Hardware decompression
+requires startup configuration.
 
 ### Logging
 
@@ -725,11 +739,17 @@ leaving the previous sink active.
 
 ### Expression Evaluation
 
-**File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
+**File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
+| `enable_regex_jit_impl` | true | Enable the specialized JIT implementation for supported regex patterns |
+
+These settings are connection-local: use `SET` or `SET SESSION`; `SET GLOBAL` is
+rejected. `RESET` restores the registered default. Query initialization captures both
+settings in an immutable snapshot, so later changes do not affect an existing query.
+Evaluators retain their own policy values rather than reading mutable global defaults.
 
 `expression_executor_strategy` remains registered as a deprecated compatibility alias for
 `expression_evaluator_strategy`; new configuration should use the evaluator name.
@@ -912,7 +932,6 @@ Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 
 | Flag | Value | Namespace |
 |------|-------|-----------|
-| `EXPRESSION_EVALUATOR_STRATEGY` | `ast_interpret` | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |

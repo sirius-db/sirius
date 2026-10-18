@@ -404,7 +404,8 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   const cucascade::memory::memory_space& mem_space,
   ::cuda::stream_ref stream,
   bool like_swar_fastpath,
-  std::shared_ptr<const sirius::like_multiliteral_cache> like_cache)
+  std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+  expression_query_policy policy)
 {
   auto const& split = dynamic_cast<parquet_split_info const&>(info);
   if (split.dependencies().size() != split.rg_slices.size()) {
@@ -443,7 +444,7 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   // reader to filter rows, positions stop identifying file rows and we refuse rather than
   // delete the wrong ones.
   auto base = parquet_gpu_ingestible::materialize_metadata_to_table(
-    info, mem_space, stream, like_swar_fastpath, std::move(like_cache));
+    info, mem_space, stream, like_swar_fastpath, std::move(like_cache), policy);
 
   if (!has_deletes) { return base; }
 

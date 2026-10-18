@@ -420,6 +420,12 @@ void sirius_physical_operator::set_pipeline(std::shared_ptr<pipeline::sirius_pip
   _pipeline = std::move(pipeline);
 }
 
+expression_query_policy sirius_physical_operator::expression_policy() const noexcept
+{
+  return _pipeline ? _pipeline->get_operator_params().expression_policy()
+                   : expression_query_policy{};
+}
+
 bool sirius_physical_operator::like_swar_fastpath_enabled() const noexcept
 {
   return _pipeline != nullptr && _pipeline->get_operator_params().like_swar_fastpath;

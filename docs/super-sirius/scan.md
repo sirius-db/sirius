@@ -394,10 +394,16 @@ pipeline completion; the normal GPU filter then removes its rows.
 
 **Statless entries and re-pinning.** Disabling the option before pinning skips the extra GPU work
 and creates an entry without zone maps. Turning the option on later does not retrofit statistics.
-A HOST re-pin replaces the entry. For an in-place GPU merge, the re-pin must cover every cached
-column and pass the normal merge-alignment checks; a strict subset cannot restore statistics.
-Unpinning and then re-pinning all required columns is the safest recovery. Merging a new GPU
-column while capture is disabled also drops the entry's existing zone maps.
+A HOST re-pin replaces the entry. A column-major GPU merge also builds a replacement generation
+privately, sharing the existing data columns and copying their metadata before appending new
+columns. To restore statistics, the re-pin must cover every cached column and pass the normal
+merge-alignment checks; a strict subset cannot restore statistics. Unpinning and then re-pinning
+all required columns is the safest recovery. Merging a new GPU column while capture is disabled
+drops the replacement generation's zone maps.
+
+Data and metadata are published together under the pin-registry lock. A failure before
+publication leaves the previous entry intact. SQL pin operations require exclusive maintenance;
+the direct column-merge API also rejects a merge while readers retain the existing entry.
 
 ## Batch Coalescing
 
@@ -624,6 +630,13 @@ Separately from the prefetching cache, the ioctx always exposes a `metadata_stor
 - **Evictor as backpressure.** When the buffer pool can't satisfy a load, the worker posts an eviction request and blocks until the evictor returns enough chunks; pool exhaustion is never a silent failure. Eviction walks LRU candidates using a per-chunk `chunk_lifecycle` score (query-tick aging plus insert/consume counts), so never-consumed entries are not evicted first.
 - **Multi-GPU safe.** Device reads carry the caller's device id; the reactor sets the device before the H2D copy, and pinned chunks are portable across CUDA contexts.
 - **Generations.** Cache entries are keyed by the io_object's cache id (path plus strong ETag for object stores, path for local files) and shared-owned: the map holds one owner while a generation is current, and a `cache_handle`, an in-flight fill, a queued completion, or a cached-copy retirement holds another for as long as it may touch the generation's chunks. Admitting a newer generation of a path retires the older ones — they leave the map, keep serving their holders, and are reclaimed synchronously when the last owner releases. The evictor only borrows. `generation_count(path)` and `retired_generation_count()` expose the state.
+
+Cache summaries report cumulative `global` counters and `last_cycle` deltas over a cache-wide
+interval between refreshes, not work attributed to one query. A refresh samples each counter
+once and advances the reporting baseline under one mutex; formatting and logging happen after
+releasing it. The scan manager logs that same captured report. Diagnostic `summary()` calls do
+not advance the baseline. Counter writers remain lock-free with respect to this mutex, so the
+five counters are individually sampled rather than an atomic snapshot of an entire read.
 
 ### Constants
 
