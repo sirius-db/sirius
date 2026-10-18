@@ -995,6 +995,26 @@ class cluster_lists_chunk_source : public vector_chunk_source {
   const vss::cluster_lists& _lists;
 };
 
+/// A corpus chunk for the fold: staged on @p stage_on under a reservation of its own, so its copy
+/// overlaps the compute on @p stream. That reservation is outside the one the task was admitted
+/// with, so it fails once another task's admission has taken the device's free memory; the
+/// chunk then comes from the task's own reservation, on @p stream, which the task's estimate
+/// already counts its staged chunks in. Failing instead retried the task with a doubled
+/// reservation, which left even less room for staging, until the retry asked for the whole device
+/// and waited for it forever (Deep10M self-join on a 2.5 GB device, two tasks admitted at once).
+staged_vector_chunk stage_for_fold(vector_chunk_source& source,
+                                   std::size_t j,
+                                   cucascade::memory::memory_space& space,
+                                   rmm::cuda_stream_view stage_on,
+                                   rmm::cuda_stream_view stream)
+{
+  try {
+    return source.stage(j, space, stage_on);
+  } catch (rmm::out_of_memory const&) {
+    return source.stage_for_task(j, space, stream);
+  }
+}
+
 }  // namespace
 
 std::unique_ptr<vector_chunk_source> make_materialized_chunk_source(
@@ -1561,7 +1581,7 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
     vss::staged_pinned_chunk staged_pin;
     cudf::column_view labels_view;
     if (build_labels) {
-      staged_build = build_labels->stage(j, space, stream);
+      staged_build = stage_for_fold(*build_labels, j, space, stream, stream);
       labels_view  = staged_build.view;
     } else {
       staged_pin = vss::stage_pinned_column_chunk(
@@ -3128,7 +3148,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           }
           return stage_compact(j);
         }
-        return direct ? staged_vector_chunk{} : _corpus->stage(j, *mem_space, stage_on);
+        return direct ? staged_vector_chunk{}
+                      : stage_for_fold(*_corpus, j, *mem_space, stage_on, stream);
       };
       prefetched = chunks.empty() ? staged_vector_chunk{} : stage_next(chunks[0]);
       if (sweep == 0 && seed) {
@@ -3597,12 +3618,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     if (_corpus->is_streaming()) { staging_stream.emplace(); }
     auto const stage_on = staging_stream ? staging_stream->view() : stream;
 
-    auto prefetched =
-      n_chunks > 0 ? _corpus->stage(0, *mem_space, stage_on) : staged_vector_chunk{};
+    auto prefetched = n_chunks > 0 ? stage_for_fold(*_corpus, 0, *mem_space, stage_on, stream)
+                                   : staged_vector_chunk{};
 
     auto advance = [&](std::size_t next) {
-      prefetched =
-        next < n_chunks ? _corpus->stage(next, *mem_space, stage_on) : staged_vector_chunk{};
+      prefetched = next < n_chunks ? stage_for_fold(*_corpus, next, *mem_space, stage_on, stream)
+                                   : staged_vector_chunk{};
     };
 
     // Borrowed build-side batches whose read locks have to outlive the searches reading them.

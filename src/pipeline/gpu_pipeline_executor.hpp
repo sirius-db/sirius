@@ -145,6 +145,19 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    */
   gpu_pipeline_task* cast_to_gpu_pipeline_task(sirius::parallel::itask* task);
 
+  /**
+   * @brief A reservation of @p bytes in this executor's memory space, waited for while any of its
+   * tasks is running.
+   *
+   * cucascade's make_reservation() sleeps until a reservation is released: memory freed any other
+   * way, a batch the downgrade executor spills, wakes nothing. And it settles for a partial
+   * reservation only once no reservation at all is left in the space, while pins, cached indexes
+   * and operator state hold reservations for a query's whole life. So this polls instead, and
+   * with none of this executor's tasks running -- no release is coming -- returns what the space
+   * has, which the caller's downgrade path takes from there. Null only when the executor stops.
+   */
+  std::unique_ptr<cucascade::memory::reservation> wait_for_reservation(std::size_t bytes);
+
   cucascade::memory::exclusive_stream_pool _stream_pool;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
@@ -154,6 +167,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
     std::make_shared<sirius::event::query_event_publisher>()};
   sirius::creator::task_creator* _task_creator{nullptr};
   std::atomic<size_t> _tasks_executed{0};
+  /// Dispatched tasks not yet finished: the only releases a reservation wait can count on.
+  std::atomic<size_t> _tasks_in_flight{0};
 };
 
 }  // namespace pipeline
