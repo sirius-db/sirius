@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "log/level.hpp"
 #include "log/sink.hpp"
+#include "sirius/ffi.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
 #include "utils/log_test_utils.hpp"
@@ -46,11 +47,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -1122,7 +1125,7 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
 
   auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
-  require_shared_operator_defaults(sirius_ctx->get_config().get_operator_params(), expected_batch);
+  require_shared_operator_defaults(duckdb::session_operator_params(*con.context), expected_batch);
 
   auto set = con.Query("SET scan_task_batch_size = 99");
   REQUIRE(set != nullptr);
@@ -1131,7 +1134,7 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE(set_readback != nullptr);
   REQUIRE_FALSE(set_readback->HasError());
   REQUIRE(set_readback->Collection().GetValue(0, 0).GetValue<uint64_t>() == 99);
-  REQUIRE(sirius_ctx->get_config().get_operator_params().scan_task_batch_size == 99);
+  REQUIRE(duckdb::session_operator_params(*con.context).scan_task_batch_size == 99);
 
   auto reset_setting = con.Query("RESET scan_task_batch_size");
   REQUIRE(reset_setting != nullptr);
@@ -1140,7 +1143,7 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE(reset != nullptr);
   REQUIRE_FALSE(reset->HasError());
   REQUIRE(reset->Collection().GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
-  REQUIRE(sirius_ctx->get_config().get_operator_params().scan_task_batch_size == expected_batch);
+  REQUIRE(duckdb::session_operator_params(*con.context).scan_task_batch_size == expected_batch);
 }
 
 TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius][config]")
@@ -1466,21 +1469,21 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       REQUIRE_THAT(rejected->GetError(),
                    Catch::Matchers::ContainsSubstring("enable_dynamic_filter_multi_partition"));
     }
-    REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+    REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
             17 * mib);
   }
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
   REQUIRE(zero_partition != nullptr);
   REQUIRE(zero_partition->HasError());
-  REQUIRE(sirius_ctx->get_config().get_operator_params().hash_partition_bytes == 3 * mib);
+  REQUIRE(duckdb::session_operator_params(*con.context).hash_partition_bytes == 3 * mib);
 
   auto negative_mark_join_ratio = con.Query("SET mark_join_build_switch_ratio = -1.0");
   REQUIRE(negative_mark_join_ratio != nullptr);
   REQUIRE(negative_mark_join_ratio->HasError());
   REQUIRE_THAT(negative_mark_join_ratio->GetError(),
                Catch::Matchers::ContainsSubstring("mark_join_build_switch_ratio must be >= 0.0"));
-  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+  REQUIRE(duckdb::session_operator_params(*con.context).mark_join_build_switch_ratio ==
           Approx(3.0));
 
   auto invalid_domain_threshold = con.Query("SET dynamic_filter_domain_coverage_threshold = 'NaN'");
@@ -1489,7 +1492,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE_THAT(invalid_domain_threshold->GetError(),
                Catch::Matchers::ContainsSubstring(
                  "dynamic_filter_domain_coverage_threshold must be finite and greater than 0.0"));
-  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_domain_coverage_threshold ==
+  REQUIRE(duckdb::session_operator_params(*con.context).dynamic_filter_domain_coverage_threshold ==
           Approx(0.8));
 
   auto invalid_keep_threshold = con.Query("SET dynamic_filter_keep_threshold = 'NaN'");
@@ -1498,7 +1501,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE_THAT(
     invalid_keep_threshold->GetError(),
     Catch::Matchers::ContainsSubstring("dynamic_filter_keep_threshold must be in [0.0, 1.0]"));
-  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_keep_threshold ==
+  REQUIRE(duckdb::session_operator_params(*con.context).dynamic_filter_keep_threshold ==
           Approx(0.7));
 
   for (auto const* bad_fraction : {"SET dynamic_filter_inlist_max_l2_fraction = -0.5",
@@ -1510,7 +1513,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
     REQUIRE_THAT(invalid_inlist_fraction->GetError(),
                  Catch::Matchers::ContainsSubstring(
                    "dynamic_filter_inlist_max_l2_fraction must be in [0.0, 1.0]"));
-    REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_inlist_max_l2_fraction ==
+    REQUIRE(duckdb::session_operator_params(*con.context).dynamic_filter_inlist_max_l2_fraction ==
             Approx(0.4));
   }
 
@@ -1519,19 +1522,19 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(nan_mark_join_ratio->HasError());
   REQUIRE_THAT(nan_mark_join_ratio->GetError(),
                Catch::Matchers::ContainsSubstring("mark_join_build_switch_ratio must be >= 0.0"));
-  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+  REQUIRE(duckdb::session_operator_params(*con.context).mark_join_build_switch_ratio ==
           Approx(3.0));
 
   auto zero_mark_join_ratio = con.Query("SET mark_join_build_switch_ratio = 0.0");
   REQUIRE(zero_mark_join_ratio != nullptr);
   REQUIRE_FALSE(zero_mark_join_ratio->HasError());
-  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+  REQUIRE(duckdb::session_operator_params(*con.context).mark_join_build_switch_ratio ==
           Approx(0.0));
 
   auto reset_mark_join_ratio = con.Query("RESET mark_join_build_switch_ratio");
   REQUIRE(reset_mark_join_ratio != nullptr);
   REQUIRE_FALSE(reset_mark_join_ratio->HasError());
-  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+  REQUIRE(duckdb::session_operator_params(*con.context).mark_join_build_switch_ratio ==
           Approx(3.0));
 
   for (auto const* value : {"-0.1", "'NaN'", "'Infinity'"}) {
@@ -1550,7 +1553,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
     REQUIRE(retained != nullptr);
     REQUIRE_FALSE(retained->HasError());
     REQUIRE(retained->Collection().GetValue(0, 0).GetValue<double>() == Approx(0.6));
-    REQUIRE(sirius_ctx->get_config().get_compression_config().max_compressed_fraction ==
+    REQUIRE(duckdb::session_compression_config(*con.context).max_compressed_fraction ==
             Approx(0.6));
   }
 
@@ -1568,14 +1571,18 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET enable_dynamic_filter");
   require_ok("SET enable_dynamic_filter_multi_partition = false");
   REQUIRE_FALSE(
-    sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_multi_partition);
-  require_ok("RESET enable_dynamic_filter_multi_partition");
+    duckdb::session_operator_params(*con.context).enable_dynamic_filter_multi_partition);
+  // Session overrides must leave the shared YAML defaults unchanged.
   REQUIRE(sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_multi_partition);
+  require_ok("RESET enable_dynamic_filter_multi_partition");
+  REQUIRE(duckdb::session_operator_params(*con.context).enable_dynamic_filter_multi_partition);
   require_ok("SET max_dynamic_filter_bloom_bytes_per_gpu = 18446744073709551615");
-  REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+  REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
           std::numeric_limits<uint64_t>::max());
-  require_ok("RESET max_dynamic_filter_bloom_bytes_per_gpu");
   REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+          17 * mib);
+  require_ok("RESET max_dynamic_filter_bloom_bytes_per_gpu");
+  REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
           17 * mib);
   auto multi_reset = con.Query(
     "SELECT current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN, "
@@ -1590,14 +1597,14 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("SET dynamic_filter_keep_threshold = 1.0");
   require_ok("RESET dynamic_filter_keep_threshold");
   require_ok("SET dynamic_filter_inlist_max_l2_fraction = 0.0");
-  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_inlist_max_l2_fraction ==
+  REQUIRE(duckdb::session_operator_params(*con.context).dynamic_filter_inlist_max_l2_fraction ==
           Approx(0.0));
   require_ok("SET dynamic_filter_inlist_max_l2_fraction = 1.0");
-  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_inlist_max_l2_fraction ==
+  REQUIRE(duckdb::session_operator_params(*con.context).dynamic_filter_inlist_max_l2_fraction ==
           Approx(1.0));
   require_ok("RESET dynamic_filter_inlist_max_l2_fraction");
   // RESET restores the registered default, which this context's YAML set to 0.4.
-  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_inlist_max_l2_fraction ==
+  REQUIRE(duckdb::session_operator_params(*con.context).dynamic_filter_inlist_max_l2_fraction ==
           Approx(0.4));
   require_ok("SET pin_table_compression = false");
   require_ok("RESET pin_table_compression");
@@ -1620,11 +1627,11 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(reset->Collection().GetValue(3, 0).GetValue<bool>());
   REQUIRE(reset->Collection().GetValue(4, 0).GetValue<double>() == Approx(0.6));
 
-  auto const& params = sirius_ctx->get_config().get_operator_params();
+  auto const& params = duckdb::session_operator_params(*con.context);
   REQUIRE(params.scan_task_batch_size == 1 * mib);
   REQUIRE(params.max_sort_partition_memory_fraction == Approx(0.25));
   REQUIRE_FALSE(params.enable_dynamic_filter);
-  auto const& compression = sirius_ctx->get_config().get_compression_config();
+  auto const& compression = duckdb::session_compression_config(*con.context);
   REQUIRE(compression.enable_pin_table_compression);
   REQUIRE(compression.max_compressed_fraction == Approx(0.6));
 }
@@ -1748,6 +1755,84 @@ TEST_CASE("Sirius startup preserves logging settings when sink construction fail
   REQUIRE(duckdb::Config::LOG_BACKEND == "spdlog");
   REQUIRE(duckdb::Config::LOG_DIR == valid_dir.string());
   REQUIRE(duckdb::Config::LOG_LEVEL == "debug");
+}
+
+TEST_CASE("FFI startup serializes logging settings and restores them on sink failure",
+          "[sirius][context][config][sirius_ffi][isolated_context]")
+{
+  auto const test_root = fs::temp_directory_path() / "sirius-ffi-log-rollback-test";
+  std::unique_lock log_lock(duckdb::Config::logging_mutex);
+  auto const previous_backend = duckdb::Config::LOG_BACKEND;
+  auto const previous_log_dir = duckdb::Config::LOG_DIR;
+  auto const previous_level   = duckdb::Config::LOG_LEVEL;
+  auto const previous_sink    = sirius::log::get_sink();
+  finally restore_logging{[&]() {
+    std::lock_guard lock(duckdb::Config::logging_mutex);
+    duckdb::Config::LOG_BACKEND = previous_backend;
+    duckdb::Config::LOG_DIR     = previous_log_dir;
+    duckdb::Config::LOG_LEVEL   = previous_level;
+    sirius::log::set_sink(previous_sink);
+    std::error_code ec;
+    fs::remove_all(test_root, ec);
+  }};
+
+  fs::remove_all(test_root);
+  fs::create_directories(test_root);
+  auto const blocker = test_root / "not-a-directory";
+  std::ofstream(blocker) << "file";
+  // Fail sink creation before FFI startup reaches GPU initialization.
+  sirius::util::env_guard backend_env{"SIRIUS_LOG_BACKEND", "spdlog"};
+  sirius::util::env_guard dir_env{"SIRIUS_LOG_DIR", (blocker / "child").string()};
+  sirius::util::env_guard level_env{"SIRIUS_LOG_LEVEL", "debug"};
+
+  SECTION("failed initialization restores all settings and the sink")
+  {
+    REQUIRE_THROWS_WITH(sirius::ffi::Context{},
+                        Catch::Matchers::ContainsSubstring(blocker.string()));
+    REQUIRE(duckdb::Config::LOG_BACKEND == previous_backend);
+    REQUIRE(duckdb::Config::LOG_DIR == previous_log_dir);
+    REQUIRE(duckdb::Config::LOG_LEVEL == previous_level);
+    REQUIRE(sirius::log::get_sink() == previous_sink);
+  }
+
+  SECTION("a waiting initialization cannot overwrite a serialized settings update")
+  {
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    auto startup        = std::async(std::launch::async, [&]() {
+      started.set_value();
+      try {
+        sirius::ffi::Context context;
+      } catch (...) {
+        return std::current_exception();
+      }
+      return std::exception_ptr{};
+    });
+    started_future.wait();
+    // Give startup a chance to reach the logging lock while we hold it. Keep the
+    // environment unchanged until the worker joins, and unlock before assertions.
+    auto const status    = startup.wait_for(std::chrono::milliseconds(100));
+    bool const unchanged = duckdb::Config::LOG_BACKEND == previous_backend &&
+                           duckdb::Config::LOG_DIR == previous_log_dir &&
+                           duckdb::Config::LOG_LEVEL == previous_level;
+    auto const updated_dir      = (test_root / "updated").string();
+    duckdb::Config::LOG_BACKEND = "noop";
+    duckdb::Config::LOG_DIR     = updated_dir;
+    duckdb::Config::LOG_LEVEL   = "warn";
+    log_lock.unlock();
+    auto error = startup.get();
+    log_lock.lock();
+
+    REQUIRE(status == std::future_status::timeout);
+    REQUIRE(unchanged);
+    REQUIRE(error != nullptr);
+    REQUIRE_THROWS_WITH(std::rethrow_exception(error),
+                        Catch::Matchers::ContainsSubstring(blocker.string()));
+    REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
+    REQUIRE(duckdb::Config::LOG_DIR == updated_dir);
+    REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
+    REQUIRE(sirius::log::get_sink() == previous_sink);
+  }
 }
 
 TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mutation",
@@ -2410,4 +2495,63 @@ TEST_CASE("Sirius configuration enables dense count join by default and accepts 
     Catch::Matchers::ContainsSubstring("sirius.operator_params.dense_count_join_max_bytes") &&
       Catch::Matchers::ContainsSubstring("internal engine policy") &&
       Catch::Matchers::ContainsSubstring("remove this key"));
+}
+
+TEST_CASE("Sirius query options stay local and snapshots remain immutable",
+          "[sirius][config][isolated_context][query_options]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+  unsetenv("SIRIUS_DISABLE");
+  auto cfg = config_fixture("effective_operator_defaults_high_level.yaml");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection a(db), b(db);
+  auto runtime  = a.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto defaults = runtime->get_config().get_operator_params();
+  auto execute  = [](duckdb::Connection& con, const char* sql) {
+    auto result = con.Query(sql);
+    REQUIRE(result);
+    if (result->HasError()) INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+  };
+  execute(a, "SET scan_task_batch_size=12345");
+  execute(a, "SET expression_evaluator_strategy='materialize'");
+  execute(a, "SET enable_regex_jit_impl=false");
+  execute(a, "SET pin_table_input_compression_plan_dir='/tmp/a-plans'");
+  auto first = duckdb::query_operator_options(*a.context);
+  CHECK(first->scan_task_batch_size == 12345);
+  CHECK(first->expression_strategy == sirius::expression_evaluator_strategy::MATERIALIZE);
+  CHECK_FALSE(first->enable_regex_jit);
+  auto other = duckdb::query_operator_options(*b.context);
+  CHECK(other->scan_task_batch_size == defaults.scan_task_batch_size);
+  CHECK(other->expression_strategy == defaults.expression_strategy);
+  CHECK(other->enable_regex_jit);
+  CHECK(duckdb::session_compression_config(*b.context).input_plan_dir != "/tmp/a-plans");
+  execute(a, "SET scan_task_batch_size=67890");
+  CHECK(first->scan_task_batch_size == 12345);
+  CHECK(duckdb::query_operator_options(*a.context)->scan_task_batch_size == 67890);
+  CHECK(runtime->get_config().get_operator_params().scan_task_batch_size ==
+        defaults.scan_task_batch_size);
+  for (auto sql : {"SET GLOBAL expression_evaluator_strategy='ast_jit'",
+                   "SET GLOBAL enable_regex_jit_impl=true"}) {
+    auto rejected = a.Query(sql);
+    REQUIRE(rejected->HasError());
+  }
+  execute(a, "RESET expression_evaluator_strategy");
+  execute(a, "RESET enable_regex_jit_impl");
+  auto reset_policy = duckdb::query_operator_options(*a.context)->expression_policy();
+  CHECK(reset_policy.strategy == defaults.expression_strategy);
+  CHECK(reset_policy.regex_jit == defaults.enable_regex_jit);
+  // RESET affects future queries, not the snapshot already handed to an evaluator.
+  CHECK(first->expression_strategy == sirius::expression_evaluator_strategy::MATERIALIZE);
+  CHECK_FALSE(first->enable_regex_jit);
+  auto global = a.Query("SET GLOBAL scan_task_batch_size=1");
+  REQUIRE(global->HasError());
+  CHECK(duckdb::query_operator_options(*a.context)->scan_task_batch_size == 67890);
+  execute(a, "RESET scan_task_batch_size");
+  CHECK(duckdb::query_operator_options(*a.context)->scan_task_batch_size ==
+        defaults.scan_task_batch_size);
 }

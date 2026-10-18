@@ -726,7 +726,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       sirius::expression_evaluator evaluator(&expr,
                                              mr,
                                              stream,
-                                             strategy_from_config(),
+                                             expression_policy(),
                                              expression_evaluator::default_min_ast_size,
                                              like_swar_fastpath_enabled(),
                                              like_cache());

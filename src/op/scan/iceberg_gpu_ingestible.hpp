@@ -86,7 +86,8 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
     const cucascade::memory::memory_space& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    expression_query_policy policy = {}) override;
 
  private:
   /// Resolves which scanned file each manifest-side key refers to, once. A mismatch would

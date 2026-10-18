@@ -3604,7 +3604,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "Production residence publishes ready data before a blocked footer resumes",
+                 "Default preparation coalesces files while a later footer is delayed",
                  "[integration][scan_preparation][iceberg][default_residence]")
 {
   sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
@@ -3612,14 +3612,14 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   preparation_test_state observed(counters);
   std::mutex mutex;
   std::condition_variable changed;
-  bool earlier_decoded = false, overlapped = false;
+  bool earlier_decoded = false, decoded_while_held = false, held_footer = false;
   auto reset                          = reset_after_test(counters->parquet_phase_for_testing);
   counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
     std::unique_lock lock(mutex);
     if (footer && file.ends_with("c.parquet")) {
-      if (!changed.wait_for(lock, std::chrono::seconds(20), [&] { return earlier_decoded; }))
-        throw std::runtime_error("ready data did not decode while the later footer was blocked");
-      overlapped = true;
+      held_footer = true;
+      decoded_while_held =
+        changed.wait_for(lock, std::chrono::milliseconds(50), [&] { return earlier_decoded; });
     } else if (!footer && !file.ends_with("c.parquet")) {
       earlier_decoded = true;
       changed.notify_all();
@@ -3633,13 +3633,16 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_three")),
                       gpu_route::gpu,
                       expected);
-  CHECK(overlapped);
+  CHECK(held_footer);
+  CHECK_FALSE(decoded_while_held);
   REQUIRE(observed.routes.size() == 1);
   CHECK(observed.routes.front().second);
   auto publication = observed.publication();
-  CHECK(publication.partial_emissions > 0);
-  REQUIRE(sirius::scan_manager::k_underfilled_batch_residence);
-  CHECK(publication.max_residence >= *sirius::scan_manager::k_underfilled_batch_residence);
+  CHECK(publication.partial_emissions == 0);
+  auto policy = sirius::scan_manager::preparation_config{}.resolve(1).partial_batch;
+  REQUIRE(policy);
+  CHECK(policy->max_residence == std::chrono::seconds(2));
+  CHECK(publication.max_residence == std::chrono::microseconds(0));
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -4140,6 +4143,18 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto three    = GENERATE(false, true);
   auto context  = sirius::test::get_registered_sirius_context(*con);
   auto counters = context->physical_counters();
+  auto dv_limit = GENERATE(std::optional<size_t>{},
+                           std::optional<size_t>{0},
+                           std::optional<size_t>{1},
+                           std::optional<size_t>{8});
+  struct config_restore {
+    sirius::sirius_config& config;
+    sirius::scan_manager::scan_manager_config saved;
+    ~config_restore() { config.set_scan_manager_config(saved); }
+  } restore{context->get_config(), context->get_config().get_scan_manager_config()};
+  auto scan_config                             = restore.saved;
+  scan_config.preparation.max_inflight_dv_jobs = dv_limit;
+  context->get_config().set_scan_manager_config(scan_config);
   REQUIRE_FALSE(counters->preparation_provider_for_testing);
   auto spaces =
     context->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
@@ -4176,11 +4191,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(d.allocation_granularity == block);
   auto const& config    = context->get_config().get_scan_manager_config();
   auto limits           = config.preparation.resolve(config.thread_pool.num_threads);
-  auto expected_permits = std::min<size_t>({three ? 3u : 1u,
-                                            static_cast<size_t>(config.thread_pool.num_threads),
-                                            limits.max_inflight_jobs,
-                                            limits.max_active_units,
-                                            limits.max_pending_results});
+  auto expected_permits = std::min<size_t>(three ? 3u : 1u, config.thread_pool.num_threads);
+  if (limits.max_inflight_dv_jobs)
+    expected_permits = std::min(expected_permits, limits.max_inflight_dv_jobs);
   CHECK(d.c_requested == d.sigma_retained + (scarce ? 1 : expected_permits) * d.w);
   CHECK(d.c_requested % d.allocation_granularity == 0);
   REQUIRE(observed.routes.size() == 1);

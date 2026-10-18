@@ -103,7 +103,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (ast_supported && _strategy != expression_evaluator_strategy::MATERIALIZE &&
+  if (ast_supported && _policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     // Only numeric binary functions are supported in AST currently.
     D_ASSERT(args.size() == 2);
@@ -468,7 +468,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     auto const cudf_pattern = ::sirius::regex::to_cudf_regex_pattern(pattern_str);
     auto const has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
     if (has_backrefs) {
-      if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
+      if (_policy.regex_jit) {
         if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
           return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
             input.get_column_view(), _stream, _mr);

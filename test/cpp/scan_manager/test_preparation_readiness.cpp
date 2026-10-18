@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <deque>
 #include <future>
 #include <mutex>
 using namespace sirius::scan_manager;
@@ -57,6 +58,7 @@ struct tagged : sirius::op::scan::scan_info {
   int id;
   size_t rows;
   tagged(int i, size_t n = 1) : id(i), rows(n) {}
+  size_t preparation_bytes() const noexcept override { return rows; }
 };
 struct accumulator : sirius::op::scan::batch_coalescer {
   size_t cap, retained = 0;
@@ -66,6 +68,8 @@ struct accumulator : sirius::op::scan::batch_coalescer {
   std::function<clock::time_point()> fake_clock;
   std::function<void()> on_retained;
   explicit accumulator(size_t cap = 1000) : cap(cap) {}
+  size_t target_batch_bytes() const noexcept override { return cap; }
+  size_t retained_bytes() const noexcept override { return retained; }
   cursor_step advance(sirius::op::scan::scan_info& input, size_t& cursor, size_t quantum) override
   {
     auto& data   = dynamic_cast<tagged&>(input);
@@ -115,7 +119,8 @@ struct sink {
   std::mutex mutex;
   std::condition_variable cv;
   std::vector<int> published;
-  std::function<void()> consumed;
+  std::function<void(size_t)> consumed;
+  std::deque<size_t> pending_bytes;
   std::atomic<bool> closed{false};
   std::atomic<size_t> close_calls{0};
   std::atomic<size_t> preparations{0};
@@ -136,7 +141,14 @@ struct sink {
   }
   void consume()
   {
-    if (consumed) consumed();
+    size_t bytes;
+    {
+      std::lock_guard l(mutex);
+      if (pending_bytes.empty()) return;
+      bytes = pending_bytes.front();
+      pending_bytes.pop_front();
+    }
+    if (consumed) consumed(bytes);
   }
 };
 auto finite_jobs(size_t count,
@@ -166,15 +178,20 @@ struct fixture {
   preparation_coordinator coordinator;
   std::vector<std::shared_ptr<hold>> holds;
   explicit fixture(size_t workers                               = 2,
-                   size_t slots                                 = 4,
+                   size_t lookahead                             = 4,
                    std::chrono::milliseconds interrupt_interval = k_interrupt_check_interval,
                    std::optional<preparation_options> options   = std::nullopt)
     : pool(static_cast<int>(workers)),
       dispatcher(pool),
       coordinator(completion,
                   dispatcher,
-                  options.value_or(preparation_options{
-                    workers, slots, slots, workers, 1, 20ms, interrupt_interval}))
+                  options.value_or(preparation_options{workers,
+                                                       lookahead,
+                                                       workers,
+                                                       1,
+                                                       interrupt_interval,
+                                                       0,
+                                                       partial_batch_options{50, 20ms, 20ms}}))
   {
   }
   std::thread owner;
@@ -253,6 +270,7 @@ struct fixture {
          auto& tag = dynamic_cast<tagged&>(*metadata);
          std::lock_guard l(out->mutex);
          out->published.push_back(tag.id);
+         out->pending_bytes.push_back(p.preparation_bytes);
          out->cv.notify_all();
        },
        [out] {
@@ -261,11 +279,41 @@ struct fixture {
          out->closed = true;
          out->cv.notify_all();
        },
-       [out](std::function<void()> consume) { out->consumed = std::move(consume); },
+       [out](std::function<void(size_t)> consume) { out->consumed = std::move(consume); },
        {}});
   }
 };
 }  // namespace
+TEST_CASE("Default and zero job limits allow submission while the worker is blocked",
+          "[scan_preparation][coordinator]")
+{
+  preparation_config config;
+  if (GENERATE(false, true)) config.max_inflight_metadata_jobs = 0;
+  fixture f(1, 2, k_interrupt_check_interval, config.resolve(1));
+  auto blocked       = f.make_hold();
+  auto third         = f.make_hold();
+  auto out           = std::make_shared<sink>();
+  size_t submissions = 0;
+  f.coordinator.before_submission_for_testing([&] {
+    if (++submissions == 3) third->wait();
+  });
+  f.source(std::make_shared<accumulator>(3), out, finite_jobs(3, [=](int id) {
+             if (id == 0) blocked->wait();
+             return std::make_unique<tagged>(id);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(blocked->await());
+  REQUIRE(third->await());
+  CHECK(f.coordinator.snapshot().jobs_peak == 3);
+  third->release();
+  blocked->release();
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(out->count() == 1);
+  CHECK_FALSE(f.owner_error);
+}
+
 TEST_CASE("Ready partial batches publish while every preparation worker is blocked",
           "[scan_preparation][coordinator]")
 {
@@ -442,11 +490,12 @@ TEST_CASE(
   REQUIRE(out->await(1));
   std::this_thread::sleep_for(25ms);
   CHECK(out->count() == 1);
-  CHECK(next.load() == 1);
+  CHECK(next.load() >= 1);
+  CHECK(next.load() <= 2);
   auto stats = f.coordinator.snapshot();
   CHECK(stats.output_peak <= 1);
-  CHECK(stats.results_peak <= 1);
-  CHECK(stats.jobs_peak <= 1);
+  CHECK(stats.results_peak <= 2);
+  CHECK(stats.jobs_peak <= 2);
   f.coordinator.request_stop(stop_reason::normal_eos);
   f.finish();
   CHECK(out->count() == 1);
@@ -536,22 +585,16 @@ TEST_CASE("GPU completion without a ready event still stops preparation and sett
   f.finish();
   CHECK(out->count() == 0);
 }
-TEST_CASE("Production defaults publish retained input while later metadata remains blocked",
+TEST_CASE("Production defaults publish a small batch at the deadline while metadata is blocked",
           "[scan_preparation][coordinator]")
 {
   auto options = preparation_config{}.resolve(2);
-  REQUIRE(options.underfilled_batch_residence);
-  auto residence = *options.underfilled_batch_residence;
+  REQUIRE(options.partial_batch);
+  REQUIRE(options.partial_batch->max_residence == 2s);
   fixture f(2, 4, k_interrupt_check_interval, options);
-  auto out = std::make_shared<sink>();
-  auto a   = std::make_shared<accumulator>();
-  auto h   = f.make_hold();
-
-  auto tick     = std::make_shared<std::atomic<int>>(0);
-  auto origin   = accumulator::clock::now();
-  auto clock    = [tick, origin] { return origin + std::chrono::milliseconds(tick->load()); };
-  a->fake_clock = clock;
-  f.coordinator.clock_for_testing(clock);
+  auto out       = std::make_shared<sink>();
+  auto a         = std::make_shared<accumulator>();
+  auto h         = f.make_hold();
   auto retained  = std::make_shared<std::promise<void>>();
   auto reached   = retained->get_future();
   auto notified  = std::make_shared<std::atomic<bool>>(false);
@@ -562,39 +605,40 @@ TEST_CASE("Production defaults publish retained input while later metadata remai
              if (id == 1) h->wait();
              return std::make_unique<tagged>(id);
            }));
-  auto query_guard = f.shutdown_guard();
+  auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(reached.wait_for(1s) == std::future_status::ready);
   REQUIRE(h->await());
-  tick->store(residence.count() - 1);
-  f.coordinator.wake_for_testing();
-  std::this_thread::sleep_for(5ms);
+  std::this_thread::sleep_for(30ms);
   CHECK(out->count() == 0);
-  tick->store(residence.count());
-  f.coordinator.wake_for_testing();
-  REQUIRE(out->await(1));
-  CHECK(f.coordinator.snapshot().max_residence == residence);
-  CHECK(f.coordinator.snapshot().max_deadline_lateness == 0ms);
-  CHECK_FALSE(out->closed.load());
-  tick->store(100);
-  f.coordinator.wake_for_testing();
-  std::this_thread::sleep_for(5ms);
-  CHECK(out->count() == 1);
+  {
+    std::unique_lock lock(out->mutex);
+    REQUIRE(out->cv.wait_for(lock, 3s, [&] { return !out->published.empty(); }));
+  }
+  CHECK_FALSE(out->closed);
+  CHECK(f.coordinator.snapshot().partial_emissions == 1);
+  CHECK(f.coordinator.snapshot().max_residence >= 2s);
+  h->release();
+  REQUIRE(out->await_closed());
+  CHECK(out->count() == 2);
 }
 TEST_CASE("Cancellation racing with a deadline never publishes after recognition",
           "[scan_preparation][coordinator]")
 {
   auto use_interrupt_signal = GENERATE(false, true);
+  auto size_triggered       = GENERATE(false, true);
+  auto options              = preparation_config{}.resolve(2);
+  options.partial_batch     = partial_batch_options{50, 20ms, size_triggered ? 1s : 20ms};
   for (int iteration = 0; iteration < 12; ++iteration) {
     std::atomic<bool> interrupted{false};
-    fixture f;
+    fixture f(2, 4, k_interrupt_check_interval, options);
     if (use_interrupt_signal) {
       f.coordinator.set_interrupt_check([&] { return interrupted.load(); });
     }
     auto out = std::make_shared<sink>();
     auto h   = f.make_hold();
 
-    f.source(std::make_shared<accumulator>(), out, finite_jobs(2, [=](int id) {
+    f.source(std::make_shared<accumulator>(2), out, finite_jobs(2, [=](int id) {
                if (id == 1) h->wait();
                return std::make_unique<tagged>(id);
              }));
@@ -664,7 +708,7 @@ TEST_CASE("GPU completion cannot hide an accepted preparation failure",
   CHECK(out->count() == 0);
 }
 
-TEST_CASE("Later scans cannot consume the last output credit needed by the first scan",
+TEST_CASE("Later scans filling their lookahead cannot block the first scan",
           "[scan_preparation][coordinator]")
 {
   fixture f(2, 2);
@@ -683,11 +727,11 @@ TEST_CASE("Later scans cannot consume the last output credit needed by the first
   REQUIRE(later->await(1));
   // No later pipeline consumption while execution still needs the first scan.
   std::this_thread::sleep_for(20ms);
-  CHECK(later->count() == 1);
+  CHECK(later->count() == 2);
   blocked->release();
   REQUIRE(first->await(1));
   first->consume();
-  CHECK(f.coordinator.snapshot().output_peak <= 2);
+  CHECK(f.coordinator.snapshot().output_peak <= 3);
 }
 
 TEST_CASE(
@@ -866,7 +910,7 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
     out->closed = true;
     out->cv.notify_all();
   };
-  source.bind_consumption = [out](std::function<void()> callback) {
+  source.bind_consumption = [out](std::function<void(size_t)> callback) {
     out->consumed = std::move(callback);
   };
   f.coordinator.add_source(std::move(source));
@@ -966,7 +1010,7 @@ TEST_CASE("Exhausted enumeration cannot close before accepted out-of-order resul
   REQUIRE(out->await_closed());
   CHECK(out->published == std::vector<int>{1, 0});
 }
-TEST_CASE("A single result and output slot preserves progress across multiple scans",
+TEST_CASE("One lookahead batch per scan preserves progress with one worker",
           "[scan_preparation][coordinator]")
 {
   fixture f(1, 1);
@@ -979,7 +1023,7 @@ TEST_CASE("A single result and output slot preserves progress across multiple sc
   auto guard = f.shutdown_guard();
   f.start();
   REQUIRE(first->await(1));
-  CHECK(last->count() == 0);
+  REQUIRE(last->await(1));
   first->consume();
   REQUIRE(first->await_closed());
   REQUIRE(last->await(1));
@@ -988,7 +1032,7 @@ TEST_CASE("A single result and output slot preserves progress across multiple sc
   f.finish();
   CHECK(f.coordinator.snapshot().jobs_peak == 1);
   CHECK(f.coordinator.snapshot().results_peak <= 1);
-  CHECK(f.coordinator.snapshot().output_peak == 1);
+  CHECK(f.coordinator.snapshot().output_peak <= 2);
 }
 
 TEST_CASE("Physical external users delay quiescence after success or cancellation",
@@ -1030,7 +1074,7 @@ TEST_CASE("Physical external users delay quiescence after success or cancellatio
 TEST_CASE("Cancelling a pending unit synchronizes with and wakes the query owner",
           "[scan_preparation][coordinator]")
 {
-  fixture f;
+  fixture f(1, 1);
   auto out = std::make_shared<sink>();
   required_input_set required;
   required.set(static_cast<size_t>(required_input::delete_set));
@@ -1122,9 +1166,10 @@ TEST_CASE(
     return preparation_coordinator::publication{
       std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch)), 0};
   };
-  source.publish = [out](preparation_coordinator::publication&) {
+  source.publish = [out](preparation_coordinator::publication& p) {
     std::lock_guard lock(out->mutex);
     out->published.push_back(1);
+    out->pending_bytes.push_back(p.preparation_bytes);
     out->cv.notify_all();
   };
   source.close = [out] {
@@ -1132,7 +1177,7 @@ TEST_CASE(
     out->closed = true;
     out->cv.notify_all();
   };
-  source.bind_consumption = [out](std::function<void()> callback) {
+  source.bind_consumption = [out](std::function<void(size_t)> callback) {
     out->consumed = std::move(callback);
   };
   f.coordinator.add_source(std::move(source));
@@ -1212,4 +1257,200 @@ TEST_CASE("Observed interruption stops claims and publication while owned work d
   CHECK(out->preparations == 0);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
   CHECK_THROWS_AS(f.coordinator.set_interrupt_check({}), std::logic_error);
+}
+
+TEST_CASE("Lookahead tracks work across result coalescing and publication until consumption",
+          "[scan_preparation][coordinator]")
+{
+  auto rows_per_file                 = GENERATE(1, 4);
+  auto lookahead                     = GENERATE(1, 2, 3);
+  auto options                       = preparation_config{}.resolve(1);
+  options.max_inflight_metadata_jobs = 1;
+  options.lookahead_batches          = lookahead;
+  fixture f(1, lookahead, k_interrupt_check_interval, options);
+  auto out       = std::make_shared<sink>();
+  auto completed = std::make_shared<std::atomic<size_t>>(0);
+  f.source(std::make_shared<accumulator>(8), out, finite_jobs(100, [=](int id) {
+             ++*completed;
+             return std::make_unique<tagged>(id, rows_per_file);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await(lookahead));
+  std::this_thread::sleep_for(20ms);
+  CHECK(completed->load() == lookahead * 8 / rows_per_file);
+  CHECK(out->count() == lookahead);
+  out->consume();
+  REQUIRE(out->await(lookahead + 1));
+  CHECK(completed->load() == (lookahead + 1) * 8 / rows_per_file);
+  CHECK(f.coordinator.snapshot().jobs_peak == 1);
+}
+
+TEST_CASE("A file larger than lookahead streams through bounded output and reaches EOS",
+          "[scan_preparation][coordinator]")
+{
+  auto options              = preparation_config{}.resolve(1);
+  options.lookahead_batches = 2;
+  fixture f(1, 2, k_interrupt_check_interval, options);
+  auto out = std::make_shared<sink>();
+  f.source(std::make_shared<accumulator>(8), out, single_job([] {
+             return std::make_unique<tagged>(0, 41);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await(2));
+  std::this_thread::sleep_for(20ms);
+  CHECK(out->count() == 2);
+  for (size_t consumed = 0; consumed < 6; ++consumed) {
+    REQUIRE(out->await(consumed + 1));
+    out->consume();
+  }
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(out->count() == 6);
+  CHECK(f.coordinator.snapshot().output_peak <= 2);
+}
+
+TEST_CASE("Pruned preparation results do not consume the lookahead window",
+          "[scan_preparation][coordinator]")
+{
+  auto options              = preparation_config{}.resolve(2);
+  options.lookahead_batches = 1;
+  fixture f(2, 1, k_interrupt_check_interval, options);
+  auto out = std::make_shared<sink>();
+  f.source(std::make_shared<accumulator>(8), out, finite_jobs(100, [](int id) {
+             return std::make_unique<tagged>(id, id == 99 ? 1 : 0);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await_closed());
+  f.finish();
+  CHECK(out->count() == 1);
+}
+
+TEST_CASE("Size-based partial emission respects fill and minimum residence",
+          "[scan_preparation][coordinator][partial_batch]")
+{
+  auto bytes               = GENERATE(49, 50, 100);
+  auto options             = preparation_config{}.resolve(2);
+  options.partial_batch    = partial_batch_options{};
+  options.drain_quantum    = GENERATE(1u, 100u);
+  options.max_control_work = 1;
+  fixture f(2, 2, k_interrupt_check_interval, options);
+  auto a        = std::make_shared<accumulator>(100);
+  auto out      = std::make_shared<sink>();
+  auto retained = f.make_hold(), blocked = f.make_hold();
+  std::atomic<int> milliseconds{100};
+  auto clock = [&] {
+    return accumulator::clock::time_point{} + std::chrono::milliseconds(milliseconds.load());
+  };
+  a->fake_clock = clock;
+  f.coordinator.clock_for_testing(clock);
+  a->on_retained = [a = a.get(), bytes, retained] {
+    if (a->retained + 1 == static_cast<size_t>(bytes)) retained->wait();
+  };
+  f.source(a, out, finite_jobs(2, [=](int id) {
+             if (id == 1) blocked->wait();
+             return std::make_unique<tagged>(id, id ? 0 : bytes);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(retained->await());
+  milliseconds = 149;
+  retained->release();
+  REQUIRE(blocked->await());
+  if (bytes == 100) {
+    REQUIRE(out->await(1));  // Normal full batches do not wait for the minimum residence.
+  } else {
+    std::this_thread::sleep_for(20ms);
+    CHECK(out->count() == 0);
+    milliseconds = 150;
+    f.coordinator.wake_for_testing();
+    if (bytes == 50) {
+      REQUIRE(out->await(1));
+    } else {
+      std::this_thread::sleep_for(20ms);
+      CHECK(out->count() == 0);
+      milliseconds = 2100;
+      f.coordinator.wake_for_testing();
+      REQUIRE(out->await(1));
+    }
+  }
+  CHECK_FALSE(out->closed.load());
+  {
+    std::lock_guard lock(out->mutex);
+    CHECK(out->pending_bytes.front() == bytes);
+  }
+  auto stats = f.coordinator.snapshot();
+  CHECK(stats.normal_emissions == (bytes == 100 ? 1 : 0));
+  CHECK(stats.size_emissions == (bytes == 50 ? 1 : 0));
+  CHECK(stats.partial_emissions == (bytes == 100 ? 0 : 1));
+}
+
+TEST_CASE("Size-based partial emission waits for consumption but timeout can use spare capacity",
+          "[scan_preparation][coordinator][partial_batch]")
+{
+  auto timeout          = GENERATE(false, true);
+  auto options          = preparation_config{}.resolve(1);
+  options.partial_batch = partial_batch_options{};
+  options.drain_quantum = 100;
+  fixture f(1, 2, k_interrupt_check_interval, options);
+  auto a    = std::make_shared<accumulator>(100);
+  auto out  = std::make_shared<sink>();
+  auto next = f.make_hold(), retained = f.make_hold(), tail = f.make_hold();
+  std::atomic<int> milliseconds{100};
+  auto clock = [&] {
+    return accumulator::clock::time_point{} + std::chrono::milliseconds(milliseconds.load());
+  };
+  a->fake_clock = clock;
+  f.coordinator.clock_for_testing(clock);
+  std::atomic<bool> second{false};
+  a->on_retained = [&] {
+    if (second && a->retained == 49) retained->wait();
+  };
+  f.source(a, out, finite_jobs(3, [=](int id) {
+             if (id == 1) next->wait();
+             if (id == 2) tail->wait();
+             return std::make_unique<tagged>(id, id == 0 ? 100 : id == 1 ? 50 : 0);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await(1));
+  second = true;
+  next->release();
+  REQUIRE(retained->await());
+  milliseconds = 150;
+  retained->release();
+  std::this_thread::sleep_for(20ms);
+  CHECK(out->count() == 1);
+  if (timeout) {
+    milliseconds = 2100;
+    f.coordinator.wake_for_testing();
+  } else {
+    out->consume();  // The existing callback must wake the owner without new metadata.
+  }
+  REQUIRE(out->await(2));
+  CHECK_FALSE(out->closed.load());
+}
+
+TEST_CASE("Partial batch deadlines wake while all preparation workers are held",
+          "[scan_preparation][coordinator][partial_batch]")
+{
+  auto bytes            = GENERATE(1, 50);
+  auto options          = preparation_config{}.resolve(1);
+  options.partial_batch = partial_batch_options{50, 10ms, 40ms};
+  fixture f(1, 2, k_interrupt_check_interval, options);
+  auto out     = std::make_shared<sink>();
+  auto blocked = f.make_hold();
+  f.source(std::make_shared<accumulator>(100), out, finite_jobs(2, [=](int id) {
+             if (id == 1) blocked->wait();
+             return std::make_unique<tagged>(id, id ? 0 : bytes);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(blocked->await());
+  REQUIRE(out->await(1));
+  auto stats = f.coordinator.snapshot();
+  CHECK(stats.partial_emissions == 1);
+  CHECK_FALSE(out->closed.load());
 }
