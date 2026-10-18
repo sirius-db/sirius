@@ -87,6 +87,7 @@ impl SiriusContext {
                 ring.recv_bytes,
                 ring.gpu_landing_fraction,
                 ring.host_landing_bytes,
+                ring.disk_writers,
             )?),
         })
     }
@@ -400,6 +401,8 @@ pub struct RingOptions {
     pub gpu_landing_fraction: f64,
     /// Host bytes that landed batches may hold until their receivers take them.
     pub host_landing_bytes: u64,
+    /// Threads writing batches that land on disk.
+    pub disk_writers: u64,
 }
 
 /// One batch exported for the ring exchange: a job on the sender's [`RingExchange`].

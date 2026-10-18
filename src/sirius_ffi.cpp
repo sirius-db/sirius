@@ -281,9 +281,10 @@ struct Context::Impl {
         throw sirius::internal_exception("Context: no current CUDA device for the ring exchange");
       }
       sirius::exec::ring_exchange::options opts;
-      opts.frame_bytes = ring_options->frame_bytes;
-      opts.send_bytes  = ring_options->send_bytes;
-      opts.recv_bytes  = ring_options->recv_bytes;
+      opts.frame_bytes  = ring_options->frame_bytes;
+      opts.send_bytes   = ring_options->send_bytes;
+      opts.recv_bytes   = ring_options->recv_bytes;
+      opts.disk_writers = ring_options->disk_writers;
       if (auto const* value = std::getenv("SIRIUS_CN_RING_RETURN_SPILLED")) {
         opts.return_spilled = std::string_view{value} == "1";
       }
@@ -578,12 +579,13 @@ std::unique_ptr<Context> make_context_with_ring(const std::string& config_path,
                                                 std::uint64_t send_bytes,
                                                 std::uint64_t recv_bytes,
                                                 double gpu_landing_fraction,
-                                                std::uint64_t host_landing_bytes)
+                                                std::uint64_t host_landing_bytes,
+                                                std::uint64_t disk_writers)
 {
   return std::make_unique<Context>(
     config_path,
     Context::RingOptions{
-      frame_bytes, send_bytes, recv_bytes, gpu_landing_fraction, host_landing_bytes});
+      frame_bytes, send_bytes, recv_bytes, gpu_landing_fraction, host_landing_bytes, disk_writers});
 }
 
 // ---------------------------------------------------------------------------

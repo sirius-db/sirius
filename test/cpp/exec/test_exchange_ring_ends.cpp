@@ -36,12 +36,16 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/data/disk_io_backend.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/convertible_data_batch.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <exec/exchange_inbox.hpp>
 #include <exec/exchange_ring_ends.hpp>
+#include <fcntl.h>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstdint>
@@ -50,6 +54,7 @@
 #include <memory>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -232,6 +237,13 @@ bool holds(cucascade::data_batch& batch)
   return dynamic_cast<Representation const*>(ro.get_data()) != nullptr;
 }
 
+void wait(ring_exchange& ends, std::uint64_t ticket)
+{
+  while (!ends.done(ticket)) {
+    std::this_thread::yield();
+  }
+}
+
 /// Ships @p job from @p from to @p to as the transport would, frame by frame, through the two
 /// rings; returns the receiver's landing and its exchange-inbox token.
 std::pair<ring_exchange::landing, std::uint64_t> ship(ring_exchange& from,
@@ -244,7 +256,7 @@ std::pair<ring_exchange::landing, std::uint64_t> ship(ring_exchange& from,
     auto const recv = to.recv_ring().lease();
     REQUIRE(send.has_value());
     REQUIRE(recv.has_value());
-    from.wait(from.stage(job.token, k, *send));
+    wait(from, from.stage(job.token, k, *send));
     auto const len = std::min<std::uint64_t>(
       from.frame_bytes(), job.stream_bytes - std::uint64_t{k} * from.frame_bytes());
     // The peer's WRITE.
@@ -256,7 +268,7 @@ std::pair<ring_exchange::landing, std::uint64_t> ship(ring_exchange& from,
     // wait for the legacy stream; NIXL's notification comes after its WRITE is.
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
     from.send_ring().release(*send);
-    to.wait(to.copy_out(landing.id, k, *recv, len));
+    wait(to, to.copy_out(landing.id, k, *recv, len));
     // I2: the frame is free once its copy-out is done, whatever happens to the batch; a later
     // WRITE into it must not change what landed.
     REQUIRE(cudaMemset(reinterpret_cast<void*>(to.recv_ring().frame_address(*recv)), 0xab, len) ==
@@ -376,6 +388,132 @@ TEST_CASE("a throw in seal() gives back the landing's charge", "[exchange_ring][
   CHECK(receiver->stats().gpu_held == 0);
 }
 
+/// A disk whose every write takes 20 ms more: a slow file system.
+class slow_disk final : public cucascade::idisk_io_backend {
+ public:
+  static constexpr auto delay = std::chrono::milliseconds{20};
+
+  void write(fs::path const& path,
+             void const* dev_ptr,
+             std::size_t size,
+             std::size_t file_offset,
+             ::cuda::stream_ref stream) override
+  {
+    std::vector<char> host(size);
+    REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+    REQUIRE(cudaMemcpy(host.data(), dev_ptr, size, cudaMemcpyDeviceToHost) == cudaSuccess);
+    write(path, host.data(), size, file_offset);
+  }
+
+  void read(fs::path const& path,
+            void* dev_ptr,
+            std::size_t size,
+            std::size_t file_offset,
+            ::cuda::stream_ref) override
+  {
+    std::vector<char> host(size);
+    read(path, host.data(), size, file_offset);
+    REQUIRE(cudaMemcpy(dev_ptr, host.data(), size, cudaMemcpyHostToDevice) == cudaSuccess);
+  }
+
+  void write(fs::path const& path,
+             void const* host_ptr,
+             std::size_t size,
+             std::size_t file_offset) override
+  {
+    std::this_thread::sleep_for(delay);
+    int const fd = ::open(path.c_str(), O_CREAT | O_WRONLY, 0644);
+    auto const n = ::pwrite(fd, host_ptr, size, static_cast<off_t>(file_offset));
+    ::close(fd);
+    if (n != static_cast<ssize_t>(size)) { throw std::runtime_error("slow_disk: short write"); }
+  }
+
+  void read(fs::path const& path,
+            void* host_ptr,
+            std::size_t size,
+            std::size_t file_offset) override
+  {
+    int const fd = ::open(path.c_str(), O_RDONLY);
+    auto const n = ::pread(fd, host_ptr, size, static_cast<off_t>(file_offset));
+    ::close(fd);
+    if (n != static_cast<ssize_t>(size)) { throw std::runtime_error("slow_disk: short read"); }
+  }
+};
+
+TEST_CASE("disk landings written by several threads overlap", "[exchange_ring][ends]")
+{
+  auto const dir = env().dir / "slow";
+  fs::create_directories(dir);
+  cucascade::memory::memory_space disk(
+    cucascade::memory::disk_memory_space_config{1, 4ull << 30, dir.string()},
+    std::make_shared<slow_disk>());
+  auto const table    = sample_table();
+  auto const expected = digest(table->view());
+
+  // Every frame of one batch reaches the receive ring before any copy-out, as from a sender
+  // that runs ahead: its disk writes are all queued at once. Returns how long they took.
+  auto const land = [&](std::size_t writers) {
+    ring_exchange::options opts;
+    opts.frame_bytes  = MiB;
+    opts.send_bytes   = 16 * MiB;
+    opts.recv_bytes   = 16 * MiB;
+    opts.disk_writers = writers;
+    ring_exchange sender(0, opts);
+    ring_exchange receiver(0, opts);
+    sender.attach(env().exchange, {env().host, env().disk, 256 * MiB, 256 * MiB});
+    receiver.attach(env().exchange, {nullptr, &disk, 0, 0});
+
+    auto const job = sender.export_batch(gpu_batch(std::make_unique<cudf::table>(*table)));
+    REQUIRE(job.has_value());
+    auto const landing = receiver.begin(job->header);
+    REQUIRE(landing.tier == Tier::DISK);
+    REQUIRE(landing.frames <= receiver.recv_ring().frames());
+    std::vector<std::uint32_t> frames;
+    for (std::uint32_t k = 0; k < landing.frames; ++k) {
+      auto const send = sender.send_ring().lease();
+      auto const recv = receiver.recv_ring().lease();
+      REQUIRE(send.has_value());
+      REQUIRE(recv.has_value());
+      wait(sender, sender.stage(job->token, k, *send));
+      auto const len = std::min<std::uint64_t>(MiB, job->stream_bytes - std::uint64_t{k} * MiB);
+      REQUIRE(cudaMemcpy(reinterpret_cast<void*>(receiver.recv_ring().frame_address(*recv)),
+                         reinterpret_cast<void const*>(sender.send_ring().frame_address(*send)),
+                         len,
+                         cudaMemcpyDeviceToDevice) == cudaSuccess);
+      REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+      sender.send_ring().release(*send);
+      frames.push_back(*recv);
+    }
+    sender.release_job(job->token);
+
+    auto const start = std::chrono::steady_clock::now();
+    std::vector<std::uint64_t> tickets;
+    for (std::uint32_t k = 0; k < landing.frames; ++k) {
+      auto const len = std::min<std::uint64_t>(MiB, job->stream_bytes - std::uint64_t{k} * MiB);
+      tickets.push_back(receiver.copy_out(landing.id, k, frames[k], len));
+    }
+    // I1: a copy-out queues its write and returns; the transport never waits on the disk.
+    CHECK(std::chrono::steady_clock::now() - start < slow_disk::delay);
+    for (auto const ticket : tickets) {
+      wait(receiver, ticket);
+    }
+    auto const took = std::chrono::steady_clock::now() - start;
+    for (auto const frame : frames) {
+      receiver.recv_ring().release(frame);
+    }
+    auto received = env().exchange->take_batch(receiver.seal(landing.id));
+    CHECK(holds<cucascade::disk_data_representation>(*received));
+    CHECK(digest(*received) == expected);
+    return took;
+  };
+
+  auto const serial   = land(1);
+  auto const parallel = land(4);
+  CHECK(serial >= 7 * slow_disk::delay);
+  CHECK(parallel * 2 < serial);
+  fs::remove_all(dir);
+}
+
 TEST_CASE("I5: no room in any tier is the one failure, with every tier's numbers",
           "[exchange_ring][ends]")
 {
@@ -450,7 +588,7 @@ TEST_CASE("a landing refuses frames out of order of its stream", "[exchange_ring
                     Catch::Matchers::ContainsSubstring("out of range"));
   CHECK_THROWS_WITH(receiver->copy_out(landing.id, 0, *frame, 5),
                     Catch::Matchers::ContainsSubstring("the stream needs"));
-  receiver->wait(receiver->copy_out(landing.id, 0, *frame, MiB));
+  wait(*receiver, receiver->copy_out(landing.id, 0, *frame, MiB));
   CHECK_THROWS_WITH(receiver->copy_out(landing.id, 0, *frame, MiB),
                     Catch::Matchers::ContainsSubstring("already copied"));
   CHECK_THROWS_WITH(receiver->seal(landing.id), Catch::Matchers::ContainsSubstring("frames"));

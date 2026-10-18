@@ -37,6 +37,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace cucascade {
@@ -85,6 +86,10 @@ class ring_exchange {
     /// tier, not only when its receiver takes it. The freed budget lands more batches on the
     /// GPU, which spill in turn: at SF10000 q09 that churn cost more than it saved.
     bool return_spilled = false;
+    /// Threads writing disk landings. One writes through the disk tier's device path, which
+    /// serializes its callers; more each copy a frame to a pinned bounce of their own and write
+    /// it from host, so landings' writes overlap.
+    std::size_t disk_writers = 1;
   };
 
   /// Allocates both rings on @p device. Call before the engine's pool is built, so the rings are
@@ -179,9 +184,6 @@ class ring_exchange {
   /// @throws std::runtime_error when they failed (a disk write, say), consuming it.
   [[nodiscard]] bool done(std::uint64_t ticket);
 
-  /// Waits for @p ticket, then consumes it as done() does.
-  void wait(std::uint64_t ticket);
-
   struct counters {
     std::uint64_t sent_batches[4]{};    ///< by batch_kind
     std::uint64_t sent_bytes[4]{};      ///< stream bytes, by batch_kind
@@ -204,7 +206,16 @@ class ring_exchange {
 
   [[nodiscard]] std::uint64_t new_ticket(std::shared_ptr<ticket> t);
   [[nodiscard]] std::shared_ptr<ticket> record(rmm::cuda_stream_view stream);
-  void run_disk_writes();
+  /// Waits for the next task of @p queue and finds the ticket whose @p field holds it: a null
+  /// task once @p stop is set and the queue is empty, a null ticket for an aborted task.
+  template <typename Task>
+  std::pair<std::shared_ptr<Task>, std::shared_ptr<ticket>> next_task(
+    std::mutex& mutex,
+    std::condition_variable& cv,
+    std::deque<std::shared_ptr<Task>>& queue,
+    bool const& stop,
+    std::shared_ptr<Task> ticket::* field);
+  void run_disk_writes(bool bounced);
 
   int _device;
   frame_ring _send;
@@ -226,13 +237,12 @@ class ring_exchange {
   std::map<std::uint64_t, std::shared_ptr<ticket>> _tickets;
   counters _counters;
 
-  // Disk landings' copy-outs, written one at a time through a pinned bounce frame.
+  // Disk landings' copy-outs, written by options::disk_writers threads.
   std::mutex _disk_mutex;
   std::condition_variable _disk_cv;
   std::deque<std::shared_ptr<disk_task>> _disk_queue;
   bool _disk_stop{false};
-  void* _bounce{nullptr};
-  std::thread _disk_thread;
+  std::vector<std::thread> _disk_threads;
 
   // Frames of batches sent from their disk files, read one at a time through a pinned bounce
   // frame and copied into the send frame.

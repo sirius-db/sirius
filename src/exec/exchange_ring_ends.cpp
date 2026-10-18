@@ -320,7 +320,10 @@ ring_exchange::ring_exchange(int device, options const& opts)
     _return_spilled{opts.return_spilled},
     _read_stream{stream_on(device)}
 {
-  _disk_thread = std::thread([this] { run_disk_writes(); });
+  auto const writers = std::max<std::size_t>(opts.disk_writers, 1);
+  for (std::size_t i = 0; i < writers; ++i) {
+    _disk_threads.emplace_back([this, bounced = writers > 1] { run_disk_writes(bounced); });
+  }
   _read_thread = std::thread([this] { run_disk_reads(); });
   SIRIUS_LOG_INFO(
     "ring exchange on device {}: send ring {} x {} bytes at {:#x}, receive ring {} x {} bytes at "
@@ -341,7 +344,9 @@ ring_exchange::~ring_exchange()
     _disk_stop = true;
   }
   _disk_cv.notify_all();
-  if (_disk_thread.joinable()) { _disk_thread.join(); }
+  for (auto& writer : _disk_threads) {
+    if (writer.joinable()) { writer.join(); }
+  }
   {
     std::lock_guard lock{_read_mutex};
     _read_stop = true;
@@ -426,13 +431,6 @@ bool ring_exchange::done(std::uint64_t id)
   if (t->in_flight) { t->in_flight->fetch_sub(1); }
   if (!failure.empty()) { throw std::runtime_error(failure); }
   return true;
-}
-
-void ring_exchange::wait(std::uint64_t id)
-{
-  while (!done(id)) {
-    std::this_thread::yield();
-  }
 }
 
 // ---- sender --------------------------------------------------------------------------------
@@ -828,28 +826,42 @@ std::uint64_t ring_exchange::copy_out(std::uint64_t id,
   return ticket_id;
 }
 
-void ring_exchange::run_disk_writes()
+template <typename Task>
+std::pair<std::shared_ptr<Task>, std::shared_ptr<ring_exchange::ticket>> ring_exchange::next_task(
+  std::mutex& mutex,
+  std::condition_variable& cv,
+  std::deque<std::shared_ptr<Task>>& queue,
+  bool const& stop,
+  std::shared_ptr<Task> ticket::* field)
 {
+  std::shared_ptr<Task> task;
+  {
+    std::unique_lock lock{mutex};
+    cv.wait(lock, [&] { return stop || !queue.empty(); });
+    if (queue.empty()) { return {}; }
+    task = std::move(queue.front());
+    queue.pop_front();
+  }
+  std::lock_guard lock{_mutex};
+  for (auto const& [id, candidate] : _tickets) {
+    if ((*candidate).*field == task) { return {task, candidate}; }
+  }
+  return {task, nullptr};
+}
+
+void ring_exchange::run_disk_writes(bool bounced)
+{
+  // A bounced writer copies each frame to a pinned frame of its own, on a stream of its own, and
+  // writes it from there: the disk tier's device writes all share one pair of buffers.
+  void* bounce = nullptr;
+  std::optional<rmm::cuda_stream> stream;
+  absl::Cleanup free_bounce = [&] {
+    if (bounce != nullptr) { static_cast<void>(cudaFreeHost(bounce)); }
+  };
   // Each task writes one received frame; its ticket is found by task.
   for (;;) {
-    std::shared_ptr<disk_task> task;
-    {
-      std::unique_lock lock{_disk_mutex};
-      _disk_cv.wait(lock, [&] { return _disk_stop || !_disk_queue.empty(); });
-      if (_disk_queue.empty()) { return; }
-      task = std::move(_disk_queue.front());
-      _disk_queue.pop_front();
-    }
-    std::shared_ptr<ticket> t;
-    {
-      std::lock_guard lock{_mutex};
-      for (auto const& [id, candidate] : _tickets) {
-        if (candidate->task == task) {
-          t = candidate;
-          break;
-        }
-      }
-    }
+    auto const [task, t] = next_task(_disk_mutex, _disk_cv, _disk_queue, _disk_stop, &ticket::task);
+    if (!task) { return; }
     if (!t) { continue; }  // aborted
     try {
       rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
@@ -857,11 +869,28 @@ void ring_exchange::run_disk_writes()
       if (!task->head.empty()) {
         backend.write(task->path, task->head.data(), task->head.size(), 0);
       }
-      for (auto const& [frame_offset, file_offset, size] : task->writes) {
-        backend.write(
-          task->path, task->frame + frame_offset, size, file_offset, _recv_stream.view());
+      if (bounced) {
+        if (bounce == nullptr) {
+          RMM_CUDA_TRY(cudaMallocHost(&bounce, _recv.frame_bytes()));
+          stream.emplace(stream_on(_device));
+        }
+        std::size_t span = 0;
+        for (auto const& [frame_offset, file_offset, size] : task->writes) {
+          span = std::max(span, frame_offset + size);
+        }
+        RMM_CUDA_TRY(
+          cudaMemcpyAsync(bounce, task->frame, span, cudaMemcpyDeviceToHost, stream->value()));
+        stream->synchronize();
+        for (auto const& [frame_offset, file_offset, size] : task->writes) {
+          backend.write(task->path, static_cast<char*>(bounce) + frame_offset, size, file_offset);
+        }
+      } else {
+        for (auto const& [frame_offset, file_offset, size] : task->writes) {
+          backend.write(
+            task->path, task->frame + frame_offset, size, file_offset, _recv_stream.view());
+        }
+        _recv_stream.synchronize();
       }
-      _recv_stream.synchronize();
       t->disk_state->store(1, std::memory_order_release);
     } catch (std::exception const& e) {
       *t->error = std::format(
@@ -874,24 +903,8 @@ void ring_exchange::run_disk_writes()
 void ring_exchange::run_disk_reads()
 {
   for (;;) {
-    std::shared_ptr<read_task> task;
-    {
-      std::unique_lock lock{_read_mutex};
-      _read_cv.wait(lock, [&] { return _read_stop || !_read_queue.empty(); });
-      if (_read_queue.empty()) { return; }
-      task = std::move(_read_queue.front());
-      _read_queue.pop_front();
-    }
-    std::shared_ptr<ticket> t;
-    {
-      std::lock_guard lock{_mutex};
-      for (auto const& [id, candidate] : _tickets) {
-        if (candidate->read == task) {
-          t = candidate;
-          break;
-        }
-      }
-    }
+    auto const [task, t] = next_task(_read_mutex, _read_cv, _read_queue, _read_stop, &ticket::read);
+    if (!task) { return; }
     if (!t) { continue; }
     try {
       rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_device}};
