@@ -353,6 +353,17 @@ TEST_CASE("arrow_host_import: refuses mismatched and unsupported batches before 
     batch->array.null_count = 1;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("has null rows"));
   }
+  SECTION("struct null count contradicts an all-valid bitmap")
+  {
+    std::uint8_t validity   = 0b111;
+    const void* buffers[]   = {&validity};
+    batch->array.buffers    = buffers;
+    batch->array.null_count = 1;
+    import_test_resource observed;
+    REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint, rmm::device_async_resource_ref{observed}),
+                        ContainsSubstring("has null rows"));
+    REQUIRE(observed.counts->attempts == 0);
+  }
   SECTION("shapes refused by name")
   {
     for (auto [format, reason] : {std::pair{"U", "64-bit offsets"},
