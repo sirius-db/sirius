@@ -271,8 +271,9 @@ void validate_batch(const ArrowArray* array,
   }
   // A null struct row has no place in a table; cudf would import its children as present.
   if (const auto* validity = validity_of(*array);
-      validity != nullptr &&
-      count_nulls(validity, array->offset, array->offset + array->length) > 0) {
+      array->null_count > 0 ||
+      (validity != nullptr &&
+       count_nulls(validity, array->offset, array->offset + array->length) > 0)) {
     throw invalid_input_exception("{}: the struct array has null rows; a record batch has none",
                                   error_prefix);
   }

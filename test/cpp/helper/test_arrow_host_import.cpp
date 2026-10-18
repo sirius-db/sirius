@@ -350,7 +350,7 @@ TEST_CASE("arrow_host_import: refuses mismatched and unsupported batches before 
     std::uint8_t validity   = 0b101;  // row 1 is null
     const void* buffers[]   = {&validity};
     batch->array.buffers    = buffers;
-    batch->array.null_count = 1;
+    batch->array.null_count = GENERATE(-1, 0, 1);
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("has null rows"));
   }
   SECTION("struct null count contradicts an all-valid bitmap")
