@@ -587,9 +587,9 @@ TEST_CASE_METHOD(KMeansFixture,
 // -----------------------------------------------------------------------------
 // A corpus that is not stored in cluster order is refused, not answered.
 //
-// The join reads each chunk's labels as a run per cluster. An unordered corpus makes
-// that reading wrong rather than merely slow -- a cluster would be a partial range,
-// and the rows outside it would never be scored while the answer still looked whole.
+// The join reads each chunk's labels as runs of one cluster. An unordered corpus is all runs
+// of a few rows, which the search would visit a few rows at a time; a corpus whose chunks hold
+// a few sorted spans back to back (what a build phase's coalescing produces) is answered.
 //
 // The refusal is thrown at execution, not at bind, because it needs the corpus labels
 // on the device. If DuckDB turns that into a CPU fallback the query still fails, but
@@ -682,6 +682,29 @@ TEST_CASE_METHOD(KMeansFixture,
                "search_mode => 'approx', metric => 'l2', k => 5, clustering => 'apb_c', "
                "cluster_column => 'not_a_column', build_source => 'scan');",
                "not found in table");
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a corpus whose chunks hold sorted spans back to back answers as a sorted one",
+                 "[integration][gpu_execution][array][vss][kmeans][approx]")
+{
+  // A build phase's batches are ordered spans of an ORDER BY, and the stage that coalesces them
+  // into chunks joins spans in the order they finish -- so a chunk can be two sorted runs, each
+  // cluster appearing twice. Every run of a wanted cluster is searched, so the answer is the
+  // one a fully sorted corpus gives.
+  create_clustered_join(*this, *con, "aps", 8);
+  run_ok("CREATE TABLE aps_halves AS SELECT * FROM aps_corpus ORDER BY id % 2, cluster_id;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'aps_halves', tier => 'gpu', format => 'duckdb');");
+  auto const join = [&](std::string const& corpus) {
+    return distance_multiset(*con,
+                             "SELECT left_id, distance FROM sirius_knn_join('aps_probe','vec','" +
+                               corpus +
+                               "','vec', search_mode => 'approx', metric => 'l2', k => 5, "
+                               "clustering => 'aps_c', cluster_column => 'cluster_id', n_probes "
+                               "=> 2);");
+  };
+  REQUIRE(join("aps_halves") == join("aps_corpus"));
 }
 
 TEST_CASE_METHOD(KMeansFixture,

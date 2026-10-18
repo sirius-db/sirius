@@ -1596,13 +1596,14 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
     stream.synchronize();
     row_base += static_cast<std::int64_t>(rows);
 
-    // Within a chunk the labels must be non-decreasing, which makes each cluster one run and
-    // bounds the runs per chunk by the cluster count. Chunks themselves may arrive in any
-    // order -- a slice carries its own chunk, so nothing reads across a chunk boundary. That
-    // is weaker than requiring the whole corpus to be sorted, and it is what a build phase can
-    // actually promise: its batches are ordered spans of an ORDER BY, but the order the
-    // batches are handed back in is a race.
-    std::size_t start = 0;
+    // A chunk is read as runs of one cluster each, and a cluster may come as several runs --
+    // within a chunk as across chunks, since a slice carries its own chunk and nothing reads
+    // across a run. A build phase's batches are ordered spans of an ORDER BY, but the stage that
+    // coalesces them into chunks joins spans in the order they finish, so a chunk can be two
+    // sorted runs back to back. Only a corpus never put in cluster order is refused: its runs
+    // are a few rows long, and the search would visit it a few rows at a time.
+    auto const runs_before = _chunk_cluster_runs[j].size();
+    std::size_t start      = 0;
     for (std::size_t i = 1; i <= rows; ++i) {
       if (i < rows && labels[i] == labels[start]) { continue; }
       auto const c = labels[start];
@@ -1613,17 +1614,18 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
                                  " clusters");
       }
       auto& runs = _chunk_cluster_runs[j];
-      if (!runs.empty() && c <= runs.back().cluster) {
-        throw std::runtime_error(
-          "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(j) +
-          " is not stored in cluster order: cluster id " + std::to_string(c) + " follows " +
-          std::to_string(runs.back().cluster) + ". Materialize the corpus with ORDER BY " +
-          _request.build_cluster_column);
-      }
       runs.push_back(
         chunk_cluster_run{c, static_cast<std::int64_t>(start), static_cast<std::int64_t>(i)});
       _cluster_rows[static_cast<std::size_t>(c)] += static_cast<std::int64_t>(i - start);
       start = i;
+    }
+    auto const chunk_runs = _chunk_cluster_runs[j].size() - runs_before;
+    if (chunk_runs > 1024 && rows < 8 * chunk_runs) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(j) +
+        " is not stored in cluster order: " + std::to_string(chunk_runs) + " runs over " +
+        std::to_string(rows) + " rows. Materialize the corpus with ORDER BY " +
+        _request.build_cluster_column);
     }
   }
   if (row_base == 0) {
