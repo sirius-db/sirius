@@ -26,6 +26,7 @@
 
 #include <array>
 #include <barrier>
+#include <future>
 #include <thread>
 
 using namespace sirius::scan_manager;
@@ -36,20 +37,66 @@ required_input_set needs(required_input input)
   set.set(static_cast<size_t>(input));
   return set;
 }
+struct live_unit_probe {
+  explicit live_unit_probe(std::shared_ptr<preparation_unit> const& unit) : unit(unit) {}
+  std::weak_ptr<preparation_unit> unit;
+  std::shared_ptr<std::promise<void>> done = std::make_shared<std::promise<void>>();
+  std::future<void> finished               = done->get_future();
+  std::thread worker;
+  bool observed = false;
+  void observe()
+  {
+    auto live = unit.lock();
+    if (!live) throw std::logic_error("cleanup probe needs a live unit");
+    worker   = std::thread([live = std::move(live), done = done] {
+      try {
+        // Discard the snapshot before signalling; never retain the disposed payload.
+        (void)live->record();
+        done->set_value();
+      } catch (...) {
+        done->set_exception(std::current_exception());
+      }
+    });
+    observed = finished.wait_for(std::chrono::milliseconds{200}) == std::future_status::ready;
+  }
+  bool finish()
+  {
+    if (!worker.joinable()) return false;
+    // Called after disposal returns, so a mutex-order mutant can now unblock.
+    if (finished.wait_for(std::chrono::seconds{1}) != std::future_status::ready) {
+      worker.detach();  // Captured owners remain valid even on an unexpected failure.
+      return false;
+    }
+    worker.join();
+    finished.get();
+    return true;
+  }
+  ~live_unit_probe()
+  {
+    if (worker.joinable()) {
+      try {
+        (void)finish();
+      } catch (...) {
+      }
+    }
+  }
+};
 }  // namespace
 TEST_CASE("Terminal preparation releases partial dependencies outside both locks",
           "[scan_preparation][preparation_unit][preparation_cleanup]")
 {
-  auto gate     = std::make_shared<preparation_gate>();
-  auto seen     = std::make_shared<test::cleanup_observation>(gate);
-  auto required = needs(required_input::segments) | needs(required_input::checkpoint_iteration);
-  preparation_unit unit({1, 1}, required, gate);
-  auto profile = std::shared_ptr<sirius::op::scan::physical_profile_table>(
+  auto gate         = std::make_shared<preparation_gate>();
+  auto seen         = std::make_shared<test::cleanup_observation>(gate);
+  auto required     = needs(required_input::segments) | needs(required_input::checkpoint_iteration);
+  auto unit         = std::make_shared<preparation_unit>(unit_key{1, 1}, required, gate);
+  auto probe        = std::make_shared<live_unit_probe>(unit);
+  seen->after_probe = [probe] { probe->observe(); };
+  auto profile      = std::shared_ptr<sirius::op::scan::physical_profile_table>(
     new sirius::op::scan::physical_profile_table, [seen](auto* value) {
       seen->release();
       delete value;
     });
-  REQUIRE(unit.complete_input(segments_input{std::move(profile)}));
+  REQUIRE(unit->complete_input(segments_input{std::move(profile)}));
   bool fail = false, throw_report = false;
   SECTION("cancel") {}
   SECTION("failure") { fail = true; }
@@ -63,17 +110,19 @@ TEST_CASE("Terminal preparation releases partial dependencies outside both locks
     preparation_failure failure{
       sirius::transparent::late_failure_cause::other, {}, "first terminal", {}};
     if (throw_report)
-      CHECK_THROWS_WITH(unit.fail(failure), "report injected");
+      CHECK_THROWS_WITH(unit->fail(failure), "report injected");
     else
-      CHECK(unit.fail(failure));
-    REQUIRE(unit.record().failure);
-    CHECK(unit.record().failure->detail == "first terminal");
+      CHECK(unit->fail(failure));
+    REQUIRE(unit->record().failure);
+    CHECK(unit->record().failure->detail == "first terminal");
   } else {
-    CHECK(unit.cancel());
+    CHECK(unit->cancel());
   }
-  CHECK(unit.record().state == terminal);
-  CHECK_FALSE(unit.cancel());
-  CHECK_FALSE(unit.fail({sirius::transparent::late_failure_cause::other, {}, "late", {}}));
+  CHECK(probe->finish());
+  CHECK(probe->observed);
+  CHECK(unit->record().state == terminal);
+  CHECK_FALSE(unit->cancel());
+  CHECK_FALSE(unit->fail({sirius::transparent::late_failure_cause::other, {}, "late", {}}));
   CHECK(seen->releases == 1);
   CHECK(seen->outside == 1);
   CHECK(seen->errors == 0);
@@ -94,7 +143,12 @@ TEST_CASE("Failed ready snapshot retries release replaced dependency owners outs
   std::array<std::shared_ptr<test::cleanup_observation>, 3> seen;
   for (auto& owner : seen)
     owner = std::make_shared<test::cleanup_observation>(gate);
-  preparation_unit unit({97, 1}, needs(family), gate);
+  auto unit = std::make_shared<preparation_unit>(unit_key{97, 1}, needs(family), gate);
+  std::array<std::shared_ptr<live_unit_probe>, 3> probes;
+  for (size_t index = 0; index < probes.size(); ++index) {
+    probes[index]            = std::make_shared<live_unit_probe>(unit);
+    seen[index]->after_probe = [probe = probes[index]] { probe->observe(); };
+  }
   sirius::op::scan::split_dependencies old, replacement;
   size_t owners = 1;
   if (family == required_input::footer) {
@@ -136,11 +190,11 @@ TEST_CASE("Failed ready snapshot retries release replaced dependency owners outs
   auto expected = replacement;
   auto complete = [&](sirius::op::scan::split_dependencies& input) {
     if (family == required_input::footer)
-      return unit.complete_input(footer_input{
+      return unit->complete_input(footer_input{
         std::move(input.footer), std::move(input.parquet_approval), std::move(input.datasource)});
     if (family == required_input::segments)
-      return unit.complete_input(segments_input{std::move(input.profiles)});
-    return unit.complete_input(delete_set_input{std::move(input.delete_set)});
+      return unit->complete_input(segments_input{std::move(input.profiles)});
+    return unit->complete_input(delete_set_input{std::move(input.delete_set)});
   };
   bool refused = false, fired = false;
   size_t allocations = 0;
@@ -157,13 +211,13 @@ TEST_CASE("Failed ready snapshot retries release replaced dependency owners outs
   REQUIRE(refused);
   REQUIRE(fired);
   REQUIRE(allocations == 1);
-  CHECK(unit.record().state == unit_state::pending);
-  CHECK(unit.record().completed.none());
-  CHECK_FALSE(unit.record().deps);
+  CHECK(unit->record().state == unit_state::pending);
+  CHECK(unit->record().completed.none());
+  CHECK_FALSE(unit->record().deps);
   for (size_t index = 0; index < owners; ++index)
     CHECK(seen[index]->releases == 0);
   REQUIRE(complete(replacement));
-  auto ready = unit.record();
+  auto ready = unit->record();
   REQUIRE(ready.state == unit_state::ready);
   REQUIRE(ready.deps);
   CHECK(ready.deps->footer == expected.footer);
@@ -172,6 +226,8 @@ TEST_CASE("Failed ready snapshot retries release replaced dependency owners outs
   CHECK(ready.deps->profiles == expected.profiles);
   CHECK(ready.deps->delete_set == expected.delete_set);
   for (size_t index = 0; index < owners; ++index) {
+    CHECK(probes[index]->finish());
+    CHECK(probes[index]->observed);
     CHECK(seen[index]->releases == 1);
     CHECK(seen[index]->outside == 1);
     CHECK(seen[index]->errors == 0);
