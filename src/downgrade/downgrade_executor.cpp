@@ -147,6 +147,36 @@ void downgrade_executor::drain()
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 }
 
+namespace {
+/// Failed conversions in a row after which spilling pauses, and for how long. Every candidate is
+/// copied off its tier before the write that fails, so retrying the whole candidate list for
+/// every request kept a query whose tasks wait on those requests retrying for hours.
+constexpr std::uint32_t kFailedConversionsToPause = 64;
+constexpr std::chrono::seconds kSpillPause{30};
+
+std::int64_t steady_now_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
+}
+}  // namespace
+
+void downgrade_executor::note_failed_conversion(char const* what)
+{
+  auto const failed = _failed_conversions.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (failed % kFailedConversionsToPause != 0) { return; }
+  _spill_paused_until_ns.store(
+    steady_now_ns() + std::chrono::duration_cast<std::chrono::nanoseconds>(kSpillPause).count());
+  SIRIUS_LOG_ERROR(
+    "[downgrade] [{}] {} conversions in a row failed (last: {}); spilling paused for {} s, so "
+    "queries waiting for memory fail instead of retrying. Is the disk tier full or unwritable?",
+    _source_label,
+    failed,
+    what,
+    kSpillPause.count());
+}
+
 void downgrade_executor::processing_loop()
 {
   while (_running.load()) {
@@ -156,6 +186,14 @@ void downgrade_executor::processing_loop()
     auto& req = request;
 
     auto t_start = std::chrono::steady_clock::now();
+
+    if (steady_now_ns() < _spill_paused_until_ns.load()) {
+      if (req->is_monitor_request) {
+        _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+      }
+      req->result.set_value(0);
+      continue;
+    }
 
     // Per-source tracking (repos vs pipeline_queue)
     struct source_stats {
@@ -318,7 +356,8 @@ void downgrade_executor::processing_loop()
 
           _pool->dispatch(
             std::move(slot),
-            [cand       = std::move(candidate),
+            [this,
+             cand       = std::move(candidate),
              req_ptr    = req.get(),
              &res_mgr   = _reservation_manager,
              &targets   = target_spaces,
@@ -339,6 +378,7 @@ void downgrade_executor::processing_loop()
                   cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
                 if (result) {
                   std::move(rollback).Cancel();
+                  _failed_conversions.store(0, std::memory_order_relaxed);
                   req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                   repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
@@ -357,8 +397,10 @@ void downgrade_executor::processing_loop()
                 }
               } catch (const std::exception& e) {
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
+                note_failed_conversion(e.what());
               } catch (...) {
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository");
+                note_failed_conversion("unknown exception");
               }
             });
         }
@@ -394,7 +436,8 @@ void downgrade_executor::processing_loop()
 
         _pool->dispatch(
           std::move(slot),
-          [cand       = std::move(candidate),
+          [this,
+           cand       = std::move(candidate),
            req_ptr    = req.get(),
            &res_mgr   = _reservation_manager,
            &targets   = target_spaces,
@@ -419,6 +462,7 @@ void downgrade_executor::processing_loop()
                 cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
               if (result) {
                 std::move(rollback).Cancel();
+                _failed_conversions.store(0, std::memory_order_relaxed);
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                 pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
@@ -437,8 +481,10 @@ void downgrade_executor::processing_loop()
               }
             } catch (const std::exception& e) {
               SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue: {}", e.what());
+              note_failed_conversion(e.what());
             } catch (...) {
               SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue");
+              note_failed_conversion("unknown exception");
             }
           });
       }
