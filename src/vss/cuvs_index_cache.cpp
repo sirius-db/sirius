@@ -98,9 +98,10 @@ std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find_by_column(
   auto const wanted = canonical_metric(metric);
   for (auto const& kv : _entries) {
     auto const& entry = kv.second;
-    if (entry->meta.catalog_name == catalog && entry->meta.schema_name == schema &&
-        entry->meta.table_name == table && entry->meta.column_name == column &&
-        canonical_metric(entry->meta.metric) == wanted) {
+    // Only a search index answers a search; a clustering's centroids and lists share the cache.
+    if (entry->meta.kind == index_kind::ivf_flat && entry->meta.catalog_name == catalog &&
+        entry->meta.schema_name == schema && entry->meta.table_name == table &&
+        entry->meta.column_name == column && canonical_metric(entry->meta.metric) == wanted) {
       return entry;
     }
   }
