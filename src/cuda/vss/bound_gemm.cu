@@ -44,11 +44,8 @@ namespace sirius::vss {
 namespace {
 
 // Block tile 128 probe rows x 128 corpus rows, 8 warps in a 2 x 4 grid of 64 x 32 warp tiles.
-// The reduction dimension is staged through shared memory 64 components at a time; the 16-byte
-// row pad keeps the fragment loads off a single bank.
 constexpr int kTileM = 128;
 constexpr int kTileN = 128;
-constexpr int kChunk = 64;
 constexpr int kWarps = 8;
 
 template <class T>
@@ -79,6 +76,7 @@ struct group_view {
   bound_slice const* slices{nullptr};
   int64_t const* prefix{nullptr};
   int n_slices{0};
+  int walk{1};  ///< consecutive corpus tiles of its slice a block of a tile launch takes
 };
 
 __device__ inline int find_slice(group_view const& g, int64_t b)
@@ -95,16 +93,75 @@ __device__ inline int find_slice(group_view const& g, int64_t b)
   return lo;
 }
 
+// sm_80+ operand staging and products. WMMA's 16 x 16 x 16 int8 fragment compiles to the k16
+// IMMA, half the rate of the k32 one, so the products are mma.sync with operands read by
+// ldmatrix; cp.async copies the next 64 bytes of each row while the current ones are multiplied.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ inline void cp_async16(void* smem, void const* gmem, bool fill)
+{
+  auto const s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+  asm volatile(
+    "cp.async.ca.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(fill ? 16 : 0));
+}
+
+__device__ inline void cp_async4(void* smem, void const* gmem, bool fill)
+{
+  auto const s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+  asm volatile(
+    "cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(s), "l"(gmem), "r"(fill ? 4 : 0));
+}
+
+__device__ inline void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+
+/// Waits until every committed group has landed.
+__device__ inline void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::); }
+
+__device__ inline void ldmatrix_x4(unsigned (&r)[4], void const* smem)
+{
+  auto const s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(s));
+}
+
+// c (m16n8, 4 per lane) += a (m16 x 32 bytes) b (32 bytes x n8): k32 for int8, k16 for half.
+__device__ inline void mma_m16n8(int* c, unsigned const (&a)[4], unsigned b0, unsigned b1)
+{
+  asm volatile(
+    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+    "{%8, %9}, {%0, %1, %2, %3};\n"
+    : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ inline void mma_m16n8(float* c, unsigned const (&a)[4], unsigned b0, unsigned b1)
+{
+  asm volatile(
+    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+    "{%8, %9}, {%0, %1, %2, %3};\n"
+    : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+/// A warp's 16 x 16 block of scores in the register epilogue's layout (two m16n8 tiles).
+template <class A>
+struct score_frag {
+  A x[8];
+};
+#endif
+
 // Two blocks per SM: under separable compilation ptxas otherwise spends 177 registers on this
 // kernel and runs one block per SM, 1.5x slower.
 //
 // Probe tiles run fastest across the grid: the probe side is small enough to stay in L2, so each
 // corpus tile is read from memory about once instead of once per probe tile row.
 //
-// kRegisterEpilogue scores the accumulators where they are: a 16 x 16 accumulator's x[t] holds
-// row g + 8 ((t >> 1) & 1), column 8 (t >> 2) + 2 q + (t & 1), g = lane / 4, q = lane % 4 -- the
-// mma m16n8 layout WMMA uses on sm_80+, which accumulator_layout_is_m16n8 checks on the device.
-// Otherwise each fragment goes through shared memory, whatever its layout.
+// The register epilogue scores the accumulators where they are: a 16 x 16 accumulator's x[t]
+// holds row g + 8 ((t >> 1) & 1), column 8 (t >> 2) + 2 q + (t & 1), g = lane / 4, q = lane % 4
+// -- two mma m16n8 tiles side by side. On sm_80+ the products are mma.sync, whose layout that is,
+// so it always runs; below, kRegisterEpilogue says whether WMMA uses it there
+// (accumulator_layout_is_m16n8 checks on the device), and otherwise each fragment goes through
+// shared memory, whatever its layout.
 template <class T, bool kRegisterEpilogue, bool kGrouped = false>
 __global__ void __launch_bounds__(kWarps * 32, 2)
   bound_filter_kernel(T const* __restrict__ x,
@@ -124,28 +181,64 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
                       float* out_d,
                       unsigned long long* count,
                       unsigned long long capacity,
-                      group_view group)
+                      group_view group,
+                      int band)
 {
 #if __CUDA_ARCH__ >= 720
   using namespace nvcuda;
-  using E              = typename mma_traits<T>::element;
-  using A              = typename mma_traits<T>::accumulator;
+  using E = typename mma_traits<T>::element;
+  using A = typename mma_traits<T>::accumulator;
+#if __CUDA_ARCH__ >= 800
+  constexpr bool kRegisterScores = true;
+  // 64 bytes of each row per stage, two stages; the 16-byte row pad keeps ldmatrix's eight rows
+  // on distinct banks.
+  constexpr int kStageBytes = 64;
+  constexpr int kPitchBytes = kStageBytes + 16;
+  __shared__ __align__(128) unsigned char stage_a[2][kTileM * kPitchBytes];
+  __shared__ __align__(128) unsigned char stage_b[2][kTileN * kPitchBytes];
+#else
+  constexpr bool kRegisterScores = kRegisterEpilogue;
+  // The reduction dimension 64 components at a time; the 16-byte row pad keeps the fragment loads
+  // off a single bank.
+  constexpr int kChunk = 64;
   constexpr int kVec   = 16 / sizeof(T);  // components per 16-byte load
   constexpr int kPitch = kChunk + kVec;
   __shared__ __align__(32) T tile_a[kTileM * kPitch];
   __shared__ __align__(32) T tile_b[kTileN * kPitch];
-  __shared__ __align__(32) A scores[kRegisterEpilogue ? 1 : kWarps][16 * 16];
+#endif
+  __shared__ __align__(32) A scores[kRegisterScores ? 1 : kWarps][16 * 16];
   __shared__ int64_t tile_rows[kTileM];
   __shared__ float tile_qsq[kTileM];
   __shared__ float tile_limit[kTileM];
   // The tile's corpus norms, read coalesced up front rather than eight scattered loads a lane at
-  // the end, where nothing hides them.
-  __shared__ typename mma_traits<T>::norm tile_xsq[kTileN];
+  // the end, where nothing hides them; on sm_80+ the next tile's are copied during this one.
+#if __CUDA_ARCH__ >= 800
+  constexpr int kXsqBuffers = 2;
+#else
+  constexpr int kXsqBuffers = 1;
+#endif
+  __shared__ typename mma_traits<T>::norm tile_xsq[kXsqBuffers][kTileN];
 
   int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   int const wm = warp / 4, wn = warp % 4;
   int64_t q0 = static_cast<int64_t>(blockIdx.x) * kTileM;
   int64_t x0 = static_cast<int64_t>(blockIdx.y) * kTileN;
+  if constexpr (!kGrouped) {
+    // Bands of `band` probe tiles, each run across the corpus before the next: blocks start in
+    // launch order, so the probe rows of the running blocks stay in L2 while the corpus streams.
+    auto const m_tiles = static_cast<int64_t>(gridDim.x);
+    auto const l = static_cast<int64_t>(blockIdx.x) + static_cast<int64_t>(blockIdx.y) * m_tiles;
+    auto const width = static_cast<int64_t>(gridDim.y) * band;
+    auto const b = l / width, rem = l % width;
+    auto const g = min(static_cast<int64_t>(band), m_tiles - b * band);
+    q0           = (b * band + rem % g) * kTileM;
+    x0           = (rem / g) * kTileN;
+  }
+  // On sm_80+ a block walks several corpus tiles for its one probe tile, so it sets the probe side
+  // up once and copies the next tile's first stage during this one's epilogue: single-slice, the
+  // tiles gridDim.y apart; grouped, group.walk consecutive tiles of its slice. Below sm_80 every
+  // block takes one tile (a grid column per tile, walk 1).
+  int64_t x_step = static_cast<int64_t>(gridDim.y) * kTileN, x_stop = n;
   // A separate instantiation, so a single-slice launch carries none of this in its registers.
   if constexpr (kGrouped) {
     auto const b       = static_cast<int64_t>(blockIdx.x);
@@ -161,11 +254,49 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
     auto const local   = b - group.prefix[si];
     auto const m_tiles = (m + kTileM - 1) / kTileM;
     q0                 = (local % m_tiles) * kTileM;
-    x0                 = (local / m_tiles) * kTileN;
+    x0                 = (local / m_tiles) * group.walk * kTileN;
+    x_step             = kTileN;
+    x_stop             = min(n, x0 + static_cast<int64_t>(group.walk) * kTileN);
   }
+#if __CUDA_ARCH__ >= 800
+  // Thread t copies the 16-byte pieces t and t + 256 of a stage: row e / 4, piece e % 4.
+  int const row_bytes = d * static_cast<int>(sizeof(T));
+  auto const* x_bytes = reinterpret_cast<unsigned char const*>(x);
+  auto const* p_bytes = reinterpret_cast<unsigned char const*>(probe);
+  auto load_b         = [&](int64_t origin, int s, int buf) {
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      int const e = threadIdx.x + k * kWarps * 32, r = e / 4, at = s * kStageBytes + (e % 4) * 16;
+      bool const ok   = origin + r < n && at < row_bytes;
+      auto const* src = ok ? x_bytes + (origin + r) * row_bytes + at : x_bytes;
+      cp_async16(&stage_b[buf][r * kPitchBytes + (e % 4) * 16], src, ok);
+    }
+  };
+  auto load_xsq = [&](int64_t origin, int which) {
+    for (int r = threadIdx.x; r < kTileN; r += blockDim.x) {
+      bool const ok = origin + r < n;
+      cp_async4(&tile_xsq[which][r], ok ? x_sq + origin + r : x_sq, ok);
+    }
+  };
+  auto load_a = [&](int s, int buf) {
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      int const e = threadIdx.x + k * kWarps * 32, r = e / 4, at = s * kStageBytes + (e % 4) * 16;
+      int64_t const row = tile_rows[r];
+      bool const ok     = row >= 0 && at < row_bytes;
+      auto const* src   = ok ? p_bytes + row * row_bytes + at : p_bytes;
+      cp_async16(&stage_a[buf][r * kPitchBytes + (e % 4) * 16], src, ok);
+    }
+  };
+  // The corpus side of the first stage needs no probe row, so it is in flight during the setup.
+  load_b(x0, 0, 0);
+  load_xsq(x0, 0);
+#endif
   static_assert(kTileM == kTileN, "the setup loop fills both tiles' per-row values");
   for (int r = threadIdx.x; r < kTileM; r += blockDim.x) {
-    tile_xsq[r]       = x0 + r < n ? x_sq[x0 + r] : 0;
+#if __CUDA_ARCH__ < 800
+    tile_xsq[0][r] = x0 + r < n ? x_sq[x0 + r] : 0;
+#endif
     int64_t const row = q0 + r < m ? rows[q0 + r] : -1;
     tile_rows[r]      = row;
     if (row >= 0) {
@@ -182,177 +313,260 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
   }
   __syncthreads();
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, A> acc[4][2];
+#if __CUDA_ARCH__ >= 800
+  load_a(0, 0);
+  cp_async_commit();
+  int const stages = (row_bytes + kStageBytes - 1) / kStageBytes;
+  int buf          = 0;
+  for (int tile = 0; x0 < x_stop; x0 += x_step, ++tile) {
+    score_frag<A> acc[4][2];
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-#pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      wmma::fill_fragment(acc[i][j], A(0));
-    }
-  }
-  for (int k0 = 0; k0 < d; k0 += kChunk) {
-    int const kc = min(kChunk, d - k0);
-    for (int e = threadIdx.x; e < kTileM * (kChunk / kVec); e += blockDim.x) {
-      int const r = e / (kChunk / kVec), c = (e % (kChunk / kVec)) * kVec;
-      int4 a = make_int4(0, 0, 0, 0), b = make_int4(0, 0, 0, 0);
-      if (tile_rows[r] >= 0 && c < kc) {
-        a = *reinterpret_cast<int4 const*>(probe + tile_rows[r] * d + k0 + c);
-      }
-      if (x0 + r < n && c < kc) { b = *reinterpret_cast<int4 const*>(x + (x0 + r) * d + k0 + c); }
-      *reinterpret_cast<int4*>(tile_a + r * kPitch + c) = a;
-      *reinterpret_cast<int4*>(tile_b + r * kPitch + c) = b;
-    }
-    __syncthreads();
-    for (int kk = 0; kk < kc; kk += 16) {
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, E, wmma::row_major> fa[4];
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, E, wmma::col_major> fb[2];
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        wmma::load_matrix_sync(
-          fa[i], reinterpret_cast<E const*>(tile_a) + (wm * 64 + i * 16) * kPitch + kk, kPitch);
-      }
+    for (int i = 0; i < 4; ++i) {
 #pragma unroll
       for (int j = 0; j < 2; ++j) {
-        wmma::load_matrix_sync(
-          fb[j], reinterpret_cast<E const*>(tile_b) + (wn * 32 + j * 16) * kPitch + kk, kPitch);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+          acc[i][j].x[t] = A(0);
+        }
       }
+    }
+    for (int s = 0; s < stages; ++s, buf ^= 1) {
+      // One barrier a stage: past it this stage is visible to every warp and every warp is done
+      // with the previous one, whose buffer the next copies then fill -- this tile's next stage,
+      // or after its last the next tile's first stage and norms, which land during the epilogue.
+      cp_async_wait_all();
+      __syncthreads();
+      if (s + 1 < stages) {
+        load_a(s + 1, buf ^ 1);
+        load_b(x0, s + 1, buf ^ 1);
+        cp_async_commit();
+      } else if (x0 + x_step < x_stop) {
+        load_a(0, buf ^ 1);
+        load_b(x0 + x_step, 0, buf ^ 1);
+        load_xsq(x0 + x_step, (tile + 1) & 1);
+        cp_async_commit();
+      }
+      // 32 bytes of the rows per product; a stage's zero-filled tail past the row adds nothing.
+      int const steps = min(kStageBytes, row_bytes - s * kStageBytes) > 32 ? 2 : 1;
+      for (int ks = 0; ks < steps; ++ks) {
+        // Lane l addresses row l % 8 of 8 x 16-byte matrix l / 8 of each ldmatrix.x4: for the
+        // corpus, n8 tile 2p + l / 16 at byte 16 ((l / 8) % 2); for the probe, row l % 16 at byte
+        // 16 (l / 16).
+        unsigned b[4][2];
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+          unsigned r[4];
+          ldmatrix_x4(
+            r,
+            &stage_b[buf][(wn * 32 + (2 * p + (lane >> 4)) * 8 + (lane & 7)) * kPitchBytes +
+                          ks * 32 + ((lane >> 3) & 1) * 16]);
+          b[2 * p][0]     = r[0];
+          b[2 * p][1]     = r[1];
+          b[2 * p + 1][0] = r[2];
+          b[2 * p + 1][1] = r[3];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          unsigned a[4];
+          ldmatrix_x4(a,
+                      &stage_a[buf][(wm * 64 + i * 16 + (lane & 15)) * kPitchBytes + ks * 32 +
+                                    (lane >> 4) * 16]);
+#pragma unroll
+          for (int jn = 0; jn < 4; ++jn) {
+            mma_m16n8(&acc[i][jn >> 1].x[(jn & 1) * 4], a, b[jn][0], b[jn][1]);
+          }
+        }
+      }
+    }
+#else
+  {
+    constexpr int tile = 0;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, A> acc[4][2];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        wmma::fill_fragment(acc[i][j], A(0));
+      }
+    }
+    for (int k0 = 0; k0 < d; k0 += kChunk) {
+      int const kc = min(kChunk, d - k0);
+      for (int e = threadIdx.x; e < kTileM * (kChunk / kVec); e += blockDim.x) {
+        int const r = e / (kChunk / kVec), c = (e % (kChunk / kVec)) * kVec;
+        int4 a = make_int4(0, 0, 0, 0), b = make_int4(0, 0, 0, 0);
+        if (tile_rows[r] >= 0 && c < kc) {
+          a = *reinterpret_cast<int4 const*>(probe + tile_rows[r] * d + k0 + c);
+        }
+        if (x0 + r < n && c < kc) { b = *reinterpret_cast<int4 const*>(x + (x0 + r) * d + k0 + c); }
+        *reinterpret_cast<int4*>(tile_a + r * kPitch + c) = a;
+        *reinterpret_cast<int4*>(tile_b + r * kPitch + c) = b;
+      }
+      __syncthreads();
+      for (int kk = 0; kk < kc; kk += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, E, wmma::row_major> fa[4];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, E, wmma::col_major> fb[2];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          wmma::load_matrix_sync(
+            fa[i], reinterpret_cast<E const*>(tile_a) + (wm * 64 + i * 16) * kPitch + kk, kPitch);
+        }
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          wmma::load_matrix_sync(
+            fb[j], reinterpret_cast<E const*>(tile_b) + (wn * 32 + j * 16) * kPitch + kk, kPitch);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            wmma::mma_sync(acc[i][j], fa[i], fb[j], acc[i][j]);
+          }
+        }
+      }
+      __syncthreads();
+    }
+#endif
+
+    if constexpr (kRegisterScores) {
+      // Each lane scores its own elements of each fragment: its 8 columns' |x|^2 are loaded once,
+      // and 16 rows of the warp's tile with no survivor cost one vote. A column past the slice gets
+      // a norm no pair passes with: NaN for half; for int8 the lane holds -|x|^2, and -2^30 there.
+      int const g = lane / 4, q = lane % 4;
+      typename mma_traits<T>::norm xs[8];
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        int const col = wn * 32 + (c >> 2) * 16 + 8 * ((c & 3) >> 1) + 2 * q + (c & 1);
+        bool const ok = x0 + col < n;
+        if constexpr (sizeof(T) == 1) {
+          xs[c] = ok ? -tile_xsq[tile & 1][col] : -(1 << 30);
+        } else {
+          xs[c] = ok ? tile_xsq[tile & 1][col] : __int_as_float(0x7fc00000);
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        int const r0         = wm * 64 + i * 16 + g;
+        float const qs[2]    = {tile_qsq[r0], tile_qsq[r0 + 8]};
+        float const limit[2] = {tile_limit[r0], tile_limit[r0 + 8]};
+        // A pair's distance is only formed again for a survivor, where it is written out.
+        auto distance = [&](int h, int c, typename mma_traits<T>::accumulator a) {
+          if constexpr (sizeof(T) == 1) {
+            return static_cast<float>(static_cast<int32_t>(qs[h]) - xs[c] - 2 * a);
+          } else {
+            return qs[h] + xs[c] - 2.f * a;
+          }
+        };
+        // INT8: qs + xs - 2 acc is an integer below 2^24, so it is <= limit exactly when it is <=
+        // floor(limit), i.e. when 2 acc - xs >= qs - floor(limit) = base: one shift-add and one
+        // compare per pair. |2 acc| < 2^24 and |base| <= 10^9 + 2^24, so none of it overflows.
+        int32_t base[2] = {0, 0};
+        if constexpr (sizeof(T) == 1) {
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            auto const l = limit[h] >= 1e9f    ? 1000000000
+                           : limit[h] <= -1e9f ? -1000000000
+                                               : static_cast<int32_t>(floorf(limit[h]));
+            base[h]      = static_cast<int32_t>(qs[h]) - l;
+          }
+        }
+        auto pass = [&](int j, int t) {
+          int const h = (t >> 1) & 1, c = j * 4 + ((t >> 2) << 1) + (t & 1);
+          if constexpr (sizeof(T) == 1) {
+            return 2 * acc[i][j].x[t] + xs[c] >= base[h];
+          } else {
+            return distance(h, c, acc[i][j].x[t]) <= limit[h];
+          }
+        };
+        bool any = false;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+#pragma unroll
+          for (int t = 0; t < 8; ++t) {
+            any |= pass(j, t);
+          }
+        }
+        if (!__any_sync(0xffffffffu, any)) { continue; }
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          unsigned keep = 0;
+#pragma unroll
+          for (int t = 0; t < 8; ++t) {
+            keep |= pass(j, t) ? (1u << t) : 0u;
+          }
+          if (!__any_sync(0xffffffffu, keep != 0)) { continue; }
+          // One atomic for the warp: an inclusive scan of the lanes' survivor counts places each.
+          int const own = __popc(keep);
+          int before    = own;
+#pragma unroll
+          for (int o = 1; o < 32; o <<= 1) {
+            int const v = __shfl_up_sync(0xffffffffu, before, o);
+            if (lane >= o) { before += v; }
+          }
+          unsigned long long base = 0;
+          if (lane == 31) { base = atomicAdd(count, static_cast<unsigned long long>(before)); }
+          auto p =
+            __shfl_sync(0xffffffffu, base, 31) + static_cast<unsigned long long>(before - own);
+#pragma unroll
+          for (int t = 0; t < 8; ++t) {
+            if (((keep >> t) & 1u) == 0) { continue; }
+            if (p < capacity) {
+              int const h = (t >> 1) & 1, c = j * 4 + ((t >> 2) << 1) + (t & 1);
+              int64_t const xj = x0 + wn * 32 + j * 16 + 8 * (t >> 2) + 2 * q + (t & 1);
+              out_rows[p]      = static_cast<int32_t>(tile_rows[r0 + 8 * h]);
+              out_ids[p]       = id_map != nullptr ? id_map[xj] : id_base + xj;
+              out_d[p]         = distance(h, c, acc[i][j].x[t]);
+            }
+            ++p;
+          }
+        }
+      }
+    } else {
+      // Epilogue, one 16 x 16 fragment at a time through the warp's own scratch tile: a lane scores
+      // 8 pairs, and each warp-wide batch of survivors takes one atomic.
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
-          wmma::mma_sync(acc[i][j], fa[i], fb[j], acc[i][j]);
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-  if constexpr (kRegisterEpilogue) {
-    // Each lane scores its own elements of each fragment: its 8 columns' |x|^2 are loaded once,
-    // and a fragment with no survivor in the warp costs one vote.
-    int const g = lane / 4, q = lane % 4;
-    typename mma_traits<T>::norm xs[8];
-    unsigned col_ok = 0;
+          wmma::store_matrix_sync(scores[warp], acc[i][j], 16, wmma::mem_row_major);
+          __syncwarp();
+          int const rb     = wm * 64 + i * 16;
+          int64_t const xb = x0 + wn * 32 + j * 16;
 #pragma unroll
-    for (int c = 0; c < 8; ++c) {
-      int const col = wn * 32 + (c >> 2) * 16 + 8 * ((c & 3) >> 1) + 2 * q + (c & 1);
-      col_ok |= x0 + col < n ? (1u << c) : 0u;
-      xs[c] = tile_xsq[col];
-    }
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      int const r0         = wm * 64 + i * 16 + g;
-      float const qs[2]    = {tile_qsq[r0], tile_qsq[r0 + 8]};
-      float const limit[2] = {tile_limit[r0], tile_limit[r0 + 8]};
-      // A pair's distance is only formed again for a survivor, where it is written out.
-      auto distance = [&](int h, int c, typename mma_traits<T>::accumulator a) {
-        if constexpr (sizeof(T) == 1) {
-          return static_cast<float>(static_cast<int32_t>(qs[h]) + xs[c] - 2 * a);
-        } else {
-          return qs[h] + xs[c] - 2.f * a;
-        }
-      };
-      // INT8: qs + xs - 2 acc is an integer below 2^24, so it is <= limit exactly when it is <=
-      // floor(limit), i.e. when acc >= ceil((qs - floor(limit) + xs) / 2) -- one integer compare
-      // per pair against a threshold per (row, column), +inf for a column past the slice.
-      int32_t base[2] = {0, 0};
-      if constexpr (sizeof(T) == 1) {
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          auto const l = limit[h] >= 1e9f    ? 1000000000
-                         : limit[h] <= -1e9f ? -1000000000
-                                             : static_cast<int32_t>(floorf(limit[h]));
-          base[h]      = static_cast<int32_t>(qs[h]) - l;
-        }
-      }
-#pragma unroll
-      for (int j = 0; j < 2; ++j) {
-        unsigned keep = 0;
-#pragma unroll
-        for (int t = 0; t < 8; ++t) {
-          int const h = (t >> 1) & 1, c = j * 4 + ((t >> 2) << 1) + (t & 1);
-          bool pass;
-          if constexpr (sizeof(T) == 1) {
-            int32_t const threshold =
-              ((col_ok >> c) & 1u) ? (base[h] + xs[c] + 1) >> 1 : 0x7fffffff;
-            pass = acc[i][j].x[t] >= threshold;
-          } else {
-            pass = ((col_ok >> c) & 1u) && distance(h, c, acc[i][j].x[t]) <= limit[h];
-          }
-          keep |= pass ? (1u << t) : 0u;
-        }
-        if (!__any_sync(0xffffffffu, keep != 0)) { continue; }
-        // One atomic for the warp: an inclusive scan of the lanes' survivor counts places each.
-        int const own = __popc(keep);
-        int before    = own;
-#pragma unroll
-        for (int o = 1; o < 32; o <<= 1) {
-          int const v = __shfl_up_sync(0xffffffffu, before, o);
-          if (lane >= o) { before += v; }
-        }
-        unsigned long long base = 0;
-        if (lane == 31) { base = atomicAdd(count, static_cast<unsigned long long>(before)); }
-        auto p = __shfl_sync(0xffffffffu, base, 31) + static_cast<unsigned long long>(before - own);
-#pragma unroll
-        for (int t = 0; t < 8; ++t) {
-          if (((keep >> t) & 1u) == 0) { continue; }
-          if (p < capacity) {
-            int const h = (t >> 1) & 1, c = j * 4 + ((t >> 2) << 1) + (t & 1);
-            int64_t const xj = x0 + wn * 32 + j * 16 + 8 * (t >> 2) + 2 * q + (t & 1);
-            out_rows[p]      = static_cast<int32_t>(tile_rows[r0 + 8 * h]);
-            out_ids[p]       = id_map != nullptr ? id_map[xj] : id_base + xj;
-            out_d[p]         = distance(h, c, acc[i][j].x[t]);
-          }
-          ++p;
-        }
-      }
-    }
-  } else {
-    // Epilogue, one 16 x 16 fragment at a time through the warp's own scratch tile: a lane scores
-    // 8 pairs, and each warp-wide batch of survivors takes one atomic.
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-#pragma unroll
-      for (int j = 0; j < 2; ++j) {
-        wmma::store_matrix_sync(scores[warp], acc[i][j], 16, wmma::mem_row_major);
-        __syncwarp();
-        int const rb     = wm * 64 + i * 16;
-        int64_t const xb = x0 + wn * 32 + j * 16;
-#pragma unroll
-        for (int t = 0; t < 8; ++t) {
-          int const e = t * 32 + lane, r = rb + e / 16;
-          int64_t const xj  = xb + e % 16;
-          int64_t const row = tile_rows[r];
-          bool keep         = false;
-          float dist        = 0.f;
-          if (row >= 0 && xj < n) {
-            if constexpr (sizeof(T) == 1) {
-              dist = static_cast<float>(static_cast<int32_t>(tile_qsq[r]) + x_sq[xj] -
-                                        2 * scores[warp][e]);
-            } else {
-              dist = tile_qsq[r] + x_sq[xj] - 2.f * scores[warp][e];
+          for (int t = 0; t < 8; ++t) {
+            int const e = t * 32 + lane, r = rb + e / 16;
+            int64_t const xj  = xb + e % 16;
+            int64_t const row = tile_rows[r];
+            bool keep         = false;
+            float dist        = 0.f;
+            if (row >= 0 && xj < n) {
+              if constexpr (sizeof(T) == 1) {
+                dist = static_cast<float>(static_cast<int32_t>(tile_qsq[r]) + x_sq[xj] -
+                                          2 * scores[warp][e]);
+              } else {
+                dist = tile_qsq[r] + x_sq[xj] - 2.f * scores[warp][e];
+              }
+              keep = dist <= tile_limit[r];
             }
-            keep = dist <= tile_limit[r];
-          }
-          unsigned const mask = __ballot_sync(0xffffffffu, keep);
-          if (mask != 0) {
-            int const leader        = __ffs(mask) - 1;
-            unsigned long long base = 0;
-            if (lane == leader) {
-              base = atomicAdd(count, static_cast<unsigned long long>(__popc(mask)));
-            }
-            base = __shfl_sync(0xffffffffu, base, leader);
-            if (keep) {
-              auto const p = base + __popc(mask & ((1u << lane) - 1));
-              if (p < capacity) {
-                out_rows[p] = static_cast<int32_t>(row);
-                out_ids[p]  = id_map != nullptr ? id_map[xj] : id_base + xj;
-                out_d[p]    = dist;
+            unsigned const mask = __ballot_sync(0xffffffffu, keep);
+            if (mask != 0) {
+              int const leader        = __ffs(mask) - 1;
+              unsigned long long base = 0;
+              if (lane == leader) {
+                base = atomicAdd(count, static_cast<unsigned long long>(__popc(mask)));
+              }
+              base = __shfl_sync(0xffffffffu, base, leader);
+              if (keep) {
+                auto const p = base + __popc(mask & ((1u << lane) - 1));
+                if (p < capacity) {
+                  out_rows[p] = static_cast<int32_t>(row);
+                  out_ids[p]  = id_map != nullptr ? id_map[xj] : id_base + xj;
+                  out_d[p]    = dist;
+                }
               }
             }
           }
+          __syncwarp();
         }
-        __syncwarp();
       }
     }
   }
@@ -565,6 +779,54 @@ __global__ void __launch_bounds__(kSmallThreads)
       }
     }
   }
+}
+
+/// How a single-slice tile launch covers @p m_tiles x @p n_tiles tiles of rows @p row_bytes wide.
+/// The search reads every probe tile once per corpus tile, so what decides it is whether the probe
+/// side stays in L2. Within a quarter of it (sm_80+), each block keeps one probe tile and walks
+/// many corpus tiles, setting the probe rows up once; about 16 waves of two blocks per SM keeps
+/// the last wave's idle share small. Otherwise a block per tile, in bands of probe tiles that fill
+/// half the L2, each band across the whole corpus before the next. Deep10M-shaped, 10k probes x
+/// 1M rows on an RTX A5000 (6 MB L2): int8 96 / 128 wide 23.9 -> 21.7 / 25.6 -> 24.5 ms walking;
+/// walking with a probe side past that, half 256 wide 84.6 -> 113.7 ms.
+struct tile_launch {
+  dim3 grid;
+  int band;
+};
+
+tile_launch plan_tiles(int64_t m_tiles, int64_t n_tiles, int64_t row_bytes)
+{
+  int device = 0, major = 0, sms = 0, l2 = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device));
+  auto const tile_bytes = kTileM * row_bytes;
+  if (major >= 8 && m_tiles * tile_bytes <= l2 / 4) {
+    auto const want = (int64_t{16} * 2 * sms + m_tiles - 1) / m_tiles;
+    return {dim3(static_cast<unsigned>(m_tiles),
+                 static_cast<unsigned>(std::clamp<int64_t>(want, 1, n_tiles))),
+            static_cast<int>(m_tiles)};
+  }
+  auto const band = std::clamp<int64_t>(l2 / 2 / tile_bytes, 1, m_tiles);
+  return {dim3(static_cast<unsigned>(m_tiles), static_cast<unsigned>(n_tiles)),
+          static_cast<int>(band)};
+}
+
+/// Corpus tiles of its slice each block of a grouped tile launch takes, for rows @p row_bytes
+/// wide. Eight puts the setup -- the slice lookup and the probe rows' gathers -- on eight tiles,
+/// but only while the running blocks' probe tiles, two blocks per SM, fit in L2 together: each is
+/// read again for every corpus tile. On an RTX A5000 (6 MB L2), 2048 lists of 2000 rows x 800
+/// probe rows: int8 96 wide 13.6 -> 8.3 ms walking, half 128 wide 20.6 -> 17.7 ms, but half 768
+/// wide 104 -> 132 ms. Below sm_80 the kernel takes one tile per block.
+int group_walk(int64_t row_bytes)
+{
+  int device = 0, major = 0, sms = 0, l2 = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device));
+  return major >= 8 && int64_t{2} * sms * kTileM * row_bytes <= l2 ? 8 : 1;
 }
 
 /// Probe-row counts up to this go to bound_filter_small_kernel (SIRIUS_VSS_SMALL_M overrides).
@@ -966,29 +1228,30 @@ void bound_filter_int8(int8_t const* x,
     return;
   }
   CUDF_EXPECTS((n + kTileN - 1) / kTileN <= 65535, "bound_filter_int8: too many corpus rows");
-  dim3 const grid(static_cast<unsigned>((m + kTileM - 1) / kTileM),
-                  static_cast<unsigned>((n + kTileN - 1) / kTileN));
+  auto const plan   = plan_tiles((m + kTileM - 1) / kTileM, (n + kTileN - 1) / kTileN, dim);
   auto const kernel = accumulator_layout_is_m16n8<typename mma_traits<int8_t>::accumulator>()
                         ? bound_filter_kernel<int8_t, true>
                         : bound_filter_kernel<int8_t, false>;
-  kernel<<<grid, kWarps * 32, 0, stream.value()>>>(x,
-                                                   x_sq,
-                                                   n,
-                                                   id_base,
-                                                   id_map,
-                                                   probe,
-                                                   probe_sq,
-                                                   rows,
-                                                   m,
-                                                   static_cast<int>(dim),
-                                                   bound,
-                                                   slack_terms{},
-                                                   out.rows.data(),
-                                                   out.ids.data(),
-                                                   out.distances.data(),
-                                                   out.count.data(),
-                                                   static_cast<unsigned long long>(out.capacity()),
-                                                   group_view{});
+  kernel<<<plan.grid, kWarps * 32, 0, stream.value()>>>(
+    x,
+    x_sq,
+    n,
+    id_base,
+    id_map,
+    probe,
+    probe_sq,
+    rows,
+    m,
+    static_cast<int>(dim),
+    bound,
+    slack_terms{},
+    out.rows.data(),
+    out.ids.data(),
+    out.distances.data(),
+    out.count.data(),
+    static_cast<unsigned long long>(out.capacity()),
+    group_view{},
+    plan.band);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -1017,11 +1280,13 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
   // once the launch that reads them is done.
   auto launch = [&](std::vector<bound_slice> const& v, bool tile, auto&& go) {
     if (v.empty()) { return; }
+    int const walk = tile ? group_walk(dim * (f16 ? 2 : 1)) : 1;
     std::vector<int64_t> prefix(v.size() + 1, 0);
     for (std::size_t i = 0; i < v.size(); ++i) {
-      auto const blocks = tile ? ((v[i].m + kTileM - 1) / kTileM) * ((v[i].n + kTileN - 1) / kTileN)
-                               : (v[i].n + kSmallThreads - 1) / kSmallThreads;
-      prefix[i + 1]     = prefix[i] + blocks;
+      auto const n_tiles = (v[i].n + kTileN - 1) / kTileN;
+      auto const blocks  = tile ? ((v[i].m + kTileM - 1) / kTileM) * ((n_tiles + walk - 1) / walk)
+                                : (v[i].n + kSmallThreads - 1) / kSmallThreads;
+      prefix[i + 1]      = prefix[i] + blocks;
     }
     CUDF_EXPECTS(prefix.back() <= std::numeric_limits<int>::max(),
                  "bound_filter_group: too many blocks for one launch");
@@ -1037,8 +1302,10 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
                                   cudaMemcpyHostToDevice,
                                   stream.value()));
     go(static_cast<unsigned>(prefix.back()),
-       group_view{
-         static_cast<bound_slice const*>(table.data()), device_prefix, static_cast<int>(v.size())});
+       group_view{static_cast<bound_slice const*>(table.data()),
+                  device_prefix,
+                  static_cast<int>(v.size()),
+                  walk});
     CUDF_CUDA_TRY(cudaGetLastError());
   };
   auto run = [&](auto element) {
@@ -1096,7 +1363,8 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
         out.distances.data(),
         out.count.data(),
         static_cast<unsigned long long>(out.capacity()),
-        g);
+        g,
+        1);
     });
   };
   if (f16) {
@@ -1141,12 +1409,13 @@ void bound_filter_f16(std::uint16_t const* x,
     return;
   }
   CUDF_EXPECTS((n + kTileN - 1) / kTileN <= 65535, "bound_filter_f16: too many corpus rows");
-  dim3 const grid(static_cast<unsigned>((m + kTileM - 1) / kTileM),
-                  static_cast<unsigned>((n + kTileN - 1) / kTileN));
+  auto const plan   = plan_tiles((m + kTileM - 1) / kTileM,
+                               (n + kTileN - 1) / kTileN,
+                               dim * static_cast<int64_t>(sizeof(__half)));
   auto const kernel = accumulator_layout_is_m16n8<typename mma_traits<__half>::accumulator>()
                         ? bound_filter_kernel<__half, true>
                         : bound_filter_kernel<__half, false>;
-  kernel<<<grid, kWarps * 32, 0, stream.value()>>>(
+  kernel<<<plan.grid, kWarps * 32, 0, stream.value()>>>(
     reinterpret_cast<__half const*>(x),
     x_sq,
     n,
@@ -1164,7 +1433,8 @@ void bound_filter_f16(std::uint16_t const* x,
     out.distances.data(),
     out.count.data(),
     static_cast<unsigned long long>(out.capacity()),
-    group_view{});
+    group_view{},
+    plan.band);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
