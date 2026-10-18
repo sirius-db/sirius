@@ -302,14 +302,16 @@ TEST_CASE("Preparation input disposal is outside the gate on every terminal path
     late_worker,
     cancelled_unit,
     parked_result,
-    queued_batch
+    queued_batch,
+    invalid_flush
   };
   auto mode = GENERATE(path::finished,
                        path::ready_unit,
                        path::late_worker,
                        path::cancelled_unit,
                        path::parked_result,
-                       path::queued_batch);
+                       path::queued_batch,
+                       path::invalid_flush);
   CAPTURE(static_cast<int>(mode));
   fixture f(1, 1);
   auto out    = std::make_shared<sink>();
@@ -317,13 +319,23 @@ TEST_CASE("Preparation input disposal is outside the gate on every terminal path
   auto worker = f.make_hold();
   struct pruning_coalescer : accumulator {
     std::function<std::unique_ptr<sirius::op::scan::scan_info>()> emit;
+    std::shared_ptr<test::cleanup_observation> invalid_flush;
     cursor_step advance(sirius::op::scan::scan_info&, size_t&, size_t) override
     {
       return {emit ? emit() : nullptr, true};
     }
-    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override { return {}; }
+    std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override
+    {
+      std::vector<std::unique_ptr<sirius::op::scan::scan_info>> out;
+      if (invalid_flush) {
+        out.push_back(std::make_unique<cleanup_tagged>(invalid_flush));
+        out.push_back(std::make_unique<cleanup_tagged>(invalid_flush));
+      }
+      return out;
+    }
   };
   auto coalescer = std::make_shared<pruning_coalescer>();
+  if (mode == path::invalid_flush) coalescer->invalid_flush = seen;
   if (mode == path::queued_batch) {
     coalescer->emit = [&] {
       f.coordinator.request_stop(stop_reason::normal_eos);
@@ -379,8 +391,11 @@ TEST_CASE("Preparation input disposal is outside the gate on every terminal path
   }
   f.finish();
   CHECK_FALSE(f.owner_error);
-  CHECK_FALSE(f.completion.has_error());
-  CHECK(seen->releases == (mode == path::queued_batch ? 2 : 1));
+  CHECK(f.completion.has_error() == (mode == path::invalid_flush));
+  if (mode == path::invalid_flush)
+    CHECK_THROWS_WITH(f.completion.get_awaitable().get(),
+                      "final flush exceeded its reserved output slot");
+  CHECK(seen->releases == (mode == path::invalid_flush ? 3 : mode == path::queued_batch ? 2 : 1));
   CHECK(seen->outside == seen->releases);
   CHECK(seen->errors == 0);
   CHECK(out->count() == 0);
