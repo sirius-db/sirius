@@ -23,6 +23,7 @@
 
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
+#include <io/io_errors.hpp>
 #include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
 #include <log/logging.hpp>
@@ -141,8 +142,11 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   scan_manager::w_permit const& permit,
   iceberg_dv_attempt const& prepared_attempt,
   io::ioctx_resolver const& resolve,
-  std::shared_ptr<physical_check_counters> const& counters)
+  std::shared_ptr<physical_check_counters> const& counters,
+  std::stop_token stop = {})
 {
+  if (stop.stop_requested())
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled));
   auto const* dv = descriptor.dv;
   if (!dv)
     return std::make_shared<iceberg_delete_set const>(
@@ -151,10 +155,22 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   std::shared_ptr<iceberg_delete_set const> set;
   // The execution attempt owns the ledger; the permit travels with the task.
   auto allocator = prepared_attempt.ledger()->allocator(permit);
+  struct phase_guard {
+    std::shared_ptr<physical_check_counters> counters;
+    std::string path;
+    bool active{false};
+    ~phase_guard()
+    {
+      if (active && counters && counters->track_units && counters->iceberg_dv_phase_for_testing)
+        counters->iceberg_dv_phase_for_testing(path, false);
+    }
+  } phase_done{counters, dv->file_path};
   if (counters) {
     ++counters->iceberg_delete_payload_loads;
     if (counters->track_units && counters->iceberg_dv_phase_for_testing)
       counters->iceberg_dv_phase_for_testing(dv->file_path, true);
+    phase_done.active =
+      counters->track_units && static_cast<bool>(counters->iceberg_dv_phase_for_testing);
   }
   try {
     std::unique_ptr<puffin_byte_source> source;
@@ -168,6 +184,8 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
         throw std::runtime_error("[iceberg_gpu_ingestible] no datasource for Puffin file: " +
                                  dv->file_path);
       source = make_puffin_byte_source(std::move(datasource));
+      if (stop.stop_requested())
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     } catch (sirius::transparent::classified_execution_error const&) {
       throw;
     } catch (duckdb::InterruptException const&) {
@@ -204,14 +222,22 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   } catch (unsupported_physical_input const& error) {
     if (counters) counters->record(error.reason);
     throw;
+  } catch (io::descriptor_mismatch_error const& error) {
+    if (counters) ++counters->descriptor_mismatches;
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      std::string("[puffin] descriptor mismatch: ") + error.what());
+  } catch (io::object_changed_error const& error) {
+    if (counters) ++counters->iceberg_delete_identity_failures;
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      std::string("[puffin] opened object changed: ") + error.what());
   } catch (sirius::transparent::classified_execution_error const&) {
     throw;
   } catch (std::bad_alloc const&) {
     throw scan_manager::preparation_resource_error(
       "DV preparation control allocation failed", false, std::current_exception());
   }
-  if (counters && counters->track_units && counters->iceberg_dv_phase_for_testing)
-    counters->iceberg_dv_phase_for_testing(dv->file_path, false);
   return set;
 }
 
@@ -222,8 +248,9 @@ void attach_delete_set(parquet_file_scan_info& file, std::shared_ptr<iceberg_del
   if (deps.size() != 1)
     throw sirius::internal_exception(
       "[iceberg_gpu_ingestible] parquet file requires one delete-set dependency");
-  deps.front().delete_set = std::move(set);
-  file.disable_filter_pushdown |= !deps.front().delete_set->positions.empty();
+  auto const has_deletes  = !set->positions.empty();
+  deps.front().visibility = std::move(set);
+  file.disable_filter_pushdown |= has_deletes;
   file.set_contract_payload(file.contract_id(),
                             std::vector<split_materializer_certificate>(file.certificates().begin(),
                                                                         file.certificates().end()),
@@ -234,9 +261,17 @@ void attach_delete_set(parquet_file_scan_info& file, std::shared_ptr<iceberg_del
 gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider(
   io::ioctx_resolver resolve)
 {
+  auto stop_work = next_split_provider_with_stop(std::move(resolve));
+  if (!stop_work) return {};
+  return [stop_work = std::move(stop_work)]() mutable { return stop_work({}); };
+}
+
+gpu_ingestible::stoppable_metadata_scan_task_t
+iceberg_gpu_ingestible::next_split_provider_with_stop(io::ioctx_resolver resolve)
+{
   if (_deferred && !_attempt) throw std::logic_error("DV preparation attempt has not started");
   auto resolve_for_dv = resolve;
-  auto work           = _core.next_split_provider(std::move(resolve));
+  auto work           = _core.next_split_provider_with_stop(std::move(resolve));
   if (!work) return {};
   if (_deferred) {
     auto index = _next_preparation;
@@ -256,27 +291,34 @@ gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider
     if (_next_registered) held->ledger = _attempt->ledger();
     _next_registered = false;
     ++_next_preparation;
+    auto prepared        = _deferred;
+    auto attempt         = _attempt;
     auto const& profiles = static_cast<iceberg_ingestible_table_info const&>(table_info()).profiles;
     auto counters        = profiles ? profiles->counters : nullptr;
-    return [work     = std::move(work),
-            prepared = _deferred,
-            attempt  = _attempt,
-            held     = std::move(held),
+    return [work = std::move(work),
+            prepared,
+            attempt,
+            held = std::move(held),
             index,
             counters,
-            resolve = std::move(resolve_for_dv)]() {
-      auto metadata          = work();
+            resolve = std::move(resolve_for_dv)](std::stop_token stop) mutable {
+      if (stop.stop_requested())
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      auto metadata          = work(stop);
       auto& file             = dynamic_cast<parquet_file_scan_info&>(*metadata);
       auto const& descriptor = prepared->files()[index];
-      auto set =
-        read_prepared_delete_set(*prepared, descriptor, held->permit, *attempt, resolve, counters);
+      auto set               = read_prepared_delete_set(
+        *prepared, descriptor, held->permit, *attempt, resolve, counters, stop);
       attempt->record(index, set);
       attach_delete_set(file, std::move(set));
       return metadata;
     };
   }
-  return [work = std::move(work), sets = _delete_sets]() {
-    auto metadata = work();
+  auto sets = _delete_sets;
+  return [work = std::move(work), sets = std::move(sets)](std::stop_token stop) mutable {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+    auto metadata = work(stop);
     auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
     attach_delete_set(file, sets->at(file.file_path));
     return metadata;
@@ -285,6 +327,17 @@ gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider
 
 bool iceberg_ingestible_table_info::allows_cached_rows() const
 {
+  // Cached Parquet batches carry physical column positions only.  They do not
+  // carry the Iceberg field-id/default contract, so serving a mapped scan from
+  // a warm pin could return the value of an old drop/re-add field.  Until the
+  // cache certificate includes the immutable mapping semantics, force these
+  // scans through the per-file mapper.
+  // A physical Iceberg schema means the binding carries field-ID/default
+  // semantics, even when the current profile could not produce a mapper (for
+  // example because an unprojected sibling has an unsupported type).  A raw
+  // Parquet pin has only physical positions, so require a future semantic
+  // certificate before allowing either form to use it.
+  if (physical_schema || field_mapping_requirements) return false;
   if (deferred || (delete_data && !delete_data->empty())) return false;
   if (delete_sets)
     for (auto const& entry : *delete_sets)
@@ -327,9 +380,10 @@ gpu_ingestible::preparation_claim iceberg_gpu_ingestible::claim_preparation(
     required         = scan_manager::required_inputs(
       bind.read_views->entry(bind.contract_id).eligibility.later_checks, true);
   }
-  auto work = next_split_provider(std::move(resolve));
-  if (!work) return {};
-  return {std::move(work), key, required};
+  auto stop_work = next_split_provider_with_stop(std::move(resolve));
+  if (!stop_work) return {};
+  auto work = stop_work;
+  return {[work = std::move(work)] { return work({}); }, std::move(stop_work), key, required};
 }
 
 scan_manager::unit_key iceberg_gpu_ingestible::next_preparation_unit() const
@@ -363,7 +417,20 @@ void iceberg_gpu_ingestible::stop_preparation() noexcept
 void iceberg_gpu_ingestible::finish_preparation() noexcept
 {
   stop_preparation();
-  if (_attempt) _attempt->finish();
+  if (_attempt) {
+    _attempt->finish();
+    // retire_query_work can be called more than once (normal completion followed
+    // by engine destruction, or a cancellation retry). Drop the finished attempt
+    // so its plan release is strictly once and repeated cleanup is idempotent.
+    _attempt.reset();
+  } else if (_deferred) {
+    // A start/ledger/attempt failure can leave the plan owned by the live
+    // physical operator without ever installing an execution attempt.  The
+    // attempt is normally the object that retires the descriptor arena, but
+    // this path still reaches the barrier-backed final cleanup.
+    _deferred->release();
+  }
+  _deferred.reset();
 }
 
 void iceberg_gpu_ingestible::build_delete_key_map(
@@ -496,7 +563,8 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   bool has_deletes = false;
   for (size_t i = 0; i < split.rg_slices.size(); ++i) {
     auto const& slice = split.rg_slices[i];
-    auto const& set   = split.dependencies()[i].delete_set;
+    auto const set =
+      std::dynamic_pointer_cast<iceberg_delete_set const>(split.dependencies()[i].visibility);
     std::shared_ptr<iceberg_delete_set const> expected;
     if (_deferred) {
       if (slice.file_index < _deferred->files().size()) {

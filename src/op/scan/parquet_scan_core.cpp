@@ -131,6 +131,21 @@ bool expression_has_null_predicate(duckdb::Expression const& expr)
   return found;
 }
 
+/// Null-count statistics are defined for a physical input column only.  Keep
+/// computed operands (for example `lower(col) IS NULL`) on the residual path.
+bool is_bare_input_column_null_predicate(duckdb::Expression const& expr)
+{
+  auto const type = expr.GetExpressionType();
+  if (type != duckdb::ExpressionType::OPERATOR_IS_NULL &&
+      type != duckdb::ExpressionType::OPERATOR_IS_NOT_NULL) {
+    return false;
+  }
+  auto const& op       = expr.Cast<duckdb::BoundOperatorExpression>();
+  auto const& children = op.GetChildren();
+  return children.size() == 1 &&
+         children.front()->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
+}
+
 /// True when @p expr cannot be handed to cuDF's row-group statistics filter as
 /// a predicate in its own right.
 ///
@@ -287,8 +302,12 @@ std::vector<null_prune_predicate> collect_null_prune_predicates(
     if (!expects_null && filter.filter_type == duckdb::TableFilterType::EXPRESSION_FILTER) {
       auto const& expression_filter = filter.Cast<duckdb::ExpressionFilter>();
       switch (expression_filter.expr->GetExpressionType()) {
-        case duckdb::ExpressionType::OPERATOR_IS_NULL: expects_null = true; break;
-        case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL: expects_null = false; break;
+        case duckdb::ExpressionType::OPERATOR_IS_NULL:
+          if (is_bare_input_column_null_predicate(*expression_filter.expr)) expects_null = true;
+          break;
+        case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL:
+          if (is_bare_input_column_null_predicate(*expression_filter.expr)) expects_null = false;
+          break;
         default: break;
       }
     }
@@ -360,6 +379,15 @@ class parquet_batch_coalescer : public batch_coalescer {
       _contract_id(contract_id),
       _counters(std::move(counters))
   {
+  }
+
+  std::size_t target_batch_bytes() const noexcept override { return _cap; }
+
+  std::size_t retained_bytes() const noexcept override
+  {
+    return _plan->has_user_virtual_columns() && _acc_run_count > 1
+             ? memory::saturating_mul(_acc_working_bytes, std::size_t{2})
+             : _acc_working_bytes;
   }
 
   std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info> info) override
@@ -730,7 +758,8 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
   // column_ids with empty projection_ids, the no-pushdown sirius_read_parquet
   // case), filter pushdown, or hive-partition injection — needs column names.
   bool const needs_names = !bind.projection_ids.empty() ||
-                           (bind.table_filters && bind.table_filters->HasFilters()) ||
+                           (bind.table_filters && (bind.table_filters->HasFilters() ||
+                                                   bind.table_filters->HasMultiColumnFilters())) ||
                            !bind.partition_indices.empty() ||
                            column_ids_need_reader_projection(bind.column_ids, bind.names.size());
   if (needs_names && bind.names.empty()) {
@@ -753,7 +782,8 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
   // AST translation deferred to materialize_table so a task-local stream is used.
   // Filters on hive-partition columns are dropped — those columns aren't in the
   // parquet file (DuckDB prunes them at the file-list level already).
-  if (bind.table_filters && bind.table_filters->HasFilters()) {
+  if (bind.table_filters &&
+      (bind.table_filters->HasFilters() || bind.table_filters->HasMultiColumnFilters())) {
     for (auto const& entry : *bind.table_filters) {
       auto const column_index = entry.GetIndex();
       if (column_index < bind.column_ids.size() &&
@@ -947,6 +977,20 @@ bool parquet_scan_core::has_processed_all_metadata() const
 parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   io::ioctx_resolver resolve)
 {
+  return next_split_provider(std::move(resolve), {});
+}
+
+parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
+  io::ioctx_resolver resolve, std::stop_token stop)
+{
+  auto task = next_split_provider_with_stop(std::move(resolve));
+  if (!task) return {};
+  return [task = std::move(task), stop]() mutable { return task(stop); };
+}
+
+parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_provider_with_stop(
+  io::ioctx_resolver resolve)
+{
   if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
   auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
@@ -957,14 +1001,23 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   // parquet_batch_coalescer.
   auto const& file_path = _file_paths[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
-  return [this, file_path, idx, resolve = std::move(resolve)]() -> std::unique_ptr<scan_info> {
+  return [this, file_path, idx, resolve = std::move(resolve)](
+           std::stop_token stop) -> std::unique_ptr<scan_info> {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto io_ctx = resolve(file_path);
     try {
-      return build_file_scan_info(file_path, idx, io_ctx);
+      return build_file_scan_info(file_path, idx, io_ctx, stop);
     } catch (unsupported_physical_input const&) {
       throw;
     } catch (transparent::classified_execution_error const&) {
       throw;
+    } catch (io::descriptor_mismatch_error const& error) {
+      if (_info->profiles && _info->profiles->counters) {
+        _info->profiles->counters->descriptor_mismatches.fetch_add(1, std::memory_order_relaxed);
+      }
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
     } catch (duckdb::IOException const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
@@ -990,8 +1043,13 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
-  std::string const& file_path, std::size_t file_index, std::shared_ptr<io::ioctx> const& io_ctx)
+  std::string const& file_path,
+  std::size_t file_index,
+  std::shared_ptr<io::ioctx> const& io_ctx,
+  std::stop_token stop)
 {
+  if (stop.stop_requested())
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled));
   if (_execution_completion && _execution_completion->injections &&
       _execution_completion->injections->hold_footer_index == file_index + 1) {
     _execution_completion->hold_footer_for_testing(file_index + 1);
@@ -1037,7 +1095,8 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
       _info->contract_id,
       file_path,
       _plan->carrier_batch_index ? *_natural_reader_options : opts,
-      &cache_hit);
+      &cache_hit,
+      stop);
     if (resolution.identity != opened_identity) {
       throw transparent::classified_execution_error(
         transparent::late_failure_cause::physical_input,
@@ -1120,6 +1179,45 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   };
   validation_set schema_validation;
   std::shared_ptr<field_id_mapping const> mapping;
+  auto prepare_adapter_mapping = [&](std::vector<field_requirement> requirements,
+                                     bool clear_missing) {
+    if (clear_missing)
+      for (auto& field : requirements)
+        field.missing_value.reset();
+    materialization_program program;
+    program.contract   = _info->contract_id;
+    program.generation = 1;
+    std::vector<field_requirement> fields;
+    program.input_types.emplace();
+    for (auto const& column : _plan->data_columns) {
+      auto const& field = requirements.at(column.primary_idx);
+      auto const type   = field_mapping_type(field.type);
+      if (!type)
+        throw std::invalid_argument(
+          "adapter field mapping does not support a required nested field");
+      fields.push_back(field);
+      program.input_types->push_back(*type);
+    }
+    std::shared_ptr<field_id_mapping const> result;
+    if (_info->prepare_field_mapping) {
+      result = _info->prepare_field_mapping(resolved_metadata,
+                                            resolved_metadata->built_for_identity,
+                                            std::move(program),
+                                            std::move(fields));
+    } else {
+      result = std::make_shared<field_id_mapping const>(
+        field_id_mapping::compile(resolved_metadata,
+                                  resolved_metadata->built_for_identity,
+                                  std::move(program),
+                                  std::move(fields)));
+    }
+    if (!result)
+      throw std::invalid_argument("adapter-owned field mapping preparation returned null");
+    if (result->identity() != resolved_metadata->built_for_identity ||
+        result->program().contract != _info->contract_id)
+      throw std::invalid_argument("adapter-owned field mapping has mismatched identity");
+    return result;
+  };
   if (_info->physical_schema) {
     auto checked = check_iceberg_file_schema(metadata,
                                              *_info->physical_schema,
@@ -1136,31 +1234,10 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
           if (!metadata.schema[i].field_id)
             throw std::invalid_argument("iceberg_flat_v1 requires IDs on every physical field");
         auto requirements = *_info->field_mapping_requirements;
-        if (!_info->files_without_partition_values.contains(
-              sirius::io::strip_file_scheme(file_path)))
-          for (auto& field : requirements)
-            field.missing_value.reset();
-        materialization_program program;
-        program.contract   = _info->contract_id;
-        program.generation = 1;
-        program.input_types.emplace();
-        for (auto const& field : requirements)
-          program.input_types->push_back(*field_mapping_type(field.type));
-        // Validate the entire bound schema, even if the query projects a subset.
-        field_id_mapping::compile(
-          resolved_metadata, resolved_metadata->built_for_identity, program, requirements);
-        std::vector<field_requirement> fields;
-        program.input_types->clear();
-        for (auto const& column : _plan->data_columns) {
-          fields.push_back(requirements.at(column.primary_idx));
-          program.input_types->push_back(*field_mapping_type(fields.back().type));
-        }
-        mapping = std::make_shared<field_id_mapping const>(
-          field_id_mapping::compile(resolved_metadata,
-                                    resolved_metadata->built_for_identity,
-                                    std::move(program),
-                                    std::move(fields)));
-        opts = *_natural_reader_options;
+        mapping           = prepare_adapter_mapping(std::move(requirements),
+                                          !_info->files_without_partition_values.contains(
+                                            sirius::io::strip_file_scheme(file_path)));
+        opts              = *_natural_reader_options;
         if (!mapping->read_indices().empty()) opts.set_column_indices(mapping->read_indices());
         checked.approved   = true;
         checked.validation = check_bit(later_check::schema_per_file);
@@ -1173,6 +1250,27 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
       throw unsupported_physical_input(_info->contract_id, file_path, checked.reason, checked.text);
     }
     schema_validation = checked.validation;
+  }
+  // Non-Iceberg adapters can provide the same immutable per-file mapping seam
+  // without manufacturing an Iceberg physical schema.  The adapter owns the
+  // semantic proof; the shared core still verifies identity and contract and
+  // applies the resulting reader projection.
+  if (!mapping && !_info->physical_schema && _info->field_mapping_requirements &&
+      _info->prepare_field_mapping) {
+    try {
+      mapping = prepare_adapter_mapping(*_info->field_mapping_requirements, false);
+      opts    = *_natural_reader_options;
+      if (!mapping->read_indices().empty()) opts.set_column_indices(mapping->read_indices());
+      schema_validation = check_bit(later_check::schema_per_file);
+    } catch (std::invalid_argument const& error) {
+      if (_info->profiles->counters)
+        _info->profiles->counters->record(verdict_reason::interface_unavailable);
+      throw unsupported_physical_input(
+        _info->contract_id,
+        file_path,
+        verdict_reason::interface_unavailable,
+        "adapter-owned field mapping was not usable: " + std::string(error.what()));
+    }
   }
   // An encrypted ColumnMetaData is opaque: names/statistics needed to resolve
   // the working set are absent. The store already retained the raw evidence;

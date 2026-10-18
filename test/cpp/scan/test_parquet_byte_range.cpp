@@ -332,7 +332,7 @@ std::pair<std::vector<cudf::size_type>, std::int64_t> scan_selection(
   auto task       = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
   REQUIRE(task);
-  auto file = task({});
+  auto file = task();
   REQUIRE(file);
 
   // Splits materialize downstream of the coalescer, exactly as in production.

@@ -25,6 +25,7 @@
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
 
+#include <stdexcept>
 #include <stop_token>
 #include <utility>
 
@@ -58,36 +59,47 @@ load_balancing_scan_batch_coalescer::register_pipeline(
 namespace {
 preparation_coordinator::job bind_preparation_unit(
   std::function<std::unique_ptr<op::scan::scan_info>()> work,
+  std::function<std::unique_ptr<op::scan::scan_info>(std::stop_token)> stop_work,
   std::shared_ptr<preparation_unit> unit,
   required_input_set required)
 {
-  return {
-    [work = std::move(work), unit, required] {
-      try {
-        auto input       = work();
-        auto const& deps = input->dependencies().front();
-        unit->complete_input(footer_input{deps.footer, deps.parquet_approval, deps.datasource});
-        unit->complete_input(delete_set_input{deps.delete_set});
-        if (required.test(static_cast<size_t>(required_input::segments)))
-          unit->complete_input(segments_input{deps.profiles});
-        if (required.test(static_cast<size_t>(required_input::checkpoint_iteration)))
-          unit->complete_input(checkpoint_input{deps.checkpoint_iteration.value()});
-        return input;
-      } catch (...) {
-        auto error = std::current_exception();
-        auto cause = transparent::classify_failure(error);
-        std::optional<op::scan::verdict_reason> reason;
-        try {
-          std::rethrow_exception(error);
-        } catch (op::scan::unsupported_physical_input const& e) {
-          reason = e.reason;
-        } catch (...) {
-        }
-        unit->fail(preparation_failure{cause.cause, reason, cause.detail, error});
-        throw;
+  auto run = [work = std::move(work), stop_work = std::move(stop_work), unit, required](
+               std::stop_token stop) mutable {
+    auto input_work = [&] {
+      if (stop_work) return stop_work(stop);
+      return work();
+    };
+    try {
+      auto input       = input_work();
+      auto const& deps = input->dependencies().front();
+      unit->complete_input(footer_input{deps.footer, deps.parquet_approval, deps.datasource});
+      if (required.test(static_cast<size_t>(required_input::visibility))) {
+        if (!deps.visibility)
+          throw std::invalid_argument("preparation worker returned no visibility artifact");
+        unit->complete_input(visibility_input{deps.visibility});
       }
-    },
-    unit};
+      if (required.test(static_cast<size_t>(required_input::segments)))
+        unit->complete_input(segments_input{deps.profiles});
+      if (required.test(static_cast<size_t>(required_input::checkpoint_iteration)))
+        unit->complete_input(checkpoint_input{deps.checkpoint_iteration.value()});
+      return input;
+    } catch (...) {
+      auto error = std::current_exception();
+      auto cause = transparent::classify_failure(error);
+      std::optional<op::scan::verdict_reason> reason;
+      try {
+        std::rethrow_exception(error);
+      } catch (op::scan::unsupported_physical_input const& e) {
+        reason = e.reason;
+      } catch (...) {
+      }
+      unit->fail(preparation_failure{cause.cause, reason, cause.detail, error});
+      throw;
+    }
+  };
+  return {[run]() mutable { return run({}); },
+          unit,
+          [run](std::stop_token stop) mutable { return run(stop); }};
 }
 }  // namespace
 
@@ -110,10 +122,12 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
     if (!provider.has_more_splits()) return {};
     auto claim = provider.claim_preparation();
     if (!claim.work) return {};
-    if (!claim.key) return preparation_coordinator::job{std::move(claim.work), {}};
+    if (!claim.key)
+      return preparation_coordinator::job{std::move(claim.work), {}, std::move(claim.stop_work)};
     auto unit = coordinator.admit_unit(*claim.key, claim.required);
     if (!unit) return {};
-    return bind_preparation_unit(std::move(claim.work), std::move(unit), claim.required);
+    return bind_preparation_unit(
+      std::move(claim.work), std::move(claim.stop_work), std::move(unit), claim.required);
   };
   source.construct = [slot](std::unique_ptr<op::scan::scan_info> batch) {
     auto device = slot->balancer->get_next_gpu(slot->pipeline_id);

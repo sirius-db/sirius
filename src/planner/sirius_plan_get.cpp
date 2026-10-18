@@ -83,57 +83,6 @@ pre_decline iceberg_decline(scan_reason reason,
   return {verdict, reason, "iceberg_scan declines the GPU scan path: " + std::move(text)};
 }
 
-/// Descends into children so a struct's fields count toward the id space they occupy.
-void collect_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns,
-                       std::vector<int32_t>& out)
-{
-  for (auto const& column : columns) {
-    if (!column.identifier.IsNull() &&
-        column.identifier.type().id() == duckdb::LogicalTypeId::INTEGER) {
-      out.push_back(column.identifier.GetValue<int32_t>());
-    }
-    collect_field_ids(column.children, out);
-  }
-}
-
-/**
- * @brief Refuse tables whose Iceberg field-id space has a gap, meaning a column was dropped.
- *
- * Iceberg never reuses a field id, so a column dropped and re-added under the same name gets a
- * NEW id and must read NULL in older data files. This path resolves columns by NAME, so it finds
- * the dropped column and returns data the table removed, with no error and no fallback.
- *
- * With no drops N fields occupy ids 1..N, so `max > count` means an id was retired. Reads only
- * bind data, opens no files.
- *
- * A PRE-FILTER, not the whole test: a plain ADDED column keeps the space contiguous and slips
- * through, but that case fails loudly instead of returning wrong rows. Resolving by field id is
- * the complete fix; DuckDB's MultiFileColumnMapper already implements it.
- */
-std::optional<std::string> iceberg_retired_field_id_decline_reason(duckdb::LogicalGet& op)
-{
-  auto const* bind_data = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
-  if (bind_data == nullptr || iceberg_flat_mapping_supported(op.bind_data.get())) {
-    return std::nullopt;
-  }
-
-  // `reader_bind.schema` is the Iceberg schema and the only one carrying field ids; the generic
-  // `columns` list may leave `identifier` null, so it is a fallback only.
-  std::vector<int32_t> field_ids;
-  collect_field_ids(
-    bind_data->reader_bind.schema.empty() ? bind_data->columns : bind_data->reader_bind.schema,
-    field_ids);
-  if (field_ids.empty()) { return std::nullopt; }
-
-  auto const max_field_id = *std::max_element(field_ids.begin(), field_ids.end());
-  if (max_field_id <= static_cast<int32_t>(field_ids.size())) { return std::nullopt; }
-
-  return "iceberg_scan table has a gap in its Iceberg field ids (highest is " +
-         std::to_string(max_field_id) + " across " + std::to_string(field_ids.size()) +
-         " fields), so a column was dropped; this scan path resolves columns by name and would "
-         "read a dropped column's data in place of the re-added one";
-}
-
 // Why an `iceberg_scan` table must decline the GPU path, or nullopt when it may run there.
 //
 // V2 positional deletes and V3 deletion vectors are applied on GPU. Equality deletes are not:
@@ -232,10 +181,6 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
         "cannot be recovered; the GPU path resolves delete files in a separate pass and "
         "would risk pairing one snapshot's data files with another's deletes");
     }
-  }
-
-  if (auto reason = iceberg_retired_field_id_decline_reason(op)) {
-    return iceberg_decline(scan_reason::iceberg_field_id_gap, std::move(*reason));
   }
 
   if (!iceberg_table_schema_has_field_ids(op.bind_data.get())) {

@@ -41,8 +41,19 @@ op::scan::gpu_ingestible::metadata_scan_task_t split_provider::next_split_provid
 
 op::scan::gpu_ingestible::preparation_claim split_provider::claim_preparation()
 {
-  if (_ingestible->preparation_admission()) return _ingestible->claim_preparation(_resolve);
-  return {next_split_provider(), {}, {}};
+  // Admission controls reservation/ledger ownership; it must not select a
+  // different claim API.  Adapters without an admission still need their
+  // stop-aware claim and any adapter-owned claim metadata.
+  auto claim = _ingestible->claim_preparation(_resolve);
+  if (claim.work && !claim.stop_work) {
+    auto work       = claim.work;
+    claim.stop_work = [work = std::move(work)](std::stop_token stop) mutable {
+      if (stop.stop_requested())
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      return work();
+    };
+  }
+  return claim;
 }
 
 template <typename Scheduler>

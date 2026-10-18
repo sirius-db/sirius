@@ -187,15 +187,17 @@ std::unordered_set<std::string> iceberg_files_without_partition_values(
   std::unordered_map<std::string, bool> manifests;
   std::unordered_set<std::string> files, unproved;
   for (auto const& entry : inventory.entries) {
-    if (entry.content != "EXISTING") continue;
+    if (entry.content != "DATA") continue;
     auto [it, fresh] = manifests.emplace(entry.manifest_path, false);
     if (fresh) {
       auto result = connection.Query("SELECT data_file.partition FROM read_avro('" +
                                      escape_sql_string(entry.manifest_path) + "') LIMIT 0");
-      // The pinned Avro reader represents an empty record as INTEGER. Nonempty
-      // partition records are STRUCTs. Unknown/unavailable schemas grant no proof.
+      // The pinned Avro reader represents an empty record as NULL (older builds
+      // used INTEGER). Nonempty partition records are STRUCTs. Unknown/
+      // unavailable schemas grant no proof.
       it->second = result && !result->HasError() && result->GetTypes().size() == 1 &&
-                   result->GetTypes()[0] == duckdb::LogicalType::INTEGER;
+                   (result->GetTypes()[0] == duckdb::LogicalType::SQLNULL ||
+                    result->GetTypes()[0] == duckdb::LogicalType::INTEGER);
     }
     auto const path = sirius::io::strip_file_scheme(entry.file_path);
     if (it->second)

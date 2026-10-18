@@ -74,6 +74,7 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
   explicit iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestible_table_info> info);
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
+  stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve) override;
   void set_execution_completion(std::shared_ptr<pipeline::completion_handler> c) override
   {
     gpu_ingestible::set_execution_completion(c);
@@ -120,7 +121,7 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
   preparation_claim claim_preparation(io::ioctx_resolver resolve) override;
   scan_manager::unit_key next_preparation_unit() const;
   void stop_preparation() noexcept override;
-  void finish_preparation() noexcept;
+  void finish_preparation() noexcept override;
 
   filtered_table materialize_metadata_to_table(
     scan_info const& info,

@@ -22,6 +22,7 @@ class owned_arrow_batch {
   owned_arrow_batch(owned_arrow_batch const&)            = delete;
   owned_arrow_batch& operator=(owned_arrow_batch const&) = delete;
   bool has_capacity() const noexcept { return static_cast<bool>(capacity); }
+  std::int64_t row_count() const noexcept { return array.length; }
 
  private:
   friend materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch>,

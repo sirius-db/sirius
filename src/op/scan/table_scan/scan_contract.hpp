@@ -59,7 +59,12 @@ class io_object_metadata;
 
 namespace sirius::op::scan {
 class scan_info;
-struct iceberg_delete_set;
+// Adapter-owned semantic input published by the shared scan preparation path.
+// Concrete connectors extend this type; the preparation coordinator only keeps
+// the lifetime and never interprets connector-specific payloads.
+struct prepared_visibility {
+  virtual ~prepared_visibility() = default;
+};
 }  // namespace sirius::op::scan
 namespace sirius::transparent {
 class read_view_registry;
@@ -494,7 +499,7 @@ struct split_dependencies {
   std::optional<uint64_t> checkpoint_iteration;
   std::shared_ptr<physical_profile_table> profiles;
   std::shared_ptr<parquet_input_approval const> parquet_approval;
-  std::shared_ptr<iceberg_delete_set const> delete_set;
+  std::shared_ptr<prepared_visibility const> visibility;
 };
 enum class certificate_evidence_scope : uint8_t { none, binding_correspondence };
 struct eligibility_certificate {

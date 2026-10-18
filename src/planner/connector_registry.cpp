@@ -86,6 +86,21 @@ bool collect_iceberg_field_ids(std::vector<duckdb::MultiFileColumnDefinition> co
   return true;
 }
 
+bool iceberg_mapping_leaf_types_supported(
+  std::vector<duckdb::MultiFileColumnDefinition> const& columns, bool& saw_leaf)
+{
+  for (auto const& column : columns) {
+    if (!column.children.empty()) {
+      // Nested definitions are outside the flat v1 mapper's capability
+      // profile. They are checked only if a scan actually requests them.
+      continue;
+    }
+    saw_leaf = true;
+    if (!op::scan::field_mapping_type(column.type)) return false;
+  }
+  return true;
+}
+
 op::scan::certification_result supported_parquet(op::scan::bound_table_scan const&,
                                                  op::sirius_physical_table_scan const&,
                                                  duckdb::ClientContext&,
@@ -616,11 +631,12 @@ bool iceberg_flat_mapping_supported(duckdb::FunctionData const* bind_data)
   auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
   std::unordered_set<int32_t> field_ids;
   if (!collect_iceberg_field_ids(columns, field_ids)) return false;
-  return std::all_of(columns.begin(), columns.end(), [](auto const& column) {
-    return column.children.empty() && op::scan::field_mapping_type(column.type).has_value() &&
-           (!column.default_expression || column.default_expression->GetExpressionType() ==
-                                            duckdb::ExpressionType::VALUE_CONSTANT);
-  });
+  // This is a connector capability profile, not a claim that every bound
+  // column will be materialized by this scan. Nested or otherwise irrelevant
+  // fields therefore do not veto a query; the mapper validates the actual
+  // output/filter/carrier requirements later.
+  bool saw_leaf = false;
+  return iceberg_mapping_leaf_types_supported(columns, saw_leaf) && saw_leaf;
 }
 
 bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data)

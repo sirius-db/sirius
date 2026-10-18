@@ -15,11 +15,13 @@
  */
 
 #include "catch.hpp"
+#include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/preparation_test_support.hpp"
+#include "scan_manager/split_provider.hpp"
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -91,6 +93,90 @@ struct dv_precondition_fixture {
     return bind;
   }
 };
+
+class contract_table_info final : public sirius::op::scan::ingestible_table_info {
+ public:
+  bool cache_allowed = false;
+  std::span<std::string const> column_names() const override { return {}; }
+  std::span<std::string const> file_paths() const override { return {}; }
+  std::string display_name() const override { return "contract-adapter"; }
+  bool allows_cached_rows() const override { return cache_allowed; }
+};
+
+class contract_ingestible final : public sirius::op::scan::gpu_ingestible {
+ public:
+  std::shared_ptr<sirius::scan_manager::preparation_admission> admission;
+  std::shared_ptr<sirius::scan_manager::preparation_ledger> attached;
+  unsigned stop_calls   = 0;
+  unsigned finish_calls = 0;
+  unsigned claim_calls  = 0;
+  bool custom_stop_seen = false;
+
+  std::unique_ptr<sirius::op::scan::batch_coalescer> create_batch_coalescer() const override
+  {
+    return nullptr;
+  }
+  bool has_processed_all_metadata() const override { return false; }
+  metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver) override
+  {
+    return [] { return std::make_unique<sirius::op::scan::scan_info>(); };
+  }
+  sirius::op::scan::filtered_table materialize_metadata_to_table(
+    sirius::op::scan::scan_info const&,
+    cucascade::memory::memory_space const&,
+    ::cuda::stream_ref,
+    bool,
+    std::shared_ptr<const sirius::like_multiliteral_cache>,
+    sirius::expression_query_policy) override
+  {
+    return {};
+  }
+  std::unique_ptr<cudf::table> post_filter_and_project(
+    sirius::op::scan::filtered_table&&,
+    cucascade::memory::memory_space const&,
+    ::cuda::stream_ref,
+    bool,
+    std::shared_ptr<const sirius::like_multiliteral_cache>,
+    std::unique_ptr<cudf::column>*,
+    std::span<std::size_t const>,
+    sirius::expression_query_policy) override
+  {
+    return nullptr;
+  }
+  sirius::op::scan::ingestible_table_info const& table_info() const noexcept override
+  {
+    return info;
+  }
+  std::vector<std::size_t> materialized_column_order() const override { return {}; }
+  std::shared_ptr<sirius::scan_manager::preparation_admission> preparation_admission()
+    const override
+  {
+    return admission;
+  }
+  void attach_preparation_ledger(
+    std::shared_ptr<sirius::scan_manager::preparation_ledger> ledger) override
+  {
+    attached = std::move(ledger);
+  }
+  preparation_claim claim_preparation(sirius::io::ioctx_resolver) override
+  {
+    ++claim_calls;
+    auto work = [] { return std::make_unique<sirius::op::scan::scan_info>(); };
+    return {work,
+            [this, work](std::stop_token stop) mutable {
+              custom_stop_seen = true;
+              if (stop.stop_requested())
+                throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+              return work();
+            },
+            {},
+            {}};
+  }
+  void stop_preparation() noexcept override { ++stop_calls; }
+  void finish_preparation() noexcept override { ++finish_calls; }
+
+  contract_table_info info;
+};
 }  // namespace
 TEST_CASE("Admission uses the one actual grant and releases all unsuccessful grants",
           "[scan_preparation][ledger]")
@@ -126,6 +212,58 @@ TEST_CASE("Admission uses the one actual grant and releases all unsuccessful gra
     CHECK(provider.outstanding() == 0);
   }
   CHECK(provider.outstanding() == 0);
+}
+
+TEST_CASE("Non-Iceberg adapter consumes the shared preparation capability contract",
+          "[scan_preparation][contract]")
+{
+  test_reservation_provider provider;
+  auto ledger   = std::make_unique<preparation_ledger>(provider);
+  auto decision = ledger->admit(sample(), host);
+  REQUIRE(decision.deferred);
+  auto admission = std::make_shared<preparation_admission>(std::move(ledger), decision);
+
+  contract_ingestible adapter;
+  adapter.admission = admission;
+  CHECK(adapter.preparation_admission() == admission);
+  auto consumed = admission->consume();
+  REQUIRE(consumed);
+  adapter.attach_preparation_ledger(std::shared_ptr<preparation_ledger>(std::move(consumed)));
+  CHECK(adapter.attached);
+
+  auto claim = adapter.claim_preparation({});
+  REQUIRE(claim.work);
+  REQUIRE(claim.stop_work);
+  std::stop_source source;
+  source.request_stop();
+  CHECK_THROWS_AS(claim.stop_work(source.get_token()), std::system_error);
+  CHECK(claim.stop_work({}));
+
+  adapter.stop_preparation();
+  adapter.finish_preparation();
+  CHECK(adapter.stop_calls == 1);
+  CHECK(adapter.finish_calls == 1);
+  CHECK_FALSE(adapter.info.allows_cached_rows());
+  adapter.attached->close();
+  adapter.attached.reset();
+  CHECK(provider.outstanding() == 0);
+}
+
+TEST_CASE("Preparation claim uses the adapter capability without an admission",
+          "[scan_preparation][contract]")
+{
+  contract_ingestible adapter;
+  sirius::scan_manager::split_provider provider(adapter, {});
+
+  auto claim = provider.claim_preparation();
+  REQUIRE(claim.work);
+  REQUIRE(claim.stop_work);
+  CHECK(adapter.claim_calls == 1);
+
+  std::stop_source source;
+  source.request_stop();
+  CHECK_THROWS_AS(claim.stop_work(source.get_token()), std::system_error);
+  CHECK(adapter.custom_stop_seen);
 }
 TEST_CASE("Admission sums retained results across scans and accounts for allocation granularity",
           "[scan_preparation][ledger]")
@@ -705,7 +843,7 @@ TEST_CASE("DV profile qualifies only complete bounded inputs and keeps append-on
   }
 }
 
-TEST_CASE("Charged DV descriptor names outlive the plan only while a result actually uses them",
+TEST_CASE("Charged DV descriptor names outlive the plan through the last published split consumer",
           "[scan_preparation][iceberg][ledger]")
 {
   using namespace sirius::op::scan;
@@ -748,6 +886,9 @@ TEST_CASE("Charged DV descriptor names outlive the plan only while a result actu
   CHECK(ledger->tracked_units() == 2);
   SECTION("a retained result survives descriptor retirement")
   {
+    // Model the published split retaining the prepared visibility artifact.  The plan and
+    // attempt may finish at the query-wide barrier, but the descriptor arena must stay alive
+    // until this last consumer releases its result.
     attempt.finish();
     prepared.reset();
     ledger->close();
@@ -942,6 +1083,24 @@ TEST_CASE(
   ledger->close();
   ledger.reset();
   CHECK(f.provider.seen->allocated_bytes == 0);
+  CHECK(f.provider.outstanding() == 0);
+}
+
+TEST_CASE("Uninstalled Iceberg preparation releases descriptors at final cleanup",
+          "[scan_preparation][ledger]")
+{
+  dv_precondition_fixture f;
+  auto ledger     = f.consume();
+  auto ingestible = make_ingestible(f.info());
+
+  REQUIRE_FALSE(f.prepared->files().empty());
+  ingestible->finish_preparation();
+  CHECK(f.prepared->files().empty());
+  CHECK(f.provider.seen->allocated_bytes == 0);
+
+  REQUIRE_NOTHROW(ingestible->finish_preparation());
+  ledger->close();
+  ledger.reset();
   CHECK(f.provider.outstanding() == 0);
 }
 

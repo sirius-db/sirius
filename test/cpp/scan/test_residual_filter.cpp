@@ -59,6 +59,18 @@ table_filter_conjunct string_equality(std::size_t primary_index, std::size_t bat
             duckdb::ExpressionType::COMPARE_EQUAL, std::move(column), std::move(constant))};
 }
 
+table_filter_conjunct numeric_multi_column(std::size_t left, std::size_t right)
+{
+  auto lhs = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER,
+                                                                 static_cast<duckdb::idx_t>(left));
+  auto rhs = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER,
+                                                                 static_cast<duckdb::idx_t>(right));
+  return {0,
+          std::nullopt,
+          duckdb::BoundComparisonExpression::Create(
+            duckdb::ExpressionType::COMPARE_LESSTHAN, std::move(lhs), std::move(rhs))};
+}
+
 std::vector<table_filter_conjunct> two_conjuncts()
 {
   std::vector<table_filter_conjunct> conjuncts;
@@ -162,5 +174,29 @@ TEST_CASE("R4 residual refuses a lost value needed by another conjunct", "[scan]
   conjuncts.push_back(string_equality(7, 1));
   residual_filter const residual{std::move(conjuncts), {1, 2}};
   std::vector<predicate_progress> progress{{0, predicate_stage::answer, 1}};
+  REQUIRE_THROWS(residual.against_progress(progress));
+}
+
+TEST_CASE("R4 residual keeps a multi-column conjunct when another slot is answered", "[scan][r4]")
+{
+  std::vector<table_filter_conjunct> conjuncts;
+  conjuncts.push_back(string_equality(/*primary_index=*/7, /*batch_position=*/0));
+  conjuncts.push_back(numeric_multi_column(1, 2));
+  residual_filter const residual{std::move(conjuncts), {0, 1, 2}};
+
+  std::vector<predicate_progress> progress{{0, predicate_stage::answer, 0}};
+  auto const predicate = residual.against_progress(progress);
+  REQUIRE(predicate->holds<sirius::ast::conjunction>());
+  REQUIRE(predicate->get<sirius::ast::conjunction>().children.size() == 2);
+}
+
+TEST_CASE("R4 residual rejects a multi-column conjunct when a referenced slot is answered",
+          "[scan][r4]")
+{
+  auto conjuncts = two_conjuncts();
+  conjuncts.push_back(numeric_multi_column(1, 2));
+  residual_filter const residual{std::move(conjuncts), {1, 2}};
+
+  std::vector<predicate_progress> progress{{0, predicate_stage::answer, 2}};
   REQUIRE_THROWS(residual.against_progress(progress));
 }

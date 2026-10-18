@@ -234,8 +234,9 @@ arrow_stream_result materialize_arrow_stream(arrow_batch_source& source,
         throw std::invalid_argument("Arrow stream batch has no ownership capacity");
       if (item->sequence != result.batches)
         throw std::invalid_argument("Arrow stream batch sequence is not contiguous");
-      if (item->rows < 0 || item->rows > limits.max_batch_rows ||
-          item->bytes > limits.max_batch_bytes)
+      auto const actual_rows = item->input->row_count();
+      if (item->rows < 0 || actual_rows < 0 || actual_rows > limits.max_batch_rows ||
+          actual_rows != item->rows || item->bytes > limits.max_batch_bytes)
         throw std::invalid_argument("Arrow stream batch exceeds its declared limits");
 
       auto batch = import_arrow_host(item->input, program, lane, mr);

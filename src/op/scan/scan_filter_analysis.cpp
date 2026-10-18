@@ -25,6 +25,7 @@
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/expression_iterator.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <expression/ast/constant_range.hpp>
 #include <expression/ast/from_duckdb.hpp>
@@ -571,12 +572,22 @@ residual_filter::residual_filter(std::vector<table_filter_conjunct> conjuncts,
         "[residual_filter] a pushed-down filter conjunct cannot be lowered to Sirius AST: " +
         source.expr->ToString());
     }
+    std::vector<std::size_t> value_slots;
+    std::function<void(duckdb::Expression const&)> collect_slots = [&](auto const& expression) {
+      if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+        value_slots.push_back(static_cast<std::size_t>(
+          expression.template Cast<duckdb::BoundReferenceExpression>().Index()));
+      }
+      duckdb::ExpressionIterator::EnumerateChildren(expression, collect_slots);
+    };
+    collect_slots(*source.expr);
+    std::ranges::sort(value_slots);
+    value_slots.erase(std::ranges::unique(value_slots).begin(), value_slots.end());
     std::optional<std::size_t> answered_at;
     if (source.batch_position && answerable_batch_positions.count(*source.batch_position)) {
       answered_at = source.batch_position;
     }
-    _conjuncts.push_back(
-      {std::move(lowered), answered_at, source.batch_position.value_or(std::size_t{0})});
+    _conjuncts.push_back({std::move(lowered), answered_at, std::move(value_slots)});
   }
 }
 
@@ -623,9 +634,12 @@ std::unique_ptr<sirius::ast::node> residual_filter::against_progress(
         sirius::ast::reference{static_cast<std::uint32_t>(*item->answer_slot),
                                sirius::logical_type::make(sirius::type_id::BOOLEAN)}));
     } else {
-      for (auto const& other : progress)
-        if (other.answer_slot == std::optional<std::size_t>{_conjuncts[i].value_at})
+      for (auto const& other : progress) {
+        if (!other.answer_slot) continue;
+        if (std::ranges::find(_conjuncts[i].value_slots, *other.answer_slot) !=
+            _conjuncts[i].value_slots.end())
           throw std::invalid_argument("residual value was replaced by another conjunct's answer");
+      }
       children.push_back(sirius::ast::clone(*_conjuncts[i].comparison));
     }
   }

@@ -58,12 +58,13 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(
   io_object const& obj,
   std::function<std::shared_ptr<io_object_metadata>()> const& loader,
   bool* cache_hit,
-  std::stop_token stop)
+  std::stop_token stop,
+  std::string_view profile)
 {
   if (stop.stop_requested())
     throw std::system_error(std::make_error_code(std::errc::operation_canceled));
   open_observed(obj);
-  auto const lookup   = cache_key(obj.object_path());
+  auto const lookup   = cache_key(obj.object_path(), profile);
   auto const identity = obj.identity();
   // A local stat identity is obtained from the opened descriptor and may be
   // shared by separate opens while the stat tuple is unchanged. Keep the
@@ -105,7 +106,7 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(
   std::exception_ptr error;
   try {
     value = loader();
-    register_metadata(obj, value);
+    register_metadata(obj, value, profile);
   } catch (...) {
     error = std::current_exception();
   }
@@ -122,7 +123,11 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(
   return value;
 }
 
-std::string metadata_store::cache_key(std::string const& path) { return path; }
+std::string metadata_store::cache_key(std::string const& path, std::string_view profile)
+{
+  if (profile.empty()) return path;
+  return path + "\nprofile=" + std::string(profile);
+}
 
 void metadata_store::retire(iterator it, entries& retired)
 {
@@ -143,10 +148,22 @@ void metadata_store::clear()
   }
 }
 
+bool metadata_store::invalidate(std::string_view path, std::string_view profile)
+{
+  entries retired;
+  std::lock_guard lock{_mutex};
+  auto const lookup = cache_key(std::string(path), profile);
+  auto const found  = _index.find(lookup);
+  if (found == _index.end()) return false;
+  retire(found->second, retired);
+  return true;
+}
+
 bool metadata_store::put_identity(std::string const& path,
                                   object_identity identity,
                                   uint64_t generation,
                                   std::shared_ptr<io_object_metadata> value,
+                                  std::string_view profile,
                                   entries& retired)
 {
   if (!value) return false;
@@ -159,7 +176,7 @@ bool metadata_store::put_identity(std::string const& path,
       return false;
     }
   }
-  auto lookup = cache_key(path);
+  auto lookup = cache_key(path, profile);
   // Open-local evidence cannot help the next open; keep its footer-probe fast path.
   auto defer_value = [&] {
     // Keep discarded payloads alive until the caller releases _mutex. Metadata
@@ -196,20 +213,26 @@ bool metadata_store::put_identity(std::string const& path,
 }
 
 void metadata_store::register_metadata(io_object const& obj,
-                                       std::shared_ptr<io_object_metadata> metadata)
+                                       std::shared_ptr<io_object_metadata> metadata,
+                                       std::string_view profile)
 {
   if (!metadata) return;
   entries retired;
   std::unique_lock lock{_mutex};
   observe_locked(obj, retired);
-  if (!put_identity(
-        obj.object_path(), obj.identity(), obj.open_generation(), std::move(metadata), retired)) {
+  if (!put_identity(obj.object_path(),
+                    obj.identity(),
+                    obj.open_generation(),
+                    std::move(metadata),
+                    profile,
+                    retired)) {
     return;
   }
 }
-std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj) const
+std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj,
+                                                                 std::string_view profile) const
 {
-  auto lookup   = cache_key(obj.object_path());
+  auto lookup   = cache_key(obj.object_path(), profile);
   auto identity = obj.identity();
   std::lock_guard lock{_mutex};
   auto found = _index.find(lookup);

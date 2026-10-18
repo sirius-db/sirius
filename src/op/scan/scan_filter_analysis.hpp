@@ -189,7 +189,7 @@ class residual_filter {
     /// Set when this conjunct's column can arrive as the answer; the batch
     /// position that answer occupies.
     std::optional<std::size_t> answered_at;
-    std::size_t value_at;
+    std::vector<std::size_t> value_slots;
   };
   std::vector<conjunct> _conjuncts;
 };

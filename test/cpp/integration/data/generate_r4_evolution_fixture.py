@@ -81,6 +81,7 @@ for path in (target / "metadata").glob("*.avro"):
         reader = fastavro.reader(handle)
         schema = reader.writer_schema
         records = list(reader)
+        avro_metadata = dict(reader.metadata)
     for record in records:
         data = record.get("data_file")
         if not data:
@@ -101,7 +102,12 @@ for path in (target / "metadata").glob("*.avro"):
                 data[key] = None
     with path.open("wb") as handle:
         fastavro.writer(
-            handle, schema, records, codec="null", sync_marker=b"r4-evolution-001"
+            handle,
+            schema,
+            records,
+            metadata=avro_metadata,
+            codec="null",
+            sync_marker=b"r4-evolution-001",
         )
 
 # A valid migration whose absent field comes from identity-partition metadata.

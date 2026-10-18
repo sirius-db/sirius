@@ -66,6 +66,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   {
     return _core.next_split_provider(std::move(resolve));
   }
+  stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve) override
+  {
+    return _core.next_split_provider_with_stop(std::move(resolve));
+  }
   filtered_table materialize_metadata_to_table(
     scan_info const& info,
     const cucascade::memory::memory_space& space,

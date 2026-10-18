@@ -192,6 +192,14 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
   auto default_options = cudf::io::parquet_reader_options::builder().build();
   auto profile         = schema_profile(options);
   bool const canonical = cacheable && profile == schema_profile(default_options);
+  // The metadata store is keyed by object identity and path. Until schema
+  // profile is part of that key, only canonical footer parsing may participate
+  // in shared caching; option-specific parses must bypass it.
+  bool const use_cache = canonical;
+  // Canonical artifacts retain the legacy empty namespace so datasource metadata
+  // consumers continue to observe the shared footer. Option-specific profiles
+  // carry their full profile in the cache key whenever they are enabled later.
+  std::string const cache_namespace = canonical ? std::string{} : profile;
   // Normal bind/pin/scan callers differ only in projection. Parse the complete
   // footer with canonical options; the consumer applies its own projection to
   // the resulting FileMetaData. This makes reuse independent of query columns
@@ -243,15 +251,29 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
                                                      observed_identity);
     return result;
   };
-  auto metadata = cacheable && source.io_ctx() ? source.io_ctx()->metadata_store().get_or_load(
-                                                   source.get_io_object(), build, cache_hit, stop)
-                                               : build();
+  auto metadata = use_cache && source.io_ctx()
+                    ? source.io_ctx()->metadata_store().get_or_load(
+                        source.get_io_object(), build, cache_hit, stop, cache_namespace)
+                    : build();
   auto result   = std::dynamic_pointer_cast<parquet_metadata>(metadata);
   if (!result) {
     // Preserve the existing miss behavior for a payload of another metadata type.
     if (cache_hit) *cache_hit = false;
     result = std::static_pointer_cast<parquet_metadata>(build());
-    if (cacheable) std::ignore = source.store_metadata(result);
+    if (use_cache) std::ignore = source.store_metadata(result);
+  }
+  // A caller may have opened a newer object while an older foreign artifact was
+  // already published by another entry point. Resolve that mismatch centrally so
+  // scan, describe, and pin all rebuild the same canonical footer instead of
+  // carrying format-specific clear/retry logic.
+  if (use_cache && result->built_for_identity != observed_identity && source.io_ctx()) {
+    if (cache_hit) *cache_hit = false;
+    source.io_ctx()->metadata_store().invalidate(source.get_io_object().object_path(),
+                                                 cache_namespace);
+    result = std::dynamic_pointer_cast<parquet_metadata>(build());
+    if (!result)
+      throw std::runtime_error("[parquet] metadata loader returned an incompatible artifact");
+    std::ignore = source.store_metadata(result);
   }
   return {result, result->built_for_identity};
 }

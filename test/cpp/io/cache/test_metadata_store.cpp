@@ -179,6 +179,34 @@ TEST_CASE("Metadata flights do not join a different identity", "[metadata_store]
   CHECK(store.statistics().builds == 2);
 }
 
+TEST_CASE("Metadata profiles are independent cache identities", "[metadata_store]")
+{
+  cache::metadata_store store;
+  fake_object object("file", "file:v1", tag());
+  auto first  = std::make_shared<value>(32);
+  auto second = std::make_shared<value>(64);
+  CHECK(store.get_or_load(object, [&] { return first; }, nullptr, {}, "profile-a") == first);
+  CHECK(store.get_or_load(object, [&] { return second; }, nullptr, {}, "profile-b") == second);
+  CHECK(store.get_metadata(object, "profile-a") == first);
+  CHECK(store.get_metadata(object, "profile-b") == second);
+  CHECK(store.statistics().builds == 2);
+}
+
+TEST_CASE("Targeted metadata invalidation preserves other profiles", "[metadata_store]")
+{
+  cache::metadata_store store;
+  fake_object object("file", "file:v1", tag());
+  auto canonical = std::make_shared<value>(32);
+  auto profile   = std::make_shared<value>(64);
+  store.register_metadata(object, canonical, "");
+  store.register_metadata(object, profile, "iceberg_flat_v1");
+
+  CHECK(store.invalidate("file", "iceberg_flat_v1"));
+  CHECK(store.get_metadata(object, "") == canonical);
+  CHECK_FALSE(store.get_metadata(object, "iceberg_flat_v1"));
+  CHECK_FALSE(store.invalidate("file", "iceberg_flat_v1"));
+}
+
 TEST_CASE("Same-key opens preserve warm metadata and advance the observation fence",
           "[metadata_store]")
 {

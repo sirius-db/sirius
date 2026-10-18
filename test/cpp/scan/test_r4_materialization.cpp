@@ -615,6 +615,44 @@ TEST_CASE("R4 retiring an abandoned Arrow import releases its owner exactly once
   REQUIRE(released == 1);
 }
 
+TEST_CASE("R4 Arrow query drain retires cancelled batches and returns their credit", "[r4][scan]")
+{
+  struct credit_token {
+    int* returns;
+    explicit credit_token(int* target) : returns(target) {}
+    ~credit_token() { ++*returns; }
+  };
+
+  rmm::cuda_stream stream;
+  sirius::exec::retire_lane lane(stream.value());
+  int released  = 0;
+  int credits   = 0;
+  auto fixture  = std::make_shared<arrow_fixture>(released);
+  auto capacity = std::make_shared<credit_token>(&credits);
+  test_arrow_source source;
+  source.queue.push_back(
+    {std::make_shared<owned_arrow_batch>(fixture->schema, fixture->array, capacity), 0, 3, 12});
+
+  materialization_program program{49, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
+  program.input_types = program.output_types;
+  REQUIRE_THROWS(materialize_arrow_stream(
+    source, program, lane, cudf::get_current_device_resource_ref(), [](materialized_batch&&) {
+      throw std::runtime_error("query sink cancelled");
+    }));
+  REQUIRE(source.cancel_calls == 1);
+  fixture.reset();
+  capacity.reset();
+  // Cancellation stops production, but cannot release an owner submitted to the GPU lane.
+  CHECK(released == 0);
+  CHECK(credits == 0);
+
+  // The query-level drain is the last consumer barrier. It must retire the import owner and
+  // return the producer reservation exactly once after the submitted work is complete.
+  REQUIRE(lane.quiesce() == cudaSuccess);
+  CHECK(released == 1);
+  CHECK(credits == 1);
+}
+
 TEST_CASE("R4 finish refuses unproved visibility and predicate reports", "[r4][scan]")
 {
   rmm::cuda_stream stream;
@@ -709,4 +747,42 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   REQUIRE(batch.rows == 0);
   REQUIRE(batch.table.view().num_columns() == 1);
   CHECK(batch.table.view().column(0).type().id() == cudf::type_id::INT64);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "R4 adapter mapping hook runs without an Iceberg physical schema",
+                 "[r4][scan][mapping][adapter]")
+{
+  sirius::test::scratch_dir directory("r4_adapter_mapping");
+  auto path = directory.file("input.parquet");
+  auto written =
+    con->Query("COPY (SELECT 7::INTEGER old_id) TO " + directory.file_literal("input.parquet") +
+               " (FORMAT PARQUET, FIELD_IDS {old_id: 1})");
+  REQUIRE(written);
+  REQUIRE_FALSE(written->HasError());
+  auto info                    = std::make_unique<parquet_ingestible_table_info>();
+  info->contract_id            = 92;
+  info->resolved_file_paths    = {path};
+  info->names                  = {"renamed"};
+  info->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT)};
+  info->column_ids             = {duckdb::ColumnIndex(0)};
+  info->projected_output_count = 1;
+  info->field_mapping_requirements =
+    std::vector<field_requirement>{{1, duckdb::LogicalType::BIGINT, {}, true}};
+  info->prepare_field_mapping = [](std::shared_ptr<parquet_metadata const> metadata,
+                                   std::string const& identity,
+                                   materialization_program program,
+                                   std::vector<field_requirement> fields) {
+    return std::make_shared<field_id_mapping const>(field_id_mapping::compile(
+      std::move(metadata), identity, std::move(program), std::move(fields)));
+  };
+  auto ingestible = make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto prepare    = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto prepared = prepare();
+  REQUIRE(prepared);
+  auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
+  REQUIRE(file.field_mapping);
+  CHECK(file.field_mapping->read_names() == std::vector<std::string>{"old_id"});
 }

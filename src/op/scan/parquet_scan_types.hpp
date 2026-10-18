@@ -50,8 +50,8 @@
 #include <span>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -78,10 +78,21 @@ namespace sirius::op::scan {
  */
 class parquet_ingestible_table_info : public ingestible_table_info {
  public:
+  /// Adapter-owned hook for per-file mapping preparation.  The shared Parquet core supplies
+  /// only the verified footer, identity, and semantic requirements; the adapter decides how
+  /// those requirements become an immutable mapping.  A null hook keeps the built-in
+  /// iceberg_flat_v1 compiler as the compatibility path.
+  using field_mapping_preparer =
+    std::function<std::shared_ptr<field_id_mapping const>(std::shared_ptr<parquet_metadata const>,
+                                                          std::string const&,
+                                                          materialization_program,
+                                                          std::vector<field_requirement>)>;
+
   duckdb::vector<duckdb::LogicalType> bound_types;      // Full nested bind schema, in P-space.
   std::optional<iceberg_table_schema> physical_schema;  // Populated by the S3 Iceberg lowering.
   // iceberg_flat_v1 rules exported from trusted DuckDB binding, in P-space.
   std::optional<std::vector<field_requirement>> field_mapping_requirements;
+  field_mapping_preparer prepare_field_mapping;
   std::unordered_set<std::string> files_without_partition_values;
   bound_table_scan physical_contract;
   leaf_set semantic_columns;
@@ -258,6 +269,18 @@ class parquet_split_info : public scan_info {
     return plan && plan->has_user_virtual_columns() && runs > 1
              ? memory::saturating_mul(total, std::size_t{2})
              : total;
+  }
+
+  // Preparation retains the decoded inputs until the consumer takes the split.  The
+  // concatenated output is an execution-time peak and must not be charged as another
+  // preparation allocation; otherwise virtual-column batches reserve the same bytes twice.
+  [[nodiscard]] std::size_t preparation_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& s : rg_slices) {
+      total = memory::saturating_add(total, s.estimated_decode_working_bytes);
+    }
+    return total;
   }
 
  private:

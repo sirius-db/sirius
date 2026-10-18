@@ -95,10 +95,13 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     _execution_completion = std::move(completion);
   }
 
-  using metadata_scan_task_t = std::function<std::unique_ptr<scan_info>()>;
+  using metadata_scan_task_t           = std::function<std::unique_ptr<scan_info>()>;
+  using stoppable_metadata_scan_task_t = std::function<std::unique_ptr<scan_info>(std::stop_token)>;
 
   struct preparation_claim {
     metadata_scan_task_t work;
+    // Optional stop-aware wrapper used by the preparation coordinator before blocking reads.
+    std::function<std::unique_ptr<scan_info>(std::stop_token)> stop_work;
     std::optional<scan_manager::unit_key> key;
     scan_manager::required_input_set required;
   };
@@ -109,9 +112,25 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   virtual void attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>) {}
   virtual bool can_claim_preparation() { return true; }
   virtual void stop_preparation() noexcept {}
+  /// Complete adapter-owned preparation cleanup after query work has drained.
+  virtual void finish_preparation() noexcept { stop_preparation(); }
   virtual preparation_claim claim_preparation(io::ioctx_resolver resolve)
   {
-    return {next_split_provider(std::move(resolve)), {}, {}};
+    auto stop_work = next_split_provider_with_stop(resolve);
+    if (!stop_work) return {};
+    auto work = stop_work;
+    return {[work = std::move(work)] { return work({}); }, std::move(stop_work), {}, {}};
+  }
+
+  virtual stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve)
+  {
+    auto work = next_split_provider(std::move(resolve));
+    if (!work) return {};
+    return [work = std::move(work)](std::stop_token stop) mutable {
+      if (stop.stop_requested())
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      return work();
+    };
   }
 
   virtual ~gpu_ingestible() = default;

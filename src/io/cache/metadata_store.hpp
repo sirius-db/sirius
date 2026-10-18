@@ -49,15 +49,22 @@ class metadata_store {
   std::shared_ptr<io_object_metadata> get_or_load(
     io_object const& obj,
     std::function<std::shared_ptr<io_object_metadata>()> const& loader,
-    bool* cache_hit      = nullptr,
-    std::stop_token stop = {});
+    bool* cache_hit          = nullptr,
+    std::stop_token stop     = {},
+    std::string_view profile = {});
   metadata_store(metadata_store const&)            = delete;
   metadata_store& operator=(metadata_store const&) = delete;
-  void register_metadata(io_object const& obj, std::shared_ptr<io_object_metadata> metadata);
-  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(io_object const& obj) const;
+  void register_metadata(io_object const& obj,
+                         std::shared_ptr<io_object_metadata> metadata,
+                         std::string_view profile = {});
+  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(
+    io_object const& obj, std::string_view profile = {}) const;
   [[nodiscard]] bool has_path(std::string_view path) const;
   [[nodiscard]] counters statistics() const;
   [[nodiscard]] std::string describe_metadata_store() const;
+  /// Retire one path/profile entry while preserving unrelated metadata.
+  /// Existing shared owners remain valid until their last consumer releases them.
+  bool invalidate(std::string_view path, std::string_view profile = {});
   /// Drop all cached metadata after an opened-object identity mismatch.
   void clear();
 
@@ -72,12 +79,13 @@ class metadata_store {
   using iterator = entries::iterator;
   void observe_locked(io_object const& obj, entries& retired);
 
-  static std::string cache_key(std::string const& path);
+  static std::string cache_key(std::string const& path, std::string_view profile = {});
   void retire(iterator it, entries& retired);
   bool put_identity(std::string const& path,
                     object_identity identity,
                     uint64_t generation,
                     std::shared_ptr<io_object_metadata> value,
+                    std::string_view profile,
                     entries& retired);
 
   mutable std::mutex _mutex;

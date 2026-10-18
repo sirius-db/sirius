@@ -30,7 +30,9 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
@@ -391,10 +393,14 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
       info->physical_schema = std::move(schema);
   }
 
+  // Preserve the bound Iceberg field-ID/default contract for files whose physical
+  // schema is an older or newer snapshot.  Only constant defaults are admitted to
+  // the GPU mapper; expression defaults remain on the ordinary fallback path.
   if (iceberg_flat_mapping_supported(scan_op.bind_data.get())) {
     auto const& bind    = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     auto const& columns = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
     std::vector<sirius::op::scan::field_requirement> requirements;
+    requirements.reserve(info->names.size());
     for (std::size_t p = 0; p < info->names.size(); ++p) {
       auto found = std::find_if(columns.begin(), columns.end(), [&](auto const& column) {
         return column.name == info->names[p] &&
@@ -406,8 +412,15 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
       }
       std::optional<duckdb::Value> missing;
       if (found->default_expression) {
-        auto const& constant = found->default_expression->Cast<duckdb::ConstantExpression>();
-        missing              = constant.GetLiteral().ToValue();
+        auto const* expression = found->default_expression.get();
+        while (auto const* cast = dynamic_cast<duckdb::CastExpression const*>(expression))
+          expression = &cast->Child();
+        auto const* constant = dynamic_cast<duckdb::ConstantExpression const*>(expression);
+        if (!constant) {
+          requirements.clear();
+          break;
+        }
+        missing = constant->GetLiteral().ToValue().DefaultCastAs(found->type, true);
       }
       requirements.push_back(
         {found->GetIdentifierFieldId(), found->type, std::move(missing), true, true});
