@@ -70,24 +70,27 @@ PY
 [ -x "$out" ] || { echo "relink produced no executable at $out" >&2; exit 1; }
 unchanged "$out"
 
-# Both scan-reference lookups must miss dynamically and hit as global definitions in .symtab.
+# Both scan-reference lookups must miss dynamically and be defined in .symtab. The binding there
+# depends on the toolchain: some linkers keep them GLOBAL, others already make them LOCAL once
+# nothing exports them, so either is accepted here; the variant below forces LOCAL for both.
 dynamic=$(nm -D --defined-only "$out") || { echo "nm -D failed on $out" >&2; exit 1; }
 static=$(nm --defined-only "$out") || { echo "nm failed on $out" >&2; exit 1; }
+bindings=""
 for symbol in _ZN6duckdb17TableScanFunction11GetFunctionEv duckdb_extension_parquet_describe; do
   if printf '%s\n' "$dynamic" | awk -v s="$symbol" '$3 == s { found = 1 } END { exit !found }'; then
     echo "relinked CLI still exports $symbol dynamically: $out" >&2
     exit 1
   fi
   binding=$(printf '%s\n' "$static" | awk -v s="$symbol" '$3 == s && !found { print $2; found = 1 }')
-  if [ "$binding" != "T" ]; then
-    echo "$symbol is not a global text definition in the static symbol table (got '${binding:-absent}'): $out" >&2
-    exit 1
-  fi
+  case "$binding" in
+    T|t) bindings="${bindings:+$bindings, }$symbol: $binding" ;;
+    *) echo "$symbol is not a text definition in the static symbol table (got '${binding:-absent}'): $out" >&2; exit 1 ;;
+  esac
 done
 exports=$(printf '%s\n' "$dynamic" | grep -c ' _ZN6duckdb' || true)
 echo "no-export host: $out"
 echo "  version: $("$out" -csv -noheader -c 'SELECT library_version, source_id FROM pragma_version();')"
-echo "  dynamic duckdb:: exports: $exports; TableScanFunction::GetFunction and duckdb_extension_parquet_describe: static GLOBAL"
+echo "  dynamic duckdb:: exports: $exports; static bindings: $bindings"
 echo "  wrapper CLI unchanged: $before"
 
 # The localized variant: same image, both reference symbols demoted to LOCAL binding.
