@@ -877,7 +877,7 @@ TEST_CASE("Queue allocation failure unwinds every caller payload outside the gat
     {
       ++advance_calls;
       if (mode == path::partial || mode == path::sized || mode == path::full_window) {
-        retained = cap;
+        retained = mode == path::partial ? 1 : cap;
         note_retained(clock::now() - (mode == path::partial ? 1s : 100ms));
         return {nullptr, true};
       }
@@ -970,6 +970,14 @@ TEST_CASE("Queue allocation failure unwinds every caller payload outside the gat
   CHECK(seen->errors == 0);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
   if (mode == path::sized) CHECK(f.coordinator.snapshot().size_emissions > 0);
+  if (mode == path::partial) {
+    CHECK(f.coordinator.snapshot().partial_emissions > 0);
+    CHECK(f.coordinator.snapshot().size_emissions == 0);
+  }
+  if (mode == path::full_window) {
+    CHECK(f.coordinator.snapshot().normal_emissions > 0);
+    CHECK(f.coordinator.snapshot().partial_emissions == 0);
+  }
   if (mode == path::partial || mode == path::sized || mode == path::full_window)
     CHECK(coalescers.front()->partial_calls == made);
   else if (mode == path::advance)
