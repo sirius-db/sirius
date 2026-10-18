@@ -391,6 +391,61 @@ TEST_CASE("Preparation input disposal is outside the gate on every terminal path
   CHECK(f.coordinator.snapshot().output_peak <= 1);
 }
 
+TEST_CASE("Failed result settlement releases owners outside the gate and preserves the error",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  fixture f(2, 1);
+  auto failure = f.completion.get_awaitable();
+  auto out     = std::make_shared<sink>();
+  auto seen    = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  auto first = f.make_hold(), second = f.make_hold();
+  struct sized_input : cleanup_tagged {
+    size_t bytes;
+    sized_input(std::shared_ptr<test::cleanup_observation> seen, size_t bytes)
+      : cleanup_tagged(std::move(seen)), bytes(bytes)
+    {
+    }
+    size_t preparation_bytes() const noexcept override { return bytes; }
+  };
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::checkpoint_iteration));
+  auto unit = f.coordinator.admit_unit({100, 1}, required);
+  REQUIRE(unit);
+  f.source(std::make_shared<accumulator>(std::numeric_limits<size_t>::max()),
+           out,
+           [&, next = 0]() mutable -> std::optional<preparation_coordinator::job> {
+             if (next == 2) return {};
+             auto id = next++;
+             return preparation_coordinator::job{
+               [=] {
+                 (id == 0 ? first : second)->wait();
+                 return std::make_unique<sized_input>(
+                   seen, id == 0 ? std::numeric_limits<size_t>::max() : 1);
+               },
+               unit};
+           });
+  auto cleanup = f.shutdown_guard();
+  f.start();
+  REQUIRE(first->await());
+  REQUIRE(second->await());
+  first->release();
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!f.coordinator.snapshot().results_peak && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  REQUIRE(f.coordinator.snapshot().results_peak == 1);
+  second->release();
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  REQUIRE(f.completion.has_error());
+  CHECK_THROWS_WITH(failure.get(), "preparation lookahead work size overflow");
+  CHECK(seen->releases == 2);
+  CHECK(seen->outside == 2);
+  CHECK(seen->errors == 0);
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
 TEST_CASE("Retiring units releases final owners but preserves external ready snapshots",
           "[scan_preparation][coordinator][preparation_cleanup]")
 {
@@ -546,7 +601,7 @@ TEST_CASE("Final release stop notifications coalesce while units retire themselv
 TEST_CASE("Discarded dispatcher captures coalesce nested stop notifications",
           "[scan_preparation][coordinator][preparation_cleanup]")
 {
-  fixture f(1, 2, k_interrupt_check_interval, preparation_options{2, 2, 2, 2, 1, 20ms});
+  fixture f(1, 2, k_interrupt_check_interval, preparation_options{2, 2, 2, 1, 20ms});
   auto blocked = f.make_hold();
   std::atomic<size_t> work_calls{0};
   std::atomic<size_t> active{0}, peak{0};

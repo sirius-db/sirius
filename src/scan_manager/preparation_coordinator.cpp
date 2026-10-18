@@ -566,9 +566,10 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
       }
       if (record.state == unit_state::pending) continue;
       if (record.state == unit_state::cancelled) {
-        if (slot.input) source.work_bytes -= slot.input->preparation_bytes();
+        auto bytes = slot.input ? slot.input->preparation_bytes() : 0;
         ready_results.pop_back();
         release_slot(index, lock);
+        source.work_bytes -= bytes;
         return true;
       }
     }
