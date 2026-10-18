@@ -67,6 +67,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <set>
@@ -805,6 +806,134 @@ TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns"
   REQUIRE(entry.cache_info.column_names().size() == 3u);
 
   auto unpin = con.Query("CALL unpin_table('merge_pin');");
+  REQUIRE(unpin);
+  REQUIRE_FALSE(unpin->HasError());
+
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
+// Host-tier pin on an explicit NUMA node (numa_id named parameter).
+//
+// Two host spaces (NUMA 0 and 1) through the low-level `space` list, one GPU.
+// Without numa_id the pin lands on GPU 0's own node; numa_id picks the other one.
+// Pin with numa_id set to the node GPU 0 is NOT on, assert every chunk lives in
+// that HOST space, then overwrite the parquet and check the scan still returns the
+// pinned values. Skips on hosts without NUMA nodes 0 and 1 or when GPU 0's node is
+// neither of them.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - host-tier pin on a non-local NUMA host space via numa_id",
+          "[scan_manager][host_tier][pin_numa]")
+{
+  if (!fs::exists("/sys/devices/system/node/node0") ||
+      !fs::exists("/sys/devices/system/node/node1")) {
+    SKIP("needs NUMA nodes 0 and 1");
+  }
+
+  auto tmp = make_tmp("host-numa");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  generate_4file_surface(tmp);
+
+  auto yaml_path = tmp / "host_numa.yaml";
+  {
+    std::ofstream f(yaml_path);
+    f << "sirius:\n"
+         "  topology:\n"
+         "    num_gpus: 1\n"
+         "  space:\n"
+         "    gpu:\n"
+         "      - { device_id: 0, memory_capacity: 4GiB, reservation_limit_fraction: 1.0 }\n"
+         "    host:\n"
+         "      - { numa_id: 0, memory_capacity: 2GiB, block_size: 1MiB, pool_size: 128, "
+         "initial_number_pools: 2 }\n"
+         "      - { numa_id: 1, memory_capacity: 2GiB, block_size: 1MiB, pool_size: 128, "
+         "initial_number_pools: 2 }\n"
+         "  executor:\n"
+         "    scan_manager:\n"
+         "      backend: sirius\n"
+         "    pipeline:\n"
+         "      num_threads: 4\n"
+         "    task_creator:\n"
+         "      num_threads: 4\n"
+         "    downgrade:\n"
+         "      num_threads: 1\n"
+         "  operator_params:\n"
+         "    scan_task_batch_size: 1000000\n";
+  }
+
+  scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  auto const& topo = sirius_ctx->get_config().get_hw_topology();
+  REQUIRE_FALSE(topo.gpus.empty());
+  int const local_numa = topo.gpus[0].numa_node;
+  if (local_numa != 0 && local_numa != 1) {
+    fs::remove_all(tmp, ec);
+    SKIP("GPU 0 is on NUMA node " << local_numa << ", not 0 or 1");
+  }
+  int const remote_numa = 1 - local_numa;
+
+  auto glob = parquet_glob(tmp);
+
+  // A numa_id with no configured host space fails at pin time, naming the configured ones.
+  auto missing =
+    con.Query("CALL pin_table('" + glob + "', tier='host', name='numa_pin', numa_id=7);");
+  REQUIRE(missing->HasError());
+  REQUIRE_THAT(missing->GetError(), Catch::Matchers::ContainsSubstring("numa_id 7"));
+
+  // numa_id only applies to host pins.
+  auto gpu_tier = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='numa_pin', numa_id=" +
+                            std::to_string(remote_numa) + ");");
+  REQUIRE(gpu_tier->HasError());
+  REQUIRE_THAT(gpu_tier->GetError(),
+               Catch::Matchers::ContainsSubstring("only applies to tier='host'"));
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='numa_pin', numa_id=" +
+                       std::to_string(remote_numa) + ");");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  const sirius::scan_manager::pinned_entry* entry_ptr = nullptr;
+  sirius_ctx->get_scan_manager().visit_pinned_entries(
+    [&entry_ptr](std::string_view name, const auto& e) {
+      if (name == "numa_pin") {
+        entry_ptr = &e;
+        return true;
+      }
+      return false;
+    });
+  REQUIRE(entry_ptr != nullptr);
+  REQUIRE(entry_ptr->host_chunks.size() >= 4u);
+  for (auto const& chunk : entry_ptr->host_chunks) {
+    REQUIRE(chunk != nullptr);
+    INFO("chunk tier/device=" << static_cast<int>(chunk->get_current_tier()) << "/"
+                              << chunk->get_device_id());
+    REQUIRE(chunk->get_current_tier() == cucascade::memory::Tier::HOST);
+    REQUIRE(chunk->get_device_id() == remote_numa);
+  }
+
+  // Overwrite with a higher k ceiling. Each of the 4 files holds range(100000), so the
+  // pin serves MAX(k)=99999, SUM(v)=4*2*sum(0..99999) and 400000 rows; a fall-through
+  // to the mutated parquet would see range(200000).
+  generate_parquet_surface(
+    tmp, "SELECT range AS k, range * 2 AS v FROM range(200000)", /*num_files=*/4);
+
+  auto cached = con.Query(
+    "CALL gpu_execution(\"SELECT MAX(k), SUM(v), COUNT(*) FROM read_parquet('" + glob + "')\");");
+  REQUIRE(cached);
+  if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
+  REQUIRE_FALSE(cached->HasError());
+  REQUIRE(cached->Collection().GetValue(0, 0).GetValue<int64_t>() == 99999);
+  REQUIRE(cached->Collection().GetValue(1, 0).GetValue<int64_t>() == 4LL * 99999LL * 100000LL);
+  REQUIRE(cached->Collection().GetValue(2, 0).GetValue<int64_t>() == 400000);
+
+  auto unpin = con.Query("CALL unpin_table('numa_pin');");
   REQUIRE(unpin);
   REQUIRE_FALSE(unpin->HasError());
 

@@ -144,6 +144,43 @@ bounds, what was dropped and why), then per batch the sources in the order they 
 enumeration chosen, the survivor count and whether the batch came back needing no further
 filtering.
 
+## Placing host pins on a NUMA node
+
+By default a `tier => 'host'` pin puts each GPU's chunks in the host space on that GPU's
+NUMA node, falling back to the first configured host space when none matches. The optional
+`numa_id` parameter puts every chunk in the host space with that NUMA id instead:
+
+```sql
+CALL pin_table('/data/lineitem/*.parquet',
+               tier => 'host',
+               name => 'lineitem',
+               compression => true,
+               numa_id => 1);
+```
+
+The host space must exist. Configure it through the low-level `sirius.space.host` list,
+one entry per NUMA node:
+
+```yaml
+sirius:
+  space:
+    host:
+      - { numa_id: 0, memory_capacity: 400GiB, block_size: 1MiB, pool_size: 128, initial_number_pools: 384 }
+      - { numa_id: 1, memory_capacity: 418GiB, block_size: 1MiB, pool_size: 128, initial_number_pools: 384 }
+```
+
+A `numa_id` with no matching host space fails the pin and lists the configured NUMA ids.
+`numa_id` with any tier other than `host` is a bind error.
+
+Use it when one GPU's local node can't hold both its host pins and its spill. On a GB200
+each Grace node has about 478 GiB, and at TPC-H SF3000 a Simpatico-compressed lineitem
+(439 GB) fills GPU 0's node 0. Pinning lineitem with `numa_id => 1` leaves node 0 for
+spill. The downgrade executor still tries the GPU-local host space first, and other host
+spaces only after that one is full (`preferred_numa_node`, set from the GPU's NUMA node).
+Scans of a remote-node pin pay a cross-socket hop on each host-to-GPU copy. When no
+configured GPU sits on the pin's node, the task creator gets no NUMA preference from those
+chunks and schedules them as usual.
+
 ## Interaction with the downgrade executor
 
 GPU pins permanently occupy part of the downgrade budget, so heavy queries ride closer to
