@@ -80,6 +80,7 @@ class SIRIUS_FFI_EXPORT Context {
     std::uint64_t recv_bytes;
     double gpu_landing_fraction;
     std::uint64_t host_landing_bytes;
+    std::uint64_t disk_writers;
   };
   /// A context with a ring exchange; an empty `config_path` uses built-in defaults.
   Context(const std::string& config_path, RingOptions const& ring);
@@ -393,13 +394,14 @@ SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(const std::s
 /// `recv_bytes` of `frame_bytes` frames, are allocated on the current CUDA device before the
 /// engine's GPU pool. Batches landing from peers may hold up to `gpu_landing_fraction` of the GPU
 /// space and `host_landing_bytes` of the host tier until their receivers take them; beyond that
-/// they land on disk, if the configuration has a disk tier.
+/// they land on disk, if the configuration has a disk tier, written by `disk_writers` threads.
 SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_with_ring(const std::string& config_path,
                                                                   std::uint64_t frame_bytes,
                                                                   std::uint64_t send_bytes,
                                                                   std::uint64_t recv_bytes,
                                                                   double gpu_landing_fraction,
-                                                                  std::uint64_t host_landing_bytes);
+                                                                  std::uint64_t host_landing_bytes,
+                                                                  std::uint64_t disk_writers);
 
 /// Create a [`Fragment`] on `context`. The context must outlive it.
 SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);

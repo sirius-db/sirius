@@ -347,7 +347,10 @@ ring_exchange::ring_exchange(int device, options const& opts)
     _return_spilled{opts.return_spilled},
     _read_stream{stream_on(device)}
 {
-  _disk_thread = std::thread([this] { run_disk_writes(); });
+  auto const writers = std::max<std::size_t>(opts.disk_writers, 1);
+  for (std::size_t i = 0; i < writers; ++i) {
+    _disk_threads.emplace_back([this, bounced = writers > 1] { run_disk_writes(bounced); });
+  }
   _read_thread = std::thread([this] { run_disk_reads(); });
   SIRIUS_LOG_INFO(
     "ring exchange on device {}: send ring {} x {} bytes at {:#x}, receive ring {} x {} bytes at "
@@ -368,7 +371,9 @@ ring_exchange::~ring_exchange()
     _disk_stop = true;
   }
   _disk_cv.notify_all();
-  if (_disk_thread.joinable()) { _disk_thread.join(); }
+  for (auto& writer : _disk_threads) {
+    if (writer.joinable()) { writer.join(); }
+  }
   {
     std::lock_guard lock{_read_mutex};
     _read_stop = true;
@@ -866,8 +871,15 @@ std::uint64_t ring_exchange::copy_out(std::uint64_t id,
   return ticket_id;
 }
 
-void ring_exchange::run_disk_writes()
+void ring_exchange::run_disk_writes(bool bounced)
 {
+  // A bounced writer copies each frame to a pinned frame of its own, on a stream of its own, and
+  // writes it from there: the disk tier's device writes all share one pair of buffers.
+  void* bounce = nullptr;
+  std::optional<rmm::cuda_stream> stream;
+  absl::Cleanup free_bounce = [&] {
+    if (bounce != nullptr) { static_cast<void>(cudaFreeHost(bounce)); }
+  };
   // Each task writes one received frame; its ticket is found by task.
   for (;;) {
     std::shared_ptr<disk_task> task;
@@ -895,11 +907,28 @@ void ring_exchange::run_disk_writes()
       if (!task->head.empty()) {
         backend.write(task->path, task->head.data(), task->head.size(), 0);
       }
-      for (auto const& [frame_offset, file_offset, size] : task->writes) {
-        backend.write(
-          task->path, task->frame + frame_offset, size, file_offset, _recv_stream.view());
+      if (bounced) {
+        if (bounce == nullptr) {
+          RMM_CUDA_TRY(cudaMallocHost(&bounce, _recv.frame_bytes()));
+          stream.emplace(stream_on(_device));
+        }
+        std::size_t span = 0;
+        for (auto const& [frame_offset, file_offset, size] : task->writes) {
+          span = std::max(span, frame_offset + size);
+        }
+        RMM_CUDA_TRY(
+          cudaMemcpyAsync(bounce, task->frame, span, cudaMemcpyDeviceToHost, stream->value()));
+        stream->synchronize();
+        for (auto const& [frame_offset, file_offset, size] : task->writes) {
+          backend.write(task->path, static_cast<char*>(bounce) + frame_offset, size, file_offset);
+        }
+      } else {
+        for (auto const& [frame_offset, file_offset, size] : task->writes) {
+          backend.write(
+            task->path, task->frame + frame_offset, size, file_offset, _recv_stream.view());
+        }
+        _recv_stream.synchronize();
       }
-      _recv_stream.synchronize();
       t->disk_state->store(1, std::memory_order_release);
     } catch (std::exception const& e) {
       *t->error = std::format(

@@ -49,6 +49,7 @@ mod ffi {
             recv_bytes: u64,
             gpu_landing_fraction: f64,
             host_landing_bytes: u64,
+            disk_writers: u64,
         ) -> Result<UniquePtr<Context>>;
 
         /// Execute a serialized Substrait plan on the GPU, writing the results
