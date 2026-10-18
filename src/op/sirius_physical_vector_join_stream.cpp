@@ -2469,12 +2469,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       constexpr std::int64_t kFirstPiecePairs = std::int64_t{1} << 24;
       auto const rows                         = std::max<std::int64_t>(n_left, 1);
       auto const at_least                     = std::max<std::int64_t>(4 * k_join, 64);
+      // The upper bounds give way to at_least for a large k (std::clamp needs lo <= hi).
       return _lists->tier == cucascade::memory::Tier::GPU
                ? std::clamp<std::int64_t>(
                    kFirstPiecePairs / rows * vss::kSeedSample / std::max<std::int64_t>(k_join, 1),
                    at_least,
-                   10'000)
-               : std::clamp<std::int64_t>(kFirstPiecePairs / rows, at_least, vss::kSeedSample);
+                   std::max<std::int64_t>(at_least, 10'000))
+               : std::clamp<std::int64_t>(kFirstPiecePairs / rows,
+                                          at_least,
+                                          std::max<std::int64_t>(at_least, vss::kSeedSample));
     }();
     // Lists in host memory have no device rows to sample; with the bound lowered as it goes, their
     // sweep starts from an unbounded first piece instead, which serves as the sample.
@@ -2993,7 +2996,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // least): a sample near the whole cluster is the sweep again, on CUDA cores.
     auto seed_rows = [&](std::int64_t size) {
       auto const floor = std::max<std::int64_t>(64, 8 * k_join);
-      return std::min(size, std::clamp<std::int64_t>(size / 4, floor, vss::kSeedSample));
+      return std::min(
+        size,
+        std::clamp<std::int64_t>(size / 4, floor, std::max<std::int64_t>(floor, vss::kSeedSample)));
     };
     auto seed_bound = [&] {
       std::vector<std::int64_t> first(static_cast<std::size_t>(n_left));

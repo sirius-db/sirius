@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -74,7 +75,12 @@ inline void copy_file_to_device(int fd,
     auto* host   = static_cast<std::byte*>(buffers.host[slot]);
     for (std::size_t got = 0; got < n;) {
       auto const r = ::pread(fd, host + got, n - got, static_cast<off_t>(offset + done + got));
-      if (r <= 0) { throw std::runtime_error("reading spilled batch " + what + " failed"); }
+      if (r < 0 && errno == EINTR) { continue; }
+      if (r <= 0) {
+        // The other piece's copy may still be queued; the next call must not refill it under it.
+        stream.synchronize();
+        throw std::runtime_error("reading spilled batch " + what + " failed");
+      }
       got += static_cast<std::size_t>(r);
     }
     CUDF_CUDA_TRY(cudaMemcpyAsync(
