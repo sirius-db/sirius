@@ -2465,3 +2465,134 @@ TEST_CASE_METHOD(KMeansFixture,
   }
   run_ok("SELECT * FROM unpin_table('kgs_many');");
 }
+
+namespace {
+
+// A clustered corpus of 32-wide rows (float in [0, 1), or bytes 0..255 as floats), stored in
+// cluster order (or, with halves, as two cluster-ordered halves back to back, so a chunk holds a
+// cluster as two runs), and a pinned probe table. The corpus is left unpinned for the join's own
+// scan; pinned, its chunks are 256 KB batches, a chunk per row group (122,880 rows).
+void create_wide_clustered_join(KMeansFixture& fixture,
+                                const std::string& prefix,
+                                bool bytes,
+                                bool halves,
+                                int n_clusters,
+                                int corpus_rows,
+                                int probe_rows)
+{
+  fixture.run_ok("SET scan_task_batch_size = 262144;");
+  auto const gen = [&](const std::string& seed) {
+    auto const value = "(hash(i * 1000 + d + " + seed + ") % " +
+                       (bytes ? std::string("256)::FLOAT") : std::string("1000)::FLOAT / 1000.0"));
+    return "list_transform(range(32), lambda d: " + value + ")::FLOAT[32]";
+  };
+  fixture.run_ok("CREATE TABLE " + prefix + "_raw AS SELECT i::INTEGER AS id, " + gen("0") +
+                 " AS vec FROM range(" + std::to_string(corpus_rows) + ") t(i);");
+  fixture.run_ok("CREATE TABLE " + prefix + "_probe AS SELECT i::INTEGER AS id, " + gen("7777777") +
+                 " AS vec FROM range(" + std::to_string(probe_rows) + ") t(i);");
+  fixture.run_ok("CHECKPOINT;");
+  fixture.run_ok("SELECT * FROM pin_table(name => '" + prefix +
+                 "_raw', tier => 'gpu', format => 'duckdb');");
+  fixture.run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_raw','vec', name => '" + prefix +
+                 "_c', n_clusters => " + std::to_string(n_clusters) + ");");
+  fixture.run_ok("CREATE TABLE " + prefix + "_asg AS SELECT * FROM sirius_kmeans_assign('" +
+                 prefix + "_raw','vec','" + prefix + "_c', n_probes => 1);");
+  fixture.run_ok("CREATE TABLE " + prefix + "_corpus AS SELECT r.id, r.vec, a.cluster_id FROM " +
+                 prefix + "_raw r JOIN " + prefix + "_asg a ON r.rowid = a.row_id ORDER BY " +
+                 (halves ? "r.id % 2, a.cluster_id;" : "a.cluster_id;"));
+  fixture.run_ok("CHECKPOINT;");
+  fixture.run_ok("SELECT * FROM unpin_table('" + prefix + "_raw');");
+  fixture.run_ok("SELECT * FROM pin_table(name => '" + prefix +
+                 "_probe', tier => 'gpu', format => 'duckdb');");
+}
+
+// Probe id and k nearest distances by DuckDB's array_distance on the CPU, every stride-th probe.
+std::vector<std::pair<std::string, long long>> cpu_top_k(duckdb::Connection& con,
+                                                         const std::string& prefix,
+                                                         int k,
+                                                         int stride)
+{
+  return distance_multiset(
+    con,
+    "SELECT left_id, distance FROM (SELECT p.id AS left_id, array_distance(p.vec, c.vec) AS "
+    "distance, row_number() OVER (PARTITION BY p.id ORDER BY array_distance(p.vec, c.vec)) AS rk "
+    "FROM " +
+      prefix + "_probe p, " + prefix + "_corpus c WHERE p.id % " + std::to_string(stride) +
+      " = 0) WHERE rk <= " + std::to_string(k) + ";");
+}
+
+std::size_t distance_mismatches(std::vector<std::pair<std::string, long long>> const& a,
+                                std::vector<std::pair<std::string, long long>> const& b)
+{
+  REQUIRE(a.size() == b.size());
+  std::size_t mismatched = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    mismatched += a[i].first != b[i].first || std::llabs(a[i].second - b[i].second) > 1;
+  }
+  return mismatched;
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "an approximate join over a corpus without lists filters it in float16 exactly",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded]")
+{
+  // No cluster lists: each scanned chunk is coded to FLOAT16 on the device and filtered under each
+  // row's bound, what passes re-scored from the chunk's FP32 rows. Probing every cluster the answer
+  // is the exact one; probing four it is the FP32 ranked search's (SIRIUS_VSS_SCAN_BOUNDED=0) over
+  // the same clusters, from the join's own scan and from a pin alike.
+  auto const bytes  = GENERATE(false, true);
+  auto const halves = GENERATE(false, true);
+  auto const prefix =
+    std::string("sbd_") + (bytes ? "byte" : "float") + (halves ? "_halves" : "_sorted");
+  create_wide_clustered_join(*this, prefix, bytes, halves, 16, 250000, 200);
+  auto const join = [&](int n_probes, bool scan) {
+    return "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
+           "_corpus','vec', search_mode => 'approx', metric => 'l2', k => 10, clustering => '" +
+           prefix + "_c', cluster_column => 'cluster_id', n_probes => " + std::to_string(n_probes) +
+           (scan ? ", build_source => 'scan'" : "") + ");";
+  };
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_SCAN_BOUNDED"); }
+  } unset_env;
+
+  auto const oracle = cpu_top_k(*con, prefix, 10, 1);
+  REQUIRE(oracle.size() == 200u * 10u);
+  CHECK(distance_mismatches(distance_multiset(*con, join(16, true)), oracle) == 0);
+
+  auto const bounded = distance_multiset(*con, join(4, true));
+  ::setenv("SIRIUS_VSS_SCAN_BOUNDED", "0", 1);
+  auto const ranked = distance_multiset(*con, join(4, true));
+  ::unsetenv("SIRIUS_VSS_SCAN_BOUNDED");
+  CHECK(distance_mismatches(bounded, ranked) == 0);
+
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_corpus', tier => 'gpu', format => 'duckdb');");
+  // The pin holds the corpus in three chunks (the join's own scan gathers it into one), each coded,
+  // filtered and re-scored while it is the staged one.
+  auto const before = sirius::test::get_vector_join_prune_stats(*con);
+  CHECK(distance_mismatches(distance_multiset(*con, join(4, false)), bounded) == 0);
+  auto const after = sirius::test::get_vector_join_prune_stats(*con);
+  CHECK(after.chunks_available - before.chunks_available > 1);
+  run_ok("SELECT * FROM unpin_table('" + prefix + "_corpus');");
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a float16 filter over a scanned corpus that overflows its candidates stays exact",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded]")
+{
+  // 512 clusters of ~12 rows and k = 20: a row's nearest cluster cannot give it 20 distances, so
+  // its bound stays infinite and every routed pair passes until merges lower it -- 2000 probe rows
+  // over 6000 corpus rows overflow the 4M-pair candidate buffer, and the slices it replays read
+  // their own staged chunk. Probing every cluster makes the answer the exact one.
+  create_wide_clustered_join(*this, "sbo", false, false, 512, 6000, 2000);
+  auto const oracle = cpu_top_k(*con, "sbo", 20, 10);
+  REQUIRE(oracle.size() == 200u * 20u);
+  auto const scanned = distance_multiset(
+    *con,
+    "SELECT left_id, distance FROM sirius_knn_join('sbo_probe','vec','sbo_corpus','vec', "
+    "search_mode => 'approx', metric => 'l2', k => 20, clustering => 'sbo_c', cluster_column => "
+    "'cluster_id', n_probes => 512, build_source => 'scan') WHERE left_id % 10 = 0;");
+  CHECK(distance_mismatches(scanned, oracle) == 0);
+}
