@@ -16,6 +16,8 @@
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <nvcomp/version.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1023,7 +1025,18 @@ int main()
                      "delta.differences -> bitpack\n",
                      1,
                      "timestamp_us_delta_bitpack");
+#if NVCOMP_VER_MAJOR >= 6
+      bool cascaded_threw = false;
+      try {
+        roundtrip_once(tu->view(), "input -> nvcomp_cascaded\n", 1, "timestamp_us_cascaded");
+      } catch (std::runtime_error const& e) {
+        cascaded_threw =
+          std::string(e.what()).find("unavailable with nvCOMP 6") != std::string::npos;
+      }
+      expect(cascaded_threw, "nvCOMP 6 Cascaded must report unsupported options");
+#else
       roundtrip_once(tu->view(), "input -> nvcomp_cascaded\n", 1, "timestamp_us_cascaded");
+#endif
     }
 
     test_async_mr_free_safety();
