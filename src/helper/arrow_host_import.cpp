@@ -412,9 +412,8 @@ arrow_host_import_plan inspect_arrow_host_batch(const ArrowArray* array,
     }
     const auto* validity = validity_of(child);
     const auto nulls     = validity ? count_nulls(validity, begin, stop) : 0;
-    if ((child.null_count == 0 && nulls != 0) ||
-        (array->offset == 0 && array->length == child.length && child.null_count >= 0 &&
-         child.null_count != nulls) ||
+    if ((child.null_count >= 0 &&
+         (nulls > child.null_count || child.null_count > nulls + (child.length - array->length))) ||
         ((child_schema.flags & ARROW_FLAG_NULLABLE) == 0 && nulls != 0)) {
       refuse("has validity bits inconsistent with its null metadata/schema");
     }

@@ -435,6 +435,90 @@ TEST_CASE("arrow_host_import: checked plans keep combined slices and actual null
   REQUIRE(values[5] == 7);
 }
 
+TEST_CASE("arrow_host_import: impossible sliced null totals unwind before device work",
+          "[arrow_host_import]")
+{
+  const auto child_offset   = GENERATE(0, 3);
+  const bool below_selected = GENERATE(true, false);
+  CAPTURE(child_offset, below_selected);
+  auto batch   = arrow_batch_from_sql("SELECT i % 2 = 0 AS b, i::INTEGER AS v FROM range(8) t(i)");
+  auto& child  = *batch->array.children[1];
+  auto& schema = *batch->schema.children[1];
+  scoped_restore child_guard(child);
+  scoped_restore schema_guard(schema);
+  const std::uint8_t validity = (below_selected ? 0b1001 : 0b1111) << child_offset;
+  const void* buffers[]       = {&validity, child.buffers[1]};
+  child.buffers               = buffers;
+  child.offset                = child_offset;
+  child.length                = 4;
+  child.null_count            = below_selected ? 1 : 4;
+  schema.flags |= ARROW_FLAG_NULLABLE;
+  batch->array.offset = 1;
+  batch->array.length = 2;
+  bounded_host_resource host(std::numeric_limits<std::size_t>::max());
+  import_test_resource observed(-2);
+  const auto attempt = [&] {
+    auto plan = sirius::inspect_arrow_host_batch(
+      &batch->array,
+      &batch->schema,
+      "slice",
+      {"b", "v"},
+      declared({duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::INTEGER}),
+      host);
+    return sirius::import_arrow_host_table(
+      plan, cudf::get_default_stream(), rmm::device_async_resource_ref{observed});
+  };
+  REQUIRE_THROWS_WITH(attempt(), ContainsSubstring("inconsistent with its null metadata"));
+  REQUIRE(host.peak > 0);
+  REQUIRE(host.used == 0);
+  REQUIRE(observed.counts->attempts == 0);
+  REQUIRE(observed.counts->live_bytes == 0);
+  REQUIRE(batch->array.release != nullptr);
+  REQUIRE(batch->schema.release != nullptr);
+}
+
+TEST_CASE("arrow_host_import: sliced null totals allow outside distributions and unknown counts",
+          "[arrow_host_import]")
+{
+  const auto child_offset          = GENERATE(0, 3);
+  const unsigned selected_validity = GENERATE(0u, 1u, 3u);
+  const auto outside_nulls         = GENERATE(0, 1, 2);
+  const bool unknown               = GENERATE(false, true);
+  CAPTURE(child_offset, selected_validity, outside_nulls, unknown);
+  auto batch   = arrow_batch_from_sql("SELECT i::INTEGER AS v FROM range(8) t(i)");
+  auto& child  = *batch->array.children[0];
+  auto& schema = *batch->schema.children[0];
+  scoped_restore child_guard(child);
+  scoped_restore schema_guard(schema);
+  const auto selected_nulls = 2 - (selected_validity & 1) - ((selected_validity >> 1) & 1);
+  const std::uint8_t validity =
+    ((selected_validity << 1) | (outside_nulls == 0 ? 1u : 0u) | (outside_nulls < 2 ? 8u : 0u))
+    << child_offset;
+  const void* buffers[] = {&validity, child.buffers[1]};
+  child.buffers         = buffers;
+  child.offset          = child_offset;
+  child.length          = 4;
+  child.null_count      = unknown ? -1 : static_cast<std::int64_t>(selected_nulls + outside_nulls);
+  schema.flags |= ARROW_FLAG_NULLABLE;
+  batch->array.offset = 1;
+  batch->array.length = 2;
+  auto table          = import(*batch, {"v"}, declared({duckdb::LogicalType::INTEGER}));
+  const auto& column  = table->get_column(0);
+  REQUIRE(table->num_rows() == 2);
+  REQUIRE(column.type().id() == cudf::type_id::INT32);
+  REQUIRE(column.null_count() == selected_nulls);
+  cudf::bitmask_type mask = 0;
+  if (selected_nulls != 0) {
+    REQUIRE(cudaMemcpy(&mask, column.view().null_mask(), sizeof(mask), cudaMemcpyDeviceToHost) ==
+            cudaSuccess);
+    REQUIRE((mask & 3u) == selected_validity);
+  }
+  const auto values = copy_column_to_host<std::int32_t>(column.view());
+  for (int row = 0; row < 2; ++row) {
+    if ((selected_validity >> row) & 1) { REQUIRE(values[row] == child_offset + 1 + row); }
+  }
+}
+
 TEST_CASE("arrow_host_import: string windows are checked before copy", "[arrow_host_import]")
 {
   auto batch         = arrow_batch_from_sql("SELECT 'value' || i AS a FROM range(4) t(i)");
