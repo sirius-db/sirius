@@ -303,6 +303,7 @@ TEST_CASE("Preparation input disposal is outside the gate on every terminal path
     cancelled_unit,
     parked_result,
     queued_batch,
+    dropped_before_enqueue,
     invalid_flush
   };
   auto mode = GENERATE(path::finished,
@@ -311,6 +312,7 @@ TEST_CASE("Preparation input disposal is outside the gate on every terminal path
                        path::cancelled_unit,
                        path::parked_result,
                        path::queued_batch,
+                       path::dropped_before_enqueue,
                        path::invalid_flush);
   CAPTURE(static_cast<int>(mode));
   fixture f(1, 1);
@@ -343,7 +345,7 @@ TEST_CASE("Preparation input disposal is outside the gate on every terminal path
     };
   }
   std::shared_ptr<preparation_unit> unit;
-  if (mode == path::ready_unit) {
+  if (mode == path::ready_unit || mode == path::dropped_before_enqueue) {
     required_input_set required;
     required.set(static_cast<size_t>(required_input::segments));
     required.set(static_cast<size_t>(required_input::checkpoint_iteration));
@@ -366,13 +368,17 @@ TEST_CASE("Preparation input disposal is outside the gate on every terminal path
            out,
            single_job(
              [&, seen]() -> std::unique_ptr<sirius::op::scan::scan_info> {
-               if (mode == path::ready_unit) return std::make_unique<tagged>(1);
+               if (mode == path::ready_unit || mode == path::dropped_before_enqueue)
+                 return std::make_unique<tagged>(1);
                auto input = std::make_unique<cleanup_tagged>(seen);
                if (mode == path::late_worker) worker->wait();
                return input;
              },
              unit));
-  if (mode == path::ready_unit) unit.reset();
+  if (mode == path::ready_unit || mode == path::dropped_before_enqueue) unit.reset();
+  if (mode == path::dropped_before_enqueue)
+    f.coordinator.before_submission_for_testing(
+      [&] { f.coordinator.request_stop(stop_reason::normal_eos); });
   auto cleanup = f.shutdown_guard();
   f.start();
   if (mode == path::late_worker) {

@@ -619,7 +619,7 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
   auto work = source->hooks.claim();
   if (work) {
     // Workers cannot see this slot until enqueue; source registration is already frozen.
-    slots[index].unit = work->unit;
+    slots[index].unit = std::move(work->unit);
     ticket->work      = std::move(work->work);
     if (before_submit) before_submit();
     {
