@@ -88,7 +88,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   const std::optional<std::vector<std::size_t>>& selected_indices,
   decompression_pushdown_scan const* scan,
   decode_visibility_mask const& keep_mask,
-  cucascade::idata_representation& source,
+  const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream)
 {
@@ -156,7 +156,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
 
 // compressed_host_representation (pinned host) → GPU.
 std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
-  cucascade::idata_representation& source,
+  const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
@@ -186,7 +186,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
 // The compressed_table is already cached on device; decompress directly with no
 // re-fetch. When a column projection is set, only the selected columns are decoded.
 std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
-  cucascade::idata_representation& source,
+  const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
