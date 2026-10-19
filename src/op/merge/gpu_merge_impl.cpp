@@ -24,7 +24,9 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/groupby.hpp>
 #include <cudf/merge.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 

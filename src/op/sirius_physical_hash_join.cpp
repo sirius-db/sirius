@@ -540,8 +540,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     }
     auto const& left_ref  = condition.left->get<sirius::ast::reference>();
     auto const& right_ref = condition.right->get<sirius::ast::reference>();
-    auto const type       = sirius::get_cudf_type(left_ref.return_type());
-    if (type != sirius::get_cudf_type(right_ref.return_type())) {
+    auto const type       = sirius::require_cudf_type(left_ref.return_type());
+    if (type != sirius::require_cudf_type(right_ref.return_type())) {
       throw duckdb::NotImplementedException("Join key operands must have matching physical types");
     }
     bool const hash_key = is_hash_equality_key(condition.comparison, route_null_safe);
