@@ -16,7 +16,7 @@
 
 // sirius
 #include <expression/ast/node.hpp>
-#include <expression_evaluator/ast_supported_types.hpp>
+#include <expression_evaluator/checked_cast.hpp>
 #include <expression_evaluator/date_cast.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
@@ -28,9 +28,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/unary.hpp>
-
-// standard library
-#include <algorithm>
+#include <cudf/utilities/traits.hpp>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
@@ -51,21 +49,29 @@ cudf::ast::ast_operator cast_op_to_ast(sirius::type_id id)
   }
 }
 
+/// Numeric casts to integer and DECIMAL types, which cudf::cast truncates and wraps where DuckDB
+/// rounds and range-checks.
+bool needs_checked_cast(cudf::data_type source, cudf::data_type target)
+{
+  auto const integer_or_decimal = [](cudf::data_type t) {
+    return cudf::is_integral_not_bool(t) || cudf::is_fixed_point(t);
+  };
+  return (integer_or_decimal(source) || cudf::is_floating_point(source)) &&
+         integer_or_decimal(target);
+}
+
 }  // namespace
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, evaluation_mode mode)
 {
-  auto const ast_supported =
-    std::find(supported_ast_cast_types_native.begin(),
-              supported_ast_cast_types_native.end(),
-              alt.target_type.id()) != supported_ast_cast_types_native.end();
+  auto const ast_supported = alt.lowers_to_cudf_ast();
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
   // Carrier restores must reach the materialized branch, the only path authorized to use the
-  // physical representation tunnel. Semantic casts may use the cuDF AST path.
-  if (ast_supported && alt.kind == sirius::ast::cast_kind::semantic &&
-      _policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
+  // physical representation tunnel. Semantic casts that cannot round or overflow may use the cuDF
+  // AST path.
+  if (ast_supported && _policy.strategy != expression_evaluator_strategy::MATERIALIZE &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto child            = evaluate(*alt.child, evaluation_mode::AST);
     auto const& cast_expr = _ast_tree.emplace<cudf::ast::operation>(
@@ -106,6 +112,18 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
              return_type.id() == cudf::type_id::TIMESTAMP_MICROSECONDS) {
     // Carrier restores were handled above; only semantic casts reach this branch.
     result_column = temporal::cast_to_microseconds_checked(input, _stream, _mr);
+  } else if (alt.kind == sirius::ast::cast_kind::semantic &&
+             needs_checked_cast(input.type(), return_type)) {
+    // HUGEINT and UHUGEINT run as INT64 and UINT64, so a value outside them may still be valid in
+    // DuckDB: throw so the query replays on the CPU, even for TRY_CAST.
+    auto const wide_target = alt.target_type.id() == sirius::type_id::HUGEINT ||
+                             alt.target_type.id() == sirius::type_id::UHUGEINT;
+    result_column = checked_cast(input,
+                                 return_type,
+                                 alt.target_type.decimal_precision(),
+                                 alt.try_cast && !wide_target,
+                                 _stream,
+                                 _mr);
   } else {
     result_column = cudf::cast(input, return_type, _stream, _mr);
   }
