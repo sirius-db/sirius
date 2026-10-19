@@ -48,6 +48,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -426,6 +427,39 @@ TEST_CASE("request_free_memory respects byte target via predicate", "[downgrade_
   }
   REQUIRE(host_count >= 1);
 
+  executor.stop();
+}
+
+TEST_CASE("a downgrade that frees bytes wakes a task waiting for a reservation",
+          "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto batch     = make_gpu_batch(*gpu_space, 100000);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+  size_t const batch_size = get_batch_size(*batch);
+
+  // The rest is reserved and stays so: only the spill can make room for the waiting task.
+  auto filler = gpu_space->make_reservation_upto(gpu_space->get_max_memory());
+  auto waiter = std::async(std::launch::async,
+                           [&] { return gpu_space->make_reservation(batch_size) != nullptr; });
+  REQUIRE(waiter.wait_for(200ms) == std::future_status::timeout);
+
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+  REQUIRE(executor.request_free_memory_and_wait(batch_size) >= batch_size);
+  auto const woke = waiter.wait_for(5s) == std::future_status::ready;
+  filler.reset();  // lets a waiter that never woke finish
+  REQUIRE(woke);
+  REQUIRE(waiter.get());
   executor.stop();
 }
 

@@ -36,6 +36,18 @@
 namespace sirius {
 namespace parallel {
 
+/// Wakes a task waiting in @p space's make_reservation(): a spill freed bytes there. Freeing a
+/// batch's memory posts nothing to the space's waiters, only a released reservation does, so
+/// release an empty one.
+static void wake_reservation_waiters(cucascade::memory::memory_space* space) noexcept
+{
+  if (space == nullptr) { return; }
+  try {
+    static_cast<void>(space->make_reservation_upto(0));
+  } catch (...) {
+  }
+}
+
 static std::string tier_to_string(cucascade::memory::Tier tier)
 {
   switch (tier) {
@@ -349,6 +361,7 @@ void downgrade_executor::processing_loop()
              &host_target_stats,
              &disk_target_stats,
              &skips,
+             source_space,
              predicate_satisfied]() mutable {
               absl::Cleanup rollback = [&planned_bytes, candidate_bytes]() {
                 planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
@@ -363,6 +376,7 @@ void downgrade_executor::processing_loop()
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                   repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
                   repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  wake_reservation_waiters(source_space);
                   for (size_t i = 0; i < result->size(); ++i) {
                     if ((*result)[i] == 0) continue;
                     if (i < host_end_idx) {
@@ -432,6 +446,7 @@ void downgrade_executor::processing_loop()
            &pipeline_queue_stats,
            &host_target_stats,
            &disk_target_stats,
+           source_space,
            predicate_satisfied]() mutable {
             absl::Cleanup rollback = [&]() {
               planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
@@ -448,6 +463,7 @@ void downgrade_executor::processing_loop()
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                 pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
                 pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                wake_reservation_waiters(source_space);
                 for (size_t i = 0; i < result->size(); ++i) {
                   if ((*result)[i] == 0) continue;
                   if (i < host_end_idx) {
