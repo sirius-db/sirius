@@ -2,6 +2,7 @@ target_sources(
   sirius_objects
   PRIVATE expression_evaluator_strategy.cpp
           ast_op_counter.cpp
+          checked_cast.cpp
           expression_evaluator.cpp
           gpu_expression_translator.cpp
           regex/regex_playground.cpp
