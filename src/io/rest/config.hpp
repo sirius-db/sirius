@@ -29,6 +29,17 @@ namespace sirius::io::rest {
 /// Connection-cache retention policy; active-transfer limits are unchanged.
 enum class redirect_retention { legacy, expanded };
 
+/// Whether a storage node's admitted Location may be reused for later ranged
+/// GETs of the same open instead of asking the gateway again for each one.
+enum class redirect_route_reuse {
+  /// Every physical GET starts at the gateway; delegation depends on its response.
+  off,
+  /// Reuse only this open's validated GET route within its policy context.
+  /// Requires a qualified same-object, cross-range replay contract.
+  /// Refusal may re-resolve once within the operation's retry budget.
+  same_open,
+};
+
 /// Scoped delegation of HTTP 307 to a storage node, off by default.
 ///
 /// Some S3-compatible front ends (AIStore) answer an object GET / HEAD at
@@ -51,6 +62,7 @@ struct cluster_redirect_config {
   /// `host[:port]` authorities a Location may name (exact, host case-insensitive).
   std::vector<std::string> allowed_targets;
   redirect_retention retention{redirect_retention::expanded};
+  redirect_route_reuse route_reuse{redirect_route_reuse::off};
 };
 
 struct config {

@@ -476,6 +476,22 @@ char const* retention_name(config const& cfg) noexcept
   return cfg.cluster_redirect.retention == redirect_retention::expanded ? "expanded" : "legacy";
 }
 
+bool route_reuse_enabled(config const& cfg) noexcept
+{
+  return cfg.cluster_redirect.enabled &&
+         cfg.cluster_redirect.route_reuse == redirect_route_reuse::same_open;
+}
+
+/// Longest Location stored as an open's route; longer ones are used once and
+/// not kept.
+constexpr std::size_t k_max_route_bytes = 2048;
+
+char const* route_kind(rest_io_op_request const& request) noexcept
+{
+  if (request.route_cached) { return "cached"; }
+  return request.delegated_url.empty() ? "origin" : "fresh";
+}
+
 /// Successful new connections reported for the current completed transfer.
 /// A response-bearing failure can have a known count; no-response errors and
 /// unavailable counters are unknown rather than evidence of reuse.
@@ -1086,6 +1102,37 @@ bool rest_reactor::delegate_redirect(object_ref const& obj,
   return false;
 }
 
+bool rest_reactor::cached_route_refused(CURLcode rc, long status) noexcept
+{
+  if (rc == CURLE_OUT_OF_MEMORY || rc == CURLE_ABORTED_BY_CALLBACK) { return false; }
+  if (rc == CURLE_OK || status != 0) {
+    return status == 307 || status == 401 || status == 403 || status == 404 || status == 503;
+  }
+  return rc == CURLE_COULDNT_CONNECT || rc == CURLE_COULDNT_RESOLVE_HOST;
+}
+
+bool rest_reactor::seed_route(io_object const& obj, std::string_view route) noexcept
+{
+  if (!route_reuse_enabled(_config) || route.empty() || route.size() > k_max_route_bytes ||
+      conditional_tag(&obj).empty()) {
+    return false;
+  }
+  auto const* rest_obj = dynamic_cast<rest_io_object const*>(&obj);
+  if (rest_obj == nullptr) { return false; }
+  try {
+    if (!rest_obj->seed_route(std::make_shared<const std::string>(route),
+                              std::weak_ptr<const void>(_ctx))) {
+      return false;
+    }
+  } catch (...) {
+    return false;
+  }
+  _route_seeds.fetch_add(1, std::memory_order_relaxed);
+  log::log_noexcept(
+    [&] { SIRIUS_LOG_DEBUG("rest_reactor: stored storage-node route for {}", obj.object_path()); });
+  return true;
+}
+
 head_object_result rest_reactor::head_object(std::string_view bucket, std::string_view key)
 {
   object_ref const obj{std::string(bucket), std::string(key)};
@@ -1361,6 +1408,10 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
         probe.window_lo   = *start;
         probe.bytes       = make_shared_byte_span(std::move(sink.data));
         probe.etag        = std::move(sink.etag);
+        if (route_reuse_enabled(_config) && delegated_url.size() <= k_max_route_bytes &&
+            rest_io_object::is_strong_tag(probe.etag)) {
+          probe.delegated_route = std::move(delegated_url);
+        }
       }
       return probe;
     } else if (status == 200 || status == 416) {
@@ -1727,7 +1778,11 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       try {
         auto& attempt    = is_auth ? req->auth_attempt : req->attempt;
         auto const limit = is_auth ? _config.max_auth_retry_attempts : _config.max_retry_attempts;
-        if (attempt + 1 >= limit) {
+        // Cache-started requests share a total budget in addition to the auth ceiling.
+        bool const shared_exhausted =
+          req->route_started_cached &&
+          req->attempt + req->auth_attempt + 1 >= _config.max_retry_attempts;
+        if (attempt + 1 >= limit || shared_exhausted) {
           req->op->finish_error(std::make_exception_ptr(std::runtime_error(
             "rest_reactor: exhausted retries for " + req->object.bucket + "/" + req->object.key)));
           return;
@@ -1850,6 +1905,15 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
           request->needs_staging = slice.needs_staging();
           request->logical_bytes = intersect(slice.rng, io_rng).size;
           logical_bytes += request->logical_bytes;
+          if (route_reuse_enabled(_config) && !conditional_tag(file).empty()) {
+            if (auto route = file->route(_ctx)) {
+              request->delegated_url        = *route;
+              request->route_snapshot       = std::move(route);
+              request->route_cached         = true;
+              request->route_started_cached = true;
+              _route_hits.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
           request->op = std::move(op);
           expanded.push_back(std::move(request));
         }
@@ -2024,12 +2088,35 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
                      request.attempt + request.auth_attempt,
                      !request.delegated_url.empty(),
                      slot.started,
-                     request.delegated_url.empty() ? "origin" : "fresh",
+                     route_kind(request),
                      transfer_connects(slot.easy.get(), curl_status, http_status));
       }
       bool const full_object =
         io_rng.offset == 0 && op.obj != nullptr && io_rng.size == op.obj->size();
       bool const range_status = http_status == 206 || (http_status == 200 && full_object);
+
+      // Invalidate the used hint before spending one unit on origin re-resolution.
+      if (request.route_cached && cached_route_refused(curl_status, http_status)) {
+        request.route_cached = false;
+        if (op.obj != nullptr && request.route_snapshot != nullptr) {
+          if (auto const* rest_obj = dynamic_cast<rest_io_object const*>(op.obj.get())) {
+            rest_obj->drop_route(request.route_snapshot);
+          }
+        }
+        request.route_snapshot.reset();
+        if (request.route_refreshed || request.attempt + 1 >= _config.max_retry_attempts) {
+          op.finish_error(std::make_exception_ptr(
+            std::runtime_error("rest_reactor: exhausted retries for " + request.object.bucket +
+                               "/" + request.object.key)));
+          return false;
+        }
+        ++request.attempt;
+        request.route_refreshed = true;
+        request.delegated_url.clear();
+        _route_refreshes.fetch_add(1, std::memory_order_relaxed);
+        ready.push_front(std::move(slot.req));
+        return false;
+      }
 
       // Final redirect/refusal outcomes precede transport retry; informational
       // responses do not.  (A truncated error body — CURLE_PARTIAL_FILE — must
@@ -2102,6 +2189,9 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         }
       }
       if (curl_status == CURLE_OK && range_status && complete_body) {
+        if (!request.delegated_url.empty() && !request.route_cached && op.obj != nullptr) {
+          seed_route(*op.obj, request.delegated_url);
+        }
         if (!request.is_device()) {
           op.finish_success();
           return false;
@@ -2228,7 +2318,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
                          slot.req->attempt + slot.req->auth_attempt,
                          !slot.req->delegated_url.empty(),
                          slot.started,
-                         slot.req->delegated_url.empty() ? "origin" : "fresh",
+                         route_kind(*slot.req),
                          "-");
           } catch (...) {  // the record is best effort inside the noexcept drain
           }

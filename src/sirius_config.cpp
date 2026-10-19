@@ -242,6 +242,18 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
                                  retention + "' (expected expanded or legacy)");
       }
     }
+    std::string route_reuse;
+    cr.optional("route_reuse", route_reuse);
+    if (!route_reuse.empty()) {
+      if (route_reuse == "off") {
+        opt.cluster_redirect.route_reuse = io::rest::redirect_route_reuse::off;
+      } else if (route_reuse == "same_open") {
+        opt.cluster_redirect.route_reuse = io::rest::redirect_route_reuse::same_open;
+      } else {
+        throw std::runtime_error("'rest.cluster_redirect.route_reuse': invalid enum value '" +
+                                 route_reuse + "' (expected off or same_open)");
+      }
+    }
     cr.reject_unknown();
     if (opt.cluster_redirect.enabled &&
         (opt.cluster_redirect.origin.empty() || opt.cluster_redirect.allowed_targets.empty())) {

@@ -103,6 +103,11 @@ struct rest_io_op_request {
   /// lives on the request, not the connection slot, so a retry after the hop
   /// goes back to the target and a second 307 is refused.
   std::string delegated_url;
+  /// Cached-attempt provenance and operation-wide refresh/budget state.
+  bool route_cached{false};
+  bool route_started_cached{false};
+  bool route_refreshed{false};
+  std::shared_ptr<const std::string> route_snapshot;
 
   [[nodiscard]] bool is_device() const noexcept
   {
