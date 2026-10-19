@@ -218,14 +218,14 @@ inline std::size_t estimate_referenced_column_bytes(
     case type_id::INTEGER: return cudf::data_type(cudf::type_id::INT32);
     case type_id::BIGINT: return cudf::data_type(cudf::type_id::INT64);
     case type_id::HUGEINT:
-      // cuDF has no INT128 carrier. Using INT64 can lose values outside its range.
+      // FIXME: Unsafe 128-to-64-bit narrowing can corrupt values outside the INT64 range.
       return cudf::data_type(cudf::type_id::INT64);
     case type_id::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
     case type_id::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
     case type_id::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);
     case type_id::UBIGINT: return cudf::data_type(cudf::type_id::UINT64);
     case type_id::UHUGEINT:
-      // cuDF has no UINT128 carrier. Using UINT64 can lose values outside its range.
+      // FIXME: Unsafe 128-to-64-bit narrowing can corrupt values outside the UINT64 range.
       return cudf::data_type(cudf::type_id::UINT64);
     case type_id::FLOAT: return cudf::data_type(cudf::type_id::FLOAT32);
     case type_id::DOUBLE: return cudf::data_type(cudf::type_id::FLOAT64);
@@ -272,8 +272,8 @@ inline std::size_t estimate_referenced_column_bytes(
 /**
  * @brief Convert a non-null DuckDB value to a cuDF scalar.
  *
- * The value must have type @p t. Mapped types without a scalar conversion return STRING using
- * `val.ToString()`; unmappable types throw `InvalidInputException`.
+ * The value must have type @p t. DECIMAL128 and nested types return STRING using `val.ToString()`;
+ * unmappable types throw `InvalidInputException`.
  */
 [[nodiscard]] inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& val,
                                                                         logical_type const& t,
