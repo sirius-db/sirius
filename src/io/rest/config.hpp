@@ -26,6 +26,9 @@
 
 namespace sirius::io::rest {
 
+/// Connection-cache retention policy; active-transfer limits are unchanged.
+enum class redirect_retention { legacy, expanded };
+
 /// Scoped delegation of HTTP 307 to a storage node, off by default.
 ///
 /// Some S3-compatible front ends (AIStore) answer an object GET / HEAD at
@@ -47,6 +50,7 @@ struct cluster_redirect_config {
   std::string origin;
   /// `host[:port]` authorities a Location may name (exact, host case-insensitive).
   std::vector<std::string> allowed_targets;
+  redirect_retention retention{redirect_retention::expanded};
 };
 
 struct config {
@@ -169,7 +173,8 @@ struct config {
   cluster_redirect_config cluster_redirect;
 
   /// Opt-in measurement records for REST attempts and redirect decisions.
-  /// Only sanitized authority, structural range and fixed outcome/attempt/timing fields are allowed.
+  /// Only sanitized authority, structural range and fixed outcome/attempt/timing fields are
+  /// allowed.
   bool request_log{false};
 };
 

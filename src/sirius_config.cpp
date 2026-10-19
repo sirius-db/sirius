@@ -230,6 +230,18 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
     cr.optional("enabled", opt.cluster_redirect.enabled);
     cr.optional("origin", opt.cluster_redirect.origin);
     cr.optional("allowed_targets", opt.cluster_redirect.allowed_targets);
+    std::string retention;
+    cr.optional("retention", retention);
+    if (!retention.empty()) {
+      if (retention == "expanded") {
+        opt.cluster_redirect.retention = io::rest::redirect_retention::expanded;
+      } else if (retention == "legacy") {
+        opt.cluster_redirect.retention = io::rest::redirect_retention::legacy;
+      } else {
+        throw std::runtime_error("'rest.cluster_redirect.retention': invalid enum value '" +
+                                 retention + "' (expected expanded or legacy)");
+      }
+    }
     cr.reject_unknown();
     if (opt.cluster_redirect.enabled &&
         (opt.cluster_redirect.origin.empty() || opt.cluster_redirect.allowed_targets.empty())) {

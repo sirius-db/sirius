@@ -194,9 +194,7 @@ long status_line_code(std::string_view line) noexcept
 /// whose name begins with "HTTP/" is never taken for a status line.
 enum class header_line { status, field, terminator, trailer };
 
-header_line next_header_line(std::string_view line,
-                             header_phase& phase,
-                             long block_status) noexcept
+header_line next_header_line(std::string_view line, header_phase& phase, long block_status) noexcept
 {
   if (phase == header_phase::response_start) {
     phase = header_phase::response_fields;
@@ -459,6 +457,38 @@ std::string_view log_authority(std::string_view url) noexcept
   return authority;
 }
 
+/// Retention budget shared by the worker's origin and target connections.
+/// This does not cap active transfers or reserve capacity per authority.
+std::size_t connection_retention(config const& cfg) noexcept
+{
+  auto const base    = cfg.max_connections;
+  auto const& policy = cfg.cluster_redirect;
+  if (!policy.enabled || policy.retention == redirect_retention::legacy) { return base; }
+  constexpr std::size_t cap = 4096;
+  if (base >= cap) { return base; }
+  auto const authorities = policy.allowed_targets.size() + 1;
+  if (base > cap / authorities) { return cap; }
+  return base * authorities;
+}
+
+char const* retention_name(config const& cfg) noexcept
+{
+  return cfg.cluster_redirect.retention == redirect_retention::expanded ? "expanded" : "legacy";
+}
+
+/// Successful new connections reported for the current completed transfer.
+/// A response-bearing failure can have a known count; no-response errors and
+/// unavailable counters are unknown rather than evidence of reuse.
+std::string transfer_connects(CURL* handle, CURLcode rc, long status)
+{
+  if (handle == nullptr || (rc != CURLE_OK && status == 0)) { return "-"; }
+  long connects = 0;
+  if (curl_easy_getinfo(handle, CURLINFO_NUM_CONNECTS, &connects) != CURLE_OK || connects < 0) {
+    return "-";
+  }
+  return std::to_string(connects);
+}
+
 /// Terminal transfer observation; structural Range is request-generated, not a response header.
 void log_transfer(std::string_view method,
                   std::string_view url,
@@ -468,14 +498,16 @@ void log_transfer(std::string_view method,
                   std::size_t bytes,
                   std::size_t attempt,
                   bool delegated,
-                  std::chrono::steady_clock::time_point started)
+                  std::chrono::steady_clock::time_point started,
+                  std::string_view route,
+                  std::string_view connects)
 {
-  auto const elapsed_ms =
-    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started)
-      .count();
+  auto const elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started)
+                            .count();
   SIRIUS_LOG_INFO(
     "rest_reactor: transfer method={} authority={} range={} status={} curl={} bytes={} attempt={} "
-    "delegated={} elapsed_ms={}",
+    "delegated={} elapsed_ms={} route={} connects={}",
     method,
     log_authority(url),
     range.empty() ? std::string_view{"-"} : range,
@@ -484,7 +516,9 @@ void log_transfer(std::string_view method,
     bytes,
     attempt,
     delegated,
-    elapsed_ms);
+    elapsed_ms,
+    route,
+    connects);
 }
 
 char const* curl_outcome(CURLcode rc) noexcept
@@ -883,6 +917,12 @@ rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_vie
     throw std::invalid_argument("rest_reactor: max_connections must be > 0");
   }
   if (_config.max_retry_attempts == 0) { _config.max_retry_attempts = 1; }
+  if (_config.request_log && _config.cluster_redirect.enabled) {
+    SIRIUS_LOG_INFO("rest_reactor: redirect retention mode={} maxconnects={} host_connections={}",
+                    retention_name(_config),
+                    connection_retention(_config),
+                    _config.max_connections);
+  }
 
   // Touch the process-wide curl context so global init + the shared cache are
   // ready before any handle is created — including the blocking HEAD that
@@ -1025,9 +1065,10 @@ bool rest_reactor::delegate_redirect(object_ref const& obj,
     _redirects_followed.fetch_add(1, std::memory_order_relaxed);
     // The Location may carry the gateway's own authorization in its path or
     // query; only the (allow-listed) authority is fit for a log line.
-    auto const target = split_authority(location);
+    auto const target    = split_authority(location);
     auto const authority = target ? target->authority : std::string_view{};
-    SIRIUS_LOG_DEBUG("rest_reactor: delegating {}/{} to storage node {}", obj.bucket, obj.key, authority);
+    SIRIUS_LOG_DEBUG(
+      "rest_reactor: delegating {}/{} to storage node {}", obj.bucket, obj.key, authority);
     if (_config.request_log) {
       SIRIUS_LOG_INFO("rest_reactor: redirect decision=follow reason=- authority={}",
                       log_authority(location));
@@ -1035,11 +1076,8 @@ bool rest_reactor::delegate_redirect(object_ref const& obj,
     return true;
   }
   _redirects_refused.fetch_add(1, std::memory_order_relaxed);
-  SIRIUS_LOG_WARN("rest_reactor: refusing HTTP {} for {}/{}: {}",
-                  status,
-                  obj.bucket,
-                  obj.key,
-                  decision.reason);
+  SIRIUS_LOG_WARN(
+    "rest_reactor: refusing HTTP {} for {}/{}: {}", status, obj.bucket, obj.key, decision.reason);
   if (_config.request_log) {
     SIRIUS_LOG_INFO("rest_reactor: redirect decision=refuse reason=\"{}\" authority=-",
                     decision.reason);
@@ -1061,8 +1099,8 @@ head_object_result rest_reactor::head_object(std::string_view bucket, std::strin
     std::string url;
     std::vector<std::pair<std::string, std::string>> auth_headers;
     if (delegated_url.empty()) {
-      auto authd = _ctx->authorizer()->authorize(obj, request_method::HEAD, presign_ttl(_config));
-      url        = std::move(authd.url);
+      auto authd   = _ctx->authorizer()->authorize(obj, request_method::HEAD, presign_ttl(_config));
+      url          = std::move(authd.url);
       auth_headers = std::move(authd.headers);
     } else {
       url = delegated_url;
@@ -1088,8 +1126,17 @@ head_object_result rest_reactor::head_object(std::string_view bucket, std::strin
     long status        = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
     if (_config.request_log) {
-      log_transfer(
-        "HEAD", url, {}, curl_outcome(rc), status, 0, attempt, !delegated_url.empty(), started);
+      log_transfer("HEAD",
+                   url,
+                   {},
+                   curl_outcome(rc),
+                   status,
+                   0,
+                   attempt,
+                   !delegated_url.empty(),
+                   started,
+                   delegated_url.empty() ? "origin" : "fresh",
+                   transfer_connects(h.get(), rc, status));
     }
 
     if (rc == CURLE_OK && status == 200) {
@@ -1179,8 +1226,17 @@ std::string rest_reactor::list_page(std::string_view bucket,
     long status        = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
     if (_config.request_log) {
-      log_transfer(
-        "LIST", authd.url, {}, curl_outcome(rc), status, body.size(), attempt, false, started);
+      log_transfer("LIST",
+                   authd.url,
+                   {},
+                   curl_outcome(rc),
+                   status,
+                   body.size(),
+                   attempt,
+                   false,
+                   started,
+                   "origin",
+                   transfer_connects(h.get(), rc, status));
     }
 
     if (rc == CURLE_OK && status == 200) { return body; }
@@ -1226,8 +1282,8 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
     std::string url;
     std::vector<std::pair<std::string, std::string>> auth_headers;
     if (delegated_url.empty()) {
-      auto authd = _ctx->authorizer()->authorize(obj, request_method::GET, presign_ttl(_config));
-      url        = std::move(authd.url);
+      auto authd   = _ctx->authorizer()->authorize(obj, request_method::GET, presign_ttl(_config));
+      url          = std::move(authd.url);
       auth_headers = std::move(authd.headers);
     } else {
       url = delegated_url;
@@ -1265,7 +1321,9 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
                    sink.total_received,
                    attempt,
                    !delegated_url.empty(),
-                   started);
+                   started,
+                   delegated_url.empty() ? "origin" : "fresh",
+                   transfer_connects(h.get(), rc, status));
     }
 
     // Final outcomes first, as in head_object.  suffix_write_cb aborts any
@@ -1277,8 +1335,8 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
         delegated_url = std::move(sink.location);
         continue;
       }
-      throw std::runtime_error("rest_reactor::fetch_footer_suffix: HTTP 307 (" + reason +
-                               ") for " + obj.bucket + "/" + obj.key);
+      throw std::runtime_error("rest_reactor::fetch_footer_suffix: HTTP 307 (" + reason + ") for " +
+                               obj.bucket + "/" + obj.key);
     }
     if (status >= 200 && status != 206 && status != 200 && status != 416 &&
         !is_retriable_status(status)) {
@@ -1501,7 +1559,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     SIRIUS_CURLM_CHECK(curl_multi_setopt(
       multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS, static_cast<long>(_config.max_connections)));
     SIRIUS_CURLM_CHECK(curl_multi_setopt(
-      multi.get(), CURLMOPT_MAXCONNECTS, static_cast<long>(_config.max_connections)));
+      multi.get(), CURLMOPT_MAXCONNECTS, static_cast<long>(connection_retention(_config))));
 
     auto epoll_add = [&](int fd, std::uint32_t events) {
       epoll_event event{};
@@ -1965,7 +2023,9 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
                      slot.sink.total_received,
                      request.attempt + request.auth_attempt,
                      !request.delegated_url.empty(),
-                     slot.started);
+                     slot.started,
+                     request.delegated_url.empty() ? "origin" : "fresh",
+                     transfer_connects(slot.easy.get(), curl_status, http_status));
       }
       bool const full_object =
         io_rng.offset == 0 && op.obj != nullptr && io_rng.size == op.obj->size();
@@ -1991,14 +2051,14 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
             ready.push_front(std::move(slot.req));
             return false;
           }
-          op.finish_error(std::make_exception_ptr(std::runtime_error(
-            "rest_reactor: HTTP 307 (" + reason + ") for " + request.object.bucket + "/" +
-            request.object.key)));
+          op.finish_error(std::make_exception_ptr(
+            std::runtime_error("rest_reactor: HTTP 307 (" + reason + ") for " +
+                               request.object.bucket + "/" + request.object.key)));
           return false;
         }
-        op.finish_error(std::make_exception_ptr(std::runtime_error(
-          "rest_reactor: HTTP " + std::to_string(http_status) + " for " + request.object.bucket +
-          "/" + request.object.key)));
+        op.finish_error(std::make_exception_ptr(
+          std::runtime_error("rest_reactor: HTTP " + std::to_string(http_status) + " for " +
+                             request.object.bucket + "/" + request.object.key)));
         return false;
       }
       if ((http_status == 401 || http_status == 403) && !request.delegated_url.empty()) {
@@ -2167,7 +2227,9 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
                          slot.sink.total_received,
                          slot.req->attempt + slot.req->auth_attempt,
                          !slot.req->delegated_url.empty(),
-                         slot.started);
+                         slot.started,
+                         slot.req->delegated_url.empty() ? "origin" : "fresh",
+                         "-");
           } catch (...) {  // the record is best effort inside the noexcept drain
           }
         }

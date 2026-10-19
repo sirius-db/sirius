@@ -4515,6 +4515,7 @@ struct transfer_record {
   std::size_t bytes, attempt;
   bool delegated;
   std::int64_t elapsed_ms;
+  std::string route, connects;
 };
 
 struct decision_record {
@@ -4536,7 +4537,18 @@ std::vector<transfer_record> transfers(request_log_capture const& capture)
   for (auto const& entry : capture.sink->entries()) {
     if (!entry.message.starts_with(transfer_prefix)) { continue; }
     require_record_privacy(entry);
-    auto fields = record_fields(entry.message, transfer_prefix, keys);
+    std::string_view core = entry.message;
+    std::string route, connects;
+    if (auto const at = core.find(" route="); at != std::string_view::npos) {
+      constexpr std::array<std::string_view, 2> appended{"route", "connects"};
+      auto fields = record_fields(core.substr(at + 1), "", appended);
+      route       = fields.at("route");
+      connects    = fields.at("connects");
+      REQUIRE((route == "origin" || route == "fresh" || route == "cached"));
+      if (connects != "-") { (void)record_number<std::size_t>(connects); }
+      core = core.substr(0, at);
+    }
+    auto fields = record_fields(core, transfer_prefix, keys);
     REQUIRE((fields.at("delegated") == "true" || fields.at("delegated") == "false"));
     auto const elapsed = record_number<std::int64_t>(fields.at("elapsed_ms"));
     CHECK(elapsed >= 0);
@@ -4548,7 +4560,9 @@ std::vector<transfer_record> transfers(request_log_capture const& capture)
                       record_number<std::size_t>(fields.at("bytes")),
                       record_number<std::size_t>(fields.at("attempt")),
                       fields.at("delegated") == "true",
-                      elapsed});
+                      elapsed,
+                      std::move(route),
+                      std::move(connects)});
   }
   return result;
 }
@@ -4558,7 +4572,7 @@ std::vector<decision_record> decisions(request_log_capture const& capture)
   constexpr std::array<std::string_view, 3> keys{"decision", "reason", "authority"};
   std::vector<decision_record> result;
   for (auto const& entry : capture.sink->entries()) {
-    if (!entry.message.starts_with(decision_prefix)) { continue; }
+    if (!entry.message.starts_with("rest_reactor: redirect decision=")) { continue; }
     require_record_privacy(entry);
     auto fields = record_fields(entry.message, decision_prefix, keys);
     result.push_back({fields.at("decision"), fields.at("reason"), fields.at("authority")});
