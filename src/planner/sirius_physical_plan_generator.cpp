@@ -42,6 +42,7 @@
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/partition/consumer_partition_policy.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
@@ -51,6 +52,7 @@
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
@@ -1308,8 +1310,8 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
       hgb_ptr->types,
       hgb_ptr->estimated_cardinality,
-      /*key_source=*/hgb_ptr,
-      /*is_build=*/false,
+      sirius::op::partition_spec{grouped.get_output_grouping_indices()},
+      sirius::op::MemoryBarrierType::FULL,
       compressed_materialization_observer,
       op_params.enable_runtime_size_estimation);
     auto* partition_ptr = partition.get();
@@ -1318,8 +1320,8 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     }
     partition->children.push_back(std::move(hgb_op));
 
-    // The partition's downstream sizing consumer is the merge (key_source hgb only supplies keys).
-    partition_ptr->set_downstream_consumer_op(merge.get());
+    // Bind merge sizing independently of the local aggregate's explicit key description.
+    sirius::op::bind_partition_input(*merge, *partition_ptr);
     merge->children.push_back(std::move(partition));
     return merge;
   });
@@ -1450,7 +1452,15 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
 {
   D_ASSERT(join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN ||
            join_op.type == sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
-  auto* join_op_ptr = &join_op;
+  sirius::op::partition_spec spec;
+  if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+    for (auto const& key : join_op.Cast<sirius::op::sirius_physical_hash_join>().prepared_keys()) {
+      spec.key_columns.push_back(is_build ? key.right_index : key.left_index);
+      spec.key_cast_types.push_back(key.type);
+    }
+  } else {
+    spec.mode = sirius::op::partition_mode::single;
+  }
   wrap_child(
     join_op, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
       // Capture types/cardinality before the child is moved into PARTITION.
@@ -1464,14 +1474,13 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
       auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
         std::move(child_types),
         est_card,
-        /*key_source=*/join_op_ptr,
-        is_build,
+        std::move(spec),
+        sirius::op::MemoryBarrierType::FULL,
         compressed_materialization_observer);
       if (!child_physical.empty()) {
         partition->set_physical_types(child_physical);
         concat->set_physical_types(std::move(child_physical));
       }
-      partition->set_join_concat(concat.get());
       partition->children.push_back(std::move(child_orig));
       concat->children.push_back(std::move(partition));
       return concat;
@@ -1484,15 +1493,14 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
 //! No CONCAT, unlike the join wrap: CONCAT exists to fold a join's build side into one batch for
 //! its hash table, and this operator builds no hash table — it drains whole partitions.
 //!
-//! The preserved side is the build side, which makes it the sizing driver
-//! (`_drives_partition_count = _is_build`). Because sizing reads both sides' bytes, both
-//! partitions are told to wait for their sibling's input before negotiating a count.
+//! Bind preserved and counted inputs explicitly. The policy waits for both inputs before
+//! sizing their combined working set.
 void wrap_dense_count_join(sirius::op::sirius_physical_operator& dense_count_op,
                            duckdb::SiriusContext* compressed_materialization_observer)
 {
   D_ASSERT(dense_count_op.type == sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
   D_ASSERT(dense_count_op.children.size() == 2);
-  auto* dense_count_ptr = &dense_count_op;
+  auto& dense_count = dense_count_op.Cast<sirius::op::sirius_physical_dense_count_join>();
 
   // children[0] is the preserved side, children[1] the counted side (stamped by
   // try_plan_dense_count_join).
@@ -1510,17 +1518,39 @@ void wrap_dense_count_join(sirius::op::sirius_physical_operator& dense_count_op,
                  auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
                    std::move(child_types),
                    est_card,
-                   /*key_source=*/dense_count_ptr,
-                   is_build,
+                   sirius::op::partition_spec{{static_cast<int>(
+                     is_build ? dense_count.preserved_key_idx() : dense_count.counted_key_idx())}},
+                   sirius::op::MemoryBarrierType::FULL,
                    compressed_materialization_observer);
                  if (!child_physical.empty()) {
                    partition->set_physical_types(std::move(child_physical));
                  }
-                 partition->set_downstream_consumer_op(dense_count_ptr);
-                 partition->set_sizing_requires_sibling_input(true);
                  partition->children.push_back(std::move(child_orig));
                  return partition;
                });
+  }
+  sirius::op::bind_partition_inputs(
+    dense_count,
+    dense_count_op.children[0]->Cast<sirius::op::sirius_physical_partition>(),
+    dense_count_op.children[1]->Cast<sirius::op::sirius_physical_partition>());
+}
+
+// Bind the exact wrappers just constructed by this pass. Conversion does not discover roles.
+void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op, bool probe_drives)
+{
+  if (join_op.children.size() != 2) { throw std::logic_error("partitioned join needs two inputs"); }
+  auto& build_concat = join_op.children[1]->Cast<sirius::op::sirius_physical_concat>();
+  auto& build        = build_concat.children[0]->Cast<sirius::op::sirius_physical_partition>();
+  auto& probe = join_op.children[0]->children[0]->Cast<sirius::op::sirius_physical_partition>();
+  if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+    sirius::op::bind_partition_inputs(join_op.Cast<sirius::op::sirius_physical_hash_join>(),
+                                      build,
+                                      probe,
+                                      &build_concat,
+                                      probe_drives);
+  } else {
+    sirius::op::bind_partition_inputs(
+      join_op.Cast<sirius::op::sirius_physical_nested_loop_join>(), build, probe);
   }
 }
 
@@ -1538,6 +1568,9 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
     wrap_join_child(
       join_op, /*child_idx=*/1, /*is_build=*/true, op_params, compressed_materialization_observer);
   }
+  bool const probe_drives = join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN &&
+                            join_op.Cast<sirius::op::sirius_physical_hash_join>().is_right_family();
+  bind_wrapped_join(join_op, probe_drives);
 }
 
 //! Terminate one UNION arm with a `PASSTHROUGH_SINK`. Where a join arm needs `PARTITION -> CONCAT`
@@ -1600,18 +1633,17 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
   auto original          = std::move(delim_base.distinct_root);
   auto* original_agg_ptr = &original->Cast<sirius::op::sirius_physical_grouped_aggregate>();
 
-  auto partition =
-    duckdb::make_uniq<sirius::op::sirius_physical_partition>(original->types,
-                                                             original->estimated_cardinality,
-                                                             /*key_source=*/original.get(),
-                                                             /*is_build=*/false);
+  auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
+    original->types,
+    original->estimated_cardinality,
+    sirius::op::partition_spec{original_agg_ptr->get_output_grouping_indices()});
   auto* partition_ptr = partition.get();
   partition->children.push_back(std::move(original));
 
   auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
     original_agg_ptr, op_params.hash_partition_bytes);
-  // The partition's downstream sizing consumer is the merge (key_source only supplies keys).
-  partition_ptr->set_downstream_consumer_op(merge.get());
+  // Bind the merge's input policy before converting the distinct fanout.
+  sirius::op::bind_partition_input(*merge, *partition_ptr);
   merge->children.push_back(std::move(partition));
 
   // Tag the chain top with the owning DELIM_JOIN so the tree-parent wiring redirects its
@@ -1656,6 +1688,11 @@ void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& s
     auto& right_delim = slot->Cast<sirius::op::sirius_physical_right_delim_join>();
 
     auto* internal_join = delim_base.join.get();
+    if (internal_join &&
+        (internal_join->type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN ||
+         internal_join->type == sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN)) {
+      bind_wrapped_join(*internal_join, false);
+    }
     if (internal_join && internal_join->children.size() >= 2) {
       auto* build_child = internal_join->children[1].get();
       if (build_child && build_child->type == sirius::op::SiriusPhysicalOperatorType::CONCAT &&
@@ -1937,9 +1974,7 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
     if (child) { set_parent_ops(*child, &op); }
   }
   // DELIM JOIN keeps its internal `join`/`distinct_root` subtrees outside `children[]`;
-  // descend so the wrapped operators inside get tree parents. PARTITION's ctor `key_source`
-  // is captured for key/type derivation only and never stored, so without this descent its
-  // `_parent_op` stays null and the wiring can't resolve its destination.
+  // descend so their wrapped operators have tree parents for repository wiring.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
       op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();

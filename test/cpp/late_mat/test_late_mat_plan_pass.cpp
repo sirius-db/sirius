@@ -23,6 +23,8 @@
 // The second is the dangerous one, so the analysis fails closed: a shape it
 // does not model reads everything, which can only end a ride early.
 
+#include "operator/partition_test_utils.hpp"
+
 #include <cudf/types.hpp>
 
 #include <catch.hpp>
@@ -125,17 +127,6 @@ struct test_dynamic_filter : sirius::op::scan::sirius_physical_dynamic_filter {
 struct test_join : sirius::op::sirius_physical_hash_join {
   using sirius_physical_hash_join::sirius_physical_hash_join;
   void link(sirius_physical_operator* parent) { _parent_op = parent; }
-};
-
-/// A key_source a partition can be built against that hashes on nothing: an
-/// NLJ reports a single partition, so the constructor records no keys. That is
-/// the payload-carrying partition — the one a ride must pass through.
-struct keyless_key_source : sirius::op::sirius_physical_operator {
-  keyless_key_source()
-    : sirius_physical_operator(
-        sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, make_types(1), 0)
-  {
-  }
 };
 
 /// The plumbing a real plan puts around every join and aggregate. Both are
@@ -406,14 +397,12 @@ namespace {
 /// A chain of partitions, which is what a ride long enough to clear the
 /// policy's floor actually looks like: each is a pipeline sink, so each costs
 /// one port crossing, and each is positionally transparent.
-std::vector<std::unique_ptr<test_partition>> partition_chain(std::size_t columns,
-                                                             std::size_t links,
-                                                             keyless_key_source& keys)
+std::vector<std::unique_ptr<test_partition>> partition_chain(std::size_t columns, std::size_t links)
 {
   std::vector<std::unique_ptr<test_partition>> chain;
   for (std::size_t i = 0; i < links; ++i) {
-    chain.push_back(
-      std::make_unique<test_partition>(make_string_types(columns), 0, &keys, /*is_build=*/false));
+    chain.push_back(std::make_unique<test_partition>(
+      make_string_types(columns), 0, sirius::test::operator_utils::single_partition_spec()));
   }
   return chain;
 }
@@ -437,12 +426,12 @@ TEST_CASE("only a pipeline sink costs the ride anything", "[late_mat][lifetime]"
   // partition writes them to a repository for the next one to read. Only the
   // second is what a deferral saves, so only the second is counted — otherwise
   // a chain of projections would look like a ride worth paying to defer.
-  keyless_key_source keys;
   opaque_op reader(2);
 
   // scan -> partition -> reader
   wide_scan bare(2);
-  test_partition bare_partition(make_string_types(2), 0, &keys, false);
+  test_partition bare_partition(
+    make_string_types(2), 0, sirius::test::operator_utils::single_partition_spec());
   bare.link(&bare_partition);
   bare_partition.link(&reader);
 
@@ -453,7 +442,8 @@ TEST_CASE("only a pipeline sink costs the ride anything", "[late_mat][lifetime]"
   list.push_back(ref(0));
   list.push_back(ref(1));
   test_projection projection(make_string_types(2), std::move(list), 0);
-  test_partition projected_partition(make_string_types(2), 0, &keys, false);
+  test_partition projected_partition(
+    make_string_types(2), 0, sirius::test::operator_utils::single_partition_spec());
   projected.link(&projection);
   projection.link(&projected_partition);
   projected_partition.link(&reader);
@@ -528,7 +518,7 @@ TEST_CASE("a join key may not be deferred, however far it rides", "[late_mat][li
   // Insert the wrap a real plan builds between the join and its probe child:
   // PARTITION(keys from the join) -> the scan.
   auto wrap = duckdb::make_uniq<test_partition>(
-    make_string_types(3), 0, /*key_source=*/&join, /*is_build=*/false);
+    make_string_types(3), 0, sirius::test::operator_utils::hash_partition_spec(join, false));
   auto* partition = wrap.get();
   REQUIRE(partition->partition_keys() == std::vector<int>{0});
   wrap->children.push_back(std::move(join.children[0]));
@@ -566,8 +556,7 @@ TEST_CASE("registered dynamic-filter targets preserve unrelated payload deferral
       sirius::op::scan::consumer_config{
         .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
       std::vector<sirius::op::scan::binding>{}));
-  keyless_key_source keys;
-  auto chain = partition_chain(5, 3, keys);
+  auto chain = partition_chain(5, 3);
   opaque_op reader(5);
   scan.link(&endpoint);
   link_chain(endpoint, chain, reader);
@@ -643,8 +632,7 @@ TEST_CASE("an unscoped dynamic-filter producer permits restoration only before i
         .mode = sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY},
       std::vector<sirius::op::scan::binding>{}));
   opaque_op reader(3);
-  keyless_key_source keys;
-  auto chain = partition_chain(3, 3, keys);
+  auto chain = partition_chain(3, 3);
   link_chain(scan, chain, endpoint);
   endpoint.link(&reader);
 
@@ -680,8 +668,7 @@ TEST_CASE("known empty dynamic-filter endpoints preserve profitable deferral",
   }
   wide_scan scan(3);
   test_dynamic_filter endpoint(make_string_types(3), 0, consumer);
-  keyless_key_source keys;
-  auto chain = partition_chain(3, 3, keys);
+  auto chain = partition_chain(3, 3);
   opaque_op reader(3);
   scan.link(&endpoint);
   link_chain(endpoint, chain, reader);
@@ -916,8 +903,7 @@ TEST_CASE("a wide bundle over a long ride plans a deferral at its reader", "[lat
   // that reads them: the q10 shape, and the one the measurements were taken on.
   wide_scan scan(5);
   opaque_op aggregate(5);
-  keyless_key_source keys;
-  auto chain = partition_chain(5, 3, keys);
+  auto chain = partition_chain(5, 3);
   link_chain(scan, chain, aggregate);
 
   auto const planned = sirius::planner::plan_deferral(scan);
@@ -961,9 +947,8 @@ TEST_CASE("one rowid rides, so the narrower of two bundles is refused", "[late_m
   test_filter filter(make_string_types(5), std::move(predicate), 0);
   opaque_op aggregate(5);
 
-  keyless_key_source keys;
-  auto lower = partition_chain(5, 3, keys);
-  auto upper = partition_chain(5, 3, keys);
+  auto lower = partition_chain(5, 3);
+  auto upper = partition_chain(5, 3);
   link_chain(scan, lower, filter);
   link_chain(filter, upper, aggregate);
 
@@ -1126,7 +1111,8 @@ TEST_CASE("a two-stage aggregate is one ride through both halves", "[late_mat][l
   wide_scan scan(3);
   auto local = make_aggregate(3, /*groups=*/{1, 2}, /*aggregate_inputs=*/{0});
   auto merge = make_merge(3, /*groups=*/{0, 1}, /*aggregate_inputs=*/{2});
-  test_partition partition(make_string_types(3), 0, /*key_source=*/local.get(), /*is_build=*/false);
+  test_partition partition(
+    make_string_types(3), 0, sirius::op::partition_spec{local->get_output_grouping_indices()});
   REQUIRE(partition.partition_keys() == std::vector<int>{0, 1});
 
   scan.link(local.get());
@@ -1171,7 +1157,8 @@ TEST_CASE("a partition below a join still refuses a group key", "[late_mat][life
 
   wide_scan scan(3);
   auto aggregate = make_aggregate(3, /*groups=*/{0, 1}, /*aggregate_inputs=*/{2});
-  test_partition partition(make_string_types(3), 0, /*key_source=*/&join, /*is_build=*/false);
+  test_partition partition(
+    make_string_types(3), 0, sirius::test::operator_utils::hash_partition_spec(join, false));
   scan.link(aggregate.get());
   aggregate->link(&partition);
   partition.link(&join);
@@ -1197,8 +1184,7 @@ TEST_CASE("the q10 shape reports the ride past the aggregate", "[late_mat][lifet
     sirius::ast::comparison{sirius::comparison_type::equal, ref(0), ref(0)});
   test_filter key_reader(make_string_types(3), std::move(key_predicate), 0);
 
-  keyless_key_source keys;
-  auto chain           = partition_chain(3, 3, keys);
+  auto chain           = partition_chain(3, 3);
   auto aggregate       = make_aggregate(3, /*groups=*/{0, 1, 2}, /*aggregate_inputs=*/{});
   auto final_predicate = std::make_unique<sirius::ast::node>(
     sirius::ast::comparison{sirius::comparison_type::equal, ref(1), ref(2)});
@@ -1244,8 +1230,7 @@ TEST_CASE("no proof candidate means no extension is reported", "[late_mat][lifet
   // column riding real that could be proven unique, so there is nothing to
   // admit and the pass says so rather than leaving the decision open.
   wide_scan scan(3);
-  keyless_key_source keys;
-  auto chain     = partition_chain(3, 3, keys);
+  auto chain     = partition_chain(3, 3);
   auto aggregate = make_aggregate(3, /*groups=*/{1, 2}, /*aggregate_inputs=*/{0});
   auto predicate = std::make_unique<sirius::ast::node>(
     sirius::ast::comparison{sirius::comparison_type::equal, ref(0), ref(1)});
@@ -1396,8 +1381,7 @@ TEST_CASE("a bundle every column of which is only counted is planned count-only"
                                  /*groups=*/{},
                                  /*aggregate_inputs=*/{0, 1, 2, 3, 4},
                                  cudf::aggregation::Kind::COUNT_VALID);
-  keyless_key_source keys;
-  auto chain = partition_chain(5, 3, keys);
+  auto chain    = partition_chain(5, 3);
   link_chain(counted_scan, chain, *counting);
 
   auto const counted = sirius::planner::plan_deferral(counted_scan);
@@ -1411,8 +1395,7 @@ TEST_CASE("a bundle every column of which is only counted is planned count-only"
                               /*aggregate_inputs=*/{0, 1, 2, 3, 4},
                               cudf::aggregation::Kind::COUNT_VALID);
   mixed->cudf_aggregates[4] = cudf::aggregation::Kind::SUM;
-  keyless_key_source mixed_keys;
-  auto mixed_chain = partition_chain(5, 3, mixed_keys);
+  auto mixed_chain          = partition_chain(5, 3);
   link_chain(mixed_scan, mixed_chain, *mixed);
 
   auto const planned_mixed = sirius::planner::plan_deferral(mixed_scan);

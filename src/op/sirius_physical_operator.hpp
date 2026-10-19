@@ -396,10 +396,12 @@ class routed_operator_data : public pipelineable_operator_data {
     }
   }
   [[nodiscard]] std::vector<std::size_t> const& destinations() const { return _destinations; }
-  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_data_batches(
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
     std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
   {
-    return std::make_unique<routed_operator_data>(std::move(batches), _destinations);
+    auto replacement = std::make_unique<routed_operator_data>(std::move(batches), _destinations);
+    replacement->adopt_row_identity(*this);
+    return replacement;
   }
 
  private:

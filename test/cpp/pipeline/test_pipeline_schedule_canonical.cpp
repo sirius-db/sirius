@@ -113,8 +113,7 @@ void require_canonical_schedule(duckdb::Connection& con, const std::string& quer
     }
 
     // Join dependencies are build-side-first: dependencies[0] is the build CONCAT
-    // (finalize_pipeline_structure front-inserts it; link_join_partition_siblings and
-    // dynamic-filter scheduling read the slots positionally).
+    // (finalize_pipeline_structure front-inserts it for dynamic-filter scheduling).
     for (const auto& pipeline : scheduled) {
       auto source = pipeline->get_source();
       if (!source || (source->type != sirius::op::SiriusPhysicalOperatorType::HASH_JOIN &&

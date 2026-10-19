@@ -23,14 +23,6 @@ namespace op {
 
 sirius_physical_partition_consumer_operator::~sirius_physical_partition_consumer_operator() {}
 
-partition_strategy sirius_physical_partition_consumer_operator::get_partition_strategy(
-  const partition_sizing_input& /*in*/)
-{
-  throw std::runtime_error(
-    "get_partition_strategy called on a non-sizing partition consumer operator " + get_name() +
-    " (id " + std::to_string(get_operator_id()) + ")");
-}
-
 void sirius_physical_partition_consumer_operator::set_placement(
   std::shared_ptr<const partition_placement> placement)
 {

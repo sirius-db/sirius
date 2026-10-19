@@ -98,7 +98,6 @@ class sirius_pipeline_converter {
   //! Set up parent/dependency pipeline edges from the wiring descriptors.
   void setup_pipeline_parents();
   void finalize_pipeline_structure();
-  void link_join_partition_siblings();
 
   //! Hand the admitted GPU list to every PARTITION's sizing consumer (hash join, NLJ, merge,
   //! dense count join), which derives the partition count and placement from it, and to every

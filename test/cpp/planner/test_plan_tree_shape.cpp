@@ -293,7 +293,7 @@ sirius_physical_operator* require_join_child_wrap(sirius_physical_operator* op,
   REQUIRE(op->children.size() == 1);
   auto* partition = op->children[0].get();
   REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition() == is_build);
+  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
 
   REQUIRE(partition->children.size() == 1);
   return partition->children[0].get();
@@ -313,7 +313,7 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   REQUIRE(merge->children.size() == 1);
   auto* partition = merge->children[0].get();
   REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-  CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+  CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
 
   REQUIRE(partition->children.size() == 1);
   auto* hgb = partition->children[0].get();
@@ -953,7 +953,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     auto* partition = merge->children[0].get();
     REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-    CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+    CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
 
     REQUIRE(partition->children.size() == 1);
     CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
@@ -1047,7 +1047,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     auto* partition = merge->children[0].get();
     REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
-    CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+    CHECK(partition->Cast<sirius::op::sirius_physical_partition>().exchange() != nullptr);
     REQUIRE(partition->children.size() == 1);
 
     auto* hgb = partition->children[0].get();

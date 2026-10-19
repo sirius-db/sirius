@@ -27,6 +27,7 @@
 // produces a column that names what it actually read.
 
 #include "operator/operator_test_utils.hpp"
+#include "operator/partition_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -243,10 +244,9 @@ TEST_CASE(
     SiriusPhysicalOperatorType::TABLE_SCAN, scan_types, 4);
   auto* scan_ptr                                    = scan.get();
   duckdb::unique_ptr<sirius_physical_operator> tree = std::move(scan);
-  sirius_physical_operator key_source(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, scan_types, 4);
   for (int i = 0; i < 3; ++i) {
-    auto partition =
-      duckdb::make_uniq<sirius::op::sirius_physical_partition>(scan_types, 4, &key_source);
+    auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
+      scan_types, 4, sirius::test::operator_utils::single_partition_spec());
     REQUIRE(partition->partition_keys().empty());
     partition->children.push_back(std::move(tree));
     tree = std::move(partition);
