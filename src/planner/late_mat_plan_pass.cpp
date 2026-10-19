@@ -18,6 +18,7 @@
 
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
+#include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -303,20 +304,22 @@ step trace_through(sirius_physical_operator const& node,
       return step::to(moved);
     }
 
-    // A dynamic filter drops rows a join build has already excluded. It reads
-    // only the key columns it probes, and rewrites no column layout, so a
-    // payload riding past it is positionally unchanged. Treating it as a reader
-    // instead ends the ride at the operator that sits directly above a pinned
-    // scan, which is where q10's customer payload was stopping: the bundle
-    // materialized one hop from the scan and paid the rowid for nothing.
-    //
-    // The probed columns are not enumerated here: the filter set is published
-    // mid-query and a column this walk decided was payload must not become a
-    // probe key afterwards. Deferring a probed key would hand the probe a rowid
-    // in place of the value it compares, so it is refused at the source instead
-    // -- the scan withholds any column a partition hashes, which is the same
-    // column set this operator probes.
-    case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return step::to(in_pos);
+    case SiriusPhysicalOperatorType::DYNAMIC_FILTER: {
+      auto const* endpoint = dynamic_cast<op::scan::sirius_physical_dynamic_filter const*>(&node);
+      if (endpoint == nullptr) { return step::reads(); }
+      auto const& consumer = endpoint->consumer();
+      if (!consumer) { return step::to(in_pos); }
+      auto const& channel = consumer->channel();
+      if (!channel->has_producers()) { return step::to(in_pos); }
+      // An unscoped producer may probe any column, so every column is a value read here.
+      if (channel->has_unscoped_producer()) { return step::reads_and_moves(in_pos); }
+
+      // Registration is complete before analysis; publication may still be pending. Targets use
+      // this endpoint's input ordinals, including remapping below it.
+      auto const targets = channel->planned_target_columns();
+      return std::ranges::binary_search(targets, in_pos) ? step::reads_and_moves(in_pos)
+                                                         : step::to(in_pos);
+    }
 
     case SiriusPhysicalOperatorType::HASH_GROUP_BY:
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY: {

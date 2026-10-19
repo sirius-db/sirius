@@ -264,11 +264,36 @@ class pipelineable_operator_data : public operator_data {
   /**
    * @brief IDs of the non-null input batches in input order, as constructed.
    *
-   * The IDs survive preparation, which may replace a batch with a cross-GPU clone that has a new
-   * ID, and task retries, which reuse this object. `dynamic_filter_publication_session` uses them
-   * to deduplicate contributions.
+   * The IDs survive every row-preserving replacement: preparation, which may replace a batch with a
+   * cross-GPU clone that has a new ID; `with_batches_preserving_rows`; and task retries, which
+   * reuse this object. `dynamic_filter_publication_session` uses them to deduplicate contributions.
    */
   [[nodiscard]] std::vector<std::uint64_t> original_batch_ids() const;
+
+  /**
+   * @brief Returns a new task input of the same type that holds @p batches in place of this one's
+   * batches.
+   *
+   * Late materialization calls this just before an operator runs, to swap each input batch for one
+   * with its deferred columns filled in. The rows and their order stay the same, so everything this
+   * task input records about those rows still holds, and the new task input keeps it:
+   * - its subtype and the subtype's fields, such as a partition index, a scan receipt, or a cross
+   *   join slice;
+   * - the original batch ID at each position, which dynamic-filter publication uses to drop
+   *   duplicate contributions (a batch replaced twice keeps the first ID);
+   * - the preferred device.
+   *
+   * Call it only when each new batch holds the same rows, in the same order, as the batch it
+   * replaces. An operator that adds, drops, or reorders rows must build a new plain task input.
+   * Subtypes with fields of their own override it to carry those fields over.
+   *
+   * @param batches One replacement per current batch, at the same position: null exactly where the
+   *                current batch is null
+   * @return The new task input; this one is unchanged
+   * @throws std::invalid_argument if @p batches does not line up with the current batches
+   */
+  [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const;
 
   [[nodiscard]] operator_data_type get_type() const override
   {
@@ -280,22 +305,6 @@ class pipelineable_operator_data : public operator_data {
    */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
     const;
-
-  /**
-   * @brief Task input of the same kind with @p data_batches in place of the batches.
-   *
-   * Late materialization calls it when it restores deferred columns just before an operator's
-   * execute(). Subclasses that carry state besides the batches, such as a cross product task's
-   * slice, override it to copy that state into the new task input.
-   *
-   * @param data_batches The batches of the new task input.
-   * @return A task input of the same type, holding @p data_batches.
-   */
-  [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_data_batches(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches) const
-  {
-    return std::make_unique<pipelineable_operator_data>(std::move(data_batches));
-  }
 
   /**
    * @brief Get read-only accessors for the batches. Returns the pin locks acquired by
@@ -350,9 +359,27 @@ class pipelineable_operator_data : public operator_data {
     return result.empty() ? "UNKNOWN" : result;
   }
 
+ protected:
+  /**
+   * @brief Takes the row identity of @p source, whose batches this payload's batches replace
+   * position by position.
+   *
+   * Copies the preferred device and records, for each position whose batch ID differs, the original
+   * ID @p source reports for that position. Used by every `with_batches_preserving_rows`
+   * implementation.
+   *
+   * @throws std::invalid_argument if the two payloads do not hold non-null batches at the same
+   * positions
+   */
+  void adopt_row_identity(pipelineable_operator_data const& source);
+
  private:
+  /// The original ID of the batch at @p position, which must hold a non-null batch.
+  [[nodiscard]] std::uint64_t original_batch_id_at(std::size_t position) const;
+
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
-  /// (position, original ID) of each batch that preparation replaced with a clone; usually empty.
+  /// (position, original ID) of each batch that a row-preserving replacement swapped for a batch
+  /// with another ID; usually empty.
   std::vector<std::pair<std::size_t, std::uint64_t>> _replaced_batch_ids;
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
@@ -406,6 +433,14 @@ class partitioned_operator_data : public pipelineable_operator_data {
    *         "place by data affinity", not "partition 0".
    */
   [[nodiscard]] std::optional<std::size_t> get_partition_idx() const { return _partition_idx; }
+
+  /// Keeps the partition index; see `pipelineable_operator_data::with_batches_preserving_rows`.
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const override;
+
+ protected:
+  /// Takes the row identity and the partition index of @p source.
+  void adopt_partition_identity(partitioned_operator_data const& source);
 
  private:
   std::optional<std::size_t> _partition_idx;

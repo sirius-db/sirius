@@ -413,6 +413,7 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
         split->conversion_destination_bytes = next.conversion_destination_bytes;
         split->row_filter_pending           = row_filter_pending;
         split->origin                       = std::move(next.origin);
+        split->decode_attached              = std::move(next.decode_attached);
         if (!publish(std::move(split))) break;
         continue;
       }

@@ -470,6 +470,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   if (is_supported_by_hash_join && !prefer_range_joins) {
     auto options          = duckdb::query_operator_options(context);
     const auto& op_params = *options;
+    auto* const stats     = &sirius_context->get_dynamic_filter_stats();
 
     // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();
@@ -553,15 +554,17 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           std::move(left),
           static_cast<std::size_t>(key.probe_key_ordinal),
           policy,
-          [&site_channels, &op_params](sirius::op::sirius_physical_operator const& site)
+          [&site_channels, &op_params, stats](sirius::op::sirius_physical_operator const& site)
             -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
             auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-            auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
-              site.types,
-              site.estimated_cardinality,
+            auto consumer = sirius::op::scan::make_dynamic_filter_consumer(
               channel,
+              sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
               op_params.dynamic_filter_keep_threshold,
-              sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY);
+              /*decode_bindings=*/{},
+              stats);
+            auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
+              site.types, site.estimated_cardinality, std::move(consumer));
             site_channels.push_back(std::move(channel));
             return endpoint;
           });
@@ -660,7 +663,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       std::move(filter_plan),
       op_params.hash_partition_bytes,
       op_params.max_broadcast_join_size,
-      &sirius_context->get_dynamic_filter_stats());
+      stats);
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
     hj.runtime_distinct_build_probe = op_params.enable_runtime_distinct_build_probe;

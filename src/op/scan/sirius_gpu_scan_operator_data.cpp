@@ -63,55 +63,69 @@ sirius::decompression_pushdown_scan::compaction_forecast pushdown_compaction_for
 
 }  // namespace
 
-membership_snapshot snapshot_membership_probes(sirius::op::dynamic_filter_snapshot const& snapshot,
+membership_snapshot snapshot_membership_probes(decode_selection const& selection,
                                                std::size_t n_slots)
 {
   membership_snapshot snap;
-  snap.generation = snapshot.generation();
+  snap.generation = selection.generation;
   snap.probes.resize(n_slots);
-  for (auto const& [i, filter] : snapshot.entries()) {
-    if (i >= n_slots) { continue; }
-    // Only mask-capable kinds (in-list / small-in-list / Bloom) can probe
-    // at decode; zone-map filters have no per-row form.
+  for (std::size_t order = 0; order < selection.steps.size(); ++order) {
+    auto const& step       = selection.steps[order];
+    auto const& filter     = step.representative.filter;
     auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(filter.get());
-    if (applicable == nullptr) {
-      ++snap.skipped_non_mask;
-      continue;
+    if (applicable == nullptr || step.column_index < 0 ||
+        std::cmp_greater_equal(step.column_index, n_slots)) {
+      throw std::invalid_argument(
+        "decode selection step names a filter that cannot compute masks or a missing slot");
     }
-    // Ordering signal (sirius::membership_probe doc): rank by ascending
-    // expected keep-rate, num_keys where the concrete filter exposes it.
-    // Bloom has no size accessor — the rank alone places it last.
-    std::uint8_t kind_rank = 255;
-    std::uint64_t num_keys = 0;
-    if (auto const* small =
-          dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get())) {
-      kind_rank = 0;
-      num_keys  = small->size();
-    } else if (auto const* set =
-                 dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(filter.get())) {
-      kind_rank = 1;
-      num_keys  = set->size();
-    } else if (filter->kind() == sirius::op::sirius_dynamic_filter_kind::BLOOM) {
-      kind_rank = 2;
-    }
-    // The closure co-owns the filter. It is snapshotted before the balancer
-    // assigns this split's chunk to a GPU, so the device isn't known yet
-    // here; pass -1 so compute_mask resolves it from the CURRENT CUDA
-    // device at probe time, which the task scheduler has already set to
-    // the chunk's assigned GPU by then. The prior mask is the decoder's already-combined
-    // conjuncts.
-    snap.probes[i].push_back({[f = filter, applicable](cudf::column_view const& keys,
-                                                       std::uint32_t const* prior_mask_words,
-                                                       ::cuda::stream_ref s,
-                                                       rmm::device_async_resource_ref mr) {
-                                return applicable->compute_mask(
-                                  keys, prior_mask_words, /*device_id=*/-1, s, mr);
-                              },
-                              kind_rank,
-                              num_keys});
-    ++snap.attached_probes;
+    // The actual execution device is selected after attachment. The closure retains its filter
+    // and resolves the local replica when the decoder invokes it on that device.
+    int const use_current_device = -1;
+    // Equal ranks with ascending key counts make the decoder keep the consumer's probe order.
+    snap.probes[step.column_index].push_back(
+      {[f = filter, applicable](cudf::column_view const& keys,
+                                std::uint32_t const* prior_mask_words,
+                                ::cuda::stream_ref stream,
+                                rmm::device_async_resource_ref mr) {
+         return applicable->compute_mask(keys, prior_mask_words, use_current_device, stream, mr);
+       },
+       0,
+       order + 1});
+    snap.attached.insert(snap.attached.end(), step.represented.begin(), step.represented.end());
   }
   return snap;
+}
+
+std::optional<detail::membership_refresh> detail::refresh_membership_probes(
+  std::shared_ptr<const sirius::decompression_pushdown_scan> const& current,
+  std::size_t n_slots,
+  dynamic_filter_consumer const* consumer,
+  membership_attach_options options)
+{
+  if (!consumer && !current) { return std::nullopt; }
+  std::vector<binding> bindings;
+  if (sirius::decompression_pushdown_enabled() && consumer && !options.selection_unprofitable &&
+      !options.uncomposed_mvcc_mask) {
+    for (auto const& entry : consumer->decode_bindings()) {
+      if (entry.column_index >= 0 && std::cmp_less(entry.column_index, n_slots)) {
+        bindings.push_back(entry);
+      }
+    }
+  }
+  // Without bindings there is nothing to select, so skip the channel snapshot and gate locks.
+  auto selection = bindings.empty() ? decode_selection{} : consumer->select_for_decode(bindings);
+  auto const clears_probes =
+    current && std::ranges::any_of(current->request().columns,
+                                   [](auto const& column) { return !column.membership.empty(); });
+  // A decode request without probes decodes exactly like none.
+  if (selection.steps.empty() && !clears_probes) { return membership_refresh{}; }
+  auto snap = snapshot_membership_probes(selection, n_slots);
+  auto const base =
+    current
+      ? current
+      : std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
+  return membership_refresh{base->with_membership_probes(std::move(snap.probes), snap.generation),
+                            std::move(snap.attached)};
 }
 
 scan_operator_input::scan_operator_input(
@@ -222,7 +236,7 @@ void scan_operator_input::prepare_for_processing(
   }
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
 
-  if (batch && requested_memory_space && !stolen_table && !stolen_table_consumed) {
+  if (batch && !stolen_table && !stolen_table_consumed) {
     bool needs_upload = false;
     {
       auto ro          = batch->to_read_only();
@@ -230,85 +244,73 @@ void scan_operator_input::prepare_for_processing(
       // Convert when the data is not on the GPU tier, OR when it is on the GPU
       // tier but not already a plain gpu_table_representation (e.g. a
       // compressed_device_representation, which must be decompressed in place).
-      const bool is_gpu_table =
-        dynamic_cast<const ::cucascade::gpu_table_representation*>(data) != nullptr;
-      needs_upload = data != nullptr &&
-                     (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !is_gpu_table);
-      // Another converter (the memory prefetcher, say) may already have decoded this batch; its
-      // outcome binds this split all the same.
-      if (!needs_upload) { record_decode_outcome(data); }
+      auto const* gpu_rep = dynamic_cast<const ::cucascade::gpu_table_representation*>(data);
+      needs_upload =
+        data != nullptr && (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !gpu_rep);
+      if (!needs_upload && gpu_rep) { record_decode_outcome(data); }
     }
-    if (needs_upload) {
+    if (needs_upload && requested_memory_space) {
       auto& registry = ::sirius::converter_registry::get();
       auto mut       = batch->to_mutable();
-      if (pushdown_selection_unprofitable &&
-          pushdown_selection_unprofitable->load(std::memory_order_relaxed)) {
-        // An earlier batch of this scan reported that compacting during decode
-        // does not pay off; selectivity is uniform across batches, so drop the
-        // row selection and stop paying for the attempt. Only the per-query
-        // projected clone is touched — never the shared pin — and only this
-        // operator's splits: another query's scan decides fresh.
-        auto drop_row_selection = [](auto* rep) {
-          if (rep->pushdown_scan()) {
-            rep->set_pushdown_scan(rep->pushdown_scan()->without_row_selection());
+      // Prefetch can finish between the read-only check and this exclusive lock.
+      bool const converted_here =
+        mut.get_current_tier() != ::cucascade::memory::Tier::GPU ||
+        dynamic_cast<cucascade::gpu_table_representation*>(mut.get_data()) == nullptr;
+      if (converted_here) {
+        bool const selection_unprofitable =
+          pushdown_selection_unprofitable &&
+          pushdown_selection_unprofitable->load(std::memory_order_relaxed);
+        if (selection_unprofitable) {
+          // An earlier batch of this scan reported that compacting during decode
+          // does not pay off; selectivity is uniform across batches, so drop the
+          // row selection and stop paying for the attempt. Only the per-query
+          // projected clone is touched — never the shared pin — and only this
+          // operator's splits: another query's scan decides fresh.
+          auto drop_row_selection = [](auto* rep) {
+            if (rep->pushdown_scan()) {
+              rep->set_pushdown_scan(rep->pushdown_scan()->without_row_selection());
+            }
+          };
+          if (auto* device_rep =
+                dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
+            drop_row_selection(device_rep);
+          } else if (auto* host_rep =
+                       dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
+            drop_row_selection(host_rep);
           }
-        };
-        if (auto* device_rep =
-              dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
-          drop_row_selection(device_rep);
-        } else if (auto* host_rep =
-                     dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
-          drop_row_selection(host_rep);
+        }
+        // Only original compressed input can become a clean sampling opportunity. A reused
+        // conversion keeps its history, including when a previous prepare failed after conversion.
+        if (!_decoded_input_reused) {
+          auto refresh = [&](auto* rep) {
+            attach_membership_probes(*rep,
+                                     consumer.get(),
+                                     {.selection_unprofitable = selection_unprofitable,
+                                      .uncomposed_mvcc_mask   = mvcc_keep_mask.has_mask() &&
+                                                              !rep->visibility_mask().has_mask()},
+                                     decode_attached);
+          };
+          if (auto* rep = dynamic_cast<sirius::compressed_device_representation*>(mut.get_data())) {
+            refresh(rep);
+          } else if (auto* rep =
+                       dynamic_cast<sirius::compressed_host_representation*>(mut.get_data())) {
+            refresh(rep);
+          }
+        }
+        try {
+          mut.convert_to<cucascade::gpu_table_representation>(
+            registry, requested_memory_space, stream);
+        } catch (...) {
+          _decoded_input_reused =
+            _decoded_input_reused ||
+            dynamic_cast<cucascade::gpu_table_representation*>(mut.get_data()) != nullptr;
+          throw;
         }
       }
-      // Decode-time join filter snapshot: the scan-manager drain runs at query
-      // PREPARE, before any join build has published, so a drain-time snapshot
-      // is empty for the whole scan. Executor tasks prepare right before decode
-      // — by then upstream builds have published — so refresh the projected rep
-      // with a fresh per-batch snapshot here, replacing the (typically empty)
-      // drain-time one. The mapping invariant lives in
-      // snapshot_membership_probes. A masked split takes probes only if its rep carries
-      // the visibility mask too, so the two compose into one selection.
-      if (sirius::decompression_pushdown_enabled() && dynamic_filters &&
-          dynamic_filters->has_filters()) {
-        auto const snapshot = dynamic_filters->snapshot();
-        auto snapshot_onto  = [&](auto* rep) {
-          if (mvcc_keep_mask.has_mask() && !rep->visibility_mask().has_mask()) { return; }
-          std::size_t const n_slots = rep->selected_indices().has_value()
-                                         ? rep->selected_indices()->size()
-                                         : rep->column_names().size();
-          auto snap                 = snapshot_membership_probes(snapshot, n_slots);
-          SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-            "[decompression-pushdown] join filter attach (decode time) channel={}: slots={} "
-             "attached={} "
-             "generation={} skipped_non_maskable={}",
-            static_cast<void const*>(dynamic_filters.get()),
-            n_slots,
-            snap.attached_probes,
-            snap.generation,
-            snap.skipped_non_mask);
-          if (snap.attached_probes == 0) { return; }
-          auto const base = rep->pushdown_scan()
-                               ? rep->pushdown_scan()
-                               : std::make_shared<const ::sirius::decompression_pushdown_scan>(
-                                  ::sirius::pushdown_request{});
-          rep->set_pushdown_scan(
-            base->with_membership_probes(std::move(snap.probes), snap.generation));
-        };
-        if (auto* device_rep =
-              dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
-          snapshot_onto(device_rep);
-        } else if (auto* host_rep =
-                     dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
-          snapshot_onto(host_rep);
-        }
-      }
-      mut.convert_to<::cucascade::gpu_table_representation>(
-        registry, requested_memory_space, stream);
       record_decode_outcome(mut.get_data());
 
-      // Conversion produces a fresh owned table for this split (raw GPU pins already use a plain
-      // gpu_table_representation, so they never reach this branch), so a filter-free scan may
+      // Conversion produces a fresh owned table for this split (raw GPU pins and prefetched
+      // tables fail converted_here), so a filter-free scan may
       // transfer its columns without touching shared pin storage. A decode-row-filtered split has
       // no filter copy left to make, so it regains the steal regardless of row_filter_pending.
       // Masked splits keep the view path: they filter by copy and need the source view alive. A
@@ -316,7 +318,7 @@ void scan_operator_input::prepare_for_processing(
       // built every replacement cast; a non-converting split can detach immediately because no
       // allocating GPU operation follows the take, so an OOM retry can never re-enter materialize
       // on a consumed split.
-      if (converted_table_transferable()) {
+      if (converted_here && converted_table_transferable()) {
         if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
           auto& space        = gpu_rep->get_memory_space();
           stolen_table_bytes = gpu_rep->get_size_in_bytes();
@@ -346,6 +348,10 @@ void scan_operator_input::prepare_for_processing(
 
 void scan_operator_input::record_decode_outcome(::cucascade::idata_representation const* data)
 {
+  // A decoded table, fresh or adopted, is a reused conversion on any retry: it keeps its history.
+  if (dynamic_cast<::cucascade::gpu_table_representation const*>(data) != nullptr) {
+    _decoded_input_reused = true;
+  }
   auto const* decoded =
     dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(data);
   if (decoded == nullptr) { return; }
@@ -519,20 +525,20 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
     bool const stolen = stolen_table != nullptr || stolen_table_consumed;
     return stolen ? batch_bytes : 2 * batch_bytes;
   }
-  // A dynamic-filter channel is wired to this operator whenever it sits
-  // downstream of a join build, regardless of whether that build has
-  // published yet — dynamic_filters is stamped at plan-conversion time, so
-  // it is a stable pre-decode fact, unlike has_filters(). prepare_for_processing
-  // attaches a fresh per-batch membership-probe snapshot for ANY published
-  // filter right before decode, whether or not the scan also carries a
-  // static row filter: each attached probe decodes its key column and
-  // allocates a BOOL8 result mask, on top of whatever compaction it drives.
-  // Reservation cannot know in advance whether a probe will actually attach
-  // (publication may race the estimate), so a wired channel gets the same
-  // conservative envelope as a known static filter rather than falling
-  // through to the zero-copy view estimate below.
-  bool const dynamic_filter_possible = sirius::decompression_pushdown_enabled() &&
-                                       dynamic_filters != nullptr && !mvcc_keep_mask.has_mask();
+  // A dynamic-filter consumer is wired to this operator whenever it sits downstream of a join
+  // build, regardless of whether that build has published yet -- consumer is stamped before task
+  // preparation, and the planner fixes its decode bindings (from scan_decode_bindings) when it
+  // creates the consumer, so both are stable pre-decode facts, unlike has_filters().
+  // prepare_for_processing selects fresh per-batch membership probes right before decode, whether
+  // or not the scan also carries a static row filter: each attached probe decodes its key column
+  // and allocates a BOOL8 result mask, on top of whatever compaction it drives. Reservation cannot
+  // know in advance whether a probe will actually attach (publication may race the estimate), so a
+  // consumer that can attach probes gets the same conservative envelope as a known static filter
+  // rather than falling through to the zero-copy view estimate below. A consumer without decode
+  // bindings never attaches a probe.
+  bool const dynamic_filter_possible =
+    sirius::decompression_pushdown_enabled() && consumer != nullptr &&
+    !consumer->decode_bindings().empty() && !mvcc_keep_mask.has_mask();
   if (row_filter_pending || dynamic_filter_possible) {
     // Once compaction has been measured unprofitable, later batches drop the
     // row selection and decode full width — keep the full-width envelope.
