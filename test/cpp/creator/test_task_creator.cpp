@@ -55,6 +55,11 @@ using namespace sirius;
  */
 class mock_sirius_physical_operator : public sirius_physical_operator {
  public:
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   mock_sirius_physical_operator(
     SiriusPhysicalOperatorType op_type = SiriusPhysicalOperatorType::PROJECTION)
     : sirius_physical_operator(op_type, {}, 0), _use_custom_hint(false), _custom_hint(std::nullopt)
@@ -270,7 +275,7 @@ class test_fixture {
   duckdb::DuckDB db;
   duckdb::Connection con;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
-  pipeline::pipeline_build_context build_ctx{nullptr, true};
+  pipeline::pipeline_build_context build_ctx{nullptr};
   sirius::exec::query_lifecycle_registry lifecycle;
   task_scheduler pipeline_exec;
   std::vector<std::shared_ptr<sirius_pipeline>> empty_pipelines;

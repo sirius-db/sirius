@@ -32,6 +32,11 @@ namespace op {
 
 class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::MERGE_AGGREGATE;
 

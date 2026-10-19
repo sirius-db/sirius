@@ -712,24 +712,21 @@ class sirius_physical_operator {
     return memory::saturating_mul(stats.bytes, 2);
   }
 
+  /// Local effect on logical row order: establish, discard, or preserve the input sequence.
+  /// Every concrete operator must make this decision explicitly; pipeline roles are irrelevant.
+  [[nodiscard]] virtual sirius::OrderPreservationType output_order_preservation() const = 0;
+
+  /// Resolve the output order of this plan subtree, following order-preserving operators.
+  /// INSERTION_ORDER at a leaf denotes an input sequence supplied outside this tree, not a
+  /// guarantee that batches have positions. This analysis does not consult session settings.
+  [[nodiscard]] sirius::OrderPreservationType output_order() const;
+
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  ::cuda::stream_ref stream);
-
-  //! The influence the operator has on order (insertion order means no influence)
-  virtual sirius::OrderPreservationType operator_order() const
-  {
-    return sirius::OrderPreservationType::INSERTION_ORDER;
-  }
 
  public:
   // Source interface
   virtual bool is_source() const { return false; }
-
-  //! The type of order emitted by the operator (as a source)
-  virtual sirius::OrderPreservationType source_order() const
-  {
-    return sirius::OrderPreservationType::INSERTION_ORDER;
-  }
 
   // Data-size estimator hooks. nullopt means unavailable; see
   // docs/super-sirius/data-size-estimation.md.
@@ -777,10 +774,6 @@ class sirius_physical_operator {
             _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
             _parent_op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
   }
-
-  //! Whether or not the sink operator depends on the order of the input chunks
-  //! If this is set to true, we cannot do things like caching intermediate vectors
-  virtual bool sink_order_dependent() const { return false; }
 
  public:
   // Pipeline construction

@@ -29,6 +29,11 @@ namespace op {
 
 class sirius_physical_sort_sample : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   enum class BoundaryState : uint8_t { NOT_DONE, SCHEDULED, DONE };
 
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::SORT_SAMPLE;
@@ -55,12 +60,6 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   // SORT_SAMPLE is not a pipeline sink — it runs as an intermediate operator in the
   // SORT_PARTITION pipeline, so the tree-based build matches the legacy 3-pipeline shape.
   bool is_sink() const override { return false; }
-  bool sink_order_dependent() const override { return false; }
-
-  sirius::OrderPreservationType source_order() const override
-  {
-    return sirius::OrderPreservationType::FIXED_ORDER;
-  }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;

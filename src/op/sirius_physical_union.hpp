@@ -31,6 +31,11 @@ namespace op {
 //! `port_label(i)` port.
 class sirius_physical_union : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::UNION;
 
   //! @param types  Output schema. The binder has already cast every arm to the common super-type,
@@ -48,10 +53,6 @@ class sirius_physical_union : public sirius_physical_operator {
   std::string get_name() const override;
 
   bool is_source() const override;
-
-  //! `order_preservation_recursive` stops at the first `is_source()` operator, so this answer
-  //! decides the whole plan's.
-  sirius::OrderPreservationType source_order() const override;
 
   //! The base throws for a non-sink operator with more than one child.
   void build_pipelines(pipeline::sirius_pipeline& current,

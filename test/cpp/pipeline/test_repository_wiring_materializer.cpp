@@ -15,6 +15,7 @@
  */
 
 #include "operator/partition_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
@@ -94,12 +95,12 @@ TEST_CASE("materialize: basic 4-arg-style wiring attaches port and records sink 
   cucascade::shared_data_repository_manager mgr;
 
   // Source pipeline: sink op pushes through "default" port at FULL barrier.
-  sirius_physical_operator source_sink;
+  sirius::op::test_physical_operator source_sink;
   auto src_pipeline = build_pipeline(env, &source_sink, /*operators=*/{}, /*pipeline_id=*/0);
 
   // Destination pipeline: first non-sink operator is the consumer.
-  sirius_physical_operator dest_first_op;
-  sirius_physical_operator dest_sink;
+  sirius::op::test_physical_operator dest_first_op;
+  sirius::op::test_physical_operator dest_sink;
   auto dest_pipeline = build_pipeline(env, &dest_sink, {&dest_first_op}, /*pipeline_id=*/1);
 
   std::vector<repository_wiring> wirings = {{std::string_view{"default"},
@@ -136,11 +137,11 @@ TEST_CASE("materialize: empty operators routes port onto destination sink",
   wiring_test_env env;
   cucascade::shared_data_repository_manager mgr;
 
-  sirius_physical_operator source_sink;
+  sirius::op::test_physical_operator source_sink;
   auto src_pipeline = build_pipeline(env, &source_sink, {}, /*pipeline_id=*/0);
 
   // Destination pipeline has no intermediate operators; port should go on the sink.
-  sirius_physical_operator dest_sink;
+  sirius::op::test_physical_operator dest_sink;
   auto dest_pipeline = build_pipeline(env, &dest_sink, /*operators=*/{}, /*pipeline_id=*/1);
 
   std::vector<repository_wiring> wirings = {{std::string_view{"scan"},
@@ -172,12 +173,12 @@ TEST_CASE("materialize: explicit source op (5-arg-style) records fanout on the s
   // Pipeline whose sink is a delim-join-style composite — the actual emitter is a
   // sub-operator, not the pipeline's sink. The descriptor carries the explicit
   // source_op, so add_next_port_after_sink should land on it instead of on the sink.
-  sirius_physical_operator pipeline_sink;
-  sirius_physical_operator sub_emitter;
+  sirius::op::test_physical_operator pipeline_sink;
+  sirius::op::test_physical_operator sub_emitter;
   auto src_pipeline = build_pipeline(env, &pipeline_sink, {}, /*pipeline_id=*/0);
 
-  sirius_physical_operator dest_first_op;
-  sirius_physical_operator dest_sink;
+  sirius::op::test_physical_operator dest_first_op;
+  sirius::op::test_physical_operator dest_sink;
   auto dest_pipeline = build_pipeline(env, &dest_sink, {&dest_first_op}, /*pipeline_id=*/1);
 
   std::vector<repository_wiring> wirings = {{std::string_view{"default"},
@@ -205,15 +206,15 @@ TEST_CASE("materialize: multiple wirings to the same destination attach distinct
   wiring_test_env env;
   cucascade::shared_data_repository_manager mgr;
 
-  sirius_physical_operator probe_sink;
+  sirius::op::test_physical_operator probe_sink;
   auto probe_pipeline = build_pipeline(env, &probe_sink, {}, /*pipeline_id=*/0);
 
-  sirius_physical_operator build_sink;
+  sirius::op::test_physical_operator build_sink;
   auto build_pipeline_handle = build_pipeline(env, &build_sink, {}, /*pipeline_id=*/1);
 
   // Hash-join-like destination: receives "default" from probe and "build" from build side.
-  sirius_physical_operator hash_join_op;
-  sirius_physical_operator dest_sink;
+  sirius::op::test_physical_operator hash_join_op;
+  sirius::op::test_physical_operator dest_sink;
   auto dest_pipeline = build_pipeline(env, &dest_sink, {&hash_join_op}, /*pipeline_id=*/2);
 
   std::vector<repository_wiring> wirings = {
@@ -255,15 +256,16 @@ TEST_CASE("materialize: delim join destinations use the generic path with no sib
   cucascade::shared_data_repository_manager mgr;
   duckdb::vector<sirius::logical_type> empty_types;
 
-  sirius_physical_operator source_sink;
+  sirius::op::test_physical_operator source_sink;
   auto src_pipeline = build_pipeline(env, &source_sink, {}, /*pipeline_id=*/0);
 
-  auto dummy_join = duckdb::make_uniq<sirius_physical_operator>(SiriusPhysicalOperatorType::INVALID,
-                                                                empty_types,
-                                                                /*estimated_cardinality=*/0);
-  dummy_join->children.push_back(duckdb::make_uniq<sirius_physical_operator>(
+  auto dummy_join =
+    duckdb::make_uniq<sirius::op::test_physical_operator>(SiriusPhysicalOperatorType::INVALID,
+                                                          empty_types,
+                                                          /*estimated_cardinality=*/0);
+  dummy_join->children.push_back(duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::INVALID, empty_types, 0));
-  dummy_join->children.push_back(duckdb::make_uniq<sirius_physical_operator>(
+  dummy_join->children.push_back(duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::INVALID, empty_types, 0));
 
   auto right_delim = duckdb::make_uniq<sirius_physical_right_delim_join>(
@@ -278,7 +280,7 @@ TEST_CASE("materialize: delim join destinations use the generic path with no sib
     empty_types, 0, sirius::test::operator_utils::single_partition_spec());
   right_delim->partition_join = partition_join.get();
 
-  sirius_physical_operator unused_sink;
+  sirius::op::test_physical_operator unused_sink;
   auto dest_pipeline = build_pipeline(env, &unused_sink, {right_delim.get()}, /*pipeline_id=*/1);
 
   std::vector<repository_wiring> wirings = {{std::string_view{"build"},

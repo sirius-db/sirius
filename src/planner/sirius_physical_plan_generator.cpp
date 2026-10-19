@@ -2224,53 +2224,6 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
 }
 
-sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(
-  sirius::op::sirius_physical_operator& op)
-{
-  if (op.is_source()) { return op.source_order(); }
-
-  std::size_t child_idx = 0;
-  for (auto& child : op.children) {
-    // Do not take the materialization phase of physical CTEs into account
-    if (op.type == sirius::op::SiriusPhysicalOperatorType::CTE && child_idx == 0) {
-      child_idx++;
-      continue;
-    }
-    auto child_preservation = order_preservation_recursive(*child);
-    if (child_preservation != sirius::OrderPreservationType::INSERTION_ORDER) {
-      return child_preservation;
-    }
-    child_idx++;
-  }
-  return sirius::OrderPreservationType::INSERTION_ORDER;
-}
-
-bool sirius_physical_plan_generator::preserve_insertion_order(
-  duckdb::ClientContext& context, sirius::op::sirius_physical_operator& plan)
-{
-  auto preservation_type = order_preservation_recursive(plan);
-  if (preservation_type == sirius::OrderPreservationType::FIXED_ORDER) {
-    // always need to maintain preservation order
-    return true;
-  }
-  if (preservation_type == sirius::OrderPreservationType::NO_ORDER) {
-    // never need to preserve order
-    return false;
-  }
-  // preserve insertion order - check flags
-  if (!duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context)) {
-    // preserving insertion order is disabled by config
-    return false;
-  }
-  return true;
-}
-
-bool sirius_physical_plan_generator::preserve_insertion_order(
-  sirius::op::sirius_physical_operator& plan)
-{
-  return preserve_insertion_order(context, plan);
-}
-
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOperator> op)
 {

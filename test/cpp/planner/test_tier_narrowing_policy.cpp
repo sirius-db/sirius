@@ -41,6 +41,7 @@
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 
@@ -798,7 +799,7 @@ TEST_CASE("tier_narrowing_policy - unmodeled operators and DELIM_JOIN sub-trees 
 {
   SECTION("an unmodeled operator above the carrier retracts it")
   {
-    auto boundary = duckdb::make_uniq<sirius_physical_operator>(
+    auto boundary = duckdb::make_uniq<sirius::op::test_physical_operator>(
       SiriusPhysicalOperatorType::TOP_N, integer_types(1), /*estimated_cardinality=*/1);
     boundary->children.push_back(make_integer_scan(1, {k_int8}));
     duckdb::unique_ptr<sirius_physical_operator> plan = std::move(boundary);
@@ -816,7 +817,7 @@ TEST_CASE("tier_narrowing_policy - unmodeled operators and DELIM_JOIN sub-trees 
                                    make_integer_scan(2, {k_int8, k_int8}),
                                    make_integer_scan(2, {k_int8, k_int16}),
                                    duckdb_integer_types(4));
-    auto delim    = duckdb::make_uniq<sirius::op::sirius_physical_delim_join>(
+    auto delim    = duckdb::make_uniq<sirius::op::test_delim_join>(
       SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
       integer_types(4),
       std::move(sub_join),
@@ -836,7 +837,7 @@ TEST_CASE("tier_narrowing_policy - unmodeled operators and DELIM_JOIN sub-trees 
 
   SECTION("DELIM_JOIN sub-tree survivors retract")
   {
-    auto delim = duckdb::make_uniq<sirius::op::sirius_physical_delim_join>(
+    auto delim = duckdb::make_uniq<sirius::op::test_delim_join>(
       SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
       integer_types(1),
       make_integer_scan(1, {k_int8}),

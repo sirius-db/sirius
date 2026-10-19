@@ -210,10 +210,7 @@ void with_conversion_result(
       std::make_shared<sirius::operator_params>(sirius_ctx_ptr->get_config().get_operator_params());
     query_operator_params->like_swar_fastpath = duckdb::like_swar_fastpath_enabled(context);
     pipeline::pipeline_build_context build_ctx(
-      /*telemetry_context=*/nullptr,
-      duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-      std::move(active_gpu_ids),
-      std::move(query_operator_params));
+      /*telemetry_context=*/nullptr, std::move(active_gpu_ids), std::move(query_operator_params));
 
     pipeline::sirius_pipeline_build_state state;
     auto root_pipeline =

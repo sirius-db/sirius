@@ -32,6 +32,11 @@ namespace sirius::op::scan {
 /// Mode controls whether AST masks supplement membership masks; finalization closes the channel.
 class sirius_physical_dynamic_filter : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DYNAMIC_FILTER;
 
   sirius_physical_dynamic_filter(duckdb::vector<sirius::logical_type> types,

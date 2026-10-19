@@ -34,6 +34,53 @@ An operator's position in a pipeline is determined by `sirius_engine::initialize
 
 See [Task Creator](task-creator.md) for per-operator overrides.
 
+## Output ordering
+
+Every concrete physical operator implements the pure virtual `output_order_preservation()`.
+This declaration describes its local effect on logical order, independently of its pipeline role:
+
+- `FIXED_ORDER`: establishes a global output sequence.
+- `NO_ORDER`: does not preserve a global input sequence.
+- `INSERTION_ORDER`: preserves the sequence supplied by its input; it does not establish one.
+
+`operator.output_order()` resolves this property over the physical plan subtree. Defining and
+order-destroying operators return their declaration directly. Preserving unary operators inherit
+their child's resolved order, even if they are pipeline sources. The traversal uses `get_children()`
+so collectors exposing a referenced plan participate. CTE nodes follow the consumer child, ignoring
+the materialization child. Other preserving multi-input shapes are rejected rather than combining
+unrelated sequences by child visitation order.
+
+An `INSERTION_ORDER` leaf retains that result: its input sequence is external to this tree.
+This is not proof that runtime batches carry positions. A planner must establish that external
+contract before choosing an ordered consumer; it must not silently treat this value as `NO_ORDER`.
+The analysis does not consult DuckDB's insertion-order setting or repository runtime state.
+
+Use this analysis after the child's GPU operator expansion. `ORDER_BY` and `TOP_N` execute local
+per-batch sorting; their expanded global result is established by `MERGE_SORT` and `MERGE_TOP_N`.
+The planner can query `limit.children[0]->output_order()` before choosing a LIMIT implementation
+and its pipeline boundary. LIMIT variant selection is separate from this ordering API.
+
+| Operator | `output_order_preservation()` |
+|---|---|
+| MERGE_SORT, MERGE_TOP_N | `FIXED_ORDER` |
+| ORDER_BY (local sort), TOP_N (local top-N), SORT_SAMPLE, SORT_PARTITION | `NO_ORDER` |
+| PARTITION, CONCAT, UNION | `NO_ORDER` |
+| HASH_JOIN, NESTED_LOOP_JOIN, DENSE_COUNT_JOIN, LEFT_DELIM_JOIN, RIGHT_DELIM_JOIN | `NO_ORDER` |
+| HASH_GROUP_BY, UNGROUPED_AGGREGATE, MERGE_GROUP_BY, MERGE_AGGREGATE | `NO_ORDER` |
+| GPU_SCAN | `NO_ORDER` |
+| PROJECTION, FILTER, DYNAMIC_FILTER, STREAMING_LIMIT | `INSERTION_ORDER` |
+| PASSTHROUGH_SINK, CTE, materialized RESULT_COLLECTOR | `INSERTION_ORDER` |
+| TABLE_SCAN, COLUMN_DATA_SCAN (including CTE_SCAN / DELIM_SCAN), GPU_VALUES | `INSERTION_ORDER` |
+| DUMMY_SCAN, EMPTY_RESULT, STREAMING_SOURCE | `INSERTION_ORDER` |
+| STREAMING_SINK: one destination or broadcast | `INSERTION_ORDER` per destination |
+| STREAMING_SINK: hash redistribution to multiple destinations | `NO_ORDER` |
+
+Abstract intermediates (partition consumer, delim join, result collector) leave the declaration
+pure virtual so concrete implementations must choose. Test-only structural placeholders use an
+explicit `NO_ORDER` test double. A subclass of a concrete operator can inherit its declared
+behavior; C++ pure virtual methods enforce the decision at the first concrete implementation,
+not anew for every descendant. Override the declaration when a specialization changes ordering.
+
 ## Scan Operators
 
 These operators produce data for pipelines. See [Scan](scan.md) for in-depth coverage.
@@ -358,8 +405,7 @@ DISTINCT lowering's grouped aggregate over the union itself, keyed on every colu
 - **Arm pipelines are created in reverse child order.** The converter schedules child
   meta-pipelines last-created-first, so reversing makes arm 0 pipeline #0: the scan `start_query`
   seeds and the top execution priority. Drain order therefore matches execution order.
-- **`source_order()` is `NO_ORDER`.** `order_preservation_recursive` stops at the first `is_source()`
-  operator, so this answer decides the whole plan's.
+- **Output order:** `NO_ORDER`; independently ordered arms do not define a global union order.
 - **Arm ports are cached.** Both task-driver methods run on every task-creation walk that reaches
   the operator, so the `"union_{i}"` names are resolved to `port*` once on first use.
 - **Carriers.** The compressed-schema pass treats `UNION` as a native boundary, which prevents two
