@@ -51,7 +51,10 @@ class exchange_inbox {
   explicit exchange_inbox(cucascade::memory::memory_space& gpu);
 
   /// Frees at least `bytes` of GPU memory if it can, e.g. by spilling to host; blocks until done.
-  using make_room_fn = std::function<void(std::size_t bytes)>;
+  /// Returns a reservation of `bytes` it made as soon as there was room, so that no other reserver
+  /// takes the freed bytes first, or null to have the caller try once more itself.
+  using make_room_fn =
+    std::function<std::unique_ptr<cucascade::memory::reservation>(std::size_t bytes)>;
 
   /// Lets held batches spill: they become visible to @p staging, so the downgrade executor may
   /// move them to host while they wait for their receivers, and bring_to_gpu() calls

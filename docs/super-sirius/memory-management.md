@@ -126,6 +126,8 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 
 **Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds -- single request, no over-freeing.
 
+**Exchange integration:** The direct and ring exchanges make room through `request_free_memory_and_wait(bytes, predicate)`, a byte-targeted request whose predicate makes the exchange's reservation itself: the bytes a spill frees are the exchange's at once, before any other reserver can take them.
+
 ### Spill Copy Granularity
 
 **Files:** `src/data/spill_chunked_converters.hpp`, `src/data/spill_chunked_converters.cpp`, `src/data/chunked_spill_copy.hpp`
