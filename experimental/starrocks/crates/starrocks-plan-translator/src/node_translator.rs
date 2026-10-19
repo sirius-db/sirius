@@ -794,19 +794,19 @@ fn translate_aggregation(
                 })
         };
         match (phase, state) {
-            (AggPhase::Partial, Some(PartialState::Average)) => {
-                // AVG ships the FP64 sum of its input and then its count. A decimal input is
-                // already cast to FP64 by `aggregate_call`; an integer one is cast here.
+            (AggPhase::Partial, Some(PartialState::Average { sum })) => {
+                // AVG ships the sum of its input and then its count. A decimal input is summed
+                // as it is, exactly; any other is cast to FP64 first.
                 let [argument] = <[Expression; 1]>::try_from(call.arguments)
                     .map_err(|_| TranslateError::malformed("avg must have exactly one argument"))?;
-                let argument = if expr_translator::is_decimal(&function.ret_type)? {
+                let argument = if is_decimal(&sum) {
                     argument
                 } else {
                     cast_to(type_mapper::fp64_type(true), argument)
                 };
                 // The count has no slot of its own.
                 for (name, ty, binding) in [
-                    ("sum", type_mapper::fp64_type(true), Some(slot)),
+                    ("sum", sum, Some(slot)),
                     ("count", type_mapper::i64_type(true), None),
                 ] {
                     measures.push(aggregate_measure(
@@ -820,7 +820,7 @@ fn translate_aggregation(
                     outputs.push((MeasureOutput::Column { column, cast: None }, binding));
                 }
             }
-            (AggPhase::Merge, Some(PartialState::Average)) => {
+            (AggPhase::Merge, Some(PartialState::Average { sum })) => {
                 // The exchange carries the sum in the slot's column and the count in the next
                 // one (see `translate_exchange`). Sum each, then divide.
                 let sum_column =
@@ -828,13 +828,43 @@ fn translate_aggregation(
                         TranslateError::malformed("a merge avg must read one partial-state slot")
                     })?)?;
                 for (column, ty) in [
-                    (sum_column, type_mapper::fp64_type(true)),
+                    (sum_column, sum),
                     (sum_column + 1, type_mapper::i64_type(true)),
                 ] {
                     measures.push(aggregate_measure(
                         ctx.registry,
                         "sum",
                         vec![field_selection(column as i32)],
+                        ty,
+                        false,
+                    ));
+                }
+                outputs.push((
+                    MeasureOutput::Average {
+                        sum: keys + measures.len() - 2,
+                        count: keys + measures.len() - 1,
+                        ty: final_type()?,
+                    },
+                    Some(slot),
+                ));
+            }
+            // A one-phase AVG over decimals: StarRocks' exact DECIMAL128(38, s+6) average is
+            // the decimal sum divided by the count, rounded (see `finish_aggregation`). DuckDB's
+            // avg(DECIMAL) would return DOUBLE.
+            (AggPhase::OneShot, None) if call.name == "avg" && is_decimal(&final_type()?) => {
+                let [argument] = <[Expression; 1]>::try_from(call.arguments)
+                    .map_err(|_| TranslateError::malformed("avg must have exactly one argument"))?;
+                for (name, ty) in [
+                    (
+                        "sum",
+                        agg_phase::average_sum_type(node.node_id, node.node_type, function)?,
+                    ),
+                    ("count", type_mapper::i64_type(true)),
+                ] {
+                    measures.push(aggregate_measure(
+                        ctx.registry,
+                        name,
+                        vec![argument.clone()],
                         ty,
                         false,
                     ));
@@ -878,23 +908,17 @@ fn translate_aggregation(
                     }
                     _ => (call.name.clone(), final_type()?),
                 };
-                // Some results are cast to their declared type; see `finish_aggregation`.
-                let decimal_avg = function_name == "avg" && is_decimal(&output_type);
+                // Some sums are cast to their declared type; see `finish_aggregation`.
                 let cast = ((phase != AggPhase::OneShot
                     && function_name == "sum"
                     && is_integer(&output_type))
-                    || (function_name == "sum" && is_decimal(&output_type))
-                    || decimal_avg)
-                    .then(|| output_type.clone());
+                    || (function_name == "sum" && is_decimal(&output_type)))
+                .then(|| output_type.clone());
                 measures.push(aggregate_measure(
                     ctx.registry,
                     &function_name,
                     call.arguments,
-                    if decimal_avg {
-                        type_mapper::fp64_type(true)
-                    } else {
-                        output_type
-                    },
+                    output_type,
                     call.distinct,
                 ));
                 outputs.push((
@@ -937,7 +961,7 @@ fn translate_aggregation(
                 .chain(std::iter::repeat_n(None, measure_count)),
         ),
     };
-    let finished = finish_aggregation(aggregated, keys, outputs, ctx);
+    let finished = finish_aggregation(aggregated, keys, outputs, ctx)?;
     // Node conjuncts evaluate over the aggregation output (HAVING predicates).
     apply_conjuncts(finished, node, ctx)
 }
@@ -1005,18 +1029,17 @@ fn aggregate_measure(
 ///   to the type the shared partial-state rule declares.
 /// - A decimal `sum` is cast to the FE's `DECIMAL128(38,s)`. DuckDB's exact decimal sum returns
 ///   the same type, so this only pins it.
-/// - AVG is computed in FP64 (`expr_translator::aggregate_call`); a decimal AVG is cast to the
-///   FE's `DECIMAL128(38, s+6)`, so its slot holds the type the FE declared. Needs
-///   sirius-db/sirius#2124: that cast reduces a DOUBLE to a decimal scale and must round; without
-///   it the GPU truncates, and an average can be one unit low in its last digit.
-/// - A merged AVG is its summed sums divided by its summed counts. The count sum is cast back
-///   to BIGINT the same way, then to FP64 for the division.
+/// - A decimal AVG, one-phase or merged, is its decimal sum divided by its count with
+///   `sirius_decimal_divide` at the FE's result scale: StarRocks' exact `DECIMAL128(38, s+6)`,
+///   rounded half away from zero. A merged count is a sum of counts, cast back to BIGINT the same
+///   way.
+/// - A merged AVG over integers or doubles divides in FP64, as DuckDB's avg does.
 fn finish_aggregation(
     aggregated: TranslatedRel,
     keys: usize,
     outputs: Vec<(MeasureOutput, Option<SlotKey>)>,
     ctx: &mut PlanContext<'_>,
-) -> TranslatedRel {
+) -> Result<TranslatedRel> {
     let unchanged = outputs.len() + keys == aggregated.layout.len()
         && outputs.iter().enumerate().all(|(index, (output, _))| {
             matches!(output, MeasureOutput::Column { column, cast: None } if *column == keys + index)
@@ -1029,10 +1052,10 @@ fn finish_aggregation(
                 .take(keys)
                 .chain(outputs.into_iter().map(|(_, binding)| binding)),
         );
-        return TranslatedRel {
+        return Ok(TranslatedRel {
             layout,
             ..aggregated
-        };
+        });
     }
     let key_columns: Vec<_> = aggregated.layout.columns().take(keys).collect();
     let mut columns: Vec<_> = key_columns
@@ -1049,6 +1072,15 @@ fn finish_aggregation(
                     None => field,
                 }
             }
+            MeasureOutput::Average { sum, count, ty } if is_decimal(&ty) => {
+                let count = cast_to(type_mapper::i64_type(true), field_selection(count as i32));
+                expr_translator::decimal_divide(
+                    ctx.registry,
+                    field_selection(sum as i32),
+                    count,
+                    &ty,
+                )?
+            }
             MeasureOutput::Average { sum, count, ty } => {
                 let fp64 = type_mapper::fp64_type(true);
                 let count = cast_to(
@@ -1064,15 +1096,13 @@ fn finish_aggregation(
                 if ty.kind == fp64.kind {
                     average
                 } else {
-                    // A decimal AVG: rounding to its scale needs sirius-db/sirius#2124 (see
-                    // above).
                     cast_to(ty, average)
                 }
             }
         };
         columns.push((expression, binding));
     }
-    project_rel(aggregated, columns)
+    Ok(project_rel(aggregated, columns))
 }
 
 /// A throwing cast of `input` to `ty`.
@@ -1674,10 +1704,10 @@ fn project_exprs_with_context(
         if let Some(root) = expr.nodes.first()
             && expr_translator::is_decimal(&root.type_)?
         {
-            expression = expr_translator::cast(
-                type_mapper::map_type_desc(&root.type_, root.is_nullable.unwrap_or(true))?,
-                expression,
-            );
+            let ty = type_mapper::map_type_desc(&root.type_, root.is_nullable.unwrap_or(true))?;
+            if !expr_translator::is_typed_as(&expression, &ty, ctx.registry) {
+                expression = expr_translator::cast(ty, expression);
+            }
         }
         expressions.push(expression);
     }
