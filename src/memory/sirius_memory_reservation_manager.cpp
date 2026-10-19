@@ -115,7 +115,7 @@ sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
   for (std::size_t i = 0; i < gpu_spaces.size() && i < prev_device_mrs_.size(); ++i) {
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{gpu_spaces[i]->get_device_id()}};
     cudaDeviceSynchronize();
-    runtime_stream_pool::remove(*gpu_spaces[i]);
+    runtime_stream_pools_[i].reset();
     cudf::set_current_device_resource(std::move(prev_device_mrs_[i]));
   }
 }

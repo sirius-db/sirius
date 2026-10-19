@@ -273,7 +273,8 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
 
   // Retain every destination and pooled stream while direct peer copies are submitted. Waiting
   // only after this loop lets different destination GPUs transfer concurrently.
-  std::vector<std::pair<std::unique_ptr<set_replica>, cucascade::memory::borrowed_stream>> pending;
+  std::vector<std::pair<std::unique_ptr<set_replica>, sirius::memory::runtime_stream_pool::lease>>
+    pending;
   pending.reserve(spaces.size());
   _set->replicas.reserve(_set->replicas.size() + spaces.size());
   for (auto const& target : spaces) {

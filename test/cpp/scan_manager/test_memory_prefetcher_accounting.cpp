@@ -45,6 +45,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <stop_token>
 #include <string>
@@ -481,7 +482,7 @@ TEST_CASE("runtime streams remain exclusive beyond the raw pool size",
           "[memory_prefetcher][runtime_streams]")
 {
   prefetcher_env e;
-  std::vector<cucascade::memory::borrowed_stream> leases;
+  std::vector<sirius::memory::runtime_stream_pool::lease> leases;
   std::vector<cudaStream_t> streams;
   for (int i = 0; i < 40; ++i) {
     auto lease  = sirius::memory::runtime_stream_pool::acquire(*e.gpu_space);
@@ -494,4 +495,75 @@ TEST_CASE("runtime streams remain exclusive beyond the raw pool size",
   // Streams survive the borrowing operation for buffers that retain a deallocation stream.
   for (auto stream : streams)
     REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+}
+
+TEST_CASE("runtime stream leases retain their pools after manager teardown",
+          "[memory_prefetcher][runtime_streams]")
+{
+  using pool = sirius::memory::runtime_stream_pool;
+  prefetcher_env e;
+  auto first = pool::acquire(*e.gpu_space);
+  // A second pool makes move assignment release the destination's last pool owner.
+  auto replacement         = pool::install(*e.gpu_space);
+  auto second              = pool::acquire(*e.gpu_space);
+  const auto first_stream  = first.get().get();
+  const auto second_stream = second.get().get();
+  REQUIRE(first_stream != second_stream);
+  replacement.reset();
+  e.mgr.reset();
+
+  // Only bare streams survive here, never allocations from the destroyed manager.
+  REQUIRE(cudaStreamSynchronize(first_stream) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(second_stream) == cudaSuccess);
+  auto moved = std::move(first);
+  first.reset();
+  moved = std::move(second);
+  REQUIRE(moved.get().get() == second_stream);
+  REQUIRE(cudaStreamSynchronize(moved.get().get()) == cudaSuccess);
+  second.reset();
+  moved.reset();
+  moved.reset();
+}
+
+TEST_CASE("runtime stream registration unwinds even with a live lease",
+          "[memory_prefetcher][runtime_streams]")
+{
+  using pool = sirius::memory::runtime_stream_pool;
+  prefetcher_env e;
+  std::optional<pool::lease> surviving_lease;
+  // Model a manager member installed before a later constructor operation throws.
+  // Retaining the lease distinguishes unregistering from an expired weak pointer.
+  struct failing_owner {
+    pool::registration registration;
+    failing_owner(const cucascade::memory::memory_space& space,
+                  std::optional<pool::lease>& retained)
+      : registration(pool::install(space))
+    {
+      retained.emplace(pool::acquire(space));
+      throw std::runtime_error("failure after stream registration");
+    }
+  };
+  REQUIRE_THROWS_AS((failing_owner{*e.gpu_space, surviving_lease}), std::runtime_error);
+  REQUIRE(surviving_lease.has_value());
+  REQUIRE_THROWS_AS(pool::acquire(*e.gpu_space), std::logic_error);
+  REQUIRE(cudaStreamSynchronize(surviving_lease->get().get()) == cudaSuccess);
+}
+
+TEST_CASE("runtime stream registrations preserve replacements when moved or reset",
+          "[memory_prefetcher][runtime_streams]")
+{
+  using pool = sirius::memory::runtime_stream_pool;
+  prefetcher_env e;
+  auto old     = pool::install(*e.gpu_space);
+  auto current = pool::install(*e.gpu_space);
+  auto moved   = std::move(current);
+  current.reset();
+  // Resetting the destination must leave the replacement registered.
+  old = std::move(moved);
+  moved.reset();
+  auto lease = pool::acquire(*e.gpu_space);
+  old.reset();
+  old.reset();
+  REQUIRE_THROWS_AS(pool::acquire(*e.gpu_space), std::logic_error);
+  REQUIRE(cudaStreamSynchronize(lease.get().get()) == cudaSuccess);
 }

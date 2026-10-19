@@ -295,11 +295,10 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       placement.get_next_gpu(/*pipeline_id=*/0, /*data=*/nullptr, /*hint=*/{}).value();
     auto* target = space_by_device.at(gpu_id);
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_id}};
-    // Borrow a real (non-default) stream from the target memory_space's pool: the
+    // Borrow a real (non-default) stream from the target's runtime stream pool: the
     // duckdb-native decoder's cudaMemcpyBatchAsync rejects the legacy default
-    // stream. The pool owns the stream for the memory_space's lifetime (which
-    // outlives the pinned data), so the materialized buffers' deallocation stream
-    // stays valid after this call.
+    // stream. The manager retains the pool until pinned data is retired, so the
+    // materialized buffers' deallocation stream stays valid after this call.
     auto stream_lease = sirius::memory::runtime_stream_pool::acquire(*target);
     auto stream       = stream_lease.get();
 

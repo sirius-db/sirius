@@ -415,7 +415,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
   auto const& source_space = source_target->get_gpu_space();
 
   // Keep copies and streams alive until all peer transfers are queued and synchronized.
-  std::vector<std::pair<std::unique_ptr<bloom_replica>, cucascade::memory::borrowed_stream>>
+  std::vector<std::pair<std::unique_ptr<bloom_replica>, sirius::memory::runtime_stream_pool::lease>>
     pending;
   pending.reserve(spaces.size());
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
