@@ -261,6 +261,23 @@ void scan_operator_input::prepare_for_processing(
           drop_row_selection(host_rep);
         }
       }
+      // Hand the scan's restore types to the decode, so a compacted decode can write a
+      // narrow-stored column directly in the type the scan would otherwise cast it to.
+      if (!decode_restore_types.empty()) {
+        auto attach_output_types = [&](auto* rep) {
+          if (!rep->pushdown_scan()) { return; }
+          std::vector<std::optional<cudf::data_type>> types(decode_restore_types.begin(),
+                                                            decode_restore_types.end());
+          rep->set_pushdown_scan(rep->pushdown_scan()->with_output_types(std::move(types)));
+        };
+        if (auto* device_rep =
+              dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
+          attach_output_types(device_rep);
+        } else if (auto* host_rep =
+                     dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
+          attach_output_types(host_rep);
+        }
+      }
       // Decode-time join filter snapshot: the scan-manager drain runs at query
       // PREPARE, before any join build has published, so a drain-time snapshot
       // is empty for the whole scan. Executor tasks prepare right before decode

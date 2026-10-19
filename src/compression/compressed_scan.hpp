@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <cudf/types.hpp>
+
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
@@ -151,6 +153,11 @@ struct pushdown_request {
   /// the request can reconsider when a tighter set arrives.
   std::uint64_t membership_generation = 0;
 
+  /// Types the scan restores each slot to (parallel to @c columns), or empty. A compacted decode
+  /// may write a slot directly in its restore type, saving the scan's widening cast (see
+  /// @ref decompression_pushdown_scan::with_output_types).
+  std::vector<std::optional<cudf::data_type>> output_types;
+
   /// True iff the @c range entries are the scan's WHOLE row-restricting
   /// filter. Only then can a chunk come back needing no filter at all; a
   /// partial request always leaves a residual for the scan to evaluate.
@@ -276,6 +283,10 @@ class decompression_pushdown_scan {
   /// working; only the attempt to compact is given up. Null if nothing is left
   /// to ask for.
   [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> without_row_selection() const;
+
+  /// A copy of this scan whose request carries the scan's per-slot restore types.
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> with_output_types(
+    std::vector<std::optional<cudf::data_type>> output_types) const;
 
   /// This scan with its join filters replaced by a fresher snapshot. @p probes
   /// is parallel to the selected column list.
