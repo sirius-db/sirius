@@ -25,7 +25,6 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
-#include "op/sirius_physical_limit.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
@@ -508,10 +507,6 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
           throw thrust::system_error(static_cast<int>(cudaErrorLaunchOutOfResources),
                                      thrust::cuda_category(),
                                      "injected GPU task launch failure");
-      }
-      if (op.type == op::SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT) {
-        op.Cast<op::sirius_physical_unordered_streaming_limit>().claim_input(
-          operator_input_output_data);
       }
       operator_input_output_data = run_one_operator(
         op, *operator_input_output_data, stream, pipeline, _task_id, operators.size(), _allocator);
