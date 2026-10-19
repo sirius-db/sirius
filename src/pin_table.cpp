@@ -258,11 +258,14 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
 
   // SIRIUS_PIN_PHASE_DEBUG prints where a pin's time went; it synchronizes after each decode,
   // so only for attribution.
-  bool const timing       = std::getenv("SIRIUS_PIN_PHASE_DEBUG") != nullptr;
-  std::size_t const depth = [] {
-    auto const* v = std::getenv("SIRIUS_PIN_OVERLAP");
-    return v == nullptr ? std::size_t{2} : static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
-  }();
+  bool const timing     = std::getenv("SIRIUS_PIN_PHASE_DEBUG") != nullptr;
+  auto const* depth_env = std::getenv("SIRIUS_PIN_OVERLAP");
+  std::size_t depth     = depth_env == nullptr
+                            ? std::size_t{2}
+                            : static_cast<std::size_t>(std::strtoull(depth_env, nullptr, 10));
+  // With a budget, the depth follows the first batch's size: each batch ahead holds its staging
+  // and its decoded table, about twice its decoded bytes.
+  bool depth_sized  = depth_env != nullptr || options.in_flight_budget_bytes == 0;
   auto const pin_t0 = std::chrono::steady_clock::now();
   std::atomic<std::int64_t> decode_ns{0};
   double finish_s = 0, wait_s = 0;
@@ -420,9 +423,11 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
 
   // Up to `depth` batches are read and decoded on workers while this thread finishes the oldest
   // one, so file reads, both transfers and the decode of neighbouring batches overlap; batches are
-  // still finished in emission order. SIRIUS_PIN_OVERLAP sets the depth (default 2; a 38 GB pin
-  // on an RTX A5000 took 13.8 / 9.4 / 7.9 / 7.3 s at 0 / 1 / 2 / 3); 0 does each batch start to
-  // finish.
+  // still finished in emission order. SIRIUS_PIN_OVERLAP sets the depth (a 38 GB pin on an RTX
+  // A5000 took 13.8 / 9.4 / 7.9 / 7.3 s at 0 / 1 / 2 / 3); 0 does each batch start to finish.
+  // Without it the depth fits the caller's budget, between 2 and 16: the reads only spread over
+  // the ioctx's reactors when enough batches are in flight (Deep10M on the GPU, 4 reactors: 2
+  // batches 0.47 s, 16 batches 0.23 s).
   auto const since = [](auto t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   };
@@ -450,6 +455,11 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   };
   auto handle_batch = [&](std::unique_ptr<op::scan::scan_info> batch) {
     if (!batch) { return; }
+    if (!depth_sized) {
+      depth_sized          = true;
+      auto const per_batch = std::max<std::size_t>(1, 2 * batch->estimated_bytes());
+      depth = std::clamp<std::size_t>(options.in_flight_budget_bytes / per_batch, 2, 16);
+    }
     if (depth == 0) {
       timed_finish(timed_decode(std::move(batch)));
       return;

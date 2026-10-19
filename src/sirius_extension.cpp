@@ -1277,6 +1277,16 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   if (gpu_spaces.empty()) {
     throw InvalidInputException("pin_table: no GPU memory space available");
   }
+  // The batches read ahead hold host staging and device memory, so they may take an eighth of the
+  // smaller of the GPU and host spaces.
+  std::size_t in_flight_budget = std::numeric_limits<std::size_t>::max();
+  for (auto* sp : gpu_spaces) {
+    in_flight_budget = std::min<std::size_t>(in_flight_budget, sp->get_max_memory());
+  }
+  for (auto* sp : memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+    in_flight_budget = std::min<std::size_t>(in_flight_budget, sp->get_max_memory());
+  }
+  in_flight_budget /= 8;
 
   // For host tier, build a target_gpu_id -> NUMA-local host memory_space map.
   // Each round-robin GPU's host conversion should pin its data on the host
@@ -1543,7 +1553,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                       pin_comp,
                                       {.capture_chunk_stats               = capture_chunk_stats,
                                        .enable_compressed_materialization = compressed_pin,
-                                       .probe_unique_columns              = probe_unique_columns});
+                                       .probe_unique_columns              = probe_unique_columns,
+                                       .in_flight_budget_bytes            = in_flight_budget});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(host_result.column_storage));
@@ -1598,7 +1609,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                                pinned_column_types,
                                                {.capture_chunk_stats = capture_chunk_stats,
                                                 .enable_compressed_materialization = compressed_pin,
-                                                .probe_unique_columns = probe_unique_columns});
+                                                .probe_unique_columns   = probe_unique_columns,
+                                                .in_flight_budget_bytes = in_flight_budget});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(mat.column_storage));
