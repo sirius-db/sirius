@@ -64,10 +64,10 @@ detail::batched_codec_ops const& deflate_ops()
 }  // namespace
 
 std::unique_ptr<cudf::column> deflate_compressed_representation::decompress(
-  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+  decode_frame& frame) const
 {
   return detail::nvcomp_decompress_impl(
-    deflate_ops(), payload_data(), payload_size(), original_type, num_rows, stream, mr);
+    deflate_ops(), payload_data(), payload_size(), original_type, num_rows, frame);
 }
 
 std::unique_ptr<compressed_representation> deflate_compressor::compress(

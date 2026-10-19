@@ -126,16 +126,16 @@ void io_roundtrip(char const* label,
            (std::string(label) + ": data mismatch col " + std::to_string(i)).c_str());
 }
 
-// In-memory (pinned-blob) roundtrip via the production pin-path entry points:
+// Serialize `ct` through the production pin-path entry points and read it back:
 // build_compressed_table_header enumerates payload buffers, we assemble the
 // payload host-side, then read_compressed_table_from_memory reconstructs
-// through the same fetch seam pin_table uses.
-void memory_roundtrip(char const* label, cudf::table_view input, std::string const& dsl)
+// through the same fetch seam pin_table uses. Read errors land in `rerr`.
+simpatico::compressed_table memory_reread(char const* label,
+                                          simpatico::compressed_table const& ct,
+                                          std::string& rerr)
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
   auto mr                   = rmm::mr::get_current_device_resource_ref();
-
-  simpatico::compressed_table ct = simpatico::compress_with_plan(input, dsl, stream, mr);
 
   std::vector<std::uint8_t> header;
   std::vector<simpatico::payload_buffer_ref> buffers;
@@ -162,9 +162,18 @@ void memory_roundtrip(char const* label, cudf::table_view input, std::string con
         throw std::runtime_error("memory_roundtrip: fetch copy failed");
     };
 
+  return simpatico::read_compressed_table_from_memory(header, fetch, stream, mr, &rerr);
+}
+
+// In-memory (pinned-blob) roundtrip; see memory_reread.
+void memory_roundtrip(char const* label, cudf::table_view input, std::string const& dsl)
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                   = rmm::mr::get_current_device_resource_ref();
+
+  simpatico::compressed_table ct = simpatico::compress_with_plan(input, dsl, stream, mr);
   std::string rerr;
-  simpatico::compressed_table ct2 =
-    simpatico::read_compressed_table_from_memory(header, fetch, stream, mr, &rerr);
+  simpatico::compressed_table ct2 = memory_reread(label, ct, rerr);
   expect(rerr.empty(), (std::string(label) + ": read error: " + rerr).c_str());
 
   auto out = simpatico::decompress(ct2, stream, mr);
@@ -314,6 +323,94 @@ void test_dictionary()
 {
   auto t = make_string_table(4096, cudf::get_default_stream());
   io_roundtrip("dictionary", t->view(), "input -> dictionary\n");
+}
+
+// PlanNode::dictionary_key_width_hint is never serialized: both readers derive it from the stored
+// tree, so a read publishes the value the compress walk did, -1 where neither can know (a consumed
+// keys_offsets), and -1 where only the reader declines to look (a key set above its readback bound,
+// kMaxHintOffsets in api/compressed_table_io.cpp).
+void test_dictionary_key_width_hint()
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                   = rmm::mr::get_current_device_resource_ref();
+  auto const make_input     = [&](std::vector<std::string> const& keys) {
+    std::vector<std::string> values(2048);
+    for (std::size_t i = 0; i < values.size(); ++i)
+      values[i] = keys[(i * 5 + i / 7) % keys.size()];
+    return make_strings_column(values, {}, stream);
+  };
+  // 65536 distinct six-byte keys, one per row, give 65537 offsets: one past the reader's bound.
+  std::vector<std::string> many_keys(65536);
+  for (std::size_t i = 0; i < many_keys.size(); ++i) {
+    auto const digits = std::to_string(i);
+    many_keys[i]      = "K" + std::string(5 - digits.size(), '0') + digits;
+  }
+  constexpr char const* identity_offsets_plan =
+    "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+    "dictionary.indices -> bitpack\n";
+  struct shape {
+    char const* label;
+    std::unique_ptr<cudf::column> input;
+    char const* plan;
+    std::int64_t encode_expected;
+    std::int64_t read_expected;
+  };
+  std::vector<std::string> const uniform{"AB", "CD", "EF"};
+  std::vector<std::string> const variable{"A", "BB", "CCC"};
+  shape const shapes[] = {
+    {"self", make_input(uniform), "input -> dictionary\n", 2, 2},
+    {"one-byte keys", make_input({"A", "N", "R"}), identity_offsets_plan, 1, 1},
+    {"variable width self", make_input(variable), "input -> dictionary\n", 0, 0},
+    {"identity offsets", make_input(uniform), identity_offsets_plan, 2, 2},
+    {"bitpacked offsets",
+     make_input(uniform),
+     "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+     "dictionary.keys_offsets -> bitpack\n"
+     "dictionary.indices -> bitpack\n",
+     -1,
+     -1},
+    {"variable width", make_input(variable), identity_offsets_plan, 0, 0},
+    {"key set above the readback bound",
+     make_strings_column(many_keys, {}, stream),
+     identity_offsets_plan,
+     6,
+     -1},
+  };
+  auto hint_of = [](simpatico::compressed_table const& table) {
+    auto const& nodes = table.columns.front().plan_tree->nodes;
+    auto const node   = std::find_if(nodes.begin(), nodes.end(), [](simpatico::PlanNode const& n) {
+      return n.op == "dictionary";
+    });
+    expect(node != nodes.end(), "dictionary hint: plan has no dictionary node");
+    return node->dictionary_key_width_hint;
+  };
+  auto verify = [&](shape const& s,
+                    char const* producer,
+                    simpatico::compressed_table const& table,
+                    std::int64_t expected) {
+    auto const context = std::string("dictionary hint: ") + s.label + ", " + producer;
+    expect(hint_of(table) == expected, (context + ": value").c_str());
+    auto out = simpatico::decompress(table, stream, mr);
+    expect(out != nullptr && out->num_columns() == 1 &&
+             columns_equal_any(s.input->view(), out->view().column(0), stream),
+           (context + ": data mismatch").c_str());
+  };
+  for (auto const& s : shapes) {
+    auto ct =
+      simpatico::compress_with_plan(cudf::table_view{{s.input->view()}}, s.plan, stream, mr);
+    verify(s, "encode", ct, s.encode_expected);
+    TmpFile tmp;
+    std::string werr = simpatico::write_compressed_table(ct, tmp.path);
+    expect(werr.empty(), "dictionary hint: write error");
+    std::string rerr;
+    auto from_file = simpatico::read_compressed_table(tmp.path, stream, mr, &rerr);
+    expect(rerr.empty(), "dictionary hint: file read error");
+    verify(s, "file read", from_file, s.read_expected);
+    std::string merr;
+    auto from_memory = memory_reread("dictionary_key_width_hint", ct, merr);
+    expect(merr.empty(), "dictionary hint: memory read error");
+    verify(s, "memory read", from_memory, s.read_expected);
+  }
 }
 
 // 5. Multi-column: three columns with three different plans in one file.
@@ -529,6 +626,26 @@ void test_error_not_found()
   expect(ct.columns.empty(), "error_not_found: expected empty result");
 }
 
+// Error: a stored edge that names a channel its producer does not output is reported through the
+// reader's error string, not thrown and not wired to another channel.
+void test_error_unknown_edge_channel()
+{
+  auto t         = make_int32_table(1, 4096, 17);
+  auto ct        = simpatico::compress_with_plan(t->view(),
+                                          "input -> for -> deltas, references\n"
+                                                 "for.deltas -> bitpack\n",
+                                          cudf::get_default_stream(),
+                                          rmm::mr::get_current_device_resource_ref());
+  auto& producer = ct.columns[0].plan_tree->nodes[1];
+  expect(producer.op == "for" && producer.children.size() == 1, "error_unknown_edge: plan shape");
+  producer.children.front().channel = "unknown";
+  std::string err;
+  auto const reread = memory_reread("error_unknown_edge", ct, err);
+  expect(err.find("does not output") != std::string::npos,
+         ("error_unknown_edge: unexpected error '" + err + "'").c_str());
+  expect(reread.columns.empty(), "error_unknown_edge: expected empty result");
+}
+
 // Error: a non-HPLN file (garbage) is rejected rather than crashing.
 void test_error_garbage()
 {
@@ -665,12 +782,14 @@ int main()
     {"bitjoin_f32", test_bitjoin_f32},
     {"alp_rd_f64", test_alp_rd_f64},
     {"dictionary", test_dictionary},
+    {"dictionary_key_width_hint", test_dictionary_key_width_hint},
     {"multi_column", test_multi_column},
     {"selective_decompression", test_selective_decompression},
     {"memory_subset_read", test_memory_subset_read},
     {"column_names_survive", test_column_names_survive},
     {"zero_rows", test_zero_rows},
     {"error_not_found", test_error_not_found},
+    {"error_unknown_edge_channel", test_error_unknown_edge_channel},
     {"error_garbage", test_error_garbage},
     {"error_bad_magic", test_error_bad_magic},
     {"error_bad_version", test_error_bad_version},
