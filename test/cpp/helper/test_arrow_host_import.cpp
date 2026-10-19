@@ -236,12 +236,23 @@ class bounded_host_resource : public std::pmr::memory_resource {
 };
 
 #if defined(__linux__)
+struct import_copy_observation {
+  cudaStream_t stream;
+  int calls{0};
+  std::size_t bytes{0};
+  bool wrong_stream{false};
+};
+thread_local import_copy_observation* active_import_copies = nullptr;
+
 struct import_drain_fault {
   cudaStream_t stream;
   const import_test_resource::state& resource;
+  const import_copy_observation& copies;
   cudaError_t results[2];
   int calls{0};
   std::size_t live_bytes[2]{};
+  int copy_calls[2]{};
+  std::size_t copy_bytes[2]{};
   cudaError_t actual_status[2]{};
 };
 thread_local import_drain_fault* active_import_drain_fault = nullptr;
@@ -250,6 +261,26 @@ thread_local import_drain_fault* active_import_drain_fault = nullptr;
 }  // namespace
 
 #if defined(__linux__)
+extern "C" cudaError_t __real_cudaMemcpyAsync(void* destination,
+                                              const void* source,
+                                              std::size_t bytes,
+                                              cudaMemcpyKind kind,
+                                              cudaStream_t stream);
+extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* destination,
+                                              const void* source,
+                                              std::size_t bytes,
+                                              cudaMemcpyKind kind,
+                                              cudaStream_t stream)
+{
+  auto* copies = active_import_copies;
+  if (copies != nullptr && kind == cudaMemcpyHostToDevice) {
+    ++copies->calls;
+    copies->bytes += bytes;
+    copies->wrong_stream |= stream != copies->stream;
+  }
+  return __real_cudaMemcpyAsync(destination, source, bytes, kind, stream);
+}
+
 extern "C" cudaError_t __real_cudaStreamSynchronize(cudaStream_t stream);
 extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream)
 {
@@ -259,6 +290,8 @@ extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream)
   }
   const auto call            = fault->calls++;
   fault->live_bytes[call]    = fault->resource.live_bytes.load();
+  fault->copy_calls[call]    = fault->copies.calls;
+  fault->copy_bytes[call]    = fault->copies.bytes;
   const auto actual          = __real_cudaStreamSynchronize(stream);
   fault->actual_status[call] = actual;
   // Drain real work before reporting a synthetic failure, keeping this process usable.
@@ -677,8 +710,20 @@ TEST_CASE("arrow_host_import: bit-offset boundary slices normalize before GPU co
   rmm::cuda_stream stream;
   import_test_resource resource;
   resource.counts->expected_stream = stream.value();
-  auto table =
-    sirius::import_arrow_host_table(plan, stream.view(), rmm::device_async_resource_ref{resource});
+  std::unique_ptr<cudf::table> table;
+  {
+#if defined(__linux__)
+    import_copy_observation copies{stream.value()};
+    scoped_restore restore(active_import_copies);
+    active_import_copies = &copies;
+#endif
+    table = sirius::import_arrow_host_table(
+      plan, stream.view(), rmm::device_async_resource_ref{resource});
+#if defined(__linux__)
+    REQUIRE(copies.calls >= 2);
+    REQUIRE_FALSE(copies.wrong_stream);
+#endif
+  }
   REQUIRE(resource.counts->attempts > 0);
   const auto booleans       = copy_column_to_host<bool>(table->get_column(0).view());
   const auto integers       = copy_column_to_host<std::int32_t>(table->get_column(1).view());
@@ -739,13 +784,17 @@ TEST_CASE("arrow_host_import: actual import classifies failed drains and preserv
   rmm::cuda_stream stream;
   import_test_resource resource(scenario == 2 ? -1 : 1);
   resource.counts->expected_stream = stream.value();
+  import_copy_observation copies{stream.value()};
   import_drain_fault fault{stream.value(),
                            *resource.counts,
+                           copies,
                            {scenario == 0 ? cudaSuccess : cudaErrorUnknown, cudaErrorInvalidValue}};
   std::exception_ptr failure;
   {
     scoped_restore restore(active_import_drain_fault);
+    scoped_restore restore_copies(active_import_copies);
     active_import_drain_fault = &fault;
+    active_import_copies      = &copies;
     try {
       auto table = sirius::import_arrow_host_table(
         plan, stream.view(), rmm::device_async_resource_ref{resource});
@@ -755,6 +804,10 @@ TEST_CASE("arrow_host_import: actual import classifies failed drains and preserv
   }
   REQUIRE(failure != nullptr);
   REQUIRE(fault.calls == (scenario == 2 ? 2 : 1));
+  REQUIRE(resource.counts->attempts == 2);
+  REQUIRE_FALSE(copies.wrong_stream);
+  REQUIRE(fault.copy_calls[0] == (scenario == 2 ? 2 : 1));
+  REQUIRE(fault.copy_bytes[0] == (scenario == 2 ? 256 : 128));
   REQUIRE(fault.live_bytes[fault.calls - 1] == 0);
   for (int call = 0; call < fault.calls; ++call) {
     REQUIRE(fault.actual_status[call] == cudaSuccess);
@@ -770,8 +823,16 @@ TEST_CASE("arrow_host_import: actual import classifies failed drains and preserv
     }
   }
   if (scenario == 2) {
-    REQUIRE(fault.live_bytes[0] > 0);
-    REQUIRE_THROWS_AS(std::rethrow_exception(failure), cudf::cuda_error);
+    REQUIRE(fault.live_bytes[0] == 256);
+    REQUIRE(fault.copy_calls[1] == 2);
+    REQUIRE(fault.copy_bytes[1] == 256);
+    try {
+      std::rethrow_exception(failure);
+      FAIL("missing original success-sync error");
+    } catch (const cudf::cuda_error& error) {
+      REQUIRE(error.error_code() == cudaErrorUnknown);
+      REQUIRE_THAT(error.what(), ContainsSubstring("cudaErrorUnknown"));
+    }
   } else {
     REQUIRE(resource.counts->failed);
     REQUIRE_THROWS_MATCHES(std::rethrow_exception(failure),

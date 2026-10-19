@@ -109,7 +109,8 @@ target_link_options(sirius_unittest PRIVATE
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Only the test executable substitutes selected import drain results.
   target_link_options(sirius_unittest PRIVATE
-                      "LINKER:--wrap=cudaStreamSynchronize")
+                      "LINKER:--wrap=cudaStreamSynchronize"
+                      "LINKER:--wrap=cudaMemcpyAsync")
 endif()
 
 # Isolated opt-in host allocation fault tests; the runner supplies exact
