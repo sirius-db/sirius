@@ -18,7 +18,7 @@ use std::path::Path;
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
-use cxx::{CxxVector, Exception, UniquePtr, let_cxx_string};
+use cxx::{Exception, UniquePtr, let_cxx_string};
 
 /// An initialized Sirius engine context.
 ///
@@ -114,8 +114,7 @@ impl SiriusContext {
         collect_arrow_stream(stream)
     }
 
-    /// This context's [`DirectExchange`], or `None` unless it has one GPU memory space configured
-    /// with `allocator: slab`.
+    /// This context's [`DirectExchange`], or `None` unless it has one GPU memory space.
     pub fn direct_exchange(&self) -> Option<DirectExchange> {
         let inner = self.inner.borrow().direct_exchange();
         (!inner.is_null()).then_some(DirectExchange { inner })
@@ -234,29 +233,6 @@ impl Fragment<'_> {
         )
     }
 
-    /// Export the next batch with rows parked on output stream `stream_id` for a
-    /// [`DirectExchange`] peer, or `None` once the stream is drained. Release `token` on this
-    /// context's exchange once the buffers in `src` were written. An error after the batch was
-    /// pulled drops it and the next call moves on to the next batch, so fail the query instead of
-    /// retrying.
-    pub fn export_direct(&mut self, stream_id: u64) -> Result<Option<ExportedBatch>, Exception> {
-        let (mut token, mut rows) = (0, 0);
-        let mut src = CxxVector::new();
-        let layout =
-            self.inner
-                .pin_mut()
-                .export_direct(stream_id, &mut token, &mut rows, src.pin_mut())?;
-        if layout.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(ExportedBatch {
-            token,
-            rows,
-            layout: layout.as_slice().to_vec(),
-            src: address_pairs(&src),
-        }))
-    }
-
     /// Push the batch received under `token` into input stream `stream_id`, consuming the token
     /// unless the call fails before reading it: before `build`, after `run` started, or on an
     /// undeclared input. A batch whose columns differ from the declared ones is refused.
@@ -314,49 +290,22 @@ impl Fragment<'_> {
     }
 }
 
-/// One batch exported by [`Fragment::export_direct`].
-#[derive(Debug)]
-pub struct ExportedBatch {
-    /// Releases the batch on the sender's [`DirectExchange`] once `src` was written.
-    pub token: u64,
-    pub rows: u64,
-    /// What the receiver passes to [`DirectExchange::allocate`].
-    pub layout: Vec<u8>,
-    /// `(address, length)` of each buffer, pairing with the receiver's allocation.
-    pub src: Vec<(u64, u64)>,
-}
-
-/// Receives batches straight into a context's GPU slab, from [`SiriusContext::direct_exchange`].
-/// The full contract is documented on the C++ `sirius::ffi::DirectExchange`.
+/// Holds batches a transport received until [`Fragment::push_received`] takes them by token, from
+/// [`SiriusContext::direct_exchange`]. The full contract is documented on the C++
+/// `sirius::ffi::DirectExchange`.
 pub struct DirectExchange {
     inner: UniquePtr<sirius_sys::DirectExchange>,
 }
 
-// SAFETY: the C++ handle shares the context's registry, which serializes every call on one mutex
-// and sets the CUDA device itself, so no state behind it is tied to a thread.
+// SAFETY: the C++ handle shares the context's token table, which serializes every call on one
+// mutex and sets the CUDA device itself, so no state behind it is tied to a thread.
 unsafe impl Send for DirectExchange {}
 unsafe impl Sync for DirectExchange {}
 
 impl DirectExchange {
-    /// The CUDA device, base address and length of the slab every buffer lies in.
-    pub fn region(&self) -> (i32, usize, u64) {
-        (
-            self.inner.device(),
-            self.inner.region_base(),
-            self.inner.region_len(),
-        )
-    }
-
-    /// Allocate buffers for a sender's `layout` without waiting for memory. Returns the token
-    /// and the `(address, length)` of each buffer, pairing with the sender's `src`.
-    pub fn allocate(&self, layout: &[u8]) -> Result<(u64, Vec<(u64, u64)>), Exception> {
-        let mut token = 0;
-        // SAFETY: the address and length name `layout`, borrowed for the whole call.
-        let dst = unsafe {
-            self.inner
-                .allocate(layout.as_ptr() as usize, layout.len(), &mut token)?
-        };
-        Ok((token, address_pairs(&dst)))
+    /// The CUDA device of the context's GPU memory space.
+    pub fn device(&self) -> i32 {
+        self.inner.device()
     }
 
     /// Free what `token` holds. Unknown and consumed tokens are ignored.
@@ -373,14 +322,9 @@ impl DirectExchange {
 impl std::fmt::Debug for DirectExchange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("DirectExchange")
-            .field(&self.region())
+            .field(&self.device())
             .finish()
     }
-}
-
-fn address_pairs(flat: &CxxVector<u64>) -> Vec<(u64, u64)> {
-    let (pairs, _) = flat.as_slice().as_chunks::<2>();
-    pairs.iter().map(|&[address, len]| (address, len)).collect()
 }
 
 /// Error returned by [`SiriusContext::execute_substrait`] and [`Fragment::result_to_arrow`].
@@ -659,18 +603,15 @@ mod tests {
         );
     }
 
-    /// Exports a scan's batches and allocates their receive buffers on the same context's slab,
-    /// without writing them: the buffers pair up and every token is accounted for. Requires a
-    /// GPU.
+    /// A context's direct exchange starts empty, refuses a token it never handed out, and may
+    /// outlive its context, after which every call but `device` fails. Requires a GPU.
     #[test]
-    fn direct_exchange_pairs_buffers_and_accounts_tokens() {
+    fn direct_exchange_refuses_unknown_tokens_and_outlives_its_context() {
         let _guard = GPU_CONTEXT_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("users.parquet");
-        write_users_parquet(&path);
-        let config = dir.path().join("slab.yaml");
+        let config = dir.path().join("one_gpu.yaml");
         std::fs::write(
             &config,
             "sirius:
@@ -680,50 +621,30 @@ mod tests {
     gpu:
       - device_id: 0
         memory_capacity: 2147483648
-        allocator: slab
     host:
       - numa_id: 0
         memory_capacity: 4294967296
 ",
         )
         .unwrap();
-
-        let ctx = SiriusContext::from_config_file(&config).expect("bring up slab context");
+        let ctx = SiriusContext::from_config_file(&config).expect("bring up one-GPU context");
         let exchange = ctx
             .direct_exchange()
-            .expect("slab context has a direct exchange");
-        let mut sender = ctx.fragment().unwrap();
-        sender.declare_output(0).unwrap();
-        sender
-            .build(&local_files_plan(
-                path.to_str().unwrap(),
-                vec!["id".to_string(), "name".to_string()],
-            ))
-            .unwrap();
-        sender.run().unwrap();
-        let mut rows = 0;
-        let mut layout = Vec::new();
-        while let Some(batch) = sender.export_direct(0).unwrap() {
-            rows += batch.rows;
-            layout.clone_from(&batch.layout);
-            let (token, dst) = exchange.allocate(&batch.layout).unwrap();
-            let lengths = |buffers: &[(u64, u64)]| buffers.iter().map(|b| b.1).collect::<Vec<_>>();
-            assert_eq!(lengths(&dst), lengths(&batch.src));
-            exchange.release(token).unwrap();
-            exchange.release(token).unwrap();
-            exchange.release(batch.token).unwrap();
-        }
-        assert_eq!(rows, 3);
+            .expect("a one-GPU context has a direct exchange");
         assert_eq!(exchange.outstanding().unwrap(), 0);
-        assert!(exchange.allocate(b"not a layout").is_err());
+        exchange.release(7).unwrap();
 
-        // The handle may outlive its context: the region stays readable and every other call
-        // fails instead of touching the context's memory.
-        let region = exchange.region();
-        drop(sender);
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        receiver.declare_input_sender(0, 0).unwrap();
+        receiver.build(&stream_read_plan(0)).unwrap();
+        assert!(receiver.push_received(0, 7).is_err());
+
+        let device = exchange.device();
+        drop(receiver);
         drop(ctx);
-        assert_eq!(exchange.region(), region);
-        assert!(exchange.allocate(&layout).is_err());
+        assert_eq!(exchange.device(), device);
         assert!(exchange.release(1).is_err());
         assert!(exchange.outstanding().is_err());
     }

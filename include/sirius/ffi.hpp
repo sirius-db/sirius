@@ -78,7 +78,7 @@ class SIRIUS_FFI_EXPORT Context {
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
   /// A handle to this Context's direct exchange, or null unless the Context has one GPU memory
-  /// space and it uses `allocator: slab`.
+  /// space.
   [[nodiscard]] std::unique_ptr<DirectExchange> direct_exchange() const;
 
  private:
@@ -89,29 +89,17 @@ class SIRIUS_FFI_EXPORT Context {
   friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
 };
 
-/// Receives batches straight into its Context's GPU slab. A sender exports a batch with
-/// Fragment::export_direct; the receiver allocates matching buffers here, the transport writes
-/// the sender's buffers into them, and the receiver hands them to Fragment::push_received.
+/// Holds batches a transport received from another process until Fragment::push_received
+/// takes them by token.
 ///
-/// Callable from any thread. After its Context is destroyed every call but the region
-/// accessors throws.
+/// Callable from any thread. After its Context is destroyed every call but device() throws.
 class SIRIUS_FFI_EXPORT DirectExchange {
  public:
-  /// The CUDA device and address range of the slab every buffer lies in.
+  /// The CUDA device of the Context's GPU memory space.
   [[nodiscard]] int device() const noexcept;
-  [[nodiscard]] std::uintptr_t region_base() const noexcept;
-  [[nodiscard]] std::uint64_t region_len() const noexcept;
 
-  /// Allocate buffers for the `layout_len`-byte layout at `layout_addr` that export_direct
-  /// returned on the sender, without waiting for memory, and set `token` to them.
-  /// @return [address, length] per buffer, pairing with the sender's `src`.
-  /// @throws on a malformed layout or when the memory cannot be reserved now.
-  std::unique_ptr<std::vector<std::uint64_t>> allocate(std::uintptr_t layout_addr,
-                                                       std::size_t layout_len,
-                                                       std::uint64_t& token) const;
-
-  /// Free what `token` holds: a sent batch once its buffers were written, or received buffers
-  /// that will not be pushed. Unknown and consumed tokens are ignored.
+  /// Free the received batch `token` holds, one that will not be pushed. Unknown and consumed
+  /// tokens are ignored.
   void release(std::uint64_t token) const;
 
   /// Tokens neither released nor consumed.
@@ -203,20 +191,6 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint64_t source_stream_id,
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
-
-  /// Export the next batch parked on output stream `stream_id` for direct exchange, skipping
-  /// batches without rows. Sets `token`, to release on this Context's DirectExchange once the
-  /// batch's buffers were written, `rows`, and `src`, the [address, length] of each buffer.
-  /// @return the layout to pass to the receiver's DirectExchange::allocate, or null once the
-  /// stream is drained.
-  /// @throws before run(), on an unknown stream, without a DirectExchange, or on a batch it
-  /// cannot send (spilled, or a column neither fixed-width nor string). A throw after the batch
-  /// was pulled drops it, and a later call exports the next one, so the caller must fail the
-  /// query rather than retry.
-  std::unique_ptr<std::vector<std::uint8_t>> export_direct(std::uint64_t stream_id,
-                                                           std::uint64_t& token,
-                                                           std::uint64_t& rows,
-                                                           std::vector<std::uint64_t>& src);
 
   /// Push the batch received under `token` into input stream `stream_id`. Consumes the token
   /// unless it throws before reading it: before build(), without a DirectExchange, after run()
