@@ -1108,6 +1108,13 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   duckdb::Connection con(db);
   constexpr uint64_t expected_batch = (256ULL * 1024 * 1024) / 40;
 
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  auto gpu_only = con.Query("SET enable_duckdb_fallback = false");
+  REQUIRE(gpu_only != nullptr);
+  REQUIRE_FALSE(gpu_only->HasError());
+  auto const before = sirius_ctx->get_transparent_execution_stats();
+
   auto settings = con.Query(R"(
     SELECT current_setting('scan_task_batch_size')::UBIGINT,
            current_setting('hash_partition_bytes')::UBIGINT,
@@ -1123,8 +1130,6 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE(settings->Collection().GetValue(3, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(settings->Collection().GetValue(4, 0).GetValue<uint64_t>() == 2 * expected_batch);
 
-  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  REQUIRE(sirius_ctx != nullptr);
   require_shared_operator_defaults(duckdb::session_operator_params(*con.context), expected_batch);
 
   auto set = con.Query("SET scan_task_batch_size = 99");
@@ -1144,6 +1149,13 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE_FALSE(reset->HasError());
   REQUIRE(reset->Collection().GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(duckdb::session_operator_params(*con.context).scan_task_batch_size == expected_batch);
+
+  // All three settings queries must execute on GPU without a hidden CPU replay.
+  auto const after = sirius_ctx->get_transparent_execution_stats();
+  REQUIRE(after.successful_rebinds == before.successful_rebinds + 3);
+  REQUIRE(after.executions == before.executions + 3);
+  REQUIRE(after.fallbacks == before.fallbacks);
+  REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks);
 }
 
 TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius][config]")
