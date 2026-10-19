@@ -16,27 +16,118 @@
 
 #include "exec/exchange_inbox.hpp"
 
+#include "data/data_batch_utils.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "exec/exchange_staging.hpp"
+#include "log/logging.hpp"
 #include "sirius/exception.hpp"
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
+#include <absl/cleanup/cleanup.h>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <format>
 #include <utility>
 
 namespace sirius::exec {
+namespace {
+
+rmm::cuda_stream stream_on(int device)
+{
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+  return rmm::cuda_stream{};
+}
+
+}  // namespace
 
 exchange_inbox::exchange_inbox(cucascade::memory::memory_space& gpu)
   : _gpu{gpu},
     _device{gpu.get_device_id()},
+    _stream{stream_on(_device)},
     _held{std::make_shared<cucascade::shared_data_repository>()}
 {
 }
 
-void exchange_inbox::enable_spill(exchange_staging& staging) { staging.track(_held); }
+void exchange_inbox::enable_spill(exchange_staging& staging, make_room_fn make_room)
+{
+  {
+    std::lock_guard const lock{_mutex};
+    _make_room = std::move(make_room);
+  }
+  staging.track(_held);
+}
+
+std::unique_ptr<cucascade::memory::reservation> exchange_inbox::reserve(std::size_t bytes)
+{
+  make_room_fn make_room;
+  {
+    // A closed exchange's memory space may be gone with its Context; refuse before touching it.
+    std::lock_guard const lock{_mutex};
+    require_open();
+    make_room = _make_room;
+  }
+  auto reservation = _gpu.make_reservation_or_null(bytes);
+  if (reservation || !make_room) { return reservation; }
+  // A request may fail without having run: closing any query window drains the downgrade
+  // executor, which cancels what is queued. Only a request that ran and still left too little
+  // is final.
+  constexpr int attempts = 3;
+  for (int attempt = 1; attempt <= attempts; ++attempt) {
+    try {
+      make_room(bytes);
+      break;
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN("exchange inbox: making room for {} bytes failed (attempt {} of {}): {}",
+                      bytes,
+                      attempt,
+                      attempts,
+                      e.what());
+    }
+  }
+  return _gpu.make_reservation_or_null(bytes);
+}
+
+void exchange_inbox::bring_to_gpu(cucascade::data_batch& batch)
+{
+  std::size_t bytes = 0;
+  {
+    auto const read_only = batch.to_read_only();
+    if (read_only.get_current_tier() == cucascade::memory::Tier::GPU) { return; }
+    bytes = sirius::peak_materialization_bytes(read_only.get_data());
+  }
+  // Making room may spill, so it runs without the lock.
+  auto reservation = reserve(bytes);
+  if (!reservation) {
+    throw rmm::out_of_memory(
+      std::format("exchange inbox: {} bytes to bring a spilled batch back, {} available",
+                  bytes,
+                  _gpu.get_available_memory()));
+  }
+  // The copy and the conversion's sync run on the exchange's stream; the lock keeps another
+  // bring_to_gpu() from attaching its reservation to that stream meanwhile. The lock is taken
+  // before the batch's.
+  std::lock_guard const lock{_mutex};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
+  require_open();
+  // Blocking: whoever holds the batch now (the downgrade executor mid-spill) releases it soon.
+  auto mutable_batch = batch.to_mutable();
+  if (mutable_batch.get_current_tier() == cucascade::memory::Tier::GPU) { return; }
+  auto const stream = _stream.view();
+  auto* tracker     = _gpu.get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  if (!tracker->attach_reservation_to_tracker(stream, std::move(reservation))) {
+    throw sirius::internal_exception("exchange inbox: this thread already tracks a reservation");
+  }
+  absl::Cleanup detach = [&] { tracker->reset_stream_reservation(stream); };
+  mutable_batch.convert_to<cucascade::gpu_table_representation>(
+    sirius::converter_registry::get(), &_gpu, stream);
+}
 
 std::uint64_t exchange_inbox::adopt(std::shared_ptr<cucascade::data_batch> batch,
                                     std::function<void()> on_gone)

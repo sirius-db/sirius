@@ -17,18 +17,23 @@
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/data_repository_manager_registry.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "exec/exchange_inbox.hpp"
 #include "exec/exchange_staging.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
+#include <absl/cleanup/cleanup.h>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -196,4 +201,42 @@ TEST_CASE("exchange_staging lists tracked repositories until they are gone", "[e
   repository.reset();
   CHECK(staging.tracked() == 0);
   CHECK(view->get_batch_ids().empty());
+}
+
+TEST_CASE("exchange_inbox brings a spilled batch back to the GPU", "[exchange_inbox]")
+{
+  sirius::converter_registry::reset_for_testing();
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(std::size_t{64} << 20)
+    .set_per_numa_region_capacity(std::size_t{256} << 20)
+    .use_numa_id_as_host_id()
+    .track_reservation_per_stream(false);
+  sirius::memory::sirius_memory_reservation_manager manager(builder.build());
+  sirius::converter_registry::initialize();
+  absl::Cleanup const shutdown = [&] {
+    manager.shutdown();
+    sirius::converter_registry::shutdown();
+  };
+  auto& gpu  = *manager.get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* host = const_cast<memory_space*>(
+    manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front());
+
+  exchange_inbox exchange(gpu);
+  auto batch = int64_batch(gpu);
+  // The spill copy needs a real stream, not the legacy default one.
+  rmm::cuda_stream_view const stream{gpu.acquire_stream()};
+  {
+    auto mutable_batch = batch->to_mutable();
+    mutable_batch.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), host, stream);
+  }
+  stream.synchronize();
+  REQUIRE(batch->to_read_only().get_current_tier() == cucascade::memory::Tier::HOST);
+
+  exchange.bring_to_gpu(*batch);
+  CHECK(batch->to_read_only().get_current_tier() == cucascade::memory::Tier::GPU);
+  CHECK(sirius::get_cudf_table_view(batch->to_read_only()).num_rows() == rows);
+  exchange.bring_to_gpu(*batch);  // already on the GPU: left as it is
+  exchange.close();
 }
