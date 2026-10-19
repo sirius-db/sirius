@@ -106,3 +106,102 @@ TEST_CASE("shared scan waiters favor oldest query", "[shared_scan_budget]")
   CHECK_FALSE(newer_ready);
   CHECK(second);
 }
+
+TEST_CASE("shared scan limits remain stable until all users retire", "[shared_scan_budget]")
+{
+  shared_scan_budget budget;
+  auto held = budget.acquire({{1, 1}}, make_query_id(1), {}, false);
+  REQUIRE_THROWS_AS(budget.acquire({{1, 2}}, make_query_id(2), {}, true), std::invalid_argument);
+  REQUIRE_THROWS_AS(budget.acquire({{2, 3}, {1, 2}}, make_query_id(2), {}, false),
+                    std::invalid_argument);
+  CHECK(budget.active(1) == 1);
+  CHECK(budget.active(2) == 0);
+  CHECK(budget.pending() == 0);
+  // A rejected composite request must not register its other backend.
+  auto other = budget.acquire({{2, 4}}, make_query_id(2), {}, false);
+  CHECK(budget.active(2) == 1);
+  held.reset();
+  // Reusing an idle address starts new accounting with the new backend's limit.
+  auto replacement = budget.acquire({{1, 2}}, make_query_id(3), {}, false);
+  auto second      = budget.acquire({{1, 2}}, make_query_id(4), {}, false);
+  CHECK(budget.active(1) == 2);
+}
+
+TEST_CASE("shared scan requests validate duplicate and zero limits", "[shared_scan_budget]")
+{
+  shared_scan_budget budget;
+  REQUIRE_THROWS_AS(budget.acquire({{1, 1}, {1, 2}}, make_query_id(1), {}, false),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(budget.acquire({{1, 0}}, make_query_id(1), {}, false), std::invalid_argument);
+  CHECK(budget.active(1) == 0);
+  auto held = budget.acquire({{1, 2}, {1, 2}}, make_query_id(1), {}, false);
+  CHECK(budget.active(1) == 1);
+}
+
+TEST_CASE("shared scan cancellation cleans idle backend state but preserves live tickets",
+          "[shared_scan_budget]")
+{
+  shared_scan_budget budget;
+  auto held = budget.acquire({{1, 1}}, make_query_id(1), {}, false);
+  std::stop_source stop;
+  auto waiting = std::async(std::launch::async, [&] {
+    return budget.acquire({{1, 1}, {2, 3}}, make_query_id(2), stop.get_token(), false);
+  });
+  bool queued  = budget_await([&] { return budget.pending() == 1; });
+  // Backend 2 is idle but belongs to a live waiter; its limit must remain stable.
+  bool rejected = false;
+  try {
+    auto conflicting = budget.acquire({{2, 4}}, make_query_id(3), {}, true);
+  } catch (std::invalid_argument const&) {
+    rejected = true;
+  }
+  stop.request_stop();
+  auto cancelled = waiting.get();
+  CHECK(queued);
+  CHECK(rejected);
+  CHECK_FALSE(cancelled);
+  CHECK(budget.pending() == 0);
+  CHECK(budget.active(1) == 1);
+  auto replacement = budget.acquire({{2, 4}}, make_query_id(3), {}, false);
+  CHECK(budget.active(2) == 1);
+}
+
+TEST_CASE("shared scan demand and empty requests bypass speculative waiters",
+          "[shared_scan_budget]")
+{
+  shared_scan_budget budget;
+  auto held = budget.acquire({{1, 1}}, make_query_id(1), {}, false);
+  std::stop_source stop;
+  auto waiting = std::async(std::launch::async, [&] {
+    return budget.acquire({{1, 1}}, make_query_id(2), stop.get_token(), false);
+  });
+  bool queued  = budget_await([&] { return budget.pending() == 1; });
+  // Use the same stop token so a regression in the empty-request fast path
+  // cannot leave a blocked future when the test fails.
+  auto empty       = std::async(std::launch::async, [&] {
+    return budget.acquire({}, make_query_id(3), stop.get_token(), false);
+  });
+  bool empty_ready = empty.wait_for(1s) == std::future_status::ready;
+  auto demand      = budget.acquire({{1, 1}}, make_query_id(4), {}, true);
+  auto pending     = budget.pending();
+  stop.request_stop();
+  auto empty_ticket = empty.get();
+  auto cancelled    = waiting.get();
+  CHECK(queued);
+  CHECK(empty_ready);
+  CHECK(empty_ticket);
+  CHECK_FALSE(cancelled);
+  CHECK(pending == 1);
+  CHECK(budget.active(1) == 2);
+}
+
+TEST_CASE("shared scan tickets outlive their budget facade", "[shared_scan_budget]")
+{
+  shared_scan_budget::token ticket;
+  {
+    shared_scan_budget budget;
+    ticket = budget.acquire({{1, 1}}, make_query_id(1), {}, false);
+    CHECK(budget.active(1) == 1);
+  }
+  ticket.reset();
+}

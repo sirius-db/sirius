@@ -350,27 +350,35 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   // Back-off when the order has nothing to prefetch right now.
   constexpr auto k_idle_wait = std::chrono::milliseconds{10};
 
-  // Prepare a candidate and, if that succeeds, issue its IO.  Returns whether
-  // the prefetch was issued -- which is also whether the completion has taken
-  // ownership of the slot.
-  auto try_issue = [&](prefetch_candidate const& candidate) {
+  enum class issue_result { issued, finished, memory_pressure };
+  // Only issued transfers the local slot to the completion. Memory pressure lets
+  // the outer loop release both budgets before one bounded delayed retry.
+  auto try_issue = [&](prefetch_candidate const& candidate, bool delayed_retry) {
+    if (candidate.task->has_fallen_behind()) {
+      _counters.record(prefetch_outcome_kind::skipped_fell_behind);
+      return issue_result::finished;
+    }
     shared_scan_budget::token shared_ticket;
     try {
       if (_shared_budget) {
         shared_ticket = acquire_shared_ticket(*candidate.task, false);
-        if (!shared_ticket) return false;
+        if (!shared_ticket) {
+          _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+          return issue_result::finished;
+        }
       }
     } catch (...) {
-      return false;
+      _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+      return issue_result::finished;
     }
-    bool evict_on_failure = false;
+    bool evict_on_failure = delayed_retry;
     while (!st.stop_requested()) {
       if (candidate.task->has_fallen_behind()) {
         _counters.record(prefetch_outcome_kind::skipped_fell_behind);
-        return false;
+        return issue_result::finished;
       }
 
-      bool const attempted_eviction = evict_on_failure;
+      if (evict_on_failure) _counters.memory_retries.fetch_add(1, std::memory_order_relaxed);
       op::scan::scan_info::prepare_outcome prep;
       // This runs on a jthread, so an escaping exception is std::terminate for
       // the whole process -- far too much for a best-effort prefetcher.  Both
@@ -379,7 +387,7 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
       // earning its keep.  A throw is treated as "not issued": prefetch can only
       // throw before its prefetch_completion exists, because everything from
       // there on is noexcept and the report is what hands the slot over, so the
-      // slot is still the worker's and returning false releases it exactly once.
+      // slot is still the worker's and returning finished releases it exactly once.
       try {
         prep = candidate.task->prepare_for_prefetching(evict_on_failure);
         if (prep.ready()) {
@@ -395,45 +403,41 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
                 op_id, split, out.issued > 0, out.declined_memory_pressure > 0);
             }
           });
-          return true;
+          return issue_result::issued;
         }
       } catch (std::exception const& e) {
         SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: {}", e.what());
         _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
-        return false;
+        return issue_result::finished;
       } catch (...) {
         SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: unknown exception");
         _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
-        return false;
+        return issue_result::finished;
       }
       if (prep.fell_behind > 0 || candidate.task->has_fallen_behind()) {
         _counters.record(prefetch_outcome_kind::skipped_fell_behind);
-        return false;
+        return issue_result::finished;
       }
       // Nothing was refused for want of memory, so there is nothing to wait for:
       // this split has no request to prepare at all.
       if (prep.failed == 0) {
         _counters.record(prefetch_outcome_kind::nothing_to_issue);
-        return false;
+        return issue_result::finished;
       }
-      // The pool had nothing to give.  Let the evictor work, then ask again --
-      // unless the consumer reached the split meanwhile, in which case a
-      // prefetch would only duplicate the read it is already doing.
-      _counters.memory_retries.fetch_add(1, std::memory_order_relaxed);
+      // First retry with synchronous eviction. A further attempt must yield
+      // capacity and back off, and is allowed only once by the outer loop.
+      if (evict_on_failure) return issue_result::memory_pressure;
       evict_on_failure = true;
-      // The first failure immediately advances to a synchronous-eviction
-      // attempt. Abandon speculation if that also fails, releasing shared capacity.
-      if (!attempted_eviction) { continue; }
-      return false;  // Demand and another query get the budget after one failed eviction attempt.
     }
     // Stopped mid-preparation: the pool never satisfied it.
     _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
-    return false;
+    return issue_result::finished;
   };
 
+  prefetch_candidate retry;
   while (!st.stop_requested()) {
     // Every operator drained: nothing will ever be worth prefetching again.
-    if (_cursor.load(std::memory_order_relaxed) >= _ordered_work_queues.size()) { break; }
+    if (!retry && _cursor.load(std::memory_order_relaxed) >= _ordered_work_queues.size()) { break; }
 
     // One slot per in-flight prefetch.  Past this point the slot is held and has
     // to be released exactly once: by the completion when the IO was issued, or
@@ -447,7 +451,8 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
       break;
     }
 
-    auto candidate = get_next_prefetching_candidate();
+    bool const delayed_retry = bool(retry);
+    auto candidate = delayed_retry ? std::exchange(retry, {}) : get_next_prefetching_candidate();
     if (!candidate) {
       // Nothing to read ahead of yet.  Hand the slot straight back rather than
       // sit on it -- budget held by an idle worker is budget the rest of the
@@ -458,9 +463,22 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
       continue;
     }
 
-    _counters.candidates_taken.fetch_add(1, std::memory_order_relaxed);
-    if (!try_issue(candidate)) { _gatekeeper.release(); }
+    if (!delayed_retry) _counters.candidates_taken.fetch_add(1, std::memory_order_relaxed);
+    auto const result = try_issue(candidate, delayed_retry);
+    if (result == issue_result::issued) continue;
+    _gatekeeper.release();
+    if (result == issue_result::memory_pressure) {
+      if (delayed_retry) {
+        _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+      } else {
+        retry = std::move(candidate);
+        // No IO capacity is held during backoff. Like idle polling, stop latency
+        // is bounded by 10 ms; cancellation is checked before acquiring again.
+        std::this_thread::sleep_for(k_idle_wait);
+      }
+    }
   }
+  if (retry) _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
 }
 
 shared_scan_budget::token readahead_scan_manager::acquire_shared_ticket(

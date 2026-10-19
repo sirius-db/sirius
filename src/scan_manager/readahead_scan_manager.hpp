@@ -182,7 +182,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   [[nodiscard]] std::string_view name() const noexcept override { return "readahead"; }
 
-  /// Seed the per-operator readahead order for @p query.
+  /// Seed the per-operator readahead order for @p query once, before start() or
+  /// publishing splits. The query ID and order are immutable once workers start.
   void prepare_for_query(const sirius::planner::query& query);
 
   /// Start the worker that drives the readahead.  Idempotent: a second call

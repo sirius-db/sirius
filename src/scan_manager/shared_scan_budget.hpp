@@ -18,13 +18,14 @@
 #include "query_id.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <list>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <stdexcept>
 #include <stop_token>
 #include <vector>
 namespace sirius::scan_manager {
@@ -40,11 +41,11 @@ class shared_scan_budget {
 
  private:
   struct usage {
-    std::size_t active{}, limit{};
+    std::size_t active{}, limit{}, waiters{};
   };
   struct state {
     std::mutex mutex;
-    std::condition_variable cv;
+    std::condition_variable_any cv;
     std::map<std::uintptr_t, usage> backends;
     std::list<query_id_t> waiting;
   };
@@ -58,12 +59,20 @@ class shared_scan_budget {
     }
     ~ticket()
     {
+      if (requests.empty()) return;
+      bool wake = false;
       {
         std::lock_guard lock(owner->mutex);
-        for (auto const& r : requests)
-          --owner->backends.at(r.backend).active;
+        for (auto const& r : requests) {
+          auto it = owner->backends.find(r.backend);
+          auto& u = it->second;
+          --u.active;
+          wake |= u.active < u.limit;
+          if (u.active == 0 && u.waiters == 0) owner->backends.erase(it);
+        }
+        wake &= !owner->waiting.empty();
       }
-      owner->cv.notify_all();
+      if (wake) owner->cv.notify_all();
     }
     ticket(ticket const&)            = delete;
     ticket& operator=(ticket const&) = delete;
@@ -80,39 +89,74 @@ class shared_scan_budget {
     std::sort(requests.begin(), requests.end(), [](auto const& a, auto const& b) {
       return a.backend < b.backend;
     });
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      if (requests[i].limit == 0)
+        throw std::invalid_argument("shared scan budget requires a positive backend limit");
+      if (i && requests[i - 1].backend == requests[i].backend &&
+          requests[i - 1].limit != requests[i].limit)
+        throw std::invalid_argument("conflicting limits for one scan backend");
+    }
     requests.erase(std::unique(requests.begin(),
                                requests.end(),
                                [](auto const& a, auto const& b) { return a.backend == b.backend; }),
                    requests.end());
+    if (!demand && stop.stop_requested()) return {};
     auto result = std::make_shared<ticket>(shared, std::vector<request>{});
+    if (requests.empty()) return result;
     std::unique_lock lock(shared->mutex);
-    for (auto const& r : requests)
-      shared->backends[r.backend].limit = r.limit;
-    auto waiter = shared->waiting.insert(shared->waiting.end(), query);
+    // Validate the whole request before changing any accounting. Runtime configuration
+    // supplies one stable limit per backend, including demand reads.
+    for (auto const& r : requests) {
+      auto it = shared->backends.find(r.backend);
+      if (it != shared->backends.end() && it->second.limit != r.limit)
+        throw std::invalid_argument("scan backend limit changed while in use");
+    }
     struct pending_guard {
       state& owner;
+      // The span remains valid when the vector transfers into the returned ticket.
+      std::span<const request> requests;
+      std::size_t registered{0};
       std::list<query_id_t>::iterator position;
       ~pending_guard()
       {
-        owner.waiting.erase(position);
-        owner.cv.notify_all();
+        for (std::size_t i = 0; i < registered; ++i) {
+          auto it = owner.backends.find(requests[i].backend);
+          if (--it->second.waiters == 0 && it->second.active == 0) owner.backends.erase(it);
+        }
+        if (position != owner.waiting.end()) {
+          owner.waiting.erase(position);
+          // Removing a waiter can unblock a younger query, even on another backend:
+          // this baseline intentionally retains global oldest-query ordering.
+          if (!owner.waiting.empty()) owner.cv.notify_all();
+        }
       }
-    } pending{*shared, waiter};
-    while (!demand) {
-      if (stop.stop_requested()) { return {}; }
-      bool oldest    = std::none_of(shared->waiting.begin(),
+    } pending{*shared, requests, 0, shared->waiting.end()};
+    for (auto const& r : requests) {
+      auto [it, inserted] = shared->backends.try_emplace(r.backend, usage{0, r.limit, 0});
+      ++it->second.waiters;
+      ++pending.registered;
+    }
+    auto available = [&] {
+      bool oldest = std::none_of(shared->waiting.begin(),
                                  shared->waiting.end(),
                                  [&](auto const& other) { return other < query; });
-      bool available = std::all_of(requests.begin(), requests.end(), [&](auto const& r) {
-        auto const& u = shared->backends.at(r.backend);
-        return u.active < u.limit;
-      });
-      if (oldest && available) break;
-      shared->cv.wait_for(lock, std::chrono::milliseconds(20));
+      return oldest && std::all_of(requests.begin(), requests.end(), [&](auto const& r) {
+               auto const& u = shared->backends.at(r.backend);
+               return u.active < u.limit;
+             });
+    };
+    // Demand accrues debt without joining the speculative wait queue. An immediately
+    // admissible speculative request likewise needs no queue insertion or notification.
+    if (!demand) {
+      if (!available()) {
+        pending.position = shared->waiting.insert(shared->waiting.end(), query);
+        if (!shared->cv.wait(lock, stop, available)) return {};
+      }
+      if (stop.stop_requested()) return {};
     }
-    result->requests = std::move(requests);
-    for (auto const& r : result->requests)
+    for (auto const& r : requests)
       ++shared->backends.at(r.backend).active;
+    result->requests = std::move(requests);
     return result;
   }
   std::size_t pending() const
