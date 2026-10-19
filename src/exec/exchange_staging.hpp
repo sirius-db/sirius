@@ -63,8 +63,10 @@ class exchange_staging {
   explicit exchange_staging(sirius::data::data_repository_manager_registry& registry,
                             query_lifecycle_registry* lifecycle = nullptr);
 
-  /// Exposes @p repository to the downgrade executor until it is destroyed.
-  void track(std::shared_ptr<cucascade::shared_data_repository> const& repository);
+  /// Exposes @p repository to the downgrade executor until it is destroyed. The sweep walks the
+  /// view back to front, so a @p spill_first repository is listed after every other one.
+  void track(std::shared_ptr<cucascade::shared_data_repository> const& repository,
+             bool spill_first = false);
 
   /// Repositories currently tracked and still alive.
   [[nodiscard]] std::size_t tracked() const;
@@ -73,6 +75,7 @@ class exchange_staging {
   struct targets {
     mutable std::mutex mutex;
     std::vector<std::weak_ptr<cucascade::shared_data_repository>> repositories;
+    std::vector<std::weak_ptr<cucascade::shared_data_repository>> spill_first;
   };
   std::shared_ptr<targets> _targets;
 };

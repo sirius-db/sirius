@@ -36,8 +36,10 @@ class forwarding_repository final : public cucascade::shared_data_repository {
  public:
   using targets_t = std::vector<std::weak_ptr<cucascade::shared_data_repository>>;
 
-  forwarding_repository(std::shared_ptr<std::mutex> mutex, std::shared_ptr<targets_t> targets)
-    : _mutex(std::move(mutex)), _targets(std::move(targets))
+  forwarding_repository(std::shared_ptr<std::mutex> mutex,
+                        std::shared_ptr<targets_t> targets,
+                        std::shared_ptr<targets_t> spill_first)
+    : _mutex(std::move(mutex)), _targets(std::move(targets)), _spill_first(std::move(spill_first))
   {
   }
 
@@ -78,22 +80,25 @@ class forwarding_repository final : public cucascade::shared_data_repository {
   }
 
  private:
-  /// The tracked repositories still alive, pruning the rest.
+  /// The tracked repositories still alive, the spill-first ones last, pruning the rest.
   std::vector<std::shared_ptr<cucascade::shared_data_repository>> live() const
   {
     std::vector<std::shared_ptr<cucascade::shared_data_repository>> alive;
     std::lock_guard lock(*_mutex);
-    std::erase_if(*_targets, [&](auto const& weak) {
-      auto repository = weak.lock();
-      if (!repository) { return true; }
-      alive.push_back(std::move(repository));
-      return false;
-    });
+    for (auto* targets : {_targets.get(), _spill_first.get()}) {
+      std::erase_if(*targets, [&](auto const& weak) {
+        auto repository = weak.lock();
+        if (!repository) { return true; }
+        alive.push_back(std::move(repository));
+        return false;
+      });
+    }
     return alive;
   }
 
   std::shared_ptr<std::mutex> _mutex;
   std::shared_ptr<targets_t> _targets;
+  std::shared_ptr<targets_t> _spill_first;
 };
 
 }  // namespace
@@ -108,23 +113,30 @@ exchange_staging::exchange_staging(sirius::data::data_repository_manager_registr
   auto mutex = std::shared_ptr<std::mutex>(_targets, &_targets->mutex);
   auto repositories =
     std::shared_ptr<forwarding_repository::targets_t>(_targets, &_targets->repositories);
+  auto spill_first =
+    std::shared_ptr<forwarding_repository::targets_t>(_targets, &_targets->spill_first);
   registry.create_for_query(query_id)->add_new_repository(
-    0, kPort, std::make_unique<forwarding_repository>(std::move(mutex), std::move(repositories)));
+    0,
+    kPort,
+    std::make_unique<forwarding_repository>(
+      std::move(mutex), std::move(repositories), std::move(spill_first)));
 }
 
-void exchange_staging::track(std::shared_ptr<cucascade::shared_data_repository> const& repository)
+void exchange_staging::track(std::shared_ptr<cucascade::shared_data_repository> const& repository,
+                             bool spill_first)
 {
   if (!repository) { return; }
   std::lock_guard lock(_targets->mutex);
-  _targets->repositories.push_back(repository);
+  (spill_first ? _targets->spill_first : _targets->repositories).push_back(repository);
 }
 
 std::size_t exchange_staging::tracked() const
 {
   std::lock_guard lock(_targets->mutex);
-  return static_cast<std::size_t>(std::count_if(_targets->repositories.begin(),
-                                                _targets->repositories.end(),
-                                                [](auto const& w) { return !w.expired(); }));
+  auto const live = [](auto const& w) { return !w.expired(); };
+  return static_cast<std::size_t>(
+    std::count_if(_targets->repositories.begin(), _targets->repositories.end(), live) +
+    std::count_if(_targets->spill_first.begin(), _targets->spill_first.end(), live));
 }
 
 }  // namespace sirius::exec

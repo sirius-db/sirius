@@ -331,6 +331,51 @@ TEST_CASE("a batch lands on disk when the GPU and host shares are spent", "[exch
   CHECK(digest(*received) == expected);
 }
 
+TEST_CASE("a spilled sealed landing frees its GPU charge only with return_spilled",
+          "[exchange_ring][ends]")
+{
+  for (bool const return_spilled : {false, true}) {
+    auto sender = make_ring();
+    ring_exchange::options opts;
+    opts.frame_bytes    = MiB;
+    opts.send_bytes     = 4 * MiB;
+    opts.recv_bytes     = 4 * MiB;
+    opts.return_spilled = return_spilled;
+    ring_exchange receiver(0, opts);
+    receiver.attach(env().exchange, {env().host, env().disk, 256 * MiB, 256 * MiB});
+    auto batch          = gpu_batch(sample_table());
+    auto const expected = digest(*batch);
+    auto const job      = sender->export_batch(batch);
+    REQUIRE(job.has_value());
+    batch.reset();
+
+    auto const [landing, token] = ship(*sender, receiver, *job);
+    REQUIRE(landing.tier == Tier::GPU);
+    auto const charged = receiver.stats().gpu_held;
+    CHECK(charged > 0);
+    // The downgrade executor spills it before its receiver takes it.
+    move_to(env().exchange->peek_batch(token), env().host);
+    CHECK(receiver.stats().gpu_held == (return_spilled ? 0 : charged));
+    auto received = env().exchange->take_batch(token);
+    CHECK(receiver.stats().gpu_held == 0);  // given back once
+    CHECK(digest(*received) == expected);
+  }
+}
+
+TEST_CASE("a throw in seal() gives back the landing's charge", "[exchange_ring][ends]")
+{
+  auto sender   = make_ring();
+  auto receiver = make_ring();
+  // adopt() refuses a batch once the exchange is closed.
+  auto closed = std::make_shared<exchange_inbox>(*env().gpu);
+  receiver->attach(closed, {env().host, env().disk, 256 * MiB, 256 * MiB});
+  closed->close();
+  auto const job = sender->export_batch(gpu_batch(sample_table()));
+  REQUIRE(job.has_value());
+  CHECK_THROWS_AS(ship(*sender, *receiver, *job), sirius::invalid_input_exception);
+  CHECK(receiver->stats().gpu_held == 0);
+}
+
 TEST_CASE("I5: no room in any tier is the one failure, with every tier's numbers",
           "[exchange_ring][ends]")
 {

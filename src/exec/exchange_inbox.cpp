@@ -61,7 +61,9 @@ void exchange_inbox::enable_spill(exchange_staging& staging, make_room_fn make_r
     std::lock_guard const lock{_mutex};
     _make_room = std::move(make_room);
   }
-  staging.track(_held);
+  // Received batches wait for receivers that start only once all their senders finished: they
+  // spill before a running fragment's output and inputs.
+  staging.track(_held, /*spill_first=*/true);
 }
 
 std::unique_ptr<cucascade::memory::reservation> exchange_inbox::reserve(std::size_t bytes)
@@ -140,6 +142,19 @@ std::uint64_t exchange_inbox::adopt(std::shared_ptr<cucascade::data_batch> batch
   _held->add_data_batch(std::move(batch));
   if (on_gone) { _on_gone.emplace(token, std::move(on_gone)); }
   return token;
+}
+
+std::shared_ptr<cucascade::data_batch> exchange_inbox::peek_batch(std::uint64_t token) const
+{
+  std::lock_guard const lock{_mutex};
+  require_open();
+  auto const it = _held_ids.find(token);
+  auto batch    = it == _held_ids.end() ? nullptr : _held->get_data_batch_by_id(it->second);
+  if (!batch) {
+    throw sirius::invalid_input_exception("exchange inbox: token {} holds no received batch",
+                                          token);
+  }
+  return batch;
 }
 
 std::shared_ptr<cucascade::data_batch> exchange_inbox::take_batch(std::uint64_t token)
