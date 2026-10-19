@@ -54,7 +54,10 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_dynamic_filter::execute"};
   auto const& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  if (!_consumer) { return std::make_unique<pipelineable_operator_data>(input.get_data_batches(), input.get_position()); }
+  if (!_consumer) {
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches(),
+                                                        input.get_position());
+  }
 
   auto const* scan_output = dynamic_cast<scan_output_operator_data const*>(&input);
   auto const* prior       = scan_output ? &scan_output->receipt() : nullptr;
@@ -97,7 +100,8 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
     pending.push_back(std::move(result));
   }
 
-  auto output = std::make_unique<pipelineable_operator_data>(std::move(output_batches), input.get_position());
+  auto output =
+    std::make_unique<pipelineable_operator_data>(std::move(output_batches), input.get_position());
   // No allocating output operation follows the first commit, including for later batches.
   for (auto& result : pending) {
     _consumer->commit(std::move(result));

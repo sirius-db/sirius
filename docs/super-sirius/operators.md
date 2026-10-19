@@ -259,12 +259,18 @@ Evaluates a list of expressions to produce output columns.
 **File:** `src/op/sirius_physical_limit.hpp`
 
 Used only when the expanded child's `output_order()` proves `NO_ORDER`. Runs inline without an
-extra pipeline boundary. Immediately before execution, the task claims offset/limit rows under a
-mutex using the row count after upstream filters. Its immutable slice remains on the task input
-across OOM retries and deferred materialization; retrying cannot consume the quota twice.
+extra pipeline boundary. Inside `execute()`, an RAII `claim_request` reserves offset/limit rows
+under a mutex using the row count after upstream filters. The mutex is released during GPU work.
+After constructing and synchronizing the output, execution approves the request. Exceptions
+before approval refund only that request's reserved offset and limit; retries make a fresh claim.
+No batch IDs or per-input claim history are needed. A retry may select different rows, which is
+valid for this unordered input.
 
-Once the quota is claimed, `is_limit_exhausted()` stops further task creation. The pipeline waits
-for all already-created tasks (including retries) before completing. LIMIT 0 still permits an
+`is_limit_exhausted()` stops further task creation only when the limit is consumed, no claims
+remain pending, and at least one output has been approved. Both approval and rollback update
+this condition. The pipeline waits for all already-created tasks (including retries) before
+completing. The executor's post-return diagnostics do not perform retryable GPU allocations;
+changes to its retry boundary must preserve approval after all retryable work. LIMIT 0 permits an
 initial task to emit an empty batch for downstream aggregates. This does not cancel independent
 upstream pipelines or scan I/O. Outputs carry no positions.
 
