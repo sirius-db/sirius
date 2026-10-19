@@ -140,7 +140,6 @@ bool preparation_unit::complete_input(delete_set_input input)
 }
 bool preparation_unit::complete_input(checkpoint_input input)
 {
-  preparation_gate::callback_use use(gate_);
   std::unique_lock<std::mutex> gate_lock;
   if (gate_) {
     gate_lock = std::unique_lock(gate_->mutex);
@@ -148,7 +147,6 @@ bool preparation_unit::complete_input(checkpoint_input input)
   }
   std::lock_guard lock(mutex_);
   if (!accept(required_input::checkpoint_iteration)) return false;
-  use.activate_under_gate();
   deps_.checkpoint_iteration = input.iteration;
   finish_input(required_input::checkpoint_iteration);
   return true;
