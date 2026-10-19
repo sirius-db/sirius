@@ -1225,7 +1225,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   // Compression config (tier-agnostic): load the per-table plan DSL from the plan
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
-  const auto& comp_cfg = duckdb::session_compression_config(context);
+  const auto& comp_cfg  = duckdb::session_compression_config(context);
   auto const unique_cfg = duckdb::query_operator_options(context);
   bool const compression_requested =
     data.args.compression.value_or(comp_cfg.enable_pin_table_compression);
@@ -1353,19 +1353,19 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // stays at ~one batch, so the whole table never needs to fit in GPU memory. On multi-GPU
     // the chunks land round-robin across NUMA nodes; the cached-serve path then reads each
     // chunk back on a NUMA-local GPU.
-    auto host_result =
-      sirius::materialize_pin_to_host(*ingestible,
-                                      gpu_spaces_mut,
-                                      host_space_by_gpu,
-                                      *scan_mgr.io_ctx(),
-                                      pinned_column_types,
-                                      pin_comp,
-                                      {.expression_policy   = pin_op_params.expression_policy(),
-                                       .capture_chunk_stats = capture_chunk_stats,
-                                       .enable_compressed_materialization = compressed_pin,
-                                       .probe_unique_columns              = probe_unique_columns,
-                                       .probe_unique_automatic            = probe_unique_automatic,
-                                       .unique_exact_max_bytes = unique_cfg->unique_exact_max_bytes});
+    auto host_result = sirius::materialize_pin_to_host(
+      *ingestible,
+      gpu_spaces_mut,
+      host_space_by_gpu,
+      *scan_mgr.io_ctx(),
+      pinned_column_types,
+      pin_comp,
+      {.expression_policy                 = pin_op_params.expression_policy(),
+       .capture_chunk_stats               = capture_chunk_stats,
+       .enable_compressed_materialization = compressed_pin,
+       .probe_unique_columns              = probe_unique_columns,
+       .probe_unique_automatic            = probe_unique_automatic,
+       .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(host_result.column_storage));
@@ -1414,17 +1414,17 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
-    auto mat =
-      sirius::materialize_all_batches(*ingestible,
-                                      gpu_spaces_mut,
-                                      *scan_mgr.io_ctx(),
-                                      pinned_column_types,
-                                      {.expression_policy   = pin_op_params.expression_policy(),
-                                       .capture_chunk_stats = capture_chunk_stats,
-                                       .enable_compressed_materialization = compressed_pin,
-                                       .probe_unique_columns              = probe_unique_columns,
-                                       .probe_unique_automatic            = probe_unique_automatic,
-                                       .unique_exact_max_bytes = unique_cfg->unique_exact_max_bytes});
+    auto mat = sirius::materialize_all_batches(
+      *ingestible,
+      gpu_spaces_mut,
+      *scan_mgr.io_ctx(),
+      pinned_column_types,
+      {.expression_policy                 = pin_op_params.expression_policy(),
+       .capture_chunk_stats               = capture_chunk_stats,
+       .enable_compressed_materialization = compressed_pin,
+       .probe_unique_columns              = probe_unique_columns,
+       .probe_unique_automatic            = probe_unique_automatic,
+       .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(mat.column_storage));
