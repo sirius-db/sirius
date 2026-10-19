@@ -16,6 +16,7 @@
 
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_limit.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
@@ -25,9 +26,11 @@
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_streaming_sink.hpp"
 #include "op/sirius_physical_union.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
 
 #include <catch.hpp>
+#include <duckdb.hpp>
 
 #include <type_traits>
 
@@ -156,4 +159,43 @@ TEST_CASE("Streaming sink order follows routing configuration", "[output_order]"
     {first, second},
     partition_spec{{0}});
   REQUIRE(hashed.output_order_preservation() == OrderPreservationType::NO_ORDER);
+}
+
+TEST_CASE("LIMIT expansion optimizes only proven unordered input",
+          "[output_order][unordered_limit_cpu]")
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection connection(db);
+  for (auto order : {OrderPreservationType::NO_ORDER,
+                     OrderPreservationType::FIXED_ORDER,
+                     OrderPreservationType::INSERTION_ORDER}) {
+    sirius::planner::sirius_physical_plan_generator generator(*connection.context);
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(
+        duckdb::vector<sirius::logical_type>{sirius::from_duckdb(duckdb::LogicalType::BIGINT)},
+        duckdb::BoundLimitNode::ConstantValue(7),
+        duckdb::BoundLimitNode::ConstantValue(2),
+        100,
+        true);
+    plan->set_physical_types({cudf::data_type{cudf::type_id::INT32}});
+    plan->children.push_back(
+      duckdb::make_uniq<order_node>(order, SiriusPhysicalOperatorType::INVALID));
+    generator.insert_gpu_pipeline_operators(plan);
+    REQUIRE(plan->children.size() == 1);
+    CHECK(plan->get_physical_types() ==
+          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT32}});
+    if (order == OrderPreservationType::NO_ORDER) {
+      REQUIRE(plan->type == SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT);
+      CHECK_FALSE(plan->is_source());
+      CHECK(plan->children[0]->type == SiriusPhysicalOperatorType::INVALID);
+      auto& limit = plan->Cast<sirius::op::sirius_physical_unordered_streaming_limit>();
+      CHECK(limit.limit_val.GetConstantValue() == 7);
+      CHECK(limit.offset_val.GetConstantValue() == 2);
+    } else {
+      REQUIRE(plan->type == SiriusPhysicalOperatorType::STREAMING_LIMIT);
+      CHECK(plan->is_source());
+      CHECK(plan->children[0]->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+      CHECK(plan->input_barrier_for(*plan->children[0]) == sirius::op::MemoryBarrierType::FULL);
+    }
+  }
 }

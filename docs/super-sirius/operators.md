@@ -58,7 +58,8 @@ The analysis does not consult DuckDB's insertion-order setting or repository run
 Use this analysis after the child's GPU operator expansion. `ORDER_BY` and `TOP_N` execute local
 per-batch sorting; their expanded global result is established by `MERGE_SORT` and `MERGE_TOP_N`.
 The planner can query `limit.children[0]->output_order()` before choosing a LIMIT implementation
-and its pipeline boundary. LIMIT variant selection is separate from this ordering API.
+and its pipeline boundary. The planner chooses `UNORDERED_STREAMING_LIMIT` only for a resolved `NO_ORDER`;
+`FIXED_ORDER` and unresolved `INSERTION_ORDER` retain `STREAMING_LIMIT` and its full barrier.
 
 | Operator | `output_order_preservation()` |
 |---|---|
@@ -67,7 +68,7 @@ and its pipeline boundary. LIMIT variant selection is separate from this orderin
 | PARTITION, CONCAT, UNION | `NO_ORDER` |
 | HASH_JOIN, NESTED_LOOP_JOIN, DENSE_COUNT_JOIN, LEFT_DELIM_JOIN, RIGHT_DELIM_JOIN | `NO_ORDER` |
 | HASH_GROUP_BY, UNGROUPED_AGGREGATE, MERGE_GROUP_BY, MERGE_AGGREGATE | `NO_ORDER` |
-| GPU_SCAN | `NO_ORDER` |
+| GPU_SCAN, UNORDERED_STREAMING_LIMIT | `NO_ORDER` |
 | PROJECTION, FILTER, DYNAMIC_FILTER, STREAMING_LIMIT | `INSERTION_ORDER` |
 | PASSTHROUGH_SINK, CTE, materialized RESULT_COLLECTOR | `INSERTION_ORDER` |
 | TABLE_SCAN, COLUMN_DATA_SCAN (including CTE_SCAN / DELIM_SCAN), GPU_VALUES | `INSERTION_ORDER` |
@@ -253,6 +254,19 @@ Evaluates a list of expressions to produce output columns.
   Only the entries that need evaluation are passed to the expression evaluator (via its `std::vector<sirius::ast::node const*>` constructor). See [expression evaluator](expression-executor.md).
 - **Key members:** `select_list` (output expressions)
 - **Batch ordering:** Tasks may execute in any order and forward the input batch position unchanged.
+
+### `sirius_physical_unordered_streaming_limit` — `UNORDERED_STREAMING_LIMIT`
+**File:** `src/op/sirius_physical_limit.hpp`
+
+Used only when the expanded child's `output_order()` proves `NO_ORDER`. Runs inline without an
+extra pipeline boundary. Immediately before execution, the task claims offset/limit rows under a
+mutex using the row count after upstream filters. Its immutable slice remains on the task input
+across OOM retries and deferred materialization; retrying cannot consume the quota twice.
+
+Once the quota is claimed, `is_limit_exhausted()` stops further task creation. The pipeline waits
+for all already-created tasks (including retries) before completing. LIMIT 0 still permits an
+initial task to emit an empty batch for downstream aggregates. This does not cancel independent
+upstream pipelines or scan I/O. Outputs carry no positions.
 
 ### `sirius_physical_streaming_limit` — `STREAMING_LIMIT`
 **File:** `src/op/sirius_physical_limit.hpp`
@@ -628,6 +642,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
 | PROJECTION | Relational | `expression_evaluator::evaluate()` |
+| UNORDERED_STREAMING_LIMIT | Relational | Inline claims, retry-safe slices, early pipeline completion |
 | STREAMING_LIMIT | Relational | Serial slice claims after FULL input barrier |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |

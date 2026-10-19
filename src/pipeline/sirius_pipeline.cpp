@@ -341,6 +341,13 @@ std::unique_lock<std::mutex> sirius_pipeline::get_task_creation_lock()
   return std::unique_lock<std::mutex>(_status_mutex);
 }
 
+bool sirius_pipeline::is_limit_exhausted() const
+{
+  return std::any_of(operators.begin(), operators.end(), [](auto const& op) {
+    return op.get().is_limit_exhausted();
+  });
+}
+
 void sirius_pipeline::update_pipeline_status(bool original_pipeline)
 {
   bool should_notify = false;
@@ -367,13 +374,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       if (first_node == nullptr) { throw internal_exception("First node of pipeline is nullptr"); }
       // Check if any operator has exhausted its limit — this allows the pipeline to finish
       // early without waiting for the source pipeline to drain all remaining batches.
-      bool limit_exhausted = false;
-      for (auto& op_ref : operators) {
-        if (op_ref.get().is_limit_exhausted()) {
-          limit_exhausted = true;
-          break;
-        }
-      }
+      bool limit_exhausted = is_limit_exhausted();
       // Source-exhaustion conjunct: the task
       // counters can be transiently balanced (0==0 before the first split
       // arrives, or all-done-before-close), so finishing additionally requires

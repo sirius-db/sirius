@@ -29,6 +29,7 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   ORDER_BY,
   LIMIT,
   STREAMING_LIMIT,
+  UNORDERED_STREAMING_LIMIT,
   LIMIT_PERCENT,
   TOP_N,
   WINDOW,

@@ -60,8 +60,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalLimit& op)
       //                                         op.estimated_cardinality);
       break;
     default:
-      // GPU pipeline compares all limits at the end, so insertion order does not matter.
-      // Always use parallel streaming limit.
+      // Start with the general implementation. GPU expansion selects the inline unordered
+      // variant only after the child's global ordering is known.
       limit = duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(
         sirius::from_duckdb_vec(op.types),
         std::move(op.limit_val),
