@@ -17,21 +17,17 @@
 #pragma once
 
 #include "duckdb/execution/physical_operator.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
-#include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
-#include "op/sirius_physical_top_n.hpp"
 #include "sirius_config.hpp"
 
 namespace sirius {
 namespace op {
 
 /**
- * @brief Groups partitioned input batches before a downstream join
+ * @brief Groups batches within an existing input partition layout
  *
- * Buffers batches in arrival order for each partition and releases groups based on
+ * Traverses batches in repository order for each partition and releases groups based on
  * `_concat_batch_bytes`. `get_next_task_hint` and `get_next_task_input_data` use the same grouping
  * policy so a ready hint always corresponds to data that can be pulled.
  */
@@ -39,14 +35,10 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
 
-  //! `downstream_join` is the HJ/NLJ this CONCAT feeds — not the tree parent (that is
-  //! `_parent_op`, stamped by `set_parent_ops`). Its join type picks `_concat_all`; the
-  //! pointer is retained for the legacy converter's destination lookup.
   explicit sirius_physical_concat(
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
-    sirius_physical_operator* downstream_join,
-    bool is_build,
+    bool concat_all,
     uint64_t concat_batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES);
 
   std::string get_name() const override;
@@ -55,15 +47,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   bool is_sink() const override;
 
-  bool is_build_concat() const;
   [[nodiscard]] MemoryBarrierType input_barrier_for(
     sirius_physical_operator const& producer) const override;
-
-  //! The downstream HJ/NLJ this CONCAT feeds; distinct from `get_parent_op()` (tree parent).
-  [[nodiscard]] sirius_physical_operator* get_downstream_join() const noexcept
-  {
-    return _downstream_join;
-  }
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -74,8 +59,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   void sink(const operator_data& output_data, ::cuda::stream_ref stream) override;
 
-  //! Used when PARTITION + `get_partition_strategy` selects BUILD_PROBE: merge all build batches
-  //! before the join so the hash join sees a single build batch.
+  //! Configure complete-partition grouping before the first claim. Repeating the current
+  //! requirement is safe; changing it after any claim throws std::logic_error.
   void set_concat_all(bool concat_all);
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
@@ -104,11 +89,9 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     std::size_t partition_idx,
     bool pipeline_finished) const;
 
-  bool _is_build;
+  bool _input_claimed = false;
   bool _concat_all;
   uint64_t _concat_batch_bytes;
-  //! Non-owning. Captured at construction from the `downstream_join` ctor argument.
-  sirius_physical_operator* _downstream_join = nullptr;
 };
 
 }  // namespace op

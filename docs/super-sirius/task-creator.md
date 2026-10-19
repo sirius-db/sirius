@@ -140,7 +140,28 @@ Deadlock prevention: both this and sibling partition locks are acquired in a fix
 |--------|----------|
 | `get_next_task_hint()` | If source finished: READY if data exists. If `_concat_all`: WAITING. Otherwise: READY only if some partition holds a complete group — accumulated bytes strictly exceed `_concat_batch_bytes` (the overflowing batch seeds the next group); a lone oversized batch is deferred until a second batch arrives or the source finishes. |
 | `get_next_task_input_data()` | Pulls the first partition with a complete group under the same policy as the hint (`plan_pull_for_partition`). Returns `partitioned_operator_data` with partition index. |
-| Why custom | Byte-threshold batching; `_concat_all` mode for LEFT/ANTI/OUTER joins requires all data before output |
+| Why custom | Generic byte-target or complete-partition grouping, configured by the consumer wiring |
+
+CONCAT accepts a `concat_all` flag, specifying whether each partition must
+be fully concatenated. In `concat_all` is true it waits for producer
+completion, claims each nonempty partition under its operator mutex, and
+publishes one batch at that original index. It forwards singletons and
+concatenates fragmented partitions in repository traversal order; this does
+not establish SQL ordering across concurrent producers. Empty partitions
+emit nothing. Task preparation checks the decoded input footprint against
+GPU capacity before uploading any batches, then validates the actual GPU
+tables for row-count overflow and a common memory space after transfers
+and decoding. Claiming only transfers ownership into the task; execution
+consumes the validated input and forwards or concatenates it.
+
+Join wrapping selects the initial flag from join semantics. Both sibling PARTITION entry paths
+hold their locks while negotiating runtime BUILD_PROBE or whole-build dynamic-filter folding,
+before either can claim input and publish any partition output. Each join input partition keeps
+an explicit non-owning reference to its output CONCAT; build/probe roles come from the join's
+input child edges. The converter preserves build-first dependencies. A later change to the
+CONCAT flag after its first successful claim throws, since already emitted partial groups cannot
+be combined retroactively. Normal producer completion and task retirement govern readiness;
+there is no separate repository completion protocol.
 
 ### SORT_SAMPLE
 

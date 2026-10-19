@@ -129,8 +129,19 @@ struct partitioned_join_options {
         : duckdb::make_uniq<op::sirius_physical_partition>(types, 1, tree.join.get(), is_build);
     auto* const result = partition.get();
     partition->children.push_back(std::move(tree.join->children[child_index]));
-    auto concat =
-      duckdb::make_uniq<op::sirius_physical_concat>(types, 1, tree.join.get(), is_build);
+    auto concat = duckdb::make_uniq<op::sirius_physical_concat>(
+      types,
+      1,
+      options.join_type == duckdb::JoinType::OUTER ||
+        ((options.join_type == duckdb::JoinType::LEFT ||
+          options.join_type == duckdb::JoinType::SEMI ||
+          options.join_type == duckdb::JoinType::ANTI) &&
+         is_build) ||
+        ((options.join_type == duckdb::JoinType::RIGHT ||
+          options.join_type == duckdb::JoinType::RIGHT_SEMI ||
+          options.join_type == duckdb::JoinType::RIGHT_ANTI) &&
+         !is_build));
+    result->set_join_concat(concat.get());
     concat->children.push_back(std::move(partition));
     tree.join->children[child_index] = std::move(concat);
     return result;

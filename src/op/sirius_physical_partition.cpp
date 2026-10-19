@@ -584,37 +584,6 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
 
 std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_data()
 {
-  // Detect whether either partition has a build-side CONCAT downstream that can fold the build side
-  // into a single batch. BUILD_PROBE mode requires exactly one build batch at runtime; the only
-  // mechanism that guarantees it is the build-side CONCAT with concat_all enabled. The consumer
-  // needs this fact to decide BUILD_PROBE eligibility, and it is partition-side wiring the consumer
-  // cannot see, so we compute it here and pass it in.
-  auto has_build_concat = [](sirius_physical_operator& part_op) {
-    for (auto& next_port : part_op.get_next_ports_after_sink()) {
-      if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
-      auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
-      if (concat.is_build_concat()) { return true; }
-    }
-    return false;
-  };
-  // Once BUILD_PROBE is chosen, the build-side CONCAT must be told to fold all build batches into
-  // one. Either sibling may run the decision first, so both configure the build-side CONCAT.
-  // Returns whether a build-side CONCAT was found, so the caller can enforce the BUILD_PROBE
-  // invariant: BUILD_PROBE needs exactly one folded build batch at runtime, which only a
-  // concat_all'd build-side CONCAT guarantees.
-  auto enable_build_concat_all = [](sirius_physical_operator& part_op) {
-    bool found = false;
-    for (auto& next_port : part_op.get_next_ports_after_sink()) {
-      if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
-      auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
-      if (concat.is_build_concat()) {
-        concat.set_concat_all(true);
-        found = true;
-      }
-    }
-    return found;
-  };
-
   auto* consumer =
     dynamic_cast<sirius_physical_partition_consumer_operator*>(_downstream_consumer_op);
   if (consumer == nullptr) {
@@ -629,6 +598,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   if (_sibling_partition_op) {
     auto& sibling = _sibling_partition_op->Cast<sirius_physical_partition>();
     std::scoped_lock guard(lock, sibling.lock);
+    // Both siblings negotiate before either can claim, execute, or publish partition output.
+    // CONCAT cannot see any input until its complete-partition requirement is fixed.
+    auto* build_concat = _is_build ? _join_concat : sibling._join_concat;
     if (!_num_partitions.has_value()) {
       auto& sizing_partition = _drives_partition_count ? *this : sibling;
       // Both locks are held here, so the two sides can be measured together for consumers that
@@ -638,7 +610,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       auto const sizing_totals = sizing_partition.compute_input_totals();
       partition_sizing_input const in{sizing_totals.bytes,
                                       sizing_partition._is_build,
-                                      has_build_concat(*this) || has_build_concat(sibling),
+                                      build_concat != nullptr,
                                       sirius::memory::saturating_add(this_bytes, sibling_bytes),
                                       sizing_totals.rows};
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
@@ -647,17 +619,16 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       auto* hash_join          = dynamic_cast<sirius_physical_hash_join*>(consumer);
       bool build_arrives_whole = false;
       if (strategy.build_probe) {
-        // Configure both siblings' build-side CONCAT (do not short-circuit) and require that at
-        // least one build-side CONCAT exists — BUILD_PROBE cannot run without a concat_all'd build.
-        bool const found_this    = enable_build_concat_all(*this);
-        bool const found_sibling = enable_build_concat_all(sibling);
-        if (!found_this && !found_sibling) {
+        // Either sibling configures the same explicitly wired build CONCAT before publication.
+        // BUILD_PROBE cannot run without a complete build batch.
+        if (build_concat == nullptr) {
           throw std::runtime_error("sirius_physical_partition id " +
                                    std::to_string(this->get_operator_id()) +
                                    ": BUILD_PROBE was selected but no build-side CONCAT was found "
                                    "to fold the build into a "
                                    "single batch (concat_all)");
         }
+        build_concat->set_concat_all(true);
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
       } else if (in.is_build_side && strategy.num_partitions == 1 && hash_join != nullptr &&
                  hash_join->publishes_dynamic_filters() &&
@@ -668,9 +639,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         // joins size from the probe, where one partition says nothing about the build's size.
         // The byte bound matters when hash_partition_bytes exceeds the build budget: a build
         // refused BUILD_PROBE for being too large must not be folded whole for a filter either.
-        bool const found_this    = enable_build_concat_all(*this);
-        bool const found_sibling = enable_build_concat_all(sibling);
-        build_arrives_whole      = found_this || found_sibling;
+        if (build_concat != nullptr) { build_concat->set_concat_all(true); }
+        build_arrives_whole = build_concat != nullptr;
       }
       if (hash_join != nullptr) { hash_join->set_build_arrives_whole(build_arrives_whole); }
       apply_partition_strategy(strategy, *consumer);

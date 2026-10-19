@@ -287,9 +287,8 @@ sirius_physical_operator* require_join_child_wrap(sirius_physical_operator* op,
 {
   REQUIRE(op != nullptr);
   REQUIRE(op->type == SiriusPhysicalOperatorType::CONCAT);
-  auto& concat = op->Cast<sirius::op::sirius_physical_concat>();
-  CHECK(concat.is_build_concat() == is_build);
-  CHECK(concat.get_downstream_join() == join);
+  CHECK(join->children[is_build ? 1 : 0].get() == op);
+  CHECK(join->input_port_for(*op) == (is_build ? "build" : "default"));
 
   REQUIRE(op->children.size() == 1);
   auto* partition = op->children[0].get();
