@@ -129,9 +129,6 @@ constexpr uint64_t DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES = 0;
 /// near 30% of the space.
 constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
 
-/// Exact-check cap when the GPU memory space capacity cannot be read.
-constexpr uint64_t PIN_TABLE_UNIQUE_EXACT_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
-
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.

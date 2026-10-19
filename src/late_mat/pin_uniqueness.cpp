@@ -138,9 +138,6 @@ std::size_t exact_uniqueness_byte_cap(std::uint64_t configured_bytes,
                                       std::uint64_t gpu_capacity_bytes)
 {
   if (configured_bytes > 0) { return static_cast<std::size_t>(configured_bytes); }
-  if (gpu_capacity_bytes == 0) {
-    return static_cast<std::size_t>(config::PIN_TABLE_UNIQUE_EXACT_FALLBACK_MAX_BYTES);
-  }
   return static_cast<std::size_t>(static_cast<double>(gpu_capacity_bytes) *
                                   config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION);
 }
