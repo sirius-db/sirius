@@ -191,7 +191,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use prost::Message;
 
-    use super::{SiriusContext, SubstraitResult};
+    use super::{PinTableSpec, SiriusContext, SubstraitResult};
 
     /// The engine keeps process-global GPU state, so at most one context may be
     /// live at a time; context-constructing tests hold this for their duration.
@@ -411,6 +411,51 @@ mod tests {
             .execute_substrait_result(&local_files_plan_ranged(&[(p, 10, 5)], names()))
             .expect("empty split plan");
         assert_eq!(rows(&empty).len(), 0);
+    }
+
+    /// `pin_table` maps a [`PinTableSpec`] onto `CALL pin_table(...)`: the pin's summary comes
+    /// back, a scan of the pinned file still returns its rows, `unpin_table` releases it, and a
+    /// bad tier is an error that leaves the context usable. Requires a GPU.
+    #[test]
+    fn pins_and_unpins_a_parquet_table() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ids.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids]).unwrap();
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let p = path.to_str().unwrap();
+        let plan = local_files_plan(p, vec!["id".to_string()]);
+        let rows =
+            |batches: Vec<RecordBatch>| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+
+        let mut ctx = SiriusContext::new().expect("bring up sirius context");
+        let spec = PinTableSpec {
+            path: Some(p.to_string()),
+            tier: "gpu".to_string(),
+            name: "ids".to_string(),
+            cols: Some(vec!["id".to_string()]),
+            format: None,
+            schema: None,
+        };
+        assert_eq!(ctx.pin_table(&spec).unwrap(), "pinned 'ids' tier=gpu");
+        assert_eq!(rows(ctx.execute_substrait(&plan).unwrap()), 3);
+        assert_eq!(ctx.unpin_table("ids").unwrap(), "unpinned 'ids'");
+
+        let bad_tier = PinTableSpec {
+            tier: "disk".to_string(),
+            ..spec
+        };
+        assert!(ctx.pin_table(&bad_tier).is_err());
+        assert_eq!(rows(ctx.execute_substrait(&plan).unwrap()), 3);
     }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`
