@@ -2588,9 +2588,8 @@ TEST_CASE("transparent S3 projection fallback reports prose instead of an except
 
   s3_sql_fixture fixture(*env);
   set_gpu_execution(fixture.con, true);
-  auto const query =
-    "SELECT abs(n_nationkey - 100) FROM " + s3_parquet_scan(*env, "nation") + " LIMIT 1";
-  auto result = fixture.con.Query(query);
+  auto const query = "SELECT md5(n_name) FROM " + s3_parquet_scan(*env, "nation") + " LIMIT 1";
+  auto result      = fixture.con.Query(query);
   REQUIRE(result);
   REQUIRE(result->HasError());
 
