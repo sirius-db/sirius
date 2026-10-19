@@ -78,6 +78,7 @@ enum class function_id : uint16_t {
 
   // Additional numeric functions
   round,
+  abs,
 };
 
 /**
