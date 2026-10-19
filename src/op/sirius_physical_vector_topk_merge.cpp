@@ -180,7 +180,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::execute(
 
   raft::device_resources res{stream};
   auto merged = vss::knn_merge_parts_topk(
-    res, stacked_distances->view(), stacked_ids->view(), n_left, n_parts, k, mr);
+    res, stacked_distances->view(), stacked_ids->view(), n_left, n_parts, k, stream, mr);
 
   // Merged results are k per left row, nearest first: left row i repeated k times.
   cudf::numeric_scalar<cudf::size_type> zero(0, true, stream);

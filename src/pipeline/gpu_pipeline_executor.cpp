@@ -34,12 +34,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <format>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 namespace sirius {
 namespace pipeline {
@@ -203,7 +205,7 @@ void gpu_pipeline_executor::manager_loop()
           _memory_space != nullptr ? _memory_space->get_device_id() : -1,
           bytes_needs);
       }
-      reservation = _memory_space->make_reservation(bytes_needs);
+      reservation = wait_for_reservation(bytes_needs);
     }
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
@@ -277,7 +279,7 @@ void gpu_pipeline_executor::manager_loop()
         reservation = std::move(new_reservation);
       } else {
         // Predicate never succeeded — try one final reservation attempt
-        reservation = _memory_space->make_reservation(bytes_needs);
+        reservation = wait_for_reservation(bytes_needs);
       }
 
       // One INFO line per executor-driven (reserve-path) downgrade. The shortfall
@@ -352,6 +354,7 @@ void gpu_pipeline_executor::manager_loop()
     // the handler alive past the owning sirius_engine, which is destroyed before query cleanup
     // drains the queues.
     auto completion = gpu_task->get_completion_handler();
+    _tasks_in_flight.fetch_add(1);
     _bounded_pool->dispatch(
       std::move(slot),
       [this,
@@ -360,6 +363,12 @@ void gpu_pipeline_executor::manager_loop()
        consumers  = std::move(output_consumers),
        completion = std::move(completion),
        pipeline]() mutable {
+        // Counted until the task is done with its memory: its reservation goes back when
+        // execute() returns or throws.
+        struct in_flight_guard {
+          std::atomic<size_t>& count;
+          ~in_flight_guard() { count.fetch_sub(1); }
+        } const in_flight{_tasks_in_flight};
         try {
           task->execute(::cuda::stream_ref{exc_stream.get()});
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
@@ -532,6 +541,17 @@ void gpu_pipeline_executor::manager_loop()
         }
       });
   }
+}
+
+std::unique_ptr<cucascade::memory::reservation> gpu_pipeline_executor::wait_for_reservation(
+  std::size_t bytes)
+{
+  while (_running.load()) {
+    if (auto reservation = _memory_space->make_reservation_or_null(bytes)) { return reservation; }
+    if (_tasks_in_flight.load() == 0) { return _memory_space->make_reservation_upto(bytes); }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return nullptr;
 }
 
 gpu_pipeline_task* gpu_pipeline_executor::cast_to_gpu_pipeline_task(sirius::parallel::itask* task)

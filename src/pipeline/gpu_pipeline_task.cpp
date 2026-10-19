@@ -73,7 +73,11 @@ void validate_operator_output_types(const op::operator_data* data,
   for (size_t batch_index = 0; batch_index < batches.size(); batch_index++) {
     const auto& batch = batches[batch_index];
     if (!batch) { continue; }
-    cudf::table_view tbl = get_cudf_table_view(*batch);
+    // An operator may hand on a batch it already moved to host memory (an oversized vector-join
+    // answer); there is no device table to check until the consumer stages it back.
+    auto const ro = batch->to_read_only();
+    if (ro.get_current_tier() != cucascade::memory::Tier::GPU) { continue; }
+    cudf::table_view tbl = get_cudf_table_view(ro);
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
       SIRIUS_LOG_WARN(
         "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
@@ -133,7 +137,7 @@ void log_operator_data(const op::sirius_physical_operator& op,
     const auto& batches = p_data->get_read_only_batches();
     num_batches         = batches.size();
     for (auto const& batch : batches) {
-      if (batch.get_data()) {
+      if (batch.get_data() && batch.get_current_tier() == cucascade::memory::Tier::GPU) {
         auto view = get_cudf_table_view(batch);
         batch_rows += std::to_string(view.num_rows()) + "  ";
         total_bytes = memory::saturating_add(total_bytes, batch.get_data()->get_size_in_bytes());

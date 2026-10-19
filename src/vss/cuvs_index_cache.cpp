@@ -98,9 +98,10 @@ std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find_by_column(
   auto const wanted = canonical_metric(metric);
   for (auto const& kv : _entries) {
     auto const& entry = kv.second;
-    if (entry->meta.catalog_name == catalog && entry->meta.schema_name == schema &&
-        entry->meta.table_name == table && entry->meta.column_name == column &&
-        canonical_metric(entry->meta.metric) == wanted) {
+    // Only a search index answers a search; a clustering's centroids and lists share the cache.
+    if (entry->meta.kind == index_kind::ivf_flat && entry->meta.catalog_name == catalog &&
+        entry->meta.schema_name == schema && entry->meta.table_name == table &&
+        entry->meta.column_name == column && canonical_metric(entry->meta.metric) == wanted) {
       return entry;
     }
   }
@@ -119,6 +120,24 @@ std::vector<index_metadata> cuvs_index_cache::indexes_on_column(std::string_view
     if (meta.catalog_name == catalog && meta.schema_name == schema && meta.table_name == table &&
         meta.column_name == column) {
       out.push_back(meta);
+    }
+  }
+  return out;
+}
+
+std::vector<std::string> cuvs_index_cache::names_on_column(std::string_view catalog,
+                                                           std::string_view schema,
+                                                           std::string_view table,
+                                                           std::string_view column,
+                                                           index_kind kind) const
+{
+  std::scoped_lock lock(_mutex);
+  std::vector<std::string> out;
+  for (auto const& kv : _entries) {
+    auto const& meta = kv.second->meta;
+    if (meta.kind == kind && meta.catalog_name == catalog && meta.schema_name == schema &&
+        meta.table_name == table && meta.column_name == column) {
+      out.push_back(kv.first);
     }
   }
   return out;

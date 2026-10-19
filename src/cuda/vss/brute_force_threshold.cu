@@ -15,6 +15,7 @@
  */
 
 #include "cuda/vss/brute_force_threshold.hpp"
+#include "vss/size_limits.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/types.hpp>
@@ -94,7 +95,7 @@ struct true_distance_op {
 template <typename T>
 std::unique_ptr<cudf::column> uvector_to_column(rmm::device_uvector<T>&& v, cudf::data_type dt)
 {
-  auto const size = static_cast<cudf::size_type>(v.size());
+  auto const size = column_size(static_cast<std::int64_t>(v.size()), "vector join threshold");
   return std::make_unique<cudf::column>(dt, size, v.release(), rmm::device_buffer{}, 0);
 }
 
@@ -168,7 +169,8 @@ threshold_join_result brute_force_threshold(raft::device_resources const& res,
   std::size_t out_size = 0;
   auto const grow_to   = [&](std::size_t need) {
     if (need <= out_q.capacity()) return;
-    std::size_t cap = std::max<std::size_t>(need, out_q.capacity() * 2);
+    auto const cap = static_cast<std::size_t>(grown_pair_capacity(
+      out_q.capacity(), need, 2 * sizeof(int64_t) + sizeof(float), "brute_force_threshold"));
     out_q.reserve(cap, stream);
     out_n.reserve(cap, stream);
     out_dist.reserve(cap, stream);

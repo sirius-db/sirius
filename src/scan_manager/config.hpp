@@ -213,6 +213,10 @@ struct scan_manager_config {
   /// Number of uring reactor worker threads for the local-disk IO path.
   std::size_t uring_n_reactors{default_uring_n_reactors};
 
+  /// Whether the config named @c uring_n_reactors. When it did not, the uring
+  /// ioctx sizes the pool from the host memory space (see make_uring_ioctx_factory).
+  bool uring_n_reactors_explicit{false};
+
   /// Number of REST reactor worker threads for the S3/object-store IO path
   /// (each its own libcurl event loop + connection pool).
   std::size_t rest_n_reactors{2};

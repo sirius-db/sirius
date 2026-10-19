@@ -44,6 +44,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -669,6 +670,60 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE_FALSE(telemetry.enable_quent);
   REQUIRE(telemetry.output_directory == "/tmp/sirius_telemetry_config_test");
   REQUIRE(telemetry.engine_name == "sirius_config_test");
+}
+
+TEST_CASE("Sirius host pools come from registered pages by default",
+          "[sirius][context][isolated_context]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  std::source_location loc = std::source_location::current();
+  fs::path cfg = fs::path(loc.file_name()).parent_path() / "data" / "register_pools.yaml";
+
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  auto host_spaces =
+    sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(host_spaces.size() == 1);
+  auto* host_mr = const_cast<cucascade::memory::memory_space*>(host_spaces.front())
+                    ->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host_mr != nullptr);
+
+  // The pools behind these blocks, the initial ones included, come from the configured upstream.
+  auto const block_bytes = host_mr->get_block_size();
+  auto blocks            = host_mr->allocate_multiple_blocks(std::size_t{64} * block_bytes);
+  REQUIRE(blocks != nullptr);
+  for (std::size_t b = 0; b < 64; b += 21) {
+    auto* host = blocks->at(b).data();
+    cudaPointerAttributes attributes{};
+    REQUIRE(cudaPointerGetAttributes(&attributes, host) == cudaSuccess);
+    CHECK(attributes.type == cudaMemoryTypeHost);
+    // cucascade's own upstream (register_pools: false) allocates non-portable pools, so this flag
+    // is what tells the registered upstream apart from it.
+    unsigned int flags = 0;
+    REQUIRE(cudaHostGetFlags(&flags, host) == cudaSuccess);
+    CHECK((flags & cudaHostAllocPortable) != 0);
+    void* device_view = nullptr;
+    REQUIRE(cudaHostGetDevicePointer(&device_view, host, 0) == cudaSuccess);
+
+    std::memset(host, static_cast<int>(b + 1), block_bytes);
+    void* device = nullptr;
+    REQUIRE(cudaMalloc(&device, block_bytes) == cudaSuccess);
+    REQUIRE(cudaMemcpy(device, device_view, block_bytes, cudaMemcpyDefault) == cudaSuccess);
+    std::vector<unsigned char> back(block_bytes);
+    REQUIRE(cudaMemcpy(back.data(), device, block_bytes, cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaFree(device) == cudaSuccess);
+    CHECK(std::all_of(back.begin(), back.end(), [b](unsigned char v) { return v == b + 1; }));
+  }
 }
 
 TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][config]")

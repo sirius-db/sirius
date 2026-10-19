@@ -69,6 +69,23 @@ cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
   return host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
 }
 
+/// Reactors for the local-disk path: the configured count, or with none configured one per
+/// 16 GiB of the host memory space, between the built-in default and 4. A buffered read from the
+/// page cache is a copy on the reactor's thread, so one reactor caps a pin's reads at one core's
+/// copy rate; each reactor also holds a fixed 64 MiB of pinned staging, which a small host pool
+/// cannot spare. Deep10M pinned on the GPU (3.35 GB read, RTX A5000, 140 GB host pool): 1 reactor
+/// 0.47 s, 4 reactors 0.23 s, 8 reactors 0.22 s, with 16 batches in flight.
+std::size_t uring_reactor_count(const scan_manager::scan_manager_config& config,
+                                cucascade::memory::memory_reservation_manager& rm)
+{
+  if (config.uring_n_reactors_explicit) { return config.uring_n_reactors; }
+  auto host_spaces = rm.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (host_spaces.empty()) { return config.uring_n_reactors; }
+  constexpr std::size_t bytes_per_reactor = std::size_t{16} << 30;
+  auto const by_memory = host_spaces.front()->get_max_memory() / bytes_per_reactor;
+  return std::clamp<std::size_t>(by_memory, config.uring_n_reactors, 4);
+}
+
 /// Build a SigV4 authorizer from the object-store credentials, or nullptr when
 /// the store is not configured (empty endpoint / credentials / region — which
 /// disables the REST backend).  The signing form follows @c s3_signing_mode.
@@ -120,7 +137,8 @@ factory_type make_uring_ioctx_factory(
       }
       // One reactor_context shares config and the pinned staging resource.
       auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
-      return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
+      return std::make_shared<uring::uring_ioctx>(uring_reactor_count(config, reservation_manager),
+                                                  std::move(ctx));
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
       return nullptr;

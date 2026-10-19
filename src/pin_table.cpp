@@ -49,10 +49,17 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -249,6 +256,21 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
 
   auto coalescer = ingestible.create_batch_coalescer();
 
+  // SIRIUS_PIN_PHASE_DEBUG prints where a pin's time went; it synchronizes after each decode,
+  // so only for attribution.
+  bool const timing     = std::getenv("SIRIUS_PIN_PHASE_DEBUG") != nullptr;
+  auto const* depth_env = std::getenv("SIRIUS_PIN_OVERLAP");
+  std::size_t depth     = depth_env == nullptr
+                            ? std::size_t{2}
+                            : static_cast<std::size_t>(std::strtoull(depth_env, nullptr, 10));
+  // With a budget, the depth follows the first batch's size: each batch ahead holds its staging
+  // and its decoded table, about twice its decoded bytes.
+  bool depth_sized  = depth_env != nullptr || options.in_flight_budget_bytes == 0;
+  auto const pin_t0 = std::chrono::steady_clock::now();
+  std::atomic<std::int64_t> decode_ns{0};
+  double finish_s = 0, wait_s = 0;
+  std::size_t batches = 0;
+
   // Rows materialized so far, in emission order — feeds the chunk-contiguity
   // validation (duckdb-native pins only).
   std::size_t rows_materialized = 0;
@@ -283,10 +305,18 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   // together with its GPU placement + the decode stream. Mirrors
   // load_balancing_scan_batch_coalescer::process_provider_inputs, minus the connector/balancer
   // and the post-decode step: there is no downstream scan operator at pin time, so the
-  // unfiltered table is delivered to the sink directly. The device guard stays in scope across
-  // the on_batch call, so the sink runs on the correct device.
-  auto handle_batch = [&](std::unique_ptr<op::scan::scan_info> batch) {
-    if (!batch) { return; }
+  // unfiltered table is delivered to the sink directly. Split in two: the read and decode, which
+  // the next batch runs while this thread finishes the one before it, and the rest, which runs
+  // here in emission order. Each half holds the device guard, so the sink runs on the correct
+  // device.
+  struct decoded_batch {
+    std::unique_ptr<op::scan::scan_info> batch;
+    std::unique_ptr<cudf::table> tbl;
+    cucascade::memory::memory_space* target;
+    int gpu_id;
+    ::cuda::stream_ref stream;
+  };
+  auto decode_batch = [&](std::unique_ptr<op::scan::scan_info> batch) {
     // round_robin_strategy ignores pipeline_id/data; it returns the next device id
     // from its cursor. gpu_spaces is non-empty (checked above), so the strategy always
     // yields a device. space_by_device round-trips it to the materialization target.
@@ -308,8 +338,18 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // post_filter_and_project (which would only apply a row filter or re-project to a
     // query's output layout, neither of which a pin needs). `batch` is borrowed by const
     // ref and outlives the call.
-    auto materialized     = ingestible.materialize_metadata_to_table(*batch, *target, stream);
-    auto tbl              = materialized.table.release(stream, target->get_default_allocator());
+    auto materialized = ingestible.materialize_metadata_to_table(*batch, *target, stream);
+    auto tbl          = materialized.table.release(stream, target->get_default_allocator());
+    if (timing) { stream.sync(); }
+    return decoded_batch{std::move(batch), std::move(tbl), target, gpu_id, stream};
+  };
+  auto finish_batch = [&](decoded_batch decoded) {
+    auto& batch       = decoded.batch;
+    auto& tbl         = decoded.tbl;
+    auto* target      = decoded.target;
+    auto const gpu_id = decoded.gpu_id;
+    auto stream       = decoded.stream;
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_id}};
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
     rows_materialized += chunk_rows;
@@ -381,6 +421,62 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     on_batch(std::move(tbl), target, stream, std::move(column_storage), std::move(chunk_stats));
   };
 
+  // Up to `depth` batches are read and decoded on workers while this thread finishes the oldest
+  // one, so file reads, both transfers and the decode of neighbouring batches overlap; batches are
+  // still finished in emission order. SIRIUS_PIN_OVERLAP sets the depth (a 38 GB pin on an RTX
+  // A5000 took 13.8 / 9.4 / 7.9 / 7.3 s at 0 / 1 / 2 / 3); 0 does each batch start to finish.
+  // Without it the depth fits the caller's budget, between 2 and 16: the reads only spread over
+  // the ioctx's reactors when enough batches are in flight (Deep10M on the GPU, 4 reactors: 2
+  // batches 0.47 s, 16 batches 0.23 s).
+  auto const since = [](auto t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  };
+  auto const timed_decode = [&](std::unique_ptr<op::scan::scan_info> b) {
+    auto const t0 = std::chrono::steady_clock::now();
+    auto decoded  = decode_batch(std::move(b));
+    decode_ns +=
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+        .count();
+    return decoded;
+  };
+  auto const timed_finish = [&](decoded_batch decoded) {
+    auto const t0 = std::chrono::steady_clock::now();
+    finish_batch(std::move(decoded));
+    finish_s += since(t0);
+    ++batches;
+  };
+  std::deque<std::future<decoded_batch>> in_flight;
+  auto const take_oldest = [&] {
+    auto const t0 = std::chrono::steady_clock::now();
+    auto decoded  = in_flight.front().get();
+    in_flight.pop_front();
+    wait_s += since(t0);
+    return decoded;
+  };
+  auto handle_batch = [&](std::unique_ptr<op::scan::scan_info> batch) {
+    if (!batch) { return; }
+    if (!depth_sized) {
+      depth_sized          = true;
+      auto const per_batch = std::max<std::size_t>(1, 2 * batch->estimated_bytes());
+      depth = std::clamp<std::size_t>(options.in_flight_budget_bytes / per_batch, 2, 16);
+    }
+    if (depth == 0) {
+      timed_finish(timed_decode(std::move(batch)));
+      return;
+    }
+    std::optional<decoded_batch> ready;
+    if (in_flight.size() == depth) { ready = take_oldest(); }
+    in_flight.push_back(std::async(
+      std::launch::async,
+      [&timed_decode, b = std::move(batch)]() mutable { return timed_decode(std::move(b)); }));
+    if (ready) { timed_finish(std::move(*ready)); }
+  };
+  auto drain = [&] {
+    while (!in_flight.empty()) {
+      timed_finish(take_oldest());
+    }
+  };
+
   while (!ingestible.has_processed_all_metadata()) {
     // A pin reads its fixed ingestible on the one ioctx it was given; route every file to it.
     auto task = ingestible.next_split_provider([io_ctx_sp](std::string_view) { return io_ctx_sp; });
@@ -393,6 +489,18 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   }
   for (auto& b : coalescer->flush()) {
     handle_batch(std::move(b));
+  }
+  drain();
+  if (timing) {
+    std::fprintf(stderr,
+                 "[pin-phases] %zu batches, %zu decodes in flight: decode %.3f s, finish %.3f s, "
+                 "waited for decode %.3f s, wall %.3f s\n",
+                 batches,
+                 depth,
+                 static_cast<double>(decode_ns.load()) * 1e-9,
+                 finish_s,
+                 wait_s,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_t0).count());
   }
 
   if (std::any_of(options.probe_unique_columns.begin(),
