@@ -22,8 +22,11 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
+#include <cudf/copying.hpp>
+
 #include <cucascade/data/data_batch.hpp>
 
+#include <algorithm>
 #include <exception>
 #include <set>
 #include <string>
@@ -158,28 +161,67 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
   }
 
   const auto num_partitions = static_cast<int>(_outputs.size());
-  for (const auto& input_batch : input.get_read_only_batches()) {
-    auto* space = input_batch.get_memory_space();
+  // Partition everything first, publish after: an OOM here leaves nothing published, so the task
+  // can retry the whole input (sink_publishes_on_success_only). Pieces bound hash_partition's
+  // peak, ~3x its input, whatever feeds the sink: a scan batch or an aggregate's output.
+  const auto& batches  = input.get_data_batches();
+  const auto read_only = input.get_read_only_batches();
+  std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> partitioned;
+  auto const partition = [&](auto const& batch, cucascade::memory::memory_space& space) {
+    // Same kernel as PARTITION; routing only.
+    partitioned.push_back(gpu_partition_impl::hash_partition(batch,
+                                                             _spec.key_columns,
+                                                             _spec.key_cast_types,
+                                                             num_partitions,
+                                                             stream,
+                                                             space,
+                                                             batch_telemetry()));
+  };
+  for (std::size_t b = 0; b < read_only.size(); ++b) {
+    const auto& input_batch = read_only[b];
+    auto* space             = input_batch.get_memory_space();
     if (space == nullptr) {
       throw sirius::internal_exception(
         "sirius_physical_streaming_sink: partitioned sink requires a resident input batch");
     }
-
-    // Same kernel as PARTITION; routing only.
-    auto slices = gpu_partition_impl::hash_partition(input_batch,
-                                                     _spec.key_columns,
-                                                     _spec.key_cast_types,
-                                                     num_partitions,
-                                                     stream,
-                                                     *space,
-                                                     batch_telemetry());
-
+    const auto view   = sirius::get_cudf_table_view(input_batch);
+    const auto rows   = static_cast<std::size_t>(view.num_rows());
+    const auto bytes  = input_batch.get_data() ? input_batch.get_data()->get_size_in_bytes() : 0;
+    const auto pieces = partition_pieces(rows, bytes, _max_piece_bytes);
+    if (pieces.size() == 1) {
+      partition(input_batch, *space);
+      continue;
+    }
+    for (auto const& [begin, end] : pieces) {
+      auto const slice =
+        cudf::slice(view, {static_cast<cudf::size_type>(begin), static_cast<cudf::size_type>(end)})
+          .front();
+      // A view of the input batch, which the caller holds for the whole sink().
+      auto piece =
+        sirius::make_data_batch_from_view(slice, batches[b], 0, *space, stream, batch_telemetry());
+      partition(piece->to_read_only(), *space);
+    }
+  }
+  for (const auto& slices : partitioned) {
     for (std::size_t i = 0; i < slices.size(); ++i) {
       // Empty partition stays WAITING until finalize.
       if (sirius::get_cudf_table_view(*slices[i]).num_rows() == 0) { continue; }
       if (!_outputs[i]->push(slices[i])) { poison_refused_output(*_outputs[i], i); }
     }
   }
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> sirius_physical_streaming_sink::partition_pieces(
+  std::size_t rows, std::size_t bytes, std::size_t max_piece)
+{
+  if (rows <= 1 || bytes <= max_piece) { return {{0, rows}}; }
+  auto const count = (bytes + max_piece - 1) / max_piece;
+  auto const step  = std::max<std::size_t>(1, (rows + count - 1) / count);
+  std::vector<std::pair<std::size_t, std::size_t>> out;
+  for (std::size_t begin = 0; begin < rows; begin += step) {
+    out.emplace_back(begin, std::min(rows, begin + step));
+  }
+  return out;
 }
 
 std::size_t sirius_physical_streaming_sink::no_history_peak_memory_estimate(
@@ -190,8 +232,9 @@ std::size_t sirius_physical_streaming_sink::no_history_peak_memory_estimate(
   // Broadcast holds the original plus one clone per extra destination, and each one stays
   // resident until its own repository drains — so the whole fan-out is live at once, not 2×.
   if (_spec.mode == partition_mode::broadcast) { return stats.bytes * _outputs.size(); }
-  // Hash holds hash_partition's reorder buffer alongside the slices it produces.
-  return stats.bytes * 2;
+  // Hash holds the slices of the whole input, plus hash_partition's reorder buffer for one piece at
+  // a time.
+  return stats.bytes + std::min<std::size_t>(stats.bytes, _max_piece_bytes);
 }
 
 void sirius_physical_streaming_sink::build_pipelines(pipeline::sirius_pipeline& current,
