@@ -414,14 +414,26 @@ These operators are injected during pipeline splitting. They don't map to DuckDB
 ### `sirius_physical_partition` — `PARTITION`
 **File:** `src/op/sirius_physical_partition.hpp`
 
-Repartitions data into N buckets based on partition keys. Partition keys are always plain column indices — a hash-join equality key that is a complex expression has already been materialized into a real column by a planner-inserted projection (`materialize_expression_join_keys()`), because PARTITION hashes by column index and cannot evaluate expressions.
+Routes rows using explicit key columns and normalization types supplied by the physical planner.
+Complex join keys are materialized into columns before this description is constructed.
 
-- **Modes:** `HASH` (most common), `RANGE`, `EVENLY`, `CUSTOM`, `NONE`
-- **Adaptive count:** the downstream consumer's `get_partition_strategy()` computes N from input size and `hash_partition_bytes`. N is fixed on the first task because it determines each row's hash bucket.
-- **Placement:** the same strategy carries a `partition_placement` (which GPU each partition runs on). `apply_partition_strategy()` latches the count, broadcast flag, and placement on both siblings and installs the placement on the consumer and on every operator the partitions sink into (a join's CONCATs), which stamp each partition's device on the data they emit. A placement naming a GPU outside the consumer's admitted set is rejected. The consumer's `placement()` accessor throws if no placement has been installed; standalone operator tests must call `set_placement()` explicitly.
-- **Sibling coordination:** Build-side partition normally determines the shared count. For RIGHT-family hash joins other than `RIGHT_DELIM_JOIN`, the retained probe side determines it instead.
-- **Projected sizing (aggregate fanout):** when runtime estimation is enabled, the group-by partition uses a projected total and a `PARTIAL` ingress. It waits if no estimate is available. See [data management](data-management.md#runtime-data-size-estimation).
-- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_placement`, `_broadcast`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`, `_size_estimate`
+- **Routing:** hash, single-destination, replication, and resident-device selection use a resolved
+  `partition_layout`. Sort range routing retains its separate implementation pending the ordered
+  repository work.
+- **Fixed layout:** `set_fixed_layout()` supplies the destination count/placement without a sizing
+  consumer. Conflicting changes to an installed layout are rejected.
+- **Adaptive layout:** explicitly bound input policies resolve count, placement, and consumer
+  execution requirements once through `partition_exchange`, before any input claim. PARTITION
+  contains no join/groupby type dispatch or sibling-role discovery.
+- **Publication:** `routed_operator_data` attaches a destination index to each output batch.
+  Indexed publication is available on every physical operator; receivers need no sizing API.
+- **Placement:** consumer policy validates admitted GPUs and shares the placement with its input
+  routers and receivers. Stateful tasks retain the existing device stamps.
+- **Projected sizing:** aggregate fanout can latch a projected input size under a `PARTIAL`
+  ingress; measurements floor the projection. See
+  [data management](data-management.md#runtime-data-size-estimation).
+- **Dynamic filters:** a hash-join build-input observer records arrivals, certifies before claims,
+  contributes before scatter, publishes after successful scatter, and closes on finalization.
 
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/op/sirius_physical_concat.hpp`
@@ -517,7 +529,9 @@ Handle correlated subqueries via duplicate elimination. Wrap an inner join (hash
 ### `sirius_physical_partition_consumer_operator`
 **File:** `src/op/sirius_physical_partition_consumer_operator.hpp`
 
-Base interface for operators that consume partitioned data. Provides `push_data_batch_partitioned(port_id, batch, partition_idx)`.
+Base for operators whose tasks need partition placement and the admitted GPU set. Sizing targets
+and decisions belong to concrete consumers. Indexed batch publication is inherited from
+`sirius_physical_operator`, so generic receivers do not need this base.
 
 ## Result Operators
 
