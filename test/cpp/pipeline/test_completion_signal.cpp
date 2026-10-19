@@ -192,6 +192,11 @@ class waiting_source final : public sirius_physical_operator {
   {
   }
 
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   std::optional<sirius::op::task_creation_hint> get_next_task_hint() override
   {
     return sirius::op::task_creation_hint{sirius::op::TaskCreationHint::READY, this};
@@ -306,4 +311,42 @@ TEST_CASE("Task creation waiting on input allows completion and rechecks closure
   CHECK(closed == !return_input);
   REQUIRE(finished.wait_for(0s) == std::future_status::ready);
   REQUIRE_NOTHROW(finished.get());
+}
+
+TEST_CASE("Exhausted LIMIT waits for in-flight tasks without draining its source",
+          "[pipeline][completion][unordered_limit_cpu]")
+{
+  class unfinished_source : public sirius::op::test_physical_operator {
+   public:
+    unfinished_source() : test_physical_operator(SiriusPhysicalOperatorType::GPU_SCAN, {}, 100) {}
+    bool all_ports_empty() override { return false; }
+  } source;
+  class inline_limit : public sirius::op::test_physical_operator {
+   public:
+    inline_limit()
+      : test_physical_operator(SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT, {}, 1)
+    {
+    }
+    bool is_limit_exhausted() const override { return exhausted; }
+    bool exhausted = false;
+  } limit;
+  auto sink     = make_sink(SiriusPhysicalOperatorType::RESULT_COLLECTOR);
+  auto pipeline = make_finishable_pipeline(sink);
+  sirius_pipeline_build_state state;
+  state.set_pipeline_source(*pipeline, source);
+  state.add_pipeline_operator(*pipeline, limit);
+  pipeline->mark_task_created();
+  pipeline->mark_task_created();
+  CHECK_FALSE(pipeline->is_limit_exhausted());
+  limit.exhausted = true;
+  CHECK(pipeline->is_limit_exhausted());
+  pipeline->update_pipeline_status(false);
+  CHECK_FALSE(pipeline->is_pipeline_finished());
+  pipeline->mark_task_completed();
+  pipeline->update_pipeline_status(false);
+  CHECK_FALSE(pipeline->is_pipeline_finished());
+  pipeline->mark_task_completed();
+  pipeline->update_pipeline_status(false);
+  CHECK(pipeline->is_pipeline_finished());
+  CHECK_FALSE(source.all_ports_empty());
 }

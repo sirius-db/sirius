@@ -331,6 +331,7 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
     }
 
     case sirius::op::SiriusPhysicalOperatorType::LIMIT:
+    case sirius::op::SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT:
     case sirius::op::SiriusPhysicalOperatorType::STREAMING_LIMIT: {
       if (slot->children.size() != 1 || slot->children[0]->types != slot->types) { break; }
       install_physical_schema(*slot, output_physical_schema(*slot->children[0]));

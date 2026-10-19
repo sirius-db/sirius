@@ -382,6 +382,7 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
     }
 
     case sirius::op::SiriusPhysicalOperatorType::LIMIT:
+    case sirius::op::SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT:
     case sirius::op::SiriusPhysicalOperatorType::STREAMING_LIMIT: {
       if (op.children.size() != 1 || op.children[0]->types != op.types) { break; }
       return child_maps[0];

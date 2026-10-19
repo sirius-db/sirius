@@ -18,9 +18,13 @@
 #include "operator_type_traits.hpp"
 
 #include <catch.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/data/disk_io_backend.hpp>
+#include <cucascade/memory/disk_table.hpp>
 #include <helper/type_conversions.hpp>
 #include <op/sirius_physical_limit.hpp>
 
+#include <future>
 #include <map>
 #include <numeric>
 
@@ -351,4 +355,157 @@ TEST_CASE("operator input position describes a multi-batch destination",
   partitioned_operator_data partitioned(batches, std::optional<std::size_t>{11});
   REQUIRE(partitioned.with_batches_preserving_rows(batches)->get_position() == 11);
   REQUIRE_FALSE(pipelineable_operator_data(batches).get_position());
+}
+
+TEST_CASE("unordered limit retains claims across retries and batch replacement",
+          "[physical_limit][unordered_limit]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  sirius_physical_unordered_streaming_limit limit(
+    {sirius::from_duckdb(duckdb::LogicalType::BIGINT)},
+    BoundLimitNode::ConstantValue(7),
+    BoundLimitNode::ConstantValue(12),
+    100,
+    true);
+  std::vector<std::unique_ptr<operator_data>> inputs;
+  for (int begin : {0, 10, 20}) {
+    inputs.push_back(std::make_unique<pipelineable_operator_data>(
+      std::vector{make_range_batch(*space, begin, 10)}));
+  }
+  limit.claim_input(inputs[0]);
+  CHECK_FALSE(limit.is_limit_exhausted());
+  limit.claim_input(inputs[1]);
+  CHECK(limit.is_limit_exhausted());
+  // Simulate the saved operator input delivered on OOM resume, then late materialization.
+  limit.claim_input(inputs[1]);
+  auto& claimed = dynamic_cast<limiting_operator_data&>(*inputs[1]);
+  CHECK(claimed.slice_begin == 2);
+  CHECK(claimed.slice_count == 7);
+  inputs[1] = claimed.with_batches_preserving_rows(claimed.get_data_batches());
+  limit.claim_input(inputs[1]);
+  limit.claim_input(inputs[2]);
+  CHECK(dynamic_cast<limiting_operator_data&>(*inputs[2]).slice_count == 0);
+  auto result  = limit.execute(*inputs[1], cudf::get_default_stream());
+  auto& output = dynamic_cast<pipelineable_operator_data&>(*result);
+  CHECK_FALSE(output.get_position());
+  CHECK(collect_all_rows(output.get_data_batches()) ==
+        std::vector<int64_t>{12, 13, 14, 15, 16, 17, 18});
+
+  // A second LIMIT must make its own claim even when given another LIMIT's saved input.
+  sirius_physical_unordered_streaming_limit other(
+    {sirius::from_duckdb(duckdb::LogicalType::BIGINT)},
+    BoundLimitNode::ConstantValue(2),
+    BoundLimitNode::ConstantValue(1),
+    100,
+    true);
+  other.claim_input(inputs[1]);
+  CHECK(dynamic_cast<limiting_operator_data&>(*inputs[1]).slice_begin == 1);
+  CHECK(dynamic_cast<limiting_operator_data&>(*inputs[1]).slice_count == 2);
+}
+
+TEST_CASE("unordered limit zero produces an empty GPU batch", "[physical_limit][unordered_limit]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  auto batch   = make_range_batch(*space, 0, 10);
+  sirius_physical_unordered_streaming_limit zero({sirius::from_duckdb(duckdb::LogicalType::BIGINT)},
+                                                 BoundLimitNode::ConstantValue(0),
+                                                 BoundLimitNode::ConstantValue(0),
+                                                 100,
+                                                 true);
+  CHECK_FALSE(zero.is_limit_exhausted());
+  std::unique_ptr<operator_data> input =
+    std::make_unique<pipelineable_operator_data>(std::vector{batch});
+  zero.claim_input(input);
+  CHECK(zero.is_limit_exhausted());
+  auto result  = zero.execute(*input, cudf::get_default_stream());
+  auto& output = dynamic_cast<pipelineable_operator_data&>(*result);
+  REQUIRE(output.get_data_batches().size() == 1);
+  CHECK(collect_all_rows(output.get_data_batches()).empty());
+}
+
+TEST_CASE("unordered limit claims use metadata and survive retry without a GPU",
+          "[unordered_limit_cpu]")
+{
+  // Metadata-only disk batches: no file is created or read and no GPU allocation is needed.
+  cucascade::memory::disk_memory_space_config config;
+  config.mount_paths     = "/tmp";
+  config.memory_capacity = 1024;
+  class metadata_only_io : public cucascade::idisk_io_backend {
+   public:
+    void write(const std::filesystem::path&,
+               const void*,
+               std::size_t,
+               std::size_t,
+               ::cuda::stream_ref) override
+    {
+      throw std::logic_error("Unexpected metadata test I/O");
+    }
+    void read(
+      const std::filesystem::path&, void*, std::size_t, std::size_t, ::cuda::stream_ref) override
+    {
+      throw std::logic_error("Unexpected metadata test I/O");
+    }
+    void write(const std::filesystem::path&, const void*, std::size_t, std::size_t) override
+    {
+      throw std::logic_error("Unexpected metadata test I/O");
+    }
+    void read(const std::filesystem::path&, void*, std::size_t, std::size_t) override
+    {
+      throw std::logic_error("Unexpected metadata test I/O");
+    }
+  };
+  cucascade::memory::memory_space space(config, std::make_shared<metadata_only_io>());
+  auto make_input = [&](std::size_t rows) -> std::unique_ptr<operator_data> {
+    auto table = std::make_unique<cucascade::memory::disk_table_allocation>(
+      "", std::vector<cucascade::memory::column_metadata>{}, 0);
+    table->columns.emplace_back();
+    table->columns[0].num_rows = rows;
+    auto batch                 = data_batch::make(
+      0, std::make_unique<cucascade::disk_data_representation>(std::move(table), space));
+    return std::make_unique<pipelineable_operator_data>(std::vector{std::move(batch)});
+  };
+  sirius_physical_unordered_streaming_limit limit(
+    {}, BoundLimitNode::ConstantValue(27), BoundLimitNode::ConstantValue(13), 100, true);
+  std::vector<std::future<std::pair<std::size_t, std::size_t>>> tasks;
+  for (int i = 0; i < 8; ++i) {
+    tasks.push_back(std::async(std::launch::async, [&] {
+      auto input = make_input(10);
+      limit.claim_input(input);
+      auto& saved = dynamic_cast<limiting_operator_data&>(*input);
+      input       = saved.with_batches_preserving_rows(saved.get_data_batches());
+      limit.claim_input(input);
+      auto& claim = dynamic_cast<limiting_operator_data&>(*input);
+      return std::pair{claim.slice_begin, claim.slice_count};
+    }));
+  }
+  std::size_t skipped = 0, taken = 0;
+  for (auto& task : tasks) {
+    auto [skip, take] = task.get();
+    skipped += skip;
+    taken += take;
+  }
+  CHECK(skipped == 13);
+  CHECK(taken == 27);
+  CHECK(limit.is_limit_exhausted());
+
+  sirius_physical_unordered_streaming_limit zero(
+    {}, BoundLimitNode::ConstantValue(0), BoundLimitNode(), 100, true);
+  CHECK_FALSE(zero.is_limit_exhausted());
+  auto input = make_input(0);
+  zero.claim_input(input);
+  CHECK(zero.is_limit_exhausted());
+  CHECK(dynamic_cast<limiting_operator_data&>(*input).slice_count == 0);
+
+  sirius_physical_unordered_streaming_limit larger(
+    {}, BoundLimitNode::ConstantValue(100), BoundLimitNode::ConstantValue(5), 100, true);
+  auto empty = make_input(0);
+  larger.claim_input(empty);
+  CHECK_FALSE(larger.is_limit_exhausted());
+  auto small = make_input(8);
+  larger.claim_input(small);
+  CHECK(dynamic_cast<limiting_operator_data&>(*small).slice_begin == 5);
+  CHECK(dynamic_cast<limiting_operator_data&>(*small).slice_count == 3);
+  CHECK_FALSE(larger.is_limit_exhausted());
 }
