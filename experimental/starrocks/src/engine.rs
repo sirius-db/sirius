@@ -60,6 +60,9 @@ struct ExecuteRequest {
 }
 
 /// One request to the engine thread, the only one that touches the context.
+// `Run` carries a whole fragment request and outweighs the others. A request lives only until the
+// engine thread takes it, so boxing it would buy nothing.
+#[allow(clippy::large_enum_variant)]
 enum EngineRequest {
     Run(ExecuteRequest),
     /// Export the next batch parked under `slot` as a ring job.
