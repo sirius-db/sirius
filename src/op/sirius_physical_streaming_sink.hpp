@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -117,6 +118,11 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
     _max_piece_bytes = std::max<std::size_t>(1, bytes);
   }
 
+  /// Hash mode: each destination's slices are held until they add up to @p bytes, then
+  /// published as one batch, so an exchange ships and spills fewer, larger batches. 0 (the
+  /// default, unless SIRIUS_CN_EXCHANGE_BATCH_BYTES says otherwise) publishes every slice.
+  void set_combine_bytes(std::size_t bytes) { _combine_bytes = bytes; }
+
   /// The row ranges [begin, end) an input of @p rows rows and @p bytes bytes is partitioned in,
   /// each at most @p max_piece bytes (one range when it already fits, or on one row).
   [[nodiscard]] static std::vector<std::pair<std::size_t, std::size_t>> partition_pieces(
@@ -167,6 +173,19 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   partition_spec _spec;
 
   std::size_t _max_piece_bytes = default_max_piece_bytes;
+
+ private:
+  /// Publishes @p batches to output @p index, as one batch when there are several and the
+  /// GPU has room to combine them, else one by one.
+  void publish_combined(std::size_t index,
+                        std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                        ::cuda::stream_ref stream);
+
+  std::size_t _combine_bytes;
+  std::mutex _pending_mutex;
+  /// Per output, slices held until they reach _combine_bytes, and their bytes.
+  std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> _pending;
+  std::vector<std::size_t> _pending_bytes;
 };
 
 }  // namespace sirius::op

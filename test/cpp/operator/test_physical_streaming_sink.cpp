@@ -502,6 +502,45 @@ TEST_CASE("streaming_sink PART-1: partitioned fan-out preserves every row exactl
   REQUIRE(seen == expected);
 }
 
+TEST_CASE("streaming_sink PART-1b: slices are combined up to the target bytes", "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  auto [op, repos] = make_partitioned_sink(2);
+  // More than the whole input: every destination's slices wait for finalize.
+  op->set_combine_bytes(std::size_t{1} << 30);
+  std::vector<std::pair<int64_t, int32_t>> expected;
+  for (int b = 0; b < 3; ++b) {
+    std::vector<int64_t> keys;
+    std::vector<int32_t> vals;
+    for (int i = 0; i < 8; ++i) {
+      const auto key = static_cast<int64_t>(b * 8 + i);
+      keys.push_back(key);
+      vals.push_back(static_cast<int32_t>(key * 10));
+      expected.emplace_back(key, static_cast<int32_t>(key * 10));
+    }
+    sink_one(*op,
+             make_two_column_batch<int64_t, int32_t>(*gpu_space, keys, vals, cudf::type_id::INT32));
+  }
+  for (std::size_t i = 0; i < 2; ++i) {
+    CHECK(op->availability(i) == availability::WAITING);
+  }
+  op->finalize_operator();
+
+  std::vector<std::pair<int64_t, int32_t>> seen;
+  for (std::size_t i = 0; i < 2; ++i) {
+    // One combined batch per destination.
+    CHECK(repos[i]->get_batch_ids().size() == 1);
+    auto rows = drain_rows(*op, i);
+    seen.insert(seen.end(), rows.begin(), rows.end());
+  }
+  std::sort(seen.begin(), seen.end());
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(seen == expected);
+}
+
 // ============================================================================
 // PART-2: equal keys are co-located — the property a shuffle actually needs
 // ============================================================================
