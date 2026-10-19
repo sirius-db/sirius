@@ -693,14 +693,18 @@ void downgrade_executor::set_pipeline_task_queue(
 
 // --- Public request API ---
 
-std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
+std::future<size_t> downgrade_executor::request_free_memory(size_t bytes,
+                                                            std::function<bool()> satisfied)
 {
   auto req          = std::make_unique<downgrade_request>();
   req->target_bytes = bytes;
-  req->predicate    = [&freed = req->bytes_freed, bytes]() {
-    return freed.load(std::memory_order_relaxed) >= bytes;
-  };
-  auto future = req->result.get_future();
+  if (!satisfied) {
+    satisfied = [&freed = req->bytes_freed, bytes]() {
+      return freed.load(std::memory_order_relaxed) >= bytes;
+    };
+  }
+  req->predicate = std::move(satisfied);
+  auto future    = req->result.get_future();
   if (!_request_queue.push(std::move(req))) {
     SIRIUS_LOG_WARN(
       "[downgrade] request_free_memory: queue inactive, dropping request for {} bytes", bytes);
@@ -711,6 +715,12 @@ std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
 size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
 {
   return request_free_memory(bytes).get();
+}
+
+size_t downgrade_executor::request_free_memory_and_wait(size_t bytes,
+                                                        std::function<bool()> satisfied)
+{
+  return request_free_memory(bytes, std::move(satisfied)).get();
 }
 
 std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)

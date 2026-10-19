@@ -295,9 +295,19 @@ struct Context::Impl {
       // Received batches can wait a long time for their receivers. Let them spill to host under
       // pressure rather than fail the query when a shuffle outgrows the pool.
       exchange->enable_spill(
-        context->get_exchange_staging(),
-        [ctx = context.get(), space = gpu.get_id()](std::size_t bytes) {
-          ctx->get_downgrade_executor(space).request_free_memory_and_wait(bytes);
+        context->get_exchange_staging(), [ctx = context.get(), space = &gpu](std::size_t bytes) {
+          // The spill stops once this reservation is made, and keeps what it
+          // freed for it.
+          std::mutex mutex;
+          std::unique_ptr<cucascade::memory::reservation> made;
+          auto const reserve = [&] {
+            std::lock_guard const lock{mutex};
+            if (!made) { made = space->make_reservation_or_null(bytes); }
+            return made != nullptr;
+          };
+          ctx->get_downgrade_executor(space->get_id()).request_free_memory_and_wait(bytes, reserve);
+          reserve();
+          return std::move(made);
         });
     }
     if (ring) { attach_ring(*ring_options); }

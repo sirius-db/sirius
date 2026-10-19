@@ -81,7 +81,7 @@ std::unique_ptr<cucascade::memory::reservation> exchange_inbox::reserve(std::siz
   constexpr int attempts = 3;
   for (int attempt = 1; attempt <= attempts; ++attempt) {
     try {
-      make_room(bytes);
+      if (auto made = make_room(bytes)) { return made; }
       break;
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN("exchange inbox: making room for {} bytes failed (attempt {} of {}): {}",

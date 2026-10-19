@@ -121,13 +121,14 @@ class downgrade_executor {
   /**
    * @brief Asynchronously request GPU memory reclamation.
    *
-   * Constructs a predicate that checks bytes_freed >= bytes and enqueues
-   * a downgrade request. Returns immediately with a future.
+   * Enqueues a downgrade request that stops once @p satisfied holds, by default once
+   * bytes_freed >= bytes. Returns immediately with a future.
    *
    * @param bytes Target bytes to free
+   * @param satisfied Replaces the default stop condition; see request_free_memory_and_wait.
    * @return std::future<size_t> Resolves to actual bytes freed (may be less than requested)
    */
-  std::future<size_t> request_free_memory(size_t bytes);
+  std::future<size_t> request_free_memory(size_t bytes, std::function<bool()> satisfied = {});
 
   /**
    * @brief Synchronously request GPU memory reclamation.
@@ -138,6 +139,19 @@ class downgrade_executor {
    * @return size_t Actual bytes freed (may be less than requested)
    */
   size_t request_free_memory_and_wait(size_t bytes);
+
+  /**
+   * @brief Synchronously free GPU memory until @p satisfied holds.
+   *
+   * Like request_free_memory_and_wait(bytes), but stops as soon as @p satisfied returns true,
+   * which it is asked before each spill and after each one. A caller that makes its
+   * reservation inside @p satisfied keeps the bytes the spill freed: another reserver cannot
+   * take them between the spill and the caller's own attempt.
+   * WARNING: @p satisfied may be called by several threads at once.
+   *
+   * @return size_t Actual bytes freed
+   */
+  size_t request_free_memory_and_wait(size_t bytes, std::function<bool()> satisfied);
 
   /**
    * @brief Set the pipeline task queue pointer for tiered downgrade scanning.
