@@ -455,7 +455,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // Pin-time uniqueness facts count as proofs only with pin_table_prove_unique_keys; without a
   // context, prove_unique_columns considers declared PRIMARY KEYs alone.
   auto* const pin_facts_context =
-    sirius_context && duckdb::session_compression_config(context).prove_unique_keys
+    sirius_context && duckdb::query_operator_options(context)->prove_unique_keys
       ? sirius_context.get()
       : nullptr;
   auto build_side_unique_cols  = prove_unique_columns(pin_facts_context, *op.children[1]);

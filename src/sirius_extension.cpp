@@ -1226,6 +1226,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
   const auto& comp_cfg = duckdb::session_compression_config(context);
+  auto const unique_cfg = duckdb::query_operator_options(context);
   bool const compression_requested =
     data.args.compression.value_or(comp_cfg.enable_pin_table_compression);
   if (compression_requested && comp_cfg.input_plan_dir.empty()) {
@@ -1324,7 +1325,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
   // With pin_table_prove_unique_keys, every other column is observed too, as a join-key candidate.
   auto const probe_unique_automatic = sirius::late_mat::pin_unique_automatic_selection(
-    probe_unique_columns, comp_cfg.prove_unique_keys);
+    probe_unique_columns, unique_cfg->prove_unique_keys);
   for (std::size_t i = 0; i < probe_unique_columns.size(); ++i) {
     if (probe_unique_automatic[i]) { probe_unique_columns[i] = true; }
   }
@@ -1364,7 +1365,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                        .enable_compressed_materialization = compressed_pin,
                                        .probe_unique_columns              = probe_unique_columns,
                                        .probe_unique_automatic            = probe_unique_automatic,
-                                       .unique_exact_max_bytes = comp_cfg.unique_exact_max_bytes});
+                                       .unique_exact_max_bytes = unique_cfg->unique_exact_max_bytes});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(host_result.column_storage));
@@ -1398,7 +1399,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
        .enable_compressed_materialization = compressed_pin,
        .probe_unique_columns              = probe_unique_columns,
        .probe_unique_automatic            = probe_unique_automatic,
-       .unique_exact_max_bytes            = comp_cfg.unique_exact_max_bytes});
+       .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(dev_result.column_storage));
@@ -1423,7 +1424,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                        .enable_compressed_materialization = compressed_pin,
                                        .probe_unique_columns              = probe_unique_columns,
                                        .probe_unique_automatic            = probe_unique_automatic,
-                                       .unique_exact_max_bytes = comp_cfg.unique_exact_max_bytes});
+                                       .unique_exact_max_bytes = unique_cfg->unique_exact_max_bytes});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(mat.column_storage));
@@ -2781,23 +2782,18 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
 
 static void SetPinTableProveUniqueKeys(ClientContext& context, SetScope scope, Value& parameter)
 {
-  if (scope == SetScope::GLOBAL)
-    throw InvalidInputException("Pin uniqueness options are session settings");
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) { return; }
-  duckdb::session_compression_config(context).prove_unique_keys = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated pin_table_prove_unique_keys to {}", BooleanValue::Get(parameter));
+  auto* params              = get_operator_params(context, scope);
+  params->prove_unique_keys = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_prove_unique_keys to {}", params->prove_unique_keys);
 }
 
 static void SetPinTableUniqueExactMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
-  if (scope == SetScope::GLOBAL)
-    throw InvalidInputException("Pin uniqueness options are session settings");
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) { return; }
   // 0 is meaningful: it restores the derived cap (a share of GPU memory space capacity).
-  duckdb::session_compression_config(context).unique_exact_max_bytes = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated pin_table_unique_exact_max_bytes to {}", UBigIntValue::Get(parameter));
+  auto* params                   = get_operator_params(context, scope);
+  params->unique_exact_max_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_unique_exact_max_bytes to {}",
+                   params->unique_exact_max_bytes);
 }
 
 static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
@@ -3466,7 +3462,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "Prove pinned parquet columns distinct at pin time, and let joins whose build key was proven "
     "distinct take the single-pass distinct hash join, as for a PRIMARY KEY",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(compression_defaults.prove_unique_keys),
+    Value::BOOLEAN(operator_defaults.prove_unique_keys),
     SetPinTableProveUniqueKeys);
 
   config.AddExtensionOption(
@@ -3474,7 +3470,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "Cap in bytes on one column in pin_table's exact uniqueness check (a sort of the whole column; "
     "peak GPU use is about three times the cap). 0 = 10% of the GPU memory space capacity",
     LogicalType::UBIGINT,
-    Value::UBIGINT(compression_defaults.unique_exact_max_bytes),
+    Value::UBIGINT(operator_defaults.unique_exact_max_bytes),
     SetPinTableUniqueExactMaxBytes);
 
   add_sirius_option(
