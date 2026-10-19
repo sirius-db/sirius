@@ -106,19 +106,10 @@ namespace sirius::late_mat {
 [[nodiscard]] std::vector<bool> pin_unique_automatic_selection(
   std::vector<bool> const& explicitly_selected, bool prove_unique_keys);
 
-/// Byte cap for one column in the exact stage (the `pin_table_unique_exact_max_bytes` option):
-/// @p configured_bytes when non-zero, otherwise a share
-/// (`config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION`) of @p gpu_capacity_bytes, the capacity of
-/// the GPU memory space the pin retains the column on. An unknown capacity (0) falls back to
-/// `config::PIN_TABLE_UNIQUE_EXACT_FALLBACK_MAX_BYTES`.
-///
-/// The cap bounds the bytes of a column's retained chunks, which is the size of the concatenated
-/// column the exact check sorts. The check's peak GPU use is about three times that: the retained
-/// chunks, their concatenation and the sorted copy, plus cuDF's sort scratch. A column past the
-/// cap stays UNKNOWN, which costs an optimization and never an answer. Automatic columns reach the
-/// exact stage only when every chunk is distinct and the chunks overlap in range (SF1000
-/// `orders`, 1.5B rows of `o_orderkey`, 12 GB), and such a join key is worth one sort at pin
-/// time.
+/// Byte cap for one column in the exact stage (`pin_table_unique_exact_max_bytes`):
+/// @p configured_bytes when non-zero, otherwise `config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION`
+/// of @p gpu_capacity_bytes (`config::PIN_TABLE_UNIQUE_EXACT_FALLBACK_MAX_BYTES` when that is 0).
+/// The check's peak GPU use is about three times the cap; a column past it stays UNKNOWN.
 [[nodiscard]] std::size_t exact_uniqueness_byte_cap(std::uint64_t configured_bytes,
                                                     std::uint64_t gpu_capacity_bytes);
 
