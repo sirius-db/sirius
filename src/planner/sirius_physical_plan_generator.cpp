@@ -472,10 +472,8 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     if (!spaces.empty()) {
       auto const& config = sirius_ctx->get_config().get_scan_manager_config();
       auto limits        = config.preparation.resolve(config.thread_pool.num_threads);
-      auto permits       = std::min<size_t>({static_cast<size_t>(config.thread_pool.num_threads),
-                                             limits.max_inflight_jobs,
-                                             limits.max_active_units,
-                                             limits.max_pending_results});
+      auto permits       = static_cast<size_t>(config.thread_pool.num_threads);
+      if (limits.max_inflight_dv_jobs) permits = std::min(permits, limits.max_inflight_dv_jobs);
       decision = ledger->admit(envelopes, spaces.front()->get_id(), static_cast<uint32_t>(permits));
     }
   }
@@ -926,7 +924,7 @@ void require_complete_native_scan_schema(const sirius::op::sirius_physical_table
 {
   for (std::size_t column_idx = 0; column_idx < scan.types.size(); ++column_idx) {
     auto const& type = scan.types[column_idx];
-    if (sirius::try_get_cudf_type(type)) { continue; }
+    if (sirius::get_cudf_type(type)) { continue; }
     throw duckdb::NotImplementedException(
       "GPU scan output column %llu (%s) has no native cuDF "
       "carrier",
@@ -1914,7 +1912,7 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
                       : nullptr;
   auto op_params =
     sirius_ctx
-      ? sirius_ctx->get_config().get_operator_params()
+      ? *duckdb::query_operator_options(context)
       : sirius::operator_params::with_batch_size(sirius::config::derived_default_batch_size());
 
   std::unordered_map<op::sirius_physical_operator*, plan_lineage> lineage_aliases;
@@ -2109,7 +2107,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = nullptr;
 
   // SQLNULL-typed columns (e.g. an uncast NULL in VALUES) have no cuDF
-  // representation — get_cudf_type() / fixed_width_byte_size() reject them at
+  // representation — require_cudf_type() / fixed_width_byte_size() reject them at
   // execution time, after the GPU plan is already running. Reject the plan
   // here instead so transparent execution falls back to DuckDB CPU.
   for (const auto& type : op.types) {
@@ -2226,8 +2224,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       // plan = create_plan(op.Cast<duckdb::LogicalExplain>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
-      throw duckdb::NotImplementedException("Distinct not supported");
-      // plan = create_plan(op.Cast<duckdb::LogicalDistinct>());
+      plan = create_plan(op.Cast<duckdb::LogicalDistinct>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_PREPARE:
       throw duckdb::NotImplementedException("Prepare not supported");

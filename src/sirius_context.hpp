@@ -113,9 +113,32 @@ class SiriusConnectionState : public ClientContextState {
   {
     captured_plan_.reset();
     captured_original_views_.reset();
+    std::lock_guard lock(cpu_replay_error_mutex_);
+    cpu_replay_error_.reset();
   }
 
-  void QueryEnd() final { pinned_update_guard_.reset(); }
+  void QueryEnd() final
+  {
+    pinned_update_guard_.reset();
+    execution_options.reset();
+  }
+
+  // Access is serialized by the owning ClientContext. Workers only see execution_options.
+  std::optional<sirius::operator_params> operator_overrides;
+  std::optional<sirius::compression_config> compression_overrides;
+  std::shared_ptr<const sirius::operator_params> execution_options;
+
+  /// \brief Report @p error, not the interrupt it raised, when the CPU replay failed.
+  ///
+  /// The transparent CPU replay runs a nested DuckDB Executor on this connection. When it fails,
+  /// Executor::PushError raises the connection's shared interrupt flag before the error reaches the
+  /// outer query's executor. A client thread polling the outer query can see the flag in between
+  /// and fail the query with InterruptException (#2145). DuckDB drains the outer query's tasks
+  /// before QueryEnd, so the replay's error is recorded by then and replaces that interrupt.
+  void QueryEnd(ClientContext& context, optional_ptr<ErrorData> error) final;
+
+  /// \brief Record the error that failed this query's CPU replay, from the replaying thread.
+  void record_cpu_replay_error(ErrorData error, string query);
 
   [[nodiscard]] bool has_pinned_update_guard() const noexcept
   {
@@ -295,6 +318,13 @@ class SiriusConnectionState : public ClientContextState {
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
   std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;
+  /// The failed CPU replay's error and the query it belongs to. Written by a worker thread.
+  struct cpu_replay_error {
+    ErrorData error;
+    string query;
+  };
+  std::mutex cpu_replay_error_mutex_;
+  std::optional<cpu_replay_error> cpu_replay_error_;
   uint64_t connection_id_;
   uint64_t query_ordinal_ = 0;
 };
@@ -302,6 +332,9 @@ class SiriusConnectionState : public ClientContextState {
 /// \brief Resolve the per-connection Sirius state, or nullptr when Sirius has
 /// not registered on this connection.
 shared_ptr<SiriusConnectionState> get_sirius_connection_state(ClientContext& context);
+sirius::operator_params& session_operator_params(ClientContext& context);
+sirius::compression_config& session_compression_config(ClientContext& context);
+std::shared_ptr<const sirius::operator_params> query_operator_options(ClientContext& context);
 
 /// \brief Thrown by the health check when the Sirius runtime was latched
 /// unavailable before this query touched it. An ExecutorException
@@ -667,11 +700,6 @@ class SiriusContext : public ClientContextState {
   /// \return The manager, or nullptr
   [[nodiscard]] sirius::data::data_repository_manager_registry::manager_ptr
   get_data_repository_manager(sirius::query_id_t query_id) const;
-
-  /// \brief Snapshot of every in-flight query's manager, ascending by query id.
-  /// Memory pressure is a global condition, so the downgrade executors sweep across all of them.
-  [[nodiscard]] std::vector<sirius::data::data_repository_manager_registry::manager_ptr>
-  get_data_repository_managers() const;
 
   /// \brief The registry itself, for subsystems that hold a long-lived binding to it.
   [[nodiscard]] sirius::data::data_repository_manager_registry& get_data_repository_registry();

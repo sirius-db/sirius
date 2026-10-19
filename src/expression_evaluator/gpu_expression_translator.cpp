@@ -413,7 +413,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     return std::nullopt;
   }
 
-  auto const cudf_type = sirius::get_cudf_type(alt.return_type());
+  auto const cudf_type = sirius::require_cudf_type(alt.return_type());
   // TODO: Expand type support as needed. See constant.cpp.
   switch (cudf_type.id()) {
     case cudf::type_id::INT8: {
@@ -660,7 +660,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 
   // Construct the CAST expression, if possible
   // CuDF AST only supports casts to INT64, UINT64, FLOAT64
-  auto const cudf_return_type = sirius::get_cudf_type(alt.target_type);
+  auto const cudf_return_type = sirius::require_cudf_type(alt.target_type);
   switch (cudf_return_type.id()) {
     case cudf::type_id::INT64:
       return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::CAST_TO_INT64,

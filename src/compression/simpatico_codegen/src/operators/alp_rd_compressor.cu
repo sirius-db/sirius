@@ -28,6 +28,7 @@
 
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/cuda_check.hpp"
+#include "decode/decode_session.hpp"
 #include "operators/alp_common.cuh"
 
 #include <cudf/column/column.hpp>
@@ -469,11 +470,12 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
 
 template <typename T>
 std::unique_ptr<cudf::column> alp_rd_decompress_impl(alp_rd_compressed_representation const& repr,
-                                                     ::cuda::stream_ref stream,
-                                                     rmm::device_async_resource_ref mr)
+                                                     decode_frame& frame)
 {
-  using traits = alp_rd_traits<T>;
-  using uint_t = typename traits::uint_t;
+  auto const stream = frame.stream();
+  auto const mr     = frame.mr();
+  using traits      = alp_rd_traits<T>;
+  using uint_t      = typename traits::uint_t;
 
   if (repr.num_rows == 0) {
     return cudf::make_fixed_width_column(
@@ -505,7 +507,7 @@ std::unique_ptr<cudf::column> alp_rd_decompress_impl(alp_rd_compressed_represent
                                           out->mutable_view().data<T>());
   }
 
-  throw_if_cuda_error(cudaStreamSynchronize(stream.get()), "alp_rd_decompress sync");
+  throw_if_cuda_error(cudaGetLastError(), "alp_rd_decompress launch");
   return out;
 }
 
@@ -536,11 +538,11 @@ alp_rd_compressed_representation::alp_rd_compressed_representation(
 }
 
 std::unique_ptr<cudf::column> alp_rd_compressed_representation::decompress(
-  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+  decode_frame& frame) const
 {
   switch (original_type.id()) {
-    case cudf::type_id::FLOAT32: return alp_rd_decompress_impl<float>(*this, stream, mr);
-    case cudf::type_id::FLOAT64: return alp_rd_decompress_impl<double>(*this, stream, mr);
+    case cudf::type_id::FLOAT32: return alp_rd_decompress_impl<float>(*this, frame);
+    case cudf::type_id::FLOAT64: return alp_rd_decompress_impl<double>(*this, frame);
     default:
       throw std::runtime_error("alp_rd: only FLOAT32 / FLOAT64 are supported (got " +
                                type_id_to_name(original_type) + ")");

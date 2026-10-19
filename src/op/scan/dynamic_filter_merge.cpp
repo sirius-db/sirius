@@ -636,7 +636,7 @@ void apply_cascade(application_result_state& result,
 {
   auto current = input;
   if (result.ast_mask) {
-    result.output = sirius::ApplyRetentionMask(current, result.ast_mask->view(), stream, mr);
+    result.output = sirius::apply_retention_mask(current, result.ast_mask->view(), stream, mr);
     current       = result.output->view();
   }
   result.counts[0] = current.num_rows();
@@ -646,7 +646,7 @@ void apply_cascade(application_result_state& result,
       result.mask = step.mask_source->compute_mask(
         current.column(step.column_index), result.program->device_id, stream, mr);
       if (result.mask) {
-        result.output = sirius::ApplyRetentionMask(current, result.mask->view(), stream, mr);
+        result.output = sirius::apply_retention_mask(current, result.mask->view(), stream, mr);
         current       = result.output->view();
         result.contributed[i] = true;
       }
@@ -661,7 +661,7 @@ void compact_row_ids(application_result_state& result,
                      ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
-  result.scratch_table = sirius::ApplyRetentionMask(
+  result.scratch_table = sirius::apply_retention_mask(
     cudf::table_view({result.deferred.row_ids->view()}), mask, stream, mr);
   result.columns          = result.scratch_table->release();
   result.deferred.row_ids = std::move(result.columns.front());
@@ -717,7 +717,7 @@ void apply_deferred_keys(application_result_state& result,
         auto const keep_key =
           i + 1 == steps.size() || steps[i + 1].column_index == step.column_index;
         if (keep_key) {
-          result.scratch_table = sirius::ApplyRetentionMask(
+          result.scratch_table = sirius::apply_retention_mask(
             cudf::table_view({probe, state.row_ids->view()}), result.mask->view(), stream, mr);
           result.columns    = result.scratch_table->release();
           state.aligned_key = detail::aligned_key_column{
@@ -817,7 +817,7 @@ void apply_gather_once(application_result_state& result,
                                  stream.get()));
   }
   if (any_contributed(result)) {
-    result.output = sirius::ApplyRetentionMask(input, result.conjunction->view(), stream, mr);
+    result.output = sirius::apply_retention_mask(input, result.conjunction->view(), stream, mr);
   }
 }
 

@@ -116,7 +116,7 @@ std::unique_ptr<cudf::table> positional_delete_filter::apply(std::unique_ptr<cud
   // would avoid the sync; a one-byte-per-row mask does not justify it yet.
   stream.sync();
 
-  return sirius::ApplyRetentionMask(tbl->view(), bool_col->view(), stream, mr);
+  return sirius::apply_retention_mask(tbl->view(), bool_col->view(), stream, mr);
 }
 
 }  // namespace sirius::op::scan

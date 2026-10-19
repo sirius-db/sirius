@@ -140,7 +140,7 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 
 **File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
-The evaluator supports three strategies, selected via the `strategy` constructor parameter (default from `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`):
+The evaluator supports three strategies, selected via `policy.strategy` in the `expression_query_policy` constructor argument:
 
 | Strategy | How it executes | cuDF API |
 |----------|-----------------|----------|
@@ -171,6 +171,19 @@ The strategy is a DuckDB SET variable registered in `src/sirius_extension.cpp`:
 ```sql
 SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materialize'
 ```
+
+### Policy ownership
+
+At query initialization, Sirius snapshots the connection's settings into immutable
+`operator_params`. Operators derive an `expression_query_policy` from that snapshot and
+pass it to their evaluators. Scan materialization and residual filtering forward the
+same policy explicitly; pin operations supply their own settings snapshot.
+
+Each evaluator owns a constant copy of both the execution strategy and the regex JIT
+flag. Evaluation therefore uses the settings captured at construction, including when
+it runs on a different worker thread. It does not consult thread-local settings or
+mutable process globals. Standalone callers may omit the policy to use fixed defaults
+(`AST_INTERPRET`, regex JIT enabled), or pass an explicit policy.
 
 ## Supported Expression Types
 

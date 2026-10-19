@@ -15,7 +15,9 @@
  */
 
 #include "../operator/operator_test_utils.hpp"
+#include "exec/stream_plan_bindings.hpp"
 #include "exec/streaming_fragment.hpp"
+#include "helper/logical_type.hpp"
 #include "helper/type_conversions.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
@@ -28,6 +30,7 @@
 #include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/query_result.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
@@ -35,8 +38,12 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <set>
+#include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using Catch::Matchers::ContainsSubstring;
@@ -132,6 +139,61 @@ std::size_t drain_row_count(streaming_fragment& fragment, stream_id_t id)
   return rows;
 }
 
+//! region → SUM(amount) from a gather stream of VARCHAR + BIGINT.
+std::map<std::string, std::int64_t> drain_groups(streaming_fragment& fragment, stream_id_t id)
+{
+  std::map<std::string, std::int64_t> groups;
+  while (auto batch = fragment.pull(id)) {
+    auto view = sirius::get_cudf_table_view(**batch);
+    REQUIRE(view.num_columns() == 2);
+    auto regions = sirius::test::operator_utils::copy_column_to_host<std::string>(view.column(0));
+    auto amounts = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(view.column(1));
+    REQUIRE(regions.size() == amounts.size());
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+      groups[regions[i]] += amounts[i];
+    }
+  }
+  return groups;
+}
+
+//! The first comparison join in `op`'s subtree, or nullptr.
+duckdb::LogicalOperator* find_comparison_join(duckdb::LogicalOperator& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) { return &op; }
+  for (auto& child : op.children) {
+    if (auto* join = find_comparison_join(*child)) { return join; }
+  }
+  return nullptr;
+}
+
+//! Every input stream scanned in `op`'s subtree.
+std::set<stream_id_t> scanned_streams(duckdb::LogicalOperator& op)
+{
+  std::set<stream_id_t> streams;
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto& get = op.Cast<duckdb::LogicalGet>();
+    if (get.bind_data) {
+      streams.insert(get.bind_data->Cast<sirius::exec::stream_source_bind_data>().stream_id);
+    }
+  }
+  for (auto& child : op.children) {
+    streams.merge(scanned_streams(*child));
+  }
+  return streams;
+}
+
+void merge_disjoint_groups(std::map<std::string, std::int64_t>& dst,
+                           std::map<std::string, std::int64_t> src)
+{
+  for (auto& [region, amount] : src) {
+    // Hash partitioning sends each key to one destination; a split would mean the
+    // sink hashed the same region onto both roots.
+    INFO("region=" << region);
+    REQUIRE(dst.count(region) == 0);
+    dst[region] = amount;
+  }
+}
+
 }  // namespace
 
 // ============================================================================
@@ -153,7 +215,9 @@ TEST_CASE_METHOD(fragment_fixture,
     fragment.run();
 
     REQUIRE(fragment.output_batch_count(0) > 0);
+    REQUIRE(fragment.output_row_count(0) == kLeafRows);
     REQUIRE(drain_row_count(fragment, 0) == kLeafRows);
+    REQUIRE(fragment.output_row_count(0) == 0);
 
     con->Rollback();
   } catch (...) {
@@ -1195,4 +1259,196 @@ TEST_CASE_METHOD(fragment_fixture,
   CHECK(runtime->get_data_repository_manager(query_id) == nullptr);
   REQUIRE_NOTHROW(runtime->retire_query_work(query_id, retirement::cancelled));
   CHECK(runtime->get_runtime_health() == duckdb::SiriusContext::runtime_health::OK);
+}
+
+// ============================================================================
+// FRAG-14: two-shard GROUP BY (partial SUM → hash N=2 → merge SUM) in one process via
+// relay_from and sender-set EOS.
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-14: two-shard GROUP BY via hash sink and sender-set EOS",
+                 "[integration][streaming_fragment]")
+{
+  sirius::test::scratch_dir sales("frag14_sales");
+  auto const sales_0 = sales.file("sales_0.parquet");
+  auto const sales_1 = sales.file("sales_1.parquet");
+
+  {
+    auto off = con->Query("SET gpu_execution = false");
+    REQUIRE(off);
+    REQUIRE_FALSE(off->HasError());
+
+    auto write = [&](const std::string& path, const char* values_sql) {
+      auto copied = con->Query(std::string("COPY (SELECT * FROM (VALUES ") + values_sql +
+                               ") t(region, amount)) TO " + sirius::test::sql_literal(path) +
+                               " (FORMAT PARQUET)");
+      REQUIRE(copied);
+      REQUIRE_FALSE(copied->HasError());
+    };
+    // Distinct keys so the 2-way hash populates both destinations; the hash is deterministic.
+    write(sales_0,
+          "('east'::VARCHAR, 10::BIGINT), ('west'::VARCHAR, 20::BIGINT), "
+          "('east'::VARCHAR, 5::BIGINT), ('north'::VARCHAR, 3::BIGINT), "
+          "('south'::VARCHAR, 8::BIGINT)");
+    write(sales_1,
+          "('west'::VARCHAR, 7::BIGINT), ('east'::VARCHAR, 3::BIGINT), "
+          "('north'::VARCHAR, 11::BIGINT), ('south'::VARCHAR, 1::BIGINT), "
+          "('midwest'::VARCHAR, 4::BIGINT)");
+  }
+
+  auto expected_result = con->Query(
+    "SELECT region, CAST(SUM(amount) AS BIGINT) FROM ("
+    "SELECT * FROM read_parquet(" +
+    sirius::test::sql_literal(sales_0) + ") UNION ALL SELECT * FROM read_parquet(" +
+    sirius::test::sql_literal(sales_1) + ")) t GROUP BY region");
+  REQUIRE(expected_result);
+  REQUIRE_FALSE(expected_result->HasError());
+  std::map<std::string, std::int64_t> expected;
+  for (std::size_t i = 0; i < expected_result->RowCount(); ++i) {
+    expected[expected_result->Collection().GetValue(0, i).ToString()] =
+      expected_result->Collection().GetValue(1, i).GetValue<std::int64_t>();
+  }
+  REQUIRE(expected == (std::map<std::string, std::int64_t>{
+                        {"east", 18}, {"west", 27}, {"north", 14}, {"south", 9}, {"midwest", 4}}));
+
+  con->BeginTransaction();
+  try {
+    auto make_leaf = [&](const std::string& path) {
+      fragment_spec spec;
+      spec.plan_source =
+        sirius::test::sql_plan_source("SELECT region, SUM(amount) FROM read_parquet(" +
+                                      sirius::test::sql_literal(path) + ") GROUP BY region");
+      spec.outputs      = {0, 1};
+      spec.partitioning = sirius::op::partition_spec{{0}};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+
+    auto leaf0 = make_leaf(sales_0);
+    auto leaf1 = make_leaf(sales_1);
+
+    for (auto* leaf : {leaf0.get(), leaf1.get()}) {
+      leaf->build();
+      leaf->run();
+    }
+
+    REQUIRE(leaf0->sink_types().size() == 2);
+    REQUIRE(leaf0->sink_types()[0].id() == sirius::type_id::VARCHAR);
+    REQUIRE(leaf0->sink_types()[1].id() == sirius::type_id::BIGINT);
+    REQUIRE(leaf1->sink_types() == leaf0->sink_types());
+
+    // Stream names match the root SQL (`SUM(amount)`); types come from the leaf sink
+    // so the hop cannot silently widen/narrow.
+    duckdb::vector<sirius::logical_type> hop_types = leaf0->sink_types();
+
+    std::map<std::string, std::int64_t> got;
+    for (stream_id_t dest : {stream_id_t{0}, stream_id_t{1}}) {
+      fragment_spec root_spec;
+      root_spec.plan_source = sirius::test::sql_plan_source(
+        "SELECT region, SUM(amount) FROM sirius_stream_source(0) GROUP BY region");
+      root_spec.inputs[0] = stream_input_spec{{"region", "amount"}, hop_types, {0, 1}};
+      root_spec.outputs   = {1};
+      streaming_fragment root(*con->context, std::move(root_spec));
+
+      root.build();
+      root.relay_from(*leaf0, dest, 0, 0);
+      root.relay_from(*leaf1, dest, 0, 1);
+      root.run();
+
+      auto part = drain_groups(root, 1);
+      INFO("dest=" << dest << " groups=" << part.size());
+      REQUIRE_FALSE(part.empty());
+      merge_disjoint_groups(got, std::move(part));
+    }
+
+    REQUIRE(got == expected);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-15: a declared input row count is what the optimizer plans the stream scan with
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-15: a declared input row count reaches the optimizer",
+                 "[integration][streaming_fragment]")
+{
+  auto plan_sql = sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
+  duckdb::idx_t planned_rows = 0;
+
+  fragment_spec spec;
+  spec.plan_source = [&](duckdb::ClientContext& context) {
+    auto bound   = plan_sql(context);
+    planned_rows = bound.plan->EstimateCardinality(context);
+    return bound;
+  };
+  spec.inputs[0] = stream_input_spec{
+    {"a"},
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    {0},
+    1'000'000};
+  spec.outputs = {1};
+
+  con->BeginTransaction();
+  try {
+    streaming_fragment fragment(*con->context, std::move(spec));
+    fragment.build();
+    REQUIRE(planned_rows == 1'000'000);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-16: the declared row counts pick the join's build side
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-16: the stream declared smaller is the join's build side",
+                 "[integration][streaming_fragment]")
+{
+  auto const int_types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  // Both orders, so the build side follows the declared counts rather than the SQL's join order.
+  for (auto [left_rows, right_rows, expected_build] :
+       {std::tuple<std::uint64_t, std::uint64_t, stream_id_t>{10, 1'000'000, 0},
+        std::tuple<std::uint64_t, std::uint64_t, stream_id_t>{1'000'000, 10, 1}}) {
+    auto plan_sql = sirius::test::sql_plan_source(
+      "SELECT l.k FROM sirius_stream_source(0) l JOIN sirius_stream_source(1) r ON l.k = r.k");
+    std::set<stream_id_t> build_streams;
+
+    fragment_spec spec;
+    spec.plan_source = [&](duckdb::ClientContext& context) {
+      auto bound = plan_sql(context);
+      // DuckDB builds the hash table on the comparison join's right child.
+      if (auto* join = find_comparison_join(*bound.plan)) {
+        build_streams = scanned_streams(*join->children[1]);
+      }
+      return bound;
+    };
+    spec.inputs[0] = stream_input_spec{{"k"}, int_types, {0}, left_rows};
+    spec.inputs[1] = stream_input_spec{{"k"}, int_types, {0}, right_rows};
+    spec.outputs   = {2};
+
+    con->BeginTransaction();
+    try {
+      streaming_fragment fragment(*con->context, std::move(spec));
+      fragment.build();
+      INFO("left_rows=" << left_rows << " right_rows=" << right_rows);
+      REQUIRE(build_streams == std::set<stream_id_t>{expected_build});
+
+      con->Rollback();
+    } catch (...) {
+      con->Rollback();
+      throw;
+    }
+  }
 }

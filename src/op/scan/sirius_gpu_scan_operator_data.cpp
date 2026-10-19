@@ -308,6 +308,7 @@ void scan_operator_input::prepare_for_processing(
         }
       }
       record_decode_outcome(mut.get_data());
+
       // Conversion produces a fresh owned table for this split (raw GPU pins and prefetched
       // tables fail converted_here), so a filter-free scan may
       // transfer its columns without touching shared pin storage. A decode-row-filtered split has

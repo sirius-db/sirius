@@ -157,7 +157,7 @@ using value = std::variant<null_value,
  * The supplied logical_type drives DECIMAL precision recovery and typed-NULL
  * fidelity. For HUGEINT / UHUGEINT, the value is narrowed to int64_t /
  * uint64_t — the same narrowing the executor performs today via
- * duckdb::GetCudfType.
+ * sirius::get_cudf_type.
  *
  * @throws sirius::not_implemented_exception if the type is unsupported.
  */

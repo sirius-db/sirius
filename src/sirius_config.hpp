@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "expression_evaluator/query_policy.hpp"
 #include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
@@ -132,7 +133,14 @@ struct operator_params {
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
-  bool like_swar_fastpath = false;
+  bool like_swar_fastpath                           = false;
+  expression_evaluator_strategy expression_strategy = expression_query_policy{}.strategy;
+  bool enable_regex_jit                             = expression_query_policy{}.regex_jit;
+
+  [[nodiscard]] expression_query_policy expression_policy() const noexcept
+  {
+    return {expression_strategy, enable_regex_jit};
+  }
 
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;

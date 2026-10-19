@@ -23,7 +23,7 @@
   ],
   "license": "Apache-2.0",
   "name": "cuvs",
-  "port-version": 1,
+  "port-version": 2,
   "supports": "linux",
   "version-string": "26.08.01"
 }

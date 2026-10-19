@@ -296,26 +296,35 @@ static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_co
 static void from_yaml(const YAML::Node& node, scan_manager::preparation_config& opt)
 {
   yaml::reader r(node, "preparation");
-  auto limit = [&](char const* key, std::optional<size_t>& out) {
+  auto limit = [&](char const* key, std::optional<size_t>& out, bool allow_zero = false) {
     // Parse signed first so negative values cannot wrap into a large size_t.
     std::optional<int64_t> value;
     r.optional(key, value);
     if (!value) return;
-    if (*value <= 0 || static_cast<uint64_t>(*value) > std::numeric_limits<size_t>::max())
+    if (*value < 0 || (!allow_zero && *value == 0) ||
+        static_cast<uint64_t>(*value) > std::numeric_limits<size_t>::max())
       throw std::runtime_error(std::string("preparation.") + key +
-                               ": must be a positive integer that fits size_t");
+                               (allow_zero ? ": must be a nonnegative integer that fits size_t"
+                                           : ": must be a positive integer that fits size_t"));
     out = static_cast<size_t>(*value);
   };
-  limit("max_inflight_jobs", opt.max_inflight_jobs);
-  limit("max_active_units", opt.max_active_units);
-  limit("max_pending_results", opt.max_pending_results);
+  limit("max_inflight_metadata_jobs", opt.max_inflight_metadata_jobs, true);
+  limit("max_inflight_dv_jobs", opt.max_inflight_dv_jobs, true);
+  limit("lookahead_batches", opt.lookahead_batches);
   limit("max_control_work", opt.max_control_work);
   limit("drain_quantum", opt.drain_quantum);
-  auto residence = opt.underfilled_batch_residence.value_or(std::chrono::milliseconds{0});
-  r.optional(
-    "underfilled_batch_residence", residence, [](auto value) { return value.count() >= 0; });
-  opt.underfilled_batch_residence =
-    residence.count() == 0 ? std::nullopt : std::optional{residence};
+  if (auto node = r.optional_node("partial_batch")) {
+    auto& policy = opt.partial_batch.emplace();
+    yaml::reader partial(*node, "preparation.partial_batch");
+    int64_t fill = policy.min_fill_percent;
+    partial.optional(
+      "min_fill_percent", fill, [](auto value) { return value >= 1 && value <= 100; });
+    policy.min_fill_percent = static_cast<size_t>(fill);
+    partial.optional("min_residence", policy.min_residence);
+    partial.optional("max_residence", policy.max_residence);
+    policy.validate();
+    partial.reject_unknown();
+  }
   r.optional("interrupt_check_interval", opt.interrupt_check_interval, [](auto value) {
     return value.count() > 0;
   });
