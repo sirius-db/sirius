@@ -20,6 +20,7 @@
 #include "config.hpp"                                    // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                  // duckdb::CoreFunctionsExtension
 #include "data/sirius_converter_registry.hpp"            // sirius::converter_registry
+#include "downgrade/downgrade_executor.hpp"              // sirius::parallel::downgrade_executor
 #include "duckdb/common/enums/optimizer_type.hpp"        // duckdb::OptimizerType
 #include "duckdb/execution/column_binding_resolver.hpp"  // duckdb::ColumnBindingResolver
 #include "duckdb/main/client_context.hpp"                // duckdb::ClientContext
@@ -210,7 +211,11 @@ struct Context::Impl {
       exchange = std::make_shared<sirius::exec::exchange_inbox>(gpu);
       // Received batches can wait a long time for their receivers. Let them spill to host under
       // pressure rather than fail the query when a shuffle outgrows the pool.
-      exchange->enable_spill(context->get_exchange_staging());
+      exchange->enable_spill(
+        context->get_exchange_staging(),
+        [ctx = context.get(), space = gpu.get_id()](std::size_t bytes) {
+          ctx->get_downgrade_executor(space).request_free_memory_and_wait(bytes);
+        });
     }
 
     // Substrait lowering uses core functions and resolves local_files reads to parquet_scan.
