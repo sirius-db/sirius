@@ -48,7 +48,7 @@ jobs:
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
-    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "cpu-xl"]', matrix.cuda.runner)) }}
+    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "{1}"]', matrix.cuda.runner, github.event_name == 'pull_request' && 'pr-cpu-xl' || 'cpu-xl')) }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -168,7 +168,7 @@ jobs:
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
-    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xt4"]', matrix.cuda.runner)) }}
+    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "{1}"]', matrix.cuda.runner, github.event_name == 'pull_request' && 'pr-gpu-2xt4' || 'gpu-2xt4')) }}
     timeout-minutes: 90
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
