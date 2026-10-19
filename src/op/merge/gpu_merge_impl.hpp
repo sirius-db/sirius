@@ -18,6 +18,7 @@
 
 #include "telemetry/data_batch_probe.hpp"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/types.hpp>
 

@@ -950,7 +950,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 {
   sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
   bool const enable_filter = GENERATE(false, true);
-  dynamic_filter_switch_guard filter_switch(*con, enable_filter);
+  // A per-connection SET: plans read the connection's operator-options snapshot, so writing the
+  // shared config (dynamic_filter_switch_guard) no longer turns the filter off.
+  sirius::test::scoped_sirius_setting filter_switch(*con, "enable_dynamic_filter", enable_filter);
   auto plan = generate_sirius_plan(
     *con,
     "SELECT i.qty FROM items i JOIN parts p ON p.pk = i.fk WHERE p.pname = 'p1' "

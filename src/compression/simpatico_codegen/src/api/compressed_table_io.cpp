@@ -9,6 +9,7 @@
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/nvtx.hpp"
+#include "util/host_observation.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -27,6 +28,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -497,6 +499,66 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// PlanNode::dictionary_key_width_hint derivation
+// ---------------------------------------------------------------------------
+
+// Bounds the host derivation; a larger key set leaves the hint unknown and decode measures the
+// width as before. TPC-H dictionary key sets hold a few keys.
+static constexpr std::size_t kMaxHintOffsets = std::size_t{1} << 16;
+
+// -1 when the offsets do not start at zero, since the decoders assume the key chars begin at
+// offsets[0] == 0.
+static std::int64_t constant_key_width_from_offsets(std::span<std::int32_t const> offsets)
+{
+  if (offsets.size() < 2) return 0;
+  if (offsets.front() != 0) return -1;
+  auto const width = static_cast<std::int64_t>(offsets[1]) - offsets[0];
+  if (width <= 0) return 0;
+  for (std::size_t i = 2; i < offsets.size(); ++i) {
+    if (static_cast<std::int64_t>(offsets[i]) - offsets[i - 1] != width) return 0;
+  }
+  return width;
+}
+
+// Sets the hint on every `dictionary` node of `tree` before the tree is published: from the
+// self-stored representation, or from a terminal identity INT32 `keys_offsets` leaf whose offsets
+// are read back on `stream`, the stream the leaf fetches were enqueued on (one staged read per such
+// column, host memory only). INT64 offsets and a consumed `keys_offsets` stay unknown. Returns an
+// error message, or empty on success.
+static std::string derive_dictionary_key_width_hints(PlanTree& tree, ::cuda::stream_ref stream)
+{
+  for (auto& node : tree.nodes) {
+    if (op_id_from_name(node.op) != OpId::Dictionary) continue;
+    if (node.rep) {
+      if (auto const* dictionary =
+            dynamic_cast<dictionary_compressed_representation const*>(node.rep.get())) {
+        node.dictionary_key_width_hint = dictionary->constant_key_width;
+      }
+      continue;
+    }
+    auto const* stored = terminal_identity_channel(node, "keys_offsets");
+    if (!stored) continue;
+    cudf::column_view const offsets = stored->view();
+    if (offsets.type().id() != cudf::type_id::INT32 || offsets.null_count() != 0) continue;
+    auto const count = static_cast<std::size_t>(offsets.size());
+    if (count < 2) {
+      node.dictionary_key_width_hint = 0;
+      continue;
+    }
+    if (count > kMaxHintOffsets) continue;
+    std::vector<std::int32_t> host(count);
+    try {
+      read_device_bytes_completed(
+        host.data(), offsets.data<std::int32_t>(), count * sizeof(std::int32_t), stream);
+    } catch (std::exception const& error) {
+      return std::string("dictionary key width readback: ") + error.what();
+    }
+    node.dictionary_key_width_hint = constant_key_width_from_offsets(host);
+  }
+  return {};
+}
+
 // Reconstruct a compressed_table from parsed column records, pulling each leaf
 // buffer's bytes into device memory via `fetch(offset, size, dst_device, stream)`.
 // `recs` is consumed (plan trees are moved into the result).
@@ -559,7 +621,14 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
       }
     }
 
-    compute_input_sources(*plan_tree);
+    try {
+      compute_input_sources(*plan_tree);
+    } catch (std::invalid_argument const& error) {
+      return fail(std::string{error.what()} + " in col " + std::to_string(ci));
+    }
+    if (auto message = derive_dictionary_key_width_hints(*plan_tree, stream); !message.empty()) {
+      return fail(message + " in col " + std::to_string(ci));
+    }
     out_col.plan_tree = std::move(plan_tree);
   }
 

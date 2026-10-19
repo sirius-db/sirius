@@ -192,7 +192,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     expression_evaluator evaluator(*local_filter_expr,
                                    cudf::get_current_device_resource_ref(),
                                    stream,
-                                   strategy_from_config(),
+                                   expression_policy(),
                                    expression_evaluator::default_min_ast_size,
                                    like_swar_fastpath_enabled(),
                                    like_cache());

@@ -15,7 +15,6 @@
  */
 
 #include <catch.hpp>
-#include <config.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
@@ -26,11 +25,6 @@ namespace {
 
 class TimestampExtractionFixture : public sirius::test::GpuExecutionFixture {
  public:
-  ~TimestampExtractionFixture()
-  {
-    duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY = original_strategy_;
-  }
-
   void check_extraction(std::string const& query)
   {
     INFO(query);
@@ -55,10 +49,6 @@ class TimestampExtractionFixture : public sirius::test::GpuExecutionFixture {
     REQUIRE(gpu->GetTypes() == cpu->GetTypes());
     CHECK(collect_rows(*gpu) == expected);
   }
-
- private:
-  sirius::expression_evaluator_strategy original_strategy_ =
-    duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY;
 };
 
 }  // namespace

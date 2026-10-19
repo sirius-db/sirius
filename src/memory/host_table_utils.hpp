@@ -76,7 +76,7 @@ inline metadata_node make_flat_metadata_node(sirius::logical_type type,
                                              int64_t null_mask_offset)
 {
   return metadata_node{
-    sirius::get_cudf_type(type), size, null_count, data_offset, null_mask_offset, {}};
+    sirius::require_cudf_type(type), size, null_count, data_offset, null_mask_offset, {}};
 }
 
 /**

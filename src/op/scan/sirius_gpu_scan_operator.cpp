@@ -376,7 +376,7 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
   _native_physical_types.reserve(this->types.size());
   for (std::size_t column_idx = 0; column_idx < this->types.size(); ++column_idx) {
     auto const& type  = this->types[column_idx];
-    auto const native = sirius::try_get_cudf_type(type);
+    auto const native = sirius::get_cudf_type(type);
     if (!native) {
       throw internal_exception(
         "[sirius_gpu_scan_operator] output column {} ({}) has no native cuDF carrier",
@@ -563,8 +563,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     // normalize the resulting owned table.
     auto const like_swar_fastpath = like_swar_fastpath_enabled();
     auto like_pattern_cache       = like_cache();
-    auto materialized_table =
-      _ingestible->materialize_table(*scan_input, stream, like_swar_fastpath, like_pattern_cache);
+    auto materialized_table       = _ingestible->materialize_table(
+      *scan_input, stream, like_swar_fastpath, like_pattern_cache, expression_policy());
     if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
       // Elide the deferred columns from the projection: realizing the batch would
       // copy values this scan is about to replace with a rowid.
@@ -574,7 +574,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
                                                           like_swar_fastpath,
                                                           std::move(like_pattern_cache),
                                                           wants_survivors ? &survivors : nullptr,
-                                                          deferred_output().output_positions);
+                                                          deferred_output().output_positions,
+                                                          expression_policy());
     } else {
       output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
     }

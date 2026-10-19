@@ -88,7 +88,7 @@ void validate_operator_output_types(const op::operator_data* data,
     }
     for (cudf::size_type c = 0; c < tbl.num_columns(); c++) {
       cudf::data_type expected_cudf = physical_types.empty()
-                                        ? sirius::get_cudf_type(expected_types[c])
+                                        ? sirius::require_cudf_type(expected_types[c])
                                         : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
       if (actual != expected_cudf) {

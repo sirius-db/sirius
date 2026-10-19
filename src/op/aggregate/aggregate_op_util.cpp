@@ -113,7 +113,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       result.cudf_aggregate_idx.push_back(col_idx);
       result.cudf_aggregate_struct_col_indices.push_back({});
       result.aggregate_slots.push_back(
-        AggregateSlot{true, false, sum_position, sirius::get_cudf_type(aggr.return_type())});
+        AggregateSlot{true, false, sum_position, sirius::require_cudf_type(aggr.return_type())});
       auto sum_type = children[0]->return_type();
       switch (sum_type.id()) {
         case sirius::type_id::TINYINT:
@@ -130,7 +130,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       }
       // Groupby widens decimal SUM by one carrier width.
       if (sum_type.id() == sirius::type_id::DECIMAL) {
-        auto const ct = sirius::get_cudf_type(sum_type);
+        auto const ct = sirius::require_cudf_type(sum_type);
         if (ct.id() == cudf::type_id::DECIMAL32)
           sum_type = sirius::logical_type::make_decimal(18, sum_type.decimal_scale());
         if (ct.id() == cudf::type_id::DECIMAL64)

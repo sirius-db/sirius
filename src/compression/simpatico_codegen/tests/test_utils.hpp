@@ -8,13 +8,17 @@
 #include <cudf/types.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
+#include <cuda/memory_resource>
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -238,6 +242,39 @@ inline void expect(bool cond, char const* msg)
 {
   if (!cond) throw std::runtime_error(msg);
 }
+
+inline void cuda_check(cudaError_t status)
+{
+  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+}
+
+// Whether `action` throws an `Error`; any other exception propagates.
+template <typename Error = std::exception, typename Action>
+bool throws(Action&& action)
+{
+  try {
+    action();
+  } catch (Error const&) {
+    return true;
+  }
+  return false;
+}
+
+// Installs `resource` as the current device resource for the guard's lifetime.
+class current_resource_guard {
+ public:
+  explicit current_resource_guard(rmm::device_async_resource_ref resource)
+    : previous_(rmm::mr::set_current_device_resource(
+        cuda::mr::any_resource<cuda::mr::device_accessible>{resource}))
+  {
+  }
+  ~current_resource_guard() { rmm::mr::set_current_device_resource(std::move(previous_)); }
+  current_resource_guard(current_resource_guard const&)            = delete;
+  current_resource_guard& operator=(current_resource_guard const&) = delete;
+
+ private:
+  cuda::mr::any_resource<cuda::mr::device_accessible> previous_;
+};
 
 // ---------------------------------------------------------------------------
 // String helpers

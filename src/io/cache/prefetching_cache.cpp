@@ -1210,46 +1210,64 @@ void prefetching_cache::retire_pins_after_stream(
   }
 }
 
-std::string prefetching_cache::summary() const
+prefetching_cache::counters_snapshot prefetching_cache::sample_counters() const noexcept
 {
-  // Global totals plus the deltas since the last refresh (the most recent
-  // query cycle), reported separately.
-  uint64_t const reads = _counters.n_reads.load(std::memory_order_relaxed);
-  uint64_t const hits  = _counters.hits.load(std::memory_order_relaxed);
-  uint64_t const h2d   = _counters.h2d.load(std::memory_order_relaxed);
-  uint64_t const miss  = _counters.misses.load(std::memory_order_relaxed);
-  uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
-
-  return std::format(
-    "prefetching_cache: "
-    "global[reads={} hits={} h2d={} miss={} evictions={}] "
-    "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
-    reads,
-    hits,
-    h2d,
-    miss,
-    evict,
-    reads - _last_reported.n_reads,
-    hits - _last_reported.hits,
-    h2d - _last_reported.h2d,
-    miss - _last_reported.misses,
-    evict - _last_reported.evictions);
-}
-
-void prefetching_cache::prepare_for_query() noexcept
-{
-  SIRIUS_LOG_TRACE("prefetching_cache: summary of cache performance {}", summary());
-
-  _ticker.fetch_add(1, std::memory_order_relaxed);
-
-  // Snapshot the counters so the next summary() can report this cycle's deltas.
-  _last_reported = {
+  // Each counter is monotonic, but these relaxed loads are not one atomic
+  // snapshot across counters. Counter writers never take the reporting mutex.
+  return {
     _counters.n_reads.load(std::memory_order_relaxed),
     _counters.hits.load(std::memory_order_relaxed),
     _counters.h2d.load(std::memory_order_relaxed),
     _counters.misses.load(std::memory_order_relaxed),
     _counters.evictions.load(std::memory_order_relaxed),
   };
+}
+
+std::string prefetching_cache::format_summary(counters_snapshot const& sample,
+                                              counters_snapshot const& baseline)
+{
+  return std::format(
+    "prefetching_cache: "
+    "global[reads={} hits={} h2d={} miss={} evictions={}] "
+    "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
+    sample.n_reads,
+    sample.hits,
+    sample.h2d,
+    sample.misses,
+    sample.evictions,
+    sample.n_reads - baseline.n_reads,
+    sample.hits - baseline.hits,
+    sample.h2d - baseline.h2d,
+    sample.misses - baseline.misses,
+    sample.evictions - baseline.evictions);
+}
+
+std::string prefetching_cache::summary() const
+{
+  counters_snapshot sample, baseline;
+  {
+    std::lock_guard lock(_summary_mutex);
+    sample   = sample_counters();
+    baseline = _last_reported;
+  }
+  return format_summary(sample, baseline);
+}
+
+std::string prefetching_cache::prepare_for_query()
+{
+  counters_snapshot sample, baseline;
+  {
+    std::lock_guard lock(_summary_mutex);
+    sample         = sample_counters();
+    baseline       = _last_reported;
+    _last_reported = sample;
+    _ticker.fetch_add(1, std::memory_order_relaxed);
+  }
+  // Logging can overlap another refresh. Both log sites must use this captured
+  // report, never resample counters or advance the baseline after logging.
+  auto report = format_summary(sample, baseline);
+  SIRIUS_LOG_TRACE("prefetching_cache: summary of cache performance {}", report);
+  return report;
 }
 
 // ===========================================================================

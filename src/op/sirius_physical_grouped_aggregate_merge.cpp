@@ -309,7 +309,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       auto count_view = merged_cols[count_col_idx]->view();
 
       std::unique_ptr<cudf::column> avg_col;
-      bool is_decimal = sirius::IsCudfTypeDecimal(slot.output_type);
+      bool is_decimal = cudf::is_fixed_point(slot.output_type);
       if (is_decimal) {
         // DECIMAL: divide directly in fixed-point to preserve precision
         avg_col = cudf::binary_operation(

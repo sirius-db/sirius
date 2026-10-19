@@ -15,9 +15,9 @@
  */
 
 #pragma once
-
 #include "config.hpp"
 #include "duckdb/common/common.hpp"
+#include "expression_evaluator/query_policy.hpp"
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
 #include "late_mat/defer_directive.hpp"
@@ -507,6 +507,9 @@ class sirius_physical_operator {
   }
 
   [[nodiscard]] bool has_physical_overrides() const noexcept { return !_physical_types.empty(); }
+
+  /// The owning pipeline supplies query policy; standalone operators use fixed defaults.
+  [[nodiscard]] expression_query_policy expression_policy() const noexcept;
 
   [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept;
 

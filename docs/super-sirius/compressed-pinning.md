@@ -13,11 +13,17 @@ CALL pin_table('/data/lineitem/*.parquet',
 
 Tables with no plan file pin uncompressed. Each plan file carries one `---`-separated DSL
 block per full-table column in schema order; a pin of a column subset selects the matching
-blocks (`select_plan_blocks`). Scans of a compressed entry decompress the projected columns
+blocks (`select_plan_blocks`). Each pin reads its plan from the calling connection's
+`pin_table_input_compression_plan_dir`; plans are not stored in a process-wide registry.
+Scans of a compressed entry decompress the projected columns
 at task-prepare time via the `compressed_host_representation` /
 `compressed_device_blob` → `gpu_table_representation` converters, column-parallel across
 4 fixed streams (measured strictly better than serial; the stream count is deliberately
-not configurable).
+not configurable). Each conversion takes those streams from the target GPU memory space's
+shared stream pool (`memory_space::acquire_stream()`), so they are not exclusive: the
+decode's waits also cover other work queued on them, other work queued later runs behind the
+decode, and the converters rebind the decoded columns to the task stream (`decompress_chunk`
+in `src/compression/compressed_scan.cpp`).
 
 ## Decode-time equality pushdown
 

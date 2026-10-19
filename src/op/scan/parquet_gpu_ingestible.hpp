@@ -209,6 +209,14 @@ class parquet_split_info : public scan_info {
     return total;
   }
 
+  [[nodiscard]] std::size_t preparation_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& s : rg_slices)
+      total = memory::saturating_add(total, s.estimated_decode_working_bytes);
+    return total;
+  }
+
   [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
   {
     std::size_t total = 0;
@@ -357,7 +365,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     const cucascade::memory::memory_space& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    expression_query_policy policy = {}) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& table,
@@ -366,7 +375,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
     std::unique_ptr<cudf::column>* survivors,
-    std::span<std::size_t const> elided) override;
+    std::span<std::size_t const> elided,
+    expression_query_policy policy = {}) override;
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 

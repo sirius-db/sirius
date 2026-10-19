@@ -798,7 +798,7 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
             con.execute("SET pin_table_compression = true;")
             con.execute(
                 "SET pin_table_input_compression_plan_dir = "
-                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+                f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
             )
         pre_sql = os.environ.get("SIRIUS_PRE_SQL", "")
         if pre_sql:
@@ -832,21 +832,16 @@ def time_query(con, qnum, query_sql, use_gpu, profile_path=None):
         con.execute("PRAGMA profiling_mode='detailed';")
         con.execute(f"PRAGMA profiling_output='{profile_path}';")
     log(f"  Executing q{qnum} on {engine_label}…")
-    # Fetch as Arrow inside the timed region and build Python rows afterwards: fetchall()
-    # creates one Python object per value, which for large results (Q11 at SF1000 returns
-    # ~937K rows) costs far more than executing the query and is not engine time.
+    # Time con.execute() only: it plans and runs the query to completion and materializes the
+    # result inside DuckDB. The rows for result.txt are fetched afterwards, because converting a
+    # large result into Python objects (Q11 at SF1000 returns ~937K rows) costs far more than
+    # executing the query and is not engine time. Both the DuckDB 1.5 and the v2 Python clients
+    # support execute() + fetchall(); the v2 client has no Arrow export on execute() results.
     start = time.perf_counter()
     result = con.execute(query_sql)
-    column_types = [str(column[1]).upper() for column in result.description or []]
-    table = result.to_arrow_table()
     elapsed = time.perf_counter() - start
-    columns = [column.to_pylist() for column in table.columns]
-    # Arrow carries HUGEINT as decimal128(38, 0); convert back so rows match fetchall().
-    for col_idx, column_type in enumerate(column_types):
-        if column_type in ("HUGEINT", "UHUGEINT"):
-            columns[col_idx] = [None if v is None else int(v) for v in columns[col_idx]]
-    rows = list(zip(*columns)) if columns else []
-    log(f"  q{qnum} fetched {len(rows)} rows in {elapsed:.4f}s")
+    rows = result.fetchall()
+    log(f"  q{qnum} executed in {elapsed:.4f}s, fetched {len(rows)} rows")
     return elapsed, rows
 
 
@@ -1152,7 +1147,7 @@ def _build_precmd_temp_sql(
             parts.append("SET pin_table_compression = true;")
             parts.append(
                 "SET pin_table_input_compression_plan_dir = "
-                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+                f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
             )
         parts.append(emit_pin(qnum, source, data_source))
 
