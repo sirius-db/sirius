@@ -44,7 +44,7 @@
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
-#include "op/join_key_preparation.hpp"
+#include "op/key_preparation.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -1521,8 +1521,8 @@ static join_side_keys_result prepare_join_keys(const ::cucascade::read_only_data
       throw std::out_of_range("prepare_join_keys: key column is outside the input batch");
     }
     auto const column = table.column(idx);
-    auto restored     = restore_prepared_join_key(
-      column, key_types[i], stream, cudf::get_current_device_resource_ref());
+    auto restored =
+      restore_prepared_key(column, key_types[i], stream, cudf::get_current_device_resource_ref());
     result.key_views.push_back(restored ? restored->view() : column);
     if (restored) { result.owned_cast_columns.push_back(std::move(restored)); }
   }
