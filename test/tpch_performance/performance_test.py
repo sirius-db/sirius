@@ -798,7 +798,7 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
             con.execute("SET pin_table_compression = true;")
             con.execute(
                 "SET pin_table_input_compression_plan_dir = "
-                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+                f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
             )
         pre_sql = os.environ.get("SIRIUS_PRE_SQL", "")
         if pre_sql:
@@ -1147,7 +1147,7 @@ def _build_precmd_temp_sql(
             parts.append("SET pin_table_compression = true;")
             parts.append(
                 "SET pin_table_input_compression_plan_dir = "
-                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+                f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
             )
         parts.append(emit_pin(qnum, source, data_source))
 

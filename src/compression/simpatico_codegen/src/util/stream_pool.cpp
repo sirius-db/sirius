@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "codegen/util/stream_pool.hpp"
 
+#include <algorithm>
+#include <cstdio>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -60,6 +62,36 @@ cudaError_t stream_pool::sync_all()
     if (first == cudaSuccess && err != cudaSuccess) { first = err; }
   }
   return first;
+}
+
+std::vector<::cuda::stream_ref> stream_pool::refs() const
+{
+  return {streams.begin(), streams.end()};
+}
+
+cudaError_t synchronize_distinct(std::span<const ::cuda::stream_ref> streams) noexcept
+{
+  cudaError_t first = cudaSuccess;
+  for (auto it = streams.begin(); it != streams.end(); ++it) {
+    auto const handle = it->get();
+    if (std::any_of(
+          streams.begin(), it, [handle](auto earlier) { return earlier.get() == handle; }))
+      continue;
+    auto status = cudaStreamQuery(handle);
+    if (status == cudaSuccess) continue;
+    if (status != cudaErrorNotReady && first == cudaSuccess) first = status;
+    status = cudaStreamSynchronize(handle);
+    if (status != cudaSuccess && first == cudaSuccess) first = status;
+  }
+  return first;
+}
+
+void synchronize_distinct_or_log(std::span<const ::cuda::stream_ref> streams,
+                                 char const* context) noexcept
+{
+  if (auto const status = synchronize_distinct(streams); status != cudaSuccess) {
+    std::fprintf(stderr, "%s: %s\n", context, cudaGetErrorString(status));
+  }
 }
 
 }  // namespace simpatico

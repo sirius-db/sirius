@@ -31,6 +31,7 @@
  */
 
 #include "api/simpatico_codegen.hpp"
+#include "codegen/selection/decompression_pushdown_policy.hpp"
 #include "codegen/selection/selection.hpp"
 #include "codegen/util/stream_pool.hpp"
 #include "scan/fused_scan_filter_test_utils.hpp"
@@ -266,14 +267,14 @@ TEST_CASE("a declining membership probe alone falls back to the plain decode",
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
+  if (!sirius::codegen::decompression_pushdown_enabled()) {
     WARN("filtered-decode env gate off in this process; skipping membership coverage");
     return;
   }
 
   // With no source left to select by, the decode gives up and returns every row.
   REQUIRE_FALSE(result.applied);
-  CHECK(result.status == sirius::codegen::scan_filter_status::failed);
+  CHECK(result.status == sirius::codegen::scan_filter_status::refused);
   std::vector<std::int32_t> expect_v;
   std::vector<std::int32_t> expect_k;
   for (cudf::size_type i = 0; i < kRows; ++i) {
