@@ -183,6 +183,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_union.cpp
     test/cpp/operator/test_physical_union_mgpu.cpp
     test/cpp/operator/test_partition_memspace_mgpu.cpp
+    test/cpp/memory/test_capped_async_pool.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
