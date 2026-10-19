@@ -27,7 +27,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_DELIM_JOIN` | `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
 | `LOGICAL_ORDER_BY` | `ORDER_BY` | `src/planner/sirius_plan_order.cpp` |
 | `LOGICAL_TOP_N` | `TOP_N` | `src/planner/sirius_plan_top_n.cpp` |
-| `LOGICAL_LIMIT` | `STREAMING_LIMIT` | `src/planner/sirius_plan_limit.cpp` |
+| `LOGICAL_LIMIT` | `STREAMING_LIMIT`, optimized to `UNORDERED_STREAMING_LIMIT` for proven unordered input after GPU expansion | `src/planner/sirius_plan_limit.cpp` |
 | `LOGICAL_CHUNK_GET` | `COLUMN_DATA_SCAN` | `src/planner/sirius_plan_column_data_get.cpp` |
 | `LOGICAL_DELIM_GET` | `DELIM_SCAN` | `src/planner/sirius_plan_delim_get.cpp` |
 | `LOGICAL_EXPRESSION_GET` | `COLUMN_DATA_SCAN` | `src/planner/sirius_plan_expression_get.cpp` |

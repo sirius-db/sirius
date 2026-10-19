@@ -210,6 +210,9 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! Checks if the pipeline has been finished
   virtual bool is_pipeline_finished() const;
 
+  //! True once any inline LIMIT has claimed its quota; in-flight tasks must still finish.
+  [[nodiscard]] bool is_limit_exhausted() const;
+
   //! Query-terminal sink (RESULT_COLLECTOR or STREAMING_SINK): no downstream schedule/wiring;
   //! completion signals execute().
   [[nodiscard]] bool is_query_terminal() const;

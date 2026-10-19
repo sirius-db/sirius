@@ -63,6 +63,7 @@
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_limit.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_order.hpp"
@@ -1065,6 +1066,7 @@ plan_lineage collect_semantic_lineage(
     // Sort and TOP_N carry their payload through cuDF before host export.
     mark_semantic_columns(result.columns);
   } else if ((node.type == type::LIMIT || node.type == type::STREAMING_LIMIT ||
+              node.type == type::UNORDERED_STREAMING_LIMIT ||
               node.type == type::RESULT_COLLECTOR) &&
              children.size() == 1) {
     result.columns = children[0].columns;
@@ -1849,6 +1851,23 @@ void insert_gpu_pipeline_operators_recursive(
       wrap_dense_count_join(*slot, compressed_materialization_observer);
       break;
     case sirius::op::SiriusPhysicalOperatorType::STREAMING_LIMIT:
+      // Children are fully expanded: global ORDER BY/TOP N now end in their merge operators.
+      // An unresolved INSERTION_ORDER leaf is not proof of unordered input.
+      if (slot->children.at(0)->output_order() == sirius::OrderPreservationType::NO_ORDER) {
+        auto& limit      = slot->Cast<sirius::op::sirius_physical_streaming_limit>();
+        auto replacement = duckdb::make_uniq<sirius::op::sirius_physical_unordered_streaming_limit>(
+          limit.types,
+          std::move(limit.limit_val),
+          std::move(limit.offset_val),
+          limit.estimated_cardinality,
+          limit.parallel);
+        if (limit.has_physical_overrides()) {
+          replacement->set_physical_types(limit.get_physical_types());
+        }
+        replacement->children = std::move(limit.children);
+        slot                  = std::move(replacement);
+        break;
+      }
       // Claims require complete, position-addressable input before any limit task executes.
       wrap_child(*slot, 0, [](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child) {
         auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
