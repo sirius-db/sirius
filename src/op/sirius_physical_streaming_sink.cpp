@@ -22,11 +22,15 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+
+#include <rmm/error.hpp>
 
 #include <cucascade/data/data_batch.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <set>
 #include <string>
@@ -48,6 +52,21 @@ void poison_refused_output(exec::batch_stream& output, std::size_t index)
     " refused a batch after end-of-stream; the fragment produced data after its output closed")));
 }
 
+/// SIRIUS_CN_EXCHANGE_BATCH_BYTES: bytes, or with a KiB/MiB/GiB suffix; 0 when unset or bad.
+std::size_t combine_bytes_from_env()
+{
+  auto const* value = std::getenv("SIRIUS_CN_EXCHANGE_BATCH_BYTES");
+  if (value == nullptr) { return 0; }
+  char* end         = nullptr;
+  auto const number = std::strtoull(value, &end, 10);
+  std::string const unit{end};
+  if (unit.empty() || unit == "B") { return number; }
+  if (unit == "KiB") { return number << 10; }
+  if (unit == "MiB") { return number << 20; }
+  if (unit == "GiB") { return number << 30; }
+  return 0;
+}
+
 }  // namespace
 
 sirius_physical_streaming_sink::sirius_physical_streaming_sink(
@@ -55,7 +74,8 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
   std::size_t estimated_cardinality,
   std::shared_ptr<cucascade::shared_data_repository> output_repository)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::STREAMING_SINK, std::move(types), estimated_cardinality)
+      SiriusPhysicalOperatorType::STREAMING_SINK, std::move(types), estimated_cardinality),
+    _combine_bytes(combine_bytes_from_env())
 {
   if (!output_repository) {
     throw sirius::invalid_input_exception(
@@ -72,7 +92,8 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
   partition_spec spec)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::STREAMING_SINK, std::move(types), estimated_cardinality),
-    _spec(std::move(spec))
+    _spec(std::move(spec)),
+    _combine_bytes(combine_bytes_from_env())
 {
   if (output_repositories.empty()) {
     throw sirius::invalid_input_exception(
@@ -115,6 +136,8 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
     _outputs.push_back(std::make_shared<exec::batch_stream>(
       std::move(repo), std::set<exec::sender_id_t>{PIPELINE_SENDER}));
   }
+  _pending.resize(_outputs.size());
+  _pending_bytes.resize(_outputs.size(), 0);
 }
 
 std::unique_ptr<operator_data> sirius_physical_streaming_sink::execute(
@@ -209,7 +232,55 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
     for (std::size_t i = 0; i < slices.size(); ++i) {
       // Empty partition stays WAITING until finalize.
       if (sirius::get_cudf_table_view(*slices[i]).num_rows() == 0) { continue; }
-      if (!_outputs[i]->push(slices[i])) { poison_refused_output(*_outputs[i], i); }
+      if (_combine_bytes == 0) {
+        if (!_outputs[i]->push(slices[i])) { poison_refused_output(*_outputs[i], i); }
+        continue;
+      }
+      std::vector<std::shared_ptr<cucascade::data_batch>> full;
+      {
+        std::lock_guard lock{_pending_mutex};
+        _pending[i].push_back(slices[i]);
+        _pending_bytes[i] += slices[i]->to_read_only().get_data()->get_size_in_bytes();
+        if (_pending_bytes[i] < _combine_bytes) { continue; }
+        full              = std::exchange(_pending[i], {});
+        _pending_bytes[i] = 0;
+      }
+      publish_combined(i, std::move(full), stream);
+    }
+  }
+}
+
+void sirius_physical_streaming_sink::publish_combined(
+  std::size_t index,
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+  ::cuda::stream_ref stream)
+{
+  std::shared_ptr<cucascade::data_batch> combined;
+  if (batches.size() > 1) {
+    try {
+      std::vector<cucascade::read_only_data_batch> held;
+      std::vector<cudf::table_view> views;
+      for (auto const& batch : batches) {
+        held.push_back(batch->to_read_only());
+        // A slice another task produced was written on that task's stream.
+        if (cudaEvent_t writer = held.back().get_data()->get_writer_event()) {
+          RMM_CUDA_TRY(cudaStreamWaitEvent(stream.get(), writer, 0));
+        }
+        views.push_back(sirius::get_cudf_table_view(held.back()));
+      }
+      auto* space = held.front().get_memory_space();
+      auto table  = cudf::concatenate(views, stream, space->get_default_allocator());
+      combined    = sirius::make_data_batch(std::move(table), *space, stream, batch_telemetry());
+      // The slices are freed on their own streams once released: the copy reads them first.
+      stream.wait();
+    } catch (rmm::out_of_memory const&) {
+      combined.reset();
+    }
+  }
+  if (combined) { batches = {std::move(combined)}; }
+  for (auto& batch : batches) {
+    if (!_outputs[index]->push(std::move(batch))) {
+      poison_refused_output(*_outputs[index], index);
     }
   }
 }
@@ -260,6 +331,19 @@ void sirius_physical_streaming_sink::build_pipelines(pipeline::sirius_pipeline& 
 
 void sirius_physical_streaming_sink::on_finalize_operator()
 {
+  // What each destination still holds goes out before its end.
+  std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> pending;
+  {
+    std::lock_guard lock{_pending_mutex};
+    pending = std::exchange(
+      _pending, std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>>(_outputs.size()));
+    std::fill(_pending_bytes.begin(), _pending_bytes.end(), 0);
+  }
+  for (std::size_t i = 0; i < pending.size(); ++i) {
+    if (pending[i].empty()) { continue; }
+    auto* space = pending[i].front()->to_read_only().get_memory_space();
+    publish_combined(i, std::move(pending[i]), space->acquire_stream());
+  }
   // Pipeline completion = sender-set EOS (PIPELINE_SENDER).
   for (auto& s : _outputs) {
     s->close(PIPELINE_SENDER);
