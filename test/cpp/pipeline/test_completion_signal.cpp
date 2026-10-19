@@ -24,6 +24,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -64,9 +65,9 @@ std::shared_ptr<sirius_pipeline> make_finishable_pipeline(sirius_physical_operat
   return pipeline;
 }
 
-sirius_physical_operator make_sink(SiriusPhysicalOperatorType type)
+sirius::op::test_physical_operator make_sink(SiriusPhysicalOperatorType type)
 {
-  return sirius_physical_operator{type, duckdb::vector<sirius::logical_type>{}, 0};
+  return sirius::op::test_physical_operator{type, duckdb::vector<sirius::logical_type>{}, 0};
 }
 
 }  // namespace

@@ -74,6 +74,11 @@ constexpr std::size_t kGpuCapacity = 500ULL * 1024 * 1024;  // 500 MB
 //------------------------------------------------------------------------------
 class stub_operator : public sirius::op::sirius_physical_operator {
  public:
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   using execute_fn = std::function<std::unique_ptr<sirius::op::operator_data>(
     const sirius::op::operator_data&, ::cuda::stream_ref)>;
   using sink_fn    = std::function<void(const sirius::op::operator_data&, ::cuda::stream_ref)>;
@@ -315,7 +320,7 @@ struct two_operator_pipeline_context {
 two_operator_pipeline_context create_two_operator_pipeline_context()
 {
   two_operator_pipeline_context ctx;
-  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(44);
   ctx.stub_source = std::make_unique<stub_operator>();
@@ -337,7 +342,7 @@ two_operator_pipeline_context create_two_operator_pipeline_context()
 pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
-  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_source = std::make_unique<stub_operator>();
@@ -362,7 +367,7 @@ struct cached_scan_pipeline_context {
 cached_scan_pipeline_context create_cached_scan_pipeline_context()
 {
   cached_scan_pipeline_context ctx;
-  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(43);
   ctx.scan_op = std::make_unique<sirius::op::scan::sirius_gpu_scan_operator>(

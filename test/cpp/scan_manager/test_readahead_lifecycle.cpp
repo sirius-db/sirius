@@ -347,6 +347,11 @@ namespace {
 /// Minimal concrete scan carrying only the operator id the readahead keys its
 /// work queue on.
 struct test_scan : sirius::op::sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   test_scan()
     : sirius::op::sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::GPU_SCAN, {}, 0)
   {
@@ -376,7 +381,7 @@ class single_scan_query {
  private:
   std::shared_ptr<const sirius::telemetry::telemetry_context> _telemetry =
     sirius::test::make_test_telemetry_context();
-  sirius::pipeline::pipeline_build_context _ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context _ctx{nullptr};
   sirius::pipeline::sirius_pipeline_build_state _build;
   std::unique_ptr<test_scan> _scan = std::make_unique<test_scan>();
   std::unique_ptr<sirius::planner::query> _query;

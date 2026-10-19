@@ -28,6 +28,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "utils/data_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <rmm/error.hpp>
 
@@ -70,7 +71,7 @@ TEST_CASE("sirius_physical_partition barrier hook preserves producer precedence"
   REQUIRE(fixture.probe_partition->get_parent_op()->type == SiriusPhysicalOperatorType::CONCAT);
   REQUIRE(fixture.probe_partition->get_parent_op()->get_parent_op() == fixture.join.get());
 
-  sirius_physical_operator order_by{
+  sirius::op::test_physical_operator order_by{
     SiriusPhysicalOperatorType::ORDER_BY, duckdb::vector<sirius::logical_type>{}, 0};
   CHECK(fixture.probe_partition->input_barrier_for(order_by) == MemoryBarrierType::PIPELINE);
 
@@ -79,11 +80,12 @@ TEST_CASE("sirius_physical_partition barrier hook preserves producer precedence"
                                        SiriusPhysicalOperatorType::TOP_N,
                                        SiriusPhysicalOperatorType::SORT_PARTITION}) {
     CAPTURE(producer_type);
-    sirius_physical_operator producer{producer_type, duckdb::vector<sirius::logical_type>{}, 0};
+    sirius::op::test_physical_operator producer{
+      producer_type, duckdb::vector<sirius::logical_type>{}, 0};
     CHECK(fixture.probe_partition->input_barrier_for(producer) == MemoryBarrierType::FULL);
   }
 
-  sirius_physical_operator projection{
+  sirius::op::test_physical_operator projection{
     SiriusPhysicalOperatorType::PROJECTION, duckdb::vector<sirius::logical_type>{}, 0};
   CHECK(fixture.probe_partition->input_barrier_for(projection) == MemoryBarrierType::PARTIAL);
 }
@@ -91,7 +93,7 @@ TEST_CASE("sirius_physical_partition barrier hook preserves producer precedence"
 TEST_CASE("sirius_physical_partition barrier hook preserves build and right-family barriers",
           "[physical_partition][partition_barrier]")
 {
-  sirius_physical_operator projection{
+  sirius::op::test_physical_operator projection{
     SiriusPhysicalOperatorType::PROJECTION, duckdb::vector<sirius::logical_type>{}, 0};
 
   auto inner = make_partitioned_join();
@@ -519,6 +521,11 @@ struct partition_accumulation_fixture {
 };
 
 struct sizing_source : sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   sizing_source() : sirius_physical_operator(SiriusPhysicalOperatorType::PROJECTION, {}, 0) {}
 
   std::optional<std::size_t> total_source_output_bytes() const override { return projected_bytes; }
@@ -528,6 +535,10 @@ struct sizing_source : sirius_physical_operator {
 // Observe the sizing input at the consumer boundary, without context-level test counters.
 // NESTED_LOOP_JOIN supplies a key-free partition; these tests exercise scheduling, not hashing.
 struct sizing_consumer : sirius_physical_partition_consumer_operator {
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   sizing_consumer()
     : sirius_physical_partition_consumer_operator(
         SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, {}, 0)
@@ -728,7 +739,7 @@ TEST_CASE("build PARTITION declines inputs it cannot account for",
   {
     // A late-materialization directive on the PARTITION's port: the task input still carries
     // placeholders for deferred columns, so its keys cannot be accounted for.
-    sirius_physical_operator scan{
+    sirius::op::test_physical_operator scan{
       SiriusPhysicalOperatorType::ORDER_BY, duckdb::vector<sirius::logical_type>{}, 0};
     auto const pin    = std::make_shared<sirius::late_mat::pin_entry_handle>("accumulation_pin", 1);
     auto const origin = [&pin](std::uint32_t position) {
@@ -974,7 +985,7 @@ TEST_CASE("whole-build publication survives single-partition and broadcast build
 TEST_CASE("a non-FULL build input never accumulates and never blocks",
           "[physical_partition][dynamic_filter][multi_partition]")
 {
-  sirius_physical_operator order_by{
+  sirius::op::test_physical_operator order_by{
     SiriusPhysicalOperatorType::ORDER_BY, duckdb::vector<sirius::logical_type>{}, 0};
   partition_accumulation_fixture fixture{{.barrier = MemoryBarrierType::PIPELINE}};
   REQUIRE(fixture.tree.build_partition->input_barrier_for(order_by) == MemoryBarrierType::PIPELINE);
@@ -1145,9 +1156,10 @@ TEST_CASE("native join preparation aligns evaluated and compressed keys across f
       function_call{sirius::function_id::add, std::move(args), key_type});
   };
   auto child = [&]() {
-    return make_uniq<sirius_physical_operator>(SiriusPhysicalOperatorType::TABLE_SCAN,
-                                               vector<sirius::logical_type>{key_type, payload_type},
-                                               6);
+    return make_uniq<sirius::op::test_physical_operator>(
+      SiriusPhysicalOperatorType::TABLE_SCAN,
+      vector<sirius::logical_type>{key_type, payload_type},
+      6);
   };
   LogicalComparisonJoin logical(JoinType::INNER);
   logical.types = {LogicalType::INTEGER, LogicalType::INTEGER};

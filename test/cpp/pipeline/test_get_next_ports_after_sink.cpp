@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "utils/test_physical_operator.hpp"
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <expression/ast/node.hpp>
@@ -47,7 +49,7 @@ namespace {
 duckdb::unique_ptr<sirius_physical_operator> make_dummy_two_child_join()
 {
   duckdb::vector<sirius::logical_type> empty_types;
-  auto join = duckdb::make_uniq<sirius_physical_operator>(
+  auto join = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::INVALID, empty_types, 0);
   join->children.push_back(duckdb::make_uniq<sirius_physical_dummy_scan>(empty_types, 0));
   join->children.push_back(duckdb::make_uniq<sirius_physical_dummy_scan>(empty_types, 0));
@@ -71,9 +73,9 @@ TEST_CASE("returns sink ports for standard (non-delim) sink",
 {
   sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{nullptr});
 
-  sirius_physical_operator sink_op;
-  sirius_physical_operator consumer_a;
-  sirius_physical_operator consumer_b;
+  sirius::op::test_physical_operator sink_op;
+  sirius::op::test_physical_operator consumer_a;
+  sirius::op::test_physical_operator consumer_b;
   sink_op.add_next_port_after_sink({&consumer_a, "port_a"});
   sink_op.add_next_port_after_sink({&consumer_b, "port_b"});
 
@@ -95,7 +97,7 @@ TEST_CASE("yields nothing for standard sink with no ports", "[pipeline][get_next
 {
   sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{nullptr});
 
-  sirius_physical_operator sink_op;
+  sirius::op::test_physical_operator sink_op;
   sirius_pipeline_build_state build_state;
   build_state.set_pipeline_sink(pipeline, &sink_op, 0);
 
@@ -121,8 +123,8 @@ TEST_CASE("RIGHT_DELIM_JOIN: returns its own fan-out ports",
     0,
     duckdb::optional_idx());
 
-  sirius_physical_operator partition_branch;
-  sirius_physical_operator distinct_branch;
+  sirius::op::test_physical_operator partition_branch;
+  sirius::op::test_physical_operator distinct_branch;
   right_delim->add_next_port_after_sink({&partition_branch, "default"});
   right_delim->add_next_port_after_sink({&distinct_branch, "default"});
 
@@ -150,8 +152,8 @@ TEST_CASE("LEFT_DELIM_JOIN: returns its own fan-out ports", "[pipeline][get_next
     0,
     duckdb::optional_idx());
 
-  sirius_physical_operator scan_branch;
-  sirius_physical_operator distinct_branch;
+  sirius::op::test_physical_operator scan_branch;
+  sirius::op::test_physical_operator distinct_branch;
   left_delim->add_next_port_after_sink({&scan_branch, "default"});
   left_delim->add_next_port_after_sink({&distinct_branch, "default"});
 

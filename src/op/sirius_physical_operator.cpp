@@ -207,6 +207,25 @@ std::string sirius_physical_operator::to_string() const { return get_name() + pa
 
 void sirius_physical_operator::print() const { std::cout << to_string() << std::endl; }
 
+sirius::OrderPreservationType sirius_physical_operator::output_order() const
+{
+  const auto preservation = output_order_preservation();
+  if (preservation != sirius::OrderPreservationType::INSERTION_ORDER) { return preservation; }
+
+  const auto inputs = get_children();
+  // A CTE's first child materializes a definition; only its consumer child produces the
+  // enclosing plan's result. Do not let an ORDER BY inside an unused definition affect it.
+  if (type == SiriusPhysicalOperatorType::CTE) {
+    if (inputs.size() != 2) { throw internal_exception("CTE ordering requires two children"); }
+    return inputs[1].get().output_order();
+  }
+  if (inputs.empty()) { return sirius::OrderPreservationType::INSERTION_ORDER; }
+  if (inputs.size() != 1) {
+    throw internal_exception("Order-preserving operator requires one output-driving child");
+  }
+  return inputs.front().get().output_order();
+}
+
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
 sirius_physical_operator::get_children() const
 {

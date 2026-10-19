@@ -43,6 +43,11 @@ using output_mask = std::variant<passthrough, std::vector<cudf::size_type>>;
 /// @brief A Sirius filter operator.
 class sirius_physical_filter : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::FILTER;
 
  public:

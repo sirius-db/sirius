@@ -32,6 +32,7 @@
 #include "operator_test_utils.hpp"
 #include "utils/dynamic_filter_publication_fixture.hpp"
 #include "utils/sirius_test_env.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>

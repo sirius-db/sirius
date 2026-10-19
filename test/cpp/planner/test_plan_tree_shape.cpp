@@ -25,6 +25,7 @@
 
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/aggregate.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <duckdb/main/settings.hpp>
 // Reaching a join operator through these headers instantiates `vector<join_condition>`'s
@@ -2048,7 +2049,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   {
     // The propagation delim case restores `distinct_root` in place, so the distinct chain never
     // carries a sidecar; the wrap must not invent one.
-    auto delim = duckdb::make_uniq<sirius::op::sirius_physical_delim_join>(
+    auto delim = duckdb::make_uniq<sirius::op::test_delim_join>(
       SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
       wrap_integer_types(1),
       make_projection_leaf(1),

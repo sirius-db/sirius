@@ -38,23 +38,6 @@ sirius_pipeline::sirius_pipeline(const pipeline_build_context& ctx)
 {
 }
 
-bool sirius_pipeline::is_order_dependent() const
-{
-  if (source) {
-    auto source_order = source->source_order();
-    if (source_order == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
-    if (source_order == sirius::OrderPreservationType::NO_ORDER) { return false; }
-  }
-  for (auto& op_ref : operators) {
-    auto& op = op_ref.get();
-    if (op.operator_order() == sirius::OrderPreservationType::NO_ORDER) { return false; }
-    if (op.operator_order() == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
-  }
-  if (!build_ctx_.preserve_insertion_order()) { return false; }
-  if (sink && sink->sink_order_dependent()) { return true; }
-  return false;
-}
-
 std::vector<op::sirius_physical_operator::next_port_info>
 sirius_pipeline::get_next_ports_after_sink() const
 {

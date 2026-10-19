@@ -46,6 +46,11 @@ namespace {
 // query_index can read the pipeline DAG. Defaults to PROJECTION so get_next_ports_after_sink()
 // takes the plain (non-delim-join) path; a type can be supplied to model e.g. a HASH_JOIN consumer.
 struct test_operator : sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   explicit test_operator(SiriusPhysicalOperatorType type = SiriusPhysicalOperatorType::PROJECTION)
     : sirius_physical_operator(type, {}, 0)
   {
@@ -119,7 +124,7 @@ class dag_builder {
   }
 
  private:
-  pipeline_build_context _ctx{nullptr, true};
+  pipeline_build_context _ctx{nullptr};
   sirius_pipeline_build_state _bs;
   std::vector<std::unique_ptr<test_operator>> _ops;
   std::deque<std::string> _names;  // stable storage backing the port-name string_views

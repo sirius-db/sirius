@@ -254,6 +254,11 @@ struct cross_schedule_orphan {
 
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
 
   struct join_projection_columns {

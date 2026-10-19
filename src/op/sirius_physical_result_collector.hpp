@@ -73,6 +73,11 @@ class sirius_physical_result_collector : public sirius_physical_operator {
 
 class sirius_physical_materialized_collector : public sirius_physical_result_collector {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   sirius_physical_materialized_collector(::sirius::sirius_prepared_statement_data& data,
                                          duckdb::ClientContext& client_ctx);
   duckdb::unique_ptr<duckdb::ColumnDataCollection> result_collection;

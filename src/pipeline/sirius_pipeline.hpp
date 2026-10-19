@@ -195,9 +195,6 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! be done later.
   void notify_downstream_pipelines(bool original_pipeline);
 
-  //! Returns whether any of the operators in the pipeline care about preserving order
-  bool is_order_dependent() const;
-
   //! Registers a new batch index for a pipeline executor - returns the current minimum batch index
   std::size_t register_new_batch_index();
 
