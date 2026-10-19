@@ -71,6 +71,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -78,6 +79,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -340,6 +342,9 @@ struct scripted_http_response {
   std::string interim_terminator{"\r\n"};
   bool interim_only{false};
   bool close_without_response{false};
+  bool close_connection{false};
+  bool reset_connection{false};
+  std::optional<std::string> content_range;
   std::chrono::milliseconds interim_delay{0};
   bool chunked{false};
   std::vector<std::string> trailers;
@@ -360,6 +365,8 @@ class range_http_server {
     std::string method;
     std::string target;
     std::string wire;
+    std::size_t connection_id{0};
+    std::uint64_t sequence{0};
 
     std::vector<std::string> values(std::string_view name) const
     {
@@ -397,11 +404,39 @@ class range_http_server {
     return _get_records;
   }
 
+  void script_path(std::string method,
+                   std::string target,
+                   std::vector<scripted_http_response> responses,
+                   bool repeat_last = true)
+  {
+    script(std::move(method) + " " + std::move(target), std::move(responses), repeat_last);
+  }
+
+  [[nodiscard]] std::size_t accepted_connections() const noexcept
+  {
+    return _accepted_connections.load();
+  }
+
+  std::vector<std::size_t> connection_request_counts() const
+  {
+    std::lock_guard lock(_get_records_mutex);
+    std::vector<std::size_t> counts(_accepted_connections.load(), 0);
+    for (auto const& request : _requests) {
+      ++counts.at(request.connection_id - 1);
+    }
+    return counts;
+  }
+
   explicit range_http_server(std::vector<std::uint8_t> object,
                              range_fault_policy fault          = {},
                              std::vector<listed_object> listed = {},
-                             scripted_list_mode list_mode      = scripted_list_mode::normal)
-    : _object(std::move(object)), _fault(fault), _listed(std::move(listed)), _list_mode(list_mode)
+                             scripted_list_mode list_mode      = scripted_list_mode::normal,
+                             bool keep_alive                   = false)
+    : _object(std::move(object)),
+      _fault(fault),
+      _listed(std::move(listed)),
+      _list_mode(list_mode),
+      _keep_alive(keep_alive)
   {
     REQUIRE_FALSE(_object.empty());
 
@@ -431,15 +466,24 @@ class range_http_server {
     _thread = std::thread([this] { accept_loop(); });
   }
 
-  ~range_http_server()
+  ~range_http_server() { stop(); }
+
+  void stop()
   {
-    _stop.store(true);
+    if (_stop.exchange(true)) { return; }
+    if (_listen_fd >= 0) { ::shutdown(_listen_fd, SHUT_RDWR); }
+    {
+      std::lock_guard lock(_clients_mutex);
+      for (auto fd : _clients) {
+        ::shutdown(fd, SHUT_RDWR);
+      }
+    }
+    _clients_changed.notify_all();
+    if (_thread.joinable()) { _thread.join(); }
     if (_listen_fd >= 0) {
-      ::shutdown(_listen_fd, SHUT_RDWR);
       ::close(_listen_fd);
       _listen_fd = -1;
     }
-    if (_thread.joinable()) { _thread.join(); }
     for (auto& w : _workers) {
       if (w.joinable()) { w.join(); }
     }
@@ -470,10 +514,14 @@ class range_http_server {
     bool repeat_last{true};
   };
 
-  std::optional<scripted_http_response> next_response(std::string const& method)
+  std::optional<scripted_http_response> next_response(std::string const& method,
+                                                      std::string const& target)
   {
     std::lock_guard lock(_script_mutex);
-    auto const found = _scripts.find(method);
+    auto found = _scripts.find(method + " " + target);
+    if (found == _scripts.end() || found->second.responses.empty()) {
+      found = _scripts.find(method);
+    }
     if (found == _scripts.end() || found->second.responses.empty()) { return std::nullopt; }
     auto response = found->second.responses.front();
     if (found->second.responses.size() > 1 || !found->second.repeat_last) {
@@ -494,7 +542,8 @@ class range_http_server {
   void send_scripted_response(int fd,
                               std::string const& request,
                               bool is_head,
-                              scripted_http_response const& response)
+                              scripted_http_response const& response,
+                              bool keep_open)
   {
     if (response.close_without_response) { return; }
     if (response.interim_103 || response.interim_only) {
@@ -520,7 +569,9 @@ class range_http_server {
                             : response.status_line;
     headers += "\r\n";
     if (response.location) { headers += "Location: " + *response.location + "\r\n"; }
-    if (status == 206 && range) {
+    if (response.content_range) {
+      headers += "Content-Range: " + *response.content_range + "\r\n";
+    } else if (status == 206 && range) {
       headers += "Content-Range: bytes " + std::to_string(range->first) + "-" +
                  std::to_string(range->second) + "/" + std::to_string(_object.size()) + "\r\n";
     }
@@ -535,7 +586,7 @@ class range_http_server {
       auto const length = response.content_length.value_or(body.size());
       headers += "Content-Length: " + std::to_string(length) + "\r\n";
     }
-    headers += "Connection: close\r\n\r\n";
+    headers += connection_header(keep_open);
     send_all(fd, headers);
     auto const prefix = response.gate && !is_head && !response.chunked
                           ? std::min(response.body_before_gate, body.size())
@@ -701,6 +752,11 @@ class range_http_server {
   void accept_loop()
   {
     while (!_stop.load()) {
+      if (_keep_alive) {
+        std::unique_lock lock(_clients_mutex);
+        _clients_changed.wait(lock, [&] { return _stop.load() || _clients.size() < 64; });
+        if (_stop.load()) { return; }
+      }
       sockaddr_in client{};
       socklen_t len = sizeof(client);
       int fd        = ::accept(_listen_fd, reinterpret_cast<sockaddr*>(&client), &len);
@@ -708,38 +764,84 @@ class range_http_server {
         if (_stop.load()) { return; }
         continue;
       }
-      _workers.emplace_back([this, fd] {
-        handle_client(fd);
-        ::close(fd);
+      std::size_t connection_id;
+      {
+        std::lock_guard lock(_clients_mutex);
+        if (_stop.load()) {
+          ::close(fd);
+          return;
+        }
+        _clients.push_back(fd);
+        connection_id = _accepted_connections.fetch_add(1) + 1;
+      }
+      _workers.emplace_back([this, fd, connection_id] {
+        handle_client(fd, connection_id);
+        {
+          std::lock_guard lock(_clients_mutex);
+          std::erase(_clients, fd);
+          ::close(fd);
+        }
+        _clients_changed.notify_all();
       });
     }
   }
 
-  void handle_client(int fd)
+  static std::string connection_header(bool keep_open)
+  {
+    return keep_open ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
+  }
+
+  void handle_client(int fd, std::size_t connection_id)
   {
     timeval timeout{};
     timeout.tv_sec = 3;
     (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    std::string request;
+    std::string pending;
     std::array<char, 4096> buffer{};
-    while (request.find("\r\n\r\n") == std::string::npos) {
-      auto const received = ::recv(fd, buffer.data(), buffer.size(), 0);
-      if (received <= 0) { return; }
-      request.append(buffer.data(), static_cast<std::size_t>(received));
-      if (request.size() > (64U << 10)) { return; }
+    while (!_stop.load()) {
+      while (pending.find("\r\n\r\n") == std::string::npos) {
+        auto const received = ::recv(fd, buffer.data(), buffer.size(), 0);
+        if (received <= 0) { return; }
+        pending.append(buffer.data(), static_cast<std::size_t>(received));
+        if (pending.size() > (64U << 10)) { return; }
+      }
+      auto const end = pending.find("\r\n\r\n") + 4;
+      auto request   = pending.substr(0, end);
+      pending.erase(0, end);
+      bool keep_open = _keep_alive;
+      for (auto const& value : header_values(request, "connection")) {
+        if (value == "close") { keep_open = false; }
+      }
+      handle_request(fd, request, connection_id, keep_open);
+      if (!keep_open) { return; }
     }
+  }
 
+  void handle_request(int fd,
+                      std::string const& request,
+                      std::size_t connection_id,
+                      bool& keep_open)
+  {
     bool const is_head = request.rfind("HEAD ", 0) == 0;
     bool const is_get  = request.rfind("GET ", 0) == 0;
     auto const target  = request_target(request);
     bool const is_list = is_get && target.find("list-type=2") != std::string::npos;
     {
       std::lock_guard lock(_get_records_mutex);
-      _requests.push_back({request.substr(0, request.find(' ')), target, request});
+      static std::atomic<std::uint64_t> next_sequence{0};
+      _requests.push_back({request.substr(0, request.find(' ')),
+                           target,
+                           request,
+                           connection_id,
+                           next_sequence.fetch_add(1)});
     }
     _requests_changed.notify_all();
-    if (auto response = next_response(is_head ? "HEAD" : (is_list ? "LIST" : "GET"))) {
+    if (auto response = next_response(is_head ? "HEAD" : (is_list ? "LIST" : "GET"), target)) {
+      keep_open = keep_open && !response->close_connection && !response->reset_connection &&
+                  !response->close_without_response && !response->interim_only &&
+                  !(response->body && response->content_length &&
+                    *response->content_length != response->body->size());
       if (is_head) {
         _head_count.fetch_add(1);
       } else if (is_list) {
@@ -748,34 +850,39 @@ class range_http_server {
         _get_count.fetch_add(1);
         record_get(request, target);
         active_get_guard active{*this};
-        send_scripted_response(fd, request, false, *response);
+        send_scripted_response(fd, request, false, *response, keep_open);
+        if (response->reset_connection) {
+          linger reset{1, 0};
+          (void)::setsockopt(fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+        }
         return;
       }
-      send_scripted_response(fd, request, is_head, *response);
+      send_scripted_response(fd, request, is_head, *response, keep_open);
       return;
     }
     if (is_head) {
       auto const head_idx = _head_count.fetch_add(1, std::memory_order_relaxed);
       if (_fault.fail_all_heads || head_idx < _fault.fail_first_heads) {
-        std::string response =
-          "HTTP/1.1 " + std::to_string(_fault.fail_head_status) +
-          " Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        std::string response = "HTTP/1.1 " + std::to_string(_fault.fail_head_status) +
+                               " Service Unavailable\r\nContent-Length: 0\r\n" +
+                               connection_header(keep_open);
         send_all(fd, response);
         return;
       }
       std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
       append_etag_header(response, _fault.successful_head_etag);
-      response += "\r\nConnection: close\r\n\r\n";
+      response += "\r\n" + connection_header(keep_open);
       send_all(fd, response);
       return;
     }
     if (is_get && target.find("list-type=2") != std::string::npos) {
-      handle_list_request(fd, target);
+      handle_list_request(fd, target, keep_open);
       return;
     }
     if (!is_get) {
-      send_all(fd,
-               "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      send_all(
+        fd,
+        "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n" + connection_header(keep_open));
       return;
     }
 
@@ -785,11 +892,12 @@ class range_http_server {
     record_get(request, target);
     auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
     if (_fault.fail_all_gets || get_idx < _fault.fail_first_gets) {
+      if (_fault.truncate_error_body) { keep_open = false; }
       std::string response =
         "HTTP/1.1 " + std::to_string(_fault.fail_status) +
         " Service Unavailable\r\nContent-Length: " + (_fault.truncate_error_body ? "64" : "0");
       append_etag_header(response, _fault.failed_get_etag);
-      response += "\r\nConnection: close\r\n\r\n";
+      response += "\r\n" + connection_header(keep_open);
       send_all(fd, response);
       if (_fault.truncate_error_body) { send_all(fd, "short"); }
       return;
@@ -812,8 +920,8 @@ class range_http_server {
       auto const [start, end] = *range;
       if (_fault.fail_suffix_with_416 && is_suffix_range(request)) {
         send_all(fd,
-                 "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: "
-                 "close\r\n\r\n");
+                 "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n" +
+                   connection_header(keep_open));
         return;
       }
       if ((_fault.ignore_range_with_200 && is_suffix_range(request)) ||
@@ -821,7 +929,7 @@ class range_http_server {
         std::string response =
           "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
         append_etag_header(response, _fault.successful_get_etag);
-        response += "\r\nConnection: close\r\n\r\n";
+        response += "\r\n" + connection_header(keep_open);
         send_all(fd, response);
         send_body(fd, _object.data(), _object.size());
         return;
@@ -838,7 +946,7 @@ class range_http_server {
           (_fault.unknown_content_range_total ? std::string{"*"} : std::to_string(_object.size()));
       }
       append_etag_header(response, _fault.successful_get_etag);
-      response += "\r\nConnection: close\r\n\r\n";
+      response += "\r\n" + connection_header(keep_open);
       send_all(fd, response);
       send_body(fd, _object.data() + start, len);
       return;
@@ -846,18 +954,18 @@ class range_http_server {
 
     std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
     append_etag_header(response, _fault.successful_get_etag);
-    response += "\r\nConnection: close\r\n\r\n";
+    response += "\r\n" + connection_header(keep_open);
     send_all(fd, response);
     send_body(fd, _object.data(), _object.size());
   }
 
-  void handle_list_request(int fd, std::string const& target)
+  void handle_list_request(int fd, std::string const& target, bool keep_open)
   {
     auto const list_idx = _list_count.fetch_add(1, std::memory_order_relaxed);
     if (_fault.fail_all_lists || list_idx < _fault.fail_first_lists) {
-      std::string response =
-        "HTTP/1.1 " + std::to_string(_fault.fail_list_status) +
-        " Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      std::string response = "HTTP/1.1 " + std::to_string(_fault.fail_list_status) +
+                             " Service Unavailable\r\nContent-Length: 0\r\n" +
+                             connection_header(keep_open);
       send_all(fd, response);
       return;
     }
@@ -883,7 +991,7 @@ class range_http_server {
       auto body = xml.str();
       std::string response =
         "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " +
-        std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+        std::to_string(body.size()) + "\r\n" + connection_header(keep_open);
       send_all(fd, response);
       send_all(fd, body);
       return;
@@ -943,7 +1051,7 @@ class range_http_server {
 
     auto body            = xml.str();
     std::string response = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " +
-                           std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+                           std::to_string(body.size()) + "\r\n" + connection_header(keep_open);
     send_all(fd, response);
     send_all(fd, body);
   }
@@ -1043,8 +1151,13 @@ class range_http_server {
   range_fault_policy _fault;
   std::vector<listed_object> _listed;
   scripted_list_mode _list_mode;
+  bool _keep_alive{false};
   std::optional<generated_listing> _generated_listing;
   std::atomic<bool> _stop{false};
+  std::atomic<std::size_t> _accepted_connections{0};
+  std::mutex _clients_mutex;
+  std::condition_variable _clients_changed;
+  std::vector<int> _clients;
   std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
   mutable std::mutex _get_records_mutex;
@@ -4618,6 +4731,13 @@ struct logged_read {
   std::unique_ptr<sirius::io::grouped_io_request> request;
 
   logged_read(redirect_fixture const& fixture, std::size_t offset = 13, std::size_t size = 16)
+    : logged_read(fixture.object(), offset, size)
+  {
+  }
+
+  logged_read(std::shared_ptr<const sirius::io::io_object> object,
+              std::size_t offset = 13,
+              std::size_t size   = 16)
     : bytes(std::make_shared<std::vector<std::uint8_t>>(size, 0xe7)),
       coordinator(std::make_shared<sirius::io::grouped_coordinator>(size, 1))
   {
@@ -4627,7 +4747,7 @@ struct logged_read {
     slices.emplace_back(sirius::io::range{offset, size}, sirius::io::host_buffer{bytes->data()});
     slices.back().on_complete = completion;
     request =
-      sirius::io::grouped_io_request::create(fixture.object(), std::move(slices), coordinator);
+      sirius::io::grouped_io_request::create(std::move(object), std::move(slices), coordinator);
   }
 };
 
@@ -5502,6 +5622,1161 @@ TEST_CASE("REST request record allowlists omit signed query and header secrets",
       CHECK(target_requests[0].wire.find(provider_token) == std::string::npos);
       REQUIRE(transfers(logs).size() == 2);
       REQUIRE(decisions(logs).size() == 1);
+    }
+  }
+}
+
+namespace {
+
+std::size_t c3_receive_body(char* data, std::size_t size, std::size_t count, void* user) noexcept
+{
+  auto const bytes = size * count;
+  try {
+    auto& output = *static_cast<std::vector<std::uint8_t>*>(user);
+    output.insert(output.end(), data, data + bytes);
+    return bytes;
+  } catch (...) {
+    return 0;
+  }
+}
+
+}  // namespace
+
+TEST_CASE("REST c3 fixture preserves framed connections and stops idle clients",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_fixture]")
+{
+  (void)sirius::io::rest::global_curl_context::instance();
+  for (bool persistent : {false, true}) {
+    DYNAMIC_SECTION("persistent=" << persistent)
+    {
+      auto const payload = deterministic_payload(256);
+      range_http_server server(payload, {}, {}, scripted_list_mode::normal, persistent);
+      sirius::io::rest::curl_easy_ptr client{curl_easy_init()};
+      REQUIRE(client != nullptr);
+      std::vector<std::uint8_t> body;
+      REQUIRE(curl_easy_setopt(client.get(), CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1) ==
+              CURLE_OK);
+      REQUIRE(curl_easy_setopt(client.get(), CURLOPT_NOSIGNAL, 1L) == CURLE_OK);
+      REQUIRE(curl_easy_setopt(client.get(), CURLOPT_TIMEOUT_MS, 2000L) == CURLE_OK);
+      REQUIRE(curl_easy_setopt(client.get(), CURLOPT_WRITEFUNCTION, &c3_receive_body) == CURLE_OK);
+      REQUIRE(curl_easy_setopt(client.get(), CURLOPT_WRITEDATA, &body) == CURLE_OK);
+      auto get = [&](std::string const& path) {
+        auto const url = server.endpoint() + path;
+        body.clear();
+        REQUIRE(curl_easy_setopt(client.get(), CURLOPT_URL, url.c_str()) == CURLE_OK);
+        REQUIRE(curl_easy_perform(client.get()) == CURLE_OK);
+        long status = 0;
+        REQUIRE(curl_easy_getinfo(client.get(), CURLINFO_RESPONSE_CODE, &status) == CURLE_OK);
+        return status;
+      };
+      CHECK(get("/one") == 200);
+      CHECK(body == payload);
+      CHECK(get("/two") == 200);
+      CHECK(body == payload);
+      REQUIRE(server.wait_for_requests(2));
+      CHECK(server.accepted_connections() == (persistent ? 1 : 2));
+      if (persistent) {
+        CHECK(server.connection_request_counts() == std::vector<std::size_t>{2});
+        server.script_path("GET", "/queued", {error_reply(503), scripted_http_response{}}, false);
+        CHECK(get("/queued") == 503);
+        CHECK(get("/queued") == 200);
+        CHECK(body == payload);
+        CHECK(server.accepted_connections() == 1);
+        scripted_http_response close;
+        close.close_connection = true;
+        server.script_path("GET", "/close", {close});
+        CHECK(get("/close") == 200);
+        CHECK(get("/new-connection") == 200);
+        CHECK(server.accepted_connections() == 2);
+        CHECK((server.connection_request_counts() == std::vector<std::size_t>{5, 1}));
+      }
+      auto const started = std::chrono::steady_clock::now();
+      server.stop();
+      CHECK(std::chrono::steady_clock::now() - started < 2s);
+      server.stop();
+
+      auto cfg = direct_rest_test_config();
+      sirius::test::rest_redirect::set_retention(cfg, false);
+      sirius::test::rest_redirect::set_route_reuse(cfg, false);
+    }
+  }
+}
+
+namespace {
+
+using sirius::test::rest_redirect::routes;
+using sirius::test::rest_redirect::set_retention;
+using sirius::test::rest_redirect::set_route_reuse;
+
+constexpr std::size_t c3_object_size = 16U << 10;
+constexpr std::size_t c3_suffix_size = 256;
+
+struct c3_read_result {
+  std::vector<std::uint8_t> bytes;
+  std::size_t received{0};
+  std::string error;
+  bool changed{false};
+  std::error_code code;
+};
+
+struct c3_fixture {
+  c3_fixture(std::string endpoint, sirius::io::rest::config cfg, std::size_t n_reactors = 1)
+    : authorizer(std::make_shared<recording_authorizer>(std::move(endpoint))),
+      context(std::make_shared<redirect_reactor::reactor_context>(cfg, authorizer)),
+      io(std::make_shared<rest_ioctx>(n_reactors, context))
+  {
+    io->start();
+  }
+
+  ~c3_fixture() { io->shutdown(); }
+
+  redirect_reactor& reactor() const
+  {
+    redirect_object probe("s3://counter/probe", "counter", "probe", 1, redirect_tag);
+    return *io->next_reactor(probe, 1, rest_ioctx::io_op_type::host).at(0);
+  }
+
+  std::unique_ptr<sirius::io::sirius_datasource> open(bool suffix     = true,
+                                                      std::string key = redirect_key)
+  {
+    auto path = "s3://" + std::string(redirect_bucket) + "/" + key;
+    return suffix ? io->open_datasource(path, sirius::io::open_hint::parquet_footer_probe)
+                  : io->open_datasource(path);
+  }
+
+  c3_read_result read(sirius::io::sirius_datasource const& source,
+                      std::size_t offset = 0,
+                      std::size_t length = 32)
+  {
+    logged_read read(source.get_io_object().shared_from_this(), offset, length);
+    auto future = read.coordinator->get_future();
+    reactor().enqueue(std::move(read.request));
+    if (!std::move(future).wait(5s)) {
+      io->shutdown();
+      FAIL("c3 read did not settle within five seconds");
+    }
+    c3_read_result result;
+    try {
+      result.received = std::move(future).get();
+    } catch (sirius::io::object_changed_error const& error) {
+      result.error   = error.what();
+      result.changed = true;
+    } catch (std::system_error const& error) {
+      result.error = error.what();
+      result.code  = error.code();
+    } catch (std::exception const& error) {
+      result.error = error.what();
+    }
+    result.bytes = *read.bytes;
+    CHECK(read.completions->load() == 1);
+    return result;
+  }
+
+  std::shared_ptr<recording_authorizer> authorizer;
+  std::shared_ptr<redirect_reactor::reactor_context> context;
+  std::shared_ptr<rest_ioctx> io;
+};
+
+sirius::io::rest::config c3_config(range_http_server const& origin,
+                                   std::vector<std::string> targets,
+                                   bool reuse = true)
+{
+  auto cfg               = redirect_config(origin.endpoint(), std::move(targets));
+  cfg.footer_probe_bytes = c3_suffix_size;
+  cfg.request_timeout_s  = 2;
+  sirius::test::rest_redirect::set_request_log(cfg, true);
+  set_retention(cfg, true);
+  set_route_reuse(cfg, reuse);
+  return cfg;
+}
+
+void check_c3_bytes(c3_read_result const& result,
+                    std::span<std::uint8_t const> payload,
+                    std::size_t offset = 0)
+{
+  INFO(result.error);
+  CHECK(result.error.empty());
+  CHECK(result.received == result.bytes.size());
+  if (result.error.empty()) {
+    require_bytes_equal(result.bytes, payload.subspan(offset, result.bytes.size()));
+  }
+}
+
+}  // namespace
+
+TEST_CASE("REST c3 retention policies control TCP reuse",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_ac1]")
+{
+  auto const payload = deterministic_payload(c3_object_size);
+  SECTION("serial legacy and expanded policies use the same redirect workload")
+  {
+    for (bool expanded : {false, true}) {
+      DYNAMIC_SECTION("expanded=" << expanded)
+      {
+        request_log_capture logs;
+        range_http_server origin(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server target(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        origin.script("GET", {redirect_reply(target.endpoint() + "/data")});
+        auto cfg            = c3_config(origin, {authority(target.endpoint())}, false);
+        cfg.max_connections = 1;
+        set_retention(cfg, expanded);
+        c3_fixture fixture(origin.endpoint(), cfg);
+        std::vector<std::pair<std::size_t, std::size_t>> accept_deltas;
+        for (int i = 0; i < 32; ++i) {
+          auto source = fixture.io->open_datasource(
+            "s3://" + std::string(redirect_bucket) + "/retention-" + std::to_string(i),
+            static_cast<std::uint64_t>(c3_object_size));
+          auto const origin_before = origin.accepted_connections();
+          auto const target_before = target.accepted_connections();
+          check_c3_bytes(fixture.read(*source), payload);
+          accept_deltas.emplace_back(origin.accepted_connections() - origin_before,
+                                     target.accepted_connections() - target_before);
+        }
+        auto const records = transfers(logs);
+        REQUIRE(records.size() == 64);
+        bool connect_oracles_match = true;
+        for (std::size_t i = 0; i < accept_deltas.size(); ++i) {
+          auto const& first  = records[2 * i];
+          auto const& second = records[2 * i + 1];
+          CHECK(first.authority == authority(origin.endpoint()));
+          CHECK(second.authority == authority(target.endpoint()));
+          connect_oracles_match = connect_oracles_match &&
+                                  first.connects == std::to_string(accept_deltas[i].first) &&
+                                  second.connects == std::to_string(accept_deltas[i].second);
+        }
+        CHECK(origin.get_count() == 32);
+        CHECK(target.get_count() == 32);
+        auto const accepts = origin.accepted_connections() + target.accepted_connections();
+        INFO("no metadata open or warmup connection; total accepts=" << accepts);
+        if (expanded) {
+          CHECK(accepts <= 2);
+        } else {
+          CHECK(accepts >= 16);
+        }
+        CHECK(connect_oracles_match);
+      }
+    }
+  }
+  SECTION("concurrent expanded policy exercises all three targets")
+  {
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    std::vector<std::unique_ptr<range_http_server>> targets;
+    std::vector<std::string> authorities;
+    for (int i = 0; i < 3; ++i) {
+      targets.push_back(std::make_unique<range_http_server>(payload,
+                                                            tagged_object_policy(),
+                                                            std::vector<listed_object>{},
+                                                            scripted_list_mode::normal,
+                                                            true));
+      authorities.push_back(authority(targets.back()->endpoint()));
+    }
+    std::vector<scripted_http_response> replies;
+    for (int i = 0; i < 36; ++i) {
+      replies.push_back(redirect_reply(targets[i % 3]->endpoint() + "/data"));
+    }
+    origin.script("GET", std::move(replies), false);
+    auto cfg            = c3_config(origin, authorities, false);
+    cfg.max_connections = 4;
+    c3_fixture fixture(origin.endpoint(), cfg);
+    std::vector<std::unique_ptr<logged_read>> reads;
+    std::vector<sirius::exec::semi_future<std::size_t>> futures;
+    for (int i = 0; i < 36; ++i) {
+      auto object = std::make_shared<redirect_object>("s3://bucket/concurrent-" + std::to_string(i),
+                                                      "bucket",
+                                                      std::to_string(i),
+                                                      c3_object_size,
+                                                      redirect_tag);
+      reads.push_back(std::make_unique<logged_read>(std::move(object), 0, 32));
+      futures.push_back(reads.back()->coordinator->get_future());
+    }
+    stop_reactor_on_exit stop(fixture.reactor());
+    for (auto& read : reads) {
+      fixture.reactor().enqueue(std::move(read->request));
+    }
+    for (std::size_t i = 0; i < reads.size(); ++i) {
+      REQUIRE(std::move(futures[i]).wait(5s));
+      CHECK(std::move(futures[i]).get() == 32);
+      CHECK(reads[i]->completions->load() == 1);
+      require_bytes_equal(*reads[i]->bytes, std::span<std::uint8_t const>(payload).first(32));
+    }
+    auto accepts = origin.accepted_connections();
+    CHECK(origin.get_count() == 36);
+    for (auto const& target : targets) {
+      CHECK(target->get_count() == 12);
+      accepts += target->accepted_connections();
+    }
+    INFO("aggregate after all completions; total accepts=" << accepts);
+    CHECK(accepts <= 16);
+  }
+  SECTION("disabled policy keeps direct connection reuse")
+  {
+    range_http_server target(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    auto cfg            = direct_rest_test_config();
+    cfg.max_connections = 1;
+    set_retention(cfg, true);
+    c3_fixture fixture(target.endpoint(), cfg);
+    auto source =
+      fixture.io->open_datasource("s3://bucket/direct", static_cast<std::uint64_t>(c3_object_size));
+    for (int i = 0; i < 8; ++i) {
+      check_c3_bytes(fixture.read(*source), payload);
+    }
+    CHECK(target.accepted_connections() == 1);
+  }
+}
+
+namespace {
+
+std::string c3_target_path()
+{
+  return "/storage//part/../%2Fdata?pid=fixture&utm=1&cap=" + std::string(request_capability);
+}
+
+void c3_delegate(range_http_server& origin,
+                 range_http_server const& target,
+                 std::string path = c3_target_path())
+{
+  auto reply = redirect_reply(target.endpoint() + path);
+  origin.script("HEAD", {reply});
+  origin.script("GET", {reply});
+}
+
+std::vector<transfer_record> c3_since(request_log_capture const& logs, std::size_t begin)
+{
+  auto records = transfers(logs);
+  REQUIRE(records.size() >= begin);
+  records.erase(records.begin(), records.begin() + static_cast<std::ptrdiff_t>(begin));
+  return records;
+}
+
+struct c3_wire {
+  std::string endpoint;
+  long status;
+  std::size_t attempt;
+  std::string route;
+};
+
+void check_c3_trace(std::vector<transfer_record> const& records,
+                    std::vector<c3_wire> const& expected)
+{
+  CHECK(records.size() == expected.size());
+  for (std::size_t i = 0; i < std::min(records.size(), expected.size()); ++i) {
+    INFO("wire leg " << i);
+    CHECK(records[i].authority == authority(expected[i].endpoint));
+    CHECK(records[i].status == expected[i].status);
+    CHECK(records[i].attempt == expected[i].attempt);
+    CHECK(records[i].route == expected[i].route);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("REST c3 routes are seeded and reused within one open",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_ac2]")
+{
+  for (bool origin_suffix : {false, true}) {
+    DYNAMIC_SECTION("origin-served suffix=" << origin_suffix)
+    {
+      request_log_capture logs;
+      auto const payload = deterministic_payload(c3_object_size);
+      range_http_server origin(
+        payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+      range_http_server target(
+        payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+      c3_delegate(origin, target);
+      if (origin_suffix) {
+        origin.script(
+          "GET", {scripted_http_response{}, redirect_reply(target.endpoint() + c3_target_path())});
+      }
+      c3_fixture fixture(origin.endpoint(), c3_config(origin, {authority(target.endpoint())}));
+      auto const head = fixture.reactor().head_object(redirect_bucket, redirect_key);
+      CHECK(head.object_size == c3_object_size);
+      CHECK(head.etag == redirect_tag);
+      auto source        = fixture.open();
+      auto const& object = dynamic_cast<redirect_object const&>(source->get_io_object());
+      REQUIRE(object.stash_window_lo() == c3_object_size - c3_suffix_size);
+      REQUIRE(object.stash() != nullptr);
+      for (std::size_t i = 0; i < 8; ++i) {
+        auto const offset = i * 64;
+        REQUIRE(offset + 32 <= object.stash_window_lo());
+        check_c3_bytes(fixture.read(*source, offset), payload, offset);
+      }
+      CHECK(origin.head_count() == 1);
+      CHECK(origin.get_count() == (origin_suffix ? 2 : 1));
+      CHECK(target.get_count() == (origin_suffix ? 8 : 9));
+      CHECK(routes(fixture.reactor()).seeds == 1);
+      CHECK(routes(fixture.reactor()).hits == (origin_suffix ? 7 : 8));
+      require_counters(fixture.reactor(), 2, 0);
+      auto const requests = target.requests();
+      for (auto const& request : requests) {
+        require_uncredentialed(request, target.endpoint());
+        CHECK(request.target == c3_target_path());
+        if (request.method == "GET" &&
+            request.values("range") != std::vector<std::string>{"bytes=-256"}) {
+          CHECK(request.values("if-match") == std::vector<std::string>{redirect_tag});
+        }
+      }
+      auto const records = transfers(logs);
+      CHECK(std::count_if(records.begin(), records.end(), [](auto const& record) {
+              return record.route == "cached";
+            }) == (origin_suffix ? 7 : 8));
+    }
+  }
+  SECTION("one seeded open is visible to both workers of its context")
+  {
+    auto const payload = deterministic_payload(c3_object_size);
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server target(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    c3_delegate(origin, target);
+    c3_fixture fixture(origin.endpoint(), c3_config(origin, {authority(target.endpoint())}), 2);
+    auto source      = fixture.open();
+    auto first_gate  = std::make_shared<response_gate>();
+    auto second_gate = std::make_shared<response_gate>();
+    scripted_http_response first_response, second_response;
+    first_response.gate  = first_gate;
+    second_response.gate = second_gate;
+    target.script("GET", {first_response, second_response}, false);
+    auto const& object = dynamic_cast<redirect_object const&>(source->get_io_object());
+    auto workers = fixture.io->next_reactor(object, 2, rest_ioctx::io_op_type::host_vector_async);
+    REQUIRE(workers.size() == 2);
+    logged_read first(source->get_io_object().shared_from_this(), 0, 32);
+    logged_read second(source->get_io_object().shared_from_this(), 64, 32);
+    auto first_future  = first.coordinator->get_future();
+    auto second_future = second.coordinator->get_future();
+    stop_reactor_on_exit stop_first(*workers[0]);
+    stop_reactor_on_exit stop_second(*workers[1]);
+    workers[0]->enqueue(std::move(first.request));
+    workers[1]->enqueue(std::move(second.request));
+    REQUIRE(first_gate->wait_until_entered());
+    REQUIRE(second_gate->wait_until_entered());
+    CHECK(origin.get_count() == 1);
+    first_gate->release();
+    second_gate->release();
+    REQUIRE(std::move(first_future).wait(5s));
+    REQUIRE(std::move(second_future).wait(5s));
+    CHECK(std::move(first_future).get() == 32);
+    CHECK(std::move(second_future).get() == 32);
+    require_bytes_equal(*first.bytes, std::span<std::uint8_t const>(payload).first(32));
+    require_bytes_equal(*second.bytes, std::span<std::uint8_t const>(payload).subspan(64, 32));
+    CHECK(first.completions->load() == 1);
+    CHECK(second.completions->load() == 1);
+    CHECK(routes(*workers[0]).hits + routes(*workers[1]).hits == 2);
+  }
+}
+
+TEST_CASE("REST c3 route identity does not cross opens",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_ac3]")
+{
+  auto const payload = deterministic_payload(c3_object_size);
+  SECTION("existing v1 open and a freshly discovered v2")
+  {
+    request_log_capture logs;
+    auto second_payload = payload;
+    for (auto& byte : second_payload) {
+      byte ^= 0x5a;
+    }
+    auto second_policy                 = tagged_object_policy();
+    second_policy.successful_get_etag  = "\"generation-two\"";
+    second_policy.successful_head_etag = "\"generation-two\"";
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server first(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server second(second_payload, second_policy, {}, scripted_list_mode::normal, true);
+    c3_delegate(origin, first);
+    c3_fixture fixture(
+      origin.endpoint(),
+      c3_config(origin, {authority(first.endpoint()), authority(second.endpoint())}));
+    auto old_open = fixture.open();
+    c3_delegate(origin, second);
+    check_c3_bytes(fixture.read(*old_open), payload);
+    CHECK(old_open->get_io_object().validation_tag() == redirect_tag);
+    CHECK(origin.get_count() == 1);
+    auto new_open = fixture.open();
+    CHECK(new_open->get_io_object().validation_tag() == "\"generation-two\"");
+    check_c3_bytes(fixture.read(*new_open), second_payload);
+    CHECK(origin.get_count() == 2);
+    CHECK(routes(fixture.reactor()).hits == 2);
+    CHECK(routes(fixture.reactor()).seeds == 2);
+  }
+  SECTION("same-tag fresh HEAD open cannot inherit a route")
+  {
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server target(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    c3_delegate(origin, target);
+    c3_fixture fixture(origin.endpoint(), c3_config(origin, {authority(target.endpoint())}));
+    auto first = fixture.open();
+    check_c3_bytes(fixture.read(*first), payload);
+    CHECK(routes(fixture.reactor()).hits == 1);
+    auto second = fixture.open(false);
+    CHECK(&first->get_io_object() != &second->get_io_object());
+    CHECK(first->get_io_object().raw_file_cache_id() ==
+          second->get_io_object().raw_file_cache_id());
+    auto const before_origin = origin.get_count();
+    auto const before_hits   = routes(fixture.reactor()).hits;
+    check_c3_bytes(fixture.read(*second), payload);
+    CHECK(origin.get_count() == before_origin + 1);
+    CHECK(routes(fixture.reactor()).hits == before_hits);
+    check_c3_bytes(fixture.read(*second, 64), payload, 64);
+    CHECK(routes(fixture.reactor()).hits == before_hits + 1);
+  }
+  SECTION("weak and absent validators never seed")
+  {
+    for (auto const& tag : {std::string{}, std::string{"W/\"weak\""}}) {
+      DYNAMIC_SECTION("tag=" << tag)
+      {
+        auto policy                 = tagged_object_policy();
+        policy.successful_get_etag  = tag;
+        policy.successful_head_etag = tag;
+        range_http_server origin(payload, policy, {}, scripted_list_mode::normal, true);
+        range_http_server target(payload, policy, {}, scripted_list_mode::normal, true);
+        c3_delegate(origin, target);
+        c3_fixture fixture(origin.endpoint(), c3_config(origin, {authority(target.endpoint())}));
+        auto source = fixture.open();
+        for (std::size_t i = 0; i < 3; ++i) {
+          check_c3_bytes(fixture.read(*source, i * 64), payload, i * 64);
+        }
+        CHECK(origin.get_count() == 4);
+        CHECK(routes(fixture.reactor()).seeds == 0);
+        CHECK(routes(fixture.reactor()).hits == 0);
+        for (auto const& request : target.requests()) {
+          CHECK(request.values("if-match").empty());
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("REST c3 cached routing failures re-resolve once",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_ac4]")
+{
+  auto const payload = deterministic_payload(c3_object_size);
+  SECTION("a cached route is refreshed without following its new Location")
+  {
+    for (int status : {307, 404, 503, 401, 403, -1}) {
+      DYNAMIC_SECTION("cached status=" << status)
+      {
+        request_log_capture logs;
+        range_http_server origin(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server first(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server second(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server forbidden(payload, tagged_object_policy());
+        c3_delegate(origin, first);
+        c3_fixture fixture(origin.endpoint(),
+                           c3_config(origin,
+                                     {authority(first.endpoint()),
+                                      authority(second.endpoint()),
+                                      authority(forbidden.endpoint())}));
+        auto source      = fixture.open();
+        auto const begin = transfers(logs).size();
+        c3_delegate(origin, second);
+        if (status == -1) {
+          first.stop();
+        } else {
+          auto error = error_reply(status);
+          if (status == 307) { error.location = forbidden.endpoint() + "/never-follow"; }
+          first.script("GET", {error});
+        }
+        check_c3_bytes(fixture.read(*source), payload);
+        CHECK(origin.get_count() == 2);
+        CHECK(first.get_count() == (status == -1 ? 1 : 2));
+        CHECK(second.get_count() == 1);
+        CHECK(forbidden.requests().empty());
+        CHECK(routes(fixture.reactor()).hits == 1);
+        CHECK(routes(fixture.reactor()).refreshes == 1);
+        auto const records = c3_since(logs, begin);
+        check_c3_trace(records,
+                       {{first.endpoint(), status == -1 ? 0 : status, 0, "cached"},
+                        {origin.endpoint(), 307, 1, "origin"},
+                        {second.endpoint(), 206, 1, "fresh"}});
+        if (status == -1 && !records.empty()) { CHECK(records.front().connects == "-"); }
+        if (status != -1) {
+          auto const a = first.requests();
+          auto const o = origin.requests();
+          auto const b = second.requests();
+          if (a.size() >= 2 && !o.empty() && !b.empty()) {
+            CHECK(a.back().sequence < o.back().sequence);
+            CHECK(o.back().sequence < b.back().sequence);
+          }
+        }
+      }
+    }
+  }
+  SECTION("fresh target refusals remain terminal")
+  {
+    for (int status : {307, 401, 403}) {
+      DYNAMIC_SECTION("fresh status=" << status)
+      {
+        range_http_server origin(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server target(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server forbidden(payload, tagged_object_policy());
+        c3_delegate(origin, target);
+        c3_fixture fixture(
+          origin.endpoint(),
+          c3_config(origin, {authority(target.endpoint()), authority(forbidden.endpoint())}));
+        auto source = fixture.open(false);
+        auto error  = error_reply(status);
+        if (status == 307) { error.location = forbidden.endpoint() + "/never-follow"; }
+        target.script("GET", {error});
+        auto result = fixture.read(*source);
+        CHECK_THAT(result.error,
+                   Catch::Matchers::ContainsSubstring("HTTP " + std::to_string(status)));
+        CHECK(origin.get_count() == 1);
+        CHECK(target.get_count() == 1);
+        CHECK(forbidden.requests().empty());
+        CHECK(routes(fixture.reactor()).refreshes == 0);
+      }
+    }
+  }
+}
+
+TEST_CASE("REST c3 cached routing preserves terminal and retry outcomes",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_ac5]")
+{
+  auto const payload = deterministic_payload(c3_object_size);
+  SECTION("integrity outcomes do not re-resolve")
+  {
+    for (int fault : {0, 1, 2}) {
+      DYNAMIC_SECTION("integrity fault=" << fault)
+      {
+        range_http_server origin(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server target(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        c3_delegate(origin, target);
+        c3_fixture fixture(origin.endpoint(), c3_config(origin, {authority(target.endpoint())}));
+        auto source = fixture.open();
+        scripted_http_response reply;
+        if (fault == 0) { reply = error_reply(412); }
+        if (fault == 1) { reply.etag = "\"changed-generation\""; }
+        if (fault == 2) { reply.content_range = "bytes 7-38/16384"; }
+        target.script("GET", {reply});
+        auto result = fixture.read(*source);
+        if (fault < 2) {
+          CHECK(result.changed);
+        } else {
+          CHECK_THAT(result.error, Catch::Matchers::ContainsSubstring("Content-Range mismatch"));
+        }
+        CHECK(origin.get_count() == 1);
+        CHECK(target.get_count() == 2);
+        CHECK(routes(fixture.reactor()).hits == 1);
+        CHECK(routes(fixture.reactor()).refreshes == 0);
+      }
+    }
+  }
+  SECTION("a partial reset retries the same route")
+  {
+    request_log_capture logs;
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server target(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    c3_delegate(origin, target);
+    c3_fixture fixture(origin.endpoint(), c3_config(origin, {authority(target.endpoint())}));
+    auto source      = fixture.open();
+    auto const begin = transfers(logs).size();
+    scripted_http_response partial;
+    partial.body             = std::string(reinterpret_cast<char const*>(payload.data()), 8);
+    partial.content_length   = 32;
+    partial.reset_connection = true;
+    target.script("GET", {partial, scripted_http_response{}});
+    check_c3_bytes(fixture.read(*source), payload);
+    CHECK(origin.get_count() == 1);
+    CHECK(target.get_count() == 3);
+    CHECK(routes(fixture.reactor()).hits >= 1);
+    CHECK(routes(fixture.reactor()).refreshes == 0);
+    auto const records = c3_since(logs, begin);
+    CHECK(records.size() == 2);
+    for (auto const& record : records) {
+      CHECK(record.authority == authority(target.endpoint()));
+      CHECK(record.route == "cached");
+    }
+  }
+  SECTION("canceling a cached attempt completes once")
+  {
+    request_log_capture logs;
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server target(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    c3_delegate(origin, target);
+    c3_fixture fixture(origin.endpoint(), c3_config(origin, {authority(target.endpoint())}));
+    auto source = fixture.open();
+    auto gate   = std::make_shared<response_gate>();
+    scripted_http_response response;
+    response.gate             = gate;
+    response.body_before_gate = 1;
+    target.script("GET", {response});
+    logged_read read(source->get_io_object().shared_from_this(), 0, 32);
+    auto future = read.coordinator->get_future();
+    stop_reactor_on_exit stop(fixture.reactor());
+    fixture.reactor().enqueue(std::move(read.request));
+    REQUIRE(gate->wait_until_entered());
+    fixture.io->shutdown();
+    gate->release();
+    REQUIRE(std::move(future).wait(5s));
+    try {
+      (void)std::move(future).get();
+      FAIL_CHECK("canceled c3 read unexpectedly succeeded");
+    } catch (std::system_error const& error) {
+      CHECK(error.code() == std::make_error_code(std::errc::operation_canceled));
+    }
+    CHECK(read.completions->load() == 1);
+    CHECK(origin.get_count() == 1);
+    CHECK(routes(fixture.reactor()).hits == 1);
+    CHECK(routes(fixture.reactor()).refreshes == 0);
+    auto const records = transfers(logs);
+    CHECK(std::count_if(records.begin(), records.end(), [](auto const& record) {
+            return record.outcome == "aborted-local" && record.route == "cached";
+          }) == 1);
+  }
+}
+
+TEST_CASE("REST c3 refresh and authorization share attempt budgets",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_ac6]")
+{
+  auto const payload = deterministic_payload(c3_object_size);
+  for (std::string const scenario : {"success",
+                                     "fresh-transport",
+                                     "budget-one",
+                                     "auth-success",
+                                     "auth-ceiling",
+                                     "shared-ceiling",
+                                     "origin-401",
+                                     "fresh-307",
+                                     "fresh-401",
+                                     "fresh-403"}) {
+    DYNAMIC_SECTION(scenario)
+    {
+      request_log_capture logs;
+      range_http_server origin(
+        payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+      range_http_server target(
+        payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+      range_http_server forbidden(payload, tagged_object_policy());
+      c3_delegate(origin, target);
+      auto cfg = c3_config(origin, {authority(target.endpoint()), authority(forbidden.endpoint())});
+      cfg.max_retry_attempts      = scenario == "budget-one" ? 1 : 2;
+      cfg.max_auth_retry_attempts = 2;
+      if (scenario == "auth-success" || scenario == "auth-ceiling" || scenario == "origin-401") {
+        cfg.max_retry_attempts = 3;
+      }
+      if (scenario == "auth-ceiling") { cfg.max_auth_retry_attempts = 1; }
+      c3_fixture fixture(origin.endpoint(), cfg);
+      auto source      = fixture.open();
+      auto const begin = transfers(logs).size();
+      auto final_reply = scripted_http_response{};
+      if (scenario == "fresh-transport") {
+        final_reply.body           = std::string(reinterpret_cast<char const*>(payload.data()), 8);
+        final_reply.content_length = 32;
+        final_reply.close_connection = true;
+      } else if (scenario.starts_with("fresh-")) {
+        final_reply = error_reply(std::stoi(scenario.substr(6)));
+        if (scenario == "fresh-307") {
+          final_reply.location = forbidden.endpoint() + "/never-follow";
+        }
+      }
+      target.script("GET", {error_reply(503), final_reply});
+      bool const auth = scenario.starts_with("auth-") || scenario == "shared-ceiling";
+      if (auth) {
+        origin.script("GET",
+                      {error_reply(403), redirect_reply(target.endpoint() + c3_target_path())});
+      } else if (scenario == "origin-401") {
+        origin.script("GET", {error_reply(401)});
+      }
+      auto result = fixture.read(*source);
+      if (scenario == "success" || scenario == "auth-success") {
+        check_c3_bytes(result, payload);
+      } else if (scenario == "origin-401" || scenario.starts_with("fresh-3") ||
+                 scenario.starts_with("fresh-4")) {
+        auto const status = scenario == "origin-401" ? 401 : std::stoi(scenario.substr(6));
+        CHECK_THAT(result.error,
+                   Catch::Matchers::ContainsSubstring("HTTP " + std::to_string(status)));
+      } else {
+        CHECK_THAT(result.error, Catch::Matchers::ContainsSubstring("exhausted retries"));
+      }
+      CHECK(forbidden.requests().empty());
+      CHECK(routes(fixture.reactor()).hits == 1);
+      auto records = c3_since(logs, begin);
+      std::vector<c3_wire> expected{{target.endpoint(), 503, 0, "cached"}};
+      if (scenario != "budget-one") {
+        if (auth) {
+          expected.push_back({origin.endpoint(), 403, 1, "origin"});
+          if (scenario == "auth-success") {
+            expected.push_back({origin.endpoint(), 307, 2, "origin"});
+            expected.push_back({target.endpoint(), 206, 2, "fresh"});
+          }
+        } else if (scenario == "origin-401") {
+          expected.push_back({origin.endpoint(), 401, 1, "origin"});
+        } else {
+          expected.push_back({origin.endpoint(), 307, 1, "origin"});
+          auto const status = scenario == "success" || scenario == "fresh-transport"
+                                ? 206
+                                : std::stoi(scenario.substr(6));
+          expected.push_back({target.endpoint(), status, 1, "fresh"});
+        }
+        CHECK(routes(fixture.reactor()).refreshes == 1);
+      }
+      check_c3_trace(records, expected);
+      CHECK(origin.get_count() ==
+            (scenario == "budget-one" ? 1 : (scenario == "auth-success" ? 3 : 2)));
+    }
+  }
+}
+
+TEST_CASE("REST c3 reuse is opt-in and follows open lifetime",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_ac7]")
+{
+  auto const payload = deterministic_payload(c3_object_size);
+  SECTION("the default mode remains off")
+  {
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server target(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    c3_delegate(origin, target);
+    auto cfg               = redirect_config(origin.endpoint(), {authority(target.endpoint())});
+    cfg.footer_probe_bytes = c3_suffix_size;
+    c3_fixture fixture(origin.endpoint(), cfg);
+    auto source = fixture.open();
+    for (int i = 0; i < 3; ++i) {
+      check_c3_bytes(fixture.read(*source), payload);
+    }
+    CHECK(origin.get_count() == 4);
+    CHECK(routes(fixture.reactor()).hits == 0);
+    CHECK(routes(fixture.reactor()).seeds == 0);
+  }
+  SECTION("oversized capabilities are not retained")
+  {
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server target(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    c3_delegate(origin, target, "/object?long=" + std::string(2200, 'x'));
+    c3_fixture fixture(origin.endpoint(), c3_config(origin, {authority(target.endpoint())}));
+    auto source = fixture.open();
+    for (int i = 0; i < 3; ++i) {
+      check_c3_bytes(fixture.read(*source), payload);
+    }
+    CHECK(origin.get_count() == 4);
+    CHECK(routes(fixture.reactor()).hits == 0);
+    CHECK(routes(fixture.reactor()).seeds == 0);
+  }
+  SECTION("released opens and replacement contexts seed independently")
+  {
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server first(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server second(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    c3_delegate(origin, first);
+    c3_fixture fixture(origin.endpoint(), c3_config(origin, {authority(first.endpoint())}));
+    auto source = fixture.open(false);
+    check_c3_bytes(fixture.read(*source), payload);
+    check_c3_bytes(fixture.read(*source, 64), payload, 64);
+    CHECK(routes(fixture.reactor()).hits == 1);
+    source.reset();
+    auto const before = origin.get_count();
+    auto reopened     = fixture.open(false);
+    check_c3_bytes(fixture.read(*reopened), payload);
+    CHECK(origin.get_count() == before + 1);
+    CHECK(routes(fixture.reactor()).hits == 1);
+    CHECK(routes(fixture.reactor()).seeds == 2);
+    auto const old_target_count = first.get_count();
+    c3_delegate(origin, second);
+    c3_fixture replacement(origin.endpoint(), c3_config(origin, {authority(second.endpoint())}));
+    auto replacement_open         = replacement.open(false);
+    auto const before_replacement = origin.get_count();
+    check_c3_bytes(replacement.read(*replacement_open), payload);
+    CHECK(origin.get_count() == before_replacement + 1);
+    CHECK(first.get_count() == old_target_count);
+    CHECK(second.get_count() == 1);
+    CHECK(routes(replacement.reactor()).hits == 0);
+    CHECK(routes(replacement.reactor()).seeds == 1);
+    check_c3_bytes(replacement.read(*replacement_open, 64), payload, 64);
+    CHECK(routes(replacement.reactor()).hits == 1);
+  }
+}
+
+TEST_CASE("REST c3 records report routes and successful connects",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_ac8]")
+{
+  auto const payload = deterministic_payload(c3_object_size);
+  SECTION("enabled logging appends fields and describes the selected retention")
+  {
+    for (bool expanded : {false, true}) {
+      DYNAMIC_SECTION("expanded=" << expanded)
+      {
+        request_log_capture logs;
+        range_http_server origin(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server target(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        c3_delegate(origin, target);
+        auto cfg = c3_config(origin, {authority(target.endpoint())}, false);
+        set_retention(cfg, expanded);
+        c3_fixture fixture(origin.endpoint(), cfg);
+        auto source = fixture.open();
+        check_c3_bytes(fixture.read(*source), payload);
+        fixture.io->shutdown();
+        auto const records = transfers(logs);
+        check_c3_trace(records,
+                       {{origin.endpoint(), 307, 0, "origin"},
+                        {target.endpoint(), 206, 0, "fresh"},
+                        {origin.endpoint(), 307, 0, "origin"},
+                        {target.endpoint(), 206, 0, "fresh"}});
+        for (auto const& record : records) {
+          CHECK((record.connects == "0" || record.connects == "1"));
+        }
+        constexpr std::string_view header_prefix = "rest_reactor: redirect retention ";
+        constexpr std::array<std::string_view, 3> header_keys{
+          "mode", "maxconnects", "host_connections"};
+        std::size_t headers = 0;
+        for (auto const& entry : logs.sink->entries()) {
+          if (!entry.message.starts_with(header_prefix)) { continue; }
+          auto const fields = record_fields(entry.message, header_prefix, header_keys);
+          CHECK(fields.at("mode") == (expanded ? "expanded" : "legacy"));
+          CHECK(fields.at("maxconnects") == (expanded ? "2" : "1"));
+          CHECK(fields.at("host_connections") == "1");
+          ++headers;
+        }
+        CHECK(headers == 1);
+      }
+    }
+  }
+  SECTION("a failed connect is unknown rather than reuse")
+  {
+    request_log_capture logs;
+    range_http_server closed(payload);
+    auto const endpoint = closed.endpoint();
+    closed.stop();
+    auto cfg = request_record_config();
+    c3_fixture fixture(endpoint, cfg);
+    auto source = fixture.io->open_datasource("s3://bucket/unreachable",
+                                              static_cast<std::uint64_t>(c3_object_size));
+    auto result = fixture.read(*source);
+    CHECK_FALSE(result.error.empty());
+    fixture.io->shutdown();
+    auto const records = transfers(logs);
+    REQUIRE(records.size() == 1);
+    CHECK(records[0].status == 0);
+    CHECK(records[0].route == "origin");
+    CHECK(records[0].connects == "-");
+  }
+  SECTION("logging remains opt-in")
+  {
+    request_log_capture logs;
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server target(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    c3_delegate(origin, target);
+    auto cfg = c3_config(origin, {authority(target.endpoint())});
+    sirius::test::rest_redirect::set_request_log(cfg, false);
+    c3_fixture fixture(origin.endpoint(), cfg);
+    auto source = fixture.open();
+    check_c3_bytes(fixture.read(*source), payload);
+    fixture.io->shutdown();
+    CHECK(transfers(logs).empty());
+    for (auto const& entry : logs.sink->entries()) {
+      CHECK_FALSE(entry.message.starts_with("rest_reactor: redirect retention "));
+    }
+  }
+}
+
+TEST_CASE("REST c3 refusal classification preserves local failures",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_b3][rest_c3_b3_classifier]")
+{
+  struct outcome {
+    CURLcode result;
+    long status;
+    bool refused;
+  };
+  constexpr std::array<outcome, 18> cases{{
+    {CURLE_OK, 307, true},
+    {CURLE_OK, 401, true},
+    {CURLE_OK, 403, true},
+    {CURLE_OK, 404, true},
+    {CURLE_OK, 503, true},
+    {CURLE_PARTIAL_FILE, 503, true},
+    {CURLE_COULDNT_CONNECT, 0, true},
+    {CURLE_COULDNT_RESOLVE_HOST, 0, true},
+    {CURLE_OUT_OF_MEMORY, 503, false},
+    {CURLE_ABORTED_BY_CALLBACK, 307, false},
+    {CURLE_OK, 206, false},
+    {CURLE_OK, 200, false},
+    {CURLE_OK, 412, false},
+    {CURLE_OK, 416, false},
+    {CURLE_OK, 500, false},
+    {CURLE_RECV_ERROR, 206, false},
+    {CURLE_RECV_ERROR, 0, false},
+    {CURLE_OPERATION_TIMEDOUT, 0, false},
+  }};
+  static_assert(noexcept(redirect_reactor::cached_route_refused(CURLE_OK, 503L)));
+  for (auto const& expected : cases) {
+    DYNAMIC_SECTION("curl=" << static_cast<int>(expected.result) << " status=" << expected.status)
+    {
+      CHECK(redirect_reactor::cached_route_refused(expected.result, expected.status) ==
+            expected.refused);
+    }
+  }
+  for (auto result : {CURLE_OUT_OF_MEMORY, CURLE_ABORTED_BY_CALLBACK}) {
+    for (long status : {0L, 307L, 401L, 403L, 404L, 503L}) {
+      DYNAMIC_SECTION("protected curl=" << static_cast<int>(result) << " status=" << status)
+      {
+        CHECK_FALSE(redirect_reactor::cached_route_refused(result, status));
+      }
+    }
+  }
+}
+
+TEST_CASE("REST c3 cached routes stay within their policy context",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_b3][rest_c3_b3_context]")
+{
+  auto const payload = deterministic_payload(c3_object_size);
+  SECTION("a live foreign context uses its own authorizer and admission")
+  {
+    for (bool admitted_by_b : {false, true}) {
+      DYNAMIC_SECTION("origin B returns " << (admitted_by_b ? "node B" : "excluded node A"))
+      {
+        request_log_capture logs;
+        range_http_server origin_a(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server node_a(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server origin_b(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server node_b(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        c3_delegate(origin_a, node_a);
+        c3_delegate(origin_b, admitted_by_b ? node_b : node_a);
+        c3_fixture a(origin_a.endpoint(), c3_config(origin_a, {authority(node_a.endpoint())}));
+        auto source        = a.open();
+        auto const& object = dynamic_cast<redirect_object const&>(source->get_io_object());
+        auto const route_a = object.route(a.context);
+        REQUIRE(route_a != nullptr);
+        REQUIRE(object.stash_window_lo() >= 192);
+        CHECK(routes(a.reactor()).seeds == 1);
+        c3_fixture b(origin_b.endpoint(), c3_config(origin_b, {authority(node_b.endpoint())}));
+        REQUIRE(object.route(b.context) == nullptr);
+        auto const node_a_before       = node_a.get_count();
+        auto const origin_b_before     = origin_b.get_count();
+        auto const authorizer_b_before = b.authorizer->calls.load();
+        std::array<std::uint8_t, 32> bytes{};
+        if (admitted_by_b) {
+          REQUIRE(b.io->host_read_io(object, 64, bytes.size(), bytes.data()) == bytes.size());
+          require_bytes_equal(bytes,
+                              std::span<std::uint8_t const>(payload).subspan(64, bytes.size()));
+        } else {
+          auto error =
+            operation_error([&] { b.io->host_read_io(object, 64, bytes.size(), bytes.data()); });
+          CHECK_THAT(error, Catch::Matchers::ContainsSubstring("HTTP 307"));
+          require_counters(b.reactor(), 0, 1);
+        }
+        CHECK(node_a.get_count() == node_a_before);
+        CHECK(origin_b.get_count() == origin_b_before + 1);
+        CHECK(b.authorizer->calls.load() == authorizer_b_before + 1);
+        CHECK(node_b.get_count() == (admitted_by_b ? 1 : 0));
+        CHECK(routes(b.reactor()).hits == 0);
+        CHECK(routes(b.reactor()).seeds == 0);
+        CHECK(object.route(b.context) == nullptr);
+        CHECK(object.route(a.context) == route_a);
+        if (admitted_by_b) {
+          REQUIRE(b.io->host_read_io(object, 128, bytes.size(), bytes.data()) == bytes.size());
+          require_bytes_equal(bytes,
+                              std::span<std::uint8_t const>(payload).subspan(128, bytes.size()));
+          CHECK(origin_b.get_count() == origin_b_before + 2);
+          CHECK(routes(b.reactor()).hits == 0);
+          CHECK(routes(b.reactor()).seeds == 0);
+        }
+        auto const origin_a_before = origin_a.get_count();
+        REQUIRE(a.io->host_read_io(object, 0, bytes.size(), bytes.data()) == bytes.size());
+        require_bytes_equal(bytes, std::span<std::uint8_t const>(payload).first(bytes.size()));
+        CHECK(origin_a.get_count() == origin_a_before);
+        CHECK(node_a.get_count() == node_a_before + 1);
+        CHECK(routes(a.reactor()).hits == 1);
+      }
+    }
+  }
+  SECTION("retiring the owner does not transfer its occupied slot to an identical context")
+  {
+    request_log_capture logs;
+    range_http_server origin(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    range_http_server target(payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+    c3_delegate(origin, target);
+    auto const cfg = c3_config(origin, {authority(target.endpoint())});
+    std::shared_ptr<const sirius::io::io_object> retained;
+    std::weak_ptr<const void> retired_owner;
+    {
+      c3_fixture first(origin.endpoint(), cfg);
+      auto source        = first.open();
+      retained           = source->get_io_object().shared_from_this();
+      retired_owner      = first.context;
+      auto const& object = dynamic_cast<redirect_object const&>(*retained);
+      REQUIRE(object.route(first.context) != nullptr);
+      REQUIRE(object.stash_window_lo() >= 192);
+      CHECK(routes(first.reactor()).seeds == 1);
+      source.reset();
+      first.io->shutdown();
+    }
+    REQUIRE(retired_owner.expired());
+    auto const& object = dynamic_cast<redirect_object const&>(*retained);
+    c3_fixture replacement(origin.endpoint(), cfg);
+    REQUIRE(object.route(replacement.context) == nullptr);
+    auto const origin_before = origin.get_count();
+    auto const target_before = target.get_count();
+    std::array<std::uint8_t, 32> bytes{};
+    for (std::size_t i = 0; i < 3; ++i) {
+      auto const offset = i * 64;
+      REQUIRE(replacement.io->host_read_io(object, offset, bytes.size(), bytes.data()) ==
+              bytes.size());
+      require_bytes_equal(bytes,
+                          std::span<std::uint8_t const>(payload).subspan(offset, bytes.size()));
+      CHECK(origin.get_count() == origin_before + i + 1);
+      CHECK(target.get_count() == target_before + i + 1);
+      CHECK(replacement.authorizer->calls.load() == i + 1);
+      CHECK(routes(replacement.reactor()).hits == 0);
+      CHECK(routes(replacement.reactor()).seeds == 0);
+      CHECK(object.route(replacement.context) == nullptr);
+    }
+  }
+}
+
+TEST_CASE("REST c3 seed diagnostics cannot fail validated reads",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_b3][rest_c3_b3_seed]")
+{
+  using seed_signature =
+    bool (redirect_reactor::*)(sirius::io::io_object const&, std::string_view) noexcept;
+  static_assert(std::is_same_v<decltype(&redirect_reactor::seed_route), seed_signature>);
+  static_assert(std::is_nothrow_move_assignable_v<std::string>);
+
+  for (bool suffix : {false, true}) {
+    for (bool allocation_error : {false, true}) {
+      DYNAMIC_SECTION("suffix=" << suffix << " bad_alloc=" << allocation_error)
+      {
+        request_log_capture logs;
+        auto const payload = deterministic_payload(c3_object_size);
+        range_http_server origin(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        range_http_server target(
+          payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+        c3_delegate(origin, target);
+        auto throws = std::make_shared<std::atomic<std::size_t>>(0);
+        logs.sink->hook([throws, allocation_error](std::string_view message) {
+          if (!message.starts_with("rest_reactor: stored storage-node route for ")) { return; }
+          throws->fetch_add(1);
+          if (allocation_error) { throw std::bad_alloc{}; }
+          throw std::runtime_error("seed diagnostic sink failure");
+        });
+        c3_fixture fixture(origin.endpoint(), c3_config(origin, {authority(target.endpoint())}));
+        std::unique_ptr<sirius::io::sirius_datasource> source;
+        REQUIRE_NOTHROW(source = fixture.open(suffix));
+        REQUIRE(source != nullptr);
+        REQUIRE(source->size() == c3_object_size);
+        for (std::size_t i = 0; i < 3; ++i) {
+          check_c3_bytes(fixture.read(*source, i * 64), payload, i * 64);
+          CHECK(throws->load() == 1);
+          CHECK(routes(fixture.reactor()).seeds == 1);
+        }
+        auto const& object = dynamic_cast<redirect_object const&>(source->get_io_object());
+        CHECK(object.route(fixture.context) != nullptr);
+        CHECK(origin.get_count() == 1);
+        CHECK(target.get_count() == (suffix ? 4 : 3));
+        CHECK(routes(fixture.reactor()).hits == (suffix ? 3 : 2));
+        CHECK(routes(fixture.reactor()).refreshes == 0);
+      }
     }
   }
 }

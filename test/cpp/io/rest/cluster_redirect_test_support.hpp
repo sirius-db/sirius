@@ -34,6 +34,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -53,6 +54,53 @@ bool request_log_enabled(Config const& cfg)
 {
   if constexpr (has_request_log<Config>) { return cfg.request_log; }
   return false;
+}
+
+template <typename Config>
+constexpr bool has_retention = requires(Config& cfg) { cfg.cluster_redirect.retention; };
+
+template <typename Config>
+void set_retention(Config& cfg, bool expanded)
+{
+  if constexpr (has_retention<Config>) {
+    using mode                     = std::remove_cvref_t<decltype(cfg.cluster_redirect.retention)>;
+    cfg.cluster_redirect.retention = expanded ? mode::expanded : mode::legacy;
+  }
+}
+
+template <typename Config>
+constexpr bool has_route_reuse = requires(Config& cfg) { cfg.cluster_redirect.route_reuse; };
+
+template <typename Config>
+void set_route_reuse(Config& cfg, bool enabled)
+{
+  if constexpr (has_route_reuse<Config>) {
+    using mode = std::remove_cvref_t<decltype(cfg.cluster_redirect.route_reuse)>;
+    cfg.cluster_redirect.route_reuse = enabled ? mode::same_open : mode::off;
+  }
+}
+
+template <typename Counters>
+constexpr bool has_route_counters = requires(Counters const& counts) {
+  counts.route_seeds;
+  counts.route_hits;
+  counts.route_refreshes;
+};
+
+struct route_counts {
+  std::uint64_t seeds{0};
+  std::uint64_t hits{0};
+  std::uint64_t refreshes{0};
+};
+
+template <typename Reactor>
+route_counts routes(Reactor const& reactor)
+{
+  auto const counts = reactor.redirects();
+  if constexpr (has_route_counters<decltype(counts)>) {
+    return {counts.route_seeds, counts.route_hits, counts.route_refreshes};
+  }
+  return {};
 }
 
 // Run the existing transport regressions in both instrumentation modes.
