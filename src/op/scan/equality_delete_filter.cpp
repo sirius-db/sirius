@@ -103,7 +103,7 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
 
   auto bool_col = make_anti_join_mask(*build_indices, n_rows, stream, mr);
 
-  return sirius::ApplyRetentionMask(tbl->view(), bool_col->view(), stream, mr);
+  return sirius::apply_retention_mask(tbl->view(), bool_col->view(), stream, mr);
 }
 
 }  // namespace sirius::op::scan

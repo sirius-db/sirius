@@ -83,7 +83,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
-  auto const return_type = sirius::get_cudf_type(alt.target_type);
+  auto const return_type = sirius::require_cudf_type(alt.target_type);
   auto child             = evaluate(*alt.child, evaluation_mode::MATERIALIZE);
   if (child.is_scalar()) {
     child = evaluate_result(

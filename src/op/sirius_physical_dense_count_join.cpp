@@ -437,7 +437,7 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
       ? std::min(static_cast<std::size_t>(_planned_histogram_bytes), admission_ceiling)
       : admission_ceiling;
 
-  auto const key_width      = sirius::get_cudf_type(types[0]).id() == cudf::type_id::INT32
+  auto const key_width      = sirius::require_cudf_type(types[0]).id() == cudf::type_id::INT32
                                 ? sizeof(int32_t)
                                 : sizeof(int64_t);
   auto const cudf_row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
@@ -513,7 +513,7 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   auto* space = ro_batches.front().get_memory_space();
   auto mr     = space->get_default_allocator();
 
-  auto const key_type   = sirius::get_cudf_type(types[0]);
+  auto const key_type   = sirius::require_cudf_type(types[0]);
   auto require_key_type = [&](cudf::column_view const& col, char const* side) {
     if (col.type().id() != key_type.id()) {
       throw sirius::internal_exception(

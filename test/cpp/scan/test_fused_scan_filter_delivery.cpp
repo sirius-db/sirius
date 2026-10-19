@@ -16,23 +16,12 @@
 
 /**
  * @file test_fused_scan_filter_delivery.cpp
- * @brief Filtered decodes that return only the leading columns a scan outputs. The codec cases pin
- * `simpatico::decompress_scan_filter`'s delivered prefix: an applied decode returns exactly that
- * prefix, and every other outcome returns every selected column. The engine cases pin
- * `sirius::decompress_chunk`: a decode drops a scan's trailing pure-filter columns only once it has
- * applied the scan's whole filter, and every other shape keeps them. A join filter is not part of
- * that filter, so whether one ran, declined, or was dropped by the decode's probe cap never changes
- * the decision.
+ * @brief Verify filtered output prefixes and retention of columns needed by residual filters.
  *
- * Every source has two output columns followed by one column only the filter reads. The numeric
- * sources output "v" = i % 100 and "k" = i % 50 (bitpack) and end in "f" = i % 1000 (bitpack, a
- * range source) or "s" = key_string(i) (dictionary, an equality source answered as BOOL8). The
- * string sources output "v" and "n" = key_string(i) (dictionary) and end in "f"; their nullable
- * variant nulls "n" wherever i % 7 == 0. A filtered decode cannot compact a null-masked column
- * (`decompress_column` in `src/compression/simpatico_codegen/src/plan/decompress.cpp` refuses it:
- * "selection on a null-masked column is not supported"), so the nullable variant's decode fails
- * after its filter has run: a non-applied outcome that, unlike giving up on an unselective batch,
- * does not depend on the selectivity ceilings another test in this binary raises.
+ * Codec cases check delivered_prefix; engine cases drop trailing filter-only columns only when the
+ * scan's whole filter was applied. Join-filter acceptance or refusal does not complete a partially
+ * applied scan filter. Nullable selected values decline compaction and preserve the original rows
+ * and validity.
  */
 
 #include "api/simpatico_codegen.hpp"
@@ -53,6 +42,8 @@
 
 #include <catch.hpp>
 #include <compression/compressed_scan.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <concepts>
 #include <cstddef>
@@ -240,7 +231,46 @@ sc::scan_filter_request equality_request(std::vector<std::string> keys)
   return request;
 }
 
-sirius::decompress_result decompress_with(simpatico::compressed_table const& chunk,
+struct decode_environment {
+  using tracking = cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope;
+
+  static cucascade::memory::gpu_memory_space_config config(bool per_stream)
+  {
+    int device = -1;
+    REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+    cucascade::memory::gpu_memory_space_config config;
+    config.device_id              = device;
+    config.memory_capacity        = 16U << 20;
+    config.per_stream_reservation = per_stream;
+    return config;
+  }
+
+  explicit decode_environment(::cuda::stream_ref stream, bool per_stream = false)
+    : space{config(per_stream)},
+      stream{stream},
+      tracking_scope{per_stream ? tracking::PER_STREAM : tracking::PER_THREAD}
+  {
+    auto* allocator =
+      space.get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    REQUIRE(allocator != nullptr);
+    auto reservation = space.make_reservation(8U << 20);
+    REQUIRE(reservation != nullptr);
+    REQUIRE(allocator->attach_reservation_to_tracker(stream, std::move(reservation)));
+  }
+
+  ~decode_environment()
+  {
+    space.get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>()
+      ->reset_stream_reservation(stream);
+  }
+
+  cucascade::memory::memory_space space;
+  ::cuda::stream_ref stream;
+  tracking tracking_scope;
+};
+
+sirius::decompress_result decompress_with(decode_environment& environment,
+                                          simpatico::compressed_table const& chunk,
                                           sirius::pushdown_request request,
                                           ::cuda::stream_ref stream)
 {
@@ -249,8 +279,10 @@ sirius::decompress_result decompress_with(simpatico::compressed_table const& chu
                                   kSelected,
                                   &scan,
                                   sirius::decode_visibility_mask{},
+                                  environment.space,
+                                  environment.tracking_scope,
                                   stream,
-                                  cudf::get_current_device_resource_ref());
+                                  environment.space.get_default_allocator());
 }
 
 /// Join filters per selected slot, as a scan attaches them to a batch.
@@ -297,6 +329,7 @@ slot_probes one_probe(std::size_t slot, sirius::membership_probe probe)
 /// `decompression_pushdown_scan::with_membership_probes`, the way a scan refreshes a batch's join
 /// filters.
 sirius::decompress_result decompress_with_probes(
+  decode_environment& environment,
   simpatico::compressed_table const& chunk,
   sirius::pushdown_request request,
   slot_probes probes,
@@ -305,8 +338,14 @@ sirius::decompress_result decompress_with_probes(
 {
   auto const scan = sirius::decompression_pushdown_scan{std::move(request)}.with_membership_probes(
     std::move(probes), /*generation=*/1);
-  return sirius::decompress_chunk(
-    chunk, kSelected, scan.get(), keep_mask, stream, cudf::get_current_device_resource_ref());
+  return sirius::decompress_chunk(chunk,
+                                  kSelected,
+                                  scan.get(),
+                                  keep_mask,
+                                  environment.space,
+                                  environment.tracking_scope,
+                                  stream,
+                                  environment.space.get_default_allocator());
 }
 
 /// The codec and the engine read the same env gate; an explicit SIRIUS_EXP_FUSED_SCAN_FILTER=0
@@ -368,7 +407,7 @@ TEST_CASE("a filtered decode with no survivors delivers empty prefix columns",
   }
 }
 
-TEST_CASE("a filtered decode that fails after its filter ran returns every selected column",
+TEST_CASE("a nullable-selection refusal after filtering returns every selected column",
           "[fused_scan_filter][delivery]")
 {
   if (gate_off()) { return; }
@@ -385,7 +424,7 @@ TEST_CASE("a filtered decode that fails after its filter ran returns every selec
   auto out = simpatico::decompress_scan_filter(ct, kSelected, request, result, pool, stream, mr);
 
   REQUIRE_FALSE(result.applied);
-  REQUIRE(result.status == sc::scan_filter_status::failed);
+  REQUIRE(result.status == sc::scan_filter_status::refused);
   require_columns(
     out->view(), string_rows_where(every_row, /*nullable=*/true), kSelected.size(), stream);
 }
@@ -496,9 +535,12 @@ TEST_CASE("a decode carrying the whole filter drops the trailing pure-filter col
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_range_source(stream);
+  auto const per_stream           = GENERATE(false, true);
+  CAPTURE(per_stream);
+  decode_environment environment{stream, per_stream};
+  auto const ct = compress_range_source(stream);
 
-  auto const decoded = decompress_with(ct, covered_request(kOutputWidth), stream);
+  auto const decoded = decompress_with(environment, ct, covered_request(kOutputWidth), stream);
 
   CHECK(decoded.outcome.row_filtered);
   CHECK(decoded.outcome.filter_only_columns_dropped);
@@ -511,11 +553,15 @@ TEST_CASE("a decode with a join filter still drops the pure-filter column",
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_range_source(stream);
+  decode_environment environment{stream};
+  auto const ct = compress_range_source(stream);
 
   // A join filter is not part of the scan's own filter, so the range alone decides coverage.
-  auto const decoded = decompress_with_probes(
-    ct, covered_request(kOutputWidth), one_probe(0, key_set_probe(make_key_set(stream))), stream);
+  auto const decoded = decompress_with_probes(environment,
+                                              ct,
+                                              covered_request(kOutputWidth),
+                                              one_probe(0, key_set_probe(make_key_set(stream))),
+                                              stream);
 
   CHECK(decoded.outcome.row_filtered);
   CHECK(decoded.outcome.filter_only_columns_dropped);
@@ -531,12 +577,16 @@ TEST_CASE("a join filter past the delivered prefix is applied but not delivered"
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_range_source(stream);
+  decode_environment environment{stream};
+  auto const ct = compress_range_source(stream);
 
   // The join filter tests the pure-filter column "f" while the selection is built; "f" is still
   // dropped from the delivered columns.
-  auto const decoded = decompress_with_probes(
-    ct, covered_request(kOutputWidth), one_probe(2, key_set_probe(make_key_set(stream))), stream);
+  auto const decoded = decompress_with_probes(environment,
+                                              ct,
+                                              covered_request(kOutputWidth),
+                                              one_probe(2, key_set_probe(make_key_set(stream))),
+                                              stream);
 
   CHECK(decoded.outcome.row_filtered);
   CHECK(decoded.outcome.filter_only_columns_dropped);
@@ -550,10 +600,11 @@ TEST_CASE("a join filter that declines leaves the range's survivors and the drop
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_range_source(stream);
+  decode_environment environment{stream};
+  auto const ct = compress_range_source(stream);
 
   auto const decoded = decompress_with_probes(
-    ct, covered_request(kOutputWidth), one_probe(0, declining_probe()), stream);
+    environment, ct, covered_request(kOutputWidth), one_probe(0, declining_probe()), stream);
 
   // The declined join filter removed nothing, so every survivor is a row of the range.
   CHECK(decoded.outcome.row_filtered);
@@ -566,7 +617,8 @@ TEST_CASE("a decode whose only source is a join filter keeps every column",
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_range_source(stream);
+  decode_environment environment{stream};
+  auto const ct = compress_range_source(stream);
 
   sirius::pushdown_request request;
   request.columns.resize(kSelected.size());
@@ -575,7 +627,7 @@ TEST_CASE("a decode whose only source is a join filter keeps every column",
   // Coverage needs a range the decode evaluates; a claim with none is not enough.
   SECTION("the request claims coverage with no range") { request.ranges_cover_whole_filter = true; }
   auto const decoded = decompress_with_probes(
-    ct, std::move(request), one_probe(0, key_set_probe(make_key_set(stream))), stream);
+    environment, ct, std::move(request), one_probe(0, key_set_probe(make_key_set(stream))), stream);
 
   CHECK_FALSE(decoded.outcome.row_filtered);
   CHECK_FALSE(decoded.outcome.filter_only_columns_dropped);
@@ -588,7 +640,8 @@ TEST_CASE("a join filter does not complete a partly carried filter",
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_range_source(stream);
+  decode_environment environment{stream};
+  auto const ct = compress_range_source(stream);
 
   auto const in_range_and_keys = [](cudf::size_type i) {
     return in_filter_range(i) && in_key_set(i % 100);
@@ -602,22 +655,26 @@ TEST_CASE("a join filter does not complete a partly carried filter",
   // every row.
   SECTION("a conjunct is dropped") { request.columns[1].range = sirius::decode_range{5, 3}; }
   auto const decoded = decompress_with_probes(
-    ct, std::move(request), one_probe(0, key_set_probe(make_key_set(stream))), stream);
+    environment, ct, std::move(request), one_probe(0, key_set_probe(make_key_set(stream))), stream);
 
   CHECK_FALSE(decoded.outcome.row_filtered);
   CHECK_FALSE(decoded.outcome.filter_only_columns_dropped);
   require_columns(decoded.table->view(), rows_where(in_range_and_keys), kSelected.size(), stream);
 }
 
-TEST_CASE("a decode with a join filter that fails keeps every row and column",
+TEST_CASE("a nullable-selection refusal with a join filter keeps every row and column",
           "[fused_scan_filter][delivery]")
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_string_source(/*nullable=*/true, stream);
+  decode_environment environment{stream};
+  auto const ct = compress_string_source(/*nullable=*/true, stream);
 
-  auto const decoded = decompress_with_probes(
-    ct, covered_request(kOutputWidth), one_probe(0, key_set_probe(make_key_set(stream))), stream);
+  auto const decoded = decompress_with_probes(environment,
+                                              ct,
+                                              covered_request(kOutputWidth),
+                                              one_probe(0, key_set_probe(make_key_set(stream))),
+                                              stream);
 
   CHECK_FALSE(decoded.outcome.row_filtered);
   CHECK_FALSE(decoded.outcome.filter_only_columns_dropped);
@@ -632,14 +689,16 @@ TEST_CASE("a decode with a join filter and a visibility mask consumes both",
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_range_source(stream);
+  decode_environment environment{stream};
+  auto const ct = compress_range_source(stream);
 
   // Keep every even row.
   static_assert(kRows % 32 == 0);
   sirius::decode_visibility_mask keep_even;
   keep_even.words     = std::make_shared<std::uint32_t[]>(kRows / 32, 0x55555555U);
   keep_even.row_count = kRows;
-  auto const decoded  = decompress_with_probes(ct,
+  auto const decoded  = decompress_with_probes(environment,
+                                              ct,
                                               covered_request(kOutputWidth),
                                               one_probe(0, key_set_probe(make_key_set(stream))),
                                               stream,
@@ -661,15 +720,16 @@ TEST_CASE("join filters past the decode's cap leave the drop in place",
     "fused_gate_armer sets SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER=2 unless the environment overrides it");
   REQUIRE(sc::decompression_pushdown_max_membership_sources() == 2);
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_range_source(stream);
+  decode_environment environment{stream};
+  auto const ct = compress_range_source(stream);
 
   // Listed out of rank order: the decode sorts them strongest first and carries the first two.
   slot_probes probes(kSelected.size());
   probes[1].push_back(key_set_probe(make_key_set(stream, /*step=*/3), /*selectivity_rank=*/2));
   probes[0].push_back(key_set_probe(make_key_set(stream, /*step=*/5), /*selectivity_rank=*/0));
   probes[1].push_back(key_set_probe(make_key_set(stream, /*step=*/2), /*selectivity_rank=*/1));
-  auto const decoded =
-    decompress_with_probes(ct, covered_request(kOutputWidth), std::move(probes), stream);
+  auto const decoded = decompress_with_probes(
+    environment, ct, covered_request(kOutputWidth), std::move(probes), stream);
 
   CHECK(decoded.outcome.row_filtered);
   CHECK(decoded.outcome.filter_only_columns_dropped);
@@ -685,11 +745,12 @@ TEST_CASE("a decode carrying part of the filter keeps every column",
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_range_source(stream);
+  decode_environment environment{stream};
+  auto const ct = compress_range_source(stream);
 
   auto request                      = covered_request(kOutputWidth);
   request.ranges_cover_whole_filter = false;
-  auto const decoded                = decompress_with(ct, std::move(request), stream);
+  auto const decoded                = decompress_with(environment, ct, std::move(request), stream);
 
   CHECK_FALSE(decoded.outcome.row_filtered);
   CHECK_FALSE(decoded.outcome.filter_only_columns_dropped);
@@ -700,9 +761,10 @@ TEST_CASE("a decode without an output prefix keeps every column", "[fused_scan_f
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_range_source(stream);
+  decode_environment environment{stream};
+  auto const ct = compress_range_source(stream);
 
-  auto const decoded = decompress_with(ct, covered_request(std::nullopt), stream);
+  auto const decoded = decompress_with(environment, ct, covered_request(std::nullopt), stream);
 
   CHECK(decoded.outcome.row_filtered);
   CHECK_FALSE(decoded.outcome.filter_only_columns_dropped);
@@ -713,13 +775,20 @@ TEST_CASE("each chunk of one scan decides its own delivery", "[fused_scan_filter
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const mr                   = cudf::get_current_device_resource_ref();
-  auto const clean                = compress_string_source(/*nullable=*/false, stream);
-  auto const nullable             = compress_string_source(/*nullable=*/true, stream);
+  decode_environment environment{stream};
+  auto const mr       = environment.space.get_default_allocator();
+  auto const clean    = compress_string_source(/*nullable=*/false, stream);
+  auto const nullable = compress_string_source(/*nullable=*/true, stream);
   sirius::decompression_pushdown_scan const scan{covered_request(kOutputWidth)};
 
-  auto const dropped =
-    sirius::decompress_chunk(clean, kSelected, &scan, sirius::decode_visibility_mask{}, stream, mr);
+  auto const dropped = sirius::decompress_chunk(clean,
+                                                kSelected,
+                                                &scan,
+                                                sirius::decode_visibility_mask{},
+                                                environment.space,
+                                                environment.tracking_scope,
+                                                stream,
+                                                mr);
   CHECK(dropped.outcome.row_filtered);
   CHECK(dropped.outcome.filter_only_columns_dropped);
   require_columns(dropped.table->view(),
@@ -727,10 +796,16 @@ TEST_CASE("each chunk of one scan decides its own delivery", "[fused_scan_filter
                   kOutputWidth,
                   stream);
 
-  // The same request over a chunk whose "n" is null-masked: its decode fails after the filter ran,
-  // so the scan gets the whole chunk back and filters it itself.
-  auto const kept = sirius::decompress_chunk(
-    nullable, kSelected, &scan, sirius::decode_visibility_mask{}, stream, mr);
+  // The same request over a chunk whose "n" is null-masked refuses nullable selection after
+  // filtering, so the scan gets the whole chunk back and filters it itself.
+  auto const kept = sirius::decompress_chunk(nullable,
+                                             kSelected,
+                                             &scan,
+                                             sirius::decode_visibility_mask{},
+                                             environment.space,
+                                             environment.tracking_scope,
+                                             stream,
+                                             mr);
   CHECK_FALSE(kept.outcome.row_filtered);
   CHECK_FALSE(kept.outcome.filter_only_columns_dropped);
   require_columns(
@@ -742,7 +817,8 @@ TEST_CASE("an equality-only pure-filter column past the prefix is dropped with i
 {
   if (gate_off()) { return; }
   ::cuda::stream_ref const stream = cudf::get_default_stream();
-  auto const ct                   = compress_equality_source(stream);
+  decode_environment environment{stream};
+  auto const ct = compress_equality_source(stream);
 
   // The range sits on output column "v"; "s" is read only by its equality.
   sirius::pushdown_request request;
@@ -751,7 +827,7 @@ TEST_CASE("an equality-only pure-filter column past the prefix is dropped with i
   request.columns[2].equals_any     = {key_string(5)};
   request.ranges_cover_whole_filter = true;
   request.output_prefix_width       = kOutputWidth;
-  auto const decoded                = decompress_with(ct, std::move(request), stream);
+  auto const decoded                = decompress_with(environment, ct, std::move(request), stream);
 
   CHECK(decoded.outcome.row_filtered);
   CHECK(decoded.outcome.filter_only_columns_dropped);

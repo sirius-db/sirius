@@ -148,7 +148,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     }
     return materialize_as_ast_column(result.release_column());
   }
-  auto const output_type = sirius::get_cudf_type(alt.return_type());
+  auto const output_type = sirius::require_cudf_type(alt.return_type());
 
   //----------Numeric Binary Functions----------//
   auto execute_numeric_binary_func = [&](cudf::binary_operator op) -> evaluate_result {

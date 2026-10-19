@@ -300,7 +300,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
       // type. E.g., `extract(year from col)` from libcudf returns int16_t but the SQL type is
       // int64_t. Only use cudf::cast when both types are fixed-width (cast does not support
       // STRING/LIST/STRUCT).
-      auto const cudf_return_type = sirius::get_cudf_type(expr.return_type());
+      auto const cudf_return_type = sirius::require_cudf_type(expr.return_type());
       std::unique_ptr<cudf::column> result_column;
       if (result.is_scalar()) {
         result_column =
@@ -369,7 +369,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select(
       "all-columns select() overload for count(*)-style filters with no output columns");
   }
   auto mask = compute_mask(input);
-  return ApplyRetentionMask(
+  return sirius::apply_retention_mask(
     input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
 }
 
@@ -385,7 +385,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
   // ONE mask, used twice: the survivors must be exactly the rows the output
   // holds, so computing the predicate a second time would risk two answers.
   auto mask     = compute_mask(input);
-  auto selected = ApplyRetentionMask(
+  auto selected = sirius::apply_retention_mask(
     input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
 
   auto const rows = input.num_rows();
@@ -395,7 +395,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
                                   _stream,
                                   _mr);
   auto surviving =
-    ApplyRetentionMask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
+    sirius::apply_retention_mask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
   survivors = std::make_unique<cudf::column>(surviving->get_column(0), _stream, _mr);
   return selected;
 }
@@ -403,7 +403,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
 std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
 {
   auto mask = compute_mask(input);
-  return ApplyRetentionMask(input, mask->view(), _stream, _mr);
+  return sirius::apply_retention_mask(input, mask->view(), _stream, _mr);
 }
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::aggregate const& /*expr*/,

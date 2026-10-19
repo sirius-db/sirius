@@ -254,7 +254,7 @@ std::unique_ptr<cudf::table> apply_cascade(cudf::table_view const& input,
 
   auto compact = [&](std::unique_ptr<cudf::column> mask) {
     if (!mask) { return false; }
-    table   = sirius::ApplyRetentionMask(current, mask->view(), stream, mr);
+    table   = sirius::apply_retention_mask(current, mask->view(), stream, mr);
     current = table->view();
     return true;
   };
@@ -299,7 +299,7 @@ std::unique_ptr<cudf::column> compact_one(cudf::column_view const& source,
                                           rmm::device_async_resource_ref mr)
 {
   auto columns =
-    sirius::ApplyRetentionMask(cudf::table_view({source}), mask, stream, mr)->release();
+    sirius::apply_retention_mask(cudf::table_view({source}), mask, stream, mr)->release();
   assert(columns.size() == 1);
   return std::move(columns.front());
 }
@@ -389,7 +389,7 @@ std::unique_ptr<cudf::table> apply_deferred_keys(cudf::table_view const& input,
     auto const keep_key =
       step_index + 1 == steps.size() || steps[step_index + 1].column_index == step.column_index;
     if (keep_key) {
-      auto columns = sirius::ApplyRetentionMask(
+      auto columns = sirius::apply_retention_mask(
                        cudf::table_view({probe, state.row_ids->view()}), mask->view(), stream, mr)
                        ->release();
       assert(columns.size() == 2);
@@ -438,7 +438,7 @@ std::unique_ptr<cudf::table> apply_gather_once(cudf::table_view const& input,
   }
 
   if (!accumulated_mask) { return nullptr; }
-  return sirius::ApplyRetentionMask(input, accumulated_mask->view(), stream, mr);
+  return sirius::apply_retention_mask(input, accumulated_mask->view(), stream, mr);
 }
 
 }  // namespace

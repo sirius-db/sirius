@@ -321,6 +321,43 @@ int main()
     }
 
     {
+      // A fused region whose tail-routed channels feed one bitjoin with no declared output. The
+      // bitjoin's packed leaf is its own rep, so binding each channel decodes the bitjoin; every
+      // slot must bind the field it consumes, not the bitjoin's first input.
+      auto t = make_int32_table(1, 65536, 10);
+      for (auto const* joined : {"bitpack.chunk_bits_7:0, bitpack.chunk_count_31:0",
+                                 "bitpack.chunk_count_31:0, bitpack.chunk_bits_7:0"}) {
+        std::string const dsl =
+          std::string{
+            "input -> bitpack -> chunk_min, chunk_count, "
+            "chunk_bits, packed\n"} +
+          joined + " -> bitjoin_u64\n";
+        roundtrip_once(t->view(), dsl, 1, "fused_slots_into_bitjoin");
+      }
+      roundtrip_once(t->view(),
+                     "input -> for -> deltas, references\n"
+                     "for.deltas -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+                     "for.references_31:0, for.deltas.chunk_min_31:0 -> bitjoin_u64\n",
+                     1,
+                     "nested_fused_slots_into_bitjoin");
+    }
+
+    {
+      // The bitjoin's first input is an output of a non-codegen node, which takes that value over
+      // for its rebuilt representation; the delta region under the node's later output then binds
+      // its routed channel from the same bitjoin. Binding looks the channel up in the memo, so it
+      // does not depend on the first input still being there.
+      auto t = make_f32_table(1, 4096, 12);
+      roundtrip_once(t->view(),
+                     "input -> bitextract_f32 -> sign, exponent, mantissa\n"
+                     "bitextract_f32.mantissa -> delta -> differences\n"
+                     "bitextract_f32.sign_0:0, bitextract_f32.mantissa.differences_31:0 "
+                     "-> bitjoin_u64\n",
+                     1,
+                     "fused_slot_after_consumed_bitjoin_input");
+    }
+
+    {
       // Corrupt the structural metadata (drop two of the bitjoin's three inputs)
       // so decode is asked to reconstruct from an inconsistent tree. This must
       // be a loud error, never an implicit/partial decode of a wrong column.
@@ -954,7 +991,7 @@ int main()
 
     {
       // Nullable decomposed dictionary WITH the null_mask channel routed:
-      // validity must survive the from_outputs rebuild.
+      // validity must survive the channel-based rebuild.
       auto stream             = cudf::get_default_stream();
       std::vector<bool> valid = {true, false, true, true};
       auto tn                 = make_strings_table({"apple", "", "cherry", "apple"}, valid, stream);
