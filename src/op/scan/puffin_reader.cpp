@@ -494,6 +494,9 @@ bool read_puffin_bytes(puffin_byte_source& source,
     throw;
   } catch (io::object_changed_error const&) {
     throw;
+  } catch (std::bad_alloc const&) {
+    // Allocation failures are resource failures, not reader I/O failures.
+    throw;
   } catch (std::system_error const& error) {
     if (error.code() == std::errc::operation_canceled) throw;
     throw sirius::transparent::classified_execution_error(

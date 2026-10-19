@@ -143,6 +143,7 @@ for variant, names in (
     ("dv_corrupt_crc", ("a",)),
     ("dv_missing_payload", ("a",)),
     ("dv_unsupported_uri", ("a",)),
+    ("dv_unused_unsupported_uri", ("a",)),
 ):
     dest = out / variant
     (dest / "metadata").mkdir(parents=True, exist_ok=True)
@@ -169,6 +170,7 @@ for variant, names in (
                 row["added_rows_count"] *= len(names)
         else:
             expanded = []
+            unused = None
             for original in rows:
                 for name in names:
                     row = copy.deepcopy(original)
@@ -186,6 +188,8 @@ for variant, names in (
                         df["file_path"] = str(data)
                         df["file_size_in_bytes"] = data.stat().st_size
                     else:
+                        if variant == "dv_unused_unsupported_uri":
+                            unused = copy.deepcopy(row)
                         sidecar = dest / "data" / (name + ".puffin")
                         footer = copy.deepcopy(source_footer)
                         footer["blobs"][0]["properties"]["referenced-data-file"] = str(
@@ -218,6 +222,14 @@ for variant, names in (
                             )
                     expanded.append(row)
             rows = expanded
+            if unused is not None:
+                unused["data_file"][
+                    "file_path"
+                ] = "http://unsupported-puffin.invalid/unused-sidecar.puffin"
+                unused["data_file"]["referenced_data_file"] = str(
+                    dest / "data" / "unselected.parquet"
+                )
+                rows.append(unused)
         write(dest / "metadata" / path.name, schema, metadata, rows)
     for path in (dest / "metadata").glob("snap-*.avro"):
         schema, metadata, rows = read(path)

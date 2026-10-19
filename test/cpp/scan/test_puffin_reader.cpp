@@ -38,6 +38,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -166,6 +167,23 @@ class throwing_puffin_source final : public puffin_byte_source {
   {
     throw std::runtime_error("injected footer read failure");
   }
+  [[nodiscard]] std::streamoff size() const override { return size_; }
+
+ private:
+  std::streamoff size_;
+  std::streamoff offset_ = 0;
+};
+
+class bad_alloc_puffin_source final : public puffin_byte_source {
+ public:
+  explicit bad_alloc_puffin_source(std::streamoff size) : size_(size) {}
+  bool seek(std::streamoff offset) override
+  {
+    if (offset < 0 || offset > size_) return false;
+    offset_ = offset;
+    return true;
+  }
+  bool read(std::span<std::byte>) override { throw std::bad_alloc{}; }
   [[nodiscard]] std::streamoff size() const override { return size_; }
 
  private:
@@ -797,6 +815,17 @@ TEST_CASE("Charged Puffin classifies thrown magic reads as reader I/O",
     CHECK(failure.cause == sirius::transparent::late_failure_cause::reader_io);
     CHECK(std::string(failure.what()).find("injected footer read failure") != std::string::npos);
   }
+}
+
+TEST_CASE("Charged Puffin preserves allocation failures from magic reads",
+          "[scan_preparation][iceberg][charged_reader][failure]")
+{
+  auto const ref = fixture_ref();
+  std::error_code error;
+  auto const size = fs::file_size(ref.puffin_path, error);
+  REQUIRE_FALSE(error);
+  bad_alloc_puffin_source source(static_cast<std::streamoff>(size));
+  CHECK_THROWS_AS(read_for_test(ref, true, &source), std::bad_alloc);
 }
 
 TEST_CASE("Charged Puffin reports a short footer magic read as missing magic",

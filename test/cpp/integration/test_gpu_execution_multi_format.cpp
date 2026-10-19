@@ -4145,6 +4145,18 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Unsupported remote Puffin for an unselected data file is ignored",
+                 "[integration][scan_preparation][iceberg][planning]")
+{
+  auto table = inventory_fixture("dv_unused_unsupported_uri");
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table));
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "Preparation routes preserve rows and delete payload loading",
                  "[integration][scan_preparation][iceberg][route_parity]")
 {

@@ -996,8 +996,7 @@ gpu_ingestible::metadata_scan_task_t parquet_gpu_ingestible::next_split_provider
       throw;
     } catch (io::descriptor_mismatch_error const& error) {
       if (_info->profiles && _info->profiles->counters) {
-        _info->profiles->counters->iceberg_delete_descriptor_mismatches.fetch_add(
-          1, std::memory_order_relaxed);
+        _info->profiles->counters->descriptor_mismatches.fetch_add(1, std::memory_order_relaxed);
       }
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
@@ -1109,6 +1108,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   } catch (std::bad_alloc const&) {
     throw;
   } catch (std::logic_error const&) {
+    throw;
+  } catch (io::object_changed_error const&) {
+    // Preserve the typed identity failure for the outer task handler.
     throw;
   } catch (std::exception const& error) {
     if (_info->physical_schema && !_info->physical_schema->fields.empty()) {

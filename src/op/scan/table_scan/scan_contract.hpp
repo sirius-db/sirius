@@ -215,7 +215,7 @@ struct physical_check_counters {
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
   std::atomic<uint64_t> iceberg_delete_reader_io_failures{0};
   std::atomic<uint64_t> iceberg_delete_identity_failures{0};
-  std::atomic<uint64_t> iceberg_delete_descriptor_mismatches{0};
+  std::atomic<uint64_t> descriptor_mismatches{0};
   std::atomic<uint64_t> iceberg_delete_corrupt_inputs{0};
   std::atomic<uint64_t> iceberg_inventory_bytes_peak{0};
 

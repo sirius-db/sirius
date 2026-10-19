@@ -139,6 +139,27 @@ std::vector<std::string> resolve_parquet_scan_file_paths(
 namespace {
 std::atomic<uint64_t> next_standalone_plan_generation{1};
 
+std::string_view bare_path(std::string_view path)
+{
+  return path.starts_with("file://") ? path.substr(7) : path;
+}
+
+bool descriptor_targets_selected_file(sirius::op::scan::IcebergDeleteFileEntry const& descriptor,
+                                      std::vector<std::string> const& selected_paths)
+{
+  auto const target = bare_path(descriptor.referenced_data_file);
+  for (auto const& selected : selected_paths) {
+    auto const path = bare_path(selected);
+    if (target == path) return true;
+    auto const longer  = target.size() >= path.size() ? target : path;
+    auto const shorter = target.size() >= path.size() ? path : target;
+    if (!shorter.empty() && longer.ends_with(shorter) && longer.size() > shorter.size() &&
+        longer[longer.size() - shorter.size() - 1] == '/')
+      return true;
+  }
+  return false;
+}
+
 uint64_t reserve_standalone_plan_generation()
 {
   auto const generation = next_standalone_plan_generation.fetch_add(1, std::memory_order_relaxed);
@@ -482,8 +503,15 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
   bool qualified = true;
   for (auto const& c : scans) {
     if (c.discovery->positional_delete_files.empty()) validate_deletion_vector_claims(*c.discovery);
+    // The manifest can carry descriptors for data files pruned from this scan.  Keep only the
+    // descriptors that belong to the final file list so unsupported sidecars cannot reject or
+    // later get opened by an otherwise valid plan.
+    auto& descriptors = c.discovery->deletion_vector_entries;
+    std::erase_if(descriptors, [&](auto const& dv) {
+      return !descriptor_targets_selected_file(dv, c.info->resolved_file_paths);
+    });
     uint64_t total = 0;
-    for (auto const& dv : c.discovery->deletion_vector_entries) {
+    for (auto const& dv : descriptors) {
       inspect_remote_puffin(c.scan->contract_id, dv);
       if (dv.record_count < 0 ||
           static_cast<uint64_t>(dv.record_count) > std::numeric_limits<uint64_t>::max() - total) {
