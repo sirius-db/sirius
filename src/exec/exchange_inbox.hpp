@@ -79,6 +79,10 @@ class exchange_inbox {
   /// @throws sirius::invalid_input_exception on a token that holds no received batch.
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> take_batch(std::uint64_t token);
 
+  /// The batch @p token holds, left in place for its receiver.
+  /// @throws sirius::invalid_input_exception on a token that holds no received batch.
+  [[nodiscard]] std::shared_ptr<cucascade::data_batch> peek_batch(std::uint64_t token) const;
+
   /// Frees what @p token holds; an unknown or consumed token is ignored.
   void release(std::uint64_t token);
 

@@ -20,12 +20,9 @@
 
 #include <cucascade/data/data_repository.hpp>
 
-#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <vector>
 
 namespace sirius::data {
 class data_repository_manager_registry;
@@ -63,17 +60,14 @@ class exchange_staging {
   explicit exchange_staging(sirius::data::data_repository_manager_registry& registry,
                             query_lifecycle_registry* lifecycle = nullptr);
 
-  /// Exposes @p repository to the downgrade executor until it is destroyed.
-  void track(std::shared_ptr<cucascade::shared_data_repository> const& repository);
-
-  /// Repositories currently tracked and still alive.
-  [[nodiscard]] std::size_t tracked() const;
+  /// Exposes @p repository to the downgrade executor until it is destroyed. The sweep walks the
+  /// view back to front, so a @p spill_first repository is listed after every other one.
+  void track(std::shared_ptr<cucascade::shared_data_repository> const& repository,
+             bool spill_first = false);
 
  private:
-  struct targets {
-    mutable std::mutex mutex;
-    std::vector<std::weak_ptr<cucascade::shared_data_repository>> repositories;
-  };
+  struct targets;
+  class forwarding_repository;
   std::shared_ptr<targets> _targets;
 };
 

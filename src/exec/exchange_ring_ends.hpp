@@ -81,6 +81,10 @@ class ring_exchange {
     std::size_t frame_bytes = std::size_t{64} << 20;
     std::size_t send_bytes  = std::size_t{1} << 30;
     std::size_t recv_bytes  = std::size_t{3} << 29;
+    /// Give a landing's charge to the GPU or host budget back once a spill moves it off that
+    /// tier, not only when its receiver takes it. The freed budget lands more batches on the
+    /// GPU, which spill in turn: at SF10000 q09 that churn cost more than it saved.
+    bool return_spilled = false;
   };
 
   /// Allocates both rings on @p device. Call before the engine's pool is built, so the rings are
@@ -213,6 +217,7 @@ class ring_exchange {
   bool _closed{false};
   /// Bytes landed per tier and not yet taken; shared with the exchange inbox's on_gone callbacks.
   std::shared_ptr<held> _held;
+  bool _return_spilled;
 
   mutable std::mutex _mutex;
   std::uint64_t _next{1};

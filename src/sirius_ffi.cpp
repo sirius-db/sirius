@@ -62,6 +62,8 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string_view>
+#include <utility>
 
 namespace sirius::ffi {
 
@@ -282,7 +284,10 @@ struct Context::Impl {
       opts.frame_bytes = ring_options->frame_bytes;
       opts.send_bytes  = ring_options->send_bytes;
       opts.recv_bytes  = ring_options->recv_bytes;
-      ring             = std::make_shared<sirius::exec::ring_exchange>(device, opts);
+      if (auto const* value = std::getenv("SIRIUS_CN_RING_RETURN_SPILLED")) {
+        opts.return_spilled = std::string_view{value} == "1";
+      }
+      ring = std::make_shared<sirius::exec::ring_exchange>(device, opts);
     }
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);

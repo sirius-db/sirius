@@ -193,13 +193,11 @@ TEST_CASE("exchange_staging lists tracked repositories until they are gone", "[e
   auto const id   = batch->get_batch_id();
   repository->add_data_batch(batch);
   staging.track(repository);
-  CHECK(staging.tracked() == 1);
   CHECK(view->get_batch_ids() == std::vector<std::uint64_t>{id});
   CHECK(view->get_data_batch_by_id(id) == batch);
   CHECK(view->pop_next_data_batch() == nullptr);  // the view owns nothing
 
   repository.reset();
-  CHECK(staging.tracked() == 0);
   CHECK(view->get_batch_ids().empty());
 }
 
@@ -239,4 +237,23 @@ TEST_CASE("exchange_inbox brings a spilled batch back to the GPU", "[exchange_in
   CHECK(sirius::get_cudf_table_view(batch->to_read_only()).num_rows() == rows);
   exchange.bring_to_gpu(*batch);  // already on the GPU: left as it is
   exchange.close();
+}
+
+TEST_CASE("exchange_staging lists a spill-first repository last", "[exchange_inbox]")
+{
+  sirius::data::data_repository_manager_registry registry;
+  exchange_staging staging(registry);
+  memory_space gpu(gpu_config());
+  auto const landed  = std::make_shared<cucascade::shared_data_repository>();
+  auto const running = std::make_shared<cucascade::shared_data_repository>();
+  auto const first   = int64_batch(gpu);
+  auto const second  = int64_batch(gpu);
+  landed->add_data_batch(first);
+  running->add_data_batch(second);
+  // Tracked first, listed last: the downgrade sweep walks back to front.
+  staging.track(landed, /*spill_first=*/true);
+  staging.track(running);
+  auto const ids =
+    registry.get(exchange_staging::query_id)->get_repositories().front()->get_batch_ids();
+  CHECK(ids == std::vector<std::uint64_t>{second->get_batch_id(), first->get_batch_id()});
 }
