@@ -23,6 +23,7 @@
 #include <cudf/table/table.hpp>
 
 #include <catch.hpp>
+#include <op/aggregate/aggregate_op_util.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
 
 #include <algorithm>
@@ -199,4 +200,67 @@ TEMPLATE_TEST_CASE(
     expected_table->view(),
     true);
   REQUIRE(tables_match);
+}
+
+TEMPLATE_TEST_CASE(
+  "sirius_physical_grouped_aggregate any_value over a column functionally dependent on the key",
+  "[physical_grouped_aggregate][any_value]",
+  int32_t,
+  int64_t,
+  double,
+  decimal64_tag,
+  string_tag,
+  date32_tag)
+{
+  using Traits = gpu_type_traits<TestType>;
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+
+  auto mr                = get_resource_ref(*space);
+  auto stream            = default_stream();
+  std::size_t num_groups = 500;
+
+  // Input: [key, value]; expected: [key, min(value), max(value), count(value)].
+  auto [input_table, expected_table] =
+    sirius::test::make_test_data_for_grouped_aggregate<Traits>(num_groups, 1, stream, mr);
+
+  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(
+    std::move(input_table), *space, stream, sirius::telemetry::batch_telemetry_info{});
+
+  // GROUP BY key; any_value(key) has exactly one valid answer per group, the key itself.
+  auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
+    {0}, {"any_value", "max", "count"}, {0, 1, 1});
+
+  sirius_physical_grouped_aggregate grouped_aggregator(std::move(agg_result.output_types),
+                                                       std::move(agg_result.aggregates),
+                                                       std::move(agg_result.groups),
+                                                       num_groups);
+
+  auto outputs =
+    grouped_aggregator.execute(pipelineable_operator_data({input_batch}), default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
+
+  auto const expected_view = expected_table->view();
+  cudf::table_view const expected_any_value{{expected_view.column(0),
+                                             expected_view.column(0),
+                                             expected_view.column(2),
+                                             expected_view.column(3)}};
+  bool tables_match = sirius::test::expect_data_batch_equivalent_to_table(
+    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0],
+    expected_any_value,
+    true);
+  REQUIRE(tables_match);
+}
+
+TEST_CASE("to_cudf_aggregation_kind runs any_value as a mergeable MIN",
+          "[physical_grouped_aggregate][any_value]")
+{
+  // any_value must map to a single kind that can also merge partial results across batches and
+  // GPUs; MIN keeps a non-NULL member of the group and is NULL only for an all-NULL group.
+  REQUIRE(sirius::op::to_cudf_aggregation_kind(sirius::aggregate_id::any_value) ==
+          cudf::aggregation::Kind::MIN);
+  REQUIRE(sirius::op::to_cudf_aggregation_kind(sirius::aggregate_id::min) ==
+          cudf::aggregation::Kind::MIN);
 }

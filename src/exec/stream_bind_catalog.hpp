@@ -39,8 +39,10 @@ struct stream_input_binding {
   std::shared_ptr<cucascade::shared_data_repository> repository;
   std::set<sender_id_t> expected_senders;
 
-  /// Back-pointer into the engine-owned plan; filled during planning for session registration.
-  op::sirius_physical_streaming_source* built = nullptr;
+  /// Back-pointers into the engine-owned plan, one per plan leaf that reads this stream; filled
+  /// during planning for session registration. More than one when the stream is read through a
+  /// subtree the plan instantiates more than once (e.g. a Substrait ReferenceRel referenced twice).
+  std::vector<op::sirius_physical_streaming_source*> built;
 
   /// Reported to the optimizer as the scan's cardinality. nullopt keeps DuckDB's default of 1.
   std::optional<std::uint64_t> estimated_rows;
@@ -67,10 +69,16 @@ class stream_bind_catalog : public duckdb::ClientContextState {
   /// @throws sirius::invalid_input_exception when `id` was never declared.
   [[nodiscard]] const stream_input_binding& get(stream_id_t id) const;
 
-  /// @throws sirius::invalid_input_exception when `id` was never declared, or when it already
-  ///         has a built operator (the same declared stream read by more than one plan leaf —
-  ///         fan-out reads of a single declared stream are not supported).
-  void set_built(stream_id_t id, op::sirius_physical_streaming_source* built);
+  /// The repository the next plan leaf reading `id` drains: the declared one for the first leaf,
+  /// a fresh one for every further leaf (each leaf owns its queue; the session fans pushes out).
+  /// @throws sirius::invalid_input_exception when `id` was never declared.
+  [[nodiscard]] std::shared_ptr<cucascade::shared_data_repository> repository_for_next_leaf(
+    stream_id_t id) const;
+
+  /// Record one more plan leaf reading `id`.
+  /// @throws sirius::invalid_input_exception when `id` was never declared, `built` is null, or
+  ///         `built` is already recorded.
+  void add_built(stream_id_t id, op::sirius_physical_streaming_source* built);
 
   [[nodiscard]] std::vector<stream_id_t> declared_streams() const;
 

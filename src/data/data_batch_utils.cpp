@@ -18,11 +18,15 @@
 
 #include "compression/compressed_representation.hpp"
 
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/column_metadata.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
+#include <optional>
 #include <vector>
 
 namespace sirius {
@@ -70,6 +74,30 @@ batch_rows_and_bytes get_batch_rows_and_bytes(cucascade::data_batch const& batch
   if (data == nullptr) { return {}; }
   return {.rows  = representation_num_rows(*data),
           .bytes = data->get_uncompressed_data_size_in_bytes()};
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> clone_for_fanout(
+  const cucascade::read_only_data_batch& batch,
+  ::cuda::stream_ref stream,
+  std::span<const telemetry::batch_telemetry_info> telemetry)
+{
+  std::vector<std::shared_ptr<cucascade::data_batch>> copies;
+  copies.reserve(telemetry.size());
+  if (telemetry.empty()) { return copies; }
+
+  auto* space = batch.get_memory_space();
+  std::optional<rmm::cuda_set_device_raii> device_guard;
+  if (space != nullptr && space->get_tier() == cucascade::memory::Tier::GPU) {
+    device_guard.emplace(rmm::cuda_device_id{space->get_device_id()});
+  }
+  for (const auto& info : telemetry) {
+    const auto clone_batch_id = get_next_batch_id();
+    copies.push_back(batch.clone(
+      clone_batch_id, stream, telemetry::quent_data_batch_probe::create(info, clone_batch_id)));
+  }
+  // Destinations read on their own streams; the copies must be complete before any reads them.
+  stream.sync();
+  return copies;
 }
 
 }  // namespace sirius

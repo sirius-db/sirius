@@ -762,7 +762,7 @@ TEST_CASE("Transparent stream planning preserves errors when fallback is disable
         sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
         std::make_shared<cucascade::shared_data_repository>(),
         {0},
-        nullptr});
+        {}});
     auto result = con.Query("SELECT row_number() OVER () FROM sirius_stream_source(0)");
     REQUIRE(result);
     REQUIRE(result->HasError());

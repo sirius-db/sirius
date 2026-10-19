@@ -16,20 +16,92 @@
 
 #include "exec/stream_session.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/data_batch_probe.hpp"
 
+#include <cudf/utilities/default_stream.hpp>
+
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+
+#include <algorithm>
+#include <cstddef>
+#include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <utility>
 
 namespace sirius::exec {
 
+namespace {
+
+/// Fan-out copies of a GPU batch, made on a stream from @p space's pool under a reservation for
+/// all of them, so the copies are admitted like any other allocation and do not serialize against
+/// every pipeline stream as the legacy default stream would.
+std::vector<std::shared_ptr<cucascade::data_batch>> clone_on_reserved_stream(
+  const cucascade::read_only_data_batch& batch,
+  cucascade::memory::memory_space& space,
+  std::span<const telemetry::batch_telemetry_info> copy_telemetry)
+{
+  const auto* data = batch.get_data();
+  const std::size_t bytes =
+    (data == nullptr ? 0 : data->get_size_in_bytes()) * copy_telemetry.size();
+
+  // The pool is shared, and a stream already carrying another caller's reservation refuses a
+  // second one; move on to the next stream in that case.
+  constexpr int kMaxStreamAttempts = 16;
+  for (int attempt = 0; attempt < kMaxStreamAttempts; ++attempt) {
+    const auto stream = space.acquire_stream();
+    auto reservation  = space.make_reservation(std::max<std::size_t>(bytes, 1));
+    auto* allocator   = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+    if (allocator == nullptr) {
+      throw sirius::internal_exception(
+        "stream_session: GPU memory space has no reservation-aware allocator");
+    }
+    if (!allocator->attach_reservation_to_tracker(stream, std::move(reservation))) { continue; }
+    try {
+      auto copies = clone_for_fanout(batch, stream, copy_telemetry);
+      allocator->reset_stream_reservation(stream);
+      return copies;
+    } catch (...) {
+      allocator->reset_stream_reservation(stream);
+      throw;
+    }
+  }
+  throw sirius::internal_exception(
+    "stream_session: no pooled stream accepted the fan-out reservation");
+}
+
+}  // namespace
+
 void stream_session::add_source(stream_id_t id, op::sirius_physical_streaming_source& source)
 {
-  if (!_sources.emplace(id, &source).second) {
+  add_sources(id, {&source});
+}
+
+void stream_session::add_sources(stream_id_t id,
+                                 const std::vector<op::sirius_physical_streaming_source*>& sources)
+{
+  if (_sources.find(id) != _sources.end()) {
     throw sirius::invalid_input_exception("stream_session: input stream " + std::to_string(id) +
                                           " is already registered");
   }
+  if (sources.empty()) {
+    throw sirius::invalid_input_exception("stream_session: input stream " + std::to_string(id) +
+                                          " has no source");
+  }
+  std::set<op::sirius_physical_streaming_source*> seen;
+  for (auto* source : sources) {
+    if (source == nullptr || !seen.insert(source).second) {
+      throw sirius::invalid_input_exception("stream_session: input stream " + std::to_string(id) +
+                                            " lists a null or repeated source");
+    }
+  }
+  _sources.emplace(id, sources);
 }
 
 void stream_session::add_sink(std::vector<stream_id_t> ids,
@@ -82,14 +154,15 @@ std::vector<stream_id_t> stream_session::output_streams() const
   return ids;
 }
 
-op::sirius_physical_streaming_source& stream_session::resolve_source(stream_id_t id) const
+const std::vector<op::sirius_physical_streaming_source*>& stream_session::resolve_sources(
+  stream_id_t id) const
 {
   auto it = _sources.find(id);
   if (it == _sources.end()) {
     throw sirius::invalid_input_exception("stream_session: no input stream with id " +
                                           std::to_string(id));
   }
-  return *it->second;
+  return it->second;
 }
 
 const stream_session::sink_output& stream_session::resolve_sink(stream_id_t id) const
@@ -104,17 +177,56 @@ const stream_session::sink_output& stream_session::resolve_sink(stream_id_t id) 
 
 bool stream_session::push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch)
 {
-  return resolve_source(id).push(std::move(batch));
+  const auto& sources = resolve_sources(id);
+  if (sources.size() == 1) { return sources.front()->push(std::move(batch)); }
+
+  // Fan-out: leaves 1..N-1 each get an independent deep copy in the batch's current memory space
+  // (as a broadcast sink does), made before leaf 0 receives the original handle so its pipeline
+  // cannot touch the batch while the copies are read.
+  std::vector<std::shared_ptr<cucascade::data_batch>> copies;
+  if (batch != nullptr) {
+    std::vector<telemetry::batch_telemetry_info> copy_telemetry;
+    copy_telemetry.reserve(sources.size() - 1);
+    for (std::size_t i = 1; i < sources.size(); ++i) {
+      copy_telemetry.push_back(sources[i]->batch_telemetry());
+    }
+    auto read_only = batch->to_read_only();
+    auto* space    = read_only.get_memory_space();
+    if (space == nullptr || space->get_tier() != cucascade::memory::Tier::GPU) {
+      // Off-GPU copies allocate no device memory; the stream only orders the copy.
+      copies = clone_for_fanout(read_only, cudf::get_default_stream(), copy_telemetry);
+    } else {
+      copies = clone_on_reserved_stream(read_only, *space, copy_telemetry);
+    }
+  }
+  bool accepted = true;
+  for (std::size_t i = 1; i < sources.size(); ++i) {
+    accepted = sources[i]->push(batch != nullptr ? std::move(copies[i - 1]) : nullptr) && accepted;
+  }
+  return sources.front()->push(std::move(batch)) && accepted;
 }
 
 void stream_session::close_input(stream_id_t id, sender_id_t sender)
 {
-  resolve_source(id).close_input(sender);
+  for (auto* source : resolve_sources(id)) {
+    source->close_input(sender);
+  }
 }
 
 bool stream_session::input_closed(stream_id_t id) const
 {
-  return resolve_source(id).stream().terminal();
+  const auto& sources = resolve_sources(id);
+  return std::all_of(
+    sources.begin(), sources.end(), [](auto* source) { return source->stream().terminal(); });
+}
+
+bool stream_session::input_sender_closed(stream_id_t id, sender_id_t sender) const
+{
+  const auto& sources = resolve_sources(id);
+  return std::all_of(sources.begin(), sources.end(), [&](auto* source) {
+    const auto& stream = source->stream();
+    return stream.terminal() || stream.sender_closed(sender);
+  });
 }
 
 std::optional<std::shared_ptr<cucascade::data_batch>> stream_session::pull(stream_id_t id)
