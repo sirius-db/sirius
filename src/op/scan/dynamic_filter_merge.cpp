@@ -20,7 +20,6 @@
 #include <cudf/filling.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
-#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_uvector.hpp>
 #include <rmm/error.hpp>
@@ -40,7 +39,6 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <concepts>
 #include <cstddef>
 #include <exception>
 #include <functional>
@@ -48,7 +46,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <thread>

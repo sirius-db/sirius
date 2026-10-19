@@ -16,7 +16,6 @@
 
 #include "transparent/read_view_registry.hpp"
 
-#include "io/sirius_datasource.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"

@@ -19,7 +19,6 @@
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/settings.hpp"
-#include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
 #include "sirius_context.hpp"

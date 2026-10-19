@@ -17,7 +17,7 @@
 #include "sirius_config.hpp"
 
 #include <sirius/context/config_builder.hpp>
-#include <yaml-cpp/yaml.h>
+#include <yaml-cpp/yaml.h>  // IWYU pragma: keep
 
 #include <fstream>
 #include <utility>

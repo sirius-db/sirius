@@ -18,7 +18,6 @@
 
 #include "decompression_pushdown_policy.hpp"
 
-#include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -28,13 +27,11 @@
 #include <codegen/util/stream_pool.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
-#include <log/logging.hpp>
 #include <sirius/exception.hpp>
 
 #include <algorithm>
 #include <array>
 #include <limits>
-#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>

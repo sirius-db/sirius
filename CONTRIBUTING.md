@@ -57,6 +57,18 @@ pre-commit run -a
 Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `codespell`, and
 `rumdl` (Markdown links and anchors).
 
+CI checks configured C/C++ sources under `src/` for unused includes
+after the Linux Clang debug build. Run the same check locally after building:
+
+```bash
+pixi run --locked run-clang-tidy -p build/clang-debug -j 4 \
+  -checks='-*,misc-include-cleaner' "$PWD/src/.*[.](c|cc|cpp|cxx)$"
+```
+
+Unused-include findings and parsing errors fail the check. CUDA translation units
+and third-party sources are excluded. Public re-exports can be declared using Clang's
+`IWYU pragma: export` and `IWYU pragma: begin_exports` / `end_exports` annotations.
+
 ## Submodules
 
 The `duckdb/` and `sirius-duckdb/vcpkg/` directories are third-party submodules. Their `CONTRIBUTING.md` files apply to contributing to those upstream projects, not to Sirius. Do not modify submodule contents directly.

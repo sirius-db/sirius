@@ -24,7 +24,6 @@
 #include <array>
 #include <cctype>
 #include <chrono>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>

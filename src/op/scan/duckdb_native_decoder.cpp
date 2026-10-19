@@ -33,12 +33,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/null_mask.hpp>
-#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table.hpp>
-#include <cudf/utilities/error.hpp>
-#include <cudf/utilities/span.hpp>
-#include <cudf/utilities/traits.hpp>
-#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
@@ -50,11 +45,9 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
-#include <duckdb/common/types/vector.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/storage/block_manager.hpp>
-#include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/buffer_manager.hpp>
 #include <duckdb/storage/compression/roaring/roaring.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
@@ -68,7 +61,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <future>
 #include <optional>
 #include <span>
 #include <stdexcept>

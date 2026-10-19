@@ -40,7 +40,6 @@
 #include "codegen/jit/render_util.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>

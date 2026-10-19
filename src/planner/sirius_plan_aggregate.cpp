@@ -41,7 +41,6 @@
 #include "planner/decimal_sum_input_bounds.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
-#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
 #include <algorithm>

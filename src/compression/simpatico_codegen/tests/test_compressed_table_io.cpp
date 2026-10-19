@@ -8,7 +8,6 @@
 
 #include "api/compressed_table_io.hpp"
 #include "api/simpatico_codegen.hpp"
-#include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/plan/leaf_desc.hpp"
 #include "test_utils.hpp"
 

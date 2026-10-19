@@ -185,6 +185,26 @@ jobs:
           grep -E '(FAILED:|: error:|: fatal error:)' /tmp/build.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Check unused C/C++ includes
+        id: includes
+        if: >-
+          matrix.build.arch == 'x64' && matrix.build.compiler == 'clang'
+          && matrix.build.build-type == 'debug' && matrix.build.environment == 'default'
+          && matrix.build.cudf-channel == 'stable'
+        run: |
+          set -o pipefail
+          pixi run --locked run-clang-tidy -p build/clang-debug -j 4 \
+            -checks='-*,misc-include-cleaner' \
+            "$PWD/src/.*[.](c|cc|cpp|cxx)$" 2>&1 | tee /tmp/includes.log
+
+      - name: Surface include errors
+        if: failure() && steps.includes.outcome == 'failure'
+        run: |
+          echo '## Include check errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -100 /tmp/includes.log >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Check the pinned DuckDB revisions
         run: |
           engine=$(git rev-parse HEAD:duckdb)

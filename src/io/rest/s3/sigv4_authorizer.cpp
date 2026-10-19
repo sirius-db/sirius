@@ -22,7 +22,6 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
-#include <stdexcept>
 #include <utility>
 
 namespace sirius::io::rest::s3 {

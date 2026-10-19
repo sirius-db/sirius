@@ -29,7 +29,6 @@
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/execution/execution_context.hpp>
@@ -37,7 +36,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <unordered_map>

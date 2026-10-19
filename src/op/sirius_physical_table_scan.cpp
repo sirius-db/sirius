@@ -20,14 +20,13 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "log/logging.hpp"
-#include "op/scan/iceberg_gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"  // IWYU pragma: keep
 #include "op/scan/scan_utils.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/cudf_utils.hpp>
-#include <cudf/table/table.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>

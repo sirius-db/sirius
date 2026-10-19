@@ -18,8 +18,6 @@
 
 #include "telemetry/telemetry_context.hpp"
 
-#include <cstdlib>
-
 namespace sirius::planner {
 
 query::query(std::vector<std::shared_ptr<pipeline::sirius_pipeline>> pipelines,

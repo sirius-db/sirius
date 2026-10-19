@@ -28,8 +28,6 @@
 #include <duckdb/function/compression_function.hpp>
 #include <duckdb/function/partition_stats.hpp>
 #include <duckdb/main/attached_database.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include <duckdb/planner/expression_iterator.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/planner/table_filter_set.hpp>
@@ -46,7 +44,6 @@
 #include <duckdb/storage/table/row_group_segment_tree.hpp>
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
-#include <duckdb/storage/table_storage_info.hpp>
 #include <scan_manager/pinned_chunk_stats.hpp>
 
 #include <algorithm>

@@ -31,7 +31,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <stdexcept>
 #include <vector>
 
 using sirius::codegen::build_chunk_row_set;

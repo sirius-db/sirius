@@ -16,8 +16,6 @@
 
 #include "config.hpp"
 
-#include "log/logging.hpp"
-
 namespace duckdb {
 
 uint64_t Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 512ULL * 1024 * 1024;  ///< 50 MB

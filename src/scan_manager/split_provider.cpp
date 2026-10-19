@@ -17,7 +17,7 @@
 #include "scan_manager/split_provider.hpp"
 
 #include "exec/completion_controller.hpp"
-#include "exec/scoped_dispatcher.hpp"
+#include "exec/scoped_dispatcher.hpp"  // IWYU pragma: keep
 #include "exec/try.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 

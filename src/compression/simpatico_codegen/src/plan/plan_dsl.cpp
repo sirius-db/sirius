@@ -3,9 +3,7 @@
 
 #include "codegen/plan/bit_spec.hpp"           // bitextract_canonical_name, canonicalize_path
 #include "codegen/plan/operator_registry.hpp"  // op_id_from_name, canonical_channels
-#include "codegen/plan/representation.hpp"
 
-#include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <optional>

@@ -23,8 +23,6 @@
 
 #include <cudf/column/column_factories.hpp>
 
-#include <rmm/mr/per_device_resource.hpp>
-
 #include <cuda_runtime.h>
 
 #include <memory>

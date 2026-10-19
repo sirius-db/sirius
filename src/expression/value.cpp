@@ -21,8 +21,6 @@
 
 // duckdb
 #include <duckdb/common/types/date.hpp>
-#include <duckdb/common/types/decimal.hpp>
-#include <duckdb/common/types/hugeint.hpp>
 #include <duckdb/common/types/timestamp.hpp>
 #include <duckdb/common/types/value.hpp>
 

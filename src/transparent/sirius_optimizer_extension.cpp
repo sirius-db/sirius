@@ -21,8 +21,6 @@
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
 
-#include <duckdb/common/enums/optimizer_type.hpp>
-#include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>

@@ -15,13 +15,10 @@
  */
 
 // sirius
-#include <expression/ast/node.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
-#include <sirius/exception.hpp>
 
 // cudf
 #include <cudf/binaryop.hpp>
-#include <cudf/cudf_utils.hpp>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;

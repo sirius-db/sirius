@@ -18,12 +18,9 @@
 #include "op/scan/puffin_reader.hpp"
 #include "sirius/exception.hpp"
 
-#include <cudf/table/table.hpp>
-
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
 #include <io/io_errors.hpp>
-#include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>

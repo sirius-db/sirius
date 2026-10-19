@@ -18,7 +18,6 @@
 
 #include "compressed_representation.hpp"
 #include "compressed_scan.hpp"
-#include "device_compressed_blob.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>

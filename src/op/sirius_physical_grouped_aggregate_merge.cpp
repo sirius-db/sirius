@@ -15,9 +15,7 @@
  */
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 
-#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/stddev.hpp"
 #include "op/merge/gpu_merge_impl.hpp"

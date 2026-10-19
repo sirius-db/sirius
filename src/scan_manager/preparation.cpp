@@ -17,7 +17,6 @@
 #include "scan_manager/preparation.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "op/scan/iceberg_delete_set.hpp"
 
 namespace sirius::scan_manager {
 void preparation_gate::check_interrupted()

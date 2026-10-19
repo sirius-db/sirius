@@ -16,8 +16,6 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
-#include "config.hpp"
-#include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "telemetry/nvtx.hpp"

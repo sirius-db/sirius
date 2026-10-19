@@ -22,7 +22,6 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
-#include <cudf/copying.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>

@@ -38,7 +38,6 @@
 
 // standard library
 #include <memory>
-#include <numeric>
 #include <variant>
 
 namespace {

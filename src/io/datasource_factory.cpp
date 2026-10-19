@@ -26,8 +26,6 @@
 #include "log/logging.hpp"
 #include "scan_manager/config.hpp"
 
-#include <cudf/io/datasource.hpp>
-
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
