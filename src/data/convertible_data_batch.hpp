@@ -91,7 +91,7 @@ class convertible_data_batch : public convertible_data {
       mut_opt.emplace(_batch->to_mutable());
     } else {
       mut_opt = _batch->try_to_mutable();
-      if (!mut_opt) { return std::nullopt; }
+      if (!mut_opt) { return skip(spill_skip::lock_busy); }
     }
     auto& mut = *mut_opt;
 
@@ -99,7 +99,7 @@ class convertible_data_batch : public convertible_data {
     auto cur_space = mut.get_memory_space();
     for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
       const auto* space = target_spaces[idx];
-      if (cur_space == space) { return std::nullopt; }
+      if (cur_space == space) { return skip(spill_skip::wrong_tier); }
     }
 
     auto data_size = mut.get_data()->get_size_in_bytes();
@@ -154,8 +154,10 @@ class convertible_data_batch : public convertible_data {
       bytes_per_target[idx] = data_size;
       return bytes_per_target;
     }
-    return std::nullopt;
+    return skip(spill_skip::no_target);
   }
+
+  [[nodiscard]] std::optional<spill_skip> skipped() const noexcept override { return _skipped; }
 
   /**
    * @brief Get the size in bytes of this batch in the specified memory space.
@@ -175,7 +177,14 @@ class convertible_data_batch : public convertible_data {
   }
 
  private:
+  std::optional<std::vector<std::size_t>> skip(spill_skip why) noexcept
+  {
+    _skipped = why;
+    return std::nullopt;
+  }
+
   std::shared_ptr<cucascade::data_batch> _batch;
+  std::optional<spill_skip> _skipped;
 };
 
 /**
@@ -194,6 +203,9 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * @param repo The repository to iterate (non-owning; caller ensures lifetime).
    */
   explicit convertible_data_batch_provider(cucascade::shared_data_repository* repo) : _repo(repo) {}
+
+  /// Counts the batches the provider passes over into @p skips (not owned; null counts none).
+  void count_skips(spill_skip_counts* skips) noexcept { _skips = skips; }
 
   /**
    * @brief Get the next convertible batch matching the given memory space.
@@ -328,20 +340,34 @@ class convertible_data_batch_provider : public convertible_data_provider {
 
     // A subscribed batch is being held by a task (queued or preparing); skip it so we don't
     // downgrade data a task is about to use.
-    if (ignore_subscribed && batch->get_subscriber_count() > 0) { return nullptr; }
+    if (ignore_subscribed && batch->get_subscriber_count() > 0) {
+      if (_skips) {
+        auto ro = batch->try_to_read_only();
+        _skips->add(spill_skip::subscribed, ro ? ro->get_data()->get_size_in_bytes() : 0);
+      }
+      return nullptr;
+    }
 
-    if (batch->get_state() != cucascade::batch_state::idle) { return nullptr; }
+    if (batch->get_state() != cucascade::batch_state::idle) {
+      if (_skips) { _skips->add(spill_skip::not_idle, 0); }
+      return nullptr;
+    }
 
     auto ro = batch->try_to_read_only();
-    if (!ro) { return nullptr; }
+    if (!ro) {
+      if (_skips) { _skips->add(spill_skip::not_idle, 0); }
+      return nullptr;
+    }
     if (ro->get_memory_space() == space) {
       return std::make_unique<convertible_data_batch>(std::move(batch));
     }
 
+    if (_skips) { _skips->add(spill_skip::wrong_tier, ro->get_data()->get_size_in_bytes()); }
     return nullptr;
   }
 
   cucascade::shared_data_repository* _repo;
+  spill_skip_counts* _skips{nullptr};
 };
 
 }  // namespace sirius

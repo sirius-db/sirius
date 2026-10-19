@@ -172,6 +172,8 @@ void downgrade_executor::processing_loop()
       std::atomic<size_t> bytes{0};
     };
     target_tier_stats host_target_stats, disk_target_stats;
+    // What the sweep found and passed over, by reason: why spilling may free less than asked.
+    spill_skip_counts skips;
 
     // Resolve the source memory space for filtering candidates
     auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
@@ -273,13 +275,17 @@ void downgrade_executor::processing_loop()
     auto const managers   = _data_repo_registry.candidates();
     for (auto const& [victim_id, manager] : std::views::reverse(managers)) {
       auto borrow = _query_lifecycle.try_acquire_work(victim_id);
-      if (!borrow) { continue; }
+      if (!borrow) {
+        skips.add(spill_skip::borrow_refused, 0);
+        continue;
+      }
       if (req->satisfied.load() || pool_interrupted || target_completed()) break;
       auto repos = manager->get_repositories();
       for (auto* repo : repos) {
         if (req->satisfied.load() || target_completed()) break;
 
         convertible_data_batch_provider provider(repo);
+        provider.count_skips(&skips);
         auto candidates = provider.get_all_convertible(
           source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
 
@@ -309,7 +315,10 @@ void downgrade_executor::processing_loop()
           // victim claim into each candidate before handing it to another thread.
 
           auto work = _query_lifecycle.try_acquire_work(victim_id);
-          if (!work) { break; }
+          if (!work) {
+            skips.add(spill_skip::borrow_refused, candidate_bytes);
+            break;
+          }
           candidate->retain_work(std::move(work));
 
           auto slot = _pool->reserve();
@@ -339,6 +348,7 @@ void downgrade_executor::processing_loop()
              &repo_stats,
              &host_target_stats,
              &disk_target_stats,
+             &skips,
              predicate_satisfied]() mutable {
               absl::Cleanup rollback = [&planned_bytes, candidate_bytes]() {
                 planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
@@ -364,6 +374,8 @@ void downgrade_executor::processing_loop()
                     }
                   }
                   predicate_satisfied(req_ptr);
+                } else if (auto const why = cand->skipped()) {
+                  skips.add(*why, candidate_bytes);
                 }
               } catch (const std::exception& e) {
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
@@ -471,6 +483,7 @@ void downgrade_executor::processing_loop()
     }
 
     // === Logging ===
+    _skip_totals.add(skips);
     auto total_bytes   = req->bytes_freed.load(std::memory_order_relaxed);
     auto total_batches = req->batches_downgraded.load(std::memory_order_relaxed);
     auto duration_ms =
@@ -487,7 +500,7 @@ void downgrade_executor::processing_loop()
       // spill directory (every convert threw, nothing was freed, no warning).
       SIRIUS_LOG_INFO(
         "[downgrade][monitor] [{}] request done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s), "
-        "satisfied={} | to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
+        "satisfied={} | to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes | skipped: {}",
         _source_label,
         total_batches,
         total_bytes,
@@ -497,14 +510,22 @@ void downgrade_executor::processing_loop()
         host_target_stats.batches.load(std::memory_order_relaxed),
         host_target_stats.bytes.load(std::memory_order_relaxed),
         disk_target_stats.batches.load(std::memory_order_relaxed),
-        disk_target_stats.bytes.load(std::memory_order_relaxed));
+        disk_target_stats.bytes.load(std::memory_order_relaxed),
+        skips.to_string());
+    } else if (!req->satisfied.load() && skips.total() > 0) {
+      SIRIUS_LOG_INFO(
+        "[downgrade] [{}] request unsatisfied: {} batches, {} bytes freed | skipped: {}",
+        _source_label,
+        total_batches,
+        total_bytes,
+        skips.to_string());
     }
 
     SIRIUS_LOG_DEBUG(
       "[downgrade] [{}] request {}done: {} batches, {} bytes (target {}, planned {}) in "
       "{:.2f} ms ({:.1f} MB/s) | "
       "repos: {}/{} batches/bytes, pipeline_queue: {}/{} | "
-      "to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
+      "to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes | skipped: {}",
       _source_label,
       request_label,
       total_batches,
@@ -520,7 +541,8 @@ void downgrade_executor::processing_loop()
       host_target_stats.batches.load(std::memory_order_relaxed),
       host_target_stats.bytes.load(std::memory_order_relaxed),
       disk_target_stats.batches.load(std::memory_order_relaxed),
-      disk_target_stats.bytes.load(std::memory_order_relaxed));
+      disk_target_stats.bytes.load(std::memory_order_relaxed),
+      skips.to_string());
 
     // Fulfill the promise
     req->result.set_value(total_bytes);
