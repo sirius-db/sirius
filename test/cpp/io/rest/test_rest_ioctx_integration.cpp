@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "io/cache/prefetching_cache.hpp"
+#include "io/cache/types.hpp"
 #include "io/io_errors.hpp"
 #include "io/rest/authorizer.hpp"
 #include "io/rest/rest_ioctx.hpp"
@@ -37,6 +38,8 @@
 
 #include <arpa/inet.h>
 #include <config.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <log/logging.hpp>
 #include <netinet/in.h>
@@ -361,6 +364,13 @@ class range_http_server {
     return _max_requested_range.load();
   }
   [[nodiscard]] int peak_active_gets() const noexcept { return _peak_active_gets.load(); }
+  /// Every ranged GET the server answered with a 206, as [first, last] byte
+  /// positions, in arrival order.
+  [[nodiscard]] std::vector<std::pair<std::size_t, std::size_t>> served_ranges() const
+  {
+    std::lock_guard lock(_served_mutex);
+    return _served_ranges;
+  }
 
   void set_generated_listing(std::string prefix, std::size_t total)
   {
@@ -610,7 +620,11 @@ class range_http_server {
         send_body(fd, _object.data(), _object.size());
         return;
       }
-      auto const len    = end - start + 1;
+      auto const len = end - start + 1;
+      {
+        std::lock_guard lock(_served_mutex);
+        _served_ranges.emplace_back(start, end);
+      }
       auto previous_max = _max_requested_range.load(std::memory_order_relaxed);
       while (len > previous_max && !_max_requested_range.compare_exchange_weak(
                                      previous_max, len, std::memory_order_relaxed)) {}
@@ -838,6 +852,8 @@ class range_http_server {
   std::atomic<std::size_t> _max_requested_range{0};
   std::atomic<int> _active_gets{0};
   std::atomic<int> _peak_active_gets{0};
+  mutable std::mutex _served_mutex;
+  std::vector<std::pair<std::size_t, std::size_t>> _served_ranges;
   std::thread _thread;
   std::vector<std::thread> _workers;
 };
@@ -855,13 +871,25 @@ sirius::io::rest::config direct_rest_test_config()
   return cfg;
 }
 
-std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint,
-                                                   sirius::io::rest::config cfg,
-                                                   std::size_t n_reactors = 1)
+/// True when a CUDA device is present; otherwise WARNs that the calling test is
+/// skipped.  Staged device reads need one.
+bool has_cuda_device()
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0) return true;
+  WARN("Skipping: no CUDA device");
+  return false;
+}
+
+std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(
+  std::string endpoint,
+  sirius::io::rest::config cfg,
+  std::size_t n_reactors                                      = 1,
+  cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr)
 {
   auto authorizer = std::make_shared<fixed_url_authorizer>(std::move(endpoint));
   auto ctx        = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
-    cfg, std::move(authorizer), nullptr);
+    cfg, std::move(authorizer), host_mr);
   auto ioctx = std::make_shared<rest_ioctx>(n_reactors, std::move(ctx));
   ioctx->start();
   return ioctx;
@@ -2499,11 +2527,7 @@ TEST_CASE("rest_ioctx fans out host_readv_async_io ranges against the SeaweedFS 
 TEST_CASE("rest_ioctx keeps caller host buffers until the device event completes",
           "[s3][integration][rest]")
 {
-  int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
-    WARN("Skipping rest_ioctx caller-host device-event test: no CUDA device");
-    return;
-  }
+  if (!has_cuda_device()) return;
 
   auto payload = deterministic_payload(256 * 1024);
   range_http_server server(payload);
@@ -2567,11 +2591,7 @@ TEST_CASE(
     return;
   }
 
-  int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
-    WARN("Skipping rest_ioctx device-read integration test: no CUDA device");
-    return;
-  }
+  if (!has_cuda_device()) return;
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const small  = read_binary_file(local_fixture_path("small.bin"));
@@ -2818,4 +2838,373 @@ TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging"
     INFO("teardown completed in-flight request with exception: " << e.what());
     SUCCEED("future resolved with an exception during teardown");
   }
+}
+
+// ---- GET coalescing --------------------------------------------------------
+//
+// The REST worker serves a run of logical slices -- cache-chunk fills,
+// populate-on-read fills and staged device reads -- with one ranged GET,
+// bridging gaps up to merge_max_gap. These drive the reactor directly with
+// prepared slices shaped like the prefetching cache's, against the fake range
+// server, and check the GETs it saw plus every destination's bytes.
+
+namespace {
+
+constexpr std::size_t fusion_chunk = 1UL << 20;  // cache chunk == staging block
+using span_t                       = std::pair<std::size_t, std::size_t>;
+
+/// Records every cache-chunk publication the reactor reports.
+struct publication_log {
+  std::mutex mutex;
+  std::vector<std::pair<sirius::io::cache::cached_chunk*, bool>> entries;
+
+  [[nodiscard]] std::shared_ptr<sirius::io::prepared_io_completion> completion()
+  {
+    return std::make_shared<sirius::io::prepared_io_completion>(
+      [this](std::span<sirius::io::cache::cached_chunk* const> chunks, bool ok) noexcept {
+        std::lock_guard lock(mutex);
+        for (auto* chunk : chunks) {
+          entries.emplace_back(chunk, ok);
+        }
+      });
+  }
+
+  /// How many times @p chunk was published as {succeeded, failed}.
+  [[nodiscard]] span_t count(sirius::io::cache::cached_chunk* chunk)
+  {
+    std::lock_guard lock(mutex);
+    std::size_t ok = 0, failed = 0;
+    for (auto const& [c, success] : entries) {
+      if (c != chunk) continue;
+      (success ? ok : failed) += 1;
+    }
+    return {ok, failed};
+  }
+};
+
+/// A cache chunk with its own buffer. Its fill is unset, which the reactor plans
+/// as the whole chunk -- what a fresh prefetch claim looks like.
+struct test_chunk {
+  explicit test_chunk(std::size_t offset) : chunk(offset), bytes(fusion_chunk, std::uint8_t{0xee})
+  {
+    chunk.data = bytes.data();
+  }
+  sirius::io::cache::cached_chunk chunk;
+  std::vector<std::uint8_t> bytes;
+};
+
+/// A rest_ioctx whose reactors share a pinned staging resource with
+/// cache-chunk-sized blocks, as the scan manager wires it.
+struct fusion_fixture {
+  explicit fusion_fixture(range_http_server& server,
+                          std::size_t merge_max_gap      = 512UL << 10,
+                          std::size_t max_retry_attempts = 2,
+                          std::size_t n_reactors         = 1)
+    : upstream(0), host_mr(0, upstream, 64UL << 20, 64UL << 20, fusion_chunk, 16, 1)
+  {
+    auto cfg               = direct_rest_test_config();
+    cfg.max_connections    = 4;
+    cfg.merge_max_gap      = merge_max_gap;
+    cfg.max_retry_attempts = max_retry_attempts;
+    ioctx                  = make_direct_rest_ioctx(server.endpoint(), cfg, n_reactors, &host_mr);
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream;
+  cucascade::memory::fixed_size_host_memory_resource host_mr;
+  std::shared_ptr<rest_ioctx> ioctx;
+};
+
+sirius::io::prepared_io_slice chunk_fill(test_chunk& c, publication_log& log)
+{
+  sirius::io::prepared_io_slice slice{
+    sirius::io::range{c.chunk.offset, fusion_chunk},
+    sirius::io::host_buffer{std::vector<sirius::io::cache::cached_chunk*>{&c.chunk}}};
+  slice.on_complete = log.completion();
+  return slice;
+}
+
+/// @p n adjacent whole-chunk cache fills from offset 0, owned by @p chunks.
+std::vector<sirius::io::prepared_io_slice> contiguous_fills(
+  std::size_t n, std::vector<std::unique_ptr<test_chunk>>& chunks, publication_log& log)
+{
+  std::vector<sirius::io::prepared_io_slice> slices;
+  for (std::size_t i = 0; i < n; ++i) {
+    chunks.push_back(std::make_unique<test_chunk>(i * fusion_chunk));
+    slices.push_back(chunk_fill(*chunks.back(), log));
+  }
+  return slices;
+}
+
+}  // namespace
+
+TEST_CASE("rest fuses a run of contiguous cache-chunk fills into one GET",
+          "[s3][integration][rest][fusion]")
+{
+  if (!has_cuda_device()) return;
+  auto payload = deterministic_payload(6 * fusion_chunk + 17);
+  range_http_server server(payload);
+  fusion_fixture fixture(server);
+  auto datasource = fixture.ioctx->open_datasource("s3://fuse-bucket/object.bin", payload.size());
+
+  constexpr std::size_t n = 4;
+  std::vector<std::unique_ptr<test_chunk>> chunks;
+  publication_log log;
+  auto future = fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(),
+                                                          contiguous_fills(n, chunks, log));
+  REQUIRE(std::move(future).get(10s) == n * fusion_chunk);
+
+  CHECK(server.served_ranges() == std::vector<span_t>{{0, n * fusion_chunk - 1}});
+  for (auto& c : chunks) {
+    require_bytes_equal(
+      c->bytes, std::span<std::uint8_t const>(payload.data() + c->chunk.offset, fusion_chunk));
+    CHECK(log.count(&c->chunk) == span_t{1, 0});
+  }
+}
+
+TEST_CASE("rest keeps a contiguous run on one reactor when fewer runs than reactors",
+          "[s3][integration][rest][fusion]")
+{
+  if (!has_cuda_device()) return;
+  auto payload = deterministic_payload(4 * fusion_chunk);
+  range_http_server server(payload);
+  fusion_fixture fixture(server, 512UL << 10, 2, /*n_reactors=*/4);
+  auto datasource =
+    fixture.ioctx->open_datasource("s3://balance-bucket/object.bin", payload.size());
+
+  // One run against several reactors: split slice by slice it would become
+  // several GETs; kept whole it is one, and the reactors left without work are
+  // handed nothing.
+  std::vector<std::unique_ptr<test_chunk>> chunks;
+  publication_log log;
+  auto future = fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(),
+                                                          contiguous_fills(3, chunks, log));
+  REQUIRE(std::move(future).get(10s) == 3 * fusion_chunk);
+  CHECK(server.served_ranges() == std::vector<span_t>{{0, 3 * fusion_chunk - 1}});
+}
+
+TEST_CASE("rest fuses cache fills, populate-on-read fills and staged device reads in one GET",
+          "[s3][integration][rest][fusion]")
+{
+  if (!has_cuda_device()) return;
+  auto payload = deterministic_payload(4 * fusion_chunk);
+  range_http_server server(payload);
+  fusion_fixture fixture(server);
+  auto datasource = fixture.ioctx->open_datasource("s3://mixed-bucket/object.bin", payload.size());
+
+  rmm::cuda_stream stream;
+  publication_log log;
+  test_chunk prefetched(0);            // readahead fill: host chunk only
+  test_chunk populated(fusion_chunk);  // demand fill: chunk + device window
+  std::size_t const populate_lo = fusion_chunk + 100;
+  std::size_t const staged_a_lo = 2 * fusion_chunk;
+  std::size_t const staged_a_sz = 300UL << 10;
+  std::size_t const staged_b_lo = staged_a_lo + staged_a_sz;
+  std::size_t const staged_b_sz = fusion_chunk + 5;
+
+  rmm::device_buffer populate_dst(2 * fusion_chunk - populate_lo, stream);
+  rmm::device_buffer staged_a_dst(staged_a_sz, stream);
+  rmm::device_buffer staged_b_dst(staged_b_sz, stream);
+
+  std::vector<sirius::io::prepared_io_slice> slices;
+  slices.push_back(chunk_fill(prefetched, log));
+  {
+    sirius::io::prepared_io_slice slice{
+      sirius::io::range{populate_lo, populate_dst.size()},
+      sirius::io::host_buffer{std::vector<sirius::io::cache::cached_chunk*>{&populated.chunk}},
+      sirius::io::device_buffer{static_cast<std::uint8_t*>(populate_dst.data()), stream}};
+    slice.on_complete = log.completion();
+    slices.push_back(std::move(slice));
+  }
+  slices.emplace_back(
+    sirius::io::range{staged_a_lo, staged_a_sz},
+    sirius::io::device_buffer{static_cast<std::uint8_t*>(staged_a_dst.data()), stream});
+  slices.emplace_back(
+    sirius::io::range{staged_b_lo, staged_b_sz},
+    sirius::io::device_buffer{static_cast<std::uint8_t*>(staged_b_dst.data()), stream});
+
+  auto const logical = fusion_chunk + populate_dst.size() + staged_a_sz + staged_b_sz;
+  auto future =
+    fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(), std::move(slices));
+  REQUIRE(std::move(future).get(10s) == logical);
+
+  CHECK(server.served_ranges() == std::vector<span_t>{{0, staged_b_lo + staged_b_sz - 1}});
+
+  auto const expect = [&](std::size_t offset, std::size_t size) {
+    return std::span<std::uint8_t const>(payload.data() + offset, size);
+  };
+  require_bytes_equal(prefetched.bytes, expect(0, fusion_chunk));
+  require_bytes_equal(populated.bytes, expect(fusion_chunk, fusion_chunk));
+  require_bytes_equal(copy_device_to_host(populate_dst, populate_dst.size(), stream),
+                      expect(populate_lo, populate_dst.size()));
+  require_bytes_equal(copy_device_to_host(staged_a_dst, staged_a_sz, stream),
+                      expect(staged_a_lo, staged_a_sz));
+  require_bytes_equal(copy_device_to_host(staged_b_dst, staged_b_sz, stream),
+                      expect(staged_b_lo, staged_b_sz));
+  CHECK(log.count(&prefetched.chunk) == span_t{1, 0});
+  CHECK(log.count(&populated.chunk) == span_t{1, 0});
+}
+
+TEST_CASE("rest bridges gaps up to merge_max_gap with one GET and discards the gap",
+          "[s3][integration][rest][fusion]")
+{
+  if (!has_cuda_device()) return;
+  auto payload           = deterministic_payload(4 * fusion_chunk);
+  std::size_t const gap  = 256UL << 10;
+  std::size_t const b_lo = fusion_chunk + gap;
+
+  // One gap under merge_max_gap, one over it.
+  auto const max_gap = GENERATE(std::size_t{512UL << 10}, std::size_t{128UL << 10});
+  range_http_server server(payload);
+  fusion_fixture fixture(server, max_gap);
+  auto datasource = fixture.ioctx->open_datasource("s3://gap-bucket/object.bin", payload.size());
+
+  publication_log log;
+  test_chunk a(0), b(b_lo);
+  std::vector<sirius::io::prepared_io_slice> slices;
+  slices.push_back(chunk_fill(a, log));
+  slices.push_back(chunk_fill(b, log));
+  auto future =
+    fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(), std::move(slices));
+  REQUIRE(std::move(future).get(10s) == 2 * fusion_chunk);
+
+  auto served = server.served_ranges();
+  std::ranges::sort(served);
+  if (max_gap >= gap) {
+    CHECK(served == std::vector<span_t>{{0, b_lo + fusion_chunk - 1}});
+  } else {
+    CHECK(served == std::vector<span_t>{{0, fusion_chunk - 1}, {b_lo, b_lo + fusion_chunk - 1}});
+  }
+  // A gap byte stored anywhere would shift B's bytes.
+  require_bytes_equal(a.bytes, std::span<std::uint8_t const>(payload.data(), fusion_chunk));
+  require_bytes_equal(b.bytes, std::span<std::uint8_t const>(payload.data() + b_lo, fusion_chunk));
+  CHECK(log.count(&a.chunk) == span_t{1, 0});
+  CHECK(log.count(&b.chunk) == span_t{1, 0});
+}
+
+TEST_CASE("rest fails or retries every constituent of a fused GET together",
+          "[s3][integration][rest][fusion]")
+{
+  if (!has_cuda_device()) return;
+  auto payload = deterministic_payload(4 * fusion_chunk);
+  range_fault_policy fault{};
+  std::size_t max_retry_attempts = 3;
+  bool fails                     = false;
+  SECTION("a failed fused GET fails each constituent once")
+  {
+    fault.fail_all_gets = true;
+    max_retry_attempts  = 2;
+    fails               = true;
+  }
+  SECTION("a retried fused GET publishes each constituent once") { fault.fail_first_gets = 1; }
+
+  range_http_server server(payload, fault);
+  fusion_fixture fixture(server, 512UL << 10, max_retry_attempts);
+  auto datasource =
+    fixture.ioctx->open_datasource("s3://retry-fuse-bucket/object.bin", payload.size());
+  publication_log log;
+  std::vector<std::unique_ptr<test_chunk>> chunks;
+  auto future = fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(),
+                                                          contiguous_fills(3, chunks, log));
+  if (fails) {
+    CHECK_THROWS(std::move(future).get(10s));
+  } else {
+    REQUIRE(std::move(future).get(10s) == 3 * fusion_chunk);
+  }
+  CHECK(server.get_count() == 2);  // one fused GET, retried once
+  for (auto& c : chunks) {
+    if (!fails) {
+      require_bytes_equal(
+        c->bytes, std::span<std::uint8_t const>(payload.data() + c->chunk.offset, fusion_chunk));
+    }
+    CHECK(log.count(&c->chunk) == (fails ? span_t{0, 1} : span_t{1, 0}));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reads that wait for pinned staging instead of failing.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::size_t staging_tier_bytes = 16UL << 20;
+
+/// A reactor whose only staging is a small pinned resource the test can drain.
+struct staging_fixture {
+  staging_fixture(range_http_server& server, std::chrono::milliseconds wait_timeout)
+    : upstream(0), host_mr(0, upstream, staging_tier_bytes, staging_tier_bytes, fusion_chunk, 16, 1)
+  {
+    auto cfg                 = direct_rest_test_config();
+    cfg.staging_wait_timeout = wait_timeout;
+    ioctx                    = make_direct_rest_ioctx(server.endpoint(), cfg, 1, &host_mr);
+  }
+
+  /// Take every block the resource has left.
+  cucascade::memory::fixed_size_host_memory_resource::fixed_multiple_blocks_allocation exhaust()
+  {
+    auto const available = host_mr.get_available_memory();
+    return host_mr.allocate_multiple_blocks(available / fusion_chunk * fusion_chunk);
+  }
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream;
+  cucascade::memory::fixed_size_host_memory_resource host_mr;
+  std::shared_ptr<rest_ioctx> ioctx;
+};
+
+/// One staged device read filling @p dst from @p offset.
+std::vector<sirius::io::prepared_io_slice> staged_read(rmm::device_buffer& dst,
+                                                       std::size_t offset,
+                                                       rmm::cuda_stream& stream)
+{
+  std::vector<sirius::io::prepared_io_slice> slices;
+  slices.emplace_back(sirius::io::range{offset, dst.size()},
+                      sirius::io::device_buffer{static_cast<std::uint8_t*>(dst.data()), stream});
+  return slices;
+}
+
+}  // namespace
+
+TEST_CASE("rest read parks while staging is exhausted and completes once it frees",
+          "[s3][integration][rest][staging]")
+{
+  if (!has_cuda_device()) return;
+  auto payload = deterministic_payload(4 * fusion_chunk);
+  range_http_server server(payload);
+  staging_fixture fixture(server, std::chrono::minutes{1});
+  auto datasource = fixture.ioctx->open_datasource("s3://park-bucket/object.bin", payload.size());
+  rmm::cuda_stream stream;
+
+  auto hold              = fixture.exhaust();
+  std::size_t const size = fusion_chunk + 11;
+  rmm::device_buffer dst(size, stream);
+  auto future = fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(),
+                                                          staged_read(dst, 5, stream));
+  std::this_thread::sleep_for(300ms);
+  CHECK_FALSE(future.is_ready());
+  CHECK(server.get_count() == 0);
+
+  hold.reset();
+  REQUIRE(std::move(future).get(10s) == size);
+  require_bytes_equal(copy_device_to_host(dst, size, stream),
+                      std::span<std::uint8_t const>(payload.data() + 5, size));
+}
+
+TEST_CASE("rest read fails after staging_wait_timeout without staging",
+          "[s3][integration][rest][staging]")
+{
+  if (!has_cuda_device()) return;
+  auto payload = deterministic_payload(4 * fusion_chunk);
+  range_http_server server(payload);
+  staging_fixture fixture(server, std::chrono::milliseconds{200});
+  auto datasource =
+    fixture.ioctx->open_datasource("s3://timeout-bucket/object.bin", payload.size());
+  rmm::cuda_stream stream;
+
+  auto hold = fixture.exhaust();
+  rmm::device_buffer dst(fusion_chunk, stream);
+  auto const start = std::chrono::steady_clock::now();
+  auto future      = fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(),
+                                                          staged_read(dst, 0, stream));
+  CHECK_THROWS_AS(std::move(future).get(10s), rmm::out_of_memory);
+  CHECK(std::chrono::steady_clock::now() - start >= 200ms);
+  CHECK(server.get_count() == 0);
 }

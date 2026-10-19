@@ -51,15 +51,16 @@ void ioctx::initialize_cache(
       "ioctx::initialize_cache() called but backend does not support vector host read");
     return;
   }
+  // Built and validated off to the side, then published, so no reader can see
+  // a cache that is about to be refused.
+  std::unique_ptr<cache::prefetching_cache> built;
   try {
-    _cache = std::make_unique<cache::prefetching_cache>(
+    built = std::make_unique<cache::prefetching_cache>(
       reservation_manager, this, cache_config, std::move(topology_index));
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("prefetching_cache construction failed: {}", e.what());
-    _cache.reset();
   } catch (...) {
     SIRIUS_LOG_ERROR("prefetching_cache construction failed: unknown error");
-    _cache.reset();
   }
   // The reactors plan a fragmented fill's extent with
   // cache::fill_span(fill, chunk->offset, their own staging block size).  A
@@ -68,19 +69,25 @@ void ioctx::initialize_cache(
   // write past the end of a pinned chunk.  The two are equal today only because
   // both read the same front HOST arena; refuse the cache rather than let a
   // future split of those resources corrupt the heap silently.
-  if (_cache && staging_block_size() != 0 && staging_block_size() != _cache->chunk_size()) {
+  if (built && staging_block_size() != 0 && staging_block_size() != built->chunk_size()) {
     SIRIUS_LOG_ERROR(
       "ioctx::initialize_cache: backend {} stages in {}-byte blocks but the prefetching cache "
       "chunk is {} bytes; the two must match because fragmented fills are planned with the "
       "staging block size -- running without a cache",
       static_cast<int>(type()),
       staging_block_size(),
-      _cache->chunk_size());
-    _cache.reset();
+      built->chunk_size());
+    return;
   }
+  _cache = std::move(built);
+  _cache_view.store(_cache.get(), std::memory_order_release);
 }
 
-void ioctx::shutdown_cache() noexcept { _cache.reset(); }
+void ioctx::shutdown_cache() noexcept
+{
+  _cache_view.store(nullptr, std::memory_order_release);
+  _cache.reset();
+}
 
 std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path)
 {

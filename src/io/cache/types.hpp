@@ -110,6 +110,12 @@ class buffer_pool {
   /// Bulk-allocate up to @p n chunks, appending pointers to @p out.
   /// Returns the number actually allocated (may be < n if the pool is
   /// exhausted and cannot grow).
+  ///
+  /// Both allocators enforce the pool's limit (@ref chunks_over_cap): a request
+  /// that would take the pool's resident chunks past it is refused outright
+  /// (empty result) rather than served.  An empty pool admits
+  /// any single request, so a request larger than the cap can still run alone
+  /// instead of never running.
   std::vector<std::byte*> allocate_bulk(size_t n, int& numa_node);
 
   std::vector<std::byte*> allocate_bulk_from(size_t n, int numa_node);
@@ -132,17 +138,50 @@ class buffer_pool {
 
   [[nodiscard]] size_t reservation_size_for_prefetching() const noexcept;
 
+  /// Hard cap on the bytes of chunks the pool may hand out:
+  /// @c eviction_threshold_fraction of the host tier, chunk aligned.  0 means
+  /// uncapped.
   [[nodiscard]] size_t max_allowed_budget_for_prefetching() const noexcept;
 
   [[nodiscard]] size_t max_system_wide_usage() const noexcept;
 
+  /// Chunks that would have to be freed for @p n more to fit under the pool's
+  /// limit (0 when they already fit).  A snapshot, used to size eviction demands.
+  ///
+  /// The limit is @ref max_allowed_budget_for_prefetching, lowered while a host
+  /// space is over its downgrade stop threshold to what the cache holds less the
+  /// overshoot -- the stop line less what everything else on the tier uses --
+  /// but never below the pool's reservation.  So the cache fills what spill does
+  /// not need, gives way as spill grows, and replaces chunks rather than grows
+  /// once it is the one at the line.
+  [[nodiscard]] size_t chunks_over_cap(size_t n) const noexcept;
+
+  /// Some host space holds more than its downgrade stop threshold: spilled data
+  /// is, or soon will be, moving to disk to make room.
+  [[nodiscard]] bool host_under_spill_pressure() const noexcept;
+
+  /// The pool is at its configured cap (@ref max_allowed_budget_for_prefetching),
+  /// as opposed to a limit the host tier's pressure set.
+  [[nodiscard]] bool over_static_cap() const noexcept;
+
+  /// The pool has no room for another chunk under its limit (and holds more than
+  /// its reserved floor).  Judged on the pool's OWN resident chunks -- not on
+  /// system-wide host usage, which includes spills and would keep a cache that
+  /// is itself small permanently evicting.
   [[nodiscard]] bool should_start_evicting() const noexcept;
 
  private:
+  /// Bytes the host spaces hold over their downgrade stop thresholds, summed.
+  [[nodiscard]] size_t host_bytes_over_stop_line() const noexcept;
+
+  /// The pool's limit in chunks (@ref chunks_over_cap); max size_t when unlimited.
+  [[nodiscard]] size_t limit_chunks() const noexcept;
+
   struct host_arena {
     int numa_id;
     std::unique_ptr<cucascade::memory::reservation> reservation;
     cucascade::memory::fixed_size_host_memory_resource* mr;
+    cucascade::memory::memory_space const* space;
   };
 
   size_t _chunk_bytes{1};
@@ -150,6 +189,12 @@ class buffer_pool {
   size_t _max_allowed_budget_for_prefetching{0};
   std::unordered_map<int, size_t> _numa_to_arena_index;
   std::vector<host_arena> _host_arenas;
+  /// Charge @p n chunks against the cap before allocating them.  One CAS, so
+  /// concurrent allocators cannot both pass a check and overshoot together.
+  [[nodiscard]] bool try_charge(size_t n) noexcept;
+
+  [[nodiscard]] bool fits(size_t current, size_t n) const noexcept;
+
   std::atomic<size_t> _n_allocated_chunks{0};
 };
 

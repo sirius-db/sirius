@@ -613,6 +613,32 @@ TEST_CASE("sirius_config reads max_readahead_scans", "[scan_manager][config][rea
   CHECK(*budget.max_readahead_scans == 12);
 }
 
+TEST_CASE("max_readahead_bytes is read from YAML and overrides the cache budget",
+          "[scan_manager][config][readahead]")
+{
+  using sirius::scan_manager::prefetch_strategy;
+  auto cfg = load_scan_manager("sirius_readahead_bytes_unset.yaml",
+                               scan_manager_yaml("      rest_n_reactors: 1\n"));
+  CHECK_FALSE(cfg.max_readahead_bytes.has_value());
+  // Unset: the smallest cache prefetching budget the caller found, else unlimited.
+  CHECK(cfg.resolve_readahead(8, prefetch_strategy::eager, 5ull << 30).max_resident_bytes ==
+        (5ull << 30));
+  CHECK(cfg.resolve_readahead(8, prefetch_strategy::eager).max_resident_bytes == 0);
+
+  // Byte strings, like every other byte-valued key; an explicit value wins.
+  auto const sized = load_scan_manager("sirius_readahead_bytes_sized.yaml",
+                                       scan_manager_yaml("      max_readahead_bytes: 2GiB\n"));
+  REQUIRE(sized.max_readahead_bytes == (2ull << 30));
+  CHECK(sized.resolve_readahead(8, prefetch_strategy::eager, 5ull << 30).max_resident_bytes ==
+        (2ull << 30));
+
+  // An explicit zero means no byte bound, whatever the caches say.
+  auto const zero = load_scan_manager("sirius_readahead_bytes_zero.yaml",
+                                      scan_manager_yaml("      max_readahead_bytes: 0\n"));
+  REQUIRE(zero.max_readahead_bytes == std::size_t{0});
+  CHECK(zero.resolve_readahead(8, prefetch_strategy::eager, 5ull << 30).max_resident_bytes == 0);
+}
+
 TEST_CASE("sirius_config reads readahead_strategy", "[scan_manager][config][readahead]")
 {
   auto const unset = load_scan_manager("sirius_readahead_strategy_unset.yaml",
