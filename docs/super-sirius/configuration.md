@@ -144,6 +144,7 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
+| `allocator` | `async` \| `async_capped` | `async` | `async` is a CUDA async pool primed to the capacity; the capacity does not cap it, so allocations outside reservations can grow it past the limit. `async_capped` is a CUDA async pool created with the capacity (rounded up to 2 MiB) as its hard maximum (`cudaMemPoolProps::maxSize`), primed to it, and trimmed on OOM like `async`. Also accepted per space as `sirius.space.gpu[].allocator`. |
 
 The high-level GPU path keeps per-stream reservation tracking off. The
 diagnostic control remains available only through the explicit low-level
@@ -241,6 +242,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
 | `memory_capacity` | bytes | space default | Absolute capacity of the space. |
+| `allocator` | `async` \| `async_capped` | `async` | The space's GPU pool; see `sirius.memory.gpu.allocator`. |
 
 #### `sirius.space.host[]` — one entry per host (pinned) memory space
 

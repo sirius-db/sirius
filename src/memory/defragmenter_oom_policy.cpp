@@ -18,6 +18,7 @@
 #include "memory/defragmenter_oom_policy.hpp"
 
 #include "cuda_runtime_api.h"
+#include "memory/capped_async_memory_resource.hpp"
 
 #include <cuda_runtime.h>
 
@@ -81,14 +82,20 @@ void* defragmenter_oom_policy::do_handle_oom(std::size_t bytes,
     std::rethrow_exception(eptr);
   }
 
-  // If the pool doesn't look fragmented, trimming won't help — bail out.
-  if (!oom_ex->pool_handle || !is_pool_fragmented(oom_ex->pool_handle, bytes)) {
-    std::rethrow_exception(eptr);
+  // cuCascade finds the pool only behind RMM's own async resources; a capped pool is looked up
+  // by the device the allocation ran on.
+  cudaMemPool_t pool = oom_ex->pool_handle;
+  if (pool == nullptr) {
+    int device = 0;
+    if (cudaGetDevice(&device) == cudaSuccess) { pool = capped_pool_on_device(device); }
   }
+
+  // If the pool doesn't look fragmented, trimming won't help — bail out.
+  if (!pool || !is_pool_fragmented(pool, bytes)) { std::rethrow_exception(eptr); }
 
   // Release all free, fragmented blocks back to the driver so it can reassemble
   // them into larger contiguous regions for the retry.
-  cudaMemPoolTrimTo(oom_ex->pool_handle, /*minBytesToKeep=*/0);
+  cudaMemPoolTrimTo(pool, /*minBytesToKeep=*/0);
   cudaDeviceSynchronize();  // Ensure that the trim operation is complete before retrying.
 
   try {
