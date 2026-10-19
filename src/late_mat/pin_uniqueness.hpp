@@ -108,7 +108,7 @@ namespace sirius::late_mat {
 
 /// Byte cap for one column in the exact stage (`pin_table_unique_exact_max_bytes`):
 /// @p configured_bytes when non-zero, otherwise `config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION`
-/// of @p gpu_capacity_bytes (`config::PIN_TABLE_UNIQUE_EXACT_FALLBACK_MAX_BYTES` when that is 0).
+/// of @p gpu_capacity_bytes.
 /// The check's peak GPU use is about three times the cap; a column past it stays UNKNOWN.
 [[nodiscard]] std::size_t exact_uniqueness_byte_cap(std::uint64_t configured_bytes,
                                                     std::uint64_t gpu_capacity_bytes);

@@ -380,8 +380,6 @@ TEST_CASE("the exact-stage byte cap is a share of GPU memory unless set",
   REQUIRE(
     exact_uniqueness_byte_cap(0, 100 * gib) ==
     static_cast<std::size_t>(100 * gib * sirius::config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION));
-  REQUIRE(exact_uniqueness_byte_cap(0, 0) ==
-          sirius::config::PIN_TABLE_UNIQUE_EXACT_FALLBACK_MAX_BYTES);
 }
 
 TEST_CASE("a chunk of the wrong width abandons the proof", "[late_mat][pin_uniqueness]")
