@@ -25,6 +25,7 @@
 // of value order, because `part.10` globs before `part.2`.
 
 #include "operator/operator_test_utils.hpp"
+#include "sirius_config.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -368,20 +369,19 @@ TEST_CASE("an automatic column with sorted, overlapping chunks is left to the ex
   REQUIRE(probe.candidate(0));
 }
 
-TEST_CASE("the exact-stage cap is raised for automatic columns", "[late_mat][pin_uniqueness]")
+TEST_CASE("the exact-stage byte cap is a share of GPU memory unless set",
+          "[late_mat][pin_uniqueness]")
 {
-  using sirius::late_mat::exact_uniqueness_row_cap;
-  {
-    scoped_env unset{"SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS", nullptr};
-    REQUIRE(exact_uniqueness_row_cap() == 300'000'000u);
-    REQUIRE(exact_uniqueness_row_cap(true) ==
-            static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()));
-  }
-  {
-    scoped_env set{"SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS", "1000"};
-    REQUIRE(exact_uniqueness_row_cap() == 1000u);
-    REQUIRE(exact_uniqueness_row_cap(true) == 1000u);
-  }
+  using sirius::late_mat::exact_uniqueness_byte_cap;
+  constexpr std::uint64_t gib = 1ULL << 30;
+  // An explicit cap wins over the derived one.
+  REQUIRE(exact_uniqueness_byte_cap(1000, 100 * gib) == 1000u);
+  // 0 derives the cap from the GPU memory space's capacity.
+  REQUIRE(
+    exact_uniqueness_byte_cap(0, 100 * gib) ==
+    static_cast<std::size_t>(100 * gib * sirius::config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION));
+  REQUIRE(exact_uniqueness_byte_cap(0, 0) ==
+          sirius::config::PIN_TABLE_UNIQUE_EXACT_FALLBACK_MAX_BYTES);
 }
 
 TEST_CASE("a chunk of the wrong width abandons the proof", "[late_mat][pin_uniqueness]")

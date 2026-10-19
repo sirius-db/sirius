@@ -1431,7 +1431,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
       current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
       current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT,
-      current_setting('pin_table_prove_unique_keys')::BOOLEAN
+      current_setting('pin_table_prove_unique_keys')::BOOLEAN,
+      current_setting('pin_table_unique_exact_max_bytes')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1461,6 +1462,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->Collection().GetValue(20, 0).GetValue<bool>());
   REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
   REQUIRE_FALSE(settings->Collection().GetValue(22, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(23, 0).GetValue<uint64_t>() == 9 * mib);
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =

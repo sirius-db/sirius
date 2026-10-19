@@ -459,6 +459,8 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   });
   r.optional("input_plan_dir", opt.input_plan_dir);
   r.optional("prove_unique_keys", opt.prove_unique_keys);
+  // 0 is meaningful here: it selects the share of GPU memory space capacity.
+  r.optional("unique_exact_max_bytes", yaml::bytes(opt.unique_exact_max_bytes));
   r.reject_unknown();
 }
 

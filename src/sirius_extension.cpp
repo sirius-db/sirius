@@ -1363,7 +1363,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                        .capture_chunk_stats = capture_chunk_stats,
                                        .enable_compressed_materialization = compressed_pin,
                                        .probe_unique_columns              = probe_unique_columns,
-                                       .probe_unique_automatic = probe_unique_automatic});
+                                       .probe_unique_automatic            = probe_unique_automatic,
+                                       .unique_exact_max_bytes = comp_cfg.unique_exact_max_bytes});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(host_result.column_storage));
@@ -1396,7 +1397,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
        .capture_chunk_stats               = false,
        .enable_compressed_materialization = compressed_pin,
        .probe_unique_columns              = probe_unique_columns,
-       .probe_unique_automatic            = probe_unique_automatic});
+       .probe_unique_automatic            = probe_unique_automatic,
+       .unique_exact_max_bytes            = comp_cfg.unique_exact_max_bytes});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(dev_result.column_storage));
@@ -1420,7 +1422,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                        .capture_chunk_stats = capture_chunk_stats,
                                        .enable_compressed_materialization = compressed_pin,
                                        .probe_unique_columns              = probe_unique_columns,
-                                       .probe_unique_automatic = probe_unique_automatic});
+                                       .probe_unique_automatic            = probe_unique_automatic,
+                                       .unique_exact_max_bytes = comp_cfg.unique_exact_max_bytes});
     sirius_ctx->get_event_publisher().publish_compressed_materialization(
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(mat.column_storage));
@@ -2786,6 +2789,17 @@ static void SetPinTableProveUniqueKeys(ClientContext& context, SetScope scope, V
   SIRIUS_LOG_DEBUG("Updated pin_table_prove_unique_keys to {}", BooleanValue::Get(parameter));
 }
 
+static void SetPinTableUniqueExactMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("Pin uniqueness options are session settings");
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  // 0 is meaningful: it restores the derived cap (a share of GPU memory space capacity).
+  duckdb::session_compression_config(context).unique_exact_max_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_unique_exact_max_bytes to {}", UBigIntValue::Get(parameter));
+}
+
 static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                                                SetScope scope,
                                                Value& parameter)
@@ -3454,6 +3468,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(compression_defaults.prove_unique_keys),
     SetPinTableProveUniqueKeys);
+
+  config.AddExtensionOption(
+    "pin_table_unique_exact_max_bytes",
+    "Cap in bytes on one column in pin_table's exact uniqueness check (a sort of the whole column; "
+    "peak GPU use is about three times the cap). 0 = 10% of the GPU memory space capacity",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(compression_defaults.unique_exact_max_bytes),
+    SetPinTableUniqueExactMaxBytes);
 
   add_sirius_option(
     config,

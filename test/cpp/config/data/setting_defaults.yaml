@@ -42,5 +42,6 @@ sirius:
     max_compressed_fraction: 0.6
     input_plan_dir: /tmp/sirius-compression-plans
     prove_unique_keys: false
+    unique_exact_max_bytes: 9MiB
   telemetry:
     enable_quent: false
