@@ -53,6 +53,11 @@ class limiting_operator_data : public pipelineable_operator_data {
 
 class sirius_physical_streaming_limit : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::STREAMING_LIMIT;
 

@@ -83,6 +83,11 @@ std::unique_ptr<sirius::ast::node> ref(std::uint32_t column)
 // The plan generator links parents in production; these expose the same field
 // so a test can build a chain without one.
 struct fake_scan : sirius::op::sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   explicit fake_scan(std::size_t columns)
     : sirius_physical_operator(
         sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, make_types(columns), 0)
@@ -93,6 +98,11 @@ struct fake_scan : sirius::op::sirius_physical_operator {
 
 /// The same, with columns wide enough for a bundle to clear the value floor.
 struct wide_scan : sirius::op::sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   explicit wide_scan(std::size_t columns)
     : sirius_physical_operator(
         sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, make_string_types(columns), 0)
@@ -103,6 +113,11 @@ struct wide_scan : sirius::op::sirius_physical_operator {
 
 /// An operator shape the analysis does not model, so it must consume.
 struct opaque_op : sirius::op::sirius_physical_operator {
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   explicit opaque_op(std::size_t columns)
     : sirius_physical_operator(
         sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY, make_types(columns), 0)

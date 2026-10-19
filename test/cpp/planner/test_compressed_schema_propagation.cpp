@@ -43,6 +43,7 @@
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 
@@ -422,7 +423,7 @@ TEST_CASE("compressed_schema_propagation - native boundaries restore children fu
                                       SiriusPhysicalOperatorType::ORDER_BY,
                                       SiriusPhysicalOperatorType::TOP_N);
 
-  auto boundary = duckdb::make_uniq<sirius_physical_operator>(
+  auto boundary = duckdb::make_uniq<sirius::op::test_physical_operator>(
     boundary_type, integer_types(2), /*estimated_cardinality=*/1);
   boundary->children.push_back(make_scan(2, {k_int8, k_int8}));
   duckdb::unique_ptr<sirius_physical_operator> plan = std::move(boundary);
@@ -700,7 +701,7 @@ TEST_CASE("compressed_schema_propagation - DELIM_JOIN sub-trees are restored nat
           "[compressed_schema_propagation]")
 {
   auto join_sub = make_pure_reference_projection({0}, make_scan(1, {k_int8}));
-  auto delim    = duckdb::make_uniq<sirius::op::sirius_physical_delim_join>(
+  auto delim    = duckdb::make_uniq<sirius::op::test_delim_join>(
     SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
     integer_types(1),
     std::move(join_sub),
@@ -734,7 +735,7 @@ TEST_CASE("compressed_schema_propagation - DELIM_JOIN sub-trees are restored nat
 TEST_CASE("compressed_schema_propagation - sidecar fast path inspects DELIM_JOIN sub-trees",
           "[compressed_schema_propagation]")
 {
-  auto delim = duckdb::make_uniq<sirius::op::sirius_physical_delim_join>(
+  auto delim = duckdb::make_uniq<sirius::op::test_delim_join>(
     SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
     integer_types(1),
     make_scan(1, {k_int8}),
@@ -877,12 +878,12 @@ TEST_CASE("compressed_schema_propagation - an unmappable type clears every sidec
 {
   duckdb::vector<sirius::logical_type> unmappable_types;
   unmappable_types.push_back(sirius::logical_type::make(sirius::type_id::SQLNULL));
-  auto unmappable =
-    duckdb::make_uniq<sirius_physical_operator>(SiriusPhysicalOperatorType::COLUMN_DATA_SCAN,
-                                                std::move(unmappable_types),
-                                                /*estimated_cardinality=*/1);
+  auto unmappable = duckdb::make_uniq<sirius::op::test_physical_operator>(
+    SiriusPhysicalOperatorType::COLUMN_DATA_SCAN,
+    std::move(unmappable_types),
+    /*estimated_cardinality=*/1);
 
-  auto delim = duckdb::make_uniq<sirius::op::sirius_physical_delim_join>(
+  auto delim = duckdb::make_uniq<sirius::op::test_delim_join>(
     SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
     integer_types(1),
     std::move(unmappable),

@@ -29,6 +29,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "utils/dynamic_filter_publication_fixture.hpp"
 #include "utils/sirius_test_env.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 
