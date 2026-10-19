@@ -26,6 +26,7 @@
 
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/error.hpp>
@@ -131,6 +132,8 @@ class import_test_resource {
     std::atomic<std::size_t> live_bytes{0};
     std::atomic<bool> failed{false};
     std::atomic<int> callback_status{cudaSuccess};
+    cudaStream_t expected_stream{nullptr};
+    std::atomic<bool> wrong_stream{false};
     bool delay_deallocation{false};
     long fail_at{-1};
   };
@@ -145,6 +148,9 @@ class import_test_resource {
                  std::size_t bytes,
                  std::size_t alignment = alignof(std::max_align_t))
   {
+    if (counts->expected_stream && stream.get() != counts->expected_stream) {
+      counts->wrong_stream = true;
+    }
     attempt();
     auto* pointer = upstream_.allocate(stream, bytes, alignment);
     counts->live_bytes += bytes;
@@ -155,6 +161,9 @@ class import_test_resource {
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
+    if (counts->expected_stream && stream.get() != counts->expected_stream) {
+      counts->wrong_stream = true;
+    }
     if (counts->delay_deallocation) {
       counts->callback_status = cudaLaunchHostFunc(
         stream.get(),
@@ -166,6 +175,7 @@ class import_test_resource {
   }
   void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
   {
+    if (counts->expected_stream) { counts->wrong_stream = true; }
     attempt();
     auto* pointer = upstream_.allocate_sync(bytes, alignment);
     counts->live_bytes += bytes;
@@ -175,6 +185,7 @@ class import_test_resource {
                        std::size_t bytes,
                        std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
+    if (counts->expected_stream) { counts->wrong_stream = true; }
     upstream_.deallocate_sync(pointer, bytes, alignment);
     counts->live_bytes -= bytes;
   }
@@ -224,7 +235,36 @@ class bounded_host_resource : public std::pmr::memory_resource {
   std::size_t limit_;
 };
 
+#if defined(__linux__)
+struct import_drain_fault {
+  cudaStream_t stream;
+  const import_test_resource::state& resource;
+  cudaError_t results[2];
+  int calls{0};
+  std::size_t live_bytes[2]{};
+  cudaError_t actual_status[2]{};
+};
+thread_local import_drain_fault* active_import_drain_fault = nullptr;
+#endif
+
 }  // namespace
+
+#if defined(__linux__)
+extern "C" cudaError_t __real_cudaStreamSynchronize(cudaStream_t stream);
+extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream)
+{
+  auto* fault = active_import_drain_fault;
+  if (fault == nullptr || fault->stream != stream || fault->calls >= 2) {
+    return __real_cudaStreamSynchronize(stream);
+  }
+  const auto call            = fault->calls++;
+  fault->live_bytes[call]    = fault->resource.live_bytes.load();
+  const auto actual          = __real_cudaStreamSynchronize(stream);
+  fault->actual_status[call] = actual;
+  // Drain real work before reporting a synthetic failure, keeping this process usable.
+  return actual == cudaSuccess ? fault->results[call] : actual;
+}
+#endif
 
 TEST_CASE("arrow_host_import: DuckDB's scalar types import at the declared cudf types",
           "[arrow_host_import]")
@@ -613,35 +653,139 @@ TEST_CASE("arrow_host_import: every observed allocation refusal drains and keeps
 TEST_CASE("arrow_host_import: bit-offset boundary slices normalize before GPU copy",
           "[arrow_host_import]")
 {
-  const int rows = GENERATE(1, 7, 8, 31, 32, 33, 511, 512, 513);
-  auto batch     = arrow_batch_from_sql(
-    "SELECT i % 2 = 0 AS b, CASE WHEN i % 7 = 0 THEN NULL ELSE i END::INTEGER AS v "
-        "FROM range(" +
-    std::to_string(rows + 1) + ") t(i)");
-  batch->array.offset = 1;
-  batch->array.length = rows;
-  auto table          = import(
-    *batch, {"b", "v"}, declared({duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::INTEGER}));
-  const auto booleans  = copy_column_to_host<bool>(table->get_column(0).view());
-  const auto integers  = copy_column_to_host<std::int32_t>(table->get_column(1).view());
-  const auto& nullable = table->get_column(1);
+  const int rows         = GENERATE(1, 7, 8, 31, 32, 33, 511, 512, 513);
+  const int child_offset = GENERATE(0, 1, 7);
+  CAPTURE(rows, child_offset);
+  auto batch = arrow_batch_from_sql(
+    "SELECT CASE WHEN i % 5 = 0 THEN NULL ELSE i % 3 = 0 END AS b, "
+    "CASE WHEN i % 7 = 0 THEN NULL ELSE i END::INTEGER AS v "
+    "FROM range(" +
+    std::to_string(rows + child_offset + 1) + ") t(i)");
+  auto& boolean_child  = *batch->array.children[0];
+  boolean_child.offset = child_offset;
+  boolean_child.length -= child_offset;
+  boolean_child.null_count = -1;
+  batch->array.offset      = 1;
+  batch->array.length      = rows;
+  const auto plan          = sirius::inspect_arrow_host_batch(
+    &batch->array,
+    &batch->schema,
+    "bit offsets",
+    {"b", "v"},
+    declared({duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::INTEGER}),
+    *std::pmr::new_delete_resource());
+  rmm::cuda_stream stream;
+  import_test_resource resource;
+  resource.counts->expected_stream = stream.value();
+  auto table =
+    sirius::import_arrow_host_table(plan, stream.view(), rmm::device_async_resource_ref{resource});
+  REQUIRE(resource.counts->attempts > 0);
+  const auto booleans       = copy_column_to_host<bool>(table->get_column(0).view());
+  const auto integers       = copy_column_to_host<std::int32_t>(table->get_column(1).view());
+  const auto& nullable      = table->get_column(1);
+  const auto& nullable_bool = table->get_column(0);
   REQUIRE(nullable.null_count() == rows / 7);
   std::vector<cudf::bitmask_type> mask((rows + 31) / 32);
+  std::vector<cudf::bitmask_type> bool_mask((rows + 31) / 32);
   if (rows >= 7) {
     REQUIRE(cudaMemcpy(mask.data(),
                        nullable.view().null_mask(),
                        mask.size() * sizeof(cudf::bitmask_type),
                        cudaMemcpyDeviceToHost) == cudaSuccess);
   }
+  const int bool_nulls = (child_offset + rows) / 5 - child_offset / 5;
+  REQUIRE(nullable_bool.null_count() == bool_nulls);
+  if (bool_nulls != 0) {
+    REQUIRE(cudaMemcpy(bool_mask.data(),
+                       nullable_bool.view().null_mask(),
+                       bool_mask.size() * sizeof(cudf::bitmask_type),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+  }
   for (int row = 0; row < rows; ++row) {
-    REQUIRE(booleans[row] == ((row + 1) % 2 == 0));
+    const auto source_row = child_offset + row + 1;
+    const bool bool_valid = source_row % 5 != 0;
+    if (bool_nulls != 0) {
+      REQUIRE(((bool_mask[row / 32] >> (row % 32)) & 1) == static_cast<unsigned>(bool_valid));
+    }
+    if (bool_valid) { REQUIRE(booleans[row] == (source_row % 3 == 0)); }
     const bool valid = (row + 1) % 7 != 0;
     if (rows >= 7) {
       REQUIRE(((mask[row / 32] >> (row % 32)) & 1) == static_cast<unsigned>(valid));
     }
     if (valid) { REQUIRE(integers[row] == row + 1); }
   }
+  table.reset();
+  stream.synchronize();
+  REQUIRE(resource.counts->live_bytes == 0);
+  REQUIRE_FALSE(resource.counts->wrong_stream);
 }
+
+#if defined(__linux__)
+TEST_CASE("arrow_host_import: actual import classifies failed drains and preserves causes",
+          "[arrow_host_import]")
+{
+  // Allocation failure + successful/failed drain, then failed success-path sync + failed drain.
+  const int scenario = GENERATE(0, 1, 2);
+  CAPTURE(scenario);
+  auto batch = arrow_batch_from_sql("SELECT i::INTEGER AS a, i::INTEGER AS b FROM range(32) t(i)");
+  bounded_host_resource host(std::numeric_limits<std::size_t>::max());
+  const auto plan = sirius::inspect_arrow_host_batch(
+    &batch->array,
+    &batch->schema,
+    "drain",
+    {"a", "b"},
+    declared({duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER}),
+    host);
+  rmm::cuda_stream stream;
+  import_test_resource resource(scenario == 2 ? -1 : 1);
+  resource.counts->expected_stream = stream.value();
+  import_drain_fault fault{stream.value(),
+                           *resource.counts,
+                           {scenario == 0 ? cudaSuccess : cudaErrorUnknown, cudaErrorInvalidValue}};
+  std::exception_ptr failure;
+  {
+    scoped_restore restore(active_import_drain_fault);
+    active_import_drain_fault = &fault;
+    try {
+      auto table = sirius::import_arrow_host_table(
+        plan, stream.view(), rmm::device_async_resource_ref{resource});
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  }
+  REQUIRE(failure != nullptr);
+  REQUIRE(fault.calls == (scenario == 2 ? 2 : 1));
+  REQUIRE(fault.live_bytes[fault.calls - 1] == 0);
+  for (int call = 0; call < fault.calls; ++call) {
+    REQUIRE(fault.actual_status[call] == cudaSuccess);
+  }
+  if (scenario != 0) {
+    try {
+      std::rethrow_exception(failure);
+      FAIL("missing terminal drain error");
+    } catch (const sirius::arrow_host_import_drain_error& error) {
+      REQUIRE(error.cuda_status() == (scenario == 2 ? cudaErrorInvalidValue : cudaErrorUnknown));
+      failure = error.original_failure();
+      REQUIRE(failure != nullptr);
+    }
+  }
+  if (scenario == 2) {
+    REQUIRE(fault.live_bytes[0] > 0);
+    REQUIRE_THROWS_AS(std::rethrow_exception(failure), cudf::cuda_error);
+  } else {
+    REQUIRE(resource.counts->failed);
+    REQUIRE_THROWS_MATCHES(std::rethrow_exception(failure),
+                           rmm::out_of_memory,
+                           ContainsSubstring("injected Arrow import allocation failure"));
+  }
+  REQUIRE(resource.counts->live_bytes == 0);
+  REQUIRE_FALSE(resource.counts->wrong_stream);
+  REQUIRE(batch->array.release != nullptr);
+  REQUIRE(batch->schema.release != nullptr);
+  REQUIRE(host.used > 0);
+  REQUIRE(cudaStreamQuery(stream.value()) == cudaSuccess);
+}
+#endif
 
 TEST_CASE("arrow_host_import: host staging limits unwind before device work and survive plan moves",
           "[arrow_host_import]")

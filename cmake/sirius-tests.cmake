@@ -106,6 +106,12 @@ add_dependencies(sirius_unittest sirius_nvtx_startup)
 target_link_options(sirius_unittest PRIVATE
                     "LINKER:--allow-multiple-definition")
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Only the test executable substitutes selected import drain results.
+  target_link_options(sirius_unittest PRIVATE
+                      "LINKER:--wrap=cudaStreamSynchronize")
+endif()
+
 # Isolated opt-in host allocation fault tests; the runner supplies exact
 # call-site ranges.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

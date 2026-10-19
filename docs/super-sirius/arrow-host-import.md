@@ -86,11 +86,20 @@ and allocator bookkeeping are not thereby charged or hard-bounded. Callers enfor
 their actual admission policies through the PMR/MR and retain the associated owners.
 These estimates are not a bound on native split planning or whole-process memory.
 
+Producer buffers and PMR staging may be pageable. CUDA may stage these transfers
+and block the calling host thread; the Async API does not promise overlap between
+imports. A pinned PMR affects normalized buffers only, so pinned producer storage
+is also needed when measuring pinned-source transfer performance. Pinned memory
+is not required for correctness, and no throughput guarantee is made here.
+
 ## Tests
 
 The unit tests use real DuckDB Arrow exports plus isolated structural mutations.
 They cover scalar values, slices/null masks, decimal constraints, invalid final
 columns before device allocation, allocation refusal/cleanup, and PMR limits.
+The Linux test executable also injects selected synchronization return statuses
+after draining real work, exercising import's terminal-error branch without
+poisoning the CUDA context. This does not qualify recovery from a failed device.
 Run the focused suite after building through the project's Pixi environment:
 
 ```sh
