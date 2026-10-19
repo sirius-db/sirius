@@ -18,8 +18,9 @@
 // Builds Substrait in the test because the FFI has no SQL helper.
 // Covers a result fragment, a relay_from chain, several fragments built before any runs (on one
 // and on two threads), build() and run()/drop on different threads, drop after build(), a build()
-// that fails after setup, execute_substrait, and pin_table/unpin_table. Spec errors and
-// failed-build rollback live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
+// that fails after setup, execute_substrait, pin_table/unpin_table, and byte-range splits of a
+// pinned file. Spec errors and failed-build rollback live in test_streaming_fragment.cpp and
+// test_sirius_ffi_fragment.cpp.
 
 #include "sirius/exception.hpp"
 #include "sirius/ffi.hpp"
@@ -38,6 +39,7 @@
 #include <source_location>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -65,6 +67,24 @@ std::string local_files_plan(std::string const& path)
   auto* item = root->mutable_input()->mutable_read()->mutable_local_files()->add_items();
   item->set_uri_file(path);
   item->mutable_parquet();
+  return serialize_plan(plan);
+}
+
+// One LocalFiles item per `{start, length}` byte range of `path`.
+std::string local_files_ranged_plan(
+  std::string const& path, std::vector<std::pair<std::uint64_t, std::uint64_t>> const& ranges)
+{
+  substrait::Plan plan;
+  auto* root = plan.add_relations()->mutable_root();
+  root->add_names("a");
+  auto* files = root->mutable_input()->mutable_read()->mutable_local_files();
+  for (auto const& [start, length] : ranges) {
+    auto* item = files->add_items();
+    item->set_uri_file(path);
+    item->set_start(start);
+    item->set_length(length);
+    item->mutable_parquet();
+  }
   return serialize_plan(plan);
 }
 
@@ -420,6 +440,48 @@ TEST_CASE("FFI pin_table serves scans of the pinned files, and unpin_table relea
   // The same name can be pinned again after an unpin, here on the host tier.
   REQUIRE(*ctx->pin_table(glob, "host", "ids", "a", "parquet", "") == "pinned 'ids' tier=host");
   REQUIRE(execute_i64s(*ctx, local_files_plan(high)) == high_rows);
+  REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
+}
+
+TEST_CASE("FFI byte-range splits of a pinned file read from disk and return each row once",
+          "[isolated_context][sirius_ffi][byte_range]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_pin_byte_ranges");
+  auto const path = scratch.file("ids.parquet");
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    // Several row groups, so each half of the file owns some of them.
+    auto copied =
+      con.Query("COPY (SELECT range::BIGINT AS a FROM range(30000)) TO " +
+                sirius::test::sql_literal(path) + " (FORMAT PARQUET, ROW_GROUP_SIZE 5000)");
+    REQUIRE(copied);
+    REQUIRE_FALSE(copied->HasError());
+  }
+  auto const size = static_cast<std::uint64_t>(fs::file_size(path));
+  auto const half = size / 2;
+
+  auto ctx         = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto const whole = execute_i64s(*ctx, local_files_plan(path));
+  REQUIRE(whole.size() == 30000);
+  REQUIRE(*ctx->pin_table(path, "gpu", "ids", "", "", "") == "pinned 'ids' tier=gpu");
+  REQUIRE(execute_i64s(*ctx, local_files_plan(path)) == whole);
+
+  // Each split is its own scan, as on two compute nodes. Served from the pin, each would return
+  // all 30000 rows.
+  auto const left  = execute_i64s(*ctx, local_files_ranged_plan(path, {{0, half}}));
+  auto const right = execute_i64s(*ctx, local_files_ranged_plan(path, {{half, size - half}}));
+  REQUIRE_FALSE(left.empty());
+  REQUIRE_FALSE(right.empty());
+  REQUIRE(left.size() < whole.size());
+  auto both = left;
+  both.insert(both.end(), right.begin(), right.end());
+  std::sort(both.begin(), both.end());
+  REQUIRE(both == whole);
+
+  REQUIRE(execute_i64s(*ctx, local_files_ranged_plan(path, {{0, half}, {half, size - half}})) ==
+          whole);
   REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
 }
 

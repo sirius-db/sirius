@@ -2618,6 +2618,10 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
     // Cached parquet batches have no per-row file provenance.
     if (p->has_requested_user_virtual_columns()) { return {}; }
+    // A byte-range split owns only some of a file's row groups, but a pin matches on the file set
+    // and would serve every pinned row to each of the K splits: K copies, no error. The plan-time
+    // probe in sirius_plan_get.cpp refuses the same scans.
+    if (p->has_byte_ranges()) { return {}; }
     // Exact match or strict file subset both pass here; the serve path
     // (try_match_cached_entry) additionally requires chunk provenance before it
     // serves a subset, because only provenance says which chunks hold which files.

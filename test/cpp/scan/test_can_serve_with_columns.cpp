@@ -168,6 +168,22 @@ TEST_CASE("cache_entry_info: parquet virtual columns always bypass a matching pi
   REQUIRE(pinned.can_serve_with_columns(scan).empty());
 }
 
+TEST_CASE("cache_entry_info: a parquet scan reading byte ranges bypasses a matching pin",
+          "[scan][can_serve][byte_range]")
+{
+  auto pinned = parquet_cache({"a.parquet", "b.parquet"}, {0});
+  parquet_ingestible_table_info scan;
+  fill(scan, {"a.parquet", "b.parquet"}, {0});
+
+  // (0,0) is a whole-file read, so the pin still serves it.
+  scan.resolved_file_ranges = {{}, {{0, 0}}};
+  REQUIRE(pinned.can_serve_with_columns(scan) == std::vector<std::size_t>{0});
+
+  scan.resolved_file_ranges = {{}, {{0, 100}, {100, 100}}};
+  REQUIRE(scan.has_byte_ranges());
+  REQUIRE(pinned.can_serve_with_columns(scan).empty());
+}
+
 TEST_CASE("cache_entry_info: duckdb same-table subset request hits with a gather projection",
           "[scan][can_serve]")
 {
