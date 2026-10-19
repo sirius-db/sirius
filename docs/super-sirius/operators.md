@@ -280,7 +280,7 @@ Uniqueness is detected by walking the DuckDB logical plan:
 - **GROUP BY** uniqueness on `LogicalAggregate`
 - Propagates through `LogicalFilter`, `LogicalOrder`, `LogicalLimit`, `LogicalTopN`, and `LogicalProjection`
 
-Only PRIMARY KEY is considered (not plain UNIQUE) due to NULL handling semantics with `null_equality::UNEQUAL`. IS NOT DISTINCT FROM joins are excluded since they require `null_equality::EQUAL`.
+Only PRIMARY KEY is considered (not plain UNIQUE) due to NULL handling semantics with `null_equality::UNEQUAL`. For a parquet scan of a pinned table, a column proven distinct at pin time (no nulls, no repeats) also counts, unless `pin_table_prove_unique_keys` is off; see [Pin-Proven Unique Join Keys](optimizations.md#pin-proven-unique-join-keys). IS NOT DISTINCT FROM joins are excluded since they require `null_equality::EQUAL`.
 
 Build/probe state machine for BUILD_PROBE mode (one instance per partition slot, driven by `build_probe_action`):
 ```mermaid
