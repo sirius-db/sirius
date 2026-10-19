@@ -68,6 +68,7 @@
 #include <data/sirius_converter_registry.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/load_balancing_scan_batch_coalescer.hpp>
@@ -1950,8 +1951,15 @@ TEST_CASE("a compressed split decoded with a join filter keeps the drop and the 
     auto channel              = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
     auto producer             = channel->register_producer({0});
     channel->freeze_registration();
+    auto const* published = filter.get();
     REQUIRE(producer.push_filter(0, std::move(filter)));
-    split->dynamic_filters = std::move(channel);
+    // A decode attaches only filters with a measured keep ratio worth probing.
+    auto consumer = std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+      channel, sirius::op::scan::consumer_config{}, sirius::op::scan::identity_bindings(1));
+    auto& gate = sirius::op::scan::detail::consumer_test_access::gate(*consumer);
+    gate.record_keep_ratio(8, 2, 1);
+    gate.record_filter_keep_ratio({published, 0}, 0.25, 1);
+    split->consumer = std::move(consumer);
     return split;
   };
   auto const require_rows = [&](cudf::table_view out, fsf::source_rows const& expected) {
@@ -2297,6 +2305,26 @@ TEST_CASE("Resident dequeue backstop rejects a stale query before processing",
   REQUIRE_THROWS_AS(scan.get_next_task_input_data(), certificate_incomplete);
   CHECK(observer.get_transparent_execution_stats().certificate_incompletes == 1);
   CHECK(observer.get_transparent_execution_stats().certificate_mismatches == 0);
+}
+
+TEST_CASE("a dynamic-filter consumer reserves decode headroom only when it can attach probes",
+          "[cached_serving][scan_manager][dynamic_filter]")
+{
+  auto& e    = env();
+  auto batch = make_test_batch(e, 64);
+  sirius::op::scan::scan_operator_input split(batch);
+  auto const channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  split.consumer     = std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+    channel, sirius::op::scan::consumer_config{}, std::vector<sirius::op::scan::binding>{});
+  auto const batch_bytes = split.get_estimated_size_in_bytes();
+  REQUIRE(batch_bytes > 0);
+  // Without decode bindings the consumer never attaches a probe, so the view estimate stands.
+  REQUIRE(split.get_estimated_working_set_size_in_bytes() == batch_bytes);
+  split.consumer = std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
+    channel, sirius::op::scan::consumer_config{}, sirius::op::scan::identity_bindings(1));
+  auto const expected =
+    sirius::decompression_pushdown_enabled() ? batch_bytes + batch_bytes / 4 : batch_bytes;
+  REQUIRE(split.get_estimated_working_set_size_in_bytes() == expected);
 }
 
 TEST_CASE("Cached workers reject a returned batch when connection interruption is observed",

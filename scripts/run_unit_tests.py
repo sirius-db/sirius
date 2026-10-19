@@ -14,7 +14,12 @@ The run has three steps:
              than two GPUs are visible.
   late_mat   The late-materialization tests with SIRIUS_EXP_LATE_MAT=1. The
              gate is read once per process, so these tests need a process of
-             their own.
+             their own. The hidden [.late_mat_fused] tests run alone in a
+             second process: they skip when either gate is off, and Catch2
+             fails a run in which every test skipped, so a misconfigured gate
+             fails the step instead of passing unnoticed. That process sets
+             SIRIUS_EXP_FUSED_SCAN_FILTER=1 to override an inherited value; the
+             test binary arms that gate itself only when it is unset.
 
 The run stops after a step that fails. Arguments after -- are Catch2 options
 passed to every process. Every process writes its console output (unittest.log)
@@ -43,8 +48,10 @@ STEPS = ("shards", "multi_gpu", "late_mat")
 STEP_SPECS = {
     "shards": "~[.]~[multi_gpu]",
     "multi_gpu": "[multi_gpu]~[.]",
-    "late_mat": "[late_mat],[deferred_query],[native_filter]",
+    "late_mat": "[late_mat]~[late_mat_fused],[deferred_query]~[late_mat_fused],"
+    "[native_filter]~[late_mat_fused]",
 }
+LATE_MAT_FUSED_SPEC = "[late_mat_fused]"
 TIMEOUT_MIN = {"shards": 45, "multi_gpu": 20, "late_mat": 20}
 SUMMARY_PREFIXES = ("All tests passed", "test cases:", "No tests ran")
 
@@ -227,13 +234,25 @@ def main() -> int:
             case "multi_gpu":
                 jobs = [Job(label=step, cmd=cmd, env={}, log_dir=log_root / step)]
             case "late_mat":
+                fused_cmd = cmd[:-1] + [LATE_MAT_FUSED_SPEC]
                 jobs = [
                     Job(
                         label=step,
                         cmd=cmd,
                         env={"SIRIUS_EXP_LATE_MAT": "1"},
                         log_dir=log_root / step,
-                    )
+                        prefix="[late_mat] ",
+                    ),
+                    Job(
+                        label="late_mat_fused",
+                        cmd=fused_cmd,
+                        env={
+                            "SIRIUS_EXP_LATE_MAT": "1",
+                            "SIRIUS_EXP_FUSED_SCAN_FILTER": "1",
+                        },
+                        log_dir=log_root / "late_mat_fused",
+                        prefix="[late_mat_fused] ",
+                    ),
                 ]
         with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
             try:
@@ -251,7 +270,7 @@ def main() -> int:
 
     print(f"\nUnit test summary (logs in {log_root}/<process>/):")
     for r in results:
-        print(f"{r.label:<10} exit {r.status:<4} {r.seconds:5.0f}s  {r.summary}")
+        print(f"{r.label:<14} exit {r.status:<4} {r.seconds:5.0f}s  {r.summary}")
     return 0 if all(r.status == 0 for r in results) else 1
 
 

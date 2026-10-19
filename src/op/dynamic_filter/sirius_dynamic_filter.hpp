@@ -513,7 +513,7 @@ class sirius_dynamic_filter_set {
   void ignore_columns(std::vector<std::size_t> const& cols);
 
   /// Filters one key binding publishes at most: one zone map and one membership filter.
-  static constexpr std::size_t filters_per_binding = 2;
+  static constexpr std::size_t FILTERS_PER_BINDING = 2;
 
   /**
    * @brief Registers one producer's target output columns
@@ -527,7 +527,7 @@ class sirius_dynamic_filter_set {
    *         channel object doesn't invalidate the survivor producer handle.
    */
   [[nodiscard]] producer register_producer(std::vector<std::size_t> planned_target_columns,
-                                           std::size_t filters_per_column = filters_per_binding);
+                                           std::size_t filters_per_column = FILTERS_PER_BINDING);
 
   /**
    * @brief Seals the producer set before execution or a manual plan's first observation

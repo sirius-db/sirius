@@ -42,10 +42,6 @@
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 
-namespace sirius::op {
-class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dynamic_filter.hpp)
-}
-
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
@@ -58,6 +54,7 @@ class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dyna
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/storage_lock.hpp>
 #include <io/types.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 
 namespace cucascade::memory {
 class fixed_size_host_memory_resource;
@@ -429,10 +426,10 @@ struct cached_scan_plan {
 /// may drop rows against the ranges while decoding, handing back an
 /// already-filtered batch. See @c sirius::pushdown_request; an empty request
 /// (the default) leaves every chunk decoding unfiltered.
-/// @p dynamic_filters is the operator's dynamic-filter channel (join builds
-/// publish into it mid-scan); the provider snapshots it PER BATCH onto the
-/// attached scan, so later batches legitimately see more filters. Null (the
-/// default) disables it.
+/// @p consumer is shared with the scan and its immediate dynamic-filter endpoint.
+/// It selects memberships for each compressed chunk through its decode bindings;
+/// an empty map attaches none. Each returned batch carries its own attachment history.
+///
 /// The attaches compose with @p mvcc_masks PER CHUNK: a masked slot also gets the mask
 /// itself (set_visibility_mask), so the decode compacts to visible survivors; a default
 /// slot gets the pushdown alone.
@@ -446,12 +443,12 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks                                         = {},
-  std::vector<insert_delta_split> delta_splits                           = {},
-  std::vector<cudf::data_type> normalization_targets                     = {},
-  bool has_physical_overrides                                            = false,
-  sirius::pushdown_request pushdown_req                                  = {},
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr);
+  mvcc_chunk_mask_set mvcc_masks                              = {},
+  std::vector<insert_delta_split> delta_splits                = {},
+  std::vector<cudf::data_type> normalization_targets          = {},
+  bool has_physical_overrides                                 = false,
+  sirius::pushdown_request pushdown_req                       = {},
+  std::shared_ptr<op::scan::dynamic_filter_consumer> consumer = nullptr);
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with

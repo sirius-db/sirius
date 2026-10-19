@@ -52,6 +52,14 @@
 namespace sirius {
 namespace op {
 
+std::unique_ptr<pipelineable_operator_data> cross_join_slice_data::with_batches_preserving_rows(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
+{
+  auto replacement = std::make_unique<cross_join_slice_data>(std::move(batches), slice, num_slices);
+  replacement->adopt_row_identity(*this);
+  return replacement;
+}
+
 static bool nlj_is_equality(sirius::comparison_type c)
 {
   return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
