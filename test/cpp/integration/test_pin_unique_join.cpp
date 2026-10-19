@@ -207,7 +207,26 @@ bool join_proven_unique(duckdb::Connection& con, std::string const& sql)
   return joins.front()->unique_build_keys;
 }
 
-void write_config(fs::path const& yaml_path)
+/// Writes a distinct key split over two files whose key ranges overlap (even and odd keys), so the
+/// pin's chunks overlap in range and only the exact stage can prove the key distinct.
+void generate_overlapping_dim(fs::path const& dir)
+{
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  for (int parity = 0; parity < 2; ++parity) {
+    run_generator(gen,
+                  "COPY (SELECT range * 2 + " + std::to_string(parity) +
+                    " AS k, range AS payload FROM range(" + std::to_string(dim_rows / 2) +
+                    ")) TO " +
+                    sirius::test::sql_literal(
+                      (dir / ("part." + std::to_string(parity) + ".parquet")).string()) +
+                    " (FORMAT PARQUET);");
+  }
+}
+
+/// @p extra_sections are appended under `sirius:` (indented by two spaces).
+void write_config(fs::path const& yaml_path, std::string const& extra_sections = "")
 {
   std::ofstream f(yaml_path);
   f << "sirius:\n"
@@ -230,6 +249,7 @@ void write_config(fs::path const& yaml_path)
        "    downgrade:\n"
        "      num_threads: 1\n"
        "      monitor_period: 10ms\n";
+  f << extra_sections;
 }
 
 void pin(duckdb::Connection& con, fs::path const& file, std::string const& name)
@@ -310,4 +330,59 @@ TEST_CASE("a pinned distinct parquet column proves a join's build keys unique",
   for (auto const* name : {"pin_unique_join_unique_dim", "pin_unique_join_dup_dim"}) {
     con.Query("CALL unpin_table('" + std::string{name} + "');");
   }
+}
+
+TEST_CASE("the exact-stage byte cap declines a column over the cap",
+          "[integration][pin_unique_join]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  sirius::test::scratch_dir scratch{"pin_unique_join_byte_cap"};
+  auto const& tmp       = scratch.path();
+  auto const dim_dir    = tmp / "overlap_dim";
+  auto const unused_dim = tmp / "unused_unique_dim.parquet";
+  auto const unused_dup = tmp / "unused_dup_dim.parquet";
+  auto const fact       = tmp / "fact.parquet";
+  fs::create_directories(dim_dir);
+  generate_parquet(unused_dim, unused_dup, fact);
+  generate_overlapping_dim(dim_dir);
+  auto const dim_glob = dim_dir / "*.parquet";
+
+  // A small scan batch makes each file its own pinned chunk, so the chunks overlap in range.
+  auto const yaml_path = tmp / "pin_unique_join_byte_cap.yaml";
+  write_config(yaml_path,
+               "  operator_params:\n"
+               "    scan_task_batch_size: 64KiB\n");
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con = local_env.make_connection();
+  set_option(con, "SET enable_duckdb_fallback = false;");
+  scoped_env const no_explicit_columns{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
+  auto const sql = join_query(fact, dim_glob);
+
+  SECTION("under the default cap the exact stage proves the key")
+  {
+    pin(con, dim_glob, "pin_unique_join_overlap_dim");
+    CHECK(join_proven_unique(con, sql));
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+  }
+
+  SECTION("a column over the cap is left unproven")
+  {
+    // One chunk of k alone is 80 KB, so a 1 KiB cap declines the column at its first chunk.
+    set_option(con, "SET pin_table_unique_exact_max_bytes = 1024;");
+    pin(con, dim_glob, "pin_unique_join_overlap_dim");
+    CHECK_FALSE(join_proven_unique(con, sql));
+    CHECK(gpu_answer(con, sql) == cpu_answer(sql));
+    set_option(con, "RESET pin_table_unique_exact_max_bytes;");
+  }
+
+  con.Query("CALL unpin_table('pin_unique_join_overlap_dim');");
 }

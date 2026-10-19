@@ -17,6 +17,7 @@
 #include "late_mat/pin_uniqueness.hpp"
 
 #include "log/logging.hpp"
+#include "sirius_config.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/reduction.hpp>
@@ -133,15 +134,15 @@ std::vector<bool> pin_unique_automatic_selection(std::vector<bool> const& explic
   return automatic;
 }
 
-std::size_t exact_uniqueness_row_cap(bool automatic)
+std::size_t exact_uniqueness_byte_cap(std::uint64_t configured_bytes,
+                                      std::uint64_t gpu_capacity_bytes)
 {
-  std::size_t const default_cap =
-    automatic ? static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()) : 300'000'000;
-  char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS");
-  if (v == nullptr || v[0] == '\0') { return default_cap; }
-  char* end         = nullptr;
-  auto const parsed = std::strtoull(v, &end, 10);
-  return (end == v || parsed == 0) ? default_cap : static_cast<std::size_t>(parsed);
+  if (configured_bytes > 0) { return static_cast<std::size_t>(configured_bytes); }
+  if (gpu_capacity_bytes == 0) {
+    return static_cast<std::size_t>(config::PIN_TABLE_UNIQUE_EXACT_FALLBACK_MAX_BYTES);
+  }
+  return static_cast<std::size_t>(static_cast<double>(gpu_capacity_bytes) *
+                                  config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION);
 }
 
 std::optional<bool> exact_distinct_over_chunks(std::span<cudf::column_view const> chunks,

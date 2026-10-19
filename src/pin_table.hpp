@@ -180,6 +180,9 @@ struct pin_materialization_options {
   /// Positional with @c probe_unique_columns: true = the column is observed automatically
   /// (see @c late_mat::pin_unique_automatic_selection). Empty = none.
   std::vector<bool> probe_unique_automatic;
+  /// Cap on one column's bytes in the exact uniqueness stage; 0 = a share of the GPU memory
+  /// space's capacity (see @c late_mat::exact_uniqueness_byte_cap).
+  std::uint64_t unique_exact_max_bytes = 0;
 };
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
