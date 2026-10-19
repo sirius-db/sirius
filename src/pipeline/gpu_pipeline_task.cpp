@@ -805,7 +805,37 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
         throw oom_reschedule_exception(
           std::move(output_data), operators.size(), "OOM restoring a deferral at the sink");
       }
-      publish_output(*output_data, materialized.get(), stream);
+      try {
+        publish_output(*output_data, materialized.get(), stream);
+      } catch (const rmm::out_of_memory& oom) {
+        // A sink that publishes nothing unless it returns (a partitioned STREAMING_SINK) is
+        // retried like an operator: none of its input reached a repository yet.
+        auto sink_op = pipeline->get_sink();
+        if (!sink_op || !sink_op->sink_publishes_on_success_only()) { throw; }
+        auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+        auto const bytes_to_materialize_input =
+          local_state.get_reservation_size_info()->bytes_to_materialize_input;
+        peak_bytes =
+          peak_bytes > bytes_to_materialize_input ? peak_bytes - bytes_to_materialize_input : 0;
+        std::size_t requested_bytes = 0;
+        if (auto const* cc_oom =
+              dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+          requested_bytes = cc_oom->requested_bytes;
+        }
+        SIRIUS_LOG_WARN(
+          "Pipeline {}: OOM in sink {} (nothing published), requested {} bytes, peak allocated {} "
+          "bytes, rescheduling task {}",
+          pipeline->get_pipeline_id(),
+          sink_op->get_name(),
+          requested_bytes,
+          peak_bytes,
+          get_task_id());
+        auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+        global.get_memory_history().record_on_failure(input_basis, peak_bytes);
+        materialized.reset();
+        throw oom_reschedule_exception(
+          std::move(output_data), operators.size(), "OOM in a sink that published nothing");
+      }
     }
 
     // Record memory metrics for future reservation estimates. Measured after publish_output, not
