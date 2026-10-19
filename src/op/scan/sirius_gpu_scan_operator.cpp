@@ -376,7 +376,7 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
   _native_physical_types.reserve(this->types.size());
   for (std::size_t column_idx = 0; column_idx < this->types.size(); ++column_idx) {
     auto const& type  = this->types[column_idx];
-    auto const native = sirius::try_get_cudf_type(type);
+    auto const native = sirius::get_cudf_type(type);
     if (!native) {
       throw internal_exception(
         "[sirius_gpu_scan_operator] output column {} ({}) has no native cuDF carrier",

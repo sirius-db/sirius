@@ -330,7 +330,7 @@ std::vector<checked_type> check_columns(const ArrowSchema& schema,
           types[i].decimal_scale() > types[i].decimal_precision()))) {
       refuse_declared();
     }
-    const auto mapped = try_get_cudf_type(types[i]);
+    const auto mapped = get_cudf_type(types[i]);
     if (!mapped || cudf::is_nested(*mapped)) { refuse_declared(); }
     const auto target  = *mapped;
     const auto carried = cudf_type_of_format(format_of(child), decimal);

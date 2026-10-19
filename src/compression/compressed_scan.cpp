@@ -21,18 +21,25 @@
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/selection.hpp>
 #include <codegen/util/stream_pool.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <log/logging.hpp>
 #include <sirius/exception.hpp>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius {
 
@@ -50,17 +57,8 @@ bool pushdown_request::selects_rows() const noexcept
 
 namespace {
 
-// Streams for cross-column decode parallelism, one pool per thread and device.
-// Work is submitted from the calling thread so cuCascade memory-reservation
-// tracking (attached to the calling thread) sees all allocations.
-// 4 is not a configuration parameter — it matches the typical SM occupancy
-// sweet spot for column-parallel decode without thread-spawn overhead.
+// Lane submission stays on the calling host thread for per-thread reservation accounting.
 constexpr std::size_t kDecodeStreams = 4;
-
-simpatico::stream_pool& decode_pool()
-{
-  return simpatico::thread_device_stream_pool(kDecodeStreams);
-}
 
 //===----------------------------------------------------------------------===//
 // Per-chunk capability probe
@@ -332,6 +330,7 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
                                                       std::span<const std::size_t> selected,
                                                       pushdown_request const& request,
                                                       decode_visibility_mask const& keep_mask,
+                                                      std::span<const ::cuda::stream_ref> lanes,
                                                       ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr,
                                                       pushdown_outcome& outcome)
@@ -417,16 +416,10 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   }
 
   sirius::codegen::scan_filter_result result;
-  std::string error;
-  auto table = simpatico::decompress_scan_filter(
-    chunk, selected, wave_request, result, decode_pool(), stream, mr, &error);
-  // The decode synchronized `stream`; re-point the selection buffers there
-  // anyway so their teardown follows the batch's ordering.
+  auto table =
+    simpatico::decompress_scan_filter(chunk, selected, wave_request, result, lanes, stream, mr);
+  // Rebind selection buffers so their deallocation follows the caller's stream ordering.
   result.set_stream(stream);
-  if (!error.empty()) {
-    SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-      "[decompression-pushdown] assembly REFUSED ({}); the batch decoded plainly", error);
-  }
   // row_filtered only when the decode carried every conjunct of the scan's own filter: a partially
   // applied request must leave the batch untagged so the scan evaluates the residual (re-checking
   // already-applied conjuncts on the surviving rows is idempotent).
@@ -508,9 +501,8 @@ decompression_pushdown_scan::with_membership_probes(
 std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::for_chunk(
   simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const
 {
-  // An in-place equality answer is only worth asking for where the plan can
-  // resolve the predicate without materialising the column (a dictionary root);
-  // pushing it into any other plan is correct but only moves the comparison.
+  // Non-dictionary BOOL8 requests disable fused row filtering, so retain only dictionary
+  // predicates.
   auto narrowed  = _request;
   bool any_asked = false;
   for (std::size_t i = 0; i < narrowed.columns.size(); ++i) {
@@ -593,12 +585,15 @@ decompression_pushdown_scan::compaction_forecast decompression_pushdown_scan::fo
 // Entry point
 //===----------------------------------------------------------------------===//
 
-decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
-                                   std::span<const std::size_t> selected,
-                                   decompression_pushdown_scan const* scan,
-                                   decode_visibility_mask const& keep_mask,
-                                   ::cuda::stream_ref stream,
-                                   rmm::device_async_resource_ref mr)
+decompress_result decompress_chunk(
+  simpatico::compressed_table const& chunk,
+  std::span<const std::size_t> selected,
+  decompression_pushdown_scan const* scan,
+  decode_visibility_mask const& keep_mask,
+  cucascade::memory::memory_space const& space,
+  cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope tracking_scope,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
 {
   decompress_result out;
   static pushdown_request const no_request;
@@ -611,14 +606,59 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
     predicates.size(),
     request.empty());
 
-  if (!request.empty() && !request.row_selection_disabled) {
+  if (space.get_tier() != cucascade::memory::Tier::GPU ||
+      space.get_device_id() != rmm::get_current_cuda_device().value()) {
+    throw std::logic_error(
+      "decompress_chunk: the memory space is not a GPU space on the current device");
+  }
+  if (space.get_memory_resource_of<cucascade::memory::Tier::GPU>() == nullptr) {
+    throw std::logic_error("decompress_chunk: missing GPU reservation allocator");
+  }
+  // Per-stream reservations require the caller's stream; per-thread reservations cover auxiliary
+  // lanes. Count mask sources as well as output columns so multiple filters on one column can run
+  // concurrently.
+  std::size_t lane_count = 1;
+  if (tracking_scope ==
+      cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD) {
+    std::size_t mask_sources = 0;
+    if (!request.empty() && !request.row_selection_disabled) {
+      for (auto const& entry : request.columns) {
+        mask_sources +=
+          (entry.range ? 1 : 0) + (entry.equals_any.empty() ? 0 : 1) + entry.membership.size();
+      }
+    }
+    lane_count =
+      std::clamp<std::size_t>(std::max(selected.size(), mask_sources), 1, kDecodeStreams);
+  }
+
+  auto all_lanes = [stream]<std::size_t... I>(std::index_sequence<I...>) {
+    return std::array<::cuda::stream_ref, kDecodeStreams>{((void)I, stream)...};
+  }(std::make_index_sequence<kDecodeStreams>{});
+  if (lane_count > 1) {
+    auto& pool = simpatico::thread_device_stream_pool(kDecodeStreams);
+    if (pool.streams.size() < lane_count) {
+      throw std::logic_error("decompress_chunk: decode pool has too few streams");
+    }
+    // Order lane reads after input writes queued on the caller's stream.
+    auto const inputs_ready = stream.record_event();
+    for (std::size_t i = 0; i < lane_count; ++i) {
+      all_lanes[i] = ::cuda::stream_ref{pool.streams[i]};
+      all_lanes[i].wait(inputs_ready);
+    }
+  }
+  std::span<const ::cuda::stream_ref> const lanes{all_lanes.data(), lane_count};
+  // A visibility mask can still participate in pushdown when scan row selection is disabled.
+  // If no supported filter source remains, the ordinary decode leaves the mask for the scan to
+  // apply.
+  bool const has_pushdown =
+    (!request.empty() && !request.row_selection_disabled) || keep_mask.has_mask();
+  if (has_pushdown) {
     out.table =
-      decompress_with_pushdown(chunk, selected, request, keep_mask, stream, mr, out.outcome);
+      decompress_with_pushdown(chunk, selected, request, keep_mask, lanes, stream, mr, out.outcome);
   }
   if (!out.table) {
-    out.table = predicates.empty()
-                  ? simpatico::decompress(chunk, selected, decode_pool(), mr)
-                  : simpatico::decompress(chunk, selected, predicates, decode_pool(), mr);
+    out.table = predicates.empty() ? simpatico::decompress(chunk, selected, lanes, mr)
+                                   : simpatico::decompress(chunk, selected, predicates, lanes, mr);
   }
   // An active equality directive yields BOOL8 on every path — the filtered decode and the plain
   // rerun alike — so the substituted positions are exactly the active entries the decoded table

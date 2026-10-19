@@ -232,7 +232,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
           uint64_t narrow_columns = 0;
           for (std::size_t column_idx = 0; column_idx < width; ++column_idx) {
             if (view.column(static_cast<cudf::size_type>(column_idx)).type() !=
-                sirius::get_cudf_type(types[column_idx])) {
+                sirius::require_cudf_type(types[column_idx])) {
               ++narrow_columns;
             }
           }

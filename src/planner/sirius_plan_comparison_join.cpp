@@ -535,7 +535,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           targets[entry->second].key_bindings.push_back(
             {.admitted_key_index   = key_index,
              .channel_push_ordinal = terminal.ordinal,
-             .probe_storage_type   = sirius::try_get_cudf_type(scan.types[terminal.ordinal])
+             .probe_storage_type   = sirius::get_cudf_type(scan.types[terminal.ordinal])
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
           scan_bound = true;
         }

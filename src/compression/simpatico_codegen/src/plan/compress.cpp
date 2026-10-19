@@ -220,7 +220,26 @@ struct CompressWalk {
   void emit_bitjoin_node(NodeId n);
   bool emit_fused_node(NodeId n, cudf::column_view col);
   void emit_generic_node(NodeId n, cudf::column_view col);
+  void publish_dictionary_key_width_hint(NodeId n, compressed_representation const& repr);
 };
+
+// The reader recovers the width only from a self-stored representation or a terminal `keys_offsets`
+// output (stored as an identity leaf); a consumed `keys_offsets` output is compressed further and
+// must stay unknown here too so in-memory and deserialized tables take the same decode routes.
+void CompressWalk::publish_dictionary_key_width_hint(NodeId n,
+                                                     compressed_representation const& repr)
+{
+  auto const* dictionary = dynamic_cast<dictionary_compressed_representation const*>(&repr);
+  if (!dictionary) return;
+  PlanNode& node = tree.nodes[n];
+  for (size_t idx = 0; idx < node.output_names.size(); ++idx) {
+    if (node.output_names[idx] == "keys_offsets" &&
+        consumer_by_input.count(ValueId{n, static_cast<ChannelId>(idx)})) {
+      return;
+    }
+  }
+  node.dictionary_key_width_hint = dictionary->constant_key_width;
+}
 
 void CompressWalk::emit_path(ValueId v)
 {
@@ -507,6 +526,7 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   // consumers release it and then is freed. node.meta persists and carries
   // uncompressed_size / original_type_id / algorithm to the decode path.
   tree.nodes[n].meta = repr->describe_meta();
+  publish_dictionary_key_width_hint(n, *repr);
 
   if (node.output_names.empty()) {
     release_column(input_val);

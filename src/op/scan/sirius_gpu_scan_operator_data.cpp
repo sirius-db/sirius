@@ -306,6 +306,7 @@ void scan_operator_input::prepare_for_processing(
       mut.convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
       record_decode_outcome(mut.get_data());
+
       // Conversion produces a fresh owned table for this split (raw GPU pins already use a plain
       // gpu_table_representation, so they never reach this branch), so a filter-free scan may
       // transfer its columns without touching shared pin storage. A decode-row-filtered split has
