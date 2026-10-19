@@ -190,9 +190,15 @@ table is pinned uncompressed.
 | `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
 | `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Directory of per-table Simpatico plan files. An empty path leaves compression inactive. |
+| `prove_unique_keys` | `pin_table_prove_unique_keys` | bool | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and observes only the columns late materialization names. |
+| `unique_exact_max_bytes` | `pin_table_unique_exact_max_bytes` | bytes | 0 (auto) | Cap on one column in the pin-time exact uniqueness check, which sorts the whole column when its chunks overlap in range. The cap bounds the concatenated column; the check's peak GPU use is about three times that. A column past the cap stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
 
 The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
 `max_compressed_fraction` values instead of silently changing retention behavior.
+
+`prove_unique_keys` and `unique_exact_max_bytes` are not about compression; they live in this
+section because it holds the `pin_table` settings. See
+[Pin-Proven Unique Join Keys](optimizations.md#pin-proven-unique-join-keys).
 
 ### How Downgrade Thresholds Work
 
@@ -876,6 +882,8 @@ retention gates.
 | `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). |
+| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time and use those facts as join-key proofs (single-pass distinct hash join). Affects pins and plans made after it is set. |
+| `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on one column in the pin-time exact uniqueness check; `0` uses 10% of the GPU memory space capacity. |
 
 Both size gates are evaluated on the narrowed table when compressed materialization is active.
 See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authoring, and results.
@@ -890,7 +898,7 @@ still an experimental optimization, not a normal session choice.
 | `SIRIUS_EXP_LATE_MAT` | off | The master gate. Carries a pin-order rowid instead of scanned values for a GPU-tier pinned table, restoring them at the far end. |
 | `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` | off | Columns the pin-time uniqueness probe observes: `all`, a name list, or `none`. Required for a group-by-rowid ride or a rider to be admissible at all. |
 
-Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
+Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
 gate table, the mechanism, and results.
 
