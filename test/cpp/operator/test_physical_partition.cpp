@@ -45,6 +45,7 @@
 #include <future>
 #include <numeric>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 using namespace duckdb;
@@ -1263,4 +1264,62 @@ TEST_CASE("sibling partition sizing reports the sizing side's rows", "[physical_
 
   REQUIRE(f.partition.get_next_task_input_data());
   REQUIRE(f.consumer.rows == std::vector<uint64_t>{drives ? 100u : 30u});
+}
+
+TEST_CASE("fixed hash routing and concat-all assemble fragmented input for an opaque consumer",
+          "[physical_partition][physical_concat]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  auto types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_partition router(types, 6, partition_spec{{0}});
+  sirius_physical_concat concat(types, 6, true);
+  sirius_physical_operator consumer(SiriusPhysicalOperatorType::WINDOW, types, 6);
+  cucascade::shared_data_repository concat_repo;
+  cucascade::shared_data_repository consumer_repo;
+  auto producer             = std::make_shared<controllable_pipeline>(false);
+  auto concat_port          = std::make_unique<sirius_physical_operator::port>();
+  concat_port->type         = MemoryBarrierType::PARTIAL;
+  concat_port->repo         = &concat_repo;
+  concat_port->src_pipeline = producer;
+  concat.add_port("default", std::move(concat_port));
+  auto consumer_port  = std::make_unique<sirius_physical_operator::port>();
+  consumer_port->type = MemoryBarrierType::FULL;
+  consumer_port->repo = &consumer_repo;
+  consumer.add_port("default", std::move(consumer_port));
+  router.add_next_port_after_sink({&concat, "default"});
+  concat.add_next_port_after_sink({&consumer, "default"});
+  router.set_fixed_layout({partition_mode::hash, partition_placement::unpinned(4)});
+  for (auto const& values : std::vector<std::vector<int32_t>>{{1, 2, 1}, {2, 3, 1}}) {
+    auto batch = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
+    // Only the key column is used in this fixture; payload/schema preservation is covered above.
+    auto output = router.execute(pipelineable_operator_data({batch}), default_stream());
+    router.sink(*output, default_stream());
+    CHECK_FALSE(concat.get_next_task_input_data());
+  }
+  producer->finished = true;
+  std::vector<int32_t> rows;
+  std::unordered_map<int32_t, std::size_t> destinations;
+  std::size_t tasks = 0;
+  while (auto input = concat.get_next_task_input_data()) {
+    auto output         = concat.execute(*input, default_stream());
+    auto const& indexed = dynamic_cast<partitioned_operator_data const&>(*output);
+    REQUIRE(indexed.get_partition_idx());
+    auto const values = copy_column_to_host<int32_t>(
+      sirius::get_cudf_table_view(*indexed.get_data_batches().front()).column(0));
+    for (auto key : values) {
+      auto entry = destinations.emplace(key, *indexed.get_partition_idx()).first;
+      CHECK(entry->second == *indexed.get_partition_idx());
+      rows.push_back(key);
+    }
+    concat.sink(*output, default_stream());
+    ++tasks;
+  }
+  std::sort(rows.begin(), rows.end());
+  CHECK(rows == std::vector<int32_t>{1, 1, 1, 2, 2, 3});
+  CHECK(tasks == 4);
+  CHECK(consumer_repo.num_partitions() == 4);
+  CHECK(consumer_repo.total_size() == 4);
 }
