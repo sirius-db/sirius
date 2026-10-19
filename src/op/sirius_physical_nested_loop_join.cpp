@@ -718,7 +718,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       if (expr.holds<sirius::ast::reference>()) {
         auto const& ref   = expr.get<sirius::ast::reference>();
         auto const column = table.column(ref.column_index);
-        if (column.type() == sirius::get_cudf_type(ref.return_type())) {
+        if (column.type() == sirius::require_cudf_type(ref.return_type())) {
           col_views.push_back(column);
           return join_input_index;
         }

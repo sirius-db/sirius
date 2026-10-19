@@ -153,7 +153,7 @@ cudf::data_type pin_native_type(cudf::data_type decoded_type,
                                 duckdb::LogicalType const* declared_type)
 {
   if (declared_type == nullptr) { return decoded_type; }
-  auto const native = sirius::try_get_cudf_type(sirius::from_duckdb(*declared_type));
+  auto const native = sirius::get_cudf_type(sirius::from_duckdb(*declared_type));
   return native.value_or(decoded_type);
 }
 

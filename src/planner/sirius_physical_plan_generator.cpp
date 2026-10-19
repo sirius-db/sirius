@@ -913,7 +913,7 @@ void require_complete_native_scan_schema(const sirius::op::sirius_physical_table
 {
   for (std::size_t column_idx = 0; column_idx < scan.types.size(); ++column_idx) {
     auto const& type = scan.types[column_idx];
-    if (sirius::try_get_cudf_type(type)) { continue; }
+    if (sirius::get_cudf_type(type)) { continue; }
     throw duckdb::NotImplementedException(
       "GPU scan output column %llu (%s) has no native cuDF "
       "carrier",
@@ -2096,7 +2096,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = nullptr;
 
   // SQLNULL-typed columns (e.g. an uncast NULL in VALUES) have no cuDF
-  // representation — get_cudf_type() / fixed_width_byte_size() reject them at
+  // representation — require_cudf_type() / fixed_width_byte_size() reject them at
   // execution time, after the GPU plan is already running. Reject the plan
   // here instead so transparent execution falls back to DuckDB CPU.
   for (const auto& type : op.types) {
