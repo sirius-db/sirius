@@ -227,6 +227,11 @@ Slot credits remain occupied until that local disposal finishes; out-of-lock uni
 and failure reporting are also counted until completion. Release callbacks may make bounded,
 nonthrowing gate observations or notifications, but must not synchronously drain or destroy
 their own coordinator. Normal stop notifications coalesce with an active cancellation sweep.
+Stopping cancels the per-query dispatcher shared by preparation and cached scan work.
+Pending jobs are discarded without running their computation; their captures are released
+outside the gate and remain accounted until disposal completes. Other queries retain their
+own dispatchers. After preparation becomes quiescent, late stop notifications leave the
+retired dispatcher untouched; query work leases still protect the remaining execution users.
 Explicit unit retirement returns registry membership, not a physical
 byte reservation. External ready snapshots, provider caches and published consumer inputs
 keep their existing ownership; preparation quiescence does not invalidate them.

@@ -99,6 +99,8 @@ struct preparation_coordinator::state {
   {
     preparation_gate::callback_use use(gate);
     lock_type lock(gate->mutex);
+    // finish() drained accepted callbacks; late notifications need no dispatcher.
+    if (phase == lifecycle::quiescent) return;
     gate->closed = true;
     gate->cv.notify_all();
     // A release may notify stop again. One sweep owns cancellation and discarded

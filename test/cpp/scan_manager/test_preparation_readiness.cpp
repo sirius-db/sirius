@@ -28,6 +28,7 @@
 #include <deque>
 #include <future>
 #include <mutex>
+#include <stop_token>
 using namespace sirius::scan_manager;
 using namespace std::chrono_literals;
 namespace {
@@ -575,6 +576,47 @@ TEST_CASE("Dependency disposal keeps drain pending through terminal cleanup",
   CHECK_FALSE(f.owner_error);
   CHECK(f.completion.has_error() == (mode == operation::fail));
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("Quiescent preparation ignores late dispatcher stop notifications",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  auto failure = GENERATE(false, true);
+  CAPTURE(failure);
+  sirius::exec::static_thread_pool pool(1);
+  std::optional<sirius::exec::scoped_dispatcher> dispatcher(std::in_place, pool);
+  sirius::pipeline::completion_handler completion;
+  preparation_coordinator coordinator(completion, *dispatcher, preparation_config{}.resolve(1));
+  coordinator.arm();
+  coordinator.run_on_query_thread();
+  REQUIRE(coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+
+  // Transparent replacement makes a stale borrow observable without accessing a dead mutex.
+  dispatcher.reset();
+  dispatcher.emplace(pool);
+  auto paused  = std::make_shared<hold>();
+  auto drain   = std::shared_ptr<void>(nullptr, [&](void*) {
+    dispatcher->request_stop();
+    dispatcher->wait_for_all();
+  });
+  auto release = std::shared_ptr<hold>(paused.get(), [paused](hold*) { paused->release(); });
+  std::promise<std::stop_token> started;
+  auto running = started.get_future();
+  dispatcher->enqueue([paused, started = std::move(started)](std::stop_token token) mutable {
+    started.set_value(token);
+    paused->wait();
+  });
+  REQUIRE(running.wait_for(1s) == std::future_status::ready);
+  auto token = running.get();
+  if (failure)
+    completion.report_error("late completion failure");
+  else
+    completion.mark_completed();
+  coordinator.request_stop(stop_reason::normal_eos);
+  coordinator.request_stop(stop_reason::normal_eos);
+  CHECK_FALSE(token.stop_requested());
+  CHECK(completion.has_error() == failure);
+  CHECK(coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 
 TEST_CASE("Final release stop notifications coalesce while units retire themselves",
