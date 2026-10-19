@@ -834,6 +834,164 @@ __global__ void rotate_rows_kernel(
   }
 }
 
+/// The same products and order for widths that are a multiple of 16, faster: a block takes 64 rows
+/// x 16 Q components, each thread 4 consecutive rows x Q consecutive components, so its operands
+/// come from shared memory as vectors and each value loaded feeds 4 or Q multiply-adds (the 64 x
+/// 64 tiles above feed 2 per load, and leave a third of a 96-wide rotation's tiles empty). Deep10M
+/// int8 lists (10M x 96, rotated twice): 41 ms a pass in rotate_rows_kernel on an RTX A5000.
+constexpr int kWideRowsPerThread = 8;  // rows per thread of the wide kernel (block: 16 x that)
+
+// With kMinMax the rotated rows are not written: each component's minimum and maximum over them
+// go to min_b / max_b (order-preserving bits, as column_min_max), the values those rows would hold.
+template <int Q, int R, bool kMinMax = false>
+__global__ void __launch_bounds__(256) rotate_rows_wide_kernel(float const* __restrict__ x,
+                                                               int64_t rows,
+                                                               int64_t d,
+                                                               float const* __restrict__ r,
+                                                               float* out,
+                                                               unsigned* min_b = nullptr,
+                                                               unsigned* max_b = nullptr)
+{
+  constexpr int kRows  = 16 * R;
+  constexpr int kCols  = 16 * Q;
+  constexpr int kPitch = kCols + 4;  // keeps every row 16-byte aligned
+  __shared__ __align__(16) float xs[kRotStep][kRows + 4];
+  __shared__ __align__(16) float rs[kRotStep][kPitch];
+  auto const row0 = static_cast<int64_t>(blockIdx.x) * kRows;
+  auto const col0 = static_cast<int64_t>(blockIdx.y) * kCols;
+  int const tx    = threadIdx.x % 16;
+  int const ty    = threadIdx.x / 16;
+  float acc[R][Q] = {};
+  for (int64_t k0 = 0; k0 < d; k0 += kRotStep) {
+    // Four consecutive components of a row per 16-byte load: kRows rows of x, kCols rows of r.
+    for (int e = threadIdx.x; e < kRows * 4; e += 256) {
+      int const i = e / 4, kq = (e % 4) * 4;
+      float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (row0 + i < rows) { v = *reinterpret_cast<float4 const*>(x + (row0 + i) * d + k0 + kq); }
+      xs[kq][i]     = v.x;
+      xs[kq + 1][i] = v.y;
+      xs[kq + 2][i] = v.z;
+      xs[kq + 3][i] = v.w;
+    }
+    for (int e = threadIdx.x; e < kCols * 4; e += 256) {
+      int const c = e / 4, kq = (e % 4) * 4;
+      float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (col0 + c < d) { v = *reinterpret_cast<float4 const*>(r + (col0 + c) * d + k0 + kq); }
+      rs[kq][c]     = v.x;
+      rs[kq + 1][c] = v.y;
+      rs[kq + 2][c] = v.z;
+      rs[kq + 3][c] = v.w;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < kRotStep; ++kk) {
+      float a[R];
+#pragma unroll
+      for (int p = 0; p < R; p += 4) {
+        float4 const a4 = *reinterpret_cast<float4 const*>(&xs[kk][R * ty + p]);
+        a[p]            = a4.x;
+        a[p + 1]        = a4.y;
+        a[p + 2]        = a4.z;
+        a[p + 3]        = a4.w;
+      }
+      float b[Q];
+#pragma unroll
+      for (int q = 0; q < Q; ++q) {
+        b[q] = rs[kk][tx * Q + q];
+      }
+#pragma unroll
+      for (int p = 0; p < R; ++p) {
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+          acc[p][q] = fmaf(a[p], b[q], acc[p][q]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if constexpr (kMinMax) {
+    // This thread's rows per component, then the 16 thread rows of each component combined.
+    __shared__ float lo_s[16][kCols], hi_s[16][kCols];
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+      float lo = INFINITY, hi = -INFINITY;
+#pragma unroll
+      for (int p = 0; p < R; ++p) {
+        if (row0 + R * ty + p < rows) {
+          lo = fminf(lo, acc[p][q]);
+          hi = fmaxf(hi, acc[p][q]);
+        }
+      }
+      lo_s[ty][tx * Q + q] = lo;
+      hi_s[ty][tx * Q + q] = hi;
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < kCols; c += 256) {
+      if (col0 + c >= d) { continue; }
+      float lo = INFINITY, hi = -INFINITY;
+#pragma unroll
+      for (int t = 0; t < 16; ++t) {
+        lo = fminf(lo, lo_s[t][c]);
+        hi = fmaxf(hi, hi_s[t][c]);
+      }
+      atomicMin(min_b + col0 + c, ordered_bits(lo));
+      atomicMax(max_b + col0 + c, ordered_bits(hi));
+    }
+  } else {
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+      auto const i = row0 + R * ty + p;
+      if (i >= rows) { continue; }
+#pragma unroll
+      for (int q = 0; q < Q; ++q) {
+        auto const j = col0 + tx * Q + q;
+        if (j < d) { out[i * d + j] = acc[p][q]; }
+      }
+    }
+  }
+}
+
+/// The wide kernel's tile width for @p d: components cut into as few tiles of at most 128 as
+/// possible, each a multiple of 16 (16 Q components). 0 when the wide kernel does not apply.
+int wide_rotation_q(int64_t d, float const* x, float const* rotation)
+{
+  bool const aligned = reinterpret_cast<std::uintptr_t>(x) % 16 == 0 &&
+                       reinterpret_cast<std::uintptr_t>(rotation) % 16 == 0;
+  if (d % 16 != 0 || d > 1024 || !aligned) { return 0; }
+  auto const tiles = (d + 127) / 128;
+  return static_cast<int>((d / tiles + 15) / 16);
+}
+
+template <bool kMinMax>
+void launch_wide_rotation(int q,
+                          float const* x,
+                          int64_t rows,
+                          int64_t d,
+                          float const* rotation,
+                          float* out,
+                          unsigned* min_b,
+                          unsigned* max_b,
+                          rmm::cuda_stream_view stream)
+{
+  constexpr int R = kWideRowsPerThread;
+  dim3 const grid(static_cast<unsigned>((rows + 16 * R - 1) / (16 * R)),
+                  static_cast<unsigned>((d + 16 * q - 1) / (16 * q)));
+  auto go = [&](auto kernel) {
+    kernel<<<grid, 256, 0, stream.value()>>>(x, rows, d, rotation, out, min_b, max_b);
+  };
+  switch (q) {
+    case 1: go(rotate_rows_wide_kernel<1, R, kMinMax>); break;
+    case 2: go(rotate_rows_wide_kernel<2, R, kMinMax>); break;
+    case 3: go(rotate_rows_wide_kernel<3, R, kMinMax>); break;
+    case 4: go(rotate_rows_wide_kernel<4, R, kMinMax>); break;
+    case 5: go(rotate_rows_wide_kernel<5, R, kMinMax>); break;
+    case 6: go(rotate_rows_wide_kernel<6, R, kMinMax>); break;
+    case 7: go(rotate_rows_wide_kernel<7, R, kMinMax>); break;
+    default: go(rotate_rows_wide_kernel<8, R, kMinMax>); break;
+  }
+  CUDF_CHECK_CUDA(stream.value());
+}
+
 }  // namespace
 
 void rotate_rows(float const* x,
@@ -844,10 +1002,31 @@ void rotate_rows(float const* x,
                  rmm::cuda_stream_view stream)
 {
   if (rows == 0) { return; }
-  dim3 const grid(static_cast<unsigned>((rows + kRotTile - 1) / kRotTile),
-                  static_cast<unsigned>((d + kRotTile - 1) / kRotTile));
+  auto const row_blocks = static_cast<unsigned>((rows + kRotTile - 1) / kRotTile);
+  // A width that is a multiple of 16 (every INT8 one) goes to the wide kernel.
+  if (auto const q = wide_rotation_q(d, x, rotation); q > 0) {
+    launch_wide_rotation<false>(q, x, rows, d, rotation, out, nullptr, nullptr, stream);
+    return;
+  }
+  dim3 const grid(row_blocks, static_cast<unsigned>((d + kRotTile - 1) / kRotTile));
   rotate_rows_kernel<<<grid, 256, 0, stream.value()>>>(x, rows, d, rotation, out);
   CUDF_CHECK_CUDA(stream.value());
+}
+
+bool rotate_rows_min_max(float const* x,
+                         int64_t rows,
+                         int64_t d,
+                         float const* rotation,
+                         unsigned int* min_bits,
+                         unsigned int* max_bits,
+                         rmm::cuda_stream_view stream)
+{
+  auto const q = wide_rotation_q(d, x, rotation);
+  if (q == 0) { return false; }
+  if (rows > 0) {
+    launch_wide_rotation<true>(q, x, rows, d, rotation, nullptr, min_bits, max_bits, stream);
+  }
+  return true;
 }
 
 void quantize_rows_int8(float const* x,

@@ -264,6 +264,7 @@ set(TEST_SOURCES
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/vss/test_bound_filter.cpp
+    test/cpp/vss/test_code_rotation.cpp
     test/cpp/vss/test_brute_force_search.cpp
     test/cpp/vss/test_brute_force_threshold.cpp
     test/cpp/vss/test_cudf_raft_interop.cpp

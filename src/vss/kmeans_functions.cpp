@@ -610,13 +610,18 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                         stream);
       }
       if (want_int8) {
-        column_min_max(
-          rotated_rows(list_column_as_dataset_view(staged.view, dim).data_handle(), rows),
-          rows,
-          dim,
-          col_min->data(),
-          col_max->data(),
-          stream);
+        auto const* chunk_rows = list_column_as_dataset_view(staged.view, dim).data_handle();
+        // A rotation's range is taken as the rows are rotated, without writing them out.
+        if (!rotation || !rotate_rows_min_max(chunk_rows,
+                                              rows,
+                                              dim,
+                                              static_cast<float const*>(rotation->data()),
+                                              col_min->data(),
+                                              col_max->data(),
+                                              stream)) {
+          column_min_max(
+            rotated_rows(chunk_rows, rows), rows, dim, col_min->data(), col_max->data(), stream);
+        }
       }
       // Before the copy below, which waits for the labels: into pageable memory it is synchronous.
       walk.prefetch_after(i);

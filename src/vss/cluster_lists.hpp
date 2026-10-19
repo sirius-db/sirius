@@ -343,6 +343,16 @@ void rotate_rows(float const* x,
                  float* out,
                  rmm::cuda_stream_view stream);
 
+/// column_min_max over the rows rotate_rows would write, without writing them: false (nothing
+/// done) when that path does not apply (a width not a multiple of 16, or unaligned pointers).
+[[nodiscard]] bool rotate_rows_min_max(float const* x,
+                                       std::int64_t rows,
+                                       std::int64_t d,
+                                       float const* rotation,
+                                       unsigned int* min_bits,
+                                       unsigned int* max_bits,
+                                       rmm::cuda_stream_view stream);
+
 /// How far rotate_rows' result for a row x may sit from the exact rotation, as a multiple of |x|:
 /// each component is a d-term FP32 dot product with an orthonormal row (error at most about
 /// d u |x|, u = 2^-24), with the rotation itself rounded to FP32, over sqrt(d) components.
