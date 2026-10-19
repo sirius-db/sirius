@@ -826,6 +826,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   REQUIRE(result->RowCount() == 1);
   CHECK(result->Collection().GetValue(0, 0).ToString() == "16773120");
   auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.executions == before.executions + 1);
+  CHECK(after.fallbacks == before.fallbacks);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
   CHECK(observed);
   run_ok("SET scan_task_batch_size=" + previous_batch);
