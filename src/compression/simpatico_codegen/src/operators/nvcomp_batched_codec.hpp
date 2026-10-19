@@ -36,6 +36,7 @@
 #include <utility>
 
 namespace simpatico {
+class decode_frame;
 namespace detail {
 
 // Chunk offsets within a frame (and per-chunk output slots) are aligned to this.
@@ -100,14 +101,14 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
 
 // Decompress a frame produced by batched_compress_bytes into device `dst`, which
 // must hold exactly `out_bytes` (the original uncompressed size). No-op when
-// `out_bytes == 0`. Synchronizes internally.
+// `out_bytes == 0`. Enqueued on `owner.stream()`; the chunk tables uploaded from
+// the host live in `owner` until session completion.
 void batched_decompress_bytes(batched_codec_ops const& ops,
                               void const* frame,
                               std::size_t frame_size,
                               void* dst,
                               std::size_t out_bytes,
-                              ::cuda::stream_ref stream,
-                              rmm::device_async_resource_ref mr);
+                              decode_frame& owner);
 
 }  // namespace detail
 }  // namespace simpatico

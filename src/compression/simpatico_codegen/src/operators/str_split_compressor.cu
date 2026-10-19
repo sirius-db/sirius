@@ -5,6 +5,7 @@
 
 #include "codegen/plan/bitjoin_layout.hpp"  // copy_column_view
 #include "codegen/plan/representation.hpp"
+#include "decode/decode_session.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -20,11 +21,13 @@
 namespace simpatico {
 
 std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
-  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+  decode_frame& frame) const
 {
-  auto& offsets   = channels_[0];
-  auto& chars     = channels_[1];
-  auto* null_mask = channels_.size() > 2 ? channels_[2].get() : nullptr;
+  auto const stream = frame.stream();
+  auto const mr     = frame.mr();
+  auto& offsets     = channels_[0];
+  auto& chars       = channels_[1];
+  auto* null_mask   = channels_.size() > 2 ? channels_[2].get() : nullptr;
   if (num_rows == 0 || !offsets) {
     return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
   }

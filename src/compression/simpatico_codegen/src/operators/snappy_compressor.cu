@@ -63,10 +63,10 @@ detail::batched_codec_ops const& snappy_ops()
 }  // namespace
 
 std::unique_ptr<cudf::column> snappy_compressed_representation::decompress(
-  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+  decode_frame& frame) const
 {
   return detail::nvcomp_decompress_impl(
-    snappy_ops(), payload_data(), payload_size(), original_type, num_rows, stream, mr);
+    snappy_ops(), payload_data(), payload_size(), original_type, num_rows, frame);
 }
 
 std::unique_ptr<compressed_representation> snappy_compressor::compress(
