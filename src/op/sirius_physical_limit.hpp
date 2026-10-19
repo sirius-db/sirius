@@ -56,14 +56,35 @@ class sirius_physical_unordered_streaming_limit : public sirius_physical_operato
     return sirius::OrderPreservationType::NO_ORDER;
   }
 
-  /// Called immediately before execute, after upstream filters. Retains the claim on the
-  /// task input so OOM rescheduling (including deferred materialization) cannot claim twice.
-  void claim_input(std::unique_ptr<operator_data>& input);
+  /// A provisional quota reservation. Unapproved requests refund only their own quota.
+  /// The operator must outlive its requests; approve only after all fallible output work.
+  class claim_request {
+   public:
+    claim_request(sirius_physical_unordered_streaming_limit& owner, std::size_t rows);
+    ~claim_request() noexcept;
+    claim_request(const claim_request&)            = delete;
+    claim_request& operator=(const claim_request&) = delete;
+    claim_request(claim_request&&)                 = delete;
+    claim_request& operator=(claim_request&&)      = delete;
+
+    std::size_t slice_begin() const { return _skip; }
+    std::size_t slice_count() const { return _take; }
+    void approve() noexcept;
+
+   private:
+    sirius_physical_unordered_streaming_limit& _owner;
+    std::size_t _skip;
+    std::size_t _take;
+    bool _approved = false;
+  };
 
  private:
   std::mutex _claim_mutex;
   std::size_t _remaining_offset;
   std::size_t _remaining_limit;
+  std::size_t _pending_claims = 0;
+  bool _has_approved_claim    = false;
+  void update_exhaustion();  // Requires _claim_mutex.
   std::atomic<bool> _limit_exhausted{false};
 };
 
@@ -80,27 +101,17 @@ class limiting_operator_data : public pipelineable_operator_data {
   {
   }
 
-  limiting_operator_data(const pipelineable_operator_data& input,
-                         std::size_t begin,
-                         std::size_t count,
-                         const sirius_physical_unordered_streaming_limit* owner)
-    : pipelineable_operator_data(input), slice_begin(begin), slice_count(count), claim_owner(owner)
-  {
-  }
-
   std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
     std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
   {
     auto result = std::make_unique<limiting_operator_data>(
       std::move(batches), slice_begin, slice_count, get_position());
-    result->claim_owner = claim_owner;
     result->adopt_row_identity(*this);
     return result;
   }
 
   const std::size_t slice_begin;
   const std::size_t slice_count;
-  const sirius_physical_unordered_streaming_limit* claim_owner = nullptr;
 };
 
 class sirius_physical_streaming_limit : public sirius_physical_operator {

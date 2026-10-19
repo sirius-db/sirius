@@ -24,6 +24,7 @@
 // does not model reads everything, which can only end a ride early.
 
 #include "operator/partition_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 
@@ -699,7 +700,7 @@ TEST_CASE("an unknown dynamic-filter shape ends every column's ride",
           "[late_mat][lifetime][dynamic_filter]")
 {
   fake_scan scan(2);
-  sirius::op::sirius_physical_operator endpoint(
+  sirius::op::test_physical_operator endpoint(
     sirius::op::SiriusPhysicalOperatorType::DYNAMIC_FILTER, make_types(2), 0);
   scan.link(&endpoint);
   auto const lives = analyze_column_lifetimes(scan);

@@ -28,7 +28,10 @@ namespace sirius {
 namespace op {
 
 namespace {
-std::unique_ptr<operator_data> execute_slice(const limiting_operator_data& input,
+std::unique_ptr<operator_data> execute_slice(const pipelineable_operator_data& input,
+                                             std::size_t slice_begin,
+                                             std::size_t slice_count,
+                                             std::optional<std::size_t> position,
                                              sirius_physical_operator& op,
                                              ::cuda::stream_ref stream)
 {
@@ -36,24 +39,22 @@ std::unique_ptr<operator_data> execute_slice(const limiting_operator_data& input
   if (batches.size() != 1) { throw internal_exception("Limit task requires one input batch"); }
   auto const& batch = batches.front();
   auto view         = sirius::get_cudf_table_view(batch);
-  if (input.slice_begin > static_cast<std::size_t>(view.num_rows()) ||
-      input.slice_count > static_cast<std::size_t>(view.num_rows()) - input.slice_begin) {
+  if (slice_begin > static_cast<std::size_t>(view.num_rows()) ||
+      slice_count > static_cast<std::size_t>(view.num_rows()) - slice_begin) {
     throw internal_exception("Limit slice exceeds input rows");
   }
-  if (input.slice_begin == 0 && input.slice_count == static_cast<std::size_t>(view.num_rows())) {
-    return std::make_unique<pipelineable_operator_data>(
-      input.get_data_batches(), input.claim_owner ? std::nullopt : input.get_position());
+  if (slice_begin == 0 && slice_count == static_cast<std::size_t>(view.num_rows())) {
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches(), position);
   }
   auto slices = cudf::slice(view,
-                            {static_cast<cudf::size_type>(input.slice_begin),
-                             static_cast<cudf::size_type>(input.slice_begin + input.slice_count)},
+                            {static_cast<cudf::size_type>(slice_begin),
+                             static_cast<cudf::size_type>(slice_begin + slice_count)},
                             stream);
   auto table  = std::make_unique<cudf::table>(
     slices.front(), stream, batch.get_memory_space()->get_default_allocator());
   auto output = sirius::make_data_batch(
     std::move(table), *batch.get_memory_space(), stream, op.batch_telemetry());
-  return std::make_unique<pipelineable_operator_data>(
-    std::vector{std::move(output)}, input.claim_owner ? std::nullopt : input.get_position());
+  return std::make_unique<pipelineable_operator_data>(std::vector{std::move(output)}, position);
 }
 }  // namespace
 
@@ -75,44 +76,71 @@ sirius_physical_unordered_streaming_limit::sirius_physical_unordered_streaming_l
 {
 }
 
-void sirius_physical_unordered_streaming_limit::claim_input(std::unique_ptr<operator_data>& input)
+sirius_physical_unordered_streaming_limit::claim_request::claim_request(
+  sirius_physical_unordered_streaming_limit& owner, std::size_t rows)
+  : _owner(owner)
 {
-  if (auto* claimed = dynamic_cast<const limiting_operator_data*>(input.get());
-      claimed && claimed->claim_owner == this) {
-    return;
+  std::lock_guard<std::mutex> guard(_owner._claim_mutex);
+  _skip = std::min(_owner._remaining_offset, rows);
+  _take = std::min(_owner._remaining_limit, rows - _skip);
+  _owner._remaining_offset -= _skip;
+  _owner._remaining_limit -= _take;
+  ++_owner._pending_claims;
+}
+
+sirius_physical_unordered_streaming_limit::claim_request::~claim_request() noexcept
+{
+  if (_approved) { return; }
+  std::lock_guard<std::mutex> guard(_owner._claim_mutex);
+  // Other tasks may have committed in the meantime: never restore a counter snapshot.
+  _owner._remaining_offset += _skip;
+  _owner._remaining_limit += _take;
+  --_owner._pending_claims;
+  _owner.update_exhaustion();
+}
+
+void sirius_physical_unordered_streaming_limit::claim_request::approve() noexcept
+{
+  if (_approved) { return; }
+  std::lock_guard<std::mutex> guard(_owner._claim_mutex);
+  _approved                  = true;
+  _owner._has_approved_claim = true;
+  --_owner._pending_claims;
+  _owner.update_exhaustion();
+}
+
+void sirius_physical_unordered_streaming_limit::update_exhaustion()
+{
+  // Provisional reservations must not stop task creation. LIMIT 0 also needs a successful
+  // empty output before stopping, so downstream aggregates receive an input batch.
+  if (_has_approved_claim && _remaining_limit == 0 && _pending_claims == 0) {
+    _limit_exhausted.store(true, std::memory_order_release);
   }
-  if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE ||
-      (offset_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE &&
-       offset_val.Type() != duckdb::LimitNodeType::UNSET)) {
-    throw not_implemented_exception("Streaming limit requires constant limit/offset");
-  }
-  auto const& data    = dynamic_cast<const pipelineable_operator_data&>(*input);
-  auto const& batches = data.get_data_batches();
-  if (batches.size() != 1) { throw internal_exception("Limit task requires one input batch"); }
-  auto rows = sirius::get_batch_rows_and_bytes(*batches.front()).rows;
-  if (!rows) { throw internal_exception("Cannot determine batch row count for unordered LIMIT"); }
-  std::lock_guard<std::mutex> guard(_claim_mutex);
-  auto skip = std::min(_remaining_offset, *rows);
-  auto take = std::min(_remaining_limit, *rows - skip);
-  // Allocate and retain the claim before changing shared counters. Copying the base also
-  // retains prepared input pin locks; retries may replace its batches on another device.
-  auto claimed = std::make_unique<limiting_operator_data>(data, skip, take, this);
-  input        = std::move(claimed);
-  _remaining_offset -= skip;
-  _remaining_limit -= take;
-  // Even LIMIT 0 must create one task, so downstream aggregates receive an empty batch.
-  if (_remaining_limit == 0) { _limit_exhausted.store(true, std::memory_order_release); }
 }
 
 std::unique_ptr<operator_data> sirius_physical_unordered_streaming_limit::execute(
   const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_unordered_streaming_limit::execute"};
-  auto const& input = dynamic_cast<const limiting_operator_data&>(input_data);
-  if (input.claim_owner != this) {
-    throw internal_exception("Unordered LIMIT input is not claimed");
+  if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE ||
+      (offset_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE &&
+       offset_val.Type() != duckdb::LimitNodeType::UNSET)) {
+    throw not_implemented_exception("Streaming limit requires constant limit/offset");
   }
-  return execute_slice(input, *this, stream);
+  auto const& input   = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto const& batches = input.get_data_batches();
+  if (batches.size() != 1) { throw internal_exception("Limit task requires one input batch"); }
+  auto rows = sirius::get_batch_rows_and_bytes(*batches.front()).rows;
+  if (!rows) { throw internal_exception("Cannot determine batch row count for unordered LIMIT"); }
+  claim_request claim(*this, *rows);
+  auto output =
+    execute_slice(input, claim.slice_begin(), claim.slice_count(), std::nullopt, *this, stream);
+  // Finish GPU work and all output allocations before committing. The executor's remaining
+  // diagnostics do not perform retryable GPU allocations; extending its retry boundary must
+  // preserve this contract. Returning the completed unique_ptr cannot throw.
+  stream.sync();
+  claim.approve();
+  return output;
 }
 
 sirius_physical_streaming_limit::sirius_physical_streaming_limit(
@@ -181,7 +209,8 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
   auto const& input = dynamic_cast<const limiting_operator_data&>(input_data);
-  return execute_slice(input, *this, stream);
+  return execute_slice(
+    input, input.slice_begin, input.slice_count, input.get_position(), *this, stream);
 }
 
 }  // namespace op

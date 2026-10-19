@@ -28,6 +28,7 @@
 
 #include "operator/operator_test_utils.hpp"
 #include "operator/partition_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -240,7 +241,7 @@ TEST_CASE(
     sirius::logical_type::make(sirius::type_id::INTEGER),
     sirius::logical_type::make(sirius::type_id::BIGINT),
     sirius::logical_type::make(sirius::type_id::BIGINT)};
-  auto scan = duckdb::make_uniq<sirius_physical_operator>(
+  auto scan = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::TABLE_SCAN, scan_types, 4);
   auto* scan_ptr                                    = scan.get();
   duckdb::unique_ptr<sirius_physical_operator> tree = std::move(scan);
@@ -277,7 +278,8 @@ TEST_CASE(
       std::vector<sirius::op::scan::binding>{}));
   auto* endpoint_ptr = endpoint.get();
   endpoint->children.push_back(std::move(projection));
-  sirius_physical_operator later_reader(SiriusPhysicalOperatorType::HASH_GROUP_BY, port_types, 4);
+  sirius::op::test_physical_operator later_reader(
+    SiriusPhysicalOperatorType::HASH_GROUP_BY, port_types, 4);
   later_reader.children.push_back(std::move(endpoint));
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(later_reader, nullptr);
 
@@ -483,7 +485,8 @@ TEST_CASE("decode history survives restoration and keeps conditioned rows out of
     channel,
     sirius::op::scan::consumer_config{},
     sirius::op::scan::identity_bindings(types.size()));
-  sirius_physical_operator scan(sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, types, 4);
+  sirius::op::test_physical_operator scan(
+    sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, types, 4);
   sirius::op::scan::sirius_physical_dynamic_filter endpoint(types, 4, consumer);
   REQUIRE(sirius::planner::install_deferral(
     scan,
