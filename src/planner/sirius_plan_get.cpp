@@ -65,6 +65,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -579,10 +580,13 @@ void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
 /// @param extra_column  Appended after the emitted columns when non-empty. Used for the
 ///                      corpus's cluster ids, which the fold reads but the join never emits --
 ///                      putting it last is what keeps materialize's column positions unchanged.
+/// @param trailing_columns  Appended after that: a self-join's probe output columns the corpus
+///                      does not emit, read from the corpus scan's batches.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_side_scan(
   duckdb::ClientContext& context,
   const sirius::vss::vector_join_side& side,
-  const std::string& extra_column = {})
+  const std::string& extra_column                  = {},
+  const std::vector<std::string>& trailing_columns = {})
 {
   auto& entry_base = duckdb::Catalog::GetEntry(
     context, duckdb::CatalogType::TABLE_ENTRY, side.catalog, side.schema, side.table);
@@ -627,6 +631,16 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_side_scan(
     auto const extra_idx = static_cast<duckdb::idx_t>(std::distance(names.begin(), extra_it));
     column_ids.emplace_back(extra_idx);
     projected_types.push_back(types[extra_idx]);
+  }
+  for (auto const& col : trailing_columns) {
+    auto const trailing_it = std::find(names.begin(), names.end(), col);
+    if (trailing_it == names.end()) {
+      throw duckdb::InternalException("sirius_knn_join: output column '" + col +
+                                      "' vanished between bind and plan");
+    }
+    auto const idx = static_cast<duckdb::idx_t>(std::distance(names.begin(), trailing_it));
+    column_ids.emplace_back(idx);
+    projected_types.push_back(types[idx]);
   }
 
   return duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
@@ -1434,12 +1448,52 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   req.left.output_columns  = std::move(kept_left);
   req.right.output_columns = std::move(kept_right);
 
+  // A self-join over one table's vector column scans it once: the probe reads the corpus scan's
+  // batches, so the table is materialized -- and past memory spilled -- once rather than twice
+  // (a Deep10M self-join put ~25x a one-sided join's bytes on the disk tier). The corpus scan
+  // carries the probe's output columns as well, after its own and the cluster column.
+  // SIRIUS_VSS_SELF_JOIN_SHARE=0 gives each side its own scan.
+  std::vector<std::string> probe_only_columns;
+  if (req.probe_from_scan && req.build_from_scan && !bind_data.probe_is_relation &&
+      !req.left.from_relation && !req.right.from_relation && !req.left.is_view &&
+      !req.right.is_view && req.left.catalog == req.right.catalog &&
+      req.left.schema == req.right.schema && req.left.table == req.right.table &&
+      req.left.column == req.right.column && [] {
+        auto const* v = std::getenv("SIRIUS_VSS_SELF_JOIN_SHARE");
+        return v == nullptr || std::string_view{v} != "0";
+      }()) {
+    req.probe_shares_build  = true;
+    auto const& corpus_cols = req.right.output_columns;
+    bool const has_cluster  = !req.build_cluster_column.empty();
+    std::size_t const after = 1 + corpus_cols.size() + (has_cluster ? 1 : 0);
+    req.left.output_positions.clear();
+    for (auto const& col : req.left.output_columns) {
+      auto const it = std::find(corpus_cols.begin(), corpus_cols.end(), col);
+      if (it != corpus_cols.end()) {
+        req.left.output_positions.push_back(
+          1 + static_cast<std::size_t>(std::distance(corpus_cols.begin(), it)));
+      } else if (has_cluster && col == req.build_cluster_column) {
+        req.left.output_positions.push_back(1 + corpus_cols.size());
+      } else {
+        auto jt = std::find(probe_only_columns.begin(), probe_only_columns.end(), col);
+        if (jt == probe_only_columns.end()) {
+          probe_only_columns.push_back(col);
+          jt = std::prev(probe_only_columns.end());
+        }
+        req.left.output_positions.push_back(
+          after + static_cast<std::size_t>(std::distance(probe_only_columns.begin(), jt)));
+      }
+    }
+  }
+
   // Row orders for the fed sides, minted here so the fold and materialize resolve positions
   // against one list per side rather than each deriving one of their own.
   std::shared_ptr<sirius::vss::materialized_side_buffer> build_side =
     req.build_from_scan ? std::make_shared<sirius::vss::materialized_side_buffer>() : nullptr;
   std::shared_ptr<sirius::vss::materialized_side_buffer> probe_side =
-    req.probe_from_scan ? std::make_shared<sirius::vss::materialized_side_buffer>() : nullptr;
+    req.probe_shares_build ? build_side
+    : req.probe_from_scan  ? std::make_shared<sirius::vss::materialized_side_buffer>()
+                           : nullptr;
 
   if ((build_side || probe_side) && !use_streaming) {
     throw duckdb::NotImplementedException(
@@ -1543,7 +1597,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
                                                                         prune_stats);
     // Probe first, then corpus: wrap_vector_join walks the children in that order to decide
     // which is the build side, matching wrap_join's probe=0 / build=1 convention.
-    if (req.probe_from_scan) {
+    if (req.probe_from_scan && !req.probe_shares_build) {
       stream_op->children.push_back(probe_child.has_value() ? std::move(*probe_child)
                                                             : make_side_scan(context, req.left));
     }
@@ -1553,8 +1607,9 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       // a different row order than the one the build side's snapshot fixed.
       stream_op->children.push_back(
         corpus_child.has_value() ? std::move(*corpus_child)
-        : req.right.is_view      ? make_view_side(req.right, req.build_cluster_column)
-                                 : make_side_scan(context, req.right, req.build_cluster_column));
+        : req.right.is_view
+          ? make_view_side(req.right, req.build_cluster_column)
+          : make_side_scan(context, req.right, req.build_cluster_column, probe_only_columns));
     }
     join_stage = std::move(stream_op);
   } else {

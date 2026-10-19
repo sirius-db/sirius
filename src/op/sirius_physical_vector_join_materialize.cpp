@@ -310,10 +310,12 @@ sirius_physical_vector_join_materialize::probe_side_output_views(
       "should have taken it before any row reached this operator");
   }
 
-  // Output columns sit after the vector column, which the probe scan projects first.
+  // Output columns sit after the vector column, which the probe scan projects first -- unless
+  // the probe reads the corpus side's batches, laid out for the corpus.
+  auto const& positions = _request.left.output_positions;
   std::vector<std::size_t> out_cols(num_output_columns);
   for (std::size_t c = 0; c < num_output_columns; ++c) {
-    out_cols[c] = c + 1;
+    out_cols[c] = positions.empty() ? c + 1 : positions.at(c);
   }
 
   std::vector<std::vector<cudf::column_view>> per_column(num_output_columns);
@@ -336,10 +338,10 @@ sirius_physical_vector_join_materialize::probe_side_output_views(
     ro = host_or_device_resident(
       batch, std::move(ro), _sirius_ctx, ::cuda::stream_ref{stream.value()}, "a probe-side batch");
     cudf::table_view table;
-    cudf::size_type first = 0;
+    bool resident = false;
     if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
-      table = sirius::get_cudf_table_view(ro);
-      first = 1;
+      table    = sirius::get_cudf_table_view(ro);
+      resident = true;
     } else {
       const auto* data = ro.get_data();
       if (data == nullptr) {
@@ -368,8 +370,10 @@ sirius_physical_vector_join_materialize::probe_side_output_views(
       _probe_restaged.push_back(std::move(staged));
       _probe_reservations.push_back(std::move(reservation));
     }
+    // A resident batch holds every column; a restaged one holds only out_cols, in order.
     for (std::size_t c = 0; c < num_output_columns; ++c) {
-      per_column[c].push_back(table.column(first + static_cast<cudf::size_type>(c)));
+      per_column[c].push_back(
+        table.column(static_cast<cudf::size_type>(resident ? out_cols[c] : c)));
     }
     _probe_readers.push_back(std::move(ro));
   }

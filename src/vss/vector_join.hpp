@@ -58,6 +58,9 @@ struct vector_join_side {
   std::string table;                        ///< base table
   std::string column;                       ///< vector column
   std::vector<std::string> output_columns;  ///< base-table columns to emit in order
+  /// Where each of @c output_columns sits in the side's batches. Empty: column c at c + 1, right
+  /// after the vector column, as a side's own scan lays them out.
+  std::vector<std::size_t> output_positions;
   /// A VIEW (named subquery) rather than a base table; only valid on a scanned corpus side.
   /// The planner binds and streams it, and nothing looks for a pin.
   bool is_view{false};
@@ -119,6 +122,9 @@ struct vector_join_request {
   /// Same for the probe side (`probe_source => 'scan'`). Independent of build_from_scan so each
   /// side can be A/B'd against its pinned path on its own.
   bool probe_from_scan{false};
+  /// Set by the plan generator when both sides scan the same table's vector column: the probe
+  /// reads the corpus side's batches instead of a scan and a copy of its own.
+  bool probe_shares_build{false};
   /// Name of a clustering trained by `sirius_kmeans_fit`, shared by both sides. Empty means an
   /// exhaustive join. When set, each probe batch visits only the corpus chunks holding clusters
   /// its rows were assigned to, which is what makes the join approximate.

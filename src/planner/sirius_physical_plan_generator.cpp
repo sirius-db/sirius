@@ -768,7 +768,7 @@ void wrap_vector_join(sirius::op::sirius_physical_operator& join_op,
 {
   auto const& req       = join_op.Cast<sirius::op::sirius_physical_vector_join_stream>().request();
   std::size_t child_idx = 0;
-  if (req.probe_from_scan) {
+  if (req.probe_from_scan && !req.probe_shares_build) {
     wrap_join_child(
       join_op, child_idx++, /*is_build=*/false, op_params, compressed_materialization_observer);
   }

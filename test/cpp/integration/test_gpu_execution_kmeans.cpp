@@ -2596,3 +2596,82 @@ TEST_CASE_METHOD(KMeansFixture,
     "'cluster_id', n_probes => 512, build_source => 'scan') WHERE left_id % 10 = 0;");
   CHECK(distance_mismatches(scanned, oracle) == 0);
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a self-join over one scanned table reads it once and answers as two scans do",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded][self_join]")
+{
+  // Both sides scan the same table's vector column, so the probe reads the corpus scan's batches
+  // instead of a second scan and copy of its own (SIRIUS_VSS_SELF_JOIN_SHARE=0 scans twice). The
+  // probe's output columns travel in the corpus batches: `tag` after the corpus's own columns and
+  // the cluster column, `cluster_id` as the cluster column itself. Three row groups give the
+  // corpus three chunks, each holding clusters as runs.
+  create_wide_clustered_join(*this, "sjs", false, false, 16, 300000, 10);
+  run_ok(
+    "CREATE TABLE sjs_t AS SELECT id, vec, cluster_id, (id % 7)::INTEGER AS tag FROM sjs_corpus "
+    "ORDER BY cluster_id;");
+  run_ok("CHECKPOINT;");
+  run_ok("SET concat_batch_bytes = 2000000;");
+  struct reset_on_exit {
+    KMeansFixture& fixture;
+    ~reset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_SELF_JOIN_SHARE");
+      fixture.con->Query("RESET concat_batch_bytes;");
+    }
+  } reset{*this};
+
+  auto const join = [&](const std::string& search) {
+    return "SELECT left_id, distance, left_tag, left_cluster_id, right_id FROM "
+           "sirius_knn_join('sjs_t','vec','sjs_t','vec', metric => 'l2', k => 3, " +
+           search +
+           ", left_output_columns => ['id','tag','cluster_id'], right_output_columns => ['id'], "
+           "probe_source => 'scan', build_source => 'scan');";
+  };
+  auto const approx = [&](int n_probes) {
+    return join("search_mode => 'approx', clustering => 'sjs_c', cluster_column => 'cluster_id', "
+                "n_probes => " +
+                std::to_string(n_probes));
+  };
+  std::map<std::string, std::string> cluster_of;
+  for (auto const& r : ok_rows(*con, "SELECT id, cluster_id FROM sjs_t;")) {
+    cluster_of[r.at(0)] = r.at(1);
+  }
+  // Every row's probe columns are its own row's, whichever batch they came from.
+  auto const probe_columns_right = [&](std::vector<std::vector<std::string>> const& rows) {
+    std::size_t wrong = 0;
+    for (auto const& r : rows) {
+      wrong += std::stoll(r.at(2)) != std::stoll(r.at(0)) % 7 || cluster_of.at(r.at(0)) != r.at(3);
+    }
+    return wrong;
+  };
+  auto const multiset_of = [](std::vector<std::vector<std::string>> const& rows, int stride) {
+    std::vector<std::pair<std::string, long long>> out;
+    for (auto const& r : rows) {
+      if (std::stoll(r.at(0)) % stride == 0) {
+        out.emplace_back(r.at(0), std::llround(std::stod(r.at(1)) * 1000.0));
+      }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  // DuckDB's array_distance on the CPU over the whole table, every 3000th probe.
+  auto const oracle = distance_multiset(
+    *con,
+    "SELECT left_id, distance FROM (SELECT p.id AS left_id, array_distance(p.vec, c.vec) AS "
+    "distance, row_number() OVER (PARTITION BY p.id ORDER BY array_distance(p.vec, c.vec)) AS rk "
+    "FROM sjs_t p, sjs_t c WHERE p.id % 3000 = 0) WHERE rk <= 3;");
+  REQUIRE(oracle.size() == 100u * 3u);
+
+  for (auto const& sql : {approx(4), approx(16), join("search_mode => 'exact'")}) {
+    INFO(sql);
+    auto const shared = ok_rows(*con, sql);
+    REQUIRE(shared.size() == 300000u * 3u);
+    CHECK(probe_columns_right(shared) == 0);
+    ::setenv("SIRIUS_VSS_SELF_JOIN_SHARE", "0", 1);
+    auto const separate = ok_rows(*con, sql);
+    ::unsetenv("SIRIUS_VSS_SELF_JOIN_SHARE");
+    CHECK(distance_mismatches(multiset_of(shared, 1), multiset_of(separate, 1)) == 0);
+    if (sql != approx(4)) { CHECK(distance_mismatches(multiset_of(shared, 3000), oracle) == 0); }
+  }
+}

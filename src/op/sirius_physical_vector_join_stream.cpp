@@ -1123,7 +1123,7 @@ bool sirius_physical_vector_join_stream::build_side_ready_locked()
     return !port->src_pipeline || port->src_pipeline->is_pipeline_finished();
   };
   if (_build_side && !ready("build")) { return false; }
-  if (_probe_side && !ready("default")) { return false; }
+  if (_probe_side && !_request.probe_shares_build && !ready("default")) { return false; }
   return true;
 }
 
@@ -1174,10 +1174,16 @@ void sirius_physical_vector_join_stream::initialize_locked()
   // probe chunk, so streaming the probe is the same change staging the corpus was: stage the
   // chunk this task owns, search the whole corpus against it, release.
   if (_probe_side) {
-    auto* port = get_port("default");
+    // A self-join's probe is the corpus side's own batches, in the snapshot both read.
+    auto* port = get_port(_request.probe_shares_build ? "build" : "default");
     _probe_side->ensure_snapshot(*port->repo);
     _probe = make_materialized_chunk_source(
       *_probe_side, /*column_index=*/0, _request.dim, batch_telemetry(), _sirius_ctx);
+    if (_request.probe_shares_build && std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+      std::fprintf(stderr,
+                   "[vecjoin-phase] self-join: the probe reads the corpus scan's %zu batches\n",
+                   _probe->num_chunks());
+    }
   } else if (left_pin->tier == cucascade::memory::Tier::HOST) {
     _probe = make_host_pinned_chunk_source(*left_pin, left.column, batch_telemetry());
   } else {
