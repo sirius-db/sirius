@@ -26,6 +26,7 @@
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_extension.hpp"
+#include "sirius_registration.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "utils/child_process_environment.hpp"

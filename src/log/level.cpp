@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "log/level.hpp"
+#include <sirius/log/level.hpp>
 
 namespace sirius::log {
 

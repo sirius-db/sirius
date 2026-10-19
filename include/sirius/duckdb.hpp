@@ -20,7 +20,7 @@
 
 namespace duckdb {
 class ExtensionLoader;
-}
+}  // namespace duckdb
 
 namespace sirius {
 

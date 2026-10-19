@@ -15,10 +15,10 @@
  */
 
 #include "catch.hpp"
-#include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
 
 #include <duckdb.hpp>
+#include <sirius/log/duckdb_sink.hpp>
 
 #include <memory>
 #include <source_location>

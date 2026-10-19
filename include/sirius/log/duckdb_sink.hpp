@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include "log/sink.hpp"
+#include <sirius/export.hpp>
+#include <sirius/log/sink.hpp>
 
 #include <memory>
 
@@ -35,6 +36,6 @@ namespace sirius::log {
 ///
 /// Retains only a weak reference to `db`, so it discards messages once `db` is
 /// destroyed.
-std::shared_ptr<sink> make_duckdb_sink(duckdb::DatabaseInstance& db);
+SIRIUS_EXPORT std::shared_ptr<sink> make_duckdb_sink(duckdb::DatabaseInstance& db);
 
 }  // namespace sirius::log

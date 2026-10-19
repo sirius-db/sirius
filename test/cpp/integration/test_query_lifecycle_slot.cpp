@@ -1770,17 +1770,20 @@ void run_ac10_unavailable_matrix(duckdb::Connection& connection,
     return;
   }
 
-  // Per-connection routing settings remain writable; shared-runtime settings do not.
+  // Routing and logging settings remain writable after the runtime becomes unavailable.
   if (!set_gpu_execution(connection, false, out.error) ||
       !set_gpu_execution(connection, true, out.error) ||
-      !run_query_expect_error(connection,
-                              "SET sirius_log_level='info';",
-                              "AC-10 unavailable shared-runtime SET",
-                              "unavailable",
-                              out.error) ||
+      !run_statement(connection,
+                     "SET sirius_log_level='info';",
+                     "AC-10 logging SET after runtime unavailable",
+                     out.error) ||
       !set_gpu_execution(connection, false, out.error) ||
       !run_scalar_query(
         connection, "SELECT 84;", "84", "AC-10 final CPU sanity query", out.error)) {
+    return;
+  }
+  if (context->get_runtime_health() != duckdb::SiriusContext::runtime_health::UNAVAILABLE) {
+    out.error = "AC-10 logging SET changed runtime health";
     return;
   }
   out.b_completed = true;

@@ -16,9 +16,7 @@
 
 #pragma once
 
-#include "config.hpp"
 #include "log/logging.hpp"
-#include "log/spdlog_owning_sink.hpp"
 
 #include <atomic>
 #include <memory>
@@ -92,29 +90,17 @@ class recording_log_sink final : public sirius::log::sink {
 };
 
 /// Swaps the global logging sink for a recording one for the scope of a
-/// test and restores the configured logger (initialized in unittest.cpp's
-/// main from the Config:: values) on exit.
+/// test and restores the previous sink on exit.
 class scoped_recording_log_sink {
  public:
   explicit scoped_recording_log_sink(std::string_view level = "trace")
-    : _sink(std::make_shared<recording_log_sink>())
+    : _previous(sirius::log::get_sink()), _sink(std::make_shared<recording_log_sink>())
   {
     _sink->set_level(sirius::log::string_to_enum(level).value_or(sirius::log::level::info));
     sirius::log::set_sink(_sink);
   }
 
-  ~scoped_recording_log_sink()
-  {
-    using duckdb::Config;
-    auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
-    auto flush =
-      Config::LOG_FLUSH_SECONDS <= 0
-        ? std::nullopt
-        : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
-    auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
-    sink->set_level(lvl);
-    sirius::log::set_sink(std::move(sink));
-  }
+  ~scoped_recording_log_sink() { sirius::log::set_sink(std::move(_previous)); }
 
   scoped_recording_log_sink(const scoped_recording_log_sink&)            = delete;
   scoped_recording_log_sink& operator=(const scoped_recording_log_sink&) = delete;
@@ -124,6 +110,7 @@ class scoped_recording_log_sink {
   [[nodiscard]] std::vector<recording_log_sink::record> records() const { return _sink->records(); }
 
  private:
+  std::shared_ptr<sirius::log::sink> _previous;
   std::shared_ptr<recording_log_sink> _sink;
 };
 

@@ -17,7 +17,6 @@
 // Implementation of sirius/ffi.hpp. This translation unit sees the heavy internal types so
 // consumers (e.g. the Rust bindings) never include sirius_context.hpp.
 
-#include "config.hpp"                                    // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                  // duckdb::CoreFunctionsExtension
 #include "data/sirius_converter_registry.hpp"            // sirius::converter_registry
 #include "duckdb/common/enums/optimizer_type.hpp"        // duckdb::OptimizerType
@@ -46,6 +45,9 @@
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
 
+#include <sirius/log/noop_sink.hpp>
+#include <sirius/log/spdlog_owning_sink.hpp>
+
 #include <chrono>
 #include <cstdlib>
 #include <map>
@@ -53,6 +55,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string_view>
 
 namespace sirius::ffi {
 
@@ -64,35 +67,22 @@ constexpr duckdb::idx_t kArrowBatchSize = 1u << 20;
 // DuckDB view name a plan uses to read input stream `id`.
 std::string stream_view_name_of(std::uint64_t id) { return "sirius_stream_" + std::to_string(id); }
 
-// The embedded DuckDB never loads the Sirius extension, so nothing on this path reads the
-// SIRIUS_LOG_{BACKEND,DIR,LEVEL} environment the transparent path honors
-// (SiriusContextExtensionCallback) — the engine would run with the noop sink and no log would
-// reach the embedder. Install the same sink here when the embedder asks for one; without any
-// of the variables the sink is left untouched (noop by default).
 void install_log_sink_from_env()
 {
-  auto const* backend_env = std::getenv("SIRIUS_LOG_BACKEND");
-  auto const* log_dir_env = std::getenv("SIRIUS_LOG_DIR");
-  auto const* level_env   = std::getenv("SIRIUS_LOG_LEVEL");
-  if (!backend_env && !log_dir_env && !level_env) { return; }
-  // Serialize the complete settings update, including rollback if sink creation fails.
-  std::lock_guard log_lock(duckdb::Config::logging_mutex);
-  auto previous_backend = duckdb::Config::LOG_BACKEND;
-  auto previous_log_dir = duckdb::Config::LOG_DIR;
-  auto previous_level   = duckdb::Config::LOG_LEVEL;
-  try {
-    if (backend_env) { duckdb::Config::LOG_BACKEND = backend_env; }
-    if (log_dir_env) { duckdb::Config::LOG_DIR = log_dir_env; }
-    if (level_env) { duckdb::Config::LOG_LEVEL = level_env; }
-    // With no database, an unknown backend leaves the current sink in place.
-    duckdb::install_configured_log_sink(nullptr);
-  } catch (...) {
-    // Sink construction can throw (for example, if LOG_DIR cannot be created).
-    // It happens before set_sink(), so the previous sink is still active.
-    duckdb::Config::LOG_BACKEND.swap(previous_backend);
-    duckdb::Config::LOG_DIR.swap(previous_log_dir);
-    duckdb::Config::LOG_LEVEL.swap(previous_level);
-    throw;
+  auto backend   = std::getenv("SIRIUS_LOG_BACKEND");
+  auto directory = std::getenv("SIRIUS_LOG_DIR");
+  auto name      = std::getenv("SIRIUS_LOG_LEVEL");
+  if (!backend && !directory && !name) { return; }
+  std::string_view selected = backend ? backend : "spdlog";
+  if (selected == "noop") {
+    log::set_sink(log::make_noop_sink());
+  } else if (selected == "spdlog") {
+    auto sink =
+      log::make_spdlog_owning_sink({directory ? directory : "log", std::chrono::seconds{3}});
+    auto parsed = log::string_to_enum(name ? name : "info");
+    sink->set_level(parsed.value_or(log::level::info));
+    log::set_sink(std::move(sink));
+    if (!parsed) { SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", name); }
   }
 }
 

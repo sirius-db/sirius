@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_projection.hpp"
 
-#include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"

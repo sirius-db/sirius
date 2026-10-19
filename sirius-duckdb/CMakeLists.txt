@@ -28,7 +28,8 @@ else()
   message(FATAL_ERROR "SIRIUS_DUCKDB_LINKAGE must be static or shared")
 endif()
 
-set(EXTENSION_SOURCES src/sirius/sirius_extension.cpp)
+set(EXTENSION_SOURCES src/sirius/sirius_extension.cpp
+                      src/sirius/sirius_logging.cpp)
 
 # DuckDB's linker options are directory-wide; this backend uses BFD. Keep the
 # override local so the host and sibling extensions retain their linker.

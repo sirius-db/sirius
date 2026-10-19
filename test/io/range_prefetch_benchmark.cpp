@@ -55,7 +55,7 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <glob.h>
 #include <log/logging.hpp>
-#include <log/spdlog_owning_sink.hpp>
+#include <sirius/log/spdlog_owning_sink.hpp>
 
 #include <algorithm>
 #include <atomic>

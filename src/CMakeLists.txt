@@ -1,7 +1,6 @@
 target_sources(
   sirius_objects
-  PRIVATE config.cpp
-          debug_utils.cpp
+  PRIVATE debug_utils.cpp
           pin_table.cpp
           sirius_config.cpp
           sirius_context.cpp

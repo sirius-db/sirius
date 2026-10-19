@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include "log/level.hpp"
+#include <sirius/export.hpp>
+#include <sirius/log/level.hpp>
 
 #include <memory>
 #include <source_location>
@@ -25,7 +26,7 @@
 namespace sirius::log {
 
 /// Log sink interface.
-class sink {
+class SIRIUS_EXPORT sink {
  public:
   virtual ~sink() = default;
 
@@ -61,7 +62,7 @@ class sink {
 ///
 /// If `sink` holds a nullptr, this installs a new instance of the no-op sink
 /// instead, such that get_sink() never returns a nullptr.
-void set_sink(std::shared_ptr<sink> sink);
+SIRIUS_EXPORT void set_sink(std::shared_ptr<sink> sink);
 
 /// Returns the currently installed sink.
 ///
@@ -70,6 +71,6 @@ void set_sink(std::shared_ptr<sink> sink);
 /// This function never returns a nullptr, but calling it from a static/global
 /// object's destructor at program exit is undefined behavior because the
 /// backing singleton may be destroyed.
-std::shared_ptr<sink> get_sink();
+SIRIUS_EXPORT std::shared_ptr<sink> get_sink();
 
 }  // namespace sirius::log

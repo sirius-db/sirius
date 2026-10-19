@@ -6,7 +6,7 @@
  */
 
 #include "catch.hpp"
-#include "sirius_extension.hpp"
+#include "sirius_registration.hpp"
 
 #include <duckdb.hpp>
 #include <duckdb/function/function.hpp>

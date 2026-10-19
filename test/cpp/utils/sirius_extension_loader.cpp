@@ -5,7 +5,7 @@
 #include <duckdb/main/extension_helper.hpp>
 #include <parquet_extension.hpp>
 
-// Preserve automatic registration in engine tests without building the wrapper.
+// Automatically register the statically linked extensions in engine tests.
 namespace duckdb {
 
 ExtensionLoadResult ExtensionHelper::LoadExtension(DuckDB& db, const std::string& extension)

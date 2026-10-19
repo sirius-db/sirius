@@ -15,7 +15,6 @@
  */
 
 #pragma once
-#include "config.hpp"
 #include "duckdb/common/common.hpp"
 #include "expression_evaluator/query_policy.hpp"
 #include "helper/logical_type.hpp"

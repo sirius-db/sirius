@@ -9,5 +9,7 @@ set_target_properties(
              CXX_VISIBILITY_PRESET hidden
              CXX_SCAN_FOR_MODULES OFF)
 target_compile_features(sirius_spdlog_sink PRIVATE cxx_std_20)
-target_include_directories(sirius_spdlog_sink PRIVATE "${CMAKE_SOURCE_DIR}/src")
+target_include_directories(
+  sirius_spdlog_sink PRIVATE "${CMAKE_SOURCE_DIR}/src"
+                             "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(sirius_spdlog_sink PRIVATE spdlog::spdlog)

@@ -15,18 +15,19 @@
  */
 
 #include "catch.hpp"
-#include "config.hpp"
 #include "log/logging.hpp"
-#include "log/spdlog_owning_sink.hpp"
+#include "util/env_guard.hpp"
 #include "util/segfault_backtrace.hpp"
 #include "utils/s3_backend.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cuda_runtime.h>
 
+#include <sirius/log/spdlog_owning_sink.hpp>
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -137,15 +138,16 @@ int main(int argc, char* argv[])
   // Initialize the logger
   // SIRIUS_TEST_LOG_DIR lets concurrent test processes (CI shards) log to separate dirs.
   auto const* log_dir_env = std::getenv("SIRIUS_TEST_LOG_DIR");
-  Config::LOG_DIR         = log_dir_env ? log_dir_env : SIRIUS_UNITTEST_LOG_DIR;
-  auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
-  auto flush =
-    Config::LOG_FLUSH_SECONDS <= 0
-      ? std::nullopt
-      : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
-  auto log_sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
-  log_sink->set_level(lvl);
+  auto log_sink           = sirius::log::make_spdlog_owning_sink(
+    {log_dir_env ? log_dir_env : SIRIUS_UNITTEST_LOG_DIR, std::chrono::seconds{3}});
+  log_sink->set_level(sirius::log::level::info);
   sirius::log::set_sink(std::move(log_sink));
+  // Keep extension startup in the same per-process log directory as the test harness.
+  std::optional<sirius::util::env_guard> extension_log_dir;
+  if (!std::getenv("SIRIUS_LOG_DIR")) {
+    extension_log_dir.emplace("SIRIUS_LOG_DIR",
+                              log_dir_env ? log_dir_env : SIRIUS_UNITTEST_LOG_DIR);
+  }
 
   // This child must register a replacement before the first Sirius load. Even creating a
   // paused shared_test_env below would initialize the process-wide callback cache too early.

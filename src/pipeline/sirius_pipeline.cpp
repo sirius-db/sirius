@@ -16,7 +16,6 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
-#include "config.hpp"
 #include "creator/task_creator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"

@@ -15,9 +15,8 @@
  */
 
 #include "catch.hpp"
-#include "log/level.hpp"
-#include "log/sink.hpp"
 #include "sirius/ffi.hpp"
+#include "sirius/sirius_logging.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
 #include "utils/log_test_utils.hpp"
@@ -43,6 +42,8 @@
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/settings.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <sirius/log/level.hpp>
+#include <sirius/log/sink.hpp>
 #include <utils/utils.hpp>
 
 #include <algorithm>
@@ -62,6 +63,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -422,16 +424,16 @@ TEST_CASE("Sirius configuration keeps runtime distinct-build probing internal", 
 TEST_CASE("DuckDB setting preserves the Sirius log backend when sink construction fails",
           "[sirius][context][config][isolated_context]")
 {
+  sirius::test::scoped_recording_log_sink isolated_logs;
   finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
   setenv("SIRIUS_DISABLE", "1", 1);
 
-  auto const previous_backend = duckdb::Config::LOG_BACKEND;
-  auto const previous_log_dir = duckdb::Config::LOG_DIR;
-  auto const previous_sink    = sirius::log::get_sink();
-  auto const test_root        = fs::temp_directory_path() / "sirius-log-backend-rollback-test";
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto const previous_sink = sirius::log::get_sink();
+  auto const test_root     = fs::temp_directory_path() / "sirius-log-backend-rollback-test";
   finally restore_logging{[&]() {
-    duckdb::Config::LOG_BACKEND = previous_backend;
-    duckdb::Config::LOG_DIR     = previous_log_dir;
     sirius::log::set_sink(previous_sink);
     std::error_code cleanup_error;
     fs::remove_all(test_root, cleanup_error);
@@ -443,9 +445,6 @@ TEST_CASE("DuckDB setting preserves the Sirius log backend when sink constructio
   std::ofstream(blocker) << "file";
   auto const invalid_dir = blocker / "child";
   auto const valid_dir   = test_root / "valid";
-
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
 
   auto noop = con.Query("SET sirius_log_backend = 'noop'");
   REQUIRE(noop != nullptr);
@@ -464,7 +463,7 @@ TEST_CASE("DuckDB setting preserves the Sirius log backend when sink constructio
   REQUIRE(after_invalid != nullptr);
   REQUIRE_FALSE(after_invalid->HasError());
   REQUIRE(after_invalid->Collection().GetValue(0, 0).GetValue<std::string>() == "noop");
-  REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).backend == "noop");
   REQUIRE(sirius::log::get_sink() == noop_sink);
 
   auto repair_dir = con.Query("SET sirius_log_dir = '" + valid_dir.string() + "'");
@@ -474,18 +473,17 @@ TEST_CASE("DuckDB setting preserves the Sirius log backend when sink constructio
   auto valid_spdlog = con.Query("SET sirius_log_backend = 'spdlog'");
   REQUIRE(valid_spdlog != nullptr);
   REQUIRE_FALSE(valid_spdlog->HasError());
-  REQUIRE(duckdb::Config::LOG_BACKEND == "spdlog");
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).backend == "spdlog");
 }
 
 TEST_CASE("Sirius startup rejects unknown environment log backends before mutation",
           "[sirius][context][config][isolated_context]")
 {
-  auto const previous_backend = duckdb::Config::LOG_BACKEND;
-  auto const previous_sink    = sirius::log::get_sink();
+  sirius::test::scoped_recording_log_sink isolated_logs;
+  auto const previous_sink = sirius::log::get_sink();
   std::optional<std::string> previous_env_backend;
   if (auto const* value = std::getenv("SIRIUS_LOG_BACKEND")) { previous_env_backend = value; }
   finally restore_logging{[&]() {
-    duckdb::Config::LOG_BACKEND = previous_backend;
     sirius::log::set_sink(previous_sink);
     if (previous_env_backend) {
       setenv("SIRIUS_LOG_BACKEND", previous_env_backend->c_str(), 1);
@@ -496,36 +494,34 @@ TEST_CASE("Sirius startup rejects unknown environment log backends before mutati
   }};
 
   setenv("SIRIUS_DISABLE", "1", 1);
-  duckdb::Config::LOG_BACKEND = "noop";
+
   setenv("SIRIUS_LOG_BACKEND", "syslog", 1);
 
-  REQUIRE_THROWS_WITH(duckdb::SiriusContextExtensionCallback{},
+  REQUIRE_THROWS_WITH(sirius::duckdb_extension::logging_options_from_environment(),
                       Catch::Matchers::ContainsSubstring(
                         "SIRIUS_LOG_BACKEND must be one of: duckdb, spdlog, noop; got 'syslog'"));
-  REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
 
   setenv("SIRIUS_LOG_BACKEND", "duckdb", 1);
-  duckdb::SiriusContextExtensionCallback valid_callback;
-  REQUIRE(duckdb::Config::LOG_BACKEND == "duckdb");
+  auto valid_options = sirius::duckdb_extension::logging_options_from_environment();
+  REQUIRE(valid_options.backend == "duckdb");
 }
 
 TEST_CASE("DuckDB setting rejects unknown Sirius log levels without mutation",
           "[sirius][context][config][isolated_context]")
 {
+  sirius::test::scoped_recording_log_sink isolated_logs;
   finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
   setenv("SIRIUS_DISABLE", "1", 1);
-
-  sirius::test::scoped_recording_log_sink scoped_sink;
-  auto const previous_level = duckdb::Config::LOG_LEVEL;
-  finally restore_level{[&]() { duckdb::Config::LOG_LEVEL = previous_level; }};
 
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
 
+  sirius::test::scoped_recording_log_sink scoped_sink;
+
   auto warn = con.Query("SET sirius_log_level = 'warn'");
   REQUIRE(warn != nullptr);
   REQUIRE_FALSE(warn->HasError());
-  REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).level == "warn");
   REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::info));
   REQUIRE(sirius::log::get_sink()->should_log(sirius::log::level::warn));
 
@@ -541,37 +537,34 @@ TEST_CASE("DuckDB setting rejects unknown Sirius log levels without mutation",
   REQUIRE(after_invalid != nullptr);
   REQUIRE_FALSE(after_invalid->HasError());
   REQUIRE(after_invalid->Collection().GetValue(0, 0).GetValue<std::string>() == "warn");
-  REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).level == "warn");
   REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::info));
   REQUIRE(sirius::log::get_sink()->should_log(sirius::log::level::warn));
 
   auto critical = con.Query("SET sirius_log_level = 'critical'");
   REQUIRE(critical != nullptr);
   REQUIRE_FALSE(critical->HasError());
-  REQUIRE(duckdb::Config::LOG_LEVEL == "critical");
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).level == "critical");
   REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::error));
   REQUIRE(sirius::log::get_sink()->should_log(sirius::log::level::critical));
 
   auto off = con.Query("SET sirius_log_level = 'off'");
   REQUIRE(off != nullptr);
   REQUIRE_FALSE(off->HasError());
-  REQUIRE(duckdb::Config::LOG_LEVEL == "off");
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).level == "off");
   REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::critical));
 }
 
 TEST_CASE("Sirius startup rejects unknown environment log levels before mutation",
           "[sirius][context][config][isolated_context]")
 {
-  auto const previous_level   = duckdb::Config::LOG_LEVEL;
-  auto const previous_backend = duckdb::Config::LOG_BACKEND;
-  auto const previous_sink    = sirius::log::get_sink();
+  sirius::test::scoped_recording_log_sink isolated_logs;
+  auto const previous_sink = sirius::log::get_sink();
   std::optional<std::string> previous_env_level;
   std::optional<std::string> previous_env_backend;
   if (auto const* value = std::getenv("SIRIUS_LOG_LEVEL")) { previous_env_level = value; }
   if (auto const* value = std::getenv("SIRIUS_LOG_BACKEND")) { previous_env_backend = value; }
   finally restore_logging{[&]() {
-    duckdb::Config::LOG_LEVEL   = previous_level;
-    duckdb::Config::LOG_BACKEND = previous_backend;
     sirius::log::set_sink(previous_sink);
     if (previous_env_level) {
       setenv("SIRIUS_LOG_LEVEL", previous_env_level->c_str(), 1);
@@ -588,22 +581,19 @@ TEST_CASE("Sirius startup rejects unknown environment log levels before mutation
 
   setenv("SIRIUS_DISABLE", "1", 1);
   setenv("SIRIUS_LOG_BACKEND", "noop", 1);
-  duckdb::Config::LOG_LEVEL = "warn";
+
   setenv("SIRIUS_LOG_LEVEL", "verbose", 1);
 
   REQUIRE_THROWS_WITH(
-    duckdb::SiriusContextExtensionCallback{},
+    sirius::duckdb_extension::logging_options_from_environment(),
     Catch::Matchers::ContainsSubstring(
       "SIRIUS_LOG_LEVEL must be one of: trace, debug, info, warn, error, critical, off; got "
       "'verbose'"));
-  REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
-  REQUIRE(duckdb::Config::LOG_BACKEND == previous_backend);
 
   setenv("SIRIUS_LOG_LEVEL", "critical", 1);
-  duckdb::SiriusContextExtensionCallback valid_callback;
-  REQUIRE(duckdb::Config::LOG_LEVEL == "critical");
-  REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
-  REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::critical));
+  auto valid_options = sirius::duckdb_extension::logging_options_from_environment();
+  REQUIRE(valid_options.level == "critical");
+  REQUIRE(valid_options.backend == "noop");
 }
 
 TEST_CASE("Sirius configuration loading from file with configurator",
@@ -1639,16 +1629,16 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
 TEST_CASE("DuckDB setting preserves the Sirius log directory when sink construction fails",
           "[sirius][context][config][isolated_context]")
 {
+  sirius::test::scoped_recording_log_sink isolated_logs;
   finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
   setenv("SIRIUS_DISABLE", "1", 1);
 
-  auto const previous_backend = duckdb::Config::LOG_BACKEND;
-  auto const previous_log_dir = duckdb::Config::LOG_DIR;
-  auto const previous_sink    = sirius::log::get_sink();
-  auto const test_root        = fs::temp_directory_path() / "sirius-log-dir-rollback-test";
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto const previous_sink = sirius::log::get_sink();
+  auto const test_root     = fs::temp_directory_path() / "sirius-log-dir-rollback-test";
   finally restore_logging{[&]() {
-    duckdb::Config::LOG_BACKEND = previous_backend;
-    duckdb::Config::LOG_DIR     = previous_log_dir;
     sirius::log::set_sink(previous_sink);
     std::error_code cleanup_error;
     fs::remove_all(test_root, cleanup_error);
@@ -1661,14 +1651,11 @@ TEST_CASE("DuckDB setting preserves the Sirius log directory when sink construct
   std::ofstream(blocker) << "file";
   auto const invalid_dir = blocker / "child";
 
-  duckdb::Config::LOG_BACKEND = "spdlog";
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-
   auto valid = con.Query("SET sirius_log_dir = '" + valid_dir.string() + "'");
   REQUIRE(valid != nullptr);
   REQUIRE_FALSE(valid->HasError());
-  REQUIRE(duckdb::Config::LOG_DIR == valid_dir.string());
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).directory ==
+          valid_dir.string());
   auto const valid_sink = sirius::log::get_sink();
 
   auto invalid = con.Query("SET sirius_log_dir = '" + invalid_dir.string() + "'");
@@ -1679,17 +1666,16 @@ TEST_CASE("DuckDB setting preserves the Sirius log directory when sink construct
   REQUIRE(after_invalid != nullptr);
   REQUIRE_FALSE(after_invalid->HasError());
   REQUIRE(after_invalid->Collection().GetValue(0, 0).GetValue<std::string>() == valid_dir.string());
-  REQUIRE(duckdb::Config::LOG_DIR == valid_dir.string());
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).directory ==
+          valid_dir.string());
   REQUIRE(sirius::log::get_sink() == valid_sink);
 }
 
 TEST_CASE("Sirius startup preserves logging settings when sink construction fails",
           "[sirius][context][config][isolated_context]")
 {
-  auto const previous_backend = duckdb::Config::LOG_BACKEND;
-  auto const previous_log_dir = duckdb::Config::LOG_DIR;
-  auto const previous_level   = duckdb::Config::LOG_LEVEL;
-  auto const previous_sink    = sirius::log::get_sink();
+  sirius::test::scoped_recording_log_sink isolated_logs;
+  auto const previous_sink = sirius::log::get_sink();
   std::optional<std::string> previous_env_backend;
   std::optional<std::string> previous_env_log_dir;
   std::optional<std::string> previous_env_level;
@@ -1701,9 +1687,6 @@ TEST_CASE("Sirius startup preserves logging settings when sink construction fail
 
   auto const test_root = fs::temp_directory_path() / "sirius-startup-log-dir-rollback-test";
   finally restore_logging{[&]() {
-    duckdb::Config::LOG_BACKEND = previous_backend;
-    duckdb::Config::LOG_DIR     = previous_log_dir;
-    duckdb::Config::LOG_LEVEL   = previous_level;
     sirius::log::set_sink(previous_sink);
     if (previous_env_backend) {
       setenv("SIRIUS_LOG_BACKEND", previous_env_backend->c_str(), 1);
@@ -1736,116 +1719,52 @@ TEST_CASE("Sirius startup preserves logging settings when sink construction fail
   std::ofstream(blocker) << "file";
   auto const invalid_dir = blocker / "child";
 
-  duckdb::Config::LOG_BACKEND = "noop";
-  duckdb::Config::LOG_DIR     = valid_dir.string();
-  duckdb::Config::LOG_LEVEL   = "warn";
+  auto const staged_sink = sirius::log::get_sink();
   setenv("SIRIUS_LOG_BACKEND", "spdlog", 1);
   setenv("SIRIUS_LOG_DIR", invalid_dir.string().c_str(), 1);
   setenv("SIRIUS_LOG_LEVEL", "debug", 1);
   setenv("SIRIUS_DISABLE", "1", 1);
 
-  REQUIRE_THROWS(duckdb::SiriusContextExtensionCallback{});
-  REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
-  REQUIRE(duckdb::Config::LOG_DIR == valid_dir.string());
-  REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
-  REQUIRE(sirius::log::get_sink() == previous_sink);
+  REQUIRE_THROWS(sirius::duckdb_extension::install_log_sink(
+    sirius::duckdb_extension::logging_options_from_environment()));
+  REQUIRE(sirius::log::get_sink() == staged_sink);
 
   setenv("SIRIUS_LOG_DIR", valid_dir.string().c_str(), 1);
-  duckdb::SiriusContextExtensionCallback valid_callback;
-  REQUIRE(duckdb::Config::LOG_BACKEND == "spdlog");
-  REQUIRE(duckdb::Config::LOG_DIR == valid_dir.string());
-  REQUIRE(duckdb::Config::LOG_LEVEL == "debug");
+  auto valid_options = sirius::duckdb_extension::logging_options_from_environment();
+  sirius::duckdb_extension::install_log_sink(valid_options);
+  REQUIRE(valid_options.backend == "spdlog");
+  REQUIRE(valid_options.directory == valid_dir.string());
+  REQUIRE(valid_options.level == "debug");
 }
 
-TEST_CASE("FFI startup serializes logging settings and restores them on sink failure",
+TEST_CASE("FFI startup preserves logging settings when sink construction fails",
           "[sirius][context][config][sirius_ffi][isolated_context]")
 {
-  auto const test_root = fs::temp_directory_path() / "sirius-ffi-log-rollback-test";
-  std::unique_lock log_lock(duckdb::Config::logging_mutex);
-  auto const previous_backend = duckdb::Config::LOG_BACKEND;
-  auto const previous_log_dir = duckdb::Config::LOG_DIR;
-  auto const previous_level   = duckdb::Config::LOG_LEVEL;
-  auto const previous_sink    = sirius::log::get_sink();
-  finally restore_logging{[&]() {
-    std::lock_guard lock(duckdb::Config::logging_mutex);
-    duckdb::Config::LOG_BACKEND = previous_backend;
-    duckdb::Config::LOG_DIR     = previous_log_dir;
-    duckdb::Config::LOG_LEVEL   = previous_level;
-    sirius::log::set_sink(previous_sink);
+  sirius::test::scoped_recording_log_sink isolated_logs;
+  auto const test_root     = fs::temp_directory_path() / "sirius-ffi-log-rollback-test";
+  auto const previous_sink = sirius::log::get_sink();
+  finally cleanup{[&]() {
     std::error_code ec;
     fs::remove_all(test_root, ec);
   }};
-
   fs::remove_all(test_root);
   fs::create_directories(test_root);
   auto const blocker = test_root / "not-a-directory";
   std::ofstream(blocker) << "file";
-  // Fail sink creation before FFI startup reaches GPU initialization.
   sirius::util::env_guard backend_env{"SIRIUS_LOG_BACKEND", "spdlog"};
   sirius::util::env_guard dir_env{"SIRIUS_LOG_DIR", (blocker / "child").string()};
   sirius::util::env_guard level_env{"SIRIUS_LOG_LEVEL", "debug"};
 
-  SECTION("failed initialization restores all settings and the sink")
-  {
-    REQUIRE_THROWS_WITH(sirius::ffi::Context{},
-                        Catch::Matchers::ContainsSubstring(blocker.string()));
-    REQUIRE(duckdb::Config::LOG_BACKEND == previous_backend);
-    REQUIRE(duckdb::Config::LOG_DIR == previous_log_dir);
-    REQUIRE(duckdb::Config::LOG_LEVEL == previous_level);
-    REQUIRE(sirius::log::get_sink() == previous_sink);
-  }
-
-  SECTION("a waiting initialization cannot overwrite a serialized settings update")
-  {
-    std::promise<void> started;
-    auto started_future = started.get_future();
-    auto startup        = std::async(std::launch::async, [&]() {
-      started.set_value();
-      try {
-        sirius::ffi::Context context;
-      } catch (...) {
-        return std::current_exception();
-      }
-      return std::exception_ptr{};
-    });
-    started_future.wait();
-    // Give startup a chance to reach the logging lock while we hold it. Keep the
-    // environment unchanged until the worker joins, and unlock before assertions.
-    auto const status    = startup.wait_for(std::chrono::milliseconds(100));
-    bool const unchanged = duckdb::Config::LOG_BACKEND == previous_backend &&
-                           duckdb::Config::LOG_DIR == previous_log_dir &&
-                           duckdb::Config::LOG_LEVEL == previous_level;
-    auto const updated_dir      = (test_root / "updated").string();
-    duckdb::Config::LOG_BACKEND = "noop";
-    duckdb::Config::LOG_DIR     = updated_dir;
-    duckdb::Config::LOG_LEVEL   = "warn";
-    log_lock.unlock();
-    auto error = startup.get();
-    log_lock.lock();
-
-    REQUIRE(status == std::future_status::timeout);
-    REQUIRE(unchanged);
-    REQUIRE(error != nullptr);
-    REQUIRE_THROWS_WITH(std::rethrow_exception(error),
-                        Catch::Matchers::ContainsSubstring(blocker.string()));
-    REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
-    REQUIRE(duckdb::Config::LOG_DIR == updated_dir);
-    REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
-    REQUIRE(sirius::log::get_sink() == previous_sink);
-  }
+  REQUIRE_THROWS_WITH(sirius::ffi::Context{}, Catch::Matchers::ContainsSubstring(blocker.string()));
+  REQUIRE(sirius::log::get_sink() == previous_sink);
 }
 
 TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mutation",
           "[sirius][context][config][isolated_context]")
 {
+  sirius::test::scoped_recording_log_sink isolated_logs;
   finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
   setenv("SIRIUS_DISABLE", "1", 1);
-
-  auto const previous_seconds = duckdb::Config::LOG_FLUSH_SECONDS;
-  finally restore_seconds{[&]() {
-    duckdb::Config::LOG_FLUSH_SECONDS = previous_seconds;
-    duckdb::install_configured_log_sink(nullptr);
-  }};
 
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
@@ -1853,7 +1772,7 @@ TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mu
   auto positive = con.Query("SET sirius_log_flush_seconds = 7");
   REQUIRE(positive != nullptr);
   REQUIRE_FALSE(positive->HasError());
-  REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 7);
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).flush_seconds == 7);
 
   auto negative = con.Query("SET sirius_log_flush_seconds = -1");
   REQUIRE(negative != nullptr);
@@ -1866,12 +1785,12 @@ TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mu
   REQUIRE(after_negative != nullptr);
   REQUIRE_FALSE(after_negative->HasError());
   REQUIRE(after_negative->Collection().GetValue(0, 0).GetValue<int32_t>() == 7);
-  REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 7);
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).flush_seconds == 7);
 
   auto disabled = con.Query("SET sirius_log_flush_seconds = 0");
   REQUIRE(disabled != nullptr);
   REQUIRE_FALSE(disabled->HasError());
-  REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 0);
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).flush_seconds == 0);
 
   auto after_disabled = con.Query("SELECT current_setting('sirius_log_flush_seconds')::INTEGER");
   REQUIRE(after_disabled != nullptr);
@@ -1882,18 +1801,16 @@ TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mu
 TEST_CASE("DuckDB setting preserves the Sirius log flush interval when sink construction fails",
           "[sirius][context][config][isolated_context]")
 {
+  sirius::test::scoped_recording_log_sink isolated_logs;
   finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
   setenv("SIRIUS_DISABLE", "1", 1);
 
-  auto const previous_backend       = duckdb::Config::LOG_BACKEND;
-  auto const previous_log_dir       = duckdb::Config::LOG_DIR;
-  auto const previous_flush_seconds = duckdb::Config::LOG_FLUSH_SECONDS;
-  auto const previous_sink          = sirius::log::get_sink();
-  auto const test_root              = fs::temp_directory_path() / "sirius-log-flush-rollback-test";
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto const previous_sink = sirius::log::get_sink();
+  auto const test_root     = fs::temp_directory_path() / "sirius-log-flush-rollback-test";
   finally restore_logging{[&]() {
-    duckdb::Config::LOG_BACKEND       = previous_backend;
-    duckdb::Config::LOG_DIR           = previous_log_dir;
-    duckdb::Config::LOG_FLUSH_SECONDS = previous_flush_seconds;
     sirius::log::set_sink(previous_sink);
     std::error_code cleanup_error;
     fs::remove_all(test_root, cleanup_error);
@@ -1902,12 +1819,6 @@ TEST_CASE("DuckDB setting preserves the Sirius log flush interval when sink cons
   fs::remove_all(test_root);
   fs::create_directories(test_root);
   auto const valid_dir = test_root / "valid";
-  auto const blocker   = test_root / "not-a-directory";
-  std::ofstream(blocker) << "file";
-  auto const invalid_dir = blocker / "child";
-
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
 
   auto noop = con.Query("SET sirius_log_backend = 'noop'");
   REQUIRE(noop != nullptr);
@@ -1921,11 +1832,12 @@ TEST_CASE("DuckDB setting preserves the Sirius log flush interval when sink cons
   auto positive = con.Query("SET sirius_log_flush_seconds = 7");
   REQUIRE(positive != nullptr);
   REQUIRE_FALSE(positive->HasError());
-  REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 7);
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).flush_seconds == 7);
   auto const valid_sink = sirius::log::get_sink();
 
-  duckdb::Config::LOG_DIR = invalid_dir.string();
-  auto invalid            = con.Query("SET sirius_log_flush_seconds = 11");
+  fs::rename(valid_dir, test_root / "saved");
+  std::ofstream(valid_dir) << "file";
+  auto invalid = con.Query("SET sirius_log_flush_seconds = 11");
   REQUIRE(invalid != nullptr);
   REQUIRE(invalid->HasError());
 
@@ -1933,7 +1845,7 @@ TEST_CASE("DuckDB setting preserves the Sirius log flush interval when sink cons
   REQUIRE(after_invalid != nullptr);
   REQUIRE_FALSE(after_invalid->HasError());
   REQUIRE(after_invalid->Collection().GetValue(0, 0).GetValue<int32_t>() == 7);
-  REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 7);
+  REQUIRE(sirius::duckdb_extension::read_logging_options(*con.context).flush_seconds == 7);
   REQUIRE(sirius::log::get_sink() == valid_sink);
 }
 
@@ -2554,4 +2466,117 @@ TEST_CASE("Sirius query options stay local and snapshots remain immutable",
   execute(a, "RESET scan_task_batch_size");
   CHECK(duckdb::query_operator_options(*a.context)->scan_task_batch_size ==
         defaults.scan_task_batch_size);
+}
+
+TEST_CASE("Logging settings are global across connections",
+          "[sirius][context][config][isolated_context]")
+{
+  sirius::test::scoped_recording_log_sink isolated_logs;
+  sirius::util::env_guard disabled{"SIRIUS_DISABLE", "1"};
+  auto root = fs::temp_directory_path() /
+              ("sirius-global-logging-" +
+               std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto previous_sink = sirius::log::get_sink();
+  finally cleanup{[&]() {
+    sirius::log::set_sink(previous_sink);
+    fs::remove_all(root);
+  }};
+  sirius::util::env_guard directory{"SIRIUS_LOG_DIR", root.string()};
+  sirius::util::env_guard backend{"SIRIUS_LOG_BACKEND", "spdlog"};
+  sirius::util::env_guard level{"SIRIUS_LOG_LEVEL", "info"};
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection a(db);
+  duckdb::Connection b(db);
+
+  REQUIRE_FALSE(a.Query("SET sirius_log_level='debug'")->HasError());
+  REQUIRE_FALSE(b.Query("SET sirius_log_dir='" + (root / "rebuilt").string() + "'")->HasError());
+  CHECK(sirius::log::get_sink()->should_log(sirius::log::level::debug));
+  CHECK(sirius::duckdb_extension::read_logging_options(*a.context).directory ==
+        (root / "rebuilt").string());
+  CHECK(sirius::duckdb_extension::read_logging_options(*b.context).level == "debug");
+  REQUIRE_FALSE(b.Query("SET GLOBAL sirius_log_flush_seconds=0")->HasError());
+  CHECK(sirius::duckdb_extension::read_logging_options(*a.context).flush_seconds == 0);
+  REQUIRE_FALSE(a.Query("RESET sirius_log_level")->HasError());
+  CHECK(sirius::duckdb_extension::read_logging_options(*b.context).level == "info");
+  CHECK_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::debug));
+
+  auto current = sirius::log::get_sink();
+  for (auto sql : {"SET SESSION sirius_log_backend='noop'",
+                   "SET SESSION sirius_log_level='error'",
+                   "SET SESSION sirius_log_dir='unused'",
+                   "SET SESSION sirius_log_flush_seconds=9",
+                   "RESET SESSION sirius_log_backend",
+                   "RESET SESSION sirius_log_level",
+                   "RESET SESSION sirius_log_dir",
+                   "RESET SESSION sirius_log_flush_seconds"}) {
+    auto result = a.Query(sql);
+    REQUIRE(result->HasError());
+    CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("only be set globally"));
+  }
+  CHECK(sirius::log::get_sink() == current);
+  REQUIRE_FALSE(a.Query("SET sirius_log_backend='noop'")->HasError());
+  auto noop = sirius::log::get_sink();
+  REQUIRE_FALSE(b.Query("SET sirius_log_dir='unused'")->HasError());
+  CHECK(sirius::log::get_sink() == noop);
+}
+
+TEST_CASE("Overlapping logging statements fail until the earlier result is closed",
+          "[sirius][context][config][isolated_context]")
+{
+  sirius::test::scoped_recording_log_sink isolated_logs;
+  sirius::util::env_guard disabled{"SIRIUS_DISABLE", "1"};
+  auto root = fs::temp_directory_path() /
+              ("sirius-overlapping-logging-" +
+               std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto previous_sink = sirius::log::get_sink();
+  finally cleanup{[&]() {
+    sirius::log::set_sink(previous_sink);
+    fs::remove_all(root);
+  }};
+  sirius::util::env_guard directory{"SIRIUS_LOG_DIR", root.string()};
+  sirius::util::env_guard backend{"SIRIUS_LOG_BACKEND", "spdlog"};
+  sirius::util::env_guard level{"SIRIUS_LOG_LEVEL", "info"};
+  duckdb::DBConfig config;
+  config.SetOptionByName("threads", duckdb::Value::INTEGER(2));
+  config.SetOptionByName("external_threads", duckdb::Value::INTEGER(1));
+  duckdb::DuckDB db(nullptr, &config);
+  duckdb::Connection a(db);
+  duckdb::Connection b(db);
+
+  REQUIRE(a.Query("SET sirius_log_flush_seconds=-1")->HasError());
+  REQUIRE_FALSE(b.Query("SET sirius_log_flush_seconds=0")->HasError());
+  auto pending = a.Submit("SET sirius_log_level='debug'");
+  REQUIRE_FALSE(pending->HasError());
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  auto state    = pending->Poll();
+  while (!duckdb::IsTerminal(state) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    state = pending->Poll();
+  }
+  REQUIRE(state == duckdb::QueryResultState::FINISHED);
+  auto active_sink = sirius::log::get_sink();
+  auto overlapping =
+    std::async(std::launch::async, [&]() { return b.Query("SET sirius_log_flush_seconds=7"); });
+  auto ready = overlapping.wait_for(std::chrono::seconds{2});
+  // Release the pending result even if a regression blocks the other statement.
+  if (ready != std::future_status::ready) { pending->Complete(); }
+  REQUIRE(ready == std::future_status::ready);
+  auto rejected = overlapping.get();
+  REQUIRE(rejected->HasError());
+  CHECK_THAT(rejected->GetError(), Catch::Matchers::ContainsSubstring("cannot run concurrently"));
+  CHECK(sirius::log::get_sink() == active_sink);
+  CHECK(sirius::duckdb_extension::read_logging_options(*b.context).flush_seconds == 0);
+  auto rejected_reset = b.Query("RESET sirius_log_flush_seconds");
+  REQUIRE(rejected_reset->HasError());
+  CHECK_THAT(rejected_reset->GetError(),
+             Catch::Matchers::ContainsSubstring("cannot run concurrently"));
+  REQUIRE_FALSE(b.Query("SELECT 42")->HasError());
+
+  SECTION("completing the earlier result permits a retry") { pending->Complete(); }
+  SECTION("closing the earlier result permits a retry") { pending->Close(); }
+  REQUIRE_FALSE(b.Query("SET sirius_log_flush_seconds=7")->HasError());
+  CHECK(sirius::duckdb_extension::read_logging_options(*a.context).flush_seconds == 7);
+  CHECK(sirius::log::get_sink()->should_log(sirius::log::level::debug));
+  REQUIRE_FALSE(a.Query("RESET sirius_log_level")->HasError());
+  CHECK(sirius::duckdb_extension::read_logging_options(*b.context).level == "info");
 }

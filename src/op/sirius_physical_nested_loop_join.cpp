@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_nested_loop_join.hpp"
 
-#include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/exception.hpp"

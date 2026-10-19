@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#include "log/spdlog_owning_sink.hpp"
-
+#include <sirius/log/spdlog_owning_sink.hpp>
 #include <spdlog/sinks/daily_file_sink.h>
 #include <spdlog/spdlog.h>
 

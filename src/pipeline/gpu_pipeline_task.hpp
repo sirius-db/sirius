@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "config.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
