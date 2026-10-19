@@ -609,3 +609,60 @@ TEST_CASE("the pool grows past its reservation only while the host tier is below
   CHECK(second->prepare_prefetch(true) == sirius::io::prepare_result::prepared);
   CHECK(cache->claimed_bytes() == 80 * mib);
 }
+
+TEST_CASE("an uncapped pool over the host's stop line gives way and keeps serving",
+          "[cache][eviction][release_idle]")
+{
+  constexpr std::size_t mib = 1ull << 20;
+  temp_data_file file(512ull << 20);
+  auto memory   = constrained_memory_manager();
+  auto topology = single_gpu_index_for_evict();
+
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  auto cfg                              = constrained_lru_config();
+  cfg.cache.eviction_threshold_fraction = 0.0;  // uncapped: only the host tier limits the cache
+  sirius_scan_manager manager{scan_lifecycle, cfg, *memory, topology};
+  auto* cache = manager.ensure_default_cache();
+  REQUIRE(cache != nullptr);
+  auto host_spaces = memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE(host_spaces.size() == 1);
+  auto const* host = host_spaces.front();
+  auto* host_mr    = host->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host_mr != nullptr);
+
+  auto read = [&](std::size_t i) {
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(static_cast<std::int64_t>(i * 16 * mib),
+                        static_cast<std::int64_t>(16 * mib));
+    auto ds = manager.create_datasource(file.path.string());
+    REQUIRE(ds != nullptr);
+    ds->fadvise(ranges, 0);
+    return ds->prepare_prefetch(true);
+  };
+
+  // 80 MiB of idle chunks, past the pool's 64 MiB reservation and under the stop line.
+  for (std::size_t i = 0; i < 5; ++i) {
+    REQUIRE(read(i) == sirius::io::prepare_result::prepared);
+  }
+  REQUIRE(cache->claimed_bytes() == 80 * mib);
+  REQUIRE(host->should_stop_downgrading_memory());
+
+  // Spilled data stand-in: take the tier well past the stop line, by more than one request.
+  std::vector<
+    std::unique_ptr<cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation>>
+    spill;
+  while (host->get_amount_to_downgrade() < 40 * mib) {
+    spill.push_back(host_mr->allocate_multiple_blocks(8 * mib));
+    REQUIRE(spill.back() != nullptr);
+  }
+
+  // Every request is still served: the cache evicts its overshoot from idle chunks and then
+  // fits, rather than refusing for as long as the tier stays over the line.
+  for (std::size_t i = 5; i < 9; ++i) {
+    INFO("request " << i << ", cache: " << cache->summary());
+    CHECK(read(i) == sirius::io::prepare_result::prepared);
+  }
+  CHECK(cache->claimed_bytes() < 80 * mib);
+  CHECK(host->get_amount_to_downgrade() < 40 * mib);
+}

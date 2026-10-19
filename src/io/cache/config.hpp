@@ -114,9 +114,10 @@ struct config {
   /// Hard cap on the cache's resident chunk bytes, as a fraction of the host
   /// tier: allocations past it are refused (reads over those chunks are served
   /// uncached), and the evictor starts once it is reached.  0 means uncapped.
-  /// A ceiling, not a target: past its reservation the cache also stops growing
-  /// while the host tier is above its downgrade stop threshold, and gives idle
-  /// chunks back before spilled data moves to disk.
+  /// A ceiling, not a target: while the host tier is over its downgrade stop
+  /// threshold the cache's limit drops to the line less what everything else
+  /// uses (never below its reservation), and it gives idle chunks back before
+  /// spilled data moves to disk.
   double eviction_threshold_fraction{0.8};
 
   /// Derived from @ref eviction by @ref apply_mode; not settable on its own.

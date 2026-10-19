@@ -664,7 +664,7 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
     auto const shortage = over_cap != 0 ? over_cap : n_chunks_needed - buffers.size();
     // Refused for the host tier's sake rather than the cache's own cap: shrink by
     // idle chunks only, keeping what the readahead fetched for other scans.
-    bool const for_host = over_cap == 0 && _pool->host_under_spill_pressure();
+    bool const for_host = _pool->host_under_spill_pressure() && !_pool->over_static_cap();
     if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
     if (!wait_for_eviction) {
       // Get reclamation moving without stalling the scan-input constructor.
@@ -1609,7 +1609,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     size_t reclaimed = 0;
     // Idle-only demands get no second pass unless the pool is also over its own cap.
     bool const sweep_subscribed =
-      !_cfg.dispose_on_idle && (any_demand_takes_subscribed || _pool->should_start_evicting());
+      !_cfg.dispose_on_idle && (any_demand_takes_subscribed || _pool->over_static_cap());
     int const n_passes = sweep_subscribed ? 2 : 1;
     for (int pass = 0; pass < n_passes && reclaimed < need; ++pass) {
       bool const respect_subscribers = (pass == 0);

@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace sirius::io::cache {
@@ -71,44 +72,68 @@ buffer_pool::buffer_pool(cucascade::memory::memory_reservation_manager& reservat
 
 buffer_pool::~buffer_pool() = default;
 
+size_t buffer_pool::host_bytes_over_stop_line() const noexcept
+{
+  size_t over = 0;
+  for (auto const& arena : _host_arenas) {
+    if (arena.space == nullptr) { continue; }
+    try {
+      over += arena.space->get_amount_to_downgrade();
+    } catch (...) {  // NOLINT(bugprone-empty-catch): an unreadable space adds no pressure
+    }
+  }
+  return over;
+}
+
+bool buffer_pool::host_under_spill_pressure() const noexcept
+{
+  return host_bytes_over_stop_line() != 0;
+}
+
+size_t buffer_pool::limit_chunks() const noexcept
+{
+  auto const cap_chunks = _max_allowed_budget_for_prefetching == 0
+                            ? std::numeric_limits<size_t>::max()
+                            : _max_allowed_budget_for_prefetching / _chunk_bytes;
+  auto const over       = host_bytes_over_stop_line();
+  if (over == 0) { return cap_chunks; }
+  // Over the stop line, the cache may hold what it holds now less the overshoot: the line less
+  // what everything else uses. Its reservation is charged to the host tier whether or not chunks
+  // fill it, so the cache counts as at least that much, and may always fill it.
+  auto const held    = _n_allocated_chunks.load(std::memory_order_relaxed) * _chunk_bytes;
+  auto const own     = std::max(held, _reserved_size);
+  auto const allowed = std::max(_reserved_size, own > over ? own - over : 0);
+  return std::min(cap_chunks, allowed / _chunk_bytes);
+}
+
 bool buffer_pool::fits(size_t current, size_t n) const noexcept
 {
   // An empty pool admits any one request: an oversize request must still be
   // able to run alone, or a cap smaller than one request deadlocks the reader.
-  if (current == 0 || _max_allowed_budget_for_prefetching == 0) { return true; }
-  auto const cap_chunks = _max_allowed_budget_for_prefetching / _chunk_bytes;
-  return current <= cap_chunks && n <= cap_chunks - current;
+  if (current == 0) { return true; }
+  auto const limit = limit_chunks();
+  return current <= limit && n <= limit - current;
 }
 
 size_t buffer_pool::chunks_over_cap(size_t n) const noexcept
 {
   auto const cur = _n_allocated_chunks.load(std::memory_order_relaxed);
   if (fits(cur, n)) { return 0; }
-  auto const cap_chunks = _max_allowed_budget_for_prefetching / _chunk_bytes;
+  auto const limit = limit_chunks();
   // Cannot go below an empty pool, which admits anything.
-  return std::min(cur, cur + n - cap_chunks);
+  return std::min(cur, cur + n - std::min(limit, cur + n));
 }
 
-bool buffer_pool::host_under_spill_pressure() const noexcept
+bool buffer_pool::over_static_cap() const noexcept
 {
-  try {
-    return std::ranges::any_of(_host_arenas, [](host_arena const& arena) {
-      return arena.space != nullptr && !arena.space->should_stop_downgrading_memory();
-    });
-  } catch (...) {
-    return false;
-  }
+  if (_max_allowed_budget_for_prefetching == 0) { return false; }
+  auto const resident = _n_allocated_chunks.load(std::memory_order_relaxed) * _chunk_bytes;
+  return resident + _chunk_bytes > _max_allowed_budget_for_prefetching;
 }
 
 bool buffer_pool::try_charge(size_t n) noexcept
 {
   auto cur = _n_allocated_chunks.load(std::memory_order_relaxed);
-  // Past its reservation the cache grows only while the host tier has room: under
-  // spill pressure a cached chunk would push a spilled batch to disk, and a chunk
-  // is cheaper to fetch again than a batch is to write out and read back.
-  if (cur != 0 && (cur + n) * _chunk_bytes > _reserved_size && host_under_spill_pressure()) {
-    return false;
-  }
   for (;;) {
     if (!fits(cur, n)) { return false; }
     if (_n_allocated_chunks.compare_exchange_weak(
@@ -219,9 +244,10 @@ bool buffer_pool::should_start_evicting() const noexcept
 {
   auto const resident = _n_allocated_chunks.load(std::memory_order_relaxed) * _chunk_bytes;
   if (resident <= reservation_size_for_prefetching()) { return false; }
-  if (_max_allowed_budget_for_prefetching == 0) { return false; }  // uncapped
+  auto const limit = limit_chunks();
+  if (limit == std::numeric_limits<size_t>::max()) { return false; }  // uncapped, no pressure
   // Fires once the next chunk would be refused.
-  return resident + _chunk_bytes > _max_allowed_budget_for_prefetching;
+  return resident + _chunk_bytes > limit * _chunk_bytes;
 }
 
 }  // namespace sirius::io::cache
