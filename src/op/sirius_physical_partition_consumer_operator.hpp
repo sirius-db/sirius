@@ -131,14 +131,6 @@ class sirius_physical_partition_consumer_operator : public sirius_physical_opera
 
   virtual ~sirius_physical_partition_consumer_operator();
 
-  //! Push a data batch to a specific port with partition information
-  //! @param port_id The port identifier
-  //! @param batch The data batch to push
-  //! @param partition_idx The partition index
-  virtual void push_data_batch_partitioned(std::string_view port_id,
-                                           std::shared_ptr<::cucascade::data_batch> batch,
-                                           std::size_t partition_idx);
-
   /// @brief Decide how the upstream PARTITION operator should partition its input for this
   /// consumer, given what the partition measured (`in`). Implementations own the count/broadcast
   /// decision, update any of their own execution state (e.g. hash-join BUILD_PROBE mode), and
