@@ -835,9 +835,12 @@ TEST_CASE("arrow_host_import: actual import classifies failed drains and preserv
     }
   } else {
     REQUIRE(resource.counts->failed);
-    REQUIRE_THROWS_MATCHES(std::rethrow_exception(failure),
-                           rmm::out_of_memory,
-                           ContainsSubstring("injected Arrow import allocation failure"));
+    try {
+      std::rethrow_exception(failure);
+      FAIL("missing original allocation refusal");
+    } catch (const rmm::out_of_memory& error) {
+      REQUIRE_THAT(error.what(), ContainsSubstring("injected Arrow import allocation failure"));
+    }
   }
   REQUIRE(resource.counts->live_bytes == 0);
   REQUIRE_FALSE(resource.counts->wrong_stream);
