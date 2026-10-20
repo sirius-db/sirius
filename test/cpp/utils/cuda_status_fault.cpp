@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Linked only into sirius_unittest, together with --wrap for these two calls.
+// Linked only into sirius_cuda_fault_test, together with --wrap for these two calls.
 #include "utils/cuda_status_fault.hpp"
 
 #include <utility>

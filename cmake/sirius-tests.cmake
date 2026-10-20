@@ -108,11 +108,43 @@ add_dependencies(sirius_unittest sirius_nvtx_startup)
 target_link_options(sirius_unittest PRIVATE
                     "LINKER:--allow-multiple-definition")
 
-# Test-only wrappers let readiness regressions return a CUDA status without
-# poisoning the real device. Production targets never link these wrappers.
-target_sources(sirius_unittest PRIVATE test/cpp/utils/cuda_status_fault.cpp)
-target_link_options(sirius_unittest PRIVATE "LINKER:--wrap=cudaStreamWaitEvent"
-                    "LINKER:--wrap=cudaDeviceSynchronize")
+# CUDA fault injection is isolated from the ordinary unit-test executable: an
+# armed fault must never intercept unrelated test teardown synchronization.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(
+    sirius_cuda_fault_test
+    test/cpp/operator/test_dynamic_filter_readiness_fault.cpp
+    test/cpp/utils/cuda_status_fault.cpp src/sirius_extension_entry.cpp
+    test/cpp/utils/sirius_extension_loader.cpp)
+  target_include_directories(
+    sirius_cuda_fault_test BEFORE
+    PRIVATE $<TARGET_PROPERTY:sirius_unittest,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(
+    sirius_cuda_fault_test
+    PRIVATE $<TARGET_PROPERTY:sirius_unittest,COMPILE_DEFINITIONS>)
+  target_link_libraries(
+    sirius_cuda_fault_test
+    PRIVATE sirius_core duckdb_static ZLIB::ZLIB Catch2::Catch2WithMain
+            ${SIRIUS_CURL_TARGET} ${CMAKE_DL_LIBS})
+  sirius_link_duckdb_extensions(sirius_cuda_fault_test PRIVATE)
+  target_link_options(
+    sirius_cuda_fault_test PRIVATE "LINKER:--allow-multiple-definition"
+    "LINKER:--wrap=cudaStreamWaitEvent" "LINKER:--wrap=cudaDeviceSynchronize")
+  set_target_properties(
+    sirius_cuda_fault_test
+    PROPERTIES ENABLE_EXPORTS ON
+               CXX_SCAN_FOR_MODULES OFF
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+  if(VCPKG_BUILD)
+    set_target_properties(sirius_cuda_fault_test
+                          PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+    target_include_directories(sirius_cuda_fault_test BEFORE
+                               PRIVATE ${_VCPKG_INC})
+  endif()
+  add_dependencies(sirius_unittest sirius_cuda_fault_test)
+endif()
 
 # Isolated opt-in host allocation fault tests; the runner supplies exact
 # call-site ranges.
