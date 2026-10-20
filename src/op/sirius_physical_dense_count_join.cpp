@@ -45,9 +45,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -208,6 +212,24 @@ dense_count_join_input::dense_count_join_input(
     _preserved_count(preserved_batches.size()),
     _counted_count(counted_batches.size())
 {
+}
+
+std::unique_ptr<pipelineable_operator_data> dense_count_join_input::with_batches_preserving_rows(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const
+{
+  if (batches.size() != _preserved_count + _counted_count) {
+    throw std::invalid_argument(
+      "dense_count_join_input: a row-preserving replacement must replace each batch in place");
+  }
+  auto const counted_begin = batches.begin() + static_cast<std::ptrdiff_t>(_preserved_count);
+  std::vector<std::shared_ptr<::cucascade::data_batch>> preserved(
+    std::make_move_iterator(batches.begin()), std::make_move_iterator(counted_begin));
+  std::vector<std::shared_ptr<::cucascade::data_batch>> counted(
+    std::make_move_iterator(counted_begin), std::make_move_iterator(batches.end()));
+  auto replacement =
+    std::make_unique<dense_count_join_input>(std::move(preserved), std::move(counted));
+  replacement->adopt_partition_identity(*this);
+  return replacement;
 }
 
 sirius_physical_dense_count_join::sirius_physical_dense_count_join(

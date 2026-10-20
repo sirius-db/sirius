@@ -23,7 +23,6 @@
 #include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/config.hpp"
-#include "io/cache/metadata_store.hpp"
 #include "io/cache/types.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
@@ -396,6 +395,12 @@ class prefetching_cache {
   /// the report for that exact sample; concurrent queries may contribute to it.
   std::string prepare_for_query();
 
+  [[nodiscard]] std::size_t file_entry_count_for_testing() const noexcept
+  {
+    std::shared_lock lock(_map_mtx);
+    return _file_cache.size();
+  }
+
   [[nodiscard]] uint32_t query_epoch() const noexcept
   {
     return _ticker.load(std::memory_order_relaxed);
@@ -576,10 +581,7 @@ class prefetching_cache {
 
   mutable std::shared_mutex _map_mtx;
   std::unordered_map<std::string, std::shared_ptr<cache_generation>> _file_cache;
-  std::unordered_map<std::string,
-                     std::vector<std::weak_ptr<cache_generation>>,
-                     detail::string_hash,
-                     std::equal_to<>>
+  std::unordered_map<std::string, std::vector<std::weak_ptr<cache_generation>>>
     _generations_by_path;
   std::shared_ptr<std::shared_mutex> _retire_mtx;
 

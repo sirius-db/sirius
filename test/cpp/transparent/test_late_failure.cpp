@@ -416,6 +416,10 @@ TEST_CASE("late failure classification uses exception types rather than message 
   auto credentials = std::make_exception_ptr(sirius::io::credential_error("signing failed"));
   CHECK(classify_failure(credentials, late_failure_cause::gpu_error).cause ==
         late_failure_cause::reader_io);
+  auto descriptor =
+    std::make_exception_ptr(sirius::io::descriptor_mismatch_error("descriptor mismatch"));
+  CHECK(classify_failure(descriptor, late_failure_cause::gpu_error).cause ==
+        late_failure_cause::reader_io);
   auto text_only = std::make_exception_ptr(
     std::runtime_error("OOM physical input checkpoint certificate reader failed"));
   CHECK(classify_failure(text_only).cause == late_failure_cause::other);

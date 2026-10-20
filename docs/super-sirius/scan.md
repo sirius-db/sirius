@@ -132,7 +132,27 @@ Row mapping is a **list of runs, not one offset**. `build_batch_layout` emits on
 
 Eligible deletion-vector inputs are prepared per file during execution; positional-delete files and scans without a bounded reservation keep eager loading. See [Preparation and publication](scan-contracts-design.md#preparation-and-publication) for admission and lifetime rules.
 
+#### Deferred Puffin ownership and bounds
+
+The deferred Puffin route keeps each allocation with the component that owns its lifetime:
+
+| State | Owner | Bound and accounting |
+|-------|-------|----------------------|
+| Footer text and yyjson parser pool | The DV unit's `preparation_ledger` permit | The lowering envelope proves `footer bytes + parser pool`; `charging_allocator` charges it once as temporary memory and releases it when the read finishes. |
+| Puffin blob bytes | The same DV unit permit | The manifest content size is checked against the real footer boundary before allocation; the charged blob is bounded by the unit envelope. |
+| Decoded deletion positions | The `iceberg_delete_set` retained result | `record_count` and `kMaxDeletionVectorPositions` bound the retained `int64_t` buffer; `allocate_retained` transfers ownership from the permit to the result exactly once. |
+| REST request state, transport staging, footer stash, and backend cache | The opened `ioctx`/`sirius_datasource` | These allocations belong to the IO backend's configured connection/cache limits and are released with the datasource or ioctx. They are not charged again to the DV decode permit. |
+| Descriptor and manifest control state | `iceberg_dv_preparation` and its query admission | The inventory/envelope bounds are established during planning; cancellation and route refusal destroy the provisional admission and descriptors. |
+
+The datasource fills caller-owned charged buffers directly, so the deferred path does not add an uncharged temporary copy. A statement may receive more than one permit when the grant and limits allow it; each DV unit owns its permit and charged buffers independently. Cancellation releases that unit's permit and temporary allocations while other permitted units continue, so serialization is not used as a substitute for a bound. The IOctx-scoped metadata/cache retention budget remains tied to the cuCascade ownership decision in #2108.
+
 **Failures throw; they never degrade to empty delete data.** An empty result is indistinguishable from "this table has no deletes", so swallowing a read error would turn *could not read the deletes* into *there are none* and return rows the table logically removed.
+
+Puffin outcome classification is site-specific. Ordinary parser short/error results at the footer or
+blob magic remain `iceberg_delete_corrupt` with the parser's original message. Backend read errors,
+including an opened-object version change, are terminal `reader_io` at the charged scan wrapper;
+the version-change counter is recorded before that classification. Cancellation, allocation
+failures, and typed planning refusals retain their own outcomes.
 
 Known unsupported bindings **decline at plan time** (`sirius_plan_get.cpp`); file-schema checks and admitted deletion-vector reads run during metadata preparation. Execution-time failures stop and drain the query before the [CPU replay policy](scan-contracts-design.md#cpu-replay-policy) is applied.
 
@@ -497,7 +517,7 @@ Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native me
 | `io_context_registry` | `io/datasource_factory.{hpp,cpp}` | Scheme→backend registry. Each backend registers a scheme checker (the reactor's static `supports()`) and a factory; `lookup(scheme)` resolves a URI scheme to a backend type, `make_ioctx(type)` builds one. |
 | `prefetching_cache` | `io/cache/prefetching_cache.{hpp,cpp}` | Pinned-memory chunk cache with a lock-free per-chunk state machine, caller-driven preparation/prefetch, a background evictor, and tiered LRU scoring. Serves partial reads and populates itself on read. |
 | `buffer_pool` | `io/cache/types.{hpp,cpp}` | Growable pool of fixed-size pinned chunks, backed by a `cucascade::memory::fixed_size_host_memory_resource` per NUMA arena. Chunk size is the resource's block size. |
-| `metadata_store` | `io/cache/metadata_store.{hpp,cpp}` | Per-file metadata cache keyed by `io_object::raw_file_cache_id()`. Always present, independent of the prefetching cache; callers park parsed footers here so a later scan of the same path skips the parse. |
+| `metadata_store` | `io/cache/metadata_store.{hpp,cpp}` | Per-ioctx identity/profile metadata cache. Always present, independent of the prefetching cache; callers park parsed footers here so a later scan of the same object identity and profile skips the parse. |
 | `completion_controller` | `exec/completion_controller.hpp` | Unbounded RAII lifetime tracking. Cache-backed I/O and cached-copy waiters hold slots so teardown cannot destroy file entries or pinned chunks while a completion may still touch them; it is not a rate limit. |
 | `semi_future` / `try_t` / `completion_controller` | `exec/semi_future.hpp`, `exec/try.hpp`, `exec/completion_controller.hpp` | Async primitives the IO layer is built on. `semi_future<T>`/`promise<T>` are the wait-or-callback handles every async read returns; `try_t<T>` is the value-or-error result type; `completion_controller` + `completion_token` provide one-shot completion subscriptions. |
 
@@ -595,9 +615,11 @@ The cache does two things beyond classic prefetch:
 - **Partial reads.** A `device_read` over a range whose chunks are only partially cached copies the cached chunks straight to device and completes the rest from the backend in the same call, instead of treating a partial overlap as a miss.
 - **Populate-on-read.** On a backend that supports bounce-staged host-to-device reads, an uncached chunk being read for the device is loaded into a cache buffer (file → cache chunk → device) and published to the cache, so the next read of the same chunk is a hit — caching as a side effect of reading, like an OS page cache. A heavily-partial boundary chunk whose over-read would exceed ~25% of the chunk is instead read through an internal bounce slot and left uncached (zero over-read).
 
-Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The store keeps one generation per path — a registration replaces whatever the path held — and `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); the exact-key lookup decides whether the footer is reused.
+Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same object generation regardless of whether prefetching is wired up. The resident store has one entry per exact path and parser profile; the entry carries the object identity and the opened object's identity must match before reuse. For local files, the reusable identity is `{device, inode, size, ctime_ns}` captured from the opened descriptor. A same-inode in-place rewrite that preserves that tuple can therefore reuse older raw bytes or a parsed footer; local inputs are required to be immutable during a scan and should be updated by atomic replacement, which produces a new descriptor identity. A normal hit performs one exact index lookup and an identity check; there is no recency update or LRU scan. `has_path()` is only an *open hint* (skip the footer probe when some generation's footer is known); a path-level reverse index is used only to invalidate profiles when that path's identity changes. There is currently no per-statement opt-out for cross-statement local footer/byte reuse; an opt-out can be revisited with the retention owner after #209/#2108. HOST/runtime residency budgets, byte accounting, eviction limits, and their diagnostics remain a follow-up owned by the finalized cuCascade IO lifecycle in #2108, after the #209/#2108 identity-header handoff. R3 keeps the existing ioctx-scoped residency behavior and does not claim those bounds are implemented here.
 
 **fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` registers a scan range set and stashes its `cache_handle`. The readahead manager later drives that handle through allocation and asynchronous prefetch; the consumer stage records when reading begins so stale work can be refused or awaited instead of issuing duplicate I/O.
+
+Metadata opens advance a per-path observation fence using the existing monotonic `open_generation`; an unchanged identity keeps its cached artifact. A producer for a superseded identity can finish for its callers but cannot republish into the index. Concurrent misses for the same path, identity and parser profile share one result or exception; a failed flight is removed so a later request can retry. The store's stop-token wait cancels only that waiter, leaving the producer and other waiters intact. `statistics()` and `describe_metadata_store()` expose hits, misses, joined waits, builds, failures, cancelled waiters, stale publications and in-flight work. The dump also lists entry keys, identities, generations and holder counts. These are event counts and ownership diagnostics, not memory budgets.
 
 ### Cache Internals
 

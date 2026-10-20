@@ -258,6 +258,16 @@ zero. A non-finite result yields the input for `n >= 0` and 0 for `n < 0`. The o
 identical to DuckDB. The precision must be a constant INTEGER.
 DECIMAL and integer inputs and a column precision fall back to the CPU at plan time.
 
+### Absolute value
+
+`abs(x)` on FLOAT, DOUBLE, DECIMAL and the integer types other than HUGEINT maps to
+`function_id::abs` and runs `cudf::unary_operation` with `ABS`. NaN and infinities are preserved and
+`abs(-0.0)` is `0.0`. The result has the input's type. The absolute value of the smallest value of a
+signed integer type wraps in cuDF, where DuckDB raises an overflow error, so the evaluator checks
+with `cudf::contains` whether the input holds that value and throws. The query then falls back to the
+CPU, which raises DuckDB's error. Unsigned integers have no such value and are returned as they are.
+HUGEINT falls back at plan time.
+
 ### Logical AND/OR NULL semantics
 
 SQL `AND`/`OR` use Kleene three-valued logic (`TRUE OR NULL = TRUE`, `FALSE AND NULL = FALSE`), so conjunctions map to cuDF's Kleene operators — `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR` as AST operators and `cudf::binary_operator::NULL_LOGICAL_*` on the materialize path — never the null-propagating `LOGICAL_*` variants. The plain `LOGICAL_AND` still appears for internal structural conjunctions where operands cannot be NULL, such as the BETWEEN lowering and the AND that combines multi-condition join predicates.
