@@ -26,8 +26,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#ifndef SIMPATICO_USE_CUCASCADE_STREAM_POOL
 #include <map>
 #include <mutex>
+#endif
 #include <numeric>
 #include <optional>
 #include <ranges>

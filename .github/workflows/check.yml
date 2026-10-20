@@ -197,14 +197,6 @@ jobs:
             -checks='-*,misc-include-cleaner' \
             "$PWD/src/.*[.](c|cc|cpp|cxx)$" 2>&1 | tee /tmp/includes.log
 
-      - name: Surface include errors
-        if: failure() && steps.includes.outcome == 'failure'
-        run: |
-          echo '## Include check errors' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -100 /tmp/includes.log >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
       - name: Check the pinned DuckDB revisions
         run: |
           engine=$(git rev-parse HEAD:duckdb)
