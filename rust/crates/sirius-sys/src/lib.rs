@@ -71,6 +71,20 @@ mod ffi {
             out_stream_addr: usize,
         ) -> Result<()>;
 
+        /// A handle that cancels this context's run in progress from another
+        /// thread. It may outlive the context, after which it does nothing.
+        fn interrupter(self: &Context) -> UniquePtr<Interrupter>;
+
+        /// Handle from [`Context::interrupter`]; its methods are safe to call
+        /// from any thread, concurrently with the context's own calls.
+        type Interrupter;
+
+        /// Cancel the `execute_substrait` (or fragment run) in progress on the
+        /// handle's context: it stops within one GPU task and fails with
+        /// DuckDB's interrupt error. With no run in progress, or once the
+        /// context is gone, this does nothing.
+        fn interrupt(self: &Interrupter);
+
         /// Holds batches a transport received until a fragment takes them by
         /// token. Callable from any thread; the contract of every method is
         /// documented on the C++ class.
@@ -278,6 +292,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    Context, ExchangeInbox, Fragment, OutputDrain, RingExchange, make_context,
+    Context, ExchangeInbox, Fragment, Interrupter, OutputDrain, RingExchange, make_context,
     make_context_from_config, make_context_with_ring, make_fragment, stream_view_name,
 };
