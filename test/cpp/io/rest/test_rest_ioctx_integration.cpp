@@ -6780,3 +6780,123 @@ TEST_CASE("REST c3 seed diagnostics cannot fail validated reads",
     }
   }
 }
+
+TEST_CASE("REST c3 queued ranges select routes at first submission",
+          "[rest][rest_cluster_redirect][rest_c3][rest_c3_ac9]")
+{
+  constexpr std::size_t operation_count = 16;
+  constexpr std::size_t segment_bytes   = 16U << 20;
+  constexpr std::size_t total_bytes     = operation_count * segment_bytes;
+  auto const payload                    = deterministic_payload(total_bytes);
+  for (std::size_t slots : {2U, 16U}) {
+    DYNAMIC_SECTION("slots=" << slots)
+    {
+      request_log_capture logs;
+      range_http_server origin(
+        payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+      range_http_server target(
+        payload, tagged_object_policy(), {}, scripted_list_mode::normal, true);
+      c3_delegate(origin, target);
+      auto cfg                    = c3_config(origin, {authority(target.endpoint())});
+      cfg.max_connections         = slots;
+      cfg.max_retry_attempts      = 1;
+      cfg.max_auth_retry_attempts = 1;
+      cfg.request_timeout_s       = 60;
+      c3_fixture fixture(origin.endpoint(), cfg, 1);
+      auto source        = fixture.open(false);
+      auto const& object = dynamic_cast<redirect_object const&>(source->get_io_object());
+      REQUIRE(object.size() == total_bytes);
+      REQUIRE(redirect_object::is_strong_tag(object.validation_tag()));
+      REQUIRE(object.stash() == nullptr);
+      REQUIRE(object.route(fixture.context) == nullptr);
+      auto& worker               = fixture.reactor();
+      auto const followed_before = worker.redirects().followed;
+      CHECK(origin.head_count() == 1);
+      CHECK(target.head_count() == 1);
+      CHECK(followed_before == 1);
+      REQUIRE(origin.get_count() == 0);
+      REQUIRE(target.get_count() == 0);
+
+      std::vector<std::shared_ptr<response_gate>> gates;
+      std::vector<scripted_http_response> responses;
+      for (std::size_t i = 0; i < slots; ++i) {
+        auto gate = std::make_shared<response_gate>();
+        scripted_http_response response;
+        response.gate = gate;
+        responses.push_back(std::move(response));
+        gates.push_back(std::move(gate));
+      }
+      target.script("GET", std::move(responses), false);
+      logged_read read(source->get_io_object().shared_from_this(), 0, total_bytes);
+      auto future = read.coordinator->get_future();
+      stop_reactor_on_exit stop(worker);
+      worker.enqueue(std::move(read.request));
+      bool first_wave_ready = true;
+      for (auto const& gate : gates) {
+        if (!gate->wait_until_entered(30s)) {
+          first_wave_ready = false;
+          break;
+        }
+      }
+      if (first_wave_ready) {
+        CHECK(origin.get_count() == slots);
+        CHECK(target.get_count() == slots);
+        CHECK(read.completions->load() == 0);
+        CHECK(routes(worker).seeds == 0);
+      }
+      for (auto const& gate : gates) {
+        gate->release();
+      }
+      REQUIRE(first_wave_ready);
+      REQUIRE(std::move(future).wait(90s));
+      REQUIRE(std::move(future).get() == total_bytes);
+      worker.shutdown();
+      REQUIRE(read.completions->load() == operation_count);
+      REQUIRE(read.bytes->size() == payload.size());
+      REQUIRE(std::equal(read.bytes->begin(), read.bytes->end(), payload.begin()));
+
+      std::vector<std::string> expected_ranges;
+      std::vector<std::string> actual_ranges;
+      for (std::size_t i = 0; i < operation_count; ++i) {
+        expected_ranges.push_back("bytes=" + std::to_string(i * segment_bytes) + "-" +
+                                  std::to_string((i + 1) * segment_bytes - 1));
+      }
+      for (auto const& request : target.requests()) {
+        if (request.method != "GET") { continue; }
+        auto const ranges = request.values("range");
+        REQUIRE(ranges.size() == 1);
+        actual_ranges.push_back(ranges.front());
+      }
+      std::sort(expected_ranges.begin(), expected_ranges.end());
+      std::sort(actual_ranges.begin(), actual_ranges.end());
+      REQUIRE(actual_ranges == expected_ranges);
+      REQUIRE(target.get_count() == operation_count);
+      std::size_t target_records = 0, cached_records = 0, fresh_records = 0;
+      for (auto const& record : transfers(logs)) {
+        if (record.method != "GET" || record.authority != authority(target.endpoint())) {
+          continue;
+        }
+        ++target_records;
+        cached_records += record.route == "cached";
+        fresh_records += record.route == "fresh";
+        CHECK(record.status == 206);
+        CHECK(record.outcome == "ok");
+        CHECK(record.bytes == segment_bytes);
+        CHECK(record.attempt == 0);
+        CHECK(record.delegated);
+      }
+      REQUIRE(target_records == operation_count);
+      auto const origin_gets = origin.get_count();
+      auto const counters    = routes(worker);
+      CHECK(counters.seeds == 1);
+      CHECK(counters.refreshes == 0);
+      CHECK(worker.redirects().followed - followed_before == origin_gets);
+      CHECK(worker.redirects().refused == 0);
+      CHECK(cached_records == counters.hits);
+      CHECK(fresh_records == origin_gets);
+      CHECK(origin_gets + cached_records == operation_count);
+      CHECK(origin_gets == slots);
+      CHECK(counters.hits == operation_count - slots);
+    }
+  }
+}
