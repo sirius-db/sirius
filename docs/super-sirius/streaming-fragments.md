@@ -163,6 +163,10 @@ physical plan, and roots it in a `sirius_physical_streaming_sink` or
   would split matching keys. When `partitioning.key_cast_types` is empty, `build()` fills one per
   key: `TINYINT`, `SMALLINT`, `INTEGER` → `INT64`; `BIGINT`, `BOOLEAN`, `VARCHAR` → `EMPTY` (as-is);
   `DECIMAL` → `FLOAT64`; any other type throws. An out-of-range key column throws first.
+  The streaming sink converts each key to its cast type before hashing
+  (`partition_key_cast::normalize`), so a `DECIMAL(9,2)` and a `DECIMAL(18,2)` sender route each
+  value alike. PARTITION instead restores prepared join keys strictly
+  (`partition_key_cast::restore_prepared`), which throws on anything but a compressed carrier.
 
 **`run()`**
 

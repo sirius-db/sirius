@@ -1000,6 +1000,71 @@ TEST_CASE_METHOD(fragment_fixture,
 }
 
 // ============================================================================
+// FRAG-9e: DECIMAL keys of different widths route each value to the same destination
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-9e: DECIMAL keys of different widths route each key to the same destination",
+                 "[integration][streaming_fragment]")
+{
+  // A DECIMAL key hashes as FLOAT64, so senders that bound it at different widths (TPC-H q10's
+  // c_acctbal, q18's o_totalprice) send each value to the same destination. The partition step
+  // must convert the key, not only restore a narrowed carrier.
+  auto values = [](char const* type) {
+    std::string query = "SELECT k FROM (VALUES ";
+    for (int i = 1; i <= 20; ++i) {
+      query += std::string(i > 1 ? ", (" : "(") + std::to_string(i * 37) + ".25::" + type + ")";
+    }
+    return query + ") t(k)";
+  };
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&](char const* type) {
+      fragment_spec spec;
+      spec.plan_source  = sirius::test::sql_plan_source(values(type));
+      spec.outputs      = {0, 1};
+      spec.partitioning = sirius::op::partition_spec{{0}};
+      auto sender       = std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+      sender->build();
+      sender->run();
+      return sender;
+    };
+    auto narrow = make_sender("DECIMAL(9, 2)");
+    auto wide   = make_sender("DECIMAL(18, 2)");
+    REQUIRE(narrow->sink_types()[0].id() == sirius::type_id::DECIMAL);
+    REQUIRE(wide->sink_types()[0].id() == sirius::type_id::DECIMAL);
+
+    auto drain_keys = [&](streaming_fragment& sender, stream_id_t destination) {
+      std::vector<double> keys;
+      while (auto batch = sender.pull(destination)) {
+        auto const column = sirius::get_cudf_table_view(**batch).column(0);
+        auto const values = cudf::cast(column, cudf::data_type{cudf::type_id::FLOAT64});
+        auto host = sirius::test::operator_utils::copy_column_to_host<double>(values->view());
+        keys.insert(keys.end(), host.begin(), host.end());
+      }
+      std::sort(keys.begin(), keys.end());
+      return keys;
+    };
+
+    std::size_t routed = 0;
+    for (stream_id_t destination : {0, 1}) {
+      auto const from_narrow = drain_keys(*narrow, destination);
+      auto const from_wide   = drain_keys(*wide, destination);
+      REQUIRE_FALSE(from_narrow.empty());
+      REQUIRE(from_narrow == from_wide);
+      routed += from_narrow.size();
+    }
+    REQUIRE(routed == 20);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
 // FRAG-10: build() holds no query window, so fragments build up front and run in any order
 // ============================================================================
 
