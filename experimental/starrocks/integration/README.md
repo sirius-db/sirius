@@ -1,48 +1,78 @@
 # StarRocks CN integration branch (temporary)
 
-`tmp/sr-cn-integration-2026-10-20c` combines the open PRs of the Sirius StarRocks compute-node (CN) work on `main`, so they can be built and tested together before the stacks merge. **It is temporary and is not meant to be merged.** The PRs themselves are on sirius-db/sirius.
+`tmp/sr-cn-integration-2026-10-20f` combines the open PRs of the Sirius StarRocks compute-node (CN) work on `main`, so they can be built and tested together before the stacks merge. **It is temporary and is not meant to be merged.** The PRs themselves are on sirius-db/sirius.
 
-It replaces `tmp/sr-cn-integration-2026-10-15`. Since then, the exchange between CNs moved from the NIXL direct path (#2040, #2041, both closed) to the ring exchange (#2256 → #2257 → #2258), and the runtime-filter and failure stacks were restacked onto the ring.
+It replaces `tmp/sr-cn-integration-2026-10-20c`. Since then stack A became two PRs: #2038, then one ring PR (#2258) that folds in #2251, #2039, #2061, #2256 and #2257. Stack C was rebased onto it, #2124/#2125 became #2254, and #2259 is the pin/byte-range rule.
 
 ## What's in it
 
-The base is `main` at 9c2a44f6 (#2135).
+The base is `main` at e034d221 (#2241). Merged in this order (heads as of Oct 20, 21:00 UTC):
 
-| stack | PRs (head) |
-|---|---|
-| A: exchange and ring | #2038 multiple fragments per CN through a local exchange → #2039 received batches held by token (`exchange_inbox`) → #2061 exchange data spills to host → #2256 the ring's engine side → #2257 the ring's disk tier → #2258 the ring transport between CNs (a5cba00f) |
-| C: runtime filters, on #2258 | #2062 broadcast runtime filters (9df44f53) |
-| C: filters, on #2062 | #2102 (8c78b0f6) → #2114 (0e701a85) → #2122 (c135b923) → #2134 (3a4bfa26) → #2136 (ecd4cca0) → #2137 (764257b7) |
-| C: failures, on #2062 | #2115 (bafe517a) → #2116 (c8e7a7a0) → #2118 (a9fc33be) → #2119 (faa96815) → #2120 (3f58b03c) → #2121 (33a8115d) |
-
-The filters and failures chains are merged together here. The PRs merged on top, at these heads:
-
-| PR | head | what |
+| step | PR (head) | what |
 |---|---|---|
-| #2043 | 85e314f2 | split parquet files across CNs by byte range (merged into `main` after 9c2a44f6) |
-| #2253 | 199482df | pinned parquet tables serve file-subset scans, and `pin_table` through the FFI |
-| #2125 | 36aafdd5 | GPU casts round like DuckDB (closed; #2254 replaces it and is not in this branch) |
-| #2217 | 325d323d | a streaming sink converts its hash keys again |
-| #2129 | 2cfe909e | exact decimal division |
-| #2130 | 8cfb73f7 | exact AVG and `/` (brings #2103, #2109, #2110, #2111 and #2127) |
-| #2104 | 27b900c9 | RIGHT SEMI joins |
-| #2112 | ff3b6281 | DATE and TIMESTAMP partition keys |
-| #2128 | dc5b8721 | unary minus on the GPU |
-| #2107 | 05bdf818 | the Substrait consumer reads `FetchRel.count_expr`/`offset_expr` |
-| #2100 | c0364803 | batch dispatch uses the shared descriptor table |
-| #2101 | d63046bf | the CN heartbeat reports its StarRocks release |
-| #2251 | 17379938 | engine group A: `async_capped` allocator and slice combining |
+| 1 | #2121 (cbd01058) | stack A: #2038 multiple fragments per CN (28629cce) → #2258 the ring exchange (412d4f4b); stack C root #2062 (e0520f50); failures #2115 → #2121 |
+| 2 | #2137 (bf6f241d) | filters #2102 → #2137 |
+| 3 | #2254 (2a29128d) | GPU numeric casts round and range-check like DuckDB |
+| 4 | #2217 (325d323d) | a streaming sink converts its hash keys again |
+| 5 | #2259 (1642053d) | #2253 pinned tables + never serve a byte-range scan from a pin |
+| 6 | #2129 (2e260070) | exact decimal division |
+| 7 | #2128 (29fc3c16) | unary minus on the GPU |
+| 8 | #2130 (8cfb73f7) | coverage chain #2103, #2109, #2110, #2111, #2127, #2130 |
+| 9 | #2104 (27b900c9) | RIGHT SEMI joins |
+| 10 | #2112 (ff3b6281) | DATE/TIMESTAMP partition keys |
+| 11 | #2107 (0d41dfc0) | Substrait `FetchRel.count_expr`/`offset_expr` (substrait at bdfb4eac, ext#5) |
+| 12 | #2100 (c0364803) | batch dispatch uses the shared descriptor table |
+| 13 | #2101 (d63046bf) | the CN heartbeat reports its StarRocks release |
 
-Integration-only commits, in no PR:
-- `spill_skip::recheck` for the ring's subscribed-batch check (#2256 with #2251).
-- The filters × failures merge: `RecentQueries: Default`; `run_and_ship` returns `FragmentFailure`; a filter share's run carries its query, so a purge stops it; a purge keeps its deferred scans' params to end their hops.
-- #2253 on the ring stack: `pin_table`/`unpin_table` placed in `SiriusContext`, and the FFI interrupt test closed before #2253's pin test.
-- #2100 on the failures stack: the batch test uses a result sink, and the shared-table error maps to `StatusPb`.
-- Two translator tests dropped that an older #2104 head carried; their fixture files are in no branch.
+Integration-only changes, in no PR:
+- **filters × failures** (in the step-2 merge): `RecentQueries: Default`; `run_and_ship` returns `FragmentFailure`; a filter share's run carries its query, so a purge stops it; a purge keeps its deferred scans' params to end their hops; SRNX kinds TOPOLOGY 5, SHARE_ABANDONED 6, FAILED 7.
+- **#2217 × #2258:** `partition_key_cast::normalize` in the sink's single `hash_partition` call.
+- **#2253 × stack A:** `pin_table`/`unpin_table` take the context through its `RefCell`; #2253's tests go after A's.
+- **#2129 × #2128:** ids abs 33 (main), decimal_divide 34, negate 35 (36 in all); #2128's signature table gains `{"sirius_decimal_divide", 3, 3}`.
+- **#2100 × stack A/failures:** `resolve_descriptor_table` maps to `StatusPb`; the batch test's instances get a result sink.
+- **#2104:** two translator tests dropped whose fixtures no PR carries (20c f6dff01e).
 
-**Not included:** #2254 (casts; this branch has #2125), #2259 (never serve a byte-range scan from a pin), #2131 (`regexp_replace`).
+**Not included:** #1965 (host Arrow input), #2131 (`regexp_replace`), #2232 (NUMA placement for pins), the CN pin command (needs a port onto #2258).
 
-## Results on 2× RTX PRO 4500 Blackwell (32 GB each, one CN per GPU, every result checked against DuckDB)
+## Results on 4× GB200 (189 GB each, one CN per GPU, every result checked against DuckDB)
+
+Settings: `GPU_ALLOCATOR=async_capped`, `SIRIUS_CN_RING_GPU_LANDING_FRACTION=0.25` (env.sh), 85% of each GPU for the pool,
+128 GiB host tier per CN (SF1000), 4 pipeline threads, data on `/scratch/sirius/datasets` (GPFS). Tools repo: `box/gb200`
+rebased on `main` plus 75c3494 (the harness reads `GPU_ALLOCATOR`/`DISK_DIR`).
+
+- **Unit tests:** C++ tests of the 25 test files the branch touches against `main`: 524 cases pass. CN: CI checks pass; the
+  engine-linked CN tests pass (208, 1 ignored).
+- **SF1 smoke:** 22/22 (the harness's `nixl-hops` check fails: it looks for the direct path's log line).
+- **SF1000, 2 iterations on fresh clusters:** 44/44, sum of per-query medians **41.1 s**. Same box, Oct 19 builds on the old
+  direct NIXL exchange: v10 38.5 s (both runs), v9 40.4 s.
+
+| query | 20f median | v10 median (2 runs) | Δ vs v10 |
+|---|---:|---:|---:|
+| q01 | 4.81 | 4.60 | +5% |
+| q02 | 1.23 | 1.15 | +7% |
+| q03 | 1.73 | 1.68 | +3% |
+| q04 | 1.12 | 1.16 | -3% |
+| q05 | 1.52 | 1.56 | -2% |
+| q06 | 1.22 | 1.34 | -9% |
+| q07 | 1.91 | 1.87 | +2% |
+| q08 | 2.21 | 1.97 | +12% |
+| q09 | 3.25 | 3.44 | -6% |
+| q10 | 2.09 | 1.74 | +20% |
+| q11 | 0.71 | 0.66 | +7% |
+| q12 | 1.24 | 1.19 | +4% |
+| q13 | 1.18 | 1.09 | +9% |
+| q14 | 1.31 | 1.33 | -2% |
+| q15 | 2.20 | 2.23 | -1% |
+| q16 | 0.46 | 0.43 | +7% |
+| q17 | 2.34 | 2.07 | +13% |
+| q18 | 2.42 | 1.94 | +25% |
+| q19 | 1.59 | 1.54 | +3% |
+| q20 | 1.69 | 1.60 | +6% |
+| q21 | 4.28 | 3.33 | +28% |
+| q22 | 0.57 | 0.56 | +2% |
+| **sum** | **41.1** | **38.5** | **+6.7%** |
+
+## 20c results on 2× RTX PRO 4500 Blackwell (32 GB each, one CN per GPU, every result checked against DuckDB)
 
 Settings: `GPU_ALLOCATOR=async_capped`, `SIRIUS_CN_RING_GPU_LANDING_FRACTION=0.25`, a 256 GiB disk tier on the instance NVMe (`DISK_DIR`), 36 GiB host tier per CN. `env.sh` sets the first two; see "Setup".
 
