@@ -732,6 +732,59 @@ TEST_CASE("Discarded dispatcher captures coalesce nested stop notifications",
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 
+TEST_CASE("Completion stop retains sweep credit through discarded dispatcher captures",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  auto failure = GENERATE(false, true);
+  CAPTURE(failure);
+  fixture f(1, 1);
+  auto blocked      = f.make_hold();
+  auto paused       = f.make_hold();
+  auto seen         = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  seen->after_probe = [paused] { paused->wait(); };
+  auto cleanup      = f.shutdown_guard();
+  auto external     = f.coordinator.external_use();
+  f.dispatcher.enqueue([blocked] { blocked->wait(); });
+  REQUIRE(blocked->await());
+  std::atomic<size_t> calls{0};
+  // This pending capture has no job ticket or unit cleanup credit of its own.
+  auto capture = std::shared_ptr<void>(nullptr, [seen](void*) { seen->release(); });
+  f.dispatcher.enqueue([capture = std::move(capture), &calls] { ++calls; });
+  f.start();
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!f.coordinator.snapshot().wakes && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  REQUIRE(f.coordinator.snapshot().wakes > 0);
+
+  std::atomic<bool> notified{false};
+  std::jthread terminal([&] {
+    if (failure)
+      f.completion.report_error("discarded capture failure");
+    else
+      f.completion.mark_completed();
+    notified = true;
+  });
+  auto release = std::shared_ptr<hold>(paused.get(), [paused](hold*) { paused->release(); });
+  REQUIRE(paused->await());
+  CHECK(seen->outside == 1);
+  // Observe the credit directly: dispatcher wait_for_all also prevents quiescence.
+  CHECK(seen->callbacks_seen > 0);
+  external.reset();
+  blocked->release();
+  CHECK_FALSE(notified);
+  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  paused->release();
+  terminal.join();
+  f.finish();
+  CHECK(notified);
+  CHECK(calls == 0);
+  CHECK(seen->releases == 1);
+  CHECK(seen->errors == 0);
+  CHECK_FALSE(f.owner_error);
+  CHECK(f.completion.has_error() == failure);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
 TEST_CASE("Preparation cancel retirement and stop bookkeeping allocate no host memory",
           "[.][host_allocation_fault][preparation_allocation_fault]")
 {
