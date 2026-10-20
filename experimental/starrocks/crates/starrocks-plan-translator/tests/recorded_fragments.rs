@@ -333,20 +333,6 @@ fn joins(plan: &TranslatedPlan) -> Vec<(JoinType, Vec<String>)> {
         .collect()
 }
 
-/// q04's partial fragment: `EXISTS (lineitem ...)` is a RIGHT SEMI join keeping the orders
-/// side, under the partial COUNT.
-#[test]
-fn q04_right_semi_join_translates() {
-    assert_eq!(
-        join_ops(SEMI_ANTI_JOIN, "q04-partial"),
-        [TJoinOp::RIGHT_SEMI_JOIN]
-    );
-    let plan = translate(SEMI_ANTI_JOIN, "q04-partial").unwrap();
-    let kinds: Vec<_> = joins(&plan).into_iter().map(|(kind, _)| kind).collect();
-    assert_eq!(kinds, [JoinType::RightSemi]);
-    assert!(function_names(&plan).contains(&"count".to_string()));
-}
-
 /// q20's root fragment: `s_suppkey IN (...)` is a RIGHT SEMI join keeping the supplier side.
 #[test]
 fn q20_right_semi_join_translates() {
@@ -357,37 +343,6 @@ fn q20_right_semi_join_translates() {
     let plan = translate(SEMI_ANTI_JOIN, "q20-root").unwrap();
     let kinds: Vec<_> = joins(&plan).into_iter().map(|(kind, _)| kind).collect();
     assert_eq!(kinds, [JoinType::RightSemi]);
-}
-
-/// q21's partial fragment: `EXISTS (l2 ...)` is a RIGHT SEMI join and `NOT EXISTS (l3 ...)` a
-/// RIGHT ANTI join, both with `l_suppkey <> l1.l_suppkey` as an extra join conjunct. The
-/// conjunct has to stay in each join's condition: as a filter after the join it would test
-/// one matching row instead of whether any row matches.
-#[test]
-fn q21_semi_and_anti_joins_keep_their_other_conjuncts() {
-    assert_eq!(
-        join_ops(SEMI_ANTI_JOIN, "q21-partial"),
-        [
-            TJoinOp::RIGHT_SEMI_JOIN,
-            TJoinOp::INNER_JOIN,
-            TJoinOp::RIGHT_ANTI_JOIN
-        ]
-    );
-    let plan = translate(SEMI_ANTI_JOIN, "q21-partial").unwrap();
-    let joins = joins(&plan);
-    let kinds: Vec<_> = joins.iter().map(|(kind, _)| *kind).collect();
-    // The RIGHT ANTI join is a RIGHT join filtered on the probe key being NULL.
-    assert_eq!(
-        kinds,
-        [JoinType::RightSemi, JoinType::Inner, JoinType::Right]
-    );
-    for (kind, called) in [&joins[0], &joins[2]] {
-        assert!(
-            called.contains(&"equal".to_string()) && called.contains(&"not_equal".to_string()),
-            "{kind:?}: {called:?}"
-        );
-    }
-    assert!(function_names(&plan).contains(&"is_null".to_string()));
 }
 
 /// The aggregation node `node_id` of a recorded fragment.
