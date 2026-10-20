@@ -172,7 +172,7 @@ TEST_CASE("expression strategy survives thread handoff and caller policy changes
 {
   auto expr  = make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(1));
   auto input = make_int32_table({1, 2, 3});
-  cudf::get_default_stream().synchronize();
+  cudf::get_default_stream().sync();
   auto policy = sirius::expression_query_policy{};
   auto mr     = cudf::get_current_device_resource_ref();
   auto stream = cudf::get_default_stream();
@@ -199,7 +199,7 @@ TEST_CASE("expression strategy survives thread handoff and caller policy changes
       // Reusing the same thread for a different policy must not change the first
       // evaluator.
       auto third = is_operation(ast);
-      stream.synchronize();
+      stream.sync();
       return std::array{first, second, third};
     }).get();
   REQUIRE(result == std::array{true, false, true});
