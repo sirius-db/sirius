@@ -251,21 +251,16 @@ tagged `[timestamp_extraction]`.
 
 ### Arity and negation
 
-DuckDB overloads some function names on arity: a one-argument `-` is negation and a
-one-argument `+` is the identity. The GPU handlers read their arguments by position, so
-`from_duckdb` maps the one-argument `-` to `function_id::negate`, translates a one-argument
-`+` to its operand, and declines any function whose argument count its handler does not take
-(`sirius::accepts_argument_count`), which leaves the expression on the CPU. The
-`function_call` constructor enforces the same table and throws `sirius::internal_exception`,
-so an AST with a mismatched arity never reaches the evaluator.
+`from_duckdb_function_name` resolves a (name, argument count) pair against one signature table
+in `function_id.cpp`: a one-argument `-` is `function_id::negate`, a two-argument `-` is
+`function_id::sub`, and an arity no GPU handler takes stays on the CPU. A one-argument `+`
+translates to its operand. The `function_call` constructor throws on a mismatched arity.
 
-`negate` runs `cudf::unary_operation(NEGATE)` on TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT,
-DOUBLE and DECIMAL of every width; the result keeps the input's type, scale and precision, and
-negating `0.0` gives `-0.0` as in DuckDB. Like DuckDB, negating a signed integer's minimum
-raises `Overflow in negation of numeric value!` instead of wrapping: the handler reduces the
-input to its minimum first, which synchronizes the stream. Unsigned, HUGEINT (an INT64 carrier
-on the GPU) and INTERVAL inputs fall back to the CPU at plan time. cuDF ASTs have no negation
-operator, so `negate` is an AST breaker. Regression tests are tagged `[negate]`.
+`negate` runs `cudf::unary_operation(NEGATE)` on signed integers, FLOAT, DOUBLE and DECIMAL,
+keeping the input type (`-0.0` matches DuckDB). Negating a signed integer's minimum raises
+DuckDB's `Overflow in negation of numeric value!`; the check is a `cudf::contains` shared with
+`abs` (one stream sync). Unsigned, HUGEINT and INTERVAL negation, and a result type that differs
+from the operand's, stay on the CPU. `negate` is an AST breaker. Tests are tagged `[negate]`.
 
 ### Rounding
 

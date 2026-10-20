@@ -37,14 +37,12 @@ struct node;
  *
  * No default state: the only way to construct a `function_call` is via the
  * three-argument constructor, so every instance was built with an explicit
- * function id, an arguments vector, and a return type. The constructor rejects
- * an argument count the function's GPU handler does not take (see
- * sirius::accepts_argument_count), so the evaluator can index its arguments by
- * position. Translators check the arity first and decline the expression
- * instead. Move-only (the
- * arguments vector holds `unique_ptr<node>`); private fields with const
- * accessors prevent post-construction mutation. Moved-from instances are
- * left in the standard valid-but-unspecified state and must not be read.
+ * function id, an arguments vector, and a return type. The constructor throws
+ * on an arity the GPU handler does not take (sirius::accepts_argument_count).
+ * Move-only (the arguments vector holds `unique_ptr<node>`); private fields
+ * with const accessors prevent post-construction mutation. Moved-from
+ * instances are left in the standard valid-but-unspecified state and must not
+ * be read.
  */
 class function_call {
  public:
