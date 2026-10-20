@@ -51,6 +51,12 @@ pub(crate) struct RecentQueries<V> {
     recorded: VecDeque<(Instant, u64)>,
 }
 
+impl<V> Default for RecentQueries<V> {
+    fn default() -> Self {
+        Self::new(REMEMBER_FOR, MAX_ENDED_QUERIES)
+    }
+}
+
 impl<V> RecentQueries<V> {
     pub(crate) fn new(window: Duration, cap: usize) -> Self {
         Self {

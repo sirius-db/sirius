@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -17,11 +18,10 @@ fn stream_output_enabled() -> bool {
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
 use crate::fragment_executor::{
-    DrainHandoff, FilterKeys, FilterRun, FragmentExecutor, FragmentRun, SenderSlot,
+    DrainHandoff, FilterKeys, FilterRun, FragmentExecutor, FragmentRun, KeySource, SenderSlot,
 };
 use crate::local_exchange::{
-    ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, RemoteBatch, RemoteFrame,
-    SenderSource,
+    ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, RemoteBatch, SenderSource,
 };
 use crate::nixl_chunk::{self, NixlEndpoint, NixlEnvelope, RingDelivery, StreamHop};
 use crate::proto::starrocks::{
@@ -33,9 +33,16 @@ use crate::proto::starrocks::{
 };
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FragmentInstanceId, ResultStore};
-use crate::runtime_filters::{self, DeferredScan, FILTER_STREAM_BASE, RuntimeFilters};
-use starrocks_plan_translator::runtime_filter::{self, FilterInput};
-use starrocks_plan_translator::{ExchangeInput, PlanTranslator, StreamInputColumn, TranslatedPlan};
+use crate::runtime_filters::{
+    self, BuildSite, DeferredScan, FILTER_STREAM_BASE, FilterTopology, FragmentOutput,
+    FragmentShape, HeldShare, PendingReceiver, RuntimeFilters,
+};
+use starrocks_plan_translator::runtime_filter::{
+    self, BuildDistribution, FilterInput, ProbeKeys, ProbedFilter, SHARE_KEYS, SkipReason,
+};
+use starrocks_plan_translator::{
+    ExchangeInput, PlanTranslator, StreamInputColumn, StreamInputSchema, TranslatedPlan,
+};
 use starrocks_thrift::{
     data_sinks::{TDataSinkType, TPlanFragmentDestination, TResultSinkType},
     descriptors::TDescriptorTable,
@@ -98,8 +105,11 @@ pub(crate) struct SiriusComputeNodeService {
     /// addresses sink destinations by IP (`ComputeNode.getBrpcIpAddress`). A destination is local
     /// only when IP and port both match, so two CNs on one host see each other as remote.
     brpc_address: TNetworkAddress,
-    /// Runtime filters this CN builds from broadcast joins, and the scans waiting for them.
+    /// Runtime filters this CN builds from broadcast joins or holds a share of, and the scans
+    /// waiting for them.
     filters: Arc<RuntimeFilters>,
+    /// How long a scan waits for its runtime filters before it runs unfiltered.
+    filter_wait: Duration,
     /// The final `reportExecStatus` each dispatched instance still owes the FE.
     reports: Arc<ExecReports>,
     /// Survey mode (`SIRIUS_CN_TRANSLATE_ONLY`): accept and translate every fragment, run none.
@@ -156,6 +166,26 @@ impl Cancel {
             error: format!("query cancelled: {message}"),
         }
     }
+}
+
+/// The inputs of a receiver about to run, by exchange: runtime filter keys read in place before
+/// it consumes them.
+type HeldKeys = HashMap<ExchangeKey, Vec<KeySource>>;
+
+/// Where a deferred scan's filter keys stand.
+enum FilterKeysState {
+    /// Some are still to arrive.
+    Waiting,
+    /// All here: where they sit, and whether they are the keys themselves or only bounds.
+    Ready {
+        sources: Vec<KeySource>,
+        exact: bool,
+    },
+    /// They never will be usable; the scan runs without this filter.
+    Unusable {
+        reason: &'static str,
+        detail: String,
+    },
 }
 
 /// The runtime filters a fragment run applies, and the plan to run instead if their keys cannot
@@ -225,6 +255,7 @@ impl SiriusComputeNodeService {
             ),
             nixl,
             filters: Arc::new(RuntimeFilters::default()),
+            filter_wait: runtime_filters::wait_limit(),
             reports: Arc::new(ExecReports::new(None, Arc::clone(&ends))),
             translate_only: std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some(),
             ends,
@@ -253,8 +284,15 @@ impl RingDelivery for SiriusComputeNodeService {
         rows: u64,
         names: &[String],
     ) -> std::result::Result<(), String> {
-        if let Some(ready) = self.push_packed(request, token, rows, names.to_vec())? {
-            self.drain_ready_async(ready);
+        match self.push_packed(request, token, rows, names.to_vec())? {
+            Some(Some(ready)) => self.drain_ready_async(ready),
+            Some(None) => {}
+            // A runtime filter share for a scan that no longer waits for it.
+            None => {
+                if let Some(nixl) = self.nixl.as_ref().filter(|_| token != 0) {
+                    nixl.release(token);
+                }
+            }
         }
         Ok(())
     }
@@ -596,6 +634,20 @@ impl SiriusComputeNodeService {
             self.reports.finish(&params, Ok(()));
             return Ok(Vec::new());
         }
+        if runtime_filters::enabled() {
+            Self::log_planned_skips(&params);
+            if let (Some(query), Some(topology)) = (
+                Self::query_id(&params),
+                params
+                    .params
+                    .as_ref()
+                    .and_then(|exec| exec.runtime_filter_params.as_ref()),
+            ) {
+                self.filters.record_topology(query, topology);
+            }
+            // After the topology: a merge node's own holders find their probers there.
+            self.release_unbuilt_probers(&params);
+        }
         let expected_senders = Self::receiver_exchanges(&params)?;
         if !expected_senders.is_empty() {
             let exec = params
@@ -611,15 +663,64 @@ impl SiriusComputeNodeService {
                 match runtime_filter::built_filters(&params) {
                     Ok(built) if !built.is_empty() => {
                         info!(receiver = %id, filters = ?built, "receiver builds runtime filters");
-                        self.filters.record_builds(id, built);
+                        let (broadcast, shares): (Vec<_>, Vec<_>) =
+                            built.into_iter().partition(|filter| {
+                                filter.distribution == BuildDistribution::Broadcast
+                            });
+                        // Its probers refuse the filter too (`share_site`), so none waits.
+                        let (shares, unshareable): (Vec<_>, Vec<_>) =
+                            shares.into_iter().partition(|filter| {
+                                runtime_filters::shareable_key(&filter.column_type)
+                            });
+                        for filter in unshareable {
+                            runtime_filters::log_skipped(
+                                Some(query),
+                                Some(id),
+                                filter.filter_id,
+                                Some(filter.join_node_id),
+                                "key_type",
+                                &filter.column_type,
+                            );
+                            if let Some(merge_node) = filter.merge_node {
+                                self.release_probers(query, filter.filter_id, merge_node);
+                            }
+                        }
+                        self.filters.record_builds(id, broadcast);
+                        self.filters
+                            .record_shares(query, id, exec.sender_id.unwrap_or(0), shares);
                     }
                     Ok(_) => {}
                     Err(err) => warn!(error = %err, "ignoring a receiver's runtime filters"),
+                }
+                // A receiver never waits for a partitioned join's shares.
+                self.close_filter_exchanges(id, &params, &[]);
+                self.filters.record_shape(
+                    query,
+                    FragmentShape {
+                        exchanges: expected_senders
+                            .iter()
+                            .map(|(node_id, _)| *node_id)
+                            .collect(),
+                        sink: Self::fragment_output(&params),
+                    },
+                );
+                let filters = self.receiver_filter_sites(&params, query, id);
+                if !filters.is_empty() {
+                    info!(
+                        instance = %id,
+                        filters = ?filters.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                        "deferring a scan until its runtime filters arrive"
+                    );
+                    self.filters.defer_receiver(id, PendingReceiver { filters });
                 }
             }
             let ready = self
                 .exchanges
                 .register_receiver(id, expected_senders, params)?;
+            if runtime_filters::enabled() {
+                // Its build exchange may be complete already: its share can go.
+                self.dispatch_filtered_scans();
+            }
             return Ok(ready.into_iter().collect());
         }
         if self.defer_for_filters(&params) {
@@ -650,84 +751,696 @@ impl SiriusComputeNodeService {
         Ok(ready)
     }
 
-    /// Defers a leaf fragment whose scans probe runtime filters that a receiver on this CN builds
-    /// from a broadcast join. A timer runs it unfiltered if its filters take too long.
+    /// Logs the runtime filters `params`' fragment builds or probes that the plan already rules
+    /// out: a join filter this CN can't build, and a probe target no CN filters.
+    fn log_planned_skips(params: &TExecPlanFragmentParams) {
+        let (query, instance) = (Self::query_id(params), Self::fragment_instance_id(params));
+        let builds = runtime_filter::skipped_builds(params).unwrap_or_else(|err| {
+            warn!(error = %err, "cannot read a fragment's runtime filters");
+            Vec::new()
+        });
+        for skip in builds
+            .into_iter()
+            .chain(runtime_filter::skipped_probes(params))
+        {
+            runtime_filters::log_skipped(
+                query,
+                instance,
+                skip.filter_id,
+                Some(skip.node_id),
+                skip.reason.as_str(),
+                "",
+            );
+        }
+    }
+
+    /// Tells the probers of every partitioned join filter `params`' fragment builds but no CN can
+    /// that this holder's share won't come. They would otherwise wait for it until the limit.
+    fn release_unbuilt_probers(&self, params: &TExecPlanFragmentParams) {
+        let Some(query) = Self::query_id(params) else {
+            return;
+        };
+        let unbuilt = runtime_filter::unbuilt_shares(params).unwrap_or_else(|err| {
+            warn!(error = %err, "cannot read a fragment's runtime filters");
+            Vec::new()
+        });
+        for filter in unbuilt {
+            self.release_probers(query, filter.filter_id, filter.merge_node);
+        }
+    }
+
+    /// Tells every prober of `query`'s partitioned join filter `filter_id`, found through its
+    /// merge node, that this CN's share won't come. Runs off the caller's thread: the merge node
+    /// may be another CN.
+    fn release_probers(
+        &self,
+        query: FragmentInstanceId,
+        filter_id: i32,
+        merge_node: TNetworkAddress,
+    ) {
+        let service = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("filter-release".to_string())
+            .spawn(move || {
+                match service.filter_topology(query, &merge_node, filter_id) {
+                    Ok(topology) => {
+                        info!(
+                            %query,
+                            filter_id,
+                            probers = topology.probers.len(),
+                            "releasing a runtime filter's probers: no share comes from this CN"
+                        );
+                        service.abandon_share(filter_id, &topology.probers);
+                    }
+                    // Without the probers there is no one to tell: they wait out their limit.
+                    Err(err) => {
+                        warn!(%query, filter_id, error = %err, "cannot release a runtime filter's probers");
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            warn!(%query, filter_id, error = %err, "cannot release a runtime filter's probers");
+        }
+    }
+
+    /// Defers a leaf fragment whose scans probe runtime filters it can wait for: a broadcast
+    /// join's that a receiver on this CN builds, and a partitioned join's, whose shares every
+    /// build instance sends here. A timer runs it unfiltered if its filters take too long.
     fn defer_for_filters(&self, params: &TExecPlanFragmentParams) -> bool {
         if !runtime_filters::enabled() {
             return false;
         }
-        let probed: Vec<i32> = runtime_filter::probed_filters(params)
-            .into_iter()
-            .map(|probe| probe.filter_id)
-            .collect();
         let (Some(query), Some(instance)) =
             (Self::query_id(params), Self::fragment_instance_id(params))
         else {
             return false;
         };
-        if probed.is_empty() {
-            return false;
+        let probes = runtime_filter::probed_filters(params);
+        let broadcast: Vec<i32> = probes
+            .iter()
+            .filter(|probe| probe.distribution == BuildDistribution::Broadcast)
+            .map(|probe| probe.filter_id)
+            .collect();
+        let mut sites = self.filters.sites(query, &broadcast);
+        for probe in &probes {
+            if sites.iter().any(|(id, _)| *id == probe.filter_id) {
+                continue;
+            }
+            let skip = |reason: &str, detail: &str| {
+                runtime_filters::log_skipped(
+                    Some(query),
+                    Some(instance),
+                    probe.filter_id,
+                    Some(probe.scan_node_id),
+                    reason,
+                    detail,
+                );
+            };
+            match probe.distribution {
+                // Built by a receiver on another CN only.
+                BuildDistribution::Broadcast => skip("not_built_on_this_cn", ""),
+                BuildDistribution::Partitioned => match self.share_site(query, instance, probe) {
+                    Ok(site) => sites.push((probe.filter_id, site)),
+                    Err((reason, detail)) => skip(reason, &detail),
+                },
+                BuildDistribution::Other => skip("not_broadcast", ""),
+            }
         }
-        let sites = self.filters.sites(query, &probed);
+        let waiting: Vec<i32> = sites.iter().map(|(id, _)| *id).collect();
+        self.close_filter_exchanges(instance, params, &waiting);
         if sites.is_empty() {
-            info!(%instance, probed = ?probed, "no runtime filter of this scan is built on this CN");
             return false;
         }
         info!(
             %instance,
-            filters = ?sites.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            filters = ?waiting,
             "deferring a scan until its runtime filters arrive"
         );
-        self.filters.defer(
+        let deferred = self.filters.defer(
             instance,
             DeferredScan {
                 params: params.clone(),
                 filters: sites,
                 deferred_at: std::time::Instant::now(),
+                ready: None,
             },
         );
+        if deferred.is_err() {
+            // Its query was purged meanwhile: it never runs.
+            return true;
+        }
+        self.start_filter_timer(instance);
+        true
+    }
+
+    /// Runs deferred scan `instance` unfiltered if it still waits once the wait limit is over.
+    fn start_filter_timer(&self, instance: FragmentInstanceId) {
         let service = self.clone();
-        let wait = runtime_filters::wait_limit();
-        let _ = std::thread::Builder::new()
+        let wait = self.filter_wait;
+        let spawned = std::thread::Builder::new()
             .name("runtime-filter-timer".to_string())
             .spawn(move || {
                 std::thread::sleep(wait);
                 if let Some(scan) = service.filters.take(instance) {
                     warn!(%instance, ?wait, "runtime filters did not arrive in time; scanning unfiltered");
-                    service.run_deferred(scan, false);
+                    service.run_deferred(scan, false, None);
                 }
             });
-        true
+        if let Err(err) = spawned {
+            self.timer_not_started(instance, &err.to_string());
+        }
     }
 
-    /// Runs, each on its own thread, the deferred scans whose filters' keys are all here. Called
-    /// after every sender completes an exchange, before that exchange's receiver can run, so the
-    /// engine copies the keys before the receiver consumes them.
+    /// Runs deferred scan `instance` unfiltered now: without its timer nothing would run it if
+    /// its filters never came, and a waiting receiver would hold its inputs for good.
+    fn timer_not_started(&self, instance: FragmentInstanceId, error: &str) {
+        if let Some(scan) = self.filters.take(instance) {
+            warn!(%instance, error, "cannot time a runtime filter wait; scanning unfiltered");
+            self.run_deferred(scan, false, None);
+        }
+    }
+
+    /// The broadcast join filters the scans of receiver `instance` can wait for: built by
+    /// another receiver on this CN, from a build exchange that doesn't depend on this fragment's
+    /// output. Waiting on a build that needs this fragment's output would hold both until the
+    /// wait limit. Logs why each other filter isn't waited for.
+    fn receiver_filter_sites(
+        &self,
+        params: &TExecPlanFragmentParams,
+        query: FragmentInstanceId,
+        instance: FragmentInstanceId,
+    ) -> Vec<(i32, BuildSite)> {
+        let sink = Self::fragment_output(params);
+        let mut sites: Vec<(i32, BuildSite)> = Vec::new();
+        for probe in runtime_filter::probed_filters(params) {
+            if sites.iter().any(|(id, _)| *id == probe.filter_id) {
+                continue;
+            }
+            let skip = |reason: &str, detail: &str| {
+                runtime_filters::log_skipped(
+                    Some(query),
+                    Some(instance),
+                    probe.filter_id,
+                    Some(probe.scan_node_id),
+                    reason,
+                    detail,
+                );
+            };
+            match probe.distribution {
+                BuildDistribution::Broadcast => {
+                    let Some((_, site)) = self.filters.sites(query, &[probe.filter_id]).pop()
+                    else {
+                        skip("not_built_on_this_cn", "");
+                        continue;
+                    };
+                    match self.filters.independent(query, sink, site.key.node_id) {
+                        Ok(()) => sites.push((probe.filter_id, site)),
+                        Err(detail) => skip("deadlock_unproven", &detail),
+                    }
+                }
+                BuildDistribution::Partitioned => skip(
+                    SkipReason::NonLeafFragment.as_str(),
+                    "a partitioned join's filter",
+                ),
+                BuildDistribution::Other => skip("not_broadcast", ""),
+            }
+        }
+        sites
+    }
+
+    /// Where `params`' fragment sends its output.
+    fn fragment_output(params: &TExecPlanFragmentParams) -> FragmentOutput {
+        let Some(sink) = params
+            .fragment
+            .as_ref()
+            .and_then(|fragment| fragment.output_sink.as_ref())
+        else {
+            return FragmentOutput::Unknown;
+        };
+        match (sink.type_, sink.stream_sink.as_ref()) {
+            (TDataSinkType::DATA_STREAM_SINK, Some(stream)) => {
+                FragmentOutput::Exchange(stream.dest_node_id)
+            }
+            (TDataSinkType::RESULT_SINK, _) => FragmentOutput::Result,
+            _ => FragmentOutput::Unknown,
+        }
+    }
+
+    /// Holds back ready receiver `ready` if it waits for runtime filters: it runs once their
+    /// keys are here, or unfiltered at the wait limit. Returns it when it doesn't wait.
+    fn park_for_filters(&self, ready: ReadyFragment) -> Option<ReadyFragment> {
+        let instance = Self::fragment_instance_id(&ready.params)?;
+        let Some(pending) = self.filters.take_pending(instance) else {
+            return Some(ready);
+        };
+        let scan = DeferredScan {
+            params: ready.params.clone(),
+            filters: pending.filters,
+            deferred_at: std::time::Instant::now(),
+            ready: Some(ready),
+        };
+        match self.filters.defer(instance, scan) {
+            Ok(()) => {
+                self.start_filter_timer(instance);
+                // Its filters' keys may be here already.
+                self.dispatch_filtered_scans();
+            }
+            // Its query was purged meanwhile: free its inputs.
+            Err(scan) => self.release_inputs(scan.ready),
+        }
+        None
+    }
+
+    /// Frees a ready receiver's inputs it will never run on.
+    fn release_inputs(&self, ready: Option<ReadyFragment>) {
+        if let Some(ready) = ready {
+            drop(self.take_ready_inputs(ready.inputs));
+        }
+    }
+
+    /// Where scan `instance` receives the shares of the partitioned join filter `probe`, and how
+    /// many make it: from the plan's layout, or else from the filter's merge node.
+    fn share_site(
+        &self,
+        query: FragmentInstanceId,
+        instance: FragmentInstanceId,
+        probe: &ProbedFilter,
+    ) -> std::result::Result<BuildSite, (&'static str, String)> {
+        let column_type = probe
+            .key_type
+            .clone()
+            .ok_or(("key_type", "the probe key has no engine type".to_string()))?;
+        if !runtime_filters::shareable_key(&column_type) {
+            // No holder sends a share of a key it can't read.
+            return Err(("key_type", column_type));
+        }
+        // Holders find their probers through the merge node: without one, no share ever comes.
+        let merge_node = probe
+            .merge_node
+            .as_ref()
+            .ok_or(("no_merge_node", String::new()))?;
+        let shares = match probe.shares {
+            Some(shares) => shares,
+            None => {
+                self.filter_topology(query, merge_node, probe.filter_id)
+                    .map_err(|err| ("shares_unknown", err))?
+                    .shares
+            }
+        };
+        Ok(BuildSite {
+            key: runtime_filters::filter_exchange(instance, probe.filter_id),
+            column: 0,
+            column_type,
+            shares: Some(shares),
+        })
+    }
+
+    /// Who probes `query`'s partitioned join filter `filter_id`, asked of its merge node.
+    fn filter_topology(
+        &self,
+        query: FragmentInstanceId,
+        merge_node: &TNetworkAddress,
+        filter_id: i32,
+    ) -> std::result::Result<FilterTopology, String> {
+        let topology = match self.peer_of(merge_node)? {
+            None => self.filters.topology(query, filter_id),
+            Some(peer) => {
+                let reply = self
+                    .nixl
+                    .as_ref()
+                    .ok_or("this CN has no NIXL transport to reach the merge node")?
+                    .control(peer, &NixlEnvelope::Topology { query, filter_id })?;
+                nixl_chunk::decode_topology(&reply)?
+            }
+        };
+        topology.ok_or_else(|| {
+            format!(
+                "merge node {}:{} has no topology for filter {filter_id}",
+                merge_node.hostname, merge_node.port
+            )
+        })
+    }
+
+    /// Marks the filter exchanges of `instance` for the partitioned join filters its fragment
+    /// probes as read by no scan, except `waiting`'s, and frees any share already there.
+    fn close_filter_exchanges(
+        &self,
+        instance: FragmentInstanceId,
+        params: &TExecPlanFragmentParams,
+        waiting: &[i32],
+    ) {
+        let probed = params
+            .fragment
+            .as_ref()
+            .and_then(|fragment| fragment.plan.as_ref())
+            .into_iter()
+            .flat_map(|plan| &plan.nodes)
+            .flat_map(|node| node.probe_runtime_filters.iter().flatten())
+            .filter(|filter| BuildDistribution::of(filter) == BuildDistribution::Partitioned)
+            .filter_map(|filter| filter.filter_id)
+            .filter(|filter_id| !waiting.contains(filter_id));
+        for filter_id in probed {
+            self.drop_shares(runtime_filters::filter_exchange(instance, filter_id));
+        }
+    }
+
+    /// Frees the shares at filter exchange `key`, and drops any that arrive later.
+    fn drop_shares(&self, key: ExchangeKey) {
+        let dropped = self.exchanges.close_shares(key);
+        if let Some(nixl) = &self.nixl {
+            for &token in &dropped.tokens {
+                nixl.release(token);
+            }
+        }
+        for &slot in &dropped.slots {
+            if let Err(err) = self.executor.drop_parked(slot) {
+                warn!(?slot, error = %err, "failed to drop a runtime filter share");
+            }
+        }
+    }
+
+    /// Where a deferred scan's filter keys stand: still arriving, all here (and whether they are
+    /// the keys themselves or only bounds), or never usable. `held` are a ready receiver's
+    /// inputs, read before it consumes them.
+    fn filter_keys(&self, site: &BuildSite, held: Option<&HeldKeys>) -> FilterKeysState {
+        let Some(expected) = site.shares else {
+            let sources = held
+                .and_then(|held| held.get(&site.key).cloned())
+                .or_else(|| self.exchanges.complete_sources(site.key));
+            return match sources {
+                Some(sources) => FilterKeysState::Ready {
+                    sources,
+                    exact: true,
+                },
+                None => FilterKeysState::Waiting,
+            };
+        };
+        if self.filters.is_abandoned(site.key) {
+            return FilterKeysState::Unusable {
+                reason: "shares_abandoned",
+                detail: "a holder could not send its share".to_string(),
+            };
+        }
+        let shares = self.exchanges.shares(site.key);
+        let mut exact = true;
+        for (_, names, _) in &shares {
+            let Some(header) = runtime_filters::ShareHeader::parse(names) else {
+                return FilterKeysState::Unusable {
+                    reason: "share_unreadable",
+                    detail: format!("{names:?}"),
+                };
+            };
+            // Every share must agree with this scan on how many make the filter: a scan that ran
+            // on fewer than all of them would drop rows that match.
+            if header.shares != expected || shares.len() > expected {
+                return FilterKeysState::Unusable {
+                    reason: "share_count_mismatch",
+                    detail: format!(
+                        "this scan expects {expected} shares; a share counts {}, and {} arrived",
+                        header.shares,
+                        shares.len()
+                    ),
+                };
+            }
+            if header.key_type != site.column_type {
+                return FilterKeysState::Unusable {
+                    reason: "key_type_mismatch",
+                    detail: format!(
+                        "{} keys for a {} probe key",
+                        header.key_type, site.column_type
+                    ),
+                };
+            }
+            exact &= header.exact;
+        }
+        if shares.len() < expected || !shares.iter().all(|(_, _, complete)| *complete) {
+            return FilterKeysState::Waiting;
+        }
+        FilterKeysState::Ready {
+            sources: shares.into_iter().map(|(source, _, _)| source).collect(),
+            exact,
+        }
+    }
+
+    /// Before a ready receiver consumes its inputs: sends the shares it holds and runs the
+    /// deferred scans waiting on its exchanges, reading the keys from those inputs. When a build
+    /// exchange is the receiver's last input to complete, the exchange hands the receiver over
+    /// at once, and its keys are no longer anywhere else.
+    fn use_keys_before_run(&self, ready: &ReadyFragment) {
+        let Some(receiver) = Self::fragment_instance_id(&ready.params) else {
+            return;
+        };
+        let held: HeldKeys = ready
+            .inputs
+            .iter()
+            .map(|input| {
+                let key = ExchangeKey {
+                    fragment_instance_id: receiver,
+                    node_id: input.node_id,
+                };
+                (
+                    key,
+                    input.sources.iter().map(SenderSource::key_source).collect(),
+                )
+            })
+            .collect();
+        for share in self.filters.take_shares_of(receiver) {
+            self.send_share(share, Some(&held));
+        }
+        let scans = self.filters.take_ready(|site| {
+            !matches!(
+                self.filter_keys(site, Some(&held)),
+                FilterKeysState::Waiting
+            )
+        });
+        for scan in scans {
+            self.run_deferred(scan, true, Some(&held));
+        }
+    }
+
+    /// Runs, each on its own thread, the deferred scans whose filters' keys are all here, and
+    /// sends the filter shares whose build exchange is complete. Called after every sender
+    /// completes an exchange, before that exchange's receiver can run, so the engine copies the
+    /// keys before the receiver consumes them.
     fn dispatch_filtered_scans(&self) {
         let ready = self
             .filters
-            .take_ready(|site| self.exchanges.complete_sources(site.key).is_some());
+            .take_ready(|site| !matches!(self.filter_keys(site, None), FilterKeysState::Waiting));
         for scan in ready {
             let service = self.clone();
             let _ = std::thread::Builder::new()
                 .name("filtered-scan".to_string())
-                .spawn(move || service.run_deferred(scan, true));
+                .spawn(move || service.run_deferred(scan, true, None));
+        }
+        let shares = self
+            .filters
+            .take_ready_shares(|site| self.exchanges.complete_sources(site.key).is_some());
+        for share in shares {
+            let service = self.clone();
+            let _ = std::thread::Builder::new()
+                .name("filter-share".to_string())
+                .spawn(move || service.send_share(share, None));
         }
     }
 
-    /// Runs a deferred scan with the filters whose keys are worth applying, or unfiltered.
-    fn run_deferred(&self, scan: DeferredScan, filtered: bool) {
-        let query = Self::query_id(&scan.params);
-        self.contain_panic(query, || self.run_deferred_scan(scan, filtered));
+    /// Sends this CN's share of a partitioned join's filter to every scan probing it. A holder
+    /// that can't tells its probers to stop waiting, and they run unfiltered.
+    fn send_share(&self, share: HeldShare, held: Option<&HeldKeys>) {
+        let receiver = share.site.key.fragment_instance_id;
+        let skip = |reason: &str, detail: &str| {
+            runtime_filters::log_skipped(
+                Some(share.query),
+                Some(receiver),
+                share.filter_id,
+                Some(share.join_node_id),
+                reason,
+                detail,
+            );
+        };
+        // Without the probers there is no one to tell: they wait out their limit.
+        let topology = match self.filter_topology(share.query, &share.merge_node, share.filter_id) {
+            Ok(topology) => topology,
+            Err(err) => {
+                skip("probers_unknown", &err);
+                self.log_leak_counters("filter share");
+                return;
+            }
+        };
+        match self.ship_share(&share, &topology, held) {
+            Ok(ready) => {
+                if let Err(err) = self.drain_ready(ready) {
+                    warn!(error = %err, "a scan a runtime filter share completed failed");
+                }
+            }
+            Err((reason, detail)) => {
+                skip(reason, &detail);
+                self.abandon_share(share.filter_id, &topology.probers);
+            }
+        }
+        self.log_leak_counters("filter share");
     }
 
-    fn run_deferred_scan(&self, scan: DeferredScan, filtered: bool) {
+    /// Reads a share's keys where its build exchange left them, or in `held`, and ships them to
+    /// every prober: the distinct keys, or only their bounds when there are more than
+    /// [`runtime_filters::max_share_keys`].
+    fn ship_share(
+        &self,
+        share: &HeldShare,
+        topology: &FilterTopology,
+        held: Option<&HeldKeys>,
+    ) -> std::result::Result<Vec<ReadyFragment>, (&'static str, String)> {
+        let sources = held
+            .and_then(|held| held.get(&share.site.key).cloned())
+            .or_else(|| self.exchanges.complete_sources(share.site.key))
+            .ok_or(("keys_taken", String::new()))?;
+        let keys = FilterKeys {
+            column: share.site.column,
+            sources,
+        };
+        let stats = self
+            .executor
+            .key_stats(&keys)
+            .map_err(|err| ("keys_unreadable", err))?;
+        let header = runtime_filters::ShareHeader {
+            exact: stats.distinct <= runtime_filters::max_share_keys(),
+            shares: topology.shares,
+            key_type: share.site.column_type.clone(),
+        };
+        let node_id = FILTER_STREAM_BASE + share.filter_id;
+        let stream = StreamInputSchema {
+            node_id,
+            stream_view: format!("sirius_stream_{node_id}"),
+            columns: vec![StreamInputColumn {
+                name: SHARE_KEYS.to_string(),
+                ty: share.site.column_type.clone(),
+            }],
+        };
+        let plan = self
+            .translator
+            .translate_filter_share(&stream, (!header.exact).then_some((stats.min, stats.max)))
+            .map_err(|err| ("untranslatable", err.to_string()))?;
+        let mut outputs = Vec::with_capacity(topology.probers.len());
+        let (mut local, mut remote, mut streams) = (Vec::new(), Vec::new(), Vec::new());
+        for (instance, address) in &topology.probers {
+            let slot = SenderSlot {
+                fragment_instance_id: *instance,
+                node_id,
+                sender_id: share.sender_id,
+            };
+            match self.peer_of(address).map_err(|err| ("share_failed", err))? {
+                Some(peer) => {
+                    streams.push(outputs.len());
+                    remote.push((slot, peer));
+                }
+                None => local.push(slot),
+            }
+            outputs.push(slot);
+        }
+        if outputs.is_empty() {
+            return Err((
+                "probers_unknown",
+                "the merge node lists no prober".to_string(),
+            ));
+        }
+        info!(
+            receiver = %share.site.key.fragment_instance_id,
+            filter_id = share.filter_id,
+            exact = header.exact,
+            rows = stats.rows,
+            distinct = stats.distinct,
+            probers = outputs.len(),
+            "sending a runtime filter share"
+        );
+        let run = FragmentRun {
+            plan: &plan,
+            inputs: Vec::new(),
+            remote_inputs: Vec::new(),
+            outputs,
+            broadcast: topology.probers.len() > 1,
+            hash_keys: Vec::new(),
+            drains: None,
+            filters: vec![FilterRun {
+                stream_id: node_id as u64,
+                keys,
+                rows: stats.rows,
+            }],
+            fallback: None,
+            // A purge of the query stops its share's run too.
+            query: Some(share.site.key.fragment_instance_id),
+        };
+        // The column names carry the header; the probers read the keys by position.
+        self.run_and_ship(
+            run,
+            &local,
+            &remote,
+            streams,
+            &header.names(),
+            share.sender_id,
+        )
+        .map_err(|failure| ("share_failed", failure.error))
+    }
+
+    /// Tells every prober of filter `filter_id` that one of its shares won't come.
+    fn abandon_share(&self, filter_id: i32, probers: &[(FragmentInstanceId, TNetworkAddress)]) {
+        for (instance, address) in probers {
+            let abandoned = match self.peer_of(address) {
+                Ok(None) => {
+                    self.filters
+                        .abandon(runtime_filters::filter_exchange(*instance, filter_id));
+                    Ok(())
+                }
+                Ok(Some(peer)) => self
+                    .nixl
+                    .as_ref()
+                    .ok_or_else(|| "this CN has no NIXL transport".to_string())
+                    .and_then(|nixl| {
+                        let envelope = NixlEnvelope::ShareAbandoned {
+                            instance: *instance,
+                            filter_id,
+                        };
+                        nixl.control(peer, &envelope).map(drop)
+                    }),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = abandoned {
+                warn!(%instance, filter_id, error = %err, "could not release a runtime filter's prober");
+            }
+        }
+        self.dispatch_filtered_scans();
+    }
+
+    /// Runs a deferred scan with the filters whose keys are worth applying, or unfiltered.
+    fn run_deferred(&self, scan: DeferredScan, filtered: bool, held: Option<&HeldKeys>) {
         let query = Self::query_id(&scan.params);
+        self.contain_panic(query, || self.run_deferred_scan(scan, filtered, held));
+    }
+
+    fn run_deferred_scan(&self, scan: DeferredScan, filtered: bool, held: Option<&HeldKeys>) {
+        let query = Self::query_id(&scan.params);
+        let DeferredScan {
+            params,
+            filters,
+            deferred_at,
+            ready,
+        } = scan;
         let ran = self
-            .run_with_filters(&scan, filtered)
-            .map_err(|failure| self.end_hops(&scan.params, failure));
+            .run_with_filters(
+                &params,
+                &filters,
+                deferred_at,
+                ready.map(|ready| ready.inputs),
+                filtered,
+                held,
+            )
+            .map_err(|failure| self.end_hops(&params, failure));
         self.reports
-            .finish(&scan.params, ran.as_ref().map(drop).map_err(String::as_str));
+            .finish(&params, ran.as_ref().map(drop).map_err(String::as_str));
+        // The keys were copied, or never will be: the shares go now.
+        for (_, site) in &filters {
+            if site.shares.is_some() {
+                self.drop_shares(site.key);
+            }
+        }
         let result = ran.and_then(|ready| self.drain_ready(ready));
         if let Err(err) = result {
             warn!(error = %err, "a scan deferred for runtime filters failed");
@@ -738,23 +1451,65 @@ impl SiriusComputeNodeService {
         self.log_leak_counters("filtered scan");
     }
 
+    /// Runs a deferred scan's fragment, on `ready_inputs` for one that reads exchanges, with the
+    /// filters whose keys are worth applying, or unfiltered.
     fn run_with_filters(
         &self,
-        scan: &DeferredScan,
+        params: &TExecPlanFragmentParams,
+        filters: &[(i32, BuildSite)],
+        deferred_at: std::time::Instant,
+        ready_inputs: Option<Vec<ReadyExchangeInput>>,
         filtered: bool,
+        held: Option<&HeldKeys>,
     ) -> std::result::Result<Vec<ReadyFragment>, FragmentFailure> {
-        let params = &scan.params;
+        let mut receiver = ready_inputs
+            .map(|inputs| self.take_ready_inputs(inputs))
+            .transpose()?;
+        let exchanges = receiver
+            .as_ref()
+            .map(|receiver| receiver.exchanges.clone())
+            .unwrap_or_default();
+        let (inputs_in, remote_in) = receiver
+            .as_mut()
+            .map(|receiver| {
+                (
+                    std::mem::take(&mut receiver.inputs),
+                    std::mem::take(&mut receiver.remote),
+                )
+            })
+            .unwrap_or_default();
         let dump_seq = Self::dump_fragment(params);
-        let unfiltered = self.translate_fragment_logged(params, &[], dump_seq)?;
+        let (query, instance) = (Self::query_id(params), Self::fragment_instance_id(params));
+        let skip = |filter_id: i32, reason: &str, detail: &str| {
+            runtime_filters::log_skipped(query, instance, filter_id, None, reason, detail);
+        };
+        if !filtered {
+            for (filter_id, _) in filters {
+                skip(*filter_id, "timeout", "");
+            }
+        }
+        let unfiltered = self
+            .translate_fragment_logged(params, &exchanges, dump_seq)
+            .inspect_err(|err| {
+                for (filter_id, _) in filters.iter().filter(|_| filtered) {
+                    skip(*filter_id, "untranslatable", err);
+                }
+            })?;
+        let waited_ms = deferred_at.elapsed().as_millis() as u64;
         let mut inputs = Vec::new();
         let mut runs = Vec::new();
-        for (filter_id, site) in scan.filters.iter().filter(|_| filtered) {
-            let Some(sources) = self.exchanges.complete_sources(site.key) else {
-                info!(
-                    filter_id,
-                    "runtime filter keys were taken before the scan ran"
-                );
-                continue;
+        let mut applying = Vec::new();
+        for (filter_id, site) in filters.iter().filter(|_| filtered) {
+            let (sources, exact) = match self.filter_keys(site, held) {
+                FilterKeysState::Ready { sources, exact } => (sources, exact),
+                FilterKeysState::Unusable { reason, detail } => {
+                    skip(*filter_id, reason, &detail);
+                    continue;
+                }
+                FilterKeysState::Waiting => {
+                    skip(*filter_id, "keys_taken", "");
+                    continue;
+                }
             };
             let keys = FilterKeys {
                 column: site.column,
@@ -763,28 +1518,41 @@ impl SiriusComputeNodeService {
             let stats = match self.executor.key_stats(&keys) {
                 Ok(stats) => stats,
                 Err(err) => {
-                    warn!(filter_id, error = %err, "cannot read runtime filter keys; skipping it");
+                    skip(*filter_id, "keys_unreadable", &err);
                     continue;
                 }
             };
+            if !exact {
+                // A share too large to send exactly sent its bounds; so do they all.
+                inputs.push(FilterInput {
+                    filter_id: *filter_id,
+                    keys: ProbeKeys::Range {
+                        min: stats.min,
+                        max: stats.max,
+                    },
+                });
+                applying.push((*filter_id, None, stats));
+                continue;
+            }
             let density = runtime_filters::max_density();
             if !runtime_filters::selective(&stats, density) {
-                info!(
-                    filter_id,
-                    ?stats,
-                    density,
-                    "runtime filter keys fill their range; skipping it"
+                skip(
+                    *filter_id,
+                    "dense",
+                    &format!("{stats:?} max_density={density}"),
                 );
                 continue;
             }
             let node_id = FILTER_STREAM_BASE + filter_id;
             inputs.push(FilterInput {
                 filter_id: *filter_id,
-                node_id,
-                stream_view: format!("sirius_stream_{node_id}"),
-                column: StreamInputColumn {
-                    name: "rf_key".to_string(),
-                    ty: site.column_type.clone(),
+                keys: ProbeKeys::Stream {
+                    node_id,
+                    stream_view: format!("sirius_stream_{node_id}"),
+                    column: StreamInputColumn {
+                        name: SHARE_KEYS.to_string(),
+                        ty: site.column_type.clone(),
+                    },
                 },
             });
             runs.push(FilterRun {
@@ -792,40 +1560,53 @@ impl SiriusComputeNodeService {
                 keys,
                 rows: stats.rows,
             });
-            info!(
-                filter_id,
-                ?stats,
-                waited_ms = scan.deferred_at.elapsed().as_millis() as u64,
-                "applying runtime filter"
-            );
+            applying.push((*filter_id, Some(node_id as u64), stats));
         }
         let filtered_plan = if inputs.is_empty() {
             None
         } else {
             match self
                 .translator
-                .translate_fragment_with_inputs(params, &[], &inputs)
+                .translate_fragment_with_inputs(params, &exchanges, &inputs)
             {
                 Ok(plan) => Some(plan),
                 Err(err) => {
-                    warn!(error = %err, "cannot translate the scan with its runtime filters");
+                    for (filter_id, _, _) in &applying {
+                        skip(*filter_id, "untranslatable", &err.to_string());
+                    }
                     None
                 }
             }
         };
-        match &filtered_plan {
+        let ran = match &filtered_plan {
             Some(plan) => {
-                // Only the filters the plan reads; a filter of another scan type stays unbound.
-                runs.retain(|run| {
+                // Only the key streams the plan reads; a filter of another scan type stays
+                // unbound. Bounds are a predicate on the scan the filter was deferred for.
+                let bound = |stream_id: u64| {
                     plan.stream_inputs
                         .iter()
-                        .any(|input| input.node_id as u64 == run.stream_id)
-                });
+                        .any(|input| input.node_id as u64 == stream_id)
+                };
+                runs.retain(|run| bound(run.stream_id));
+                for (filter_id, stream_id, stats) in &applying {
+                    if stream_id.is_none_or(bound) {
+                        runtime_filters::log_applied(
+                            query,
+                            instance,
+                            *filter_id,
+                            stream_id.is_some(),
+                            stats,
+                            waited_ms,
+                        );
+                    } else {
+                        skip(*filter_id, "unbound", "no scan of the plan reads its keys");
+                    }
+                }
                 self.execute_fragment(
                     params,
                     plan,
-                    Vec::new(),
-                    Vec::new(),
+                    inputs_in,
+                    remote_in,
                     FilterPlan {
                         filters: runs,
                         fallback: Some(&unfiltered),
@@ -835,11 +1616,18 @@ impl SiriusComputeNodeService {
             None => self.execute_fragment(
                 params,
                 &unfiltered,
-                Vec::new(),
-                Vec::new(),
+                inputs_in,
+                remote_in,
                 FilterPlan::default(),
             ),
+        };
+        if ran.is_ok()
+            && let Some(receiver) = receiver.as_mut()
+        {
+            // The engine relayed every parked input and released it.
+            receiver.guard.slots.clear();
         }
+        ran
     }
 
     /// Answers one SRNX request on a blocking thread, never waiting on the engine or the transport
@@ -851,8 +1639,27 @@ impl SiriusComputeNodeService {
     ) -> std::result::Result<Vec<u8>, String> {
         nixl_chunk::reject_native_chunk(request)?;
         let envelope = NixlEnvelope::decode(attachment)?;
+        match envelope {
+            NixlEnvelope::Topology { query, filter_id } => {
+                let topology = self.filters.topology(query, filter_id);
+                return Ok(nixl_chunk::encode_topology(topology.as_ref()));
+            }
+            NixlEnvelope::ShareAbandoned {
+                instance,
+                filter_id,
+            } => {
+                self.filters
+                    .abandon(runtime_filters::filter_exchange(instance, filter_id));
+                self.dispatch_filtered_scans();
+                return Ok(Vec::new());
+            }
+            _ => {}
+        }
         let nixl = self.nixl.as_ref().ok_or("this CN has no NIXL transport")?;
         match envelope {
+            NixlEnvelope::Topology { .. } | NixlEnvelope::ShareAbandoned { .. } => {
+                unreachable!("answered above")
+            }
             NixlEnvelope::Md(_) => Ok(nixl.local_md()),
             NixlEnvelope::Packed { token, rows, names } => {
                 // A refused frame is never pushed, so its buffers are freed here. A duplicate is
@@ -950,14 +1757,16 @@ impl SiriusComputeNodeService {
         Ok(())
     }
 
-    /// Hands a remote sender's batch (none under token 0) and eos to the exchange rendezvous.
+    /// Hands a remote sender's batch (none under token 0) and eos to the exchange rendezvous,
+    /// returning the receiver it completed. `None` when it isn't kept: a runtime filter share
+    /// for a scan that no longer reads its filter exchange, whose batch the caller frees.
     fn push_packed(
         &self,
         request: &PTransmitChunkParams,
         token: u64,
         rows: u64,
         names: Vec<String>,
-    ) -> std::result::Result<Option<ReadyFragment>, String> {
+    ) -> std::result::Result<Option<Option<ReadyFragment>>, String> {
         let missing = |field: &str| format!("Packed transmit_chunk is missing {field}");
         let finst_id = request
             .finst_id
@@ -967,16 +1776,51 @@ impl SiriusComputeNodeService {
             fragment_instance_id: FragmentInstanceId::from(finst_id),
             node_id: request.node_id.ok_or_else(|| missing("node_id"))?,
         };
-        self.exchanges
-            .push_remote_frame(
-                key,
-                request.sender_id.ok_or_else(|| missing("sender_id"))?,
-                request.sequence.ok_or_else(|| missing("sequence"))?,
-                request.eos.ok_or_else(|| missing("eos"))?,
-                names,
-                (token != 0).then_some(RemoteBatch { token, rows }),
-            )
-            .map(RemoteFrame::into_ready)
+        let sender_id = request.sender_id.ok_or_else(|| missing("sender_id"))?;
+        let seq = request.sequence.ok_or_else(|| missing("sequence"))?;
+        let eos = request.eos.ok_or_else(|| missing("eos"))?;
+        let batch = (token != 0).then_some(RemoteBatch { token, rows });
+        if key.node_id >= FILTER_STREAM_BASE {
+            let kept = self
+                .exchanges
+                .push_share_frame(key, sender_id, seq, eos, names, batch)?;
+            return Ok(kept.then_some(None));
+        }
+        let ready = self
+            .exchanges
+            .push_remote_frame(key, sender_id, seq, eos, names, batch)?;
+        self.release_oversized_shares(key);
+        Ok(Some(ready.into_ready()))
+    }
+
+    /// Releases the probers of the shares held at build exchange `key` once it has received more
+    /// rows than a share sends as exact keys ([`runtime_filters::max_share_keys`]). Such a share
+    /// could only go out as bounds, which rarely drop anything, and its probers would wait for the
+    /// whole build first: q21's l2 and l3 scans waited about 1.2 s for bounds over every order
+    /// key. Rows aren't distinct keys, so a build with many duplicate keys loses a filter it
+    /// could have sent exactly.
+    fn release_oversized_shares(&self, key: ExchangeKey) {
+        if !runtime_filters::enabled() || !self.filters.holds_share_at(key) {
+            return;
+        }
+        let (rows, limit) = (
+            self.exchanges.received_rows(key),
+            runtime_filters::max_share_keys(),
+        );
+        if rows <= limit {
+            return;
+        }
+        for share in self.filters.take_ready_shares(|site| site.key == key) {
+            runtime_filters::log_skipped(
+                Some(share.query),
+                Some(key.fragment_instance_id),
+                share.filter_id,
+                Some(share.join_node_id),
+                "too_many_keys",
+                &format!("{rows} build rows, more than {limit}"),
+            );
+            self.release_probers(share.query, share.filter_id, share.merge_node);
+        }
     }
 
     /// Runs a receiver a remote frame completed on its own thread, so `transmit_chunk` answers
@@ -1076,7 +1920,7 @@ impl SiriusComputeNodeService {
             .remove(query.query_hi());
     }
 
-    /// Writes the received fragment params to `$SIRIUS_CN_DUMP_FRAGMENTS/fragment-<seq>.txt`
+    /// Writes the received fragment params to `$SIRIUS_CN_DUMP_FRAGMENTS/fragment-<pid>-<seq>.txt`
     /// (debug format) for offline plan analysis. No-op when the variable is unset.
     fn dump_fragment(params: &TExecPlanFragmentParams) -> Option<u64> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1085,7 +1929,7 @@ impl SiriusComputeNodeService {
         };
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::path::Path::new(&dir).join(format!("fragment-{seq:04}.txt"));
+        let path = Self::dump_path(&dir, "fragment", seq, "txt");
         if let Err(err) = std::fs::write(&path, format!("{params:#?}")) {
             tracing::warn!(error = %err, path = %path.display(), "failed to dump fragment params");
         }
@@ -1216,17 +2060,38 @@ impl SiriusComputeNodeService {
             fallback: filters.fallback,
             query: Self::query_id(params),
         };
+        self.run_and_ship(
+            run,
+            &local,
+            &remote,
+            streams,
+            &translated.output_names,
+            sender_id,
+        )
+    }
+
+    /// Runs a sender fragment and ships its `remote` outputs, then hands its local outputs to
+    /// their receivers and returns the receivers they complete.
+    fn run_and_ship(
+        &self,
+        run: FragmentRun<'_>,
+        local: &[SenderSlot],
+        remote: &[(SenderSlot, SocketAddr)],
+        streams: Vec<usize>,
+        names: &[String],
+        sender_id: i32,
+    ) -> std::result::Result<Vec<ReadyFragment>, FragmentFailure> {
         let shipped = if remote.is_empty() || !stream_output_enabled() {
             self.executor.run_fragment(run)?;
-            self.ship_parked(&remote, &translated.output_names)
+            self.ship_parked(remote, names)
         } else {
-            self.run_streaming(run, streams, &remote, &translated.output_names)?
+            self.run_streaming(run, streams, remote, names)?
         };
 
         // If a hop failed, the local claims are released too: their receivers can no longer
         // complete, and nothing may stay parked.
         if let Err(err) = shipped {
-            for &slot in &local {
+            for &slot in local {
                 let _ = self.executor.drop_parked(slot);
             }
             return Err(FragmentFailure::after_hops(err));
@@ -1238,12 +2103,25 @@ impl SiriusComputeNodeService {
                 node_id: slot.node_id,
             };
             let source = SenderSource::LocalParked {
-                names: translated.output_names.clone(),
+                names: names.to_vec(),
                 slot,
+            };
+            let pushed = if key.node_id >= FILTER_STREAM_BASE {
+                self.exchanges
+                    .push_share_sender(key, sender_id, source)
+                    .map(|dropped| {
+                        if dropped.is_some() {
+                            // A runtime filter share for a scan that no longer waits for it.
+                            let _ = self.executor.drop_parked(slot);
+                        }
+                        None
+                    })
+            } else {
+                self.exchanges.push_sender(key, sender_id, source)
             };
             // A refused source is not kept (its query was purged, say), so this slot and the
             // ones not yet handed over are dropped here or they stay parked.
-            match self.exchanges.push_sender(key, sender_id, source) {
+            match pushed {
                 Ok(completed) => ready.extend(completed),
                 Err(err) => {
                     for &unpushed in &local[index..] {
@@ -1383,17 +2261,25 @@ impl SiriusComputeNodeService {
                 "DATA_STREAM_SINK destination for fragment instance {id} has no brpc_server address"
             )
         })?;
+        if *address != self.brpc_address && self.nixl.is_none() {
+            return Err(format!(
+                "DATA_STREAM_SINK destination {}:{} for fragment instance {id} is remote, and \
+                 this CN has no NIXL transport",
+                address.hostname, address.port
+            ));
+        }
+        self.peer_of(address)
+    }
+
+    /// The socket address of the CN advertising brpc `address`, or `None` when it is this CN.
+    fn peer_of(
+        &self,
+        address: &TNetworkAddress,
+    ) -> std::result::Result<Option<SocketAddr>, String> {
         if *address == self.brpc_address {
             return Ok(None);
         }
         let host = address.hostname.as_str();
-        if self.nixl.is_none() {
-            return Err(format!(
-                "DATA_STREAM_SINK destination {host}:{} for fragment instance {id} is remote, and \
-                 this CN has no NIXL transport",
-                address.port
-            ));
-        }
         let port = u16::try_from(address.port)
             .map_err(|_| format!("destination brpc port {} is not a TCP port", address.port))?;
         (host, port)
@@ -1421,7 +2307,17 @@ impl SiriusComputeNodeService {
     /// released; the first error is returned.
     fn drain_ready(&self, mut queue: Vec<ReadyFragment>) -> std::result::Result<(), String> {
         let mut first_error = None;
-        while let Some(ReadyFragment { params, inputs }) = queue.pop() {
+        while let Some(ready) = queue.pop() {
+            let ready = if runtime_filters::enabled() {
+                self.use_keys_before_run(&ready);
+                match self.park_for_filters(ready) {
+                    Some(ready) => ready,
+                    None => continue,
+                }
+            } else {
+                ready
+            };
+            let ReadyFragment { params, inputs } = ready;
             match self.execute_ready_fragment(&params, inputs) {
                 Ok(next) => {
                     self.reports.finish(&params, Ok(()));
@@ -1464,7 +2360,17 @@ impl SiriusComputeNodeService {
         self.deadlines.end(query);
         self.results.fail_query(query, error);
         self.forget_descriptor_table(query);
-        let deferred = self.filters.purge_query(query);
+        // Fragments waiting for runtime filters never run: their inputs are freed and their hops
+        // end like a waiting receiver's.
+        let mut deferred = Vec::new();
+        for scan in self.filters.purge_query(query) {
+            let instance = Self::fragment_instance_id(&scan.params);
+            for (filter_id, _) in &scan.filters {
+                runtime_filters::log_skipped(Some(query), instance, *filter_id, None, "purged", "");
+            }
+            self.release_inputs(scan.ready);
+            deferred.push(scan.params);
+        }
         let purged = self.exchanges.purge_query(query, error);
         // A failed query's run in progress holds GPU memory and works for nothing: stop it, now
         // that its cause is recorded, so the interrupted fragment reports that cause first. A
@@ -1472,11 +2378,7 @@ impl SiriusComputeNodeService {
         if failed {
             self.executor.interrupt(query);
         }
-        for params in deferred
-            .iter()
-            .map(|scan| &scan.params)
-            .chain(&purged.receivers)
-        {
+        for params in deferred.iter().chain(&purged.receivers) {
             if failed {
                 self.fail_remote_hops(params, error);
             }
@@ -1712,6 +2614,7 @@ impl SiriusComputeNodeService {
             direct_buffers = self.nixl.as_ref().map_or(0, |nixl| nixl.outstanding()),
             deferred_scans = self.filters.deferred(),
             owed_reports = self.reports.owed(),
+            held_shares = self.filters.held_shares(),
             "leak counters"
         );
     }
@@ -1723,34 +2626,49 @@ impl SiriusComputeNodeService {
         params: &TExecPlanFragmentParams,
         ready_inputs: Vec<ReadyExchangeInput>,
     ) -> std::result::Result<Vec<ReadyFragment>, FragmentFailure> {
-        let mut guard = self.ready_inputs_guard(&ready_inputs);
-        let exchange_inputs = Self::exchange_inputs(&ready_inputs)?;
-        let mut inputs = Vec::with_capacity(ready_inputs.len());
-        let mut remote_inputs = Vec::new();
-        for input in ready_inputs {
+        let ReceiverInputs {
+            mut guard,
+            exchanges,
+            inputs,
+            remote,
+        } = self.take_ready_inputs(ready_inputs)?;
+        let dump_seq = Self::dump_fragment(params);
+        let translated = self.translate_fragment_logged(params, &exchanges, dump_seq)?;
+        let next =
+            self.execute_fragment(params, &translated, inputs, remote, FilterPlan::default())?;
+        // The engine relayed every parked input and released it.
+        guard.slots.clear();
+        Ok(next)
+    }
+
+    /// A ready receiver's inputs as the engine takes them, bound to their exchanges, under a
+    /// guard that frees them unless the run relays them.
+    fn take_ready_inputs(
+        &self,
+        ready: Vec<ReadyExchangeInput>,
+    ) -> std::result::Result<ReceiverInputs, String> {
+        let guard = self.ready_inputs_guard(&ready);
+        let exchanges = Self::exchange_inputs(&ready)?;
+        let mut inputs = Vec::with_capacity(ready.len());
+        let mut remote = Vec::new();
+        for input in ready {
             let mut slots = Vec::new();
             for source in input.sources {
                 match source {
                     SenderSource::LocalParked { slot, .. } => slots.push(slot),
                     SenderSource::Remote {
                         sender_id, batches, ..
-                    } => remote_inputs.push((input.node_id, sender_id, batches)),
+                    } => remote.push((input.node_id, sender_id, batches)),
                 }
             }
             inputs.push((input.node_id, slots));
         }
-        let dump_seq = Self::dump_fragment(params);
-        let translated = self.translate_fragment_logged(params, &exchange_inputs, dump_seq)?;
-        let next = self.execute_fragment(
-            params,
-            &translated,
+        Ok(ReceiverInputs {
+            guard,
+            exchanges,
             inputs,
-            remote_inputs,
-            FilterPlan::default(),
-        )?;
-        // The engine relayed every parked input and released it.
-        guard.slots.clear();
-        Ok(next)
+            remote,
+        })
     }
 
     /// Binds each exchange to its senders' output names, which must agree across senders.
@@ -1897,7 +2815,16 @@ impl SiriusComputeNodeService {
         Ok(translated)
     }
 
-    /// Writes the translated Substrait plan bytes to `$SIRIUS_CN_DUMP_FRAGMENTS/plan-<seq>.substrait`
+    /// `<dir>/<prefix>-<pid>-<seq>.<extension>`. The CNs of a cluster may share one dump directory
+    /// and each numbers its own fragments from 0, so the process id keeps their files apart.
+    fn dump_path(dir: &str, prefix: &str, seq: u64, extension: &str) -> std::path::PathBuf {
+        std::path::Path::new(dir).join(format!(
+            "{prefix}-{}-{seq:04}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    /// Writes the translated Substrait plan bytes to `$SIRIUS_CN_DUMP_FRAGMENTS/plan-<pid>-<seq>.substrait`
     /// so a failing plan can be replayed against the engine in isolation. No-op when unset.
     fn dump_substrait(translated: &TranslatedPlan, dump_seq: Option<u64>) {
         let Ok(dir) = std::env::var("SIRIUS_CN_DUMP_FRAGMENTS") else {
@@ -1906,7 +2833,7 @@ impl SiriusComputeNodeService {
         let Some(seq) = dump_seq else {
             return;
         };
-        let path = std::path::Path::new(&dir).join(format!("plan-{seq:04}.substrait"));
+        let path = Self::dump_path(&dir, "plan", seq, "substrait");
         if let Err(err) = std::fs::write(&path, translated.to_substrait_bytes()) {
             tracing::warn!(error = %err, path = %path.display(), "failed to dump substrait plan");
         }
@@ -2116,6 +3043,14 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("no message")
 }
 
+/// A ready receiver's inputs, taken for a run: see `take_ready_inputs`.
+struct ReceiverInputs {
+    guard: ReadyInputsGuard,
+    exchanges: Vec<ExchangeInput>,
+    inputs: Vec<(i32, Vec<SenderSlot>)>,
+    remote: Vec<(i32, i32, Vec<RemoteBatch>)>,
+}
+
 /// Frees a ready receiver's inputs when dropped, whichever step failed: translation, a pre-run
 /// check, or the engine run itself. Received batches are always released; one the engine pushed
 /// is already consumed, and releasing it is a no-op. Parked inputs are released unless the run
@@ -2205,6 +3140,10 @@ mod tests {
         failed: Mutex<Vec<(SocketAddr, SenderSlot, String)>>,
         /// The CN every failure frame is delivered to, as `transmit_chunk` would.
         peer: Mutex<Option<SiriusComputeNodeService>>,
+        /// What a remote merge node answers about each filter.
+        topologies: Mutex<HashMap<i32, FilterTopology>>,
+        /// Other control messages sent to peers.
+        controls: Mutex<Vec<(SocketAddr, NixlEnvelope)>>,
     }
 
     impl FakeNixl {
@@ -2291,6 +3230,18 @@ mod tests {
                 receiver
                     .handle_nixl_chunk(&nixl_chunk::failed_params(slot), &failed.encode())
                     .unwrap();
+            }
+        }
+
+        fn control(&self, peer: SocketAddr, envelope: &NixlEnvelope) -> Result<Vec<u8>, String> {
+            match envelope {
+                NixlEnvelope::Topology { filter_id, .. } => Ok(nixl_chunk::encode_topology(
+                    self.topologies.lock().unwrap().get(filter_id),
+                )),
+                other => {
+                    self.controls.lock().unwrap().push((peer, other.clone()));
+                    Ok(Vec::new())
+                }
             }
         }
     }
@@ -2722,6 +3673,12 @@ mod tests {
     struct FilterRecorder {
         stats: crate::fragment_executor::KeyStats,
         runs: Mutex<Vec<RecordedRun>>,
+        /// Each run's output names and output slots, in run order.
+        outputs: Mutex<Vec<(Vec<String>, Vec<SenderSlot>)>>,
+        /// Whether reading keys fails.
+        unreadable_keys: bool,
+        /// Parked outputs dropped.
+        dropped: Mutex<Vec<SenderSlot>>,
     }
 
     impl FilterRecorder {
@@ -2729,6 +3686,9 @@ mod tests {
             Self {
                 stats,
                 runs: Mutex::new(Vec::new()),
+                outputs: Mutex::new(Vec::new()),
+                unreadable_keys: false,
+                dropped: Mutex::new(Vec::new()),
             }
         }
 
@@ -2751,6 +3711,10 @@ mod tests {
         }
 
         fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            self.outputs
+                .lock()
+                .unwrap()
+                .push((run.plan.output_names.clone(), run.outputs.clone()));
             self.runs.lock().unwrap().push((
                 run.plan
                     .stream_inputs
@@ -2760,20 +3724,29 @@ mod tests {
                 run.filters.clone(),
                 run.fallback.is_some(),
             ));
-            Ok(None)
+            Ok(Some(FragmentResult::new(Vec::new())))
         }
 
         fn key_stats(
             &self,
             _keys: &crate::fragment_executor::FilterKeys,
         ) -> Result<crate::fragment_executor::KeyStats, String> {
+            if self.unreadable_keys {
+                return Err("injected: keys unreadable".to_string());
+            }
             Ok(self.stats)
+        }
+
+        fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
+            self.dropped.lock().unwrap().push(slot);
+            Ok(())
         }
     }
 
     fn sparse_keys() -> crate::fragment_executor::KeyStats {
         crate::fragment_executor::KeyStats {
             rows: 2_000_000,
+            distinct: 2_000_000,
             min: 1,
             max: 100_000_000,
         }
@@ -2821,6 +3794,7 @@ mod tests {
     fn keys_that_fill_their_range_are_not_applied() {
         let executor = Arc::new(FilterRecorder::new(crate::fragment_executor::KeyStats {
             rows: 2_000_000,
+            distinct: 2_000_000,
             min: 1,
             max: 2_000_000,
         }));
@@ -2853,6 +3827,80 @@ mod tests {
         assert_eq!(service.filters.deferred(), 0);
     }
 
+    /// Runs `run` with the log lines of this thread captured, and returns them.
+    fn captured_logs(run: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer(Arc::default());
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn a_scan_logs_why_its_filters_are_not_applied() {
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FilterRecorder::new(sparse_keys())),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        // A broadcast filter with no receiver building it here.
+        // `run_or_register` directly: a routed request runs on another thread.
+        let logs = captured_logs(|| {
+            service.run_or_register(&probing_scan(35)).unwrap();
+        });
+        assert!(
+            logs.contains(r#"filter_id=0 node=0 outcome="skipped" reason="not_built_on_this_cn""#),
+            "{logs}"
+        );
+        // A colocate join's filter: neither broadcast nor sent in shares.
+        let mut colocate = probing_scan(36);
+        let plan = colocate.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0].probe_runtime_filters.as_mut().unwrap()[0].build_join_mode =
+            Some(starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::COLOCATE);
+        let logs = captured_logs(|| {
+            service.run_or_register(&colocate).unwrap();
+        });
+        assert!(
+            logs.contains(r#"outcome="skipped" reason="not_broadcast""#),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn a_receiver_logs_the_filters_it_cannot_build() {
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FilterRecorder::new(sparse_keys())),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        let mut builder = filter_builder(37);
+        let plan = builder.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        let join = plan.nodes[0].hash_join_node.as_mut().unwrap();
+        join.build_runtime_filters.as_mut().unwrap()[0].build_join_mode =
+            Some(starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::COLOCATE);
+        let logs = captured_logs(|| {
+            service.run_or_register(&builder).unwrap();
+        });
+        assert!(
+            logs.contains(r#"filter_id=0 node=5 outcome="skipped" reason="not_broadcast""#),
+            "{logs}"
+        );
+    }
+
     #[test]
     fn purging_a_query_drops_its_waiting_scans() {
         let executor = Arc::new(FilterRecorder::new(sparse_keys()));
@@ -2866,6 +3914,1054 @@ mod tests {
         assert_eq!(service.filters.deferred(), 1);
         service.fail_and_purge(FragmentInstanceId::from_halves(34, 0), "injected");
         assert_eq!(service.filters.deferred(), 0);
+    }
+
+    /// The brpc address of a CN built from `ComputeNodeConfig::default()`.
+    fn local_brpc() -> TNetworkAddress {
+        TNetworkAddress::new("127.0.0.1".to_string(), 8060)
+    }
+
+    /// `id_filter`, built by a partitioned join whose `shares` instances each hold a share; the
+    /// test CN is its merge node.
+    fn share_filter(shares: i32) -> starrocks_thrift::runtime_filter::TRuntimeFilterDescription {
+        let mut filter = id_filter();
+        filter.build_join_mode =
+            Some(starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED);
+        filter.runtime_filter_merge_nodes = Some(vec![local_brpc()]);
+        filter.layout = Some(starrocks_thrift::runtime_filter::TRuntimeFilterLayout {
+            filter_id: Some(0),
+            num_instances: Some(shares),
+            ..Default::default()
+        });
+        filter
+    }
+
+    /// Instance `10 + sender` of `query`: sender `sender` of a partitioned join, holding a share
+    /// of `share_filter` in build exchange 2. It never runs: probe exchange 1 waits for a second
+    /// sender.
+    fn share_holder(query: i64, sender: i32, shares: i32) -> TExecPlanFragmentParams {
+        let mut params = filter_builder(query);
+        let plan = params.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0]
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .build_runtime_filters = Some(vec![share_filter(shares)]);
+        let exec = params.params.as_mut().unwrap();
+        exec.fragment_instance_id = TUniqueId::new(query, 10 + i64::from(sender));
+        exec.sender_id = Some(sender);
+        params
+    }
+
+    /// What the FE sends the root fragment on the merge node: `share_filter` has `shares` shares
+    /// and is probed by `probers`.
+    fn filter_topology(
+        shares: i32,
+        probers: &[(i64, i64, TNetworkAddress)],
+    ) -> starrocks_thrift::runtime_filter::TRuntimeFilterParams {
+        starrocks_thrift::runtime_filter::TRuntimeFilterParams {
+            id_to_prober_params: Some(BTreeMap::from([(
+                0,
+                probers
+                    .iter()
+                    .map(|(hi, lo, address)| {
+                        starrocks_thrift::runtime_filter::TRuntimeFilterProberParams::new(
+                            TUniqueId::new(*hi, *lo),
+                            address.clone(),
+                        )
+                    })
+                    .collect(),
+            )])),
+            runtime_filter_builder_number: Some(BTreeMap::from([(0, shares)])),
+            runtime_filter_max_size: None,
+            skew_join_runtime_filters: None,
+        }
+    }
+
+    /// Instance 3 of `query`: a scan probing `share_filter`, sending to exchange 1 of instance 10.
+    fn share_probing_scan(query: i64, shares: i32) -> TExecPlanFragmentParams {
+        let mut scan = scan_node(0, 0);
+        scan.probe_runtime_filters = Some(vec![share_filter(shares)]);
+        let mut params = query_fragment(query, 3, scan, stream_sink(1));
+        send_to(&mut params, 10, 8060);
+        params
+    }
+
+    /// Instance `20 + sender` of `query`: the build side's only sender to holder `10 + sender`.
+    fn share_build_sender(query: i64, sender: i64) -> TExecPlanFragmentParams {
+        let mut params = query_fragment(query, 20 + sender, scan_node(10, 0), stream_sink(2));
+        send_to(&mut params, 10 + sender, 8060);
+        params
+    }
+
+    /// A partitioned filter's merge node, two share holders and the probing scan, on one CN.
+    /// Returns the scan's filter exchange.
+    fn share_query(service: &SiriusComputeNodeService, query: i64) -> ExchangeKey {
+        share_query_with(service, query, 2, share_probing_scan(query, 2))
+    }
+
+    /// `share_query`, with the merge node counting `topology_shares` shares, and `scan` probing.
+    fn share_query_with(
+        service: &SiriusComputeNodeService,
+        query: i64,
+        topology_shares: i32,
+        scan: TExecPlanFragmentParams,
+    ) -> ExchangeKey {
+        let mut root = share_holder(query, 0, 2);
+        root.params.as_mut().unwrap().runtime_filter_params = Some(filter_topology(
+            topology_shares,
+            &[(query, 3, local_brpc())],
+        ));
+        exec_ok(service, &root);
+        exec_ok(service, &share_holder(query, 1, 2));
+        exec_ok(service, &scan);
+        runtime_filters::filter_exchange(FragmentInstanceId::from_halves(query, 3), 0)
+    }
+
+    /// Gives the probe expression of `params`' scan the type `primitive`.
+    fn set_probe_type(params: &mut TExecPlanFragmentParams, primitive: TPrimitiveType) {
+        let plan = params.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        let filter = &mut plan.nodes[0].probe_runtime_filters.as_mut().unwrap()[0];
+        let probe = filter
+            .plan_node_id_to_target_expr
+            .as_mut()
+            .unwrap()
+            .get_mut(&0)
+            .unwrap();
+        probe.nodes[0].type_ = scalar_type(primitive);
+    }
+
+    /// `builder` with a join the translator accepts, so the receiver can run: build exchange 2
+    /// reads tuple 1 (`o_orderkey`), joined on `l_orderkey = o_orderkey`, which keys its filters.
+    fn translatable(mut builder: TExecPlanFragmentParams) -> TExecPlanFragmentParams {
+        builder.desc_tbl = Some(tpch_desc_table());
+        let plan = builder.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[2] = exchange_plan_node(2, 1);
+        let join = plan.nodes[0].hash_join_node.as_mut().unwrap();
+        join.eq_join_conjuncts = vec![starrocks_thrift::plan_nodes::TEqJoinCondition {
+            left: slot_ref_expr(1, 0),
+            right: slot_ref_expr(3, 1),
+            opcode: Some(starrocks_thrift::opcodes::TExprOpcode::EQ),
+        }];
+        for filter in join.build_runtime_filters.as_mut().unwrap() {
+            filter.build_expr = Some(slot_ref_expr(3, 1));
+        }
+        builder
+    }
+
+    /// A service on `executor` whose scans wait at most 5 s: a test that sees a scan run sooner
+    /// shows it didn't wait out the limit.
+    fn short_wait_service(executor: Arc<FilterRecorder>) -> SiriusComputeNodeService {
+        let mut service =
+            SiriusComputeNodeService::with_executor(executor, &ComputeNodeConfig::default(), None);
+        service.filter_wait = Duration::from_secs(5);
+        service
+    }
+
+    /// Whether `service`'s deferred scan stopped waiting within 3 s, before a 5 s wait runs out.
+    fn scan_ran_within_3s(service: &SiriusComputeNodeService) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while service.filters.deferred() > 0 {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// The runs of `executor` once `count` happened, or after 3 s: before a 5 s wait runs out.
+    fn runs_within_3s(executor: &FilterRecorder, count: usize) -> Vec<RecordedRun> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let runs = executor.runs.lock().unwrap().clone();
+            if runs.len() >= count || std::time::Instant::now() > deadline {
+                return runs;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The share slot holder `10 + sender` sends the scan of `query`.
+    fn share_slot(query: i64, sender: i32) -> SenderSlot {
+        SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(query, 3),
+            node_id: FILTER_STREAM_BASE,
+            sender_id: sender,
+        }
+    }
+
+    /// The deferred scan's run among `runs`: the only one with an unfiltered fallback.
+    fn filtered_scan_run(runs: &[RecordedRun]) -> Option<&RecordedRun> {
+        runs.iter().find(|(_, _, fallback)| *fallback)
+    }
+
+    #[test]
+    fn a_partitioned_filter_is_applied_once_every_share_arrived() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        let exchange = share_query(&service, 41);
+        assert!(executor.runs.lock().unwrap().is_empty(), "the scan waits");
+        assert_eq!(service.filters.deferred(), 1);
+
+        // Holder 10's build side completes: it sends its share, the distinct keys of exchange 2.
+        exec_ok(&service, &share_build_sender(41, 0));
+        let runs = executor.wait_for(2);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        let (streams, filters, fallback) = &runs[1];
+        assert_eq!(streams, &vec![FILTER_STREAM_BASE]);
+        assert!(!fallback);
+        assert_eq!(
+            filters[0].keys.sources,
+            vec![KeySource::Parked(SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from_halves(41, 10),
+                node_id: 2,
+                sender_id: 0,
+            })]
+        );
+        assert_eq!(
+            executor.outputs.lock().unwrap()[1],
+            (vec![SHARE_KEYS.to_string()], vec![share_slot(41, 0)])
+        );
+        // One share of two: the scan still waits.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(service.filters.deferred(), 1);
+        assert!(filtered_scan_run(&executor.runs.lock().unwrap()).is_none());
+
+        // The second share completes the filter: the scan semi-joins the union of both.
+        exec_ok(&service, &share_build_sender(41, 1));
+        let runs = executor.wait_for(5);
+        let (streams, filters, _) = filtered_scan_run(&runs).expect("the scan ran filtered");
+        assert_eq!(streams, &vec![FILTER_STREAM_BASE]);
+        assert_eq!(
+            filters,
+            &vec![FilterRun {
+                stream_id: FILTER_STREAM_BASE as u64,
+                keys: FilterKeys {
+                    column: 0,
+                    sources: vec![
+                        KeySource::Parked(share_slot(41, 0)),
+                        KeySource::Parked(share_slot(41, 1)),
+                    ],
+                },
+                rows: 2_000_000,
+            }]
+        );
+        assert_eq!(service.filters.deferred(), 0);
+        // The shares are freed with the scan, and a late copy is dropped.
+        assert!(service.exchanges.shares(exchange).is_empty());
+        assert!(
+            !service
+                .exchanges
+                .push_share_frame(exchange, 7, 0, true, vec!["late".to_string()], None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_partitioned_filter_missing_a_share_scans_unfiltered_after_the_wait() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let mut service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        service.filter_wait = Duration::from_millis(100);
+        let exchange = share_query(&service, 42);
+        exec_ok(&service, &share_build_sender(42, 0));
+        // Its build sender, its share, then the scan, unfiltered.
+        let runs = executor.wait_for(3);
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        assert_eq!(runs[2], (Vec::new(), Vec::new(), false));
+        assert_eq!(service.filters.deferred(), 0);
+        assert!(service.exchanges.shares(exchange).is_empty());
+
+        // The late share is dropped where it lands, not kept for a scan that already ran.
+        exec_ok(&service, &share_build_sender(42, 1));
+        executor.wait_for(5);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(service.exchanges.shares(exchange).is_empty());
+    }
+
+    #[test]
+    fn purging_a_query_drops_its_shares_and_the_scan_waiting_for_them() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        share_query(&service, 43);
+        exec_ok(&service, &share_build_sender(43, 0));
+        executor.wait_for(2);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(service.exchanges.counts().parked_senders > 0);
+        assert_eq!(
+            service.filters.held_shares(),
+            1,
+            "holder 11's build never completes"
+        );
+
+        let logs = captured_logs(|| {
+            service.fail_and_purge(FragmentInstanceId::from_halves(43, 0), "injected")
+        });
+        assert!(
+            logs.contains(r#"filter_id=0 node=-1 outcome="skipped" reason="purged""#),
+            "{logs}"
+        );
+        assert_eq!(service.filters.deferred(), 0);
+        assert_eq!(service.exchanges.counts(), ExchangeCounts::default());
+        assert_eq!(service.filters.held_shares(), 0);
+        assert!(
+            service
+                .filters
+                .topology(FragmentInstanceId::from_halves(43, 0), 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shares_too_large_to_send_exactly_bound_the_scan_by_their_range() {
+        let executor = Arc::new(FilterRecorder::new(crate::fragment_executor::KeyStats {
+            rows: 40_000_000,
+            distinct: 30_000_000,
+            min: 7,
+            max: 6_000_000_000,
+        }));
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        share_query(&service, 44);
+        exec_ok(&service, &share_build_sender(44, 0));
+        exec_ok(&service, &share_build_sender(44, 1));
+        let runs = executor.wait_for(5);
+        // Each holder sent only its bounds.
+        let outputs = executor.outputs.lock().unwrap().clone();
+        let shares: Vec<_> = outputs
+            .iter()
+            .filter(|(_, slots)| slots.iter().all(|slot| slot.node_id == FILTER_STREAM_BASE))
+            .collect();
+        assert_eq!(shares.len(), 2, "{outputs:?}");
+        assert!(
+            shares
+                .iter()
+                .all(|(names, _)| names == &[runtime_filter::SHARE_BOUNDS])
+        );
+        // The scan keeps the keys between them: a predicate, with no key stream to read.
+        let scan = filtered_scan_run(&runs).expect("the scan ran filtered");
+        assert_eq!(scan, &(Vec::new(), Vec::new(), true));
+    }
+
+    /// A batch of `rows` rows from remote sender 0 into holder 10's build exchange 2; with no
+    /// rows, its end of stream.
+    fn build_rows(service: &SiriusComputeNodeService, query: i64, seq: i64, rows: u64) {
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(query, 10),
+            node_id: 2,
+            sender_id: 0,
+        };
+        let envelope = NixlEnvelope::Packed {
+            token: if rows == 0 { 0 } else { 7 + seq as u64 },
+            rows,
+            names: vec!["id".to_string(), "name".to_string()],
+        };
+        let (status, _) = transmit(
+            service,
+            nixl_chunk::packed_params(Some(slot), seq, rows == 0),
+            envelope,
+        );
+        assert_eq!(status.status_code, TStatusCode::OK.0, "{status:?}");
+    }
+
+    #[test]
+    fn a_holder_whose_build_outgrows_exact_keys_releases_its_probers_at_once() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let (mut service, _) = nixl_service(executor.clone());
+        service.filter_wait = Duration::from_secs(5);
+        let exchange = share_query(&service, 58);
+        let limit = runtime_filters::max_share_keys();
+
+        // As many rows as a share sends exactly: the scan still waits for the build.
+        build_rows(&service, 58, 0, limit);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(service.filters.deferred(), 1);
+
+        // One more row: the share can only be bounds, so the scan runs unfiltered at once,
+        // before the build exchange completes.
+        build_rows(&service, 58, 1, 1);
+        assert_eq!(
+            runs_within_3s(&executor, 1),
+            vec![(Vec::new(), Vec::new(), false)]
+        );
+        assert_eq!(service.filters.deferred(), 0);
+        assert_eq!(
+            service.filters.held_shares(),
+            1,
+            "holder 11's share is still held"
+        );
+
+        // Both builds complete: holder 10's share never ships, and holder 11's, which the scan
+        // no longer waits for, is dropped where it lands.
+        build_rows(&service, 58, 2, 0);
+        exec_ok(&service, &share_build_sender(58, 1));
+        let runs = executor.wait_for(3);
+        let share_runs: Vec<_> = executor
+            .outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, slots)| slots.iter().all(|slot| slot.node_id == FILTER_STREAM_BASE))
+            .map(|(_, slots)| slots[0].sender_id)
+            .collect();
+        assert_eq!(share_runs, vec![1], "{runs:?}");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(service.exchanges.shares(exchange).is_empty());
+        assert_eq!(service.filters.held_shares(), 0);
+    }
+
+    #[test]
+    fn a_share_ships_to_a_remote_prober_named_by_a_remote_merge_node() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let (service, nixl) = nixl_service(executor.clone());
+        let peer = TNetworkAddress::new("127.0.0.1".to_string(), 8061);
+        nixl.topologies.lock().unwrap().insert(
+            0,
+            FilterTopology {
+                shares: 2,
+                probers: vec![(FragmentInstanceId::from_halves(45, 3), peer.clone())],
+            },
+        );
+        let mut holder = share_holder(45, 1, 2);
+        let plan = holder.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0]
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .build_runtime_filters
+            .as_mut()
+            .unwrap()[0]
+            .runtime_filter_merge_nodes = Some(vec![peer]);
+        exec_ok(&service, &holder);
+        exec_ok(&service, &share_build_sender(45, 1));
+        executor.wait_for(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while nixl.sent.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            *nixl.sent.lock().unwrap(),
+            vec![("127.0.0.1:8061".parse().unwrap(), share_slot(45, 1))]
+        );
+    }
+
+    #[test]
+    fn a_scan_does_not_wait_for_a_partitioned_filter_on_a_key_no_holder_can_send() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        let mut scan = share_probing_scan(51, 2);
+        set_probe_type(&mut scan, TPrimitiveType::VARCHAR);
+        let logs = captured_logs(|| {
+            service.run_or_register(&scan).unwrap();
+        });
+        assert!(
+            logs.contains(r#"filter_id=0 node=0 outcome="skipped" reason="key_type""#),
+            "{logs}"
+        );
+        assert_eq!(service.filters.deferred(), 0);
+        assert_eq!(
+            executor.runs.lock().unwrap().len(),
+            1,
+            "the scan ran at once"
+        );
+    }
+
+    #[test]
+    fn a_holder_that_cannot_send_its_share_releases_its_probers_at_once() {
+        let mut recorder = FilterRecorder::new(sparse_keys());
+        recorder.unreadable_keys = true;
+        let executor = Arc::new(recorder);
+        let service = short_wait_service(executor.clone());
+        share_query(&service, 52);
+        exec_ok(&service, &share_build_sender(52, 0));
+        // Its build sender, then the scan, unfiltered, without a share run or the wait.
+        let runs = runs_within_3s(&executor, 2);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[1], (Vec::new(), Vec::new(), false));
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
+    #[test]
+    fn a_holder_that_cannot_send_tells_a_remote_prober_which_stops_waiting() {
+        let mut recorder = FilterRecorder::new(sparse_keys());
+        recorder.unreadable_keys = true;
+        let (holder_cn, nixl) = nixl_service(Arc::new(recorder));
+        let peer = TNetworkAddress::new("127.0.0.1".to_string(), 8061);
+        nixl.topologies.lock().unwrap().insert(
+            0,
+            FilterTopology {
+                shares: 2,
+                probers: vec![(FragmentInstanceId::from_halves(53, 3), peer.clone())],
+            },
+        );
+        let mut holder = share_holder(53, 1, 2);
+        let plan = holder.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0]
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .build_runtime_filters
+            .as_mut()
+            .unwrap()[0]
+            .runtime_filter_merge_nodes = Some(vec![peer]);
+        exec_ok(&holder_cn, &holder);
+        exec_ok(&holder_cn, &share_build_sender(53, 1));
+        let abandoned = NixlEnvelope::ShareAbandoned {
+            instance: FragmentInstanceId::from_halves(53, 3),
+            filter_id: 0,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while nixl.controls.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            *nixl.controls.lock().unwrap(),
+            vec![("127.0.0.1:8061".parse().unwrap(), abandoned.clone())]
+        );
+
+        // The prober's CN hears it and runs the scan unfiltered.
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let (prober_cn, _) = nixl_service(executor.clone());
+        exec_ok(&prober_cn, &share_probing_scan(53, 2));
+        assert_eq!(prober_cn.filters.deferred(), 1);
+        let (status, _) = transmit(&prober_cn, nixl_chunk::control_params(), abandoned);
+        assert_eq!(status.status_code, TStatusCode::OK.0);
+        let runs = runs_within_3s(&executor, 1);
+        assert_eq!(runs, vec![(Vec::new(), Vec::new(), false)]);
+    }
+
+    /// `share_holder`, building `share_filter` from another join's output instead of an
+    /// exchange: no CN can build it.
+    fn unbuilt_share_holder(query: i64, sender: i32, shares: i32) -> TExecPlanFragmentParams {
+        let mut params = share_holder(query, sender, shares);
+        let plan = params.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        let mut build = plan.nodes[0].clone();
+        build.node_id = 6;
+        build.num_children = 0;
+        build.hash_join_node.as_mut().unwrap().build_runtime_filters = None;
+        plan.nodes[2] = build;
+        params
+    }
+
+    #[test]
+    fn a_holder_that_cannot_build_its_share_releases_its_probers_at_once() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        let mut root = unbuilt_share_holder(54, 0, 2);
+        root.params.as_mut().unwrap().runtime_filter_params =
+            Some(filter_topology(2, &[(54, 3, local_brpc())]));
+        exec_ok(&service, &root);
+        exec_ok(&service, &share_probing_scan(54, 2));
+        exec_ok(&service, &unbuilt_share_holder(54, 1, 2));
+        // The scan, unfiltered, without a share run or the wait.
+        let runs = runs_within_3s(&executor, 1);
+        assert_eq!(runs, vec![(Vec::new(), Vec::new(), false)]);
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
+    #[test]
+    fn a_holder_that_cannot_build_its_share_tells_a_remote_prober() {
+        let (holder_cn, nixl) = nixl_service(Arc::new(FilterRecorder::new(sparse_keys())));
+        let peer = TNetworkAddress::new("127.0.0.1".to_string(), 8061);
+        nixl.topologies.lock().unwrap().insert(
+            0,
+            FilterTopology {
+                shares: 2,
+                probers: vec![(FragmentInstanceId::from_halves(56, 3), peer.clone())],
+            },
+        );
+        let mut holder = unbuilt_share_holder(56, 1, 2);
+        let plan = holder.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0]
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .build_runtime_filters
+            .as_mut()
+            .unwrap()[0]
+            .runtime_filter_merge_nodes = Some(vec![peer]);
+        exec_ok(&holder_cn, &holder);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while nixl.controls.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The prober the merge node lists hears that no share comes from this CN.
+        assert_eq!(
+            *nixl.controls.lock().unwrap(),
+            vec![(
+                "127.0.0.1:8061".parse().unwrap(),
+                NixlEnvelope::ShareAbandoned {
+                    instance: FragmentInstanceId::from_halves(56, 3),
+                    filter_id: 0,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn a_scan_does_not_wait_for_a_partitioned_filter_without_a_merge_node() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        let mut scan = share_probing_scan(55, 2);
+        let plan = scan.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0].probe_runtime_filters.as_mut().unwrap()[0].runtime_filter_merge_nodes =
+            Some(Vec::new());
+        let logs = captured_logs(|| {
+            service.run_or_register(&scan).unwrap();
+        });
+        assert!(
+            logs.contains(r#"filter_id=0 node=0 outcome="skipped" reason="no_merge_node""#),
+            "{logs}"
+        );
+        assert_eq!(service.filters.deferred(), 0);
+        assert_eq!(
+            executor.runs.lock().unwrap().len(),
+            1,
+            "the scan ran at once"
+        );
+    }
+
+    /// Instance 10 of `query`, q17's shape on one CN: join 5 builds partitioned filter 1 on the
+    /// output of join 6, which builds partitioned filter 0 on the same key from build exchange 2.
+    /// One share makes each filter. It never runs: its probe exchanges wait for second senders.
+    fn served_filter_holder(query: i64) -> TExecPlanFragmentParams {
+        let mut params = share_holder(query, 0, 1);
+        let plan = params.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        let below = plan.nodes[0].clone();
+        let mut top = below.clone();
+        let mut served = share_filter(1);
+        served.filter_id = Some(1);
+        top.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![served]);
+        let mut below = below;
+        below.node_id = 6;
+        plan.nodes = vec![
+            top,
+            exchange_plan_node(1, 0),
+            below,
+            exchange_plan_node(3, 0),
+            exchange_plan_node(2, 0),
+        ];
+        expect_senders(&mut params, 3, 2);
+        // The merge node's topology: filter 1 has one share, probed by instance 3.
+        params.params.as_mut().unwrap().runtime_filter_params =
+            Some(starrocks_thrift::runtime_filter::TRuntimeFilterParams {
+                id_to_prober_params: Some(BTreeMap::from([(
+                    1,
+                    vec![
+                        starrocks_thrift::runtime_filter::TRuntimeFilterProberParams::new(
+                            TUniqueId::new(query, 3),
+                            local_brpc(),
+                        ),
+                    ],
+                )])),
+                runtime_filter_builder_number: Some(BTreeMap::from([(1, 1)])),
+                runtime_filter_max_size: None,
+                skew_join_runtime_filters: None,
+            });
+        params
+    }
+
+    #[test]
+    fn a_filter_built_on_a_joins_output_is_applied_with_the_keys_of_the_exchange_serving_it() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        exec_ok(&service, &served_filter_holder(57));
+        let mut scan = share_probing_scan(57, 1);
+        let plan = scan.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0].probe_runtime_filters.as_mut().unwrap()[0].filter_id = Some(1);
+        exec_ok(&service, &scan);
+        assert_eq!(service.filters.deferred(), 1, "the scan waits for filter 1");
+
+        // Exchange 2 completes: filter 1's share is filter 0's keys, read from exchange 2.
+        exec_ok(&service, &share_build_sender(57, 0));
+        let runs = executor.wait_for(3);
+        let stream = FILTER_STREAM_BASE + 1;
+        let share = runs
+            .iter()
+            .find(|(_, filters, _)| filters.first().map(|f| f.stream_id) == Some(stream as u64))
+            .expect("filter 1's share ran");
+        assert_eq!(
+            share.1[0].keys.sources,
+            vec![KeySource::Parked(SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from_halves(57, 10),
+                node_id: 2,
+                sender_id: 0,
+            })]
+        );
+        let (streams, filters, _) = filtered_scan_run(&runs).expect("the scan ran filtered");
+        assert_eq!(streams, &vec![stream]);
+        assert_eq!(
+            filters[0].keys.sources,
+            vec![KeySource::Parked(SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from_halves(57, 3),
+                node_id: stream,
+                sender_id: 0,
+            })]
+        );
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
+    #[test]
+    fn a_share_is_sent_when_its_build_exchange_completes_the_receiver() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        // One holder, whose probe exchange is fed by a plain scan, not the probing one.
+        let mut root = translatable(share_holder(54, 0, 1));
+        expect_senders(&mut root, 1, 1);
+        root.params.as_mut().unwrap().runtime_filter_params =
+            Some(filter_topology(1, &[(54, 3, local_brpc())]));
+        exec_ok(&service, &root);
+        let mut scan = share_probing_scan(54, 1);
+        send_to(&mut scan, 11, 8060);
+        exec_ok(&service, &scan);
+        let mut probe_side = query_fragment(54, 30, scan_node(12, 0), stream_sink(1));
+        send_to(&mut probe_side, 10, 8060);
+        exec_ok(&service, &probe_side);
+        // The build side completes the receiver: its share goes before it runs.
+        exec_ok(&service, &share_build_sender(54, 0));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let filtered = loop {
+            let runs = executor.runs.lock().unwrap().clone();
+            if let Some(run) = filtered_scan_run(&runs) {
+                break Some(run.clone());
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let (_, filters, _) = filtered.expect("the scan ran filtered, without waiting");
+        assert_eq!(
+            filters[0].keys.sources,
+            vec![KeySource::Parked(share_slot(54, 0))]
+        );
+    }
+
+    #[test]
+    fn a_broadcast_filter_is_read_when_its_build_exchange_completes_the_receiver() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        let mut builder = translatable(filter_builder(55));
+        expect_senders(&mut builder, 1, 1);
+        exec_ok(&service, &builder);
+        let mut scan = probing_scan(55);
+        send_to(&mut scan, 11, 8060);
+        exec_ok(&service, &scan);
+        assert_eq!(service.filters.deferred(), 1);
+        let mut probe_side = query_fragment(55, 30, scan_node(12, 0), stream_sink(1));
+        send_to(&mut probe_side, 1, 8060);
+        exec_ok(&service, &probe_side);
+        exec_ok(&service, &build_sender(55));
+        let runs = runs_within_3s(&executor, 4);
+        let (_, filters, _) = filtered_scan_run(&runs).expect("the scan ran filtered");
+        assert_eq!(
+            filters[0].keys.sources,
+            vec![KeySource::Parked(SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from_halves(55, 1),
+                node_id: 2,
+                sender_id: 0,
+            })]
+        );
+    }
+
+    #[test]
+    fn shares_that_disagree_on_their_count_leave_the_scan_unfiltered() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        // The scan's plan says 2 shares; the merge node told the holders 3.
+        share_query_with(&service, 56, 3, share_probing_scan(56, 2));
+        exec_ok(&service, &share_build_sender(56, 0));
+        exec_ok(&service, &share_build_sender(56, 1));
+        assert!(scan_ran_within_3s(&service), "the scan waited");
+        let runs = runs_within_3s(&executor, 5);
+        assert!(filtered_scan_run(&runs).is_none(), "{runs:?}");
+    }
+
+    #[test]
+    fn shares_of_another_key_type_leave_the_scan_unfiltered() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        // The holders build BIGINT keys; the scan probes an INTEGER key.
+        let mut scan = share_probing_scan(57, 2);
+        set_probe_type(&mut scan, TPrimitiveType::INT);
+        share_query_with(&service, 57, 2, scan);
+        exec_ok(&service, &share_build_sender(57, 0));
+        assert!(scan_ran_within_3s(&service), "the scan waited");
+        let runs = runs_within_3s(&executor, 3);
+        assert!(filtered_scan_run(&runs).is_none(), "{runs:?}");
+    }
+
+    /// Instance 40 of `query`: a join of a scan probing `id_filter` with exchange 30 (one
+    /// sender), sending to exchange `sink_node` of instance `sink_instance`. `filter_builder`'s
+    /// instance 1 builds the filter.
+    fn nonleaf_prober(query: i64, sink_node: i32, sink_instance: i64) -> TExecPlanFragmentParams {
+        let builder = filter_builder(query);
+        let mut join = builder.fragment.unwrap().plan.unwrap().nodes[0].clone();
+        join.node_id = 41;
+        let hash_join = join.hash_join_node.as_mut().unwrap();
+        hash_join.build_runtime_filters = None;
+        hash_join.eq_join_conjuncts = vec![starrocks_thrift::plan_nodes::TEqJoinCondition {
+            left: slot_ref_expr(1, 0),
+            right: slot_ref_expr(3, 1),
+            opcode: Some(starrocks_thrift::opcodes::TExprOpcode::EQ),
+        }];
+        let mut scan = scan_node(0, 0);
+        scan.probe_runtime_filters = Some(vec![id_filter()]);
+        let plan = TPlan::new(vec![join, scan, exchange_plan_node(30, 1)]);
+        let mut params = fragment_params(Some(plan), Some(tpch_desc_table()));
+        params.fragment.as_mut().unwrap().output_sink = Some(stream_sink(sink_node));
+        params.params = Some(exec_params(
+            TUniqueId::new(query, 0),
+            TUniqueId::new(query, 40),
+        ));
+        expect_senders(&mut params, 30, 1);
+        send_to(&mut params, sink_instance, 8060);
+        params
+    }
+
+    /// Instance 50 of `query`: the only sender to `nonleaf_prober`'s exchange 30.
+    fn nonleaf_input(query: i64) -> TExecPlanFragmentParams {
+        let mut params = query_fragment(query, 50, scan_node(12, 1), stream_sink(30));
+        params.desc_tbl = Some(tpch_desc_table());
+        send_to(&mut params, 40, 8060);
+        params
+    }
+
+    /// The run of `nonleaf_prober` among `runs`: the one reading exchange 30.
+    fn nonleaf_run(runs: &[RecordedRun]) -> Option<&RecordedRun> {
+        runs.iter().find(|(streams, _, _)| streams.contains(&30))
+    }
+
+    #[test]
+    fn a_fragment_reading_exchanges_waits_for_a_filter_built_on_its_cn() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        exec_ok(&service, &filter_builder(61));
+        // Its output goes to exchange 1, not to the filter's build exchange 2.
+        exec_ok(&service, &nonleaf_prober(61, 1, 1));
+        exec_ok(&service, &nonleaf_input(61));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            nonleaf_run(&executor.runs.lock().unwrap()).is_none(),
+            "its inputs are here, its filter isn't"
+        );
+        assert_eq!(service.filters.deferred(), 1);
+
+        exec_ok(&service, &build_sender(61));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let run = loop {
+            if let Some(run) = nonleaf_run(&executor.runs.lock().unwrap()) {
+                break Some(run.clone());
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let (streams, filters, fallback) = run.expect("it ran once its filter was built");
+        assert!(streams.contains(&FILTER_STREAM_BASE), "{streams:?}");
+        assert!(fallback);
+        assert_eq!(
+            filters[0].keys.sources,
+            vec![KeySource::Parked(SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from_halves(61, 1),
+                node_id: 2,
+                sender_id: 0,
+            })]
+        );
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
+    #[test]
+    fn a_fragment_whose_filter_build_may_need_its_output_does_not_wait() {
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FilterRecorder::new(sparse_keys())),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        service.run_or_register(&filter_builder(62)).unwrap();
+        // Its output feeds the filter's own build exchange: waiting would hold both.
+        let logs = captured_logs(|| {
+            service.run_or_register(&nonleaf_prober(62, 2, 1)).unwrap();
+        });
+        assert!(
+            logs.contains(r#"filter_id=0 node=0 outcome="skipped" reason="deadlock_unproven""#),
+            "{logs}"
+        );
+        assert!(logs.contains("reads this fragment's output"), "{logs}");
+        // Its output goes to a fragment this CN hasn't seen: nothing proves it safe.
+        let mut unknown = nonleaf_prober(62, 99, 7);
+        unknown.params.as_mut().unwrap().fragment_instance_id = TUniqueId::new(62, 41);
+        let logs = captured_logs(|| {
+            service.run_or_register(&unknown).unwrap();
+        });
+        assert!(
+            logs.contains(r#"outcome="skipped" reason="deadlock_unproven""#)
+                && logs.contains("isn't on this CN"),
+            "{logs}"
+        );
+        assert!(
+            service
+                .filters
+                .take_pending(FragmentInstanceId::from_halves(62, 40))
+                .is_none()
+        );
+        assert!(
+            service
+                .filters
+                .take_pending(FragmentInstanceId::from_halves(62, 41))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_fragment_reading_exchanges_runs_unfiltered_when_its_filter_is_late() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let mut service = short_wait_service(executor.clone());
+        service.filter_wait = Duration::from_millis(300);
+        exec_ok(&service, &filter_builder(63));
+        exec_ok(&service, &nonleaf_prober(63, 1, 1));
+        exec_ok(&service, &nonleaf_input(63));
+        assert!(
+            nonleaf_run(&executor.runs.lock().unwrap()).is_none(),
+            "it waits for its filter first"
+        );
+        assert_eq!(service.filters.deferred(), 1);
+        let runs = runs_within_3s(&executor, 2);
+        let (streams, filters, fallback) = nonleaf_run(&runs).expect("it ran unfiltered");
+        assert_eq!(streams, &vec![30]);
+        assert!(filters.is_empty());
+        assert!(!fallback);
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
+    #[test]
+    fn a_fragment_with_a_sink_the_check_cant_follow_does_not_wait() {
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FilterRecorder::new(sparse_keys())),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        service.run_or_register(&filter_builder(66)).unwrap();
+        let mut multicast = nonleaf_prober(66, 1, 1);
+        let sink = multicast
+            .fragment
+            .as_mut()
+            .unwrap()
+            .output_sink
+            .as_mut()
+            .unwrap();
+        sink.type_ = TDataSinkType::MULTI_CAST_DATA_STREAM_SINK;
+        sink.stream_sink = None;
+        // It fails later as unsupported; what matters is it isn't proven safe to wait.
+        let logs = captured_logs(|| {
+            let _ = service.run_or_register(&multicast);
+        });
+        assert!(
+            logs.contains(
+                r#"outcome="skipped" reason="deadlock_unproven" detail="unsupported sink""#
+            ),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn a_waiting_fragment_whose_timer_cannot_start_runs_unfiltered_at_once() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        exec_ok(&service, &filter_builder(67));
+        exec_ok(&service, &nonleaf_prober(67, 1, 1));
+        exec_ok(&service, &nonleaf_input(67));
+        assert_eq!(service.filters.deferred(), 1);
+        service.timer_not_started(FragmentInstanceId::from_halves(67, 40), "injected");
+        let runs = executor.runs.lock().unwrap().clone();
+        let (streams, filters, _) = nonleaf_run(&runs).expect("it ran at once");
+        assert_eq!(streams, &vec![30]);
+        assert!(filters.is_empty());
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
+    #[test]
+    fn purging_a_query_frees_a_fragment_waiting_on_its_inputs_for_a_filter() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        exec_ok(&service, &filter_builder(64));
+        exec_ok(&service, &nonleaf_prober(64, 1, 1));
+        exec_ok(&service, &nonleaf_input(64));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(service.filters.deferred(), 1);
+        let logs = captured_logs(|| {
+            service.fail_and_purge(FragmentInstanceId::from_halves(64, 0), "injected")
+        });
+        assert!(logs.contains(r#"reason="purged""#), "{logs}");
+        assert_eq!(service.filters.deferred(), 0);
+        // The input it held is freed, not left parked.
+        assert!(executor.dropped.lock().unwrap().contains(&SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(64, 40),
+            node_id: 30,
+            sender_id: 0,
+        }));
+        assert_eq!(service.exchanges.counts(), ExchangeCounts::default());
+
+        // One still waiting for its inputs is forgotten too.
+        exec_ok(&service, &filter_builder(65));
+        exec_ok(&service, &nonleaf_prober(65, 1, 1));
+        service.fail_and_purge(FragmentInstanceId::from_halves(65, 0), "injected");
+        assert!(
+            service
+                .filters
+                .take_pending(FragmentInstanceId::from_halves(65, 40))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_merge_node_answers_who_probes_a_filter() {
+        let (service, _) = nixl_service(Arc::new(StubExecutor));
+        let ask = |filter_id| {
+            let (status, reply) = transmit(
+                &service,
+                nixl_chunk::control_params(),
+                NixlEnvelope::Topology {
+                    query: FragmentInstanceId::from_halves(46, 0),
+                    filter_id,
+                },
+            );
+            assert_eq!(status.status_code, TStatusCode::OK.0);
+            nixl_chunk::decode_topology(&reply).unwrap()
+        };
+        assert_eq!(ask(0), None, "not known before the root fragment arrives");
+        let mut root = share_holder(46, 0, 2);
+        root.params.as_mut().unwrap().runtime_filter_params =
+            Some(filter_topology(2, &[(46, 3, local_brpc())]));
+        exec_ok(&service, &root);
+        assert_eq!(
+            ask(0),
+            Some(FilterTopology {
+                shares: 2,
+                probers: vec![(FragmentInstanceId::from_halves(46, 3), local_brpc())],
+            })
+        );
+        assert_eq!(ask(1), None);
     }
 
     #[test]

@@ -377,7 +377,7 @@ impl From<RunError> for String {
     }
 }
 
-/// Rows, minimum and maximum of `keys`, read where they sit.
+/// Rows, distinct keys, minimum and maximum of `keys`, read where they sit.
 fn key_stats(
     context: &SiriusContext,
     parked: &mut ParkedRegistry<sirius::Fragment<'_>>,
@@ -408,6 +408,7 @@ fn key_stats(
     }
     Ok(KeyStats {
         rows: stats.rows,
+        distinct: stats.distinct,
         min: stats.min,
         max: stats.max,
     })

@@ -2,10 +2,12 @@
 //!
 //! The FE plans a filter at a hash join and lists the scans that probe it, in other fragments.
 //! A compute node can build the filter itself when the join broadcasts its build side: every
-//! node then receives the whole build input through one exchange. [`built_filters`] finds those
-//! filters in a receiver fragment, with the exchange and the key column to read;
-//! [`probed_filters`] finds the scans of a fragment that probe one. Binding a key stream to a
-//! probed filter ([`FilterInput`]) makes the translator join the scan's output against it.
+//! node then receives the whole build input through one exchange. A partitioned join's instances
+//! each receive a share of the keys instead, and the probing scans need the union of every
+//! share. [`built_filters`] finds both kinds in a receiver fragment, with the exchange and the
+//! key column to read; [`probed_filters`] finds the scans of a fragment that probe one. Binding
+//! keys to a probed filter ([`FilterInput`]) makes the translator join the scan's output against
+//! a key stream, or keep only the keys within bounds.
 
 use starrocks_thrift::exprs::TExprNodeType;
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
@@ -14,11 +16,38 @@ use starrocks_thrift::plan_nodes::{THashJoinNode, TPlanNode, TPlanNodeType};
 use starrocks_thrift::runtime_filter::{
     TRuntimeFilterBuildJoinMode, TRuntimeFilterBuildType, TRuntimeFilterDescription,
 };
+use starrocks_thrift::types::TNetworkAddress;
 
 use crate::descriptor_table::{DescriptorTable, SlotKey};
 use crate::error::{Result, TranslateError};
 use crate::row_layout::RowLayout;
 use crate::{StreamInputColumn, type_mapper};
+
+/// How the join that builds a filter spreads its build side over its instances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildDistribution {
+    /// Every instance receives the whole key set.
+    Broadcast,
+    /// A partitioned or bucket-shuffle join: each instance receives a share of the keys, and the
+    /// shares together are the whole key set.
+    Partitioned,
+    /// Any other join (colocate, local bucket): not applied.
+    Other,
+}
+
+impl BuildDistribution {
+    /// How the join building `filter` spreads its keys.
+    pub fn of(filter: &TRuntimeFilterDescription) -> Self {
+        match filter.build_join_mode {
+            Some(TRuntimeFilterBuildJoinMode::BROADCAST) => Self::Broadcast,
+            Some(
+                TRuntimeFilterBuildJoinMode::PARTITIONED
+                | TRuntimeFilterBuildJoinMode::SHUFFLE_HASH_BUCKET,
+            ) => Self::Partitioned,
+            _ => Self::Other,
+        }
+    }
+}
 
 /// A runtime filter that a scan of this fragment probes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,10 +56,73 @@ pub struct ProbedFilter {
     pub filter_id: i32,
     /// The probing scan node.
     pub scan_node_id: i32,
+    /// How the building join spreads its keys. Only a broadcast join's filter can be built on
+    /// the scan's own CN; a partitioned join's needs every instance's share.
+    pub distribution: BuildDistribution,
+    /// The FE's merge node for the filter (`runtime_filter_merge_nodes`): the CN that runs the
+    /// query's root fragment and holds the filter's share count and probers.
+    pub merge_node: Option<TNetworkAddress>,
+    /// How many build instances hold a share (`layout.num_instances`), when the plan says.
+    pub shares: Option<usize>,
+    /// DuckDB type name of the scan's probe expression, when it has one.
+    pub key_type: Option<String>,
 }
 
-/// A runtime filter this fragment builds at a broadcast hash join whose build side is one
-/// exchange, so every instance receives the whole key set.
+/// Why a compute node leaves a runtime filter the FE planned unapplied, as far as the plan
+/// shows. Run-time reasons (dense keys, a timeout) are the compute node's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Neither a broadcast nor a partitioned join (colocate, local bucket).
+    NotBroadcast,
+    /// A partitioned join's filter names no merge node, so its probers can't be found.
+    NoMergeNode,
+    /// The join's build side isn't an exchange.
+    BuildNotExchange,
+    /// The build key is an expression, not a bare column.
+    KeyNotSlot,
+    /// The join compares the key with `<=>`, which the `=` semi-join can't express.
+    NullSafe,
+    /// The broadcast branch of a skew join, which holds only the skewed keys.
+    Skew,
+    /// The probing scan is in the join's own fragment.
+    SameFragment,
+    /// The probing scan is in another fragment that reads exchanges, and the filter can't be
+    /// waited for there (a partitioned join's).
+    NonLeafFragment,
+    /// The target is a join, exchange or aggregation node; only scans apply filters.
+    TargetNotScan,
+}
+
+impl SkipReason {
+    /// The reason as logged.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotBroadcast => "not_broadcast",
+            Self::NoMergeNode => "no_merge_node",
+            Self::BuildNotExchange => "build_not_exchange",
+            Self::KeyNotSlot => "key_not_slot",
+            Self::NullSafe => "null_safe",
+            Self::Skew => "skew",
+            Self::SameFragment => "same_fragment",
+            Self::NonLeafFragment => "non_leaf_fragment",
+            Self::TargetNotScan => "target_not_scan",
+        }
+    }
+}
+
+/// A runtime filter left unapplied, at `node_id`: the building join, or the probing target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SkippedFilter {
+    /// Filter id, unique within the query.
+    pub filter_id: i32,
+    /// The building join, or the probing target.
+    pub node_id: i32,
+    pub reason: SkipReason,
+}
+
+/// A runtime filter this fragment builds at a hash join whose build side is one exchange. A
+/// broadcast join's instance receives the whole key set there; a partitioned join's instance
+/// receives its share.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuiltFilter {
     /// Filter id, unique within the query.
@@ -43,42 +135,95 @@ pub struct BuiltFilter {
     pub column: usize,
     /// DuckDB type name of the key.
     pub column_type: String,
+    /// [`BuildDistribution::Broadcast`] or [`BuildDistribution::Partitioned`].
+    pub distribution: BuildDistribution,
+    /// For a partitioned join: the FE's merge node, which knows the filter's probers.
+    pub merge_node: Option<TNetworkAddress>,
+    /// The filter whose build exchange serves this filter's keys, when this filter's own build
+    /// side isn't an exchange ([`built_filters`]).
+    pub served_by: Option<i32>,
 }
 
-/// A key stream bound to a probed filter: the scans probing `filter_id` keep only rows whose key
-/// appears in it.
+/// Column name of a share holding its exact keys.
+pub const SHARE_KEYS: &str = "rf_key";
+/// Column name of a share holding only its smallest and largest key.
+pub const SHARE_BOUNDS: &str = "rf_bound";
+
+/// Keys bound to a probed filter: the scans probing `filter_id` keep only the rows whose key
+/// they admit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilterInput {
     /// Filter id, unique within the query.
     pub filter_id: i32,
-    /// Engine stream id of the key stream. Must not collide with an exchange node id.
-    pub node_id: i32,
-    /// Engine view the key stream is read through.
-    pub stream_view: String,
-    /// The key column; its type must match the probe expression's.
-    pub column: StreamInputColumn,
+    pub keys: ProbeKeys,
 }
 
-/// Join filters the scans of `params`' fragment probe, in plan order.
+/// What a probing scan keeps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProbeKeys {
+    /// The rows whose key appears in a key stream (a left semi join).
+    Stream {
+        /// Engine stream id of the key stream. Must not collide with an exchange node id.
+        node_id: i32,
+        /// Engine view the key stream is read through.
+        stream_view: String,
+        /// The key column; its type must match the probe expression's.
+        column: StreamInputColumn,
+    },
+    /// The rows whose key is within `[min, max]`: a partitioned join's filter whose shares were
+    /// too large to send exactly.
+    Range { min: i64, max: i64 },
+}
+
+/// Join filters the scans of `params`' fragment probe, in plan order, except those a join of
+/// the same fragment builds ([`SkipReason::SameFragment`]).
 pub fn probed_filters(params: &TExecPlanFragmentParams) -> Vec<ProbedFilter> {
-    plan_nodes(params)
+    let nodes = plan_nodes(params);
+    let built_here = filters_built_in(nodes);
+    nodes
         .iter()
         .filter(|node| is_scan(node))
         .flat_map(|node| {
-            probe_filters_of(node).filter_map(move |filter| {
-                Some(ProbedFilter {
-                    filter_id: filter.filter_id?,
-                    scan_node_id: node.node_id,
+            let built_here = &built_here;
+            probe_filters_of(node)
+                .filter(move |filter| {
+                    filter
+                        .filter_id
+                        .is_some_and(|filter_id| !built_here.contains(&filter_id))
                 })
-            })
+                .filter_map(move |filter| {
+                    Some(ProbedFilter {
+                        filter_id: filter.filter_id?,
+                        scan_node_id: node.node_id,
+                        distribution: BuildDistribution::of(filter),
+                        merge_node: merge_node(filter),
+                        shares: filter
+                            .layout
+                            .as_ref()
+                            .and_then(|layout| layout.num_instances)
+                            .and_then(|instances| usize::try_from(instances).ok())
+                            .filter(|&instances| instances > 0),
+                        key_type: probe_key_type(filter, node.node_id),
+                    })
+                })
         })
         .collect()
 }
 
-/// Join filters `params`' fragment builds at a broadcast hash join whose build child is an
-/// exchange and whose key is a bare column of it. Filters of any other shape are left out, and
-/// so are filters the semi-join rewrite would apply wrongly: a key the join compares with `<=>`,
-/// and the broadcast branch of a skew join.
+/// Every join filter the hash joins of `nodes` build.
+fn filters_built_in(nodes: &[TPlanNode]) -> Vec<i32> {
+    nodes
+        .iter()
+        .filter_map(|node| node.hash_join_node.as_ref()?.build_runtime_filters.as_ref())
+        .flatten()
+        .filter_map(|filter| filter.filter_id)
+        .collect()
+}
+
+/// Join filters `params`' fragment builds at a broadcast or partitioned hash join whose build
+/// child is an exchange and whose key is a bare column of it. Filters of any other shape are left
+/// out, and so are filters the semi-join rewrite would apply wrongly: a key the join compares
+/// with `<=>`, and the broadcast branch of a skew join.
 pub fn built_filters(params: &TExecPlanFragmentParams) -> Result<Vec<BuiltFilter>> {
     let nodes = plan_nodes(params);
     if nodes.is_empty() {
@@ -93,19 +238,23 @@ pub fn built_filters(params: &TExecPlanFragmentParams) -> Result<Vec<BuiltFilter
         })?;
     let desc = DescriptorTable::try_from(desc_tbl)?;
     let children = child_indices(nodes)?;
+    let builds: Vec<JoinBuild> = join_builds(nodes, &children).collect();
+    let parents = parent_indices(&children);
     let mut built = Vec::new();
-    for (index, node) in nodes.iter().enumerate() {
-        let Some(join) = node.hash_join_node.as_ref() else {
+    for build in &builds {
+        // A filter built from its own exchange, or served by another filter's.
+        let (source, served_by) = if build.skip_reason().is_none() {
+            (*build, None)
+        } else if let Some(server) = served_by(build, &builds, nodes, &parents) {
+            (server, server.filter.filter_id)
+        } else {
             continue;
         };
-        let Some(filters) = join.build_runtime_filters.as_ref() else {
-            continue;
-        };
-        let Some(exchange) = children[index]
-            .get(1)
-            .map(|&child| &nodes[child])
-            .filter(|child| child.node_type == TPlanNodeType::EXCHANGE_NODE)
-        else {
+        let (Some(exchange), Some((_, tuple_id, slot_id)), Some(filter_id)) = (
+            source.exchange,
+            slot_key(source.filter),
+            build.filter.filter_id,
+        ) else {
             continue;
         };
         let Some(input_row_tuples) = exchange
@@ -115,36 +264,289 @@ pub fn built_filters(params: &TExecPlanFragmentParams) -> Result<Vec<BuiltFilter
         else {
             continue;
         };
-        for filter in filters {
-            let Some((filter_id, tuple_id, slot_id)) = broadcast_key(filter) else {
-                continue;
-            };
-            if null_safe_key(join, filter) {
-                continue;
-            }
-            let column = RowLayout::from_tuples(&desc, input_row_tuples)?
-                .resolve(SlotKey::new(tuple_id, slot_id))?;
-            let schema = desc.named_struct_for_tuples(input_row_tuples)?;
-            let ty = schema
-                .r#struct
-                .as_ref()
-                .and_then(|structure| structure.types.get(column))
-                .ok_or_else(|| {
-                    TranslateError::descriptor(format!(
-                        "runtime filter {filter_id} key column {column} is outside exchange {}",
-                        exchange.node_id
-                    ))
-                })?;
-            built.push(BuiltFilter {
-                filter_id,
-                join_node_id: node.node_id,
-                exchange_node_id: exchange.node_id,
-                column,
-                column_type: type_mapper::duckdb_type_name(ty)?,
-            });
-        }
+        let column = RowLayout::from_tuples(&desc, input_row_tuples)?
+            .resolve(SlotKey::new(tuple_id, slot_id))?;
+        let schema = desc.named_struct_for_tuples(input_row_tuples)?;
+        let ty = schema
+            .r#struct
+            .as_ref()
+            .and_then(|structure| structure.types.get(column))
+            .ok_or_else(|| {
+                TranslateError::descriptor(format!(
+                    "runtime filter {filter_id} key column {column} is outside exchange {}",
+                    exchange.node_id
+                ))
+            })?;
+        built.push(BuiltFilter {
+            filter_id,
+            join_node_id: build.join_node_id,
+            exchange_node_id: exchange.node_id,
+            column,
+            column_type: type_mapper::duckdb_type_name(ty)?,
+            distribution: BuildDistribution::of(build.filter),
+            merge_node: merge_node(build.filter),
+            served_by,
+        });
     }
     Ok(built)
+}
+
+/// Join filters `params`' fragment builds but [`built_filters`] leaves out, with the reason.
+pub fn skipped_builds(params: &TExecPlanFragmentParams) -> Result<Vec<SkippedFilter>> {
+    let nodes = plan_nodes(params);
+    if nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let children = child_indices(nodes)?;
+    let builds: Vec<JoinBuild> = join_builds(nodes, &children).collect();
+    let parents = parent_indices(&children);
+    Ok(builds
+        .iter()
+        .filter(|build| served_by(build, &builds, nodes, &parents).is_none())
+        .filter_map(|build| {
+            Some(SkippedFilter {
+                filter_id: build.filter.filter_id?,
+                node_id: build.join_node_id,
+                reason: build.skip_reason()?,
+            })
+        })
+        .collect())
+}
+
+/// A partitioned join's filter that `params`' fragment builds but no compute node can
+/// ([`skipped_builds`]). Its probing scans wait for every share, so they must be told that none
+/// comes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnbuiltShare {
+    /// Filter id, unique within the query.
+    pub filter_id: i32,
+    /// The join that would build it.
+    pub join_node_id: i32,
+    /// The FE's merge node for the filter, which knows its probers.
+    pub merge_node: TNetworkAddress,
+    pub reason: SkipReason,
+}
+
+/// The partitioned join filters among [`skipped_builds`] that name a merge node, through which
+/// their probers can be found. Probers of a filter without one don't wait for it.
+pub fn unbuilt_shares(params: &TExecPlanFragmentParams) -> Result<Vec<UnbuiltShare>> {
+    let nodes = plan_nodes(params);
+    if nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let children = child_indices(nodes)?;
+    let builds: Vec<JoinBuild> = join_builds(nodes, &children).collect();
+    let parents = parent_indices(&children);
+    Ok(builds
+        .iter()
+        .filter(|build| BuildDistribution::of(build.filter) == BuildDistribution::Partitioned)
+        .filter(|build| served_by(build, &builds, nodes, &parents).is_none())
+        .filter_map(|build| {
+            Some(UnbuiltShare {
+                filter_id: build.filter.filter_id?,
+                join_node_id: build.join_node_id,
+                merge_node: merge_node(build.filter)?,
+                reason: build.skip_reason()?,
+            })
+        })
+        .collect())
+}
+
+/// Probe targets in `params`' fragment that a compute node never filters: a target that isn't a
+/// scan, and a scan probing a filter a join of its own fragment builds. Other scans aren't
+/// listed; whether they're filtered is decided when they run ([`probed_filters`]).
+pub fn skipped_probes(params: &TExecPlanFragmentParams) -> Vec<SkippedFilter> {
+    let nodes = plan_nodes(params);
+    let built_here = filters_built_in(nodes);
+    let built_here = &built_here;
+    nodes
+        .iter()
+        .flat_map(|node| {
+            probe_filters_of(node).filter_map(move |filter| {
+                let filter_id = filter.filter_id?;
+                let reason = if !is_scan(node) {
+                    SkipReason::TargetNotScan
+                } else if built_here.contains(&filter_id) {
+                    SkipReason::SameFragment
+                } else {
+                    return None;
+                };
+                Some(SkippedFilter {
+                    filter_id,
+                    node_id: node.node_id,
+                    reason,
+                })
+            })
+        })
+        .collect()
+}
+
+/// One join filter a hash join of the fragment builds.
+#[derive(Clone, Copy)]
+struct JoinBuild<'a> {
+    join_node_id: i32,
+    join: &'a THashJoinNode,
+    /// Index of the join's build child among the fragment's nodes.
+    build_child: Option<usize>,
+    /// The join's build child, when it's an exchange.
+    exchange: Option<&'a TPlanNode>,
+    filter: &'a TRuntimeFilterDescription,
+}
+
+impl JoinBuild<'_> {
+    /// Why the compute node can't build this filter from its exchange, if it can't.
+    fn skip_reason(&self) -> Option<SkipReason> {
+        let distribution = BuildDistribution::of(self.filter);
+        if distribution == BuildDistribution::Other {
+            Some(SkipReason::NotBroadcast)
+        } else if distribution == BuildDistribution::Partitioned
+            && merge_node(self.filter).is_none()
+        {
+            Some(SkipReason::NoMergeNode)
+        } else if self.filter.is_broad_cast_join_in_skew == Some(true) {
+            Some(SkipReason::Skew)
+        } else if self.exchange.is_none() {
+            Some(SkipReason::BuildNotExchange)
+        } else if slot_key(self.filter).is_none() {
+            Some(SkipReason::KeyNotSlot)
+        } else if null_safe_key(self.join, self.filter) {
+            Some(SkipReason::NullSafe)
+        } else {
+            None
+        }
+    }
+}
+
+/// Every join filter the hash joins of `nodes` build.
+fn join_builds<'a>(
+    nodes: &'a [TPlanNode],
+    children: &'a [Vec<usize>],
+) -> impl Iterator<Item = JoinBuild<'a>> {
+    nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| Some((index, node, node.hash_join_node.as_ref()?)))
+        .flat_map(move |(index, node, join)| {
+            let build_child = children[index].get(1).copied();
+            let exchange = build_child
+                .map(|child| &nodes[child])
+                .filter(|child| child.node_type == TPlanNodeType::EXCHANGE_NODE);
+            join.build_runtime_filters
+                .iter()
+                .flatten()
+                .filter(|filter| is_join_filter(filter))
+                .map(move |filter| JoinBuild {
+                    join_node_id: node.node_id,
+                    join,
+                    build_child,
+                    exchange,
+                    filter,
+                })
+        })
+}
+
+/// The filter of the same fragment whose build exchange can serve the keys of `build`, a
+/// partitioned join's filter whose build side is another join's output
+/// ([`SkipReason::BuildNotExchange`]).
+///
+/// q17's filter 1 is built on `p_partkey` from the output of the join that builds filter 0 on
+/// `p_partkey` from the `part` exchange. Every key filter 1 would hold passed through that
+/// exchange: a slot id names one column in a query, and joins, filters and projections that pass
+/// the slot on unchanged only drop its values (an outer join adds NULLs, which `=` never
+/// matches). So the exchange holds a superset of filter 1's keys, and a scan keeping the rows
+/// whose key is among them keeps every row the join can match.
+///
+/// The serving filter is one this fragment builds from an exchange, on the same slot, and its
+/// exchange is under `build`'s build side with only such nodes in between.
+fn served_by<'a>(
+    build: &JoinBuild<'a>,
+    builds: &[JoinBuild<'a>],
+    nodes: &[TPlanNode],
+    parents: &[Option<usize>],
+) -> Option<JoinBuild<'a>> {
+    if BuildDistribution::of(build.filter) != BuildDistribution::Partitioned
+        || build.exchange.is_some()
+        || merge_node(build.filter).is_none()
+        || build.filter.is_broad_cast_join_in_skew == Some(true)
+        || null_safe_key(build.join, build.filter)
+    {
+        return None;
+    }
+    let (_, _, slot) = slot_key(build.filter)?;
+    let top = build.build_child?;
+    builds
+        .iter()
+        .find(|server| {
+            server.skip_reason().is_none()
+                && slot_key(server.filter).is_some_and(|(_, _, server_slot)| server_slot == slot)
+                && server
+                    .build_child
+                    .is_some_and(|exchange| passes_slot_on(nodes, parents, exchange, top, slot))
+        })
+        .copied()
+}
+
+/// Whether every node from `from`'s parent up to `to` passes slot `slot` on unchanged: a join, a
+/// filter, or a projection mapping the slot to itself. `to` must be above `from`.
+fn passes_slot_on(
+    nodes: &[TPlanNode],
+    parents: &[Option<usize>],
+    from: usize,
+    to: usize,
+    slot: i32,
+) -> bool {
+    let mut at = from;
+    while at != to {
+        let Some(parent) = parents[at] else {
+            return false;
+        };
+        at = parent;
+        let node = &nodes[at];
+        let keeps_values = matches!(
+            node.node_type,
+            TPlanNodeType::HASH_JOIN_NODE
+                | TPlanNodeType::NESTLOOP_JOIN_NODE
+                | TPlanNodeType::SELECT_NODE
+                | TPlanNodeType::PROJECT_NODE
+        );
+        if !keeps_values || !projects_slot_to_itself(node, slot) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `node`'s projection, if it has one, outputs slot `slot` as the slot itself.
+fn projects_slot_to_itself(node: &TPlanNode, slot: i32) -> bool {
+    let Some(project) = &node.project_node else {
+        return node.node_type != TPlanNodeType::PROJECT_NODE;
+    };
+    let is_slot = |expr: &starrocks_thrift::exprs::TExpr| {
+        matches!(expr.nodes.as_slice(), [node]
+            if node.node_type == TExprNodeType::SLOT_REF
+                && node.slot_ref.as_ref().is_some_and(|slot_ref| slot_ref.slot_id == slot))
+    };
+    let common = project
+        .common_slot_map
+        .as_ref()
+        .is_some_and(|map| map.contains_key(&slot));
+    !common
+        && project
+            .slot_map
+            .as_ref()
+            .and_then(|map| map.get(&slot))
+            .is_some_and(is_slot)
+}
+
+/// The parent index of every node, from [`child_indices`].
+fn parent_indices(children: &[Vec<usize>]) -> Vec<Option<usize>> {
+    let mut parents = vec![None; children.len()];
+    for (parent, kids) in children.iter().enumerate() {
+        for &child in kids {
+            parents[child] = Some(parent);
+        }
+    }
+    parents
 }
 
 /// The probe filters a scan node carries.
@@ -170,18 +572,24 @@ fn is_join_filter(filter: &TRuntimeFilterDescription) -> bool {
         .is_none_or(|kind| kind == TRuntimeFilterBuildType::JOIN_FILTER)
 }
 
-/// `(filter id, tuple id, slot id)` of a broadcast join filter keyed on a bare slot.
+/// DuckDB type name of `filter`'s probe expression at `target`.
+fn probe_key_type(filter: &TRuntimeFilterDescription, target: i32) -> Option<String> {
+    let probe = filter.plan_node_id_to_target_expr.as_ref()?.get(&target)?;
+    let ty = type_mapper::map_type_desc(&probe.nodes.first()?.type_, true).ok()?;
+    type_mapper::duckdb_type_name(&ty).ok()
+}
+
+/// The FE's merge node for `filter`, where the root fragment's instance runs.
+fn merge_node(filter: &TRuntimeFilterDescription) -> Option<TNetworkAddress> {
+    filter.runtime_filter_merge_nodes.as_ref()?.first().cloned()
+}
+
+/// `(filter id, tuple id, slot id)` of a filter keyed on a bare slot.
 ///
-/// A skew join's broadcast branch (`is_broad_cast_join_in_skew`) holds only the skewed keys, and
-/// its probe scan also feeds the shuffle branch, so applying it there would drop that branch's
-/// rows. StarRocks sends those keys to the merge node instead; it isn't a broadcast filter.
-fn broadcast_key(filter: &TRuntimeFilterDescription) -> Option<(i32, i32, i32)> {
-    if !is_join_filter(filter)
-        || filter.build_join_mode != Some(TRuntimeFilterBuildJoinMode::BROADCAST)
-        || filter.is_broad_cast_join_in_skew == Some(true)
-    {
-        return None;
-    }
+/// A skew join's broadcast branch (`is_broad_cast_join_in_skew`, [`SkipReason::Skew`]) holds only
+/// the skewed keys, and its probe scan also feeds the shuffle branch, so applying it there would
+/// drop that branch's rows. StarRocks sends those keys to the merge node instead.
+fn slot_key(filter: &TRuntimeFilterDescription) -> Option<(i32, i32, i32)> {
     let [node] = filter.build_expr.as_ref()?.nodes.as_slice() else {
         return None;
     };
