@@ -261,6 +261,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
     test/cpp/planner/test_substrait_scan_ranges.cpp
+    test/cpp/planner/test_substrait_fetch.cpp
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
     test/cpp/planner/test_tier_narrowing_policy.cpp
