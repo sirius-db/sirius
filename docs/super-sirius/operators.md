@@ -432,6 +432,10 @@ The caller selects the grouping requirement:
 - `concat_all = true`: waits for producer completion, then emits one indexed batch per nonempty input partition, forwarding singletons;
 - `concat_all = false`: retains byte-target grouping, including oversized singletons and the final under-target tail.
 
+Group selection also checks available row-count metadata before claiming or transferring input.
+Bounded groups stop before exceeding the cuDF row-count limit; a complete partition above the
+limit is rejected. Representations without row-count metadata are checked after preparation.
+
 ### `sirius_physical_passthrough_sink` — `PASSTHROUGH_SINK`
 **File:** `src/include/op/sirius_physical_passthrough_sink.hpp`
 

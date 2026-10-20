@@ -108,20 +108,28 @@ std::optional<std::vector<uint64_t>> sirius_physical_concat::plan_pull_for_parti
   auto batch_ids = repo.get_batch_ids(partition_idx);
   if (batch_ids.empty()) { return std::nullopt; }
 
-  if (_concat_all) {
-    // A concat-all group is the whole partition, so it can only form once the source is done.
-    if (!pipeline_finished) { return std::nullopt; }
-    return batch_ids;
-  }
+  // A concat-all group is the whole partition, so it can only form once the source is done.
+  if (_concat_all && !pipeline_finished) { return std::nullopt; }
 
   std::vector<uint64_t> group;
   std::size_t total_batch_size = 0;
+  std::size_t total_rows       = 0;
+  constexpr auto row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
   for (auto const batch_id : batch_ids) {
-    auto batch_idle = repo.get_data_batch_by_id(batch_id, partition_idx);
-    auto batch_ro   = batch_idle->to_read_only();
+    auto batch_idle  = repo.get_data_batch_by_id(batch_id, partition_idx);
+    auto const stats = get_batch_rows_and_bytes(*batch_idle);
+    if (stats.rows.has_value()) {
+      if (*stats.rows > row_limit - total_rows) {
+        if (!_concat_all && !group.empty()) { return group; }
+        throw std::overflow_error("CONCAT partition exceeds the cuDF row-count limit");
+      }
+      total_rows += *stats.rows;
+    }
+    // Unknown row counts are checked against the actual tables after preparation.
+    auto batch_ro = batch_idle->to_read_only();
     total_batch_size =
       memory::saturating_add(total_batch_size, batch_ro.get_data()->get_size_in_bytes());
-    if (total_batch_size > _concat_batch_bytes) {
+    if (!_concat_all && total_batch_size > _concat_batch_bytes) {
       // The accumulated group is complete; the overflowing batch seeds the next group.
       if (!group.empty()) { return group; }
       // The first batch alone exceeds the threshold. Release it as a single-batch group unless

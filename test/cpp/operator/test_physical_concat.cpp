@@ -264,6 +264,20 @@ std::shared_ptr<data_batch> make_int32_batch(memory_space& space, std::size_t nu
   return make_numeric_batch<int32_t>(space, values, cudf::type_id::INT32);
 }
 
+// Metadata-only host input for planning tests. It must never be uploaded or executed.
+std::shared_ptr<data_batch> make_host_metadata_batch(cudf::size_type rows)
+{
+  auto const hosts = get_shared_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
+  REQUIRE_FALSE(hosts.empty());
+  auto* host = const_cast<memory_space*>(hosts.front());
+  cucascade::memory::column_metadata column{};
+  column.type_id  = static_cast<int32_t>(cudf::type_id::INT32);
+  column.num_rows = rows;
+  auto table      = cucascade::memory::host_table_allocation::create({}, {column}, sizeof(int32_t));
+  auto repr       = std::make_unique<cucascade::host_data_representation>(std::move(table), host);
+  return data_batch::make(sirius::get_next_batch_id(), std::move(repr));
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -1561,11 +1575,10 @@ TEST_CASE("complete CONCAT uses normal cross-device input preparation",
         std::vector<int32_t>{4, 2, 8, 1});
 }
 
-TEST_CASE("CONCAT preparation checks the row-count boundary while the task retains its inputs",
+TEST_CASE("complete CONCAT checks known row counts before claiming or transferring input",
           "[physical_concat]")
 {
   bool const overflow = GENERATE(false, true);
-  auto* space         = get_shared_mem_space();
   auto const types =
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
   sirius_physical_concat concat(types, 0, true);
@@ -1573,27 +1586,63 @@ TEST_CASE("CONCAT preparation checks the row-count boundary while the task retai
     std::make_shared<const partition_placement>(partition_placement::unpinned(3)));
   cucascade::shared_data_repository repo;
   std::vector<std::shared_ptr<data_batch>> batches;
-  auto owner         = make_int32_batch(*space, 1);
-  auto const ro      = owner->to_read_only();
-  auto const pointer = sirius::get_cudf_table_view(ro).column(0).data<int32_t>();
-  // Oversized views over a tiny owner: inspect only metadata, accepting the row limit and
-  // rejecting one row above it. Neither case may execute against these synthetic payloads.
+  // Neither case may execute against these metadata-only payloads.
   auto const first_rows = std::numeric_limits<cudf::size_type>::max() - (overflow ? 0 : 1);
   for (auto const rows : {first_rows, cudf::size_type{1}}) {
-    cudf::column_view column(cudf::data_type{cudf::type_id::INT32}, rows, pointer, nullptr, 0);
-    auto repr = std::make_unique<cucascade::gpu_table_representation>(
-      cudf::table_view{{column}}, owner, sizeof(int32_t), *space, default_stream());
-    batches.push_back(data_batch::make(sirius::get_next_batch_id(), std::move(repr)));
+    batches.push_back(make_host_metadata_batch(rows));
   }
-  auto input = claim_concat_input(concat, repo, batches, 2);
-  CHECK(repo.total_size() == 0);
+  attach_concat_port(concat, repo);
+  for (auto const& batch : batches) {
+    repo.add_data_batch(batch, 2);
+  }
   if (overflow) {
-    CHECK_THROWS_AS(input->prepare_for_processing(space, default_stream()), std::overflow_error);
+    CHECK_THROWS_AS(concat.get_next_task_input_data(), std::overflow_error);
+    CHECK(repo.total_size() == batches.size());
+    CHECK_NOTHROW(concat.set_concat_all(false));
   } else {
-    CHECK_NOTHROW(input->prepare_for_processing(space, default_stream()));
+    auto input = concat.get_next_task_input_data();
+    REQUIRE(input != nullptr);
+    CHECK(repo.total_size() == 0);
+    CHECK(dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches() == batches);
+    CHECK_THROWS_AS(concat.set_concat_all(false), std::logic_error);
   }
-  CHECK(dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches() == batches);
-  CHECK_THROWS_AS(concat.set_concat_all(false), std::logic_error);
+  for (auto const& batch : batches) {
+    CHECK(batch->to_read_only().get_memory_space()->get_tier() == Tier::HOST);
+  }
+}
+
+TEST_CASE("bounded CONCAT hints and claims split groups at the row-count limit",
+          "[physical_concat]")
+{
+  auto const types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat(types, 0, false, std::numeric_limits<uint64_t>::max());
+  concat.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+  cucascade::shared_data_repository repo;
+  auto producer = create_unfinished_source_pipeline();
+  attach_concat_port(concat, repo, producer.pipeline);
+  auto first  = make_host_metadata_batch(std::numeric_limits<cudf::size_type>::max() - 1);
+  auto second = make_host_metadata_batch(1);
+  auto tail   = make_host_metadata_batch(1);
+  repo.add_data_batch(first, 0);
+  repo.add_data_batch(second, 0);
+  CHECK(concat.get_next_task_input_data() == nullptr);
+  repo.add_data_batch(tail, 0);
+  auto hint = concat.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::READY);
+  auto input = concat.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  CHECK(dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches() ==
+        std::vector<std::shared_ptr<data_batch>>{first, second});
+  CHECK(repo.total_size() == 1);
+  CHECK(concat.get_next_task_input_data() == nullptr);
+  producer.pipeline->set_finished(true);
+  auto final_input = concat.get_next_task_input_data();
+  REQUIRE(final_input != nullptr);
+  CHECK(dynamic_cast<pipelineable_operator_data&>(*final_input).get_data_batches() ==
+        std::vector<std::shared_ptr<data_batch>>{tail});
 }
 
 TEST_CASE("CONCAT rejects impossible decoded input before GPU preparation", "[physical_concat]")

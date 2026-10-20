@@ -75,6 +75,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
    * the threshold by itself becomes a single-batch group after another batch arrives or the source
    * pipeline finishes. Finishing the pipeline also releases an under-threshold tail. When
    * `_concat_all` is set, the complete partition becomes one group after the pipeline finishes.
+   * Known row counts also bound each group by the cuDF row-count limit; a complete partition
+   * above that limit is rejected before any batches are claimed or transferred.
    *
    * The caller must hold the operator mutex `lock`. The plan remains valid while the lock is held
    * because consumers remove batches under the same lock and producers only append batches.
