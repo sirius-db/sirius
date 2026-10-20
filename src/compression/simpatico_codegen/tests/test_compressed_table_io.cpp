@@ -757,6 +757,104 @@ void test_str_split_plan_shapes_roundtrip()
   memory_roundtrip("str_split_bare_terminal_mem", addr_tbl->view(), bare_dsl);
 }
 
+// Validity survives both serialization paths. The sidecar is not a leaf, so it
+// travels in its own per-column header record rather than through describe() --
+// this covers the file path, the pinned in-memory path, and the two fast paths
+// that write no payload bytes at all.
+void test_validity_sidecar_roundtrip()
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+
+  // Mixed validity: a real bitmask is written to the payload region.
+  auto mixed = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 128, cudf::mask_state::ALL_VALID, stream, mr);
+  std::vector<std::int32_t> host(128);
+  for (int r = 0; r < 128; ++r)
+    host[static_cast<std::size_t>(r)] = static_cast<std::int32_t>((r * 31 + 7) % 5000);
+  if (cudaMemcpy(mixed->mutable_view().head<std::int32_t>(),
+                 host.data(),
+                 host.size() * sizeof(std::int32_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    throw std::runtime_error("validity_sidecar: cudaMemcpy failed");
+  cudf::set_null_mask(mixed->mutable_view().null_mask(), 3, 4, /*valid=*/false, stream);
+  cudf::set_null_mask(mixed->mutable_view().null_mask(), 70, 96, /*valid=*/false, stream);
+  mixed->set_null_count(27);
+  cudf::table_view mixed_tbl({mixed->view()});
+  io_roundtrip("validity_mixed", mixed_tbl, "input -> delta -> differences\n");
+  memory_roundtrip("validity_mixed_mem", mixed_tbl, "input -> delta -> differences\n");
+
+  // All null: nothing is written to the payload, so this also checks that the
+  // reader rebuilds the mask from the kind alone.
+  auto all_null = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 64, cudf::mask_state::ALL_NULL, stream, mr);
+  all_null->set_null_count(64);
+  cudf::table_view an_tbl({all_null->view()});
+  io_roundtrip("validity_all_null", an_tbl, "input -> delta -> differences\n");
+  memory_roundtrip("validity_all_null_mem", an_tbl, "input -> delta -> differences\n");
+
+  // Nullable STRING through str_split, where validity used to be a routed channel.
+  std::vector<bool> valid = {true, false, true, true, false, true};
+  auto strs = make_strings_table({"alpha", "", "gamma", "delta", "x", "zeta"}, valid, stream);
+  io_roundtrip("validity_strings", strs->view(), "input -> str_split\n");
+  memory_roundtrip("validity_strings_mem", strs->view(), "input -> str_split\n");
+}
+
+// A nullable column's mask must be attributed to its own column (a projection sizes
+// columns from the per-buffer index), and a header whose validity record contradicts the
+// column is rejected at parse time rather than trusted.
+void test_validity_header_integrity()
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+
+  auto plain = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 128, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto nullable = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 128, cudf::mask_state::ALL_VALID, stream, mr);
+  cudf::set_null_mask(nullable->mutable_view().null_mask(), 3, 4, /*valid=*/false, stream);
+  nullable->set_null_count(1);
+  cudf::table_view tbl({plain->view(), nullable->view()});
+
+  auto ct = simpatico::compress_with_plan(
+    tbl, "input -> delta -> differences\n---\ninput -> delta -> differences\n", stream, mr);
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  auto const herr =
+    simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+  expect(herr.empty(), "validity_header_integrity: header error");
+  auto const mask_ptr = ct.columns[1].plan_tree->validity.mask.data();
+  bool found          = false;
+  for (auto const& b : buffers)
+    if (b.device_ptr == mask_ptr) {
+      found = true;
+      expect(b.column_index == 1, "validity_header_integrity: mask attributed to wrong column");
+    }
+  expect(found, "validity_header_integrity: mask buffer not listed");
+
+  // All-null column whose stored null_count disagrees with num_rows.
+  auto an = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 64, cudf::mask_state::ALL_NULL, stream, mr);
+  an->set_null_count(64);
+  cudf::table_view an_tbl({an->view()});
+  auto an_ct = simpatico::compress_with_plan(an_tbl, "input -> delta -> differences\n", stream, mr);
+  header.clear();
+  buffers.clear();
+  expect(
+    simpatico::build_compressed_table_header(an_ct, header, buffers, payload_bytes, stream).empty(),
+    "validity_header_integrity: all-null header error");
+  // num_rows (int64 64), kind (1 = all_null), null_count (int64 64).
+  std::vector<std::uint8_t> const pat = {64, 0, 0, 0, 0, 0, 0, 0, 1, 64, 0, 0, 0, 0, 0, 0, 0};
+  auto it = std::search(header.begin(), header.end(), pat.begin(), pat.end());
+  expect(it != header.end(), "validity_header_integrity: validity record not located");
+  *(it + 9)                         = 5;
+  simpatico::payload_fetch_fn fetch = [](std::uint64_t, std::size_t, void*, ::cuda::stream_ref) {};
+  std::string rerr;
+  simpatico::read_compressed_table_from_memory(header, fetch, stream, mr, &rerr);
+  expect(!rerr.empty(), "validity_header_integrity: corrupt null_count accepted");
+}
+
 }  // namespace
 
 int main()
@@ -794,6 +892,8 @@ int main()
     {"error_bad_version", test_error_bad_version},
     {"identity_string_roundtrip", test_identity_string_roundtrip},
     {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
+    {"validity_sidecar", test_validity_sidecar_roundtrip},
+    {"validity_header_integrity", test_validity_header_integrity},
   };
 
   int failures = 0;
