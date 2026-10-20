@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-// Public sirius::ffi Context, Fragment and DirectExchange methods only.
+// Public sirius::ffi Context, Fragment and ExchangeInbox methods only.
 // Builds Substrait in the test because the FFI has no SQL helper.
 // Covers a result fragment, a relay_from chain, several fragments built before any runs (on one
 // and on two threads), build() and run()/drop on different threads, drop after build(), a build()
-// that fails after setup, execute_substrait, and the DirectExchange handle. Spec errors and
+// that fails after setup, execute_substrait, and the ExchangeInbox handle. Spec errors and
 // failed-build rollback live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
 
 #include "sirius/exception.hpp"
@@ -367,11 +367,11 @@ TEST_CASE("FFI concurrent run() and execute_substrait on one Context wait for ea
   REQUIRE(collect_i64_column(direct) == expected);
 }
 
-TEST_CASE("FFI DirectExchange refuses unknown tokens and every call but device() after its Context",
+TEST_CASE("FFI ExchangeInbox refuses unknown tokens and every call but device() after its Context",
           "[isolated_context][sirius_ffi]")
 {
   auto ctx      = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
-  auto exchange = ctx->direct_exchange();
+  auto exchange = ctx->exchange_inbox();
   REQUIRE(exchange != nullptr);
   REQUIRE(exchange->outstanding() == 0);
   exchange->release(7);

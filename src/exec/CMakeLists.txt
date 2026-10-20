@@ -3,7 +3,7 @@ target_sources(
   PRIVATE admission_control.cpp
           arrow_result_stream.cpp
           batch_stream.cpp
-          exchange_direct.cpp
+          exchange_inbox.cpp
           stream_session.cpp
           stream_bind_catalog.cpp
           stream_plan_bindings.cpp

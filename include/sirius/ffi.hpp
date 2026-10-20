@@ -39,12 +39,12 @@
 #endif
 
 namespace sirius::exec {
-class direct_exchange;
+class exchange_inbox;
 }
 
 namespace sirius::ffi {
 
-class DirectExchange;
+class ExchangeInbox;
 class Fragment;
 
 /// RAII handle to a Sirius engine context.
@@ -77,9 +77,9 @@ class SIRIUS_FFI_EXPORT Context {
   /// released; its last release can tear down the engine on the releasing thread.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
-  /// A handle to this Context's direct exchange, or null unless the Context has one GPU memory
+  /// A handle to this Context's exchange inbox, or null unless the Context has one GPU memory
   /// space.
-  [[nodiscard]] std::unique_ptr<DirectExchange> direct_exchange() const;
+  [[nodiscard]] std::unique_ptr<ExchangeInbox> exchange_inbox() const;
 
  private:
   struct Impl;
@@ -93,7 +93,7 @@ class SIRIUS_FFI_EXPORT Context {
 /// takes them by token.
 ///
 /// Callable from any thread. After its Context is destroyed every call but device() throws.
-class SIRIUS_FFI_EXPORT DirectExchange {
+class SIRIUS_FFI_EXPORT ExchangeInbox {
  public:
   /// The CUDA device of the Context's GPU memory space.
   [[nodiscard]] int device() const noexcept;
@@ -106,9 +106,9 @@ class SIRIUS_FFI_EXPORT DirectExchange {
   [[nodiscard]] std::size_t outstanding() const;
 
  private:
-  explicit DirectExchange(std::shared_ptr<sirius::exec::direct_exchange> exchange);
+  explicit ExchangeInbox(std::shared_ptr<sirius::exec::exchange_inbox> exchange);
 
-  std::shared_ptr<sirius::exec::direct_exchange> exchange_;
+  std::shared_ptr<sirius::exec::exchange_inbox> exchange_;
 
   friend class Context;
 };
@@ -193,7 +193,7 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint32_t sender_id);
 
   /// Push the batch received under `token` into input stream `stream_id`. Consumes the token
-  /// unless it throws before reading it: before build(), without a DirectExchange, after run()
+  /// unless it throws before reading it: before build(), without a ExchangeInbox, after run()
   /// started, or on an undeclared input.
   /// @throws also on a token that holds no received batch, on a schema mismatch, or when the
   /// input already ended.

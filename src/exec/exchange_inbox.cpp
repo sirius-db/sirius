@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "exec/exchange_direct.hpp"
+#include "exec/exchange_inbox.hpp"
 
 #include "sirius/exception.hpp"
 
@@ -27,15 +27,15 @@
 
 namespace sirius::exec {
 
-direct_exchange::direct_exchange(cucascade::memory::memory_space& gpu)
+exchange_inbox::exchange_inbox(cucascade::memory::memory_space& gpu)
   : _gpu{gpu}, _device{gpu.get_device_id()}
 {
 }
 
-std::uint64_t direct_exchange::adopt(std::shared_ptr<cucascade::data_batch> batch,
-                                     std::function<void()> on_gone)
+std::uint64_t exchange_inbox::adopt(std::shared_ptr<cucascade::data_batch> batch,
+                                    std::function<void()> on_gone)
 {
-  if (!batch) { throw sirius::invalid_input_exception("direct exchange: adopt() of a null batch"); }
+  if (!batch) { throw sirius::invalid_input_exception("exchange inbox: adopt() of a null batch"); }
   std::lock_guard const lock{_mutex};
   require_open();
   auto const token = _next++;
@@ -44,7 +44,7 @@ std::uint64_t direct_exchange::adopt(std::shared_ptr<cucascade::data_batch> batc
   return token;
 }
 
-std::shared_ptr<cucascade::data_batch> direct_exchange::take_batch(std::uint64_t token)
+std::shared_ptr<cucascade::data_batch> exchange_inbox::take_batch(std::uint64_t token)
 {
   std::shared_ptr<cucascade::data_batch> batch;
   {
@@ -52,7 +52,7 @@ std::shared_ptr<cucascade::data_batch> direct_exchange::take_batch(std::uint64_t
     require_open();
     auto const it = _held.find(token);
     if (it == _held.end()) {
-      throw sirius::invalid_input_exception("direct exchange: token {} holds no received batch",
+      throw sirius::invalid_input_exception("exchange inbox: token {} holds no received batch",
                                             token);
     }
     batch = std::move(it->second);
@@ -62,7 +62,7 @@ std::shared_ptr<cucascade::data_batch> direct_exchange::take_batch(std::uint64_t
   return batch;
 }
 
-void direct_exchange::release(std::uint64_t token)
+void exchange_inbox::release(std::uint64_t token)
 {
   {
     std::lock_guard const lock{_mutex};
@@ -74,14 +74,14 @@ void direct_exchange::release(std::uint64_t token)
   gone(token);
 }
 
-std::size_t direct_exchange::outstanding() const
+std::size_t exchange_inbox::outstanding() const
 {
   std::lock_guard const lock{_mutex};
   require_open();
   return _held.size();
 }
 
-void direct_exchange::close()
+void exchange_inbox::close()
 {
   std::map<std::uint64_t, std::function<void()>> on_gone;
   {
@@ -96,7 +96,7 @@ void direct_exchange::close()
   }
 }
 
-void direct_exchange::gone(std::uint64_t token)
+void exchange_inbox::gone(std::uint64_t token)
 {
   std::function<void()> callback;
   {
@@ -109,9 +109,9 @@ void direct_exchange::gone(std::uint64_t token)
   if (callback) { callback(); }
 }
 
-void direct_exchange::require_open() const
+void exchange_inbox::require_open() const
 {
-  if (_closed) { throw sirius::invalid_input_exception("direct exchange: already closed"); }
+  if (_closed) { throw sirius::invalid_input_exception("exchange inbox: already closed"); }
 }
 
 }  // namespace sirius::exec

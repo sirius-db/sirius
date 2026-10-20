@@ -114,10 +114,10 @@ impl SiriusContext {
         collect_arrow_stream(stream)
     }
 
-    /// This context's [`DirectExchange`], or `None` unless it has one GPU memory space.
-    pub fn direct_exchange(&self) -> Option<DirectExchange> {
-        let inner = self.inner.borrow().direct_exchange();
-        (!inner.is_null()).then_some(DirectExchange { inner })
+    /// This context's [`ExchangeInbox`], or `None` unless it has one GPU memory space.
+    pub fn exchange_inbox(&self) -> Option<ExchangeInbox> {
+        let inner = self.inner.borrow().exchange_inbox();
+        (!inner.is_null()).then_some(ExchangeInbox { inner })
     }
 }
 
@@ -291,18 +291,18 @@ impl Fragment<'_> {
 }
 
 /// Holds batches a transport received until [`Fragment::push_received`] takes them by token, from
-/// [`SiriusContext::direct_exchange`]. The full contract is documented on the C++
-/// `sirius::ffi::DirectExchange`.
-pub struct DirectExchange {
-    inner: UniquePtr<sirius_sys::DirectExchange>,
+/// [`SiriusContext::exchange_inbox`]. The full contract is documented on the C++
+/// `sirius::ffi::ExchangeInbox`.
+pub struct ExchangeInbox {
+    inner: UniquePtr<sirius_sys::ExchangeInbox>,
 }
 
 // SAFETY: the C++ handle shares the context's token table, which serializes every call on one
 // mutex and sets the CUDA device itself, so no state behind it is tied to a thread.
-unsafe impl Send for DirectExchange {}
-unsafe impl Sync for DirectExchange {}
+unsafe impl Send for ExchangeInbox {}
+unsafe impl Sync for ExchangeInbox {}
 
-impl DirectExchange {
+impl ExchangeInbox {
     /// The CUDA device of the context's GPU memory space.
     pub fn device(&self) -> i32 {
         self.inner.device()
@@ -319,9 +319,9 @@ impl DirectExchange {
     }
 }
 
-impl std::fmt::Debug for DirectExchange {
+impl std::fmt::Debug for ExchangeInbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("DirectExchange")
+        f.debug_tuple("ExchangeInbox")
             .field(&self.device())
             .finish()
     }
@@ -603,10 +603,10 @@ mod tests {
         );
     }
 
-    /// A context's direct exchange starts empty, refuses a token it never handed out, and may
+    /// A context's exchange inbox starts empty, refuses a token it never handed out, and may
     /// outlive its context, after which every call but `device` fails. Requires a GPU.
     #[test]
-    fn direct_exchange_refuses_unknown_tokens_and_outlives_its_context() {
+    fn exchange_inbox_refuses_unknown_tokens_and_outlives_its_context() {
         let _guard = GPU_CONTEXT_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -629,8 +629,8 @@ mod tests {
         .unwrap();
         let ctx = SiriusContext::from_config_file(&config).expect("bring up one-GPU context");
         let exchange = ctx
-            .direct_exchange()
-            .expect("a one-GPU context has a direct exchange");
+            .exchange_inbox()
+            .expect("a one-GPU context has an exchange inbox");
         assert_eq!(exchange.outstanding().unwrap(), 0);
         exchange.release(7).unwrap();
 

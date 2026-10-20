@@ -132,7 +132,7 @@ impl RemoteFrame {
 pub(crate) struct Purged {
     /// Parked same-CN sender outputs, each released with `drop_parked`.
     pub(crate) slots: Vec<SenderSlot>,
-    /// Direct-exchange receive buffers remote senders filled, each released by token.
+    /// Batches remote senders landed in the exchange inbox, each released by token.
     pub(crate) tokens: Vec<u64>,
 }
 

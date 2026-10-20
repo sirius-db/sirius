@@ -34,7 +34,7 @@
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
 #include "exec/arrow_result_stream.hpp"
-#include "exec/exchange_direct.hpp"       // sirius::exec::direct_exchange
+#include "exec/exchange_inbox.hpp"        // sirius::exec::exchange_inbox
 #include "exec/stream_bind_catalog.hpp"   // sirius::exec::stream_bind_catalog
 #include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
@@ -167,8 +167,8 @@ struct Context::Impl {
   duckdb::unique_ptr<duckdb::Connection> conn;
   // Serializes transactions on `conn`; see in_transaction().
   std::mutex conn_mutex;
-  // Shared with every DirectExchange handle, which may outlive this Context.
-  std::shared_ptr<sirius::exec::direct_exchange> exchange;
+  // Shared with every ExchangeInbox handle, which may outlive this Context.
+  std::shared_ptr<sirius::exec::exchange_inbox> exchange;
 
   // Frees the exchange's buffers while the memory space they come from still exists.
   ~Impl()
@@ -176,11 +176,11 @@ struct Context::Impl {
     if (exchange) { exchange->close(); }
   }
 
-  sirius::exec::direct_exchange& require_exchange() const
+  sirius::exec::exchange_inbox& require_exchange() const
   {
     if (!exchange) {
       throw sirius::invalid_input_exception(
-        "Fragment: direct exchange requires a single GPU memory space");
+        "Fragment: exchange inbox requires a single GPU memory space");
     }
     return *exchange;
   }
@@ -193,7 +193,7 @@ struct Context::Impl {
     auto& memory    = context->get_memory_manager();
     auto const gpus = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     if (gpus.size() == 1) {
-      exchange = std::make_shared<sirius::exec::direct_exchange>(
+      exchange = std::make_shared<sirius::exec::exchange_inbox>(
         *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id()));
     }
 
@@ -297,23 +297,23 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     std::move(result), *reinterpret_cast<ArrowArrayStream*>(out_stream_addr), kArrowBatchSize);
 }
 
-std::unique_ptr<DirectExchange> Context::direct_exchange() const
+std::unique_ptr<ExchangeInbox> Context::exchange_inbox() const
 {
   if (!impl_->exchange) { return nullptr; }
   // Not make_unique: the constructor is private to Context.
-  return std::unique_ptr<DirectExchange>(new DirectExchange(impl_->exchange));
+  return std::unique_ptr<ExchangeInbox>(new ExchangeInbox(impl_->exchange));
 }
 
-DirectExchange::DirectExchange(std::shared_ptr<sirius::exec::direct_exchange> exchange)
+ExchangeInbox::ExchangeInbox(std::shared_ptr<sirius::exec::exchange_inbox> exchange)
   : exchange_(std::move(exchange))
 {
 }
 
-int DirectExchange::device() const noexcept { return exchange_->device(); }
+int ExchangeInbox::device() const noexcept { return exchange_->device(); }
 
-void DirectExchange::release(std::uint64_t token) const { exchange_->release(token); }
+void ExchangeInbox::release(std::uint64_t token) const { exchange_->release(token); }
 
-std::size_t DirectExchange::outstanding() const { return exchange_->outstanding(); }
+std::size_t ExchangeInbox::outstanding() const { return exchange_->outstanding(); }
 
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 

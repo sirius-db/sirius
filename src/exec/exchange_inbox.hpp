@@ -40,9 +40,9 @@ namespace sirius::exec {
  * into a fragment input by its token (Fragment::push_received). Tokens start at 1 and are never
  * reused. Every method is thread-safe.
  */
-class direct_exchange {
+class exchange_inbox {
  public:
-  explicit direct_exchange(cucascade::memory::memory_space& gpu);
+  explicit exchange_inbox(cucascade::memory::memory_space& gpu);
 
   /// Holds @p batch, already received whole, until its receiver takes it by the returned token.
   /// @p on_gone runs once when the token is taken, released or closed, outside the exchange's

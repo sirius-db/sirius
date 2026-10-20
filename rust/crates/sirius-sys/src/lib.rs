@@ -60,20 +60,20 @@ mod ffi {
         /// Holds batches a transport received until a fragment takes them by
         /// token. Callable from any thread; the contract of every method is
         /// documented on the C++ class.
-        type DirectExchange;
+        type ExchangeInbox;
 
-        /// This context's direct exchange, or null unless it has one GPU memory
+        /// This context's exchange inbox, or null unless it has one GPU memory
         /// space.
-        fn direct_exchange(self: &Context) -> UniquePtr<DirectExchange>;
+        fn exchange_inbox(self: &Context) -> UniquePtr<ExchangeInbox>;
 
         /// CUDA device of the context's GPU memory space.
-        fn device(self: &DirectExchange) -> i32;
+        fn device(self: &ExchangeInbox) -> i32;
 
         /// Free what `token` holds. Unknown and consumed tokens are ignored.
-        fn release(self: &DirectExchange, token: u64) -> Result<()>;
+        fn release(self: &ExchangeInbox, token: u64) -> Result<()>;
 
         /// Tokens neither released nor consumed.
-        fn outstanding(self: &DirectExchange) -> Result<usize>;
+        fn outstanding(self: &ExchangeInbox) -> Result<usize>;
 
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
@@ -165,6 +165,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    Context, DirectExchange, Fragment, make_context, make_context_from_config, make_fragment,
+    Context, ExchangeInbox, Fragment, make_context, make_context_from_config, make_fragment,
     stream_view_name,
 };

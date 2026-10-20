@@ -16,7 +16,7 @@
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
-#include "exec/exchange_direct.hpp"
+#include "exec/exchange_inbox.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -60,7 +60,7 @@ std::shared_ptr<cucascade::data_batch> int64_batch(memory_space& gpu)
   return sirius::make_data_batch(cudf::table{std::move(columns)}, gpu, stream, {});
 }
 
-void refused(direct_exchange& exchange, std::uint64_t token)
+void refused(exchange_inbox& exchange, std::uint64_t token)
 {
   CHECK_THROWS_MATCHES(exchange.take_batch(token),
                        sirius::invalid_input_exception,
@@ -69,10 +69,10 @@ void refused(direct_exchange& exchange, std::uint64_t token)
 
 }  // namespace
 
-TEST_CASE("direct_exchange hands an adopted batch to take_batch once", "[exchange_direct]")
+TEST_CASE("exchange_inbox hands an adopted batch to take_batch once", "[exchange_inbox]")
 {
   memory_space gpu(gpu_config());
-  direct_exchange exchange(gpu);
+  exchange_inbox exchange(gpu);
   auto const batch = int64_batch(gpu);
   auto const first = exchange.adopt(batch);
   auto const other = exchange.adopt(int64_batch(gpu));
@@ -87,12 +87,12 @@ TEST_CASE("direct_exchange hands an adopted batch to take_batch once", "[exchang
   CHECK(exchange.outstanding() == 1);
 }
 
-TEST_CASE("direct_exchange release is idempotent and close frees every token", "[exchange_direct]")
+TEST_CASE("exchange_inbox release is idempotent and close frees every token", "[exchange_inbox]")
 {
   memory_space gpu(gpu_config());
   auto const available = gpu.get_available_memory();
   {
-    direct_exchange exchange(gpu);
+    exchange_inbox exchange(gpu);
     auto const released = exchange.adopt(int64_batch(gpu));
     (void)exchange.adopt(int64_batch(gpu));
     exchange.release(released);
@@ -110,11 +110,11 @@ TEST_CASE("direct_exchange release is idempotent and close frees every token", "
   CHECK(gpu.get_available_memory() == available);
 }
 
-TEST_CASE("direct_exchange runs an adopted token's on_gone once, however it goes",
-          "[exchange_direct]")
+TEST_CASE("exchange_inbox runs an adopted token's on_gone once, however it goes",
+          "[exchange_inbox]")
 {
   memory_space gpu(gpu_config());
-  direct_exchange exchange(gpu);
+  exchange_inbox exchange(gpu);
   int taken = 0, released = 0, closed = 0;
   auto const take    = exchange.adopt(int64_batch(gpu), [&] { ++taken; });
   auto const release = exchange.adopt(int64_batch(gpu), [&] { ++released; });
