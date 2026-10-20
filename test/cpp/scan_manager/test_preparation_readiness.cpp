@@ -438,6 +438,64 @@ TEST_CASE("Publication is refused after cancellation wins during input construct
   CHECK(out->preparations == 0);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
+
+TEST_CASE("Normal EOS does not report worker operation_canceled as a query error",
+          "[scan_preparation][coordinator]")
+{
+  fixture f;
+  auto out = std::make_shared<sink>();
+  std::promise<void> started;
+  auto ready   = started.get_future();
+  bool claimed = false;
+  f.source(
+    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
+      if (std::exchange(claimed, true)) return {};
+      preparation_coordinator::job job;
+      job.stop_work =
+        [&started](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+        started.set_value();
+        while (!stop.stop_requested())
+          std::this_thread::yield();
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      };
+      return job;
+    });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(ready.wait_for(1s) == std::future_status::ready);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  f.finish();
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Normal EOS still reports a real late worker error", "[scan_preparation][coordinator]")
+{
+  fixture f;
+  auto out = std::make_shared<sink>();
+  std::promise<void> started;
+  auto ready   = started.get_future();
+  bool claimed = false;
+  f.source(
+    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
+      if (std::exchange(claimed, true)) return {};
+      preparation_coordinator::job job;
+      job.stop_work =
+        [&started](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+        started.set_value();
+        while (!stop.stop_requested())
+          std::this_thread::yield();
+        throw std::runtime_error("late worker failure");
+      };
+      return job;
+    });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(ready.wait_for(1s) == std::future_status::ready);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  f.finish();
+  CHECK(f.completion.has_error());
+}
+
 TEST_CASE("Unresolved typed input forbids scan input construction until the whole unit is ready",
           "[scan_preparation][coordinator]")
 {

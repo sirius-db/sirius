@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <mutex>
 #include <span>
 
 namespace sirius::io {

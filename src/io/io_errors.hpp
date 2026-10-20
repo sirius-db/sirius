@@ -41,6 +41,11 @@ class credential_error : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+class descriptor_mismatch_error : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 /**
  * @brief A read found the object to be a different version from the one its
  *        datasource was opened on.

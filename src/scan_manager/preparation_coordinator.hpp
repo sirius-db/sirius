@@ -22,6 +22,7 @@
 #include "scan_manager/preparation_options.hpp"
 
 #include <functional>
+#include <stop_token>
 #include <thread>
 namespace sirius::scan_manager {
 enum class stop_reason : uint8_t { user_cancel, failure_induced, normal_eos };
@@ -30,6 +31,9 @@ class preparation_coordinator {
   struct job {
     std::function<std::unique_ptr<op::scan::scan_info>()> work;
     std::shared_ptr<preparation_unit> unit;
+    // Stop-aware work is used by the dispatcher when present. Keep the legacy
+    // no-argument callback for callers that construct jobs directly.
+    std::function<std::unique_ptr<op::scan::scan_info>(std::stop_token)> stop_work;
   };
   struct publication {
     std::unique_ptr<op::operator_data> input;

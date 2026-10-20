@@ -142,6 +142,8 @@ for variant, names in (
     ("dv_three", ("a", "b", "c")),
     ("dv_corrupt_crc", ("a",)),
     ("dv_missing_payload", ("a",)),
+    ("dv_unsupported_uri", ("a",)),
+    ("dv_unused_unsupported_uri", ("a",)),
 ):
     dest = out / variant
     (dest / "metadata").mkdir(parents=True, exist_ok=True)
@@ -168,6 +170,7 @@ for variant, names in (
                 row["added_rows_count"] *= len(names)
         else:
             expanded = []
+            unused = None
             for original in rows:
                 for name in names:
                     row = copy.deepcopy(original)
@@ -185,6 +188,8 @@ for variant, names in (
                         df["file_path"] = str(data)
                         df["file_size_in_bytes"] = data.stat().st_size
                     else:
+                        if variant == "dv_unused_unsupported_uri":
+                            unused = copy.deepcopy(row)
                         sidecar = dest / "data" / (name + ".puffin")
                         footer = copy.deepcopy(source_footer)
                         footer["blobs"][0]["properties"]["referenced-data-file"] = str(
@@ -208,8 +213,23 @@ for variant, names in (
                         df["file_path"] = str(sidecar)
                         df["referenced_data_file"] = str(data)
                         df["file_size_in_bytes"] = sidecar.stat().st_size
+                        if variant == "dv_unsupported_uri":
+                            # Keep metadata, manifests, and data local while making only the
+                            # Puffin sidecar a remote URI with no registered Sirius backend.
+                            # The planner must refuse before opening this object.
+                            df["file_path"] = (
+                                "http://unsupported-puffin.invalid/sidecar.puffin"
+                            )
                     expanded.append(row)
             rows = expanded
+            if unused is not None:
+                unused["data_file"][
+                    "file_path"
+                ] = "http://unsupported-puffin.invalid/unused-sidecar.puffin"
+                unused["data_file"]["referenced_data_file"] = str(
+                    dest / "data" / "unselected.parquet"
+                )
+                rows.append(unused)
         write(dest / "metadata" / path.name, schema, metadata, rows)
     for path in (dest / "metadata").glob("snap-*.avro"):
         schema, metadata, rows = read(path)
@@ -240,8 +260,25 @@ if len(sys.argv) > 2:
             return {key: relocate(item) for key, item in value.items()}
         return value
 
+    def relocate_puffin_footer(path):
+        """Rewrite the footer's data-file URI along with the Avro metadata."""
+        encoded = path.read_bytes()
+        footer_length = struct.unpack("<i", encoded[-12:-8])[0]
+        footer_start = len(encoded) - 12 - footer_length
+        footer = json.loads(encoded[footer_start : footer_start + footer_length])
+        relocated = relocate(footer)
+        payload = json.dumps(relocated, separators=(",", ":")).encode()
+        path.write_bytes(
+            encoded[:footer_start]
+            + payload
+            + struct.pack("<i", len(payload))
+            + encoded[-8:]
+        )
+
     for path in out.rglob("*.json"):
         path.write_text(json.dumps(relocate(json.loads(path.read_text())), indent=2))
+    for path in out.rglob("*.puffin"):
+        relocate_puffin_footer(path)
     # Rewrite data/delete manifests before recording their new sizes in manifest lists.
     avro = list(out.rglob("*.avro"))
     for path in sorted(avro, key=lambda p: p.name.startswith("snap-")):
