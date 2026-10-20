@@ -32,6 +32,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/pinned_table_guard.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -233,9 +234,7 @@ TEST_CASE_METHOD(UnionFixture,
   // so two arms never present different carriers for one logical column. uwide.k is BIGINT with
   // small values (a narrowing candidate) against an INTEGER arm, and must be pinned for a sidecar
   // to be installed at all (`scan_physical_schema` in sirius_plan_get.cpp).
-  auto pin = con->Query("CALL pin_table(format='duckdb', name='uwide', tier='gpu');");
-  REQUIRE(pin);
-  REQUIRE_FALSE(pin->HasError());
+  sirius::test::pinned_table_guard pin{*con, "uwide"};
 
   auto const before = sirius::test::get_compressed_materialization_stats(*con);
 
@@ -248,8 +247,6 @@ TEST_CASE_METHOD(UnionFixture,
   // stays 0 by design -- nothing survives narrow past the boundary.
   REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
   REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
-
-  REQUIRE_FALSE(con->Query("CALL unpin_table('uwide');")->HasError());
 }
 
 TEST_CASE_METHOD(UnionFixture,
@@ -451,17 +448,13 @@ TEST_CASE_METHOD(UnionFixture,
                  "[integration][gpu_execution][union]")
 {
   // As in the UNION ALL case above: the narrowed arm is restored at the union, below the DISTINCT.
-  auto pin = con->Query("CALL pin_table(format='duckdb', name='uwide', tier='gpu');");
-  REQUIRE(pin);
-  REQUIRE_FALSE(pin->HasError());
+  sirius::test::pinned_table_guard pin{*con, "uwide"};
 
   auto const before = sirius::test::get_compressed_materialization_stats(*con);
   compare_gpu_vs_cpu("SELECT k FROM uwide UNION SELECT k FROM ua");
   auto const after = sirius::test::get_compressed_materialization_stats(*con);
   REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
   REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
-
-  REQUIRE_FALSE(con->Query("CALL unpin_table('uwide');")->HasError());
 }
 
 TEST_CASE_METHOD(UnionFixture,
@@ -487,16 +480,12 @@ TEST_CASE_METHOD(UnionFixture,
     "UNION SELECT length(v)::INTEGER FROM (SELECT v, k FROM ua GROUP BY v, k) s";
   REQUIRE_THAT(cpu_plan_text(query), Catch::Matchers::ContainsSubstring("CTE"));
 
-  auto pin = con->Query("CALL pin_table(format='duckdb', name='ua', tier='gpu');");
-  REQUIRE(pin);
-  REQUIRE_FALSE(pin->HasError());
+  sirius::test::pinned_table_guard pin{*con, "ua"};
 
   auto const before = sirius::test::get_compressed_materialization_stats(*con);
   compare_gpu_vs_cpu(query);
   auto const after = sirius::test::get_compressed_materialization_stats(*con);
   REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
-
-  REQUIRE_FALSE(con->Query("CALL unpin_table('ua');")->HasError());
 }
 
 TEST_CASE_METHOD(UnionFixture,
