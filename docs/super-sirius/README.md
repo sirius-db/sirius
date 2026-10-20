@@ -47,6 +47,8 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, ready-device scheduling, cross-GPU transfers, downgrade, concurrency invariants |
 | [Late Materialization](late-materialization.md) | Carrying a pin-order rowid instead of wide column values — the scan/port pair, group-by-rowid rides, riders, the pin-time uniqueness proof, and the `SIRIUS_EXP_LATE_MAT_*` gates |
 | [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, join-edge (SIP) endpoint placement, and the refinement design that remains future work |
+| [Vector Search](vector-search.md) | GPU k-NN over pinned tables via cuVS — the `sirius_knn_search`/`sirius_create_ann_index`/`sirius_drop_ann_index` table functions, exact (ENN) and IVF-Flat (ANN) paths, the session index cache, distance metrics |
+| [Quent Telemetry](quent-telemetry.md) | Quent-based tracing (experimental): enabling the exporter, query labels and per-phase session labels, generating telemetry, and the Quent timeline UI |
 | [Debugging](debugging.md) | Practical guide to debugging crashes and races — building/running with ASan & TSan, the `tsan.supp` file, and capturing/inspecting core dumps with gdb |
 
 ## Suggested Reading Order
@@ -64,4 +66,4 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 11. **Configuration** — tuning knobs and runtime settings
 12. **Optimizations** — performance improvements and their mechanisms
 
-<!-- last-updated-commit: f03762faf2aba9966050102d632c92cb770ff14d -->
+<!-- last-updated-commit: 5e0e39ed275199de1e420b451ca6490185a93958 -->

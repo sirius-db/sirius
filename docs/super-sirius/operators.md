@@ -30,7 +30,7 @@ An operator's position in a pipeline is determined by `sirius_engine::initialize
 | `is_sink()` | Whether this operator has a `sink()` implementation for pushing data to downstream ports — true for unconditional sinks, or when the tree parent is a sink parent (PARTITION, RIGHT_DELIM_JOIN, DENSE_COUNT_JOIN) |
 | `get_next_task_hint()` | Checks port readiness, returns `READY` or `WAITING_FOR_INPUT_DATA` |
 | `get_next_task_input_data()` | Pops one data batch from each input port |
-| `can_create_more_tasks()` / `has_processed_all_tasks()` | Signals task exhaustion |
+| `can_create_more_tasks()` | Signals task exhaustion |
 
 See [Task Creator](task-creator.md) for per-operator overrides.
 
@@ -232,7 +232,7 @@ Partition count, broadcast, and BUILD_PROBE are decided together by the free fun
 
 By execution time every equality-condition side is a plain column reference: a complex equality-key expression is materialized into a real column by a planner-inserted projection below the join (`materialize_expression_join_keys()`), because PARTITION — the first key consumer — hashes by column index and cannot evaluate expressions. Inequality sides stay inline as the mixed-join AST predicate.
 
-**NULL comparison for keys.** `compare_nulls()` picks the `null_equality` flag threaded through every cuDF join call (including the build helpers and `filtered_join`/`mark_join`): `EQUAL` only when *every* equi-key is `IS NOT DISTINCT FROM`, `UNEQUAL` otherwise (any plain `=`, delim joins, and MARK). A null-safe key *mixed* with plain `=` is instead routed through MIXED_JOIN (see below).
+**NULL comparison for keys.** `compare_nulls()` picks the `null_equality` flag threaded through every cuDF join call (including the build helpers and `filtered_join`/`mark_join`): `EQUAL` only when *every* equi-key is `IS NOT DISTINCT FROM`, `UNEQUAL` otherwise (any plain `=`, including delim joins). MARK follows the same rule: an all-null-safe MARK takes `EQUAL` and emits definite marks (`mark_is_null_safe()` — see [MARK joins](#mark-joins)); any MARK containing a plain key keeps `UNEQUAL` and the three-valued IN/EXISTS reconstruction. For non-MARK joins, a null-safe key *mixed* with plain `=` is routed through MIXED_JOIN (see below); a MARK join mixing the two has no correct GPU encoding and is rejected at plan time (CPU fallback).
 
 **Broadcast small build tables.** On multi-GPU, a build side is a broadcast candidate when it is small (`< small_table_bytes`), or when it fits `max_broadcast_join_size` and the estimated probe-to-build ratio is at least `num_gpus * 1.25`; MARK joins are forced broadcast whenever `num_gpus > 1` (see [MARK joins](#mark-joins)). Instead of routing the whole build to one GPU, the PARTITION operator proposes `num_gpus` partitions and *replicates* the small build table to every GPU (the `_broadcast` flag), so each GPU builds its own hash table and joins its local probe rows. The build sink deposits the build batch into every slot; the probe sink routes each batch to the slot for its current GPU (`slot_for_device`). Once the probe side finishes, any slot that received replicated build data but no probe rows is discarded (`discard_build_only_slots_if_probe_complete`). Right-family / mixed joins reject BUILD_PROBE and fall back to the normal partition count.
 
@@ -257,27 +257,30 @@ The following table summarizes, per join type, what concat folds, which side str
 | RIGHT | probe → 1 | build | ✅ | ✅ (probe-driven) | ❌ | STANDARD, MIXED_JOIN† |
 | RIGHT_SEMI | probe → 1 | build | ✅ | ✅ | ❌ | STANDARD, MIXED_JOIN† |
 | RIGHT_ANTI | probe → 1 | build | ✅ | ✅ | ❌ | STANDARD, MIXED_JOIN† |
-| SINGLE | — | — | — | — | — | unsupported (throws) |
+| SINGLE | — | — | — | — | — | unsupported — screened at plan time (CPU fallback) |
 
-† MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction, and a MARK + null-safe key stays a `UNEQUAL` hash key (a known null-safe limitation). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from the downstream join type (`_concat_all`); partition / broadcast / mode eligibility is decided in `compute_hash_join_partition_strategy`.
+† MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction; an all-null-safe MARK keeps its keys as `EQUAL` hash keys and emits definite marks, and a MARK mixing null-safe and plain keys is rejected at plan time (`mark_join_mixes_null_safe_keys`), falling back to DuckDB's CPU mark join. "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from the downstream join type (`_concat_all`); partition / broadcast / mode eligibility is decided in `compute_hash_join_partition_strategy`.
 
 #### MARK joins
 A MARK join emits every left row plus a `BOOL8` mark column with SQL three-valued semantics: **true** for a match, **false** for a non-match when the probe key is non-NULL and the build side has no NULL key, and **NULL** otherwise (NULL probe key, or no match while a NULL build key exists — the row *might* have matched it). Both build strategies funnel through `resolve_mark_join_result`, which scatters left-row match indices into the mark column and attaches the null mask: when the build side has a NULL key, validity equals the match flags (`cudf::bools_to_mask`); otherwise validity is the probe keys' row validity (`cudf::bitmask_and`). Build-key nullness is recorded at build time in `_build_has_null` — an atomic that is join-wide because MARK is forced single-partition (or broadcast on multi-GPU, precisely so `_build_has_null` is globally consistent).
+
+An all-null-safe MARK join (every condition `IS NOT DISTINCT FROM`) matches under `null_equality::EQUAL` and its predicate is never UNKNOWN, so every mark is definite: `resolve_mark_join_result` emits the scattered match flags with no null mask (`mark_is_null_safe()`), and the three-valued machinery above does not apply. A MARK join *mixing* a null-safe key with a plain key has no correct GPU encoding — cuDF takes one `null_equality` for all keys, and MARK does not route null-safe keys to the mixed-join predicate — and the nested loop join is no escape hatch (it evaluates each build-batch × probe-batch pair independently, emitting partial marks); the planner rejects the mixture at plan time so DuckDB's CPU mark join answers.
 
 - **STANDARD mode (adaptive build side):** by default the filter (right) side is built into a `cudf::filtered_join` and probed with the left, whose `semi_join` yields left-row match indices. When the right (probe) side is much larger than the left (output) side, Sirius instead builds the smaller left side into a `cudf::mark_join` and probes with the right. The switch is gated by `mark_join_build_switch_ratio` (build on left when `right_rows >= ratio * left_rows`; `0` disables). Both paths produce identical output.
 - **BUILD_PROBE mode:** a `cudf::filtered_join` is built once per partition slot on the right (filter) keys and persisted in that slot's build state; each streamed left probe batch calls `semi_join` against it, reusing the hash table across probes.
 
 #### Distinct Hash Join Optimization
-For INNER/LEFT joins in BUILD_PROBE mode, when the build-side keys are proven unique, Sirius uses `cudf::distinct_hash_join` instead of `cudf::hash_join`. This optimization applies when:
-- Join type is INNER or LEFT
-- Build-side keys are proven unique via logical plan analysis (`prove_unique_columns()` in `src/planner/sirius_plan_comparison_join.cpp`)
+For INNER/LEFT joins with pure-equality conditions, when the build-side keys are known distinct, Sirius uses `cudf::distinct_hash_join` instead of `cudf::hash_join` — one probe pass instead of two (count + retrieve). A plan-time uniqueness proof enables it in both STANDARD and BUILD_PROBE modes; BUILD_PROBE can additionally test distinctness at runtime.
 
-Uniqueness is detected by walking the DuckDB logical plan:
+Plan-time uniqueness is detected by walking the DuckDB logical plan (`prove_unique_columns()` in `src/planner/sirius_plan_comparison_join.cpp`):
 - **PRIMARY KEY** on `LogicalGet` (with column mapping through `projection_ids`)
-- **GROUP BY** uniqueness on `LogicalAggregate`
-- Propagates through `LogicalFilter`, `LogicalOrder`, `LogicalLimit`, `LogicalTopN`, and `LogicalProjection`
+- **GROUP BY** uniqueness on `LogicalAggregate` (single grouping set)
+- **Delim scans** (`LogicalDelimGet`) — the duplicate-eliminated chunk is unique by construction over the complete column set
+- Propagates through `LogicalFilter`, `LogicalOrder`, `LogicalLimit`, `LogicalTopN`, `LogicalProjection`, and `LogicalComparisonJoin`
 
 Only PRIMARY KEY is considered (not plain UNIQUE) due to NULL handling semantics with `null_equality::UNEQUAL`. IS NOT DISTINCT FROM joins are excluded since they require `null_equality::EQUAL`.
+
+When the planner cannot prove uniqueness, BUILD_PROBE mode can test it at runtime: `build_keys_are_distinct()` runs one `cudf::distinct_count` pass over the cached build keys (a 1M-row prefix sample refutes non-distinct builds cheaply above 4M rows; builds above 128M rows are not tested). The runtime test is an engine-internal policy, temporarily disabled by default pending a cuCollections fix (issue #1600). See [Optimizations](optimizations.md#distinct-hash-join-pr-558).
 
 Build/probe state machine for BUILD_PROBE mode (one instance per partition slot, driven by `build_probe_action`):
 ```mermaid
@@ -305,7 +308,7 @@ Supported join types: INNER, LEFT, RIGHT, OUTER, MARK via `cudf::inner_join()`, 
 ### `sirius_physical_nested_loop_join` — `NESTED_LOOP_JOIN`
 **File:** `src/include/op/sirius_physical_nested_loop_join.hpp`
 
-Fallback for joins not supported by cuDF hash join (pure inequality conditions). Uses `PhysicalNestedLoopJoin::IsSupported()` to validate.
+Fallback for joins not supported by cuDF hash join (pure inequality conditions). Validated at plan time by `PhysicalNestedLoopJoin::IsSupported()` plus its own `is_join_type_supported()` (INNER, LEFT, RIGHT, SEMI, ANTI, MARK, OUTER) — DuckDB's check also accepts RIGHT_SEMI / RIGHT_ANTI / SINGLE, which the Sirius execute dispatch has no arm for, so those are rejected at plan time (CPU fallback) instead of throwing mid-query.
 
 Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
 
@@ -320,9 +323,10 @@ Local sort of each data batch.
 ### `sirius_physical_top_n` — `TOP_N`
 **File:** `src/include/op/sirius_physical_top_n.hpp`
 
-Combined ORDER + LIMIT: selects and sorts the top N rows.
+Combined ORDER + LIMIT: selects and sorts the top N rows (locally `keep_rows = offset + limit`; MERGE_TOP_N applies the offset after the global merge).
 
-- **GPU execution:** Two-step process: `cudf::top_k_order()` selects top-N row indices, then `cudf::sort_by_key()` sorts the gathered rows to ensure deterministic output ordering- **Key members:** `orders`, `limit`, `offset`, `dynamic_filter`
+- **GPU execution:** For a single non-nullable key, `cudf::top_k_order()` selects the top-N row indices, then `cudf::sort_by_key()` over the N gathered rows ensures deterministic output ordering. For a nullable key (`top_k_order` takes no `null_order`, so it cannot honor SQL NULLS FIRST/LAST) or a multi-column key (`top_k_order` is single-column only), `sorted_order_top_k()` sorts the key columns into a permutation with `cudf::sorted_order`, slices the first N indices, and gathers only the surviving rows — payload columns are never fully sorted.
+- **Key members:** `orders`, `limit`, `offset`, `dynamic_filter`
 
 ### `sirius_physical_ungrouped_aggregate` — `UNGROUPED_AGGREGATE`
 **File:** `src/include/op/sirius_physical_ungrouped_aggregate.hpp`
@@ -383,10 +387,12 @@ Repartitions data into N buckets based on partition keys. Partition keys are alw
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/include/op/sirius_physical_concat.hpp`
 
-Reassembles partitioned data back into a linear stream. Behavior depends on join type:
+Reassembles partitioned data back into a linear stream. Each CONCAT serves one side of a downstream join, and the constructor picks its mode from that join's type:
 
-- `_concat_all = true` (LEFT/ANTI/OUTER joins): waits for all data before emitting
-- `_concat_all = false` (INNER joins): emits tasks when byte threshold (`_concat_batch_bytes`) is met
+- `_concat_all = true` — the side the join must see whole folds into a single batch: the build side of LEFT/SEMI/ANTI hash joins, the probe side of RIGHT-family hash joins, and both sides of a full OUTER join. The group is the whole partition, released only once the source pipeline finishes. (A dynamic-filter-producing BUILD_PROBE join's build CONCAT is also switched to concat-all via `set_concat_all()`.)
+- `_concat_all = false` — INNER and MARK hash joins and all nested-loop-join inputs: batches accumulate per partition into groups bounded by `_concat_batch_bytes`. `plan_pull_for_partition()` is the single group-forming policy shared by the task hint and the task-input pull, so both release identical groups: a group is complete once the next batch would push it past the threshold (that batch seeds the next group); a lone batch exceeding the threshold by itself is released as a single-batch group once a second batch arrives or the source finishes; a partition that never reaches the threshold keeps accumulating until the source finishes.
+
+See [Task Creator — CONCAT](task-creator.md#concat) for the hint/pull scheduling detail.
 
 ### `sirius_physical_sort_sample` — `SORT_SAMPLE`
 **File:** `src/include/op/sirius_physical_sort_sample.hpp`

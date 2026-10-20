@@ -74,8 +74,8 @@ DuckDB static filters remain on their existing, authoritative path. Dynamic filt
 
 | Consumer | Zone map | Membership filter |
 |---|---|---|
-| Parquet scan | Reader AST via `reader_options::set_filter`; may prune row groups and rows during decode | Post-decode mask |
-| DuckDB-native scan | Post-decode AST row mask | Post-decode mask |
+| Parquet scan | Reader AST via `reader_options::set_filter`; may prune row groups and rows during decode | Post-decode mask; compressed pinned chunks probe membership during decode |
+| DuckDB-native scan | Post-decode AST row mask | Post-decode mask; compressed pinned chunks probe membership during decode |
 | Join-edge endpoint | Not used | Post-decode mask |
 
 Membership filtering reduces downstream work but does not avoid scan I/O or decoding. The post-decode `dynamic_filter_gate` measures combined usefulness and can disable ineffective filtering; it also stops individual membership filters whose marginal keep ratio is weak.

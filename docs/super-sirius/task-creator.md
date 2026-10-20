@@ -6,7 +6,7 @@ This document covers the task creation subsystem: how the system decides when an
 
 **File:** `src/include/creator/task_creator.hpp`, `src/creator/task_creator.cpp`
 
-The `task_creator` is a multi-threaded component that converts operator scheduling requests into concrete scan or GPU pipeline tasks. It maintains global state maps for each operator type and uses a hint-chain recursion to find the deepest ready operator.
+The `task_creator` is a multi-threaded component, shared by every in-flight query, that converts operator scheduling requests into concrete GPU pipeline tasks. It keeps one state entry per query, keyed by `query_id`, and uses a hint-chain recursion to find the deepest ready operator. Cleanup, draining, and teardown target exactly one query's entry without touching any other in-flight query.
 
 Task creation policy is internal and currently demand-driven, with source-side
 pipelines prioritized first within each branch. The engine retains its
@@ -31,15 +31,19 @@ Create task (gpu_pipeline_task)
 Dispatch to executor (task_scheduler)
 ```
 
-## Global State Maps
+## Per-Query State
 
-Initialized during `prepare_for_query()`, cleared during `reset()`:
+`_query_task_global_states` maps `query_id_t` → `query_task_global_state`, one entry per in-flight query. An entry is created at execution-window begin (`set_client_context(query_id, ctx)`), filled by `prepare_for_query(query, handler)`, and dropped by `reset(query_id)`; `reset_all()` is a teardown-only safety net (`SiriusContext::terminate`).
 
-| Map | Key | Value | Purpose |
-|-----|-----|-------|---------|
-| `_gpu_operator_global_state_map` | operator ID | `gpu_pipeline_task_global_state` | Shared per-operator pipeline state |
+Each entry holds:
+- `global_states` — source operator id → `gpu_pipeline_task_global_state` (operator ids restart at 0 per query, so the map is only meaningful within its entry)
+- the `client_context` of the connection running the query
+- the query's `completion_handler` — the same handler every pipeline's global state carries
+- `active_gpu_ids` / `full_gpu_count` — the admitted GPU subset
+- the query's look-ahead queue and cursor
+- an `in_flight` counter — the per-query join for in-flight creation lambdas (`wait_for_in_flight()`) in place of a pool-wide wait
 
-All map access is protected by `_global_state_mutex`.
+The outer map is guarded by `_global_state_mutex`; a worker resolves an entry once as a `shared_ptr` and then reads `global_states` lock-free — it is written once by `prepare_for_query` and never mutated after, and the worker's own reference keeps the state alive even if `reset(query_id)` erases the map entry mid-flight.
 
 ## `TaskCreationHint` Enum
 
@@ -215,11 +219,13 @@ while running:
 
 The `mark_task_created()` call before data popping prevents a race condition where the pipeline could appear finished between data check and task creation.
 
+The creation queue is a `multi_index_priority_queue` keyed per request (query id, pipeline scheduling priority, operator type, device hint): creation is ordered the same way execution is — earlier query first, then within-query pipeline rank — and one query's pending requests can be dropped via `drain(query_index{...})` without disturbing any other query's. The manager loop resolves the request's query state once and hands the `shared_ptr` to the creation worker; a request whose query was reset while it sat in the queue is dropped, since its operator pointer may already dangle.
+
 ### Look-ahead task creation
 
 **Files:** `src/include/creator/config.hpp`, `src/creator/task_creator.cpp`
 
-The task creator is constructed with a `task_creator_config` whose internal `strategy` is `request_type::active` (the current shipped, purely demand-driven policy) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds a `_lookahead_queue` with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_hint)`: the creator walks the queue from `_index_of_next_lookahead`, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is cleared by `drain_pending_tasks()` and `reset()` so no dangling operator pointers survive `QueryEnd`. This primitive is retained for engine-controlled policy; it is not exposed through YAML.
+The task creator is constructed with a `task_creator_config` whose internal `strategy` is `request_type::active` (the current shipped, purely demand-driven policy) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds the query's own look-ahead queue with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_id_hint)`: the creator picks the oldest live query and walks that query's queue from its cursor, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is cleared by `drain_pending_tasks()` and `reset()` so no dangling operator pointers survive `QueryEnd`. This primitive is retained for engine-controlled policy; it is not exposed through YAML.
 
 ## Device Assignment for GPU Tasks
 
@@ -232,38 +238,35 @@ When the manager loop builds a `gpu_pipeline_task`, it also chooses the task's `
 Partitioned operators — BUILD_PROBE hash join, `grouped_aggregate_merge`, and the other partition-keyed operators above — build a per-partition cuco hash table that is valid only on the GPU it was built on. Touching it from a stream bound to another device trips `cudaErrorInvalidValue`. So when a task's input is a `partitioned_operator_data`, the task creator pins it to a fixed device:
 
 ```
-preferred_device_id = _active_gpu_ids[ partition_idx % _active_gpu_ids.size() ]
+preferred_device_id = active_gpu_ids[ partition_idx % active_gpu_ids.size() ]
 ```
 
 This keeps every task of a given partition (build + all probes) on one GPU while spreading partitions across GPUs.
 
-`_active_gpu_ids` starts as every device with a GPU executor — the memory manager's `Tier::GPU` memory spaces, the same set `task_scheduler` keys executors on — and is then narrowed per query: `sirius_engine::initialize_internal` computes the admitted subset and installs it via `set_active_gpu_ids()` before any pipeline is built. The pin indexes this set rather than the physical hardware topology, for two reasons. A physical-topology modulo could name a device with no executor, which the scheduler treats as "no preference" and round-robins — scattering a partition across GPUs. And a query admitted onto a subset must not pin work to a device outside it.
+The admitted subset lives in the query's own state (`query_task_global_state::active_gpu_ids`): `sirius_engine::initialize_internal` computes it and installs it via `set_active_gpu_ids(query_id, ids, full_count)` before any pipeline is built. It starts as every device with a GPU executor — the memory manager's `Tier::GPU` memory spaces, the same set `task_scheduler` keys executors on — narrowed per query. The pin indexes this set rather than the physical hardware topology, for two reasons. A physical-topology modulo could name a device with no executor, which the scheduler treats as "no preference" and round-robins — scattering a partition across GPUs. And a query admitted onto a subset must not pin work to a device outside it.
 
 Because the same list is used to build `pipeline_build_context`, the partition floor and the broadcast-join device→slot map agree with what the pin routes across. See [configuration.md](configuration.md) for `topology.gpus_per_query`.
 
-The other device preferences the task creator computes — the operator's own hint, GPU-resident byte counts, NUMA locality via `gpus_of()`, and a cached chunk's home device — are all derived from where data already lives and can name a device outside the admitted subset. They are clamped back into `_active_gpu_ids` at the point the preference is written to the task's local state.
+The other device preferences the task creator computes — the operator's own hint, GPU-resident byte counts, NUMA locality via `gpus_of()`, and a cached chunk's home device — are all derived from where data already lives and can name a device outside the admitted subset. They are clamped back into the query's `active_gpu_ids` at the point the preference is written to the task's local state.
 
-A task with no preference at all is confined the same way, but only when the query was admitted onto a strict subset. The scheduler hands an unpreferred task to whichever executor asks first, excluded ones included (a GPU_VALUES task carries no device-bound state and so sets no preference), so on a subset those tasks are pinned round-robin over `_active_gpu_ids`. Pinning costs the scheduler's freedom to place the task on whatever device frees up first, so it is skipped when nothing was narrowed away and there is nothing to confine.
+A task with no preference at all is confined the same way, but only when the query was admitted onto a strict subset. The scheduler hands an unpreferred task to whichever executor asks first, excluded ones included (a GPU_VALUES task carries no device-bound state and so sets no preference), so on a subset those tasks are pinned round-robin over the query's `active_gpu_ids`. Pinning costs the scheduler's freedom to place the task on whatever device frees up first, so it is skipped when nothing was narrowed away and there is nothing to confine.
 
 The pin is reapplied on the OOM-reschedule path (`gpu_pipeline_executor`): when a task is rebuilt with a fresh local state, its per-task `preferred_device_id` is carried forward so a rescheduled probe doesn't lose its pin and scatter.
 
-## `can_create_more_tasks()` and `has_processed_all_tasks()`
+## `can_create_more_tasks()`
 
-These methods signal task exhaustion:
-- `can_create_more_tasks()` — returns false when no more tasks can be created (e.g., scan exhausted, all partitions processed)
-- `has_processed_all_tasks()` — returns false when tasks are still in flight
+Signals task exhaustion: returns false when no more tasks can be created (e.g., scan exhausted, all partitions processed). Throws `not implemented` in the base class and must be overridden by operators that need it.
 
-Both throw `not implemented` in the base class and must be overridden by operators that need them.
-
-## `drain_pending_tasks()`
+## `drain_pending_tasks(query_id)`
 
 **File:** `src/creator/task_creator.cpp`
 
-Called during `drain_after_error()` to cleanly shut down:
-1. `_task_creation_queue.interrupt()` then `.drain()` — clears pending requests
-2. `_bounded_pool->wait_all()` — waits for in-flight task-creation lambdas to complete (guarded, since `stop_thread_pool()` may have released the pool)
-3. Clears the look-ahead queue and cursor under `_lookahead_mutex` — avoids dereferencing dangling operators after `QueryEnd`
-4. `reactivate()` — prepares for the next query
+Scoped to one query; called when that query completes (GPU epilogue, `wait_for_completion`) and during `drain_after_error(query_id)`:
+1. `_task_creation_queue.drain(query_index{query_id})` — drops only that query's queued requests; the queue stays open throughout, so no other query's producers or consumers are stalled
+2. `state->wait_for_in_flight()` — waits for that query's in-flight creation lambdas (workers decrement on every exit path, including exceptions)
+3. Clears that query's look-ahead queue and cursor under its `lookahead_mutex` — a racing `schedule_lookahead()` then finds an empty queue instead of dereferencing dying operators
+
+`reset(query_id)` is `drain_pending_tasks(query_id)` plus erasing the query's state entry; `reset_all()` resets every registered query (teardown only).
 
 ## Key Files
 

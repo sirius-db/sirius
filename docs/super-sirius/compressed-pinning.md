@@ -23,12 +23,13 @@ not configurable).
 
 A string equality filter over a compressed pinned column can be evaluated *inside* the
 decode instead of re-expressed as a post-decode comparison. At `prepare_for_query`, the
-scan manager derives a `sirius::decode_equality_pushdown` from the query's pushed-down
-filters and attaches it to the entry's scan (`set_equality_pushdown()`); the converter
-translates it into a `simpatico::decode_predicate`, so the decoder emits the match result
-directly. Interfaces: `src/compression/compressed_representation.hpp`
-(`decode_equality_pushdown`), `src/compression/compression_converters.cpp` (predicate
-translation), threaded through `sirius_scan_manager::prepare_for_query`.
+scan manager derives a `pushdown_request` from the query's pushed-down filters (equality
+values land in the request's per-column `equals_any` entries) and plans the entry's decode
+through `decompression_pushdown_scan`; the converter translates it into a
+`simpatico::decode_predicate`, so the decoder emits the match result directly. Interfaces:
+`src/compression/compressed_scan.hpp` (`pushdown_request`, `decompression_pushdown_scan`),
+`src/compression/compression_converters.cpp` (predicate translation), threaded through
+`sirius_scan_manager::prepare_for_query`.
 
 The compression settings can be staged before a table is pinned. Compression becomes active only
 when `CALL pin_table(..., compression => true)` requests it, the plan-directory setting is
@@ -165,6 +166,9 @@ python test/tpch_performance/performance_test.py --engine gpu --mode grouped \
   --iterations 3 --pin host --input /data/tpch_parquet_sf1000 --data-source parquet
 ```
 
-Checked-in SF1000 plans live in `src/compression/simpatico_codegen/plans/tpch_sf1000/`;
-per-column ratio and throughput annotations are in each file's comments. Re-measure with
-`simpatico_cli benchmark` when hardware changes.
+Checked-in SF1000 plans live in `src/compression/simpatico_codegen/plans/tpch_sf1000/`.
+`lineitem.txt` and `orders.txt` are active; the `part`, `partsupp`, `supplier` and `customer`
+plans are kept as `*_disabled.txt`, which the `<table>.txt` lookup does not match, so those
+tables (like `nation` and `region`) pin uncompressed. Per-column ratio and throughput
+annotations are in each file's comments. Re-measure with `simpatico_cli benchmark` when
+hardware changes.

@@ -25,7 +25,7 @@ DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
 3. **OnFinalizePrepare** (`SiriusContext::OnFinalizePrepare`): After DuckDB generates its CPU physical plan, this hook:
    - Retrieves the stored logical plan copy
    - Calls `sirius_physical_plan_generator::create_plan()` — the single source of truth for GPU support
-   - If successful, stashes DuckDB's CPU physical plan (kept for runtime fallback) and replaces `prepared.physical_plan` with a `PhysicalSiriusExecution` operator (a DuckDB `PhysicalOperator` subclass)
+   - If successful, stashes DuckDB's CPU physical plan (kept for runtime fallback) and replaces `prepared.physical_plan` with a `PhysicalSiriusExecution` operator (a DuckDB `PhysicalOperator` subclass), handing it the validated Sirius plan together with the pin-registry epoch it was built under
    - If `create_plan()` throws (unsupported operator/type), the CPU plan is left in place — plan-time fallback. When `enable_duckdb_fallback` is false the error is surfaced instead of silently running on CPU.
 
 4. DuckDB's executor runs `PhysicalSiriusExecution::GetData()`, which delegates to the Sirius GPU engine (Step 3 below).
@@ -46,7 +46,7 @@ This path is still supported but is no longer the primary way to use Sirius.
 
 **File:** `src/transparent/physical_sirius_execution.cpp`
 
-For transparent execution, DuckDB's executor calls `PhysicalSiriusExecution::GetData()` which lazily triggers the Sirius GPU engine on the first call. It creates a `sirius_interface`, wraps the Sirius physical plan in a `sirius_prepared_statement_data`, and calls `sirius_execute_query()`.
+For transparent execution, DuckDB's executor calls `PhysicalSiriusExecution::GetData()` which lazily triggers the Sirius GPU engine on the first call. The first execution consumes the Sirius plan that `OnFinalizePrepare` built while validating GPU support (one-shot — the move empties the slot), provided the pinned-table registry epoch still matches the one the plan was built under; a pin or unpin landing in between discards it. When no validated plan is available — a re-execution of the same prepared operator, or a stale epoch — a fresh Sirius plan is rebuilt from the retained logical-plan template, or re-planned from the SQL string when the template cannot be copied. The operator then creates a `sirius_interface`, wraps the Sirius plan in a `sirius_prepared_statement_data`, and calls `sirius_execute_query()`.
 
 If GPU execution fails at runtime (and `enable_duckdb_fallback` is true), the operator runs the stashed DuckDB CPU plan on a private `duckdb::Executor` bound to the same `ClientContext` — so the fallback executes under the same transaction and MVCC snapshot as the failed attempt, including that transaction's own uncommitted writes. The GPU result is fully materialized before any row is emitted, so the fallback cannot duplicate rows. S3-reading queries have no CPU path and surface a clear error instead of falling back. A `runtime_fallbacks` counter and a WARN log record each occurrence.
 
@@ -77,9 +77,9 @@ This is the core pipeline-building step (single-threaded, runs on the query thre
 ### 4a. Build Meta-Pipelines
 
 ```
-sirius_meta_pipeline root(engine, state, result_collector);
-root.build(*sirius_physical_plan);  // Recursively builds pipeline graph
-root.ready();                       // Reverses operator lists, marks pipelines ready
+auto root = make_shared<sirius_meta_pipeline>(build_ctx, state, nullptr);
+root->build(*sirius_physical_plan);  // Recursively builds pipeline graph
+root->ready();                       // Reverses operator lists, marks pipelines ready
 ```
 
 Each operator's `build_pipelines()` method is called recursively:
@@ -89,19 +89,19 @@ Each operator's `build_pipelines()` method is called recursively:
 
 ### 4b. Operator-Specific Pipeline Splitting
 
-After meta-pipeline construction, `initialize_internal()` applies Sirius-specific transformations:
+The operator chains that drive the splitting are inserted at plan-generation time by the `wrap_*` helpers in `src/planner/sirius_physical_plan_generator.cpp` (see [Physical Plan Generation](physical-plan-generation.md)); `build_pipelines()` then cuts pipelines at the inserted boundaries:
 
 - **TABLE_SCAN** → rewritten into a unified GPU scan source (`sirius_gpu_scan_operator`, type `GPU_SCAN`) with a per-table `gpu_ingestible`; the parquet table function maps to the parquet ingestible and `seq_scan` over a base table maps to the duckdb-native ingestible
 - **HASH_JOIN** → inserts `PARTITION + CONCAT` on both probe and build sides
 - **HASH_GROUP_BY** → inserts `PARTITION + MERGE_GROUP_BY`
-- **UNGROUPED_AGGREGATE** → inserts `PARTITION + MERGE_AGGREGATE`
-- **ORDER_BY** → creates 4-phase sort: `ORDER → SORT_SAMPLE → SORT_PARTITION → MERGE_SORT`
+- **UNGROUPED_AGGREGATE** → adds `MERGE_AGGREGATE` (no PARTITION; the merge collects partial aggregates)
+- **ORDER_BY** → inserts the sort chain `ORDER_BY → SORT_SAMPLE → SORT_PARTITION → MERGE_SORT` (SORT_SAMPLE and SORT_PARTITION share one pipeline)
 - **TOP_N** → adds `MERGE_TOP_N`
 - **DELIM_JOIN** → complex splitting with partition_join and distinct branches
 
 ### 4c. Data Repository Wiring
 
-`insert_repository()` creates `shared_data_repository` instances between pipelines and configures ports with barrier types:
+`sirius_pipeline_converter::compute_repository_wiring()` records a `repository_wiring` descriptor for every cross-pipeline edge; `materialize_repository_wiring()` then creates the `shared_data_repository` instances (keyed by destination operator id and port id), attaches the ports, and configures barrier types:
 - **FULL barrier**: downstream waits for upstream to complete (e.g., hash join build side)
 - **PARTIAL barrier**: downstream can consume data incrementally
 - **PIPELINE barrier**: streaming, no synchronization needed
@@ -118,10 +118,10 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 
 **File:** `src/sirius_engine.cpp` — `execute()`
 
-1. Calls `SiriusContext::create_query()` with the finalized pipelines
-2. Query preparation creates a `completion_handler` and installs it on the GPU executors and query-terminal pipelines
-3. Calls `task_scheduler::start_query()`, which schedules the initial scan operator and returns the completion future
-4. The main thread blocks on `future.get()` and then drains in-flight work before returning
+1. Creates this query's `completion_handler` and takes its future — the engine owns both
+2. Calls `SiriusContext::create_query()` with the finalized pipelines and the handler; `task_creator::prepare_for_query()` stamps the handler onto every pipeline's task global state and, as a `weak_ptr`, onto query-terminal pipelines
+3. Calls `task_scheduler::start_query(query)`, which schedules the initial scan operator
+4. The main thread blocks on `future.get()`, then calls `task_scheduler::wait_for_completion(query_id)` to validate nothing is still queued before returning
 
 ## Step 6: Scan Execution
 
@@ -147,7 +147,7 @@ The GPU executor's manager loop:
    - Lock input batches and convert to GPU if needed (`lock_or_prepare_batch`)
    - `compute_task()`: iterate **all** operators in the pipeline (source through sink), calling `execute()` on each
    - `publish_output()`: call the sink's `sink()` method to push results to downstream ports
-   - On OOM: catch `oom_reschedule_exception`, retry up to 10 times with 5ms backoff
+   - On OOM: catch `oom_reschedule_exception`, retry up to 100 times with 50ms backoff
    - On success: check if query is complete (RESULT_COLLECTOR sink + pipeline finished)
    - If not complete: schedule downstream consumers via `task_creator->schedule()`
    - If complete: `completion_handler->mark_completed()`
@@ -185,11 +185,12 @@ After the future resolves:
 If any task throws an exception during execution:
 
 1. The GPU executor catches it and calls `completion_handler->report_error(exception)`
-2. `drain_after_error()` is called on the pipeline executor which:
+2. `drain_after_error(query_id)` is called on the task scheduler, which:
    - Stops the task creator threads
    - Drains the task queue
    - Calls `drain_and_wait()` on the GPU executors
-   - Restarts the task creator for the next query
+   - Drops the failed query's pending creation requests (other in-flight queries keep theirs)
+   - Restarts the task creator
 3. The error propagates through the future to the main thread, surfacing as an error-carrying result at `PhysicalSiriusExecution::GetData()`
 
 On the transparent path, that error triggers the runtime CPU fallback described in Step 2 (unless `enable_duckdb_fallback` is false, the error is a user interrupt, or the query reads S3). The fallback runs the stashed DuckDB CPU plan in the same transaction, so a runtime GPU failure completes on CPU rather than failing the query.
@@ -214,9 +215,9 @@ sequenceDiagram
     Iface->>Engine: initialize(result_collector)
     Engine->>Engine: Build pipelines, rewrite scans to GPU scan source, wire repos
     Iface->>Engine: execute()
-    Engine->>PE: start_query(pipelines)
-    PE->>CH: create completion_handler
-    PE->>SM: prepare_for_query (split providers + connectors)
+    Engine->>CH: create completion_handler
+    Engine->>SM: create_query → prepare_for_query (split providers + connectors)
+    Engine->>PE: start_query(query)
     SM->>SM: drive splits through io_context + prefetch cache
     PE->>GPE: schedule initial GPU scan tasks
     GPE->>SM: pull splits via split_connector

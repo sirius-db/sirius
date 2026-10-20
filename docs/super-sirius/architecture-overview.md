@@ -50,15 +50,16 @@ SiriusContext
 ├── task_scheduler                      # Top-level executor (owns the GPU pipeline executors)
 ├── sirius_scan_manager                 # Scan-side preparation + I/O (io_context, prefetch cache, split providers)
 ├── downgrade_executor[]                # Per-memory-space monitors for GPU→Host spilling
-├── task_creator                        # Creates GPU pipeline tasks based on data availability
-└── query                               # Current query context (pipeline hashmap)
+└── task_creator                        # Creates GPU pipeline tasks based on data availability
 ```
+
+The query object itself (`planner::query` — the pipeline set plus the operator and scan indices over the plan) is not owned here: `SiriusContext::create_query()` returns it to the calling `sirius_engine`, which owns it alongside the plan it indexes, together with the query's `completion_handler`. The subsystems above are shared by every in-flight query and keep per-query state keyed by `query_id`: the task creator's state entries, the repository registry's per-query managers, and the query index on every task queue.
 
 Key lifecycle methods on `SiriusContext`:
 - `initialize()` — initializes all subsystems with config
 - `terminate()` — releases all resources
 - `QueryBegin()` / `QueryEnd()` — DuckDB query lifecycle hooks
-- `create_query()` — creates a new query with pipeline metadata
+- `create_query()` — builds the query, registers its per-query state with the task creator and scan manager, and returns it to the calling engine
 
 Scans are not a separate executor. A unified `sirius_gpu_scan_operator` (operator type `GPU_SCAN`) is the pipeline source: it pulls splits from a `split_connector` and delegates per-split materialization to an installed `gpu_ingestible` (parquet or duckdb-native today). The `sirius_scan_manager` prepares this state per query — it builds the per-table ingestible, installs the split connector, drives a `split_provider`, and owns the I/O backends (an `io_context` over io_uring plus optional REST/kvikio paths) and the prefetching cache.
 
@@ -115,6 +116,8 @@ Super Sirius uses multiple dedicated thread pools, each with a specific role:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+All of these pools are shared across concurrent queries — a query brings no threads of its own. Isolation is by state, not by thread: per-query task-creator entries, per-query repository managers, and query-keyed task queues let one query's completion, failure, or cleanup drain exactly its own work while every other in-flight query keeps running.
+
 ## Execution Lifecycle
 
 A query through Super Sirius follows these steps:
@@ -127,8 +130,8 @@ A query through Super Sirius follows these steps:
    - Converts each TABLE_SCAN source into a unified GPU scan source with a per-table `gpu_ingestible`
    - Injects PARTITION, CONCAT, MERGE operators at pipeline boundaries
    - Wires data repositories between pipelines with barrier types
-4. **Query Preparation** — `task_scheduler::prepare_for_query()` drains leftover state, creates the `completion_handler`, and installs it on the GPU executors and query-terminal pipelines; `sirius_scan_manager::prepare_for_query()` builds each scan's split provider, installs its split connector, and matches any pinned-cache entries
-5. **Query Start** — `task_scheduler::start_query()` schedules the initial scan operator and returns the completion future
+4. **Query Preparation** — `sirius_engine::execute()` creates the query's `completion_handler` and calls `SiriusContext::create_query()`, which registers per-query state: `task_creator::prepare_for_query()` stamps the handler onto every pipeline's task global state and onto query-terminal pipelines, and `sirius_scan_manager::prepare_for_query()` builds each scan's split provider, installs its split connector, and matches any pinned-cache entries
+5. **Query Start** — `task_scheduler::start_query(query)` schedules the initial scan operator; the engine blocks on the future of the handler it owns
 6. **Scan Phase** — The scan manager drives split providers that pull bytes through the `io_context` (io_uring locally, or REST/kvikio backends) and the prefetching cache; the unified GPU scan source consumes splits and materializes GPU-ready batches into data repositories
 7. **Pipeline Execution** — GPU executor threads pull tasks from the queue, acquire memory reservations, and call `execute()` on every operator in the pipeline (source through sink) on CUDA streams, then call the sink's `sink()` to push results downstream
 8. **Task Creation** — After each task completes, the task creator is notified to schedule downstream consumers based on data availability in ports

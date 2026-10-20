@@ -190,7 +190,9 @@ declared input types before any batch moves.
 **Files:** `src/include/sirius_ffi.hpp`, `src/sirius_ffi.cpp`
 
 `Context` is an RAII handle to one embedded engine: its own `duckdb::SiriusContext`, its own
-`duckdb::DuckDB` + `Connection`, and its own `stream_bind_catalog` — everything a fragment needs,
+`duckdb::DuckDB` + `Connection` (with the core-functions and Parquet extensions statically
+loaded, so a Substrait plan lowers and a `local_files` read resolves to `parquet_scan` without
+any external extension file), and its own `stream_bind_catalog` — everything a fragment needs,
 brought up once and shared by every `Fragment` created on it via `make_fragment(context)`.
 
 `Fragment` is either an **intermediate** fragment (has declared output streams, rooted in a

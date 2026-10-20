@@ -260,16 +260,24 @@ queue, one `gpu_pipeline_executor` per active GPU, and the management thread tha
 tasks to ready devices. Scan execution is reached through `task_creator`; there is no scan
 sub-executor or scan-priority queue owned here.
 
+The queue is shared by every in-flight query. Each task's priority packs its query id into the
+high bits (`query_priority_bits`) above its within-query pipeline rank, so an earlier query's
+tasks dispatch first and concurrent queries' tasks interleave deterministically. The queue is
+also indexed by query (`pipeline::index_keys_for`, the same extractor every GPU executor's queue
+uses), which is what lets `drain_query_tasks(query_id)` drop one query's pending work from every
+queue without touching another's.
+
 ### Key Methods
 
 | Method | Purpose |
 |--------|---------|
 | `start()` | Starts every GPU executor, then launches the management thread |
 | `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
-| `prepare_for_query(query)` | Drains executor leftovers and installs query/completion state |
-| `start_query()` | Schedules `query.get_scan_operators().front()` through `task_creator` and returns the completion future |
-| `terminate_query(exception)` | Reports error to completion handler |
-| `drain_after_error()` | Multi-stage drain for clean shutdown |
+| `start_query(query)` | Schedules `query.get_scan_operators().front()` through `task_creator`; completion is signalled through the query's own `completion_handler`, whose future the `sirius_engine` already holds |
+| `terminate_query(handler, error)` | Reports the error to that query's completion handler (report-only; the query thread's catch block does the draining) |
+| `drain_query_tasks(query_id)` | Drops one query's queued tasks from the scheduler's queue and every GPU executor's queue; other queries' tasks stay |
+| `drain_after_error(query_id)` | Multi-stage drain for clean shutdown after a query error |
+| `wait_for_completion(query_id)` | After the future resolves: validates every queue is empty (throws otherwise) and drops the query's remaining creation requests |
 
 ### Management Event Loop
 
@@ -289,13 +297,17 @@ while running:
     4. Dispatch the selected task to that device's GPU executor
 ```
 
+The queue sleep (`multi_index_priority_queue::wait()`), not the channel, is what hears producers
+that push directly into the queue with no `task_available` event — the downgrade executor returns
+extracted tasks this way. Both sleeps are interrupted by `stop()`.
+
 Tasks stay in the top-level queue until a ready device can accept them, preserving visibility to
 the downgrade machinery. A live preferred device is binding because the task may reference
 device-local data.
 
 ### Initial Scan Scheduling
 
-`start_query()` schedules exactly the first operator in `query.get_scan_operators()`. Subsequent
+`start_query(query)` schedules exactly the first operator in `query.get_scan_operators()`. Subsequent
 work is exposed by task hints and completion-driven downstream scheduling — plus, under the
 `lookahead` task-creator strategy, the empty-queue look-ahead above (see
 [task-creator.md](task-creator.md)); there is no `schedule_next_scan_tasks()` or
@@ -338,7 +350,11 @@ Concurrency is managed via `exec::bounded_thread_pool`, which uses a two-phase `
 | `_memory_space` | `memory_space*` | GPU memory for making reservations |
 | `_task_request_publisher` | `publisher<task_request>` | Channel to signal pipeline executor |
 | `_task_creator` | `task_creator*` | For scheduling downstream consumer tasks |
-| `_completion_handler` | `completion_handler*` | For signaling query completion (the epilogue's copy; query-terminal pipelines hold one too) |
+
+There is no executor-held completion handler: each task carries its own query's
+`completion_handler` (a `shared_ptr` in its pipeline's global state, read via
+`gpu_pipeline_task::get_completion_handler()`), so error reports and completion signals are
+always scoped to the right query even with several queries' tasks in one executor.
 
 ### Manager Loop
 
@@ -379,15 +395,15 @@ This epilogue is the usual signaller, but not the only one — see the completio
 query-terminal pipeline signals completion there because task-creator, streaming-source, and
 parent-cascade paths can finish a pipeline without returning through the GPU epilogue.
 
-`task_scheduler::prepare_for_query()` installs the handler on terminal pipelines as a
+`task_creator::prepare_for_query()` installs the handler on terminal pipelines as a
 `std::weak_ptr`, preventing retired pipelines from retaining or signaling a later query's handler.
 The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
 after releasing the lock and finishing all pipeline access.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
-`task_scheduler::wait_for_completion()` joins the task creator and in-flight GPU work before
-operators are destroyed.
+`task_scheduler::wait_for_completion(query_id)` validates that every queue is empty and drops the
+query's remaining creation requests before operators are destroyed.
 
 ### Task Request Flow
 
@@ -402,6 +418,13 @@ gpu_executor → task_request_publisher.send() → task_scheduler.management_eve
 
 **File:** `src/include/pipeline/completion_handler.hpp`
 
+One `completion_handler` exists per query. `sirius_engine::execute()` creates it and holds the
+future; `task_creator::prepare_for_query()` stamps a `shared_ptr` to it onto every pipeline's task
+global state and a `weak_ptr` onto query-terminal pipelines, so no subsystem holds a "current
+query" handler and one query's failure cannot poison another's. The `shared_ptr` matters for
+lifetime: the engine is destroyed before the query's cleanup drains the task queues, and a task
+still unwinding reports through its own reference without touching freed memory.
+
 Thread-safe signaling for query completion using promise/future:
 
 | Method | Behavior |
@@ -413,6 +436,31 @@ Thread-safe signaling for query completion using promise/future:
 
 All methods are idempotent: the GPU epilogue and terminal pipeline may signal the same completion,
 and only the first call takes effect.
+
+## Query Event Publisher
+
+**Files:** `src/include/event/event.hpp`, `src/include/event/query_event_publisher.hpp`, `src/include/event/query_event_subscriber.hpp`
+
+`event::query_event_publisher` is an observer channel for execution progress. The task creator
+and the task scheduler each see one half of the picture — the creator knows what work exists and
+why it could not make more, the scheduler knows what got dispatched and when a GPU went hungry —
+and the publisher is the one place both halves can be reported so a subscriber can tell scan-bound
+from barrier-bound from done. Reporters call `publish_*` entry points; publishing is a push into
+each subscriber's mailbox, never a callback, so a reporter is never made to wait on what a
+subscriber does.
+
+Event taxonomy (`event::event_type`): `task_created`, `task_deployed`, `failed_to_create_task`,
+`task_queue_empty`, `pipeline_closed`, `executor_awaiting_task`, `memory_downgrade_for_task`,
+`wait_for_memory_for_task`. Each publication carries a process-wide `event_id` (the ordering key —
+arrival order is guaranteed per reporter, not globally) and a system-clock timestamp, plus its
+payload (query id, operator id and type, GPU id, byte counts as applicable).
+
+Subscribers derive from `event::query_event_subscriber`, naming the events they want in the
+constructor. Each runs a worker thread of its own, draining a mailbox and dispatching into
+`on_<event>` hooks, so hook work cannot stall the creator, scheduler, or executor hot paths; with
+no subscriber registered for an event, its `publish_*` call costs a shared lock and a branch. No
+execution component publishes into the channel yet — the subsystem exists so services such as
+readahead can observe execution without a direct dependency on the creator or scheduler.
 
 ## Reschedule Handling (OOM and CUDA launch failures)
 

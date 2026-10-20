@@ -43,10 +43,12 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 
 **File:** `src/planner/sirius_plan_comparison_join.cpp`
 
-The `plan_comparison_join()` method selects the join implementation:
+The `plan_comparison_join()` method screens the join, then selects the implementation:
+
+**Join-type screening.** Each GPU join advertises the join types its execute dispatch implements via `is_join_type_supported()`, and the planner rejects everything else at plan time so the query falls back to DuckDB's CPU join instead of throwing mid-query. The hash join folds the check into `are_conditions_supported()` (INNER, LEFT, RIGHT, SEMI, ANTI, RIGHT_SEMI, RIGHT_ANTI, MARK, OUTER); the nested loop join's own list (INNER, LEFT, RIGHT, SEMI, ANTI, MARK, OUTER) is checked alongside DuckDB's broader `PhysicalNestedLoopJoin::IsSupported()`, which RIGHT_SEMI / RIGHT_ANTI / SINGLE would otherwise pass. SINGLE is implemented by neither route. A MARK join mixing a null-safe (`IS NOT DISTINCT FROM`) key with a plain key is also rejected up front — it has no correct encoding on either GPU route (see [Operators — MARK joins](operators.md#mark-joins)) — and both operator constructors keep throwing backstops for the same conditions.
 
 1. **Hash Join** — chosen when at least one equality condition exists. Checks `are_conditions_supported()` for mixed joins (equality plus an inequality, or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=`, on disjoint columns). Created with `max_build_hash_table_bytes` limit.
-2. **Nested Loop Join** — fallback for pure inequality joins where `PhysicalNestedLoopJoin::IsSupported()` returns true.
+2. **Nested Loop Join** — fallback for pure inequality joins where `PhysicalNestedLoopJoin::IsSupported()` and `sirius_physical_nested_loop_join::is_join_type_supported()` both accept.
 
 Left side = probe (streamed), right side = build (materialized).
 
@@ -95,10 +97,10 @@ A pipeline is an ordered list of operators:
 | Field | Type | Purpose |
 |-------|------|---------|
 | `source` | `optional_ptr<sirius_physical_operator>` | Alias for the **first** operator in `operators` |
-| `operators` | `vector<reference<sirius_physical_operator>>` | **All** operators in execution order, including source and sink |
+| `operators` | `std::vector<std::reference_wrapper<sirius_physical_operator>>` | **All** operators in execution order, including source and sink |
 | `sink` | `optional_ptr<sirius_physical_operator>` | Alias for the **last** operator in `operators` |
-| `dependencies` | `vector<shared_ptr<sirius_pipeline>>` | Pipelines that must finish before this one starts |
-| `parents` | `vector<weak_ptr<sirius_pipeline>>` | Pipelines that depend on this one finishing |
+| `dependencies` | `std::vector<std::shared_ptr<sirius_pipeline>>` | Pipelines that must finish before this one starts |
+| `parents` | `std::vector<std::weak_ptr<sirius_pipeline>>` | Pipelines that depend on this one finishing |
 | `tasks_created` | `atomic<size_t>` | Number of tasks created for this pipeline |
 | `tasks_completed` | `atomic<size_t>` | Number of tasks that have finished |
 | `pipeline_finished` | `atomic<bool>` | Set when all tasks are done and source is drained |
@@ -132,7 +134,7 @@ Build order rules:
 
 ### `sirius_pipeline_build_state`
 
-**File:** `src/include/pipeline/sirius_pipeline_build_state.hpp`
+**File:** `src/include/pipeline/sirius_pipeline.hpp`
 
 Provides controlled write access to pipeline internals during construction:
 - `set_pipeline_source()` / `set_pipeline_sink()` — assign source/sink operators
@@ -431,14 +433,14 @@ graph LR
 
 ## Part 4: Port Wiring
 
-### `insert_repository()`
+### Repository Wiring
 
-**File:** `src/sirius_engine.cpp`
+**Files:** `src/include/pipeline/repository_wiring.hpp`, `src/pipeline/repository_wiring_materializer.cpp`
 
-Two overloads handle repository creation:
+Repository creation is split into a plan-time and a runtime half:
 
-1. **Between two operators in different pipelines**: Creates a `shared_data_repository` keyed by `(operator_id, port_id)`, connects it to the port, and adds the pipeline dependency.
-2. **Between a partition and its consumer**: Creates a partitioned repository with the appropriate barrier type.
+1. **Plan time** — `sirius_pipeline_converter::compute_repository_wiring()` records a `repository_wiring` descriptor for every sink→source connection between pipelines: the destination port id, the barrier type, the source operator (the pipeline sink, or a sub-operator of it for delim joins and build CONCATs), and the source/destination pipelines. The descriptor is purely topological; the destination operator is resolved at materialization time.
+2. **Runtime** — `materialize_repository_wiring()` consumes the descriptors: for each it creates a `cucascade::shared_data_repository` keyed by the destination operator's id and the descriptor's port id, attaches a `port` to the destination operator, and records the destination on the source operator via `add_next_port_after_sink`.
 
 ### Barrier Types
 
@@ -448,7 +450,7 @@ Two overloads handle repository creation:
 | `PARTIAL` | Downstream can consume data incrementally as it arrives | CONCAT after PARTITION (streaming joins) |
 | `PIPELINE` | No synchronization — data flows immediately | Within a single pipeline |
 
-The barrier type is set during `insert_repository()` and checked by the base `get_next_task_hint()` method to determine operator readiness.
+The barrier type is carried on each `repository_wiring` descriptor and checked by the base `get_next_task_hint()` method to determine operator readiness.
 
 ### Port Structure
 
