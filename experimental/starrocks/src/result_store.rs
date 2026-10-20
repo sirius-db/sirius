@@ -38,6 +38,15 @@ impl FragmentInstanceId {
     pub(crate) fn query_hi(self) -> u64 {
         self.0.as_u64_pair().0
     }
+
+    /// The proto form, for routing a frame to this instance.
+    pub(crate) fn to_proto(self) -> PUniqueId {
+        let (hi, lo) = self.0.as_u64_pair();
+        PUniqueId {
+            hi: hi as i64,
+            lo: lo as i64,
+        }
+    }
 }
 
 impl From<&TUniqueId> for FragmentInstanceId {

@@ -33,7 +33,7 @@ trap cleanup EXIT INT TERM
 starrocks/output/fe/bin/start_fe.sh --logconsole &
 fe_pid="$!"
 
-target/release/sirius-starrocks-cn &
+(source scripts/cn-env.sh && exec target/release/sirius-starrocks-cn) &
 cn_pid="$!"
 
 wait -n "${fe_pid}" "${cn_pid}"
@@ -58,9 +58,9 @@ engine-build = {cmd = "pixi run --manifest-path pixi.toml make",cwd = "../..",de
 
 # Engine-linked CN (default `sirius-engine` feature); needs the engine artifact and
 # the `engine` feature's toolchain/libs (in the default env).
-cn-build = {cmd = "cargo build --release -p sirius-starrocks-cn",depends-on = ["engine-build"],description = "Build the engine-linked StarRocks CN release binary"}
-cn-test = {cmd = "cargo test -p sirius-starrocks-cn",depends-on = ["engine-build"],description = "Run engine-linked StarRocks CN tests"}
-cn-run = {cmd = "cargo run -p sirius-starrocks-cn --",depends-on = ["engine-build"],description = "Run the engine-linked StarRocks CN with local FE defaults"}
+cn-build = {cmd = "bash -c 'source scripts/cn-env.sh && cargo build --release -p sirius-starrocks-cn'",depends-on = ["engine-build"],description = "Build the engine-linked StarRocks CN release binary"}
+cn-test = {cmd = "bash -c 'source scripts/cn-env.sh && cargo test -p sirius-starrocks-cn'",depends-on = ["engine-build"],description = "Run engine-linked StarRocks CN tests"}
+cn-run = {cmd = "bash -c 'source scripts/cn-env.sh && cargo run -p sirius-starrocks-cn -- \"$@\"' _",depends-on = ["engine-build"],description = "Run the engine-linked StarRocks CN with local FE defaults"}
 
 # Pure-Rust path (no engine, build tree, or GPU). What CI runs.
 cn-test-no-engine = {cmd = "cargo test -p sirius-starrocks-cn --no-default-features",description = "Run Rust StarRocks CN tests without the embedded Sirius engine"}

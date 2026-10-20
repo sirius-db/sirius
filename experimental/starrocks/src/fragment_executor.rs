@@ -1,11 +1,12 @@
 //! Execution of a translated fragment.
 //!
 //! A result fragment returns Arrow batches for `fetch_data`; a sender fragment parks its native
-//! GPU output under [`SenderSlot`]s for a same-CN receiver to relay in. A [`StubExecutor`] stands
-//! in for the GPU engine so the StarRocks dispatch and result-return plumbing can be exercised end
-//! to end without a build tree or a GPU.
+//! GPU output under [`SenderSlot`]s for a same-CN receiver to relay in, or for the NIXL transport
+//! to export to a remote one. A [`StubExecutor`] stands in for the GPU engine so the StarRocks
+//! dispatch and result-return plumbing can be exercised end to end without a build tree or a GPU.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -25,6 +26,35 @@ pub struct SenderSlot {
     pub(crate) node_id: i32,
     /// Sender ordinal within that exchange's sender set.
     pub(crate) sender_id: i32,
+}
+
+/// One parked or streamed batch exported for the ring exchange: a job on this CN's ring, held
+/// until released there.
+#[derive(Clone, Debug)]
+pub struct RingJob {
+    pub token: u64,
+    pub rows: u64,
+    /// Bytes the job's frames carry.
+    pub stream_bytes: u64,
+    /// What the receiver lands the frames by.
+    pub header: Vec<u8>,
+}
+
+/// What [`OutputDrain::next_ring`] found within its timeout.
+#[derive(Debug)]
+pub enum RingNext {
+    Job(RingJob),
+    /// Nothing yet; the fragment may still produce more.
+    Waiting,
+    /// The stream ended and every batch was exported.
+    End,
+}
+
+/// Exports one output stream of a sender fragment while it runs, from any thread.
+pub trait OutputDrain: Send + std::fmt::Debug {
+    /// The next batch as a ring job, waiting up to `timeout` for one. Errors once the fragment
+    /// failed.
+    fn next_ring(&mut self, timeout: Duration) -> Result<RingNext, String>;
 }
 
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
@@ -83,6 +113,14 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
             return Ok(None);
         }
         self.execute(run.plan).map(Some)
+    }
+
+    /// Exports the next batch parked under `slot` as a ring job; `None` once drained. The caller
+    /// owns the job and must release it on this CN's ring exchange.
+    fn export_ring_next(&self, slot: SenderSlot) -> Result<Option<RingJob>, String> {
+        Err(format!(
+            "this executor cannot export the output parked under {slot:?}"
+        ))
     }
 
     /// Drops one destination's claim on parked output, which is freed with the last claim. The
