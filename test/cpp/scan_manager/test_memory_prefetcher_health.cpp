@@ -88,6 +88,7 @@ TEST_CASE("prefetch conversion reports fatal errors without treating OOM as runt
 {
   auto status = GENERATE(
     cudaErrorIllegalAddress, cudaErrorUnknown, cudaErrorMemoryAllocation, cudaErrorInvalidValue);
+  auto exception_type = GENERATE(0, 1, 2);  // cuDF/RMM, CCCL, Thrust
   sirius::test::publication::claim_fixture fixture;
   auto batch     = fixture.make_host_build_batch();
   auto connector = std::make_shared<split_connector>();
@@ -102,12 +103,15 @@ TEST_CASE("prefetch conversion reports fatal errors without treating OOM as runt
                                            cucascade::gpu_table_representation>()));
   converters
     .register_converter<cucascade::host_data_representation, cucascade::gpu_table_representation>(
-      [calls, status](
+      [calls, status, exception_type](
         cucascade::idata_representation&,
         const cucascade::memory::memory_space*,
         ::cuda::stream_ref,
         cucascade::memory::reservation*) -> std::unique_ptr<cucascade::idata_representation> {
         calls->fetch_add(1);
+        if (exception_type == 1) throw ::cuda::cuda_error(status, "prefetch conversion");
+        if (exception_type == 2)
+          throw thrust::system_error(status, thrust::cuda_category(), "prefetch conversion");
         if (status == cudaErrorMemoryAllocation)
           throw rmm::out_of_memory("injected conversion OOM");
         throw cudf::cuda_error("injected prefetch conversion error", status);

@@ -137,7 +137,8 @@ Fatal shared-device failures close publication and refuse later registration; or
 errors remain query-local. SQL execution remains serialized until the next admission layer.
 
 Report exceptions through `query_lifecycle_registry::report_failure()` before converting them
-to DuckDB error results. Classification uses CUDA status codes from Sirius/cuDF exceptions.
+to DuckDB error results. Classification uses CUDA status codes from Sirius, cuDF and CCCL
+exceptions, and Thrust system errors whose category is CUDA.
 The installed RMM version lacks a status accessor, so its typed CUDA/allocation exceptions use
 the status field emitted by RMM's CUDA-check macros. Arbitrary exception text is never evidence
 of device failure, and reporting does not probe or clear the calling thread's CUDA error state.

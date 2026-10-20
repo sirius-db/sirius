@@ -19,7 +19,10 @@
 
 #include <rmm/error.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
+#include <thrust/system/cuda/error.h>
+#include <thrust/system_error.h>
 
 #include <exception>
 #include <stdexcept>
@@ -106,6 +109,12 @@ inline bool fatal_device_exception(std::exception_ptr error) noexcept
     return fatal_cuda_status(e.error_code());
   } catch (cudf::cuda_error const& e) {
     return fatal_cuda_status(e.error_code());
+  } catch (::cuda::cuda_error const& e) {
+    return fatal_cuda_status(static_cast<cudaError_t>(e.status()));
+  } catch (thrust::system_error const& e) {
+    // Other backends can reuse the same numeric values; only CUDA codes apply.
+    return e.code().category() == thrust::cuda_category() &&
+           fatal_cuda_status(static_cast<cudaError_t>(e.code().value()));
   } catch (rmm::cuda_error const& e) {
     return detail::fatal_rmm_cuda_message(e.what());
   } catch (rmm::bad_alloc const& e) {

@@ -226,3 +226,21 @@ TEST_CASE("RMM CUDA macro errors preserve fatal status without a last-error prob
     check([&] { RMM_CUDA_TRY_ALLOC(status, 1024); });
   }
 }
+
+TEST_CASE("CCCL and Thrust failures classify by CUDA status and category", "[device_health]")
+{
+  for (auto status : {cudaErrorIllegalAddress,
+                      cudaErrorUnknown,
+                      cudaErrorMemoryAllocation,
+                      cudaErrorInvalidValue}) {
+    INFO("status=" << static_cast<int>(status));
+    CHECK(sirius::fatal_device_exception(std::make_exception_ptr(::cuda::cuda_error(
+            status, "stream synchronization"))) == sirius::fatal_cuda_status(status));
+    CHECK(sirius::fatal_device_exception(std::make_exception_ptr(
+            thrust::system_error(status, thrust::cuda_category(), "device operation"))) ==
+          sirius::fatal_cuda_status(status));
+    // A matching numeric value and CUDA-looking text in another category prove nothing.
+    CHECK_FALSE(sirius::fatal_device_exception(std::make_exception_ptr(
+      thrust::system_error(status, thrust::generic_category(), "cudaErrorIllegalAddress"))));
+  }
+}

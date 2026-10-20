@@ -583,3 +583,41 @@ TEST_CASE("GPU retry-handler failures preserve their type and runtime classifica
   sirius::test::retire_scheduler_query(f.lifecycle, *f.executor, sirius::make_query_id(0));
   f.executor->stop();
 }
+
+TEST_CASE("GPU executor reports CCCL and Thrust task failures before completion",
+          "[gpu_pipeline_executor][device_health]")
+{
+  using namespace std::chrono_literals;
+  bool const cccl = GENERATE(false, true);
+  auto status     = GENERATE(cudaErrorIllegalAddress, cudaErrorInvalidValue);
+  oom_test_fixture f;
+  if (!f.setup(1, "typed-cuda-error")) { SKIP("No GPU available"); }
+
+  class cuda_failure_task final : public oom_test_task_base {
+   public:
+    using oom_test_task_base::oom_test_task_base;
+    std::exception_ptr failure;
+    void execute(::cuda::stream_ref) override { std::rethrow_exception(failure); }
+  };
+  auto global = std::make_shared<oom_test_global_state>();
+  global->set_completion_handler(f.completion);
+  auto task = std::make_unique<cuda_failure_task>(
+    0, std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(nullptr), global);
+  auto failure =
+    cccl ? std::make_exception_ptr(::cuda::cuda_error(status, "prepare stream synchronization"))
+         : std::make_exception_ptr(thrust::system_error(status, thrust::cuda_category(), "task"));
+  task->failure = failure;
+  auto result   = f.completion->get_awaitable();
+  f.executor->start();
+  f.executor->schedule(std::move(task));
+  REQUIRE(result.wait_for(10s) == std::future_status::ready);
+  try {
+    result.get();
+    FAIL("task failure must reach completion");
+  } catch (std::exception const&) {
+    CHECK(std::current_exception() == failure);
+  }
+  CHECK(f.lifecycle.runtime_failed() == (status == cudaErrorIllegalAddress));
+  sirius::test::retire_scheduler_query(f.lifecycle, *f.executor, sirius::make_query_id(0));
+  f.executor->stop();
+}
