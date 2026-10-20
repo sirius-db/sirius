@@ -32,6 +32,7 @@ if(NOT SIRIUS_BUILD_SHARED AND NOT SIRIUS_BUILD_STATIC)
   message(FATAL_ERROR "Enable at least one Sirius library output")
 endif()
 option(SIRIUS_BUILD_TESTS "Build Sirius C++ tests" OFF)
+option(SIRIUS_ENABLE_CLANG_TIDY "Run clang-tidy during compilation" OFF)
 
 # Optional features
 option(ENABLE_STREAM_CHECK
@@ -45,6 +46,11 @@ endif()
 include(cmake/sirius-duckdb-provider.cmake)
 
 include(cmake/sirius-dependencies.cmake)
+
+include(cmake/sirius-clang-tidy.cmake)
+
+add_subdirectory(src/compression/simpatico_codegen
+                 "${CMAKE_BINARY_DIR}/simpatico_codegen" EXCLUDE_FROM_ALL)
 
 add_library(sirius_objects OBJECT)
 add_subdirectory(src)

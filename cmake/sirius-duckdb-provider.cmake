@@ -62,4 +62,11 @@ function(sirius_link_duckdb_extensions target)
   set(DUCKDB_MODULE_BASE_DIR "${SIRIUS_DUCKDB_SOURCE_DIR}")
   duckdb_link_extensions(${target} ${ARGN} httplib loadable_extensions
                          core_functions parquet)
+  # DuckDB adds its own source and a generated loader to each consumer target.
+  set_source_files_properties(
+    "${SIRIUS_DUCKDB_SOURCE_DIR}/extension/loader/static_extension_autoregister.cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/${target}_static_extension_loader.c"
+    TARGET_DIRECTORY
+    ${target}
+    PROPERTIES SKIP_LINTING ON)
 endfunction()

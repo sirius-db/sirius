@@ -60,6 +60,9 @@ if(TARGET simpatico)
   endif()
   foreach(variant project cccl)
     set(_fixture "${CMAKE_CURRENT_BINARY_DIR}/fixtures/${variant}")
+    set_source_files_properties(
+      "${_fixture}/codegen/jit/cccl_embedded_headers.cpp"
+      PROPERTIES SKIP_LINTING ON)
     add_custom_command(
       OUTPUT "${_fixture}/codegen/jit/embedded_headers.h"
              "${_fixture}/codegen/jit/cccl_embedded_headers.cpp"
