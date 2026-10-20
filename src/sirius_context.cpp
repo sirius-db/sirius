@@ -616,8 +616,14 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
     SIRIUS_LOG_INFO("QueryEnd");
   } catch (...) {
   }
+  // Keep completion through resource release. A close failure may arrive during retirement
+  // after the query future already delivered an unrelated error.
+  auto completion = window_completion(query_id);
   retire_query_work(query_id, query_retirement_mode::cancelled);
   auto const keys_released = release_query_state(query_id, inject_failure);
+  // Both explicit finish and destructor backstop use the existing cleanup-failure path.
+  // Do not abandon physical retirement or replace the original query error with a close error.
+  if (completion) completion->throw_if_preparation_cleanup_failed();
   try {
     log_pool_stats(end_tag);
   } catch (...) {

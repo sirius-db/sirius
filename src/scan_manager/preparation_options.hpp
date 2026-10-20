@@ -43,11 +43,18 @@ struct preparation_options {
 struct preparation_config {
   std::optional<size_t> max_inflight_metadata_jobs, max_inflight_dv_jobs, lookahead_batches,
     max_control_work, drain_quantum;
+  // Runtime-wide limits, independent of per-attempt metadata credits and GPU count.
+  std::optional<size_t> native_reader_workers, max_native_readers;
+  size_t resolved_native_workers() const { return native_reader_workers.value_or(2); }
+  size_t resolved_native_readers() const { return max_native_readers.value_or(64); }
   std::chrono::milliseconds interrupt_check_interval = k_interrupt_check_interval;
   std::optional<partial_batch_options> partial_batch = partial_batch_options{};
   preparation_options resolve(int workers) const
   {
     if (workers <= 0) throw std::invalid_argument("preparation needs positive scan worker count");
+    if (!resolved_native_workers() || resolved_native_readers() < resolved_native_workers())
+      throw std::invalid_argument(
+        "native preparation needs positive workers and at least one reader slot per worker");
     auto jobs = static_cast<size_t>(workers);
     preparation_options options{max_inflight_metadata_jobs.value_or(4096),
                                 lookahead_batches.value_or(2),

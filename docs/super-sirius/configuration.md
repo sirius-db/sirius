@@ -331,7 +331,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer threads. Preparation and coalescing run on each query owner thread, so they cannot occupy producer capacity. |
+| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer threads. Each query has an independent coordinator for coalescing and publication; provider calls run on their assigned execution domain. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
@@ -504,6 +504,8 @@ These settings are loaded at initialization. Metadata jobs default to a limit of
 | `max_inflight_metadata_jobs` | 4096 | Maximum submitted metadata preparation jobs across the query, including queued work. `0` means unlimited. Completion returns the job slot. |
 | `max_inflight_dv_jobs` | unlimited | Maximum DV preparation jobs holding temporary-memory permits, including queued work. Omitted or `0` imposes no configured count cap. Admission may grant fewer permits when HOST memory is insufficient. |
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
+| `native_reader_workers` | 2 | Native-reader worker threads per scan manager, started lazily at the first native reservation. Positive and independent of metadata workers and GPU count. |
+| `max_native_readers` | 64 | Reader slots shared by all attempts within that manager. Must be at least `native_reader_workers`; an attempt reserves its full group before any reader starts. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
 | `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
@@ -523,6 +525,8 @@ sirius:
       preparation:
         max_inflight_metadata_jobs: 4096
         max_inflight_dv_jobs: 0
+        native_reader_workers: 2
+        max_native_readers: 64
         lookahead_batches: 2
         max_control_work: 4
         drain_quantum: 4
