@@ -1157,6 +1157,43 @@ TEST_CASE("arrow_host_import: null metadata is checked against selected bits",
   scoped_restore child_guard(child);
   scoped_restore schema_guard(schema);
   const auto types = declared({duckdb::LogicalType::INTEGER});
+  SECTION("absent validity normalizes zero and unknown counts to all-valid")
+  {
+    auto valid = arrow_batch_from_sql("SELECT i::INTEGER AS a FROM range(3) t(i)");
+    auto& root = valid->array;
+    auto& leaf = *root.children[0];
+    scoped_restore root_guard(root);
+    scoped_restore leaf_guard(leaf);
+    const void* root_buffers[] = {nullptr};
+    const void* leaf_buffers[] = {nullptr, leaf.buffers[1]};
+    root.buffers               = root_buffers;
+    leaf.buffers               = leaf_buffers;
+    root.null_count            = GENERATE(std::int64_t{0}, std::int64_t{-1});
+    leaf.null_count            = GENERATE(std::int64_t{0}, std::int64_t{-1});
+    auto table                 = import(*valid, {"a"}, types);
+    REQUIRE(table->num_rows() == 3);
+    REQUIRE(table->get_column(0).null_count() == 0);
+    REQUIRE(copy_column_to_host<std::int32_t>(table->get_column(0).view()) ==
+            std::vector<std::int32_t>{0, 1, 2});
+  }
+  SECTION("absent validity cannot represent a positive null count")
+  {
+    auto& root = batch->array;
+    scoped_restore root_guard(root);
+    const void* root_buffers[] = {nullptr};
+    const void* leaf_buffers[] = {nullptr, child.buffers[1]};
+    if (GENERATE(false, true)) {
+      root.buffers    = root_buffers;
+      root.null_count = 1;
+    } else {
+      child.buffers    = leaf_buffers;
+      child.null_count = 1;
+    }
+    import_test_resource observed;
+    REQUIRE_THROWS_AS(import(*batch, {"a"}, types, rmm::device_async_resource_ref{observed}),
+                      sirius::invalid_input_exception);
+    REQUIRE(observed.counts->attempts == 0);
+  }
   SECTION("unknown null count is derived")
   {
     child.null_count = -1;

@@ -70,6 +70,18 @@ Field IDs, name matching, row-kind/visibility semantics and residual filters bel
 to the adapter. A positional type match is not proof of bound-field identity or
 native merge correctness.
 
+Schema metadata, including `ARROW:extension:name` and `ARROW:extension:metadata`,
+is not interpreted here. The caller must validate extension semantics against its
+accepted profile before inspection; matching a storage format does not establish
+that its extension semantics can be discarded.
+
+For compatibility with producers that omit an all-valid bitmap, an absent root
+or child validity buffer with `null_count=-1` is normalized to all-valid, just as
+for `null_count=0`. This deliberately accepts more than the C Data Interface's
+bitmap-omission rule. A positive null count without a bitmap is refused. When a
+bitmap is present, its selected bits determine nulls and must agree with the
+advertised count and schema nullability.
+
 ## Allocation Boundary
 
 Pinned cuDF direct Arrow import and decimal-width cast paths do not consistently
