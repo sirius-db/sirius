@@ -15,14 +15,13 @@ Tables with no plan file pin uncompressed. Each plan file carries one `---`-sepa
 block per full-table column in schema order; a pin of a column subset selects the matching
 blocks (`select_plan_blocks`). Each pin reads its plan from the calling connection's
 `pin_table_input_compression_plan_dir`; plans are not stored in a process-wide registry.
-Scans of a compressed entry decompress the projected columns
-at task-prepare time via the `compressed_host_representation` /
-`compressed_device_blob` → `gpu_table_representation` converters, column-parallel across
-4 fixed streams (measured strictly better than serial; the stream count is deliberately
-not configurable). Each conversion takes those streams from the target GPU memory space's
-shared stream pool (`memory_space::acquire_stream()`), so they are not exclusive: the
-decode's waits also cover other work queued on them, other work queued later runs behind the
-decode, and the converters rebind the decoded columns to the task stream (`decompress_chunk`
+Scans of a compressed entry decompress the projected columns at task-prepare time via the
+`compressed_host_representation` / `compressed_device_blob` → `gpu_table_representation`
+converters. With per-thread reservation tracking, multi-column decodes use up to 4
+column-parallel streams (the limit is not configurable); otherwise they use the task stream.
+Simpatico leases the parallel streams exclusively from its per-device cuCascade pool.
+The scan orders their input reads after writes on the task stream, waits for the decode
+before returning, and rebinds the decoded columns to the task stream (`decompress_chunk`
 in `src/compression/compressed_scan.cpp`).
 
 ## Decode-time equality pushdown
@@ -182,3 +181,19 @@ python test/tpch_performance/performance_test.py --engine gpu --mode grouped \
 Checked-in SF1000 plans live in `src/compression/simpatico_codegen/plans/tpch_sf1000/`;
 per-column ratio and throughput annotations are in each file's comments. Re-measure with
 `simpatico_cli benchmark` when hardware changes.
+
+## Compression streams
+
+In Sirius builds, Simpatico leases its column-parallel CUDA streams from
+`cucascade::memory::exclusive_stream_pool`. Both scan decoding's four-stream
+thread/device cache and the compression/decompression APIs' temporary leases use
+this backend. Leases are exclusive and grow the per-device pool when needed, so
+concurrent callers cannot deadlock while acquiring several streams.
+
+These pools use the same implementation as pipeline execution, but have separate,
+process-lifetime owners: compressed and decoded buffers can retain their allocation
+stream after a call or submitting thread exits. Releasing a lease synchronizes its
+streams before returning them. Input-ready events and decode completion preserve
+the ordering needed for the downstream pipeline stream.
+Allocations still run on the calling thread for cuCascade reservation accounting.
+Standalone Simpatico builds retain their CUDA-only stream backend.
