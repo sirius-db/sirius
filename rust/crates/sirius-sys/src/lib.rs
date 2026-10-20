@@ -291,6 +291,30 @@ mod ffi {
             rows: &mut u64,
             stream_bytes: &mut u64,
         ) -> Result<UniquePtr<CxxVector<u8>>>;
+
+        /// Pin a table into the engine's scan cache so later plans that scan
+        /// the same resolved source are served from memory. Runs the same
+        /// `pin_table` table function `CALL pin_table(...)` runs on the DuckDB
+        /// extension path, on the context's embedded connection. `cols_joined`
+        /// is a `'\n'`-separated column list (empty pins every column);
+        /// `format` is `"parquet"`/`"duckdb"` or empty to infer from the path
+        /// suffix; `schema_name` applies to format `duckdb` only. Must be
+        /// called on the context's owning thread and never between a
+        /// fragment's `build` and `run`. Returns a one-line summary; fallible
+        /// (bad arguments, unmatched glob, engine failure).
+        fn pin_table(
+            self: Pin<&mut Context>,
+            path: &CxxString,
+            tier: &CxxString,
+            name: &CxxString,
+            cols_joined: &CxxString,
+            format: &CxxString,
+            schema_name: &CxxString,
+        ) -> Result<UniquePtr<CxxString>>;
+
+        /// Remove the pinned entry `name` and release its memory. Same
+        /// threading contract as `pin_table`. Returns a one-line summary.
+        fn unpin_table(self: Pin<&mut Context>, name: &CxxString) -> Result<UniquePtr<CxxString>>;
     }
 }
 

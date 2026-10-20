@@ -18,8 +18,9 @@
 // Builds Substrait in the test because the FFI has no SQL helper.
 // Covers a result fragment, a relay_from chain, several fragments built before any runs (on one
 // and on two threads), build() and run()/drop on different threads, drop after build(), a build()
-// that fails after setup, execute_substrait, and the ExchangeInbox handle. Spec errors and
-// failed-build rollback live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
+// that fails after setup, execute_substrait, the ExchangeInbox handle, pin_table/unpin_table,
+// and byte-range splits of a pinned file. Spec errors and failed-build rollback live in
+// test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
 
 #include "sirius/exception.hpp"
 #include "sirius/ffi.hpp"
@@ -44,6 +45,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -74,6 +76,24 @@ std::string local_files_plan(std::string const& path)
   return serialize_plan(plan);
 }
 
+// One LocalFiles item per `{start, length}` byte range of `path`.
+std::string local_files_ranged_plan(
+  std::string const& path, std::vector<std::pair<std::uint64_t, std::uint64_t>> const& ranges)
+{
+  substrait::Plan plan;
+  auto* root = plan.add_relations()->mutable_root();
+  root->add_names("a");
+  auto* files = root->mutable_input()->mutable_read()->mutable_local_files();
+  for (auto const& [start, length] : ranges) {
+    auto* item = files->add_items();
+    item->set_uri_file(path);
+    item->set_start(start);
+    item->set_length(length);
+    item->mutable_parquet();
+  }
+  return serialize_plan(plan);
+}
+
 std::string stream_read_plan(std::uint64_t stream_id)
 {
   substrait::Plan plan;
@@ -90,17 +110,21 @@ std::string stream_read_plan(std::uint64_t stream_id)
   return serialize_plan(plan);
 }
 
-void write_ids_parquet(std::string const& path)
+// Writes `values` (a SQL VALUES list of BIGINTs) as a one-column parquet file with column a.
+void write_i64_parquet(std::string const& path, std::string const& values)
 {
   sirius::test::scoped_sirius_disable disable;
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
-  auto copied = con.Query(
-    "COPY (SELECT * FROM (VALUES (1::BIGINT), (2::BIGINT), (3::BIGINT), "
-    "(4::BIGINT), (5::BIGINT)) t(a)) TO " +
-    sirius::test::sql_literal(path) + " (FORMAT PARQUET)");
+  auto copied = con.Query("COPY (SELECT * FROM (VALUES " + values + ") t(a)) TO " +
+                          sirius::test::sql_literal(path) + " (FORMAT PARQUET)");
   REQUIRE(copied);
   REQUIRE_FALSE(copied->HasError());
+}
+
+void write_ids_parquet(std::string const& path)
+{
+  write_i64_parquet(path, "(1::BIGINT), (2::BIGINT), (3::BIGINT), (4::BIGINT), (5::BIGINT)");
 }
 
 void release_if(ArrowArrayStream& stream)
@@ -146,6 +170,15 @@ std::vector<std::int64_t> result_i64s(sirius::ffi::Fragment& fragment)
   ArrowArrayStream stream{};
   fragment.result_to_arrow(reinterpret_cast<std::uintptr_t>(&stream));
   return collect_i64_column(stream);
+}
+
+std::vector<std::int64_t> execute_i64s(sirius::ffi::Context& ctx, std::string const& plan)
+{
+  ArrowArrayStream stream{};
+  ctx.execute_substrait(plan, reinterpret_cast<std::uintptr_t>(&stream));
+  auto values = collect_i64_column(stream);
+  std::sort(values.begin(), values.end());
+  return values;
 }
 
 }  // namespace
@@ -589,4 +622,106 @@ TEST_CASE("FFI interrupt() from another thread cancels a run, and the next run w
   ArrowArrayStream stream{};
   ctx->execute_substrait(plan, reinterpret_cast<std::uintptr_t>(&stream));
   REQUIRE(collect_i64_column(stream) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+}
+
+TEST_CASE("FFI pin_table serves scans of the pinned files, and unpin_table releases the pin",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_pin_table");
+  auto const low  = scratch.file("ids_low.parquet");
+  auto const high = scratch.file("ids_high.parquet");
+  write_ids_parquet(low);
+  write_i64_parquet(high, "(6::BIGINT), (7::BIGINT), (8::BIGINT)");
+  auto const glob = (fs::path(low).parent_path() / "ids_*.parquet").string();
+
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  std::vector<std::int64_t> const low_rows{1, 2, 3, 4, 5};
+  std::vector<std::int64_t> const high_rows{6, 7, 8};
+  REQUIRE(execute_i64s(*ctx, local_files_plan(low)) == low_rows);
+
+  // An empty format infers parquet from the glob's suffix; empty columns pin every column.
+  REQUIRE(*ctx->pin_table(glob, "gpu", "ids", "", "", "") == "pinned 'ids' tier=gpu");
+
+  // Each scan reads one of the two pinned files, so the pin may serve it only from that file's
+  // chunks: the rows are that file's, never the other's.
+  REQUIRE(execute_i64s(*ctx, local_files_plan(low)) == low_rows);
+  REQUIRE(execute_i64s(*ctx, local_files_plan(high)) == high_rows);
+  auto fragment = sirius::ffi::make_fragment(*ctx);
+  fragment->build(local_files_plan(high));
+  fragment->run();
+  auto fragment_rows = result_i64s(*fragment);
+  std::sort(fragment_rows.begin(), fragment_rows.end());
+  REQUIRE(fragment_rows == high_rows);
+  fragment.reset();
+
+  REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
+  // Like CALL unpin_table, removing a name that isn't pinned does nothing.
+  REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
+  REQUIRE_NOTHROW(ctx->unpin_table("never_pinned"));
+  REQUIRE(execute_i64s(*ctx, local_files_plan(low)) == low_rows);
+
+  // The same name can be pinned again after an unpin, here on the host tier.
+  REQUIRE(*ctx->pin_table(glob, "host", "ids", "a", "parquet", "") == "pinned 'ids' tier=host");
+  REQUIRE(execute_i64s(*ctx, local_files_plan(high)) == high_rows);
+  REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
+}
+
+TEST_CASE("FFI byte-range splits of a pinned file read from disk and return each row once",
+          "[isolated_context][sirius_ffi][byte_range]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_pin_byte_ranges");
+  auto const path = scratch.file("ids.parquet");
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    // Several row groups, so each half of the file owns some of them.
+    auto copied =
+      con.Query("COPY (SELECT range::BIGINT AS a FROM range(30000)) TO " +
+                sirius::test::sql_literal(path) + " (FORMAT PARQUET, ROW_GROUP_SIZE 5000)");
+    REQUIRE(copied);
+    REQUIRE_FALSE(copied->HasError());
+  }
+  auto const size = static_cast<std::uint64_t>(fs::file_size(path));
+  auto const half = size / 2;
+
+  auto ctx         = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto const whole = execute_i64s(*ctx, local_files_plan(path));
+  REQUIRE(whole.size() == 30000);
+  REQUIRE(*ctx->pin_table(path, "gpu", "ids", "", "", "") == "pinned 'ids' tier=gpu");
+  REQUIRE(execute_i64s(*ctx, local_files_plan(path)) == whole);
+
+  // Each split is its own scan, as on two compute nodes. Served from the pin, each would return
+  // all 30000 rows.
+  auto const left  = execute_i64s(*ctx, local_files_ranged_plan(path, {{0, half}}));
+  auto const right = execute_i64s(*ctx, local_files_ranged_plan(path, {{half, size - half}}));
+  REQUIRE_FALSE(left.empty());
+  REQUIRE_FALSE(right.empty());
+  REQUIRE(left.size() < whole.size());
+  auto both = left;
+  both.insert(both.end(), right.begin(), right.end());
+  std::sort(both.begin(), both.end());
+  REQUIRE(both == whole);
+
+  REQUIRE(execute_i64s(*ctx, local_files_ranged_plan(path, {{0, half}, {half, size - half}})) ==
+          whole);
+  REQUIRE(*ctx->unpin_table("ids") == "unpinned 'ids'");
+}
+
+TEST_CASE("FFI pin_table refuses bad arguments and leaves the Context usable",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_pin_table_refusals");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  REQUIRE_THROWS_WITH(ctx->pin_table(path, "disk", "ids", "", "", ""),
+                      Catch::Matchers::ContainsSubstring("tier='disk'"));
+  REQUIRE_THROWS_WITH(ctx->pin_table(path, "", "ids", "", "", ""),
+                      Catch::Matchers::ContainsSubstring("'tier'"));
+  auto const missing = (fs::path(path).parent_path() / "none_*.parquet").string();
+  REQUIRE_THROWS(ctx->pin_table(missing, "gpu", "ids", "", "", ""));
+
+  REQUIRE(execute_i64s(*ctx, local_files_plan(path)) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }

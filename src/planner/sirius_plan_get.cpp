@@ -51,6 +51,7 @@
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/substrait_scan_ranges.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -657,7 +658,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   } else if (!marked_decline && sirius_state && compressed_materialization_on) {
     auto const files = resolve_parquet_scan_file_paths(
       op.function.GetName().GetIdentifierName(), op.bind_data.get(), op.parameters);
-    if (!files.empty()) {
+    // Ranges attach to the table info only at lowering, so read the plan's registry here: a
+    // byte-range scan never matches a pin (cache_entry_info::can_serve_with_columns), and the
+    // residency gate must see the same miss.
+    auto const byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
+      sirius::planner::scan_byte_ranges_state::kStateKey);
+    bool const reads_byte_ranges =
+      byte_ranges && std::ranges::any_of(files, [&](auto const& f) { return byte_ranges->has(f); });
+    if (!files.empty() && !reads_byte_ranges) {
       pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
       pinned       = pinned_owner.get();
     }

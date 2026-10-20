@@ -42,6 +42,26 @@ pub struct SiriusContext {
     inner: RefCell<UniquePtr<sirius_sys::Context>>,
 }
 
+/// Arguments for [`SiriusContext::pin_table`], mirroring the SQL surface of
+/// `CALL pin_table(...)` on the DuckDB extension path.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PinTableSpec {
+    /// Parquet file or glob; `None` for `format = "duckdb"`, where `name` is
+    /// the catalog table to pin.
+    pub path: Option<String>,
+    /// `"gpu"` or `"host"`.
+    pub tier: String,
+    /// Pin-registry key; also selects the compression plan file.
+    pub name: String,
+    /// Columns to pin; `None` (or empty) pins every column.
+    pub cols: Option<Vec<String>>,
+    /// `"parquet"` or `"duckdb"`; `None` infers from the path suffix (a glob
+    /// not ending in `.parquet` needs the explicit format).
+    pub format: Option<String>,
+    /// Schema containing the table, for `format = "duckdb"` only.
+    pub schema: Option<String>,
+}
+
 /// Fully materialized output of one Substrait execution.
 pub struct SubstraitResult {
     /// Arrow schema reported by the result stream, also available for empty results.
@@ -157,6 +177,37 @@ impl SiriusContext {
         Interrupter {
             inner: self.inner.borrow().interrupter(),
         }
+    }
+
+    /// Pin a table into the engine's scan cache so later plans that scan the
+    /// same resolved source are served from memory — the FFI mirror of
+    /// `CALL pin_table(...)`.
+    ///
+    /// Blocks for the whole materialization on this context's owning thread;
+    /// never call it while a fragment sits between `build` and `run`.
+    /// Compression engages per the context's YAML `sirius.compression.*`
+    /// config. Returns a one-line summary.
+    pub fn pin_table(&mut self, spec: &PinTableSpec) -> Result<String, Exception> {
+        let_cxx_string!(path = spec.path.as_deref().unwrap_or(""));
+        let_cxx_string!(tier = spec.tier.as_str());
+        let_cxx_string!(name = spec.name.as_str());
+        let cols_joined = spec.cols.as_deref().unwrap_or(&[]).join("\n");
+        let_cxx_string!(cols = cols_joined.as_str());
+        let_cxx_string!(format = spec.format.as_deref().unwrap_or(""));
+        let_cxx_string!(schema = spec.schema.as_deref().unwrap_or(""));
+        let summary = self
+            .inner
+            .pin_mut()
+            .pin_table(&path, &tier, &name, &cols, &format, &schema)?;
+        Ok(summary.to_string_lossy().into_owned())
+    }
+
+    /// Remove the pinned entry `name` and release its memory. Same threading
+    /// contract as [`pin_table`](Self::pin_table).
+    pub fn unpin_table(&mut self, name: &str) -> Result<String, Exception> {
+        let_cxx_string!(name = name);
+        let summary = self.inner.pin_mut().unpin_table(&name)?;
+        Ok(summary.to_string_lossy().into_owned())
     }
 }
 
@@ -759,7 +810,7 @@ mod tests {
     use prost::Message;
     use substrait::proto::{Plan, PlanRel, ReadRel, Rel, RelRoot, plan_rel, rel};
 
-    use super::{SiriusContext, SubstraitResult, stream_view_name};
+    use super::{PinTableSpec, SiriusContext, SubstraitResult, stream_view_name};
 
     /// The engine keeps process-global GPU state, so at most one context may be
     /// live at a time; context-constructing tests hold this for their duration.
@@ -1133,6 +1184,51 @@ mod tests {
 
         drop(ctx);
         interrupter.interrupt();
+    }
+
+    /// `pin_table` maps a [`PinTableSpec`] onto `CALL pin_table(...)`: the pin's summary comes
+    /// back, a scan of the pinned file still returns its rows, `unpin_table` releases it, and a
+    /// bad tier is an error that leaves the context usable. Requires a GPU.
+    #[test]
+    fn pins_and_unpins_a_parquet_table() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ids.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids]).unwrap();
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let p = path.to_str().unwrap();
+        let plan = local_files_plan(p, vec!["id".to_string()]);
+        let rows =
+            |batches: Vec<RecordBatch>| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+
+        let mut ctx = SiriusContext::new().expect("bring up sirius context");
+        let spec = PinTableSpec {
+            path: Some(p.to_string()),
+            tier: "gpu".to_string(),
+            name: "ids".to_string(),
+            cols: Some(vec!["id".to_string()]),
+            format: None,
+            schema: None,
+        };
+        assert_eq!(ctx.pin_table(&spec).unwrap(), "pinned 'ids' tier=gpu");
+        assert_eq!(rows(ctx.execute_substrait(&plan).unwrap()), 3);
+        assert_eq!(ctx.unpin_table("ids").unwrap(), "unpinned 'ids'");
+
+        let bad_tier = PinTableSpec {
+            tier: "disk".to_string(),
+            ..spec
+        };
+        assert!(ctx.pin_table(&bad_tier).is_err());
+        assert_eq!(rows(ctx.execute_substrait(&plan).unwrap()), 3);
     }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`
