@@ -56,6 +56,30 @@ void require_dropped_layout(gpu_ingestible const& ingestible,
 
 }  // namespace
 
+void gpu_ingestible::attach_preparation_ledger(std::shared_ptr<scan_manager::preparation_ledger>)
+{
+  throw std::logic_error("scan does not support preparation ledger installation");
+}
+
+std::vector<gpu_ingestible::preparation_source> gpu_ingestible::make_preparation_sources(
+  io::ioctx_resolver resolve)
+{
+  std::vector<preparation_source> sources;
+  sources.push_back(make_preparation_source(std::move(resolve)));
+  return sources;
+}
+
+gpu_ingestible::preparation_source gpu_ingestible::make_preparation_source(
+  io::ioctx_resolver resolve)
+{
+  preparation_source source;
+  source.try_claim   = [this, resolve = std::move(resolve)] { return try_claim_split(resolve); };
+  source.bind_wakeup = [this](scan_manager::preparation_wakeup wake) {
+    bind_preparation_wakeup(std::move(wake));
+  };
+  return source;
+}
+
 filtered_table gpu_ingestible::materialize_table(
   const op::scan::scan_operator_input& split,
   ::cuda::stream_ref stream,

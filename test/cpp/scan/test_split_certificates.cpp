@@ -1412,8 +1412,8 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
   REQUIRE_THROWS_AS(validate_split_for_gpu(81, required, {}, *split), certificate_incomplete);
 }
 
-TEST_CASE("Production scan preparation runs and publishes on the execute owner",
-          "[integration][scan][certificate][scan_preparation][query_thread]")
+TEST_CASE("Production scan preparation publishes on its owned coordinator thread",
+          "[integration][scan][certificate][scan_preparation][coordinator_thread]")
 {
   sirius::test::GpuExecutionFixture fixture;
   auto& con = *fixture.con;
@@ -1451,8 +1451,9 @@ TEST_CASE("Production scan preparation runs and publishes on the execute owner",
         REQUIRE(observation.preparation_runs == 1);
         CHECK(observation.execute_owner != std::thread::id{});
         CHECK(observation.preparation_owner == observation.execute_owner);
-        CHECK(observation.preparation_runner == observation.execute_owner);
-        CHECK(observation.preparation_publisher == observation.execute_owner);
+        CHECK(observation.preparation_runner != observation.execute_owner);
+        CHECK(observation.preparation_runner != std::thread::id{});
+        CHECK(observation.preparation_publisher == observation.preparation_runner);
       }
     }
   }

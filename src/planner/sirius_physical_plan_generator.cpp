@@ -551,7 +551,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
   };
   std::vector<scan_dv_count> counts;
-  std::vector<scan_envelope> envelopes;
+  std::vector<preparation_request> requests;
   bool qualified = true;
   for (auto const& c : scans) {
     if (c.discovery->positional_delete_files.empty()) validate_deletion_vector_claims(*c.discovery);
@@ -581,7 +581,20 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
     try {
       auto e = iceberg_dv_preparation::envelope(*c.discovery, c.info->resolved_file_paths);
       qualified &= e.qualified;
-      envelopes.push_back(std::move(e));
+      auto* candidate = &c;
+      requests.push_back({std::move(e),
+                          [candidate](preparation_ledger& ledger) {
+                            candidate->info->deferred = std::make_shared<iceberg_dv_preparation>(
+                              candidate->scan->contract_id,
+                              candidate->info->table_path,
+                              candidate->info->resolved_file_paths,
+                              candidate->discovery,
+                              ledger);
+                          },
+                          [candidate](std::shared_ptr<preparation_admission> admission) {
+                            candidate->info->deferred->bind_admission(std::move(admission));
+                          },
+                          [candidate]() noexcept { candidate->info->deferred.reset(); }});
     } catch (std::overflow_error const&) {
       qualified = false;
     }
@@ -602,15 +615,15 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
                      ? counters->preparation_provider_for_testing.get()
                      : &provider;
   if (counters->track_units && counters->preparation_envelope_for_testing)
-    for (auto& envelope : envelopes)
-      counters->preparation_envelope_for_testing(envelope);
-  auto ledger = std::make_unique<preparation_ledger>(*selected);
+    for (auto& request : requests)
+      counters->preparation_envelope_for_testing(request.envelope);
   admission_decision decision;
+  bool arena_failed = false;
   bool route_allowed =
     counters->track_units && counters->statement_dv_limit_for_testing
       ? statement_dv_route_allowed(counts, *counters->statement_dv_limit_for_testing)
       : statement_dv_route_allowed(counts);
-  if (qualified && route_allowed && !envelopes.empty()) {
+  if (qualified && route_allowed && !requests.empty()) {
     auto spaces =
       sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!spaces.empty()) {
@@ -618,47 +631,22 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       auto limits        = config.preparation.resolve(config.thread_pool.num_threads);
       auto permits       = static_cast<size_t>(config.thread_pool.num_threads);
       if (limits.max_inflight_dv_jobs) permits = std::min(permits, limits.max_inflight_dv_jobs);
-      decision = ledger->admit(envelopes, spaces.front()->get_id(), static_cast<uint32_t>(permits));
+      try {
+        decision = prepare_statement_resources(
+          *selected, requests, spaces.front()->get_id(), static_cast<uint32_t>(permits));
+      } catch (preparation_resource_error const&) {
+        arena_failed = true;
+      } catch (std::bad_alloc const&) {
+        arena_failed = true;
+      }
     }
   }
   std::string_view route_reason = !qualified           ? "unqualified_envelope"
                                   : !route_allowed     ? "statement_dv_limit"
-                                  : envelopes.empty()  ? "no_deferred_dv_work"
+                                  : requests.empty()   ? "no_deferred_dv_work"
+                                  : arena_failed       ? "arena_allocation"
                                   : !decision.deferred ? "host_admission"
                                                        : "deferred";
-  std::shared_ptr<preparation_admission> admission;
-  if (decision.deferred) {
-    // Construct all arenas before consuming the plan's one owning admission.
-    try {
-      for (auto& c : scans) {
-        if (!c.discovery->positional_delete_files.empty() ||
-            !c.discovery->equality_delete_entries.empty() ||
-            c.discovery->deletion_vector_entries.empty())
-          continue;
-        c.info->deferred = std::make_shared<iceberg_dv_preparation>(c.scan->contract_id,
-                                                                    c.info->table_path,
-                                                                    c.info->resolved_file_paths,
-                                                                    c.discovery,
-                                                                    *ledger);
-      }
-      admission = std::make_shared<preparation_admission>(std::move(ledger), decision);
-    } catch (preparation_resource_error const&) {
-      route_reason = "arena_allocation";
-      for (auto& c : scans)
-        c.info->deferred.reset();
-      ledger.reset();
-      // The admission decision is only valid while all deferred arenas exist.
-      // Clear it with the ledger so a remote Puffin cannot fall through to the
-      // eager payload path after a deferred allocation failure.
-      decision = {};
-    } catch (std::bad_alloc const&) {
-      route_reason = "arena_allocation";
-      for (auto& c : scans)
-        c.info->deferred.reset();
-      ledger.reset();
-      decision = {};
-    }
-  }
   if (!remote_puffins.empty()) {
     // Check each remote scan's final route; statement-level admission can leave a
     // mixed positional/DV statement partly eager.
@@ -682,9 +670,7 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       counters->iceberg_preparation_route_for_testing(c.scan->contract_id, bool(c.info->deferred));
   }
   for (auto& c : scans) {
-    if (c.info->deferred) {
-      c.info->deferred->bind_admission(admission);
-    } else {
+    if (!c.info->deferred) {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
       auto started = std::chrono::steady_clock::now();
       auto sid =

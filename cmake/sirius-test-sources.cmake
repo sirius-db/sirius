@@ -6,6 +6,8 @@ set(TEST_SOURCES
     test/cpp/io/cache/test_metadata_store.cpp
     test/cpp/io/test_object_identity.cpp
     test/cpp/scan_manager/test_preparation_readiness.cpp
+    test/cpp/scan_manager/test_preparation_output_lifetime.cpp
+    test/cpp/scan_manager/test_native_reader_executor.cpp
     test/cpp/scan_manager/test_preparation.cpp
     test/cpp/scan_manager/test_preparation_unit.cpp
     test/cpp/scan_manager/test_preparation_ledger.cpp

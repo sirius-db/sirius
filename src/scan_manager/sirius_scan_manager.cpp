@@ -35,7 +35,6 @@
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
-#include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_materialize.hpp"
@@ -48,6 +47,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "sirius_context.hpp"
 
@@ -1346,6 +1346,8 @@ sirius_scan_manager::sirius_scan_manager(
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
+    _native_readers(_config.preparation.resolved_native_workers(),
+                    _config.preparation.resolved_native_readers()),
     _ioctx_registry(_config, reservation_manager)
 {
   if (!_topology_index) {
@@ -1483,6 +1485,34 @@ void sirius_scan_manager::prepare_for_query(
       query_id);
     reset(query_id);
   }
+
+  // Open/validate all bound provider transactions before any scan can hold a native
+  // checkpoint key. A later provider must not start its backend behind a forced checkpoint
+  // waiting on an earlier scan's key. Keep this pass before cache matching as well.
+  auto check_preflight = [&] {
+    if (completion) {
+      if (auto error = completion->terminal_error()) { std::rethrow_exception(error); }
+    }
+    if (interrupted && interrupted()) {
+      if (completion) {
+        completion->report_error(std::make_exception_ptr(duckdb::InterruptException()));
+        if (auto error = completion->terminal_error()) { std::rethrow_exception(error); }
+      }
+      throw duckdb::InterruptException();
+    }
+    if (checkpoint_key_count(query_id) != 0) {
+      throw std::logic_error("provider preflight requires an attempt without checkpoint keys");
+    }
+  };
+  std::unordered_set<op::scan::gpu_ingestible*> preflighted;
+  for (auto const& scan_op : query.get_scan_operators()) {
+    if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
+    auto& input = scan_op->Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible();
+    if (!preflighted.insert(&input).second) { continue; }
+    check_preflight();
+    input.preflight_for_query();
+  }
+  check_preflight();
 
   // Refresh synchronized cache accounting; cache entries retain their own IO/read leases.
   if (_io_ctx && _io_ctx->cache()) {
@@ -2013,12 +2043,18 @@ void sirius_scan_manager::prepare_for_query(
 
   // Publish only once the state is fully built: a prepare that threw above destroys `state`
   // locally and never leaves a half-built entry visible to reset() or a concurrent prepare.
+  start_metadata_processing(*state, std::move(interrupted));
   {
     std::lock_guard lk{_query_states_mutex};
     _query_states.emplace(query_id, state);
   }
+}
 
-  start_metadata_processing(*state, std::move(interrupted));
+std::unique_ptr<preparation_coordinator> sirius_scan_manager::make_preparation_coordinator(
+  query_scan_manager_state& state)
+{
+  return std::make_unique<preparation_coordinator>(
+    *state.completion, *state.dispatcher, state.preparation, &_native_readers);
 }
 
 void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state,
@@ -2027,18 +2063,17 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
   std::shared_ptr<preparation_admission> admission;
   for (auto const& entry : state.scans) {
     auto& ingestible = entry.op->get_ingestible();
-    auto candidate   = ingestible.preparation_admission();
-    if (!candidate) continue;
+    auto requested   = ingestible.preparation_admission();
+    if (!requested) continue;
     if (!admission) {
-      admission    = std::move(candidate);
+      admission    = std::move(requested);
       state.ledger = admission->consume();
-    } else if (admission != candidate) {
-      throw std::logic_error("deferred scans must share the statement admission");
+    } else if (admission != requested) {
+      throw std::logic_error("scans must share the statement preparation admission");
     }
     ingestible.attach_preparation_ledger(state.ledger);
   }
-  state.coordinator = std::make_unique<preparation_coordinator>(
-    *state.completion, *state.dispatcher, state.preparation);
+  state.coordinator = make_preparation_coordinator(state);
   for (auto& scan : state.scans)
     if (auto* disk = std::get_if<query_scan_manager_state::disk_scan>(&scan.source))
       state.metadata_processor->register_coordinator_source(
@@ -2047,27 +2082,49 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
   state.coordinator->arm();
 }
 
-void sirius_scan_manager::run_preparation_on_query_thread(sirius::query_id_t id)
+void sirius_scan_manager::start_preparation(sirius::query_id_t id)
 {
   auto state = get_query_state(id);
-  if (!state || !state->coordinator) return;
+  if (!state) return;
+  std::lock_guard execution_lock(state->execution_mutex);
+  if (state->draining || state->drained || !state->coordinator) return;
   auto cached = state->metadata_processor->prepare_cached_workers(*state->coordinator);
   for (auto& work : cached)
     state->dispatcher->enqueue(std::move(work));
   maybe_start_memory_prefetcher(*state);
-  state->coordinator->run_on_query_thread();
-  if (state->physical_counters && state->physical_counters->track_units) {
-    auto stats = state->coordinator->snapshot();
-    std::lock_guard lock(state->physical_counters->units_mutex);
-    auto& observation         = state->physical_counters->publications_by_query[state->query_token];
-    observation.execute_owner = state->completion->execution_owner;
-    observation.preparation_owner     = stats.owner;
-    observation.preparation_runner    = stats.runner;
-    observation.preparation_publisher = stats.publisher;
-    observation.preparation_runs      = stats.runs;
-    observation.partial_emissions     = stats.partial_emissions;
-    observation.max_residence         = stats.max_residence;
+  state->coordinator->start();
+}
+
+void sirius_scan_manager::await_query_completion(sirius::query_id_t id,
+                                                 std::future<void>& future,
+                                                 std::function<bool()> interrupted)
+{
+  // Retain the attempt through the wait. Registry and execution locks must never
+  // be held while entering a thread-affine provider operation.
+  auto state = get_query_state(id);
+  while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+    bool cancelled = false;
+    try {
+      cancelled = interrupted && interrupted();
+      if (cancelled) throw duckdb::InterruptException();
+    } catch (...) {
+      if (!state || !state->completion) throw;
+      // Record the cause before waking cleanup, which can itself fail.
+      state->completion->report_error(std::current_exception());
+      if (state->coordinator)
+        state->coordinator->request_stop(cancelled ? stop_reason::user_cancel
+                                                   : stop_reason::failure_induced);
+      break;  // Cancellation and health failures must preserve the first execution error.
+    }
+    // One operation per turn: recheck logical completion and cancellation before
+    // another pull. Logical completion still needs the owner's retirement barrier.
+    if (state && state->coordinator) {
+      state->coordinator->pump_provider(std::chrono::milliseconds(25));
+    } else {
+      future.wait_for(std::chrono::milliseconds(25));
+    }
   }
+  future.get();
 }
 
 void sirius_scan_manager::close_preparation(sirius::query_id_t id, stop_reason reason) noexcept
@@ -2306,24 +2363,50 @@ void sirius_scan_manager::query_scan_manager_state::drain() noexcept
   // The engine retires scans while their operators are alive. Window cleanup and state
   // destruction repeat this barrier after a prepared statement may have released its plan.
   // Keep providers alive for batch disposal, but never revisit the borrowed operators.
-  if (std::exchange(drained, true)) { return; }
-  if (coordinator) coordinator->request_stop(stop_reason::normal_eos);
-  if (completion && completion->injections)
-    completion->release_footer_for_testing(completion->injections->hold_footer_index);
-  // Stop the prefetcher first: it holds shared_ptrs to the operators'
-  // connectors and must not convert batches while per-query state is torn down.
-  if (prefetcher) {
-    prefetcher->stop();
-    if (physical_counters && physical_counters->track_units) {
-      try {
-        physical_counters->prefetcher_conversions(query_token, prefetcher->batches_prefetched());
-      } catch (...) {  // Test observation must not interrupt cleanup.
+  {
+    std::lock_guard execution_lock(execution_mutex);
+    if (drained) return;
+    if (!draining) {
+      draining = true;  // Close start admission, not the completed-retirement barrier.
+      if (coordinator) coordinator->request_stop(stop_reason::normal_eos);
+      if (completion && completion->injections)
+        completion->release_footer_for_testing(completion->injections->hold_footer_index);
+      // Prefetch workers do not enter provider code. Stop them before retiring
+      // the coordinator; only this first caller owns their stop/join and reset.
+      if (prefetcher) {
+        prefetcher->stop();
+        if (physical_counters)
+          physical_counters->prefetcher_conversions(query_token, prefetcher->batches_prefetched());
+        prefetcher.reset();
       }
     }
-    prefetcher.reset();
   }
+  // All callers may enter this barrier. An external caller waits while Q pumps
+  // accepted work and close controls; it must not hold a lock Q needs to retire.
   if (coordinator) coordinator->drain();
-  if (!dispatcher) { return; }
+
+  // Provider close has finished. Serialize the remaining resource teardown once,
+  // and only mark drained after every caller can safely observe physical retirement.
+  std::lock_guard execution_lock(execution_mutex);
+  if (drained) return;
+  if (coordinator && physical_counters && physical_counters->track_units) {
+    try {
+      auto stats = coordinator->snapshot();
+      physical_counters->preparation_finished(query_token,
+                                              {.execute_owner         = completion->execution_owner,
+                                               .preparation_owner     = stats.owner,
+                                               .preparation_runner    = stats.runner,
+                                               .preparation_publisher = stats.publisher,
+                                               .preparation_runs      = stats.runs,
+                                               .partial_emissions     = stats.partial_emissions,
+                                               .max_residence         = stats.max_residence});
+    } catch (...) {  // Snapshot observation must not interrupt retirement.
+    }
+  }
+  if (!dispatcher) {
+    drained = true;
+    return;
+  }
   dispatcher->request_stop();
   dispatcher->wait_for_all();
   if (metadata_processor) metadata_processor->close_all_slots();
@@ -2332,12 +2415,10 @@ void sirius_scan_manager::query_scan_manager_state::drain() noexcept
   if (readahead) { readahead->stop(); }
   readahead.reset();
   if (ledger) ledger->close();
-  // Stop while asynchronous work is drained. Final adapter cleanup runs after
-  // the query-wide work barrier, since it may release plan-backed descriptors.
-  for (auto const& entry : scans) {
+  for (auto const& entry : scans)
     entry.op->get_ingestible().stop_preparation();
-  }
   ledger.reset();
+  drained = true;
 }
 
 std::shared_ptr<sirius_scan_manager::query_scan_manager_state> sirius_scan_manager::get_query_state(
@@ -2370,26 +2451,19 @@ void sirius_scan_manager::reset(sirius::query_id_t query_id)
 
 void sirius_scan_manager::drain_query(sirius::query_id_t query_id)
 {
-  std::shared_ptr<query_scan_manager_state> state;
+  auto state = get_query_state(query_id);
+  if (!state) return;
+  // Keep the state discoverable while an external caller waits for Q-owned
+  // work/close. Q may still need to resolve this id in its wait or retirement path.
+  // Neither the registry lock nor a once-only cleanup lock covers this barrier.
+  state->drain();
   {
     std::lock_guard lk{_query_states_mutex};
     auto it = _query_states.find(query_id);
-    if (it != _query_states.end()) {
-      state = std::move(it->second);
-      _query_states.erase(it);
-    }
+    if (it != _query_states.end() && it->second == state) _query_states.erase(it);
   }
-  // Outside the lock on purpose: draining waits out this query's in-flight reads, which can
-  // take as long as the slowest outstanding IO. Holding _query_states_mutex across it would
-  // park another connection's prepare_for_query behind this query's teardown.
-  //
-  // Order matters: stop and join FIRST, then let `state` die. The sequencer task captures the
-  // coalescer by `this` and the split tasks captured the providers, so destroying either with
-  // a task still running is a use-after-free (scoped_dispatcher's dtor asserts on it).
-  // ~query_scan_manager_state then runs: coordinator first, then dispatcher (already idle),
-  // then the coalescer and providers.
-  if (state) { state->drain(); }
-  state.reset();
+  // Destruction stays outside the registry lock, after coordinator and dispatcher
+  // retirement. Concurrent callers retain their own references through the same barrier.
 }
 
 void sirius_scan_manager::reset_all()
@@ -2567,7 +2641,10 @@ void sirius_scan_manager::stop()
 {
   // Every query's scan work must be off the pool before the pool stops: a sequencer parked on
   // a dequeue that will never be satisfied would otherwise never return.
+  // Requires the runtime owner to prevent new queries and finish preparation construction.
+  // Concurrent prepare/stop is outside this manager shutdown contract.
   reset_all();
+  _native_readers.stop();  // Every accepted reader has closed and returned its lease.
   _thread_pool.stop();
 }
 
