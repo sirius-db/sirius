@@ -182,6 +182,7 @@ struct application_result_state {
   std::unique_ptr<cudf::column> row_positions;
   bool like_swar_fastpath = false;
   std::shared_ptr<const sirius::like_multiliteral_cache> like_cache;
+  expression_query_policy policy;
   cudf::size_type residual_rows = 0;
   std::unique_ptr<cudf::ast::tree> tree;
   std::unique_ptr<cudf::column> ast_mask;
@@ -670,7 +671,7 @@ void apply_cascade(application_result_state& result,
 {
   auto current = input;
   if (result.ast_mask) {
-    result.output = sirius::ApplyRetentionMask(current, result.ast_mask->view(), stream, mr);
+    result.output = sirius::apply_retention_mask(current, result.ast_mask->view(), stream, mr);
     current       = result.output->view();
   }
   result.counts[0] = current.num_rows();
@@ -680,7 +681,7 @@ void apply_cascade(application_result_state& result,
       result.mask = step.mask_source->compute_mask(
         current.column(step.column_index), result.program->device_id, stream, mr);
       if (result.mask) {
-        result.output = sirius::ApplyRetentionMask(current, result.mask->view(), stream, mr);
+        result.output = sirius::apply_retention_mask(current, result.mask->view(), stream, mr);
         current       = result.output->view();
         result.contributed[i] = true;
       }
@@ -695,7 +696,7 @@ void compact_row_ids(application_result_state& result,
                      ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
-  result.scratch_table = sirius::ApplyRetentionMask(
+  result.scratch_table = sirius::apply_retention_mask(
     cudf::table_view({result.deferred.row_ids->view()}), mask, stream, mr);
   result.columns          = result.scratch_table->release();
   result.deferred.row_ids = std::move(result.columns.front());
@@ -751,7 +752,7 @@ void apply_deferred_keys(application_result_state& result,
         auto const keep_key =
           i + 1 == steps.size() || steps[i + 1].column_index == step.column_index;
         if (keep_key) {
-          result.scratch_table = sirius::ApplyRetentionMask(
+          result.scratch_table = sirius::apply_retention_mask(
             cudf::table_view({probe, state.row_ids->view()}), result.mask->view(), stream, mr);
           result.columns    = result.scratch_table->release();
           state.aligned_key = detail::aligned_key_column{
@@ -858,7 +859,7 @@ void apply_gather_once(application_result_state& result,
   }
   detail::check_read_checkpoint(detail::read_checkpoint::COUNTS_COPY);
   if (any_contributed(result)) {
-    result.output = sirius::ApplyRetentionMask(input, result.conjunction->view(), stream, mr);
+    result.output = sirius::apply_retention_mask(input, result.conjunction->view(), stream, mr);
   }
 }
 
@@ -881,7 +882,7 @@ void apply_cached(application_result_state& result,
       program.residual.get(),
       mr,
       stream,
-      strategy_from_config(),
+      result.policy,
       sirius::expression_evaluator::default_min_ast_size,
       result.like_swar_fastpath,
       result.like_cache);
@@ -969,13 +970,13 @@ void apply_cached(application_result_state& result,
     result.deferred.row_ids = cudf::sequence(input.num_rows(), *result.zero, stream, mr);
     std::vector<cudf::column_view> columns(projected.begin(), projected.end());
     columns.push_back(result.deferred.row_ids->view());
-    result.scratch_table = sirius::ApplyRetentionMask(cudf::table_view{columns}, keep, stream, mr);
+    result.scratch_table = sirius::apply_retention_mask(cudf::table_view{columns}, keep, stream, mr);
     result.columns       = result.scratch_table->release();
     result.row_positions = std::move(result.columns.back());
     result.columns.pop_back();
     result.output = std::make_unique<cudf::table>(std::move(result.columns));
   } else {
-    result.output = sirius::ApplyRetentionMask(projected, keep, stream, mr);
+    result.output = sirius::apply_retention_mask(projected, keep, stream, mr);
   }
   if (single_mask) { result.counts = {input.num_rows(), result.output->num_rows()}; }
   detail::check_read_checkpoint(detail::read_checkpoint::PAYLOAD_GATHER);
@@ -1293,7 +1294,8 @@ application_result dynamic_filter_consumer::apply(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   bool like_swar_fastpath,
-  std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) const
+  std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+  expression_query_policy policy) const
 {
   if (!program._state || !program._state->cached) {
     throw std::invalid_argument("cached application requires a cached program");
@@ -1302,6 +1304,7 @@ application_result dynamic_filter_consumer::apply(
   state->cached_source      = std::move(source);
   state->like_swar_fastpath = like_swar_fastpath;
   state->like_cache         = std::move(like_cache);
+  state->policy             = policy;
   no_execution_faults faults;
   return run(std::move(program), std::move(state), std::nullopt, stream, mr, faults);
 }

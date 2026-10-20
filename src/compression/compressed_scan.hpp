@@ -20,6 +20,8 @@
 
 #include <cuda/stream>
 
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -38,6 +40,10 @@ class table;
 namespace simpatico {
 class compressed_table;
 }  // namespace simpatico
+
+namespace cucascade::memory {
+class memory_space;
+}  // namespace cucascade::memory
 
 namespace sirius {
 
@@ -305,26 +311,30 @@ class decompression_pushdown_scan {
 };
 
 /**
- * @brief Decompress @p selected columns of @p chunk into a cuDF table.
+ * @brief Decompress selected columns and report which scan filters were applied.
  *
- * With @p scan non-null, as much of its request as this chunk's compression
- * plans allow is applied during the decode; the rest is simply not applied,
- * which is always sound — the request is a conjunction, so an unapplied part
- * only means rows the scan must still reject itself. @ref decompress_result::outcome
- * says what happened. With @p scan null this is an ordinary decompress.
+ * Unsupported filters remain for the scan to evaluate. A declined filtering attempt decodes all
+ * selected columns normally. The visibility mask participates only with a supported filter source;
+ * check pushdown_outcome::visibility_mask_applied before omitting it downstream.
  *
- * @p keep_mask is one additional AND source, keeping a masked chunk eligible for
- * compaction. Never a source on its own; only an applied decode consumes it
- * (@c pushdown_outcome::visibility_mask_applied).
+ * @p tracking_scope must match @p space. Per-stream tracking uses @p stream alone; per-thread
+ * tracking may use private streams ordered after its queued input writes. @p space and @p mr must
+ * belong to the current GPU.
  *
- * Never returns a null table: every way the filtering can decline ends in the
- * plain decode of the same columns.
+ * Results are complete on return. Rebind returned buffers and selection storage to @p stream before
+ * they can outlive the calling thread's private streams.
+ *
+ * @throw std::logic_error if @p space is not on the current GPU, lacks a GPU allocator, or the
+ * private pool has too few streams
  */
-decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
-                                   std::span<const std::size_t> selected,
-                                   decompression_pushdown_scan const* scan,
-                                   decode_visibility_mask const& keep_mask,
-                                   ::cuda::stream_ref stream,
-                                   rmm::device_async_resource_ref mr);
+decompress_result decompress_chunk(
+  simpatico::compressed_table const& chunk,
+  std::span<const std::size_t> selected,
+  decompression_pushdown_scan const* scan,
+  decode_visibility_mask const& keep_mask,
+  cucascade::memory::memory_space const& space,
+  cucascade::memory::reservation_aware_resource_adaptor::AllocationTrackingScope tracking_scope,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
 
 }  // namespace sirius

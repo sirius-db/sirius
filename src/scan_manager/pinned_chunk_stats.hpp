@@ -59,6 +59,22 @@ class pinned_zone_maps {
  public:
   pinned_zone_maps() = default;
 
+  /// Clone sidecar facts while sharing the immutable data columns in a new pin generation.
+  [[nodiscard]] pinned_zone_maps clone() const
+  {
+    pinned_zone_maps result;
+    result._column_types = _column_types;
+    result._column_stats.resize(_column_stats.size());
+    for (std::size_t i = 0; i < _column_stats.size(); ++i) {
+      result._column_stats[i].reserve(_column_stats[i].size());
+      for (auto const& cell : _column_stats[i]) {
+        result._column_stats[i].push_back(
+          cell ? duckdb::make_uniq<duckdb::BaseStatistics>(cell->Copy()) : nullptr);
+      }
+    }
+    return result;
+  }
+
   /**
    * @brief Normalize a pin-time capture into a sidecar.
    *

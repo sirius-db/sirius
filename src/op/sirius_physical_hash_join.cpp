@@ -267,7 +267,9 @@ std::string_view sirius_physical_hash_join::input_port_for(
   sirius_physical_operator const& producer) const
 {
   if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
-    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+    if (children.size() == 2 && children[1].get() == &producer) { return "build"; }
+    if (children.size() == 2 && children[0].get() == &producer) { return "default"; }
+    throw std::logic_error("Join CONCAT producer is not a wired input child");
   }
   return sirius_physical_operator::input_port_for(producer);
 }
@@ -540,8 +542,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     }
     auto const& left_ref  = condition.left->get<sirius::ast::reference>();
     auto const& right_ref = condition.right->get<sirius::ast::reference>();
-    auto const type       = sirius::get_cudf_type(left_ref.return_type());
-    if (type != sirius::get_cudf_type(right_ref.return_type())) {
+    auto const type       = sirius::require_cudf_type(left_ref.return_type());
+    if (type != sirius::require_cudf_type(right_ref.return_type())) {
       throw duckdb::NotImplementedException("Join key operands must have matching physical types");
     }
     bool const hash_key = is_hash_equality_key(condition.comparison, route_null_safe);

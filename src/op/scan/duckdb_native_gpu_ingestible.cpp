@@ -54,6 +54,8 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <stop_token>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -64,6 +66,8 @@ namespace {
 //===----------Batch Coalescer----------===//
 class duckdb_native_batch_coalescer : public batch_coalescer {
  public:
+  std::size_t target_batch_bytes() const noexcept override { return _cap; }
+  std::size_t retained_bytes() const noexcept override { return _acc_bytes; }
   duckdb_native_batch_coalescer(std::size_t approximate_batch_size, std::vector<bool> is_varchar)
     : _cap(approximate_batch_size),
       _is_varchar(std::move(is_varchar)),
@@ -439,7 +443,10 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
   // All ranges read the one `.duckdb` file; the resolver returns a valid ioctx or
   // throws if no backend supports the path.
   // Runs on a scan-manager dispatcher thread:
-  return [this, rg_begin, rg_end, resolve = std::move(resolve)]() -> std::unique_ptr<scan_info> {
+  return [this, rg_begin, rg_end, resolve = std::move(resolve)](
+           std::stop_token stop) -> std::unique_ptr<scan_info> {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto io_ctx = resolve(_info->db_path);
     duckdb_native_row_group_range range;
     try {
@@ -497,7 +504,8 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   ::cucascade::memory::memory_space const& mem_space,
   ::cuda::stream_ref stream,
   bool /*like_swar_fastpath*/,
-  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
+  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/,
+  expression_query_policy /*policy*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (_inject_decode_failure) {
@@ -585,7 +593,8 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* /*survivors*/,
-  std::span<std::size_t const> elided)
+  std::span<std::size_t const> elided,
+  expression_query_policy policy)
 {
   auto const output_arity        = _column_layout.output_data_positions.size();
   auto const decoded_cols        = _column_layout.data_roles.size();
@@ -602,7 +611,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     sirius::expression_evaluator exec(sirius_filter_ast.get(),
                                       mr_ref,
                                       stream,
-                                      strategy_from_config(),
+                                      policy,
                                       sirius::expression_evaluator::default_min_ast_size,
                                       like_swar_fastpath,
                                       std::move(like_cache));

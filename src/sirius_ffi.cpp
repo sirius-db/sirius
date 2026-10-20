@@ -34,13 +34,14 @@
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
 #include "exec/arrow_result_stream.hpp"
-#include "exec/stream_bind_catalog.hpp"   // sirius::exec::stream_bind_catalog
-#include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
-#include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
-#include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
-#include "helper/type_conversions.hpp"    // sirius::from_duckdb
-#include "log/logging.hpp"                // SIRIUS_LOG_INFO
-#include "parquet_extension.hpp"          // duckdb::ParquetExtension
+#include "exec/stream_bind_catalog.hpp"       // sirius::exec::stream_bind_catalog
+#include "exec/stream_plan_bindings.hpp"      // sirius::exec::register_stream_source_function
+#include "exec/streaming_fragment.hpp"        // sirius::exec::streaming_fragment, fragment_spec
+#include "from_substrait.hpp"                 // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "helper/type_conversions.hpp"        // sirius::from_duckdb
+#include "log/logging.hpp"                    // SIRIUS_LOG_INFO
+#include "parquet_extension.hpp"              // duckdb::ParquetExtension
+#include "planner/substrait_scan_ranges.hpp"  // sirius::planner::scan_byte_ranges_state
 #include "planner/unsupported_optimizers.hpp"
 #include "sirius/ffi.hpp"
 #include "sirius_config.hpp"   // sirius::sirius_config
@@ -51,6 +52,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 namespace sirius::ffi {
@@ -74,6 +76,8 @@ void install_log_sink_from_env()
   auto const* log_dir_env = std::getenv("SIRIUS_LOG_DIR");
   auto const* level_env   = std::getenv("SIRIUS_LOG_LEVEL");
   if (!backend_env && !log_dir_env && !level_env) { return; }
+  // Serialize the complete settings update, including rollback if sink creation fails.
+  std::lock_guard log_lock(duckdb::Config::logging_mutex);
   auto previous_backend = duckdb::Config::LOG_BACKEND;
   auto previous_log_dir = duckdb::Config::LOG_DIR;
   auto previous_level   = duckdb::Config::LOG_LEVEL;
@@ -104,6 +108,17 @@ sirius::exec::bound_plan lower_substrait(duckdb::Connection& conn,
                                          const std::string& substrait_plan)
 {
   auto& client = *conn.context;
+
+  // Byte-ranged parquet splits ride the plan's LocalFiles items, but DuckDB's consumer and
+  // parquet binding cannot carry them — extract into a per-plan state the physical plan
+  // generator consumes. Always replaced (and removed when this plan has none), so a stale
+  // registry can never leak a previous plan's ranges into this one.
+  client.registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
+  if (auto ranges = sirius::planner::extract_scan_byte_ranges(substrait_plan); !ranges.empty()) {
+    client.registered_state->Insert(
+      sirius::planner::scan_byte_ranges_state::kStateKey,
+      duckdb::make_shared_ptr<sirius::planner::scan_byte_ranges_state>(std::move(ranges)));
+  }
 
   duckdb::SubstraitToDuckDB transformer(conn.context, substrait_plan, /*json=*/false);
   auto relation = transformer.TransformPlan();
@@ -291,6 +306,7 @@ struct Fragment::Impl {
     std::vector<std::string> names;
     std::vector<std::string> type_names;
     std::set<sirius::exec::sender_id_t> expected_senders;
+    std::optional<std::uint64_t> estimated_rows;
   };
 
   std::map<sirius::exec::stream_id_t, declared_input> inputs;
@@ -330,6 +346,7 @@ struct Fragment::Impl {
       }
       spec.expected_senders = declared.expected_senders;
       if (spec.expected_senders.empty()) { spec.expected_senders.insert(0); }
+      spec.estimated_rows = declared.estimated_rows;
       resolved.emplace(id, std::move(spec));
     }
     return resolved;
@@ -370,6 +387,12 @@ void Fragment::declare_input_sender(std::uint64_t stream_id, std::uint32_t sende
 {
   impl_->require_not_built("declare_input_sender");
   impl_->inputs[stream_id].expected_senders.insert(sender_id);
+}
+
+void Fragment::declare_input_cardinality(std::uint64_t stream_id, std::uint64_t rows)
+{
+  impl_->require_not_built("declare_input_cardinality");
+  impl_->inputs[stream_id].estimated_rows = rows;
 }
 
 void Fragment::declare_output(std::uint64_t stream_id)
@@ -477,6 +500,12 @@ std::size_t Fragment::output_batch_count(std::uint64_t stream_id) const
 {
   if (!impl_->fragment) { return 0; }
   return impl_->fragment->output_batch_count(stream_id);
+}
+
+std::uint64_t Fragment::output_row_count(std::uint64_t stream_id) const
+{
+  impl_->require_built("output_row_count()");
+  return impl_->fragment->output_row_count(stream_id);
 }
 
 std::unique_ptr<std::vector<std::string>> Fragment::output_types() const

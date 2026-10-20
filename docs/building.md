@@ -90,7 +90,7 @@ library without building the extension:
 ```bash
 git submodule update --init duckdb substrait cucascade sirius-duckdb/vcpkg
 VCPKG_CUDA_ARCHITECTURES=100 pixi run -e vcpkg sirius-duckdb/vcpkg/vcpkg install \
-  --x-manifest-root=sirius-duckdb --x-feature=static \
+  --x-manifest-root=sirius-duckdb \
   --x-install-root=build/static-install
 ```
 

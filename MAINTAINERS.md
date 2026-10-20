@@ -7,11 +7,14 @@
 | Amin Aramoon | NVIDIA | aminaramoon |
 | James Bourbeau | NVIDIA | jrbourbeau |
 | Matthijs Brobbel | NVIDIA | mbrobbel |
+| Abel Brown | NVIDIA | infblueocean |
 | Pradeep Garigipati | NVIDIA | 9prady9 |
 | Joost Hoozemans | NVIDIA | joosthooz |
 | Kevin Kristensen | NVIDIA | kevkrist |
+| Mads Kristensen | NVIDIA | madsbk |
 | Andy Lin | UW-Madison |  yayen-lin |
 | William Malpica | NVIDIA | wmalpica |
+| Lawrence Mitchell | NVIDIA | wence- |
 | Akhil Nair | NVIDIA | Jedi18 |
 | Duc Nguyen | UW-Madison | ducndh |
 | Alexander Ocsa| NVIDIA| aocsa |

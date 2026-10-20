@@ -140,7 +140,7 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 
 **File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
-The evaluator supports three strategies, selected via the `strategy` constructor parameter (default from `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`):
+The evaluator supports three strategies, selected via `policy.strategy` in the `expression_query_policy` constructor argument:
 
 | Strategy | How it executes | cuDF API |
 |----------|-----------------|----------|
@@ -171,6 +171,19 @@ The strategy is a DuckDB SET variable registered in `src/sirius_extension.cpp`:
 ```sql
 SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materialize'
 ```
+
+### Policy ownership
+
+At query initialization, Sirius snapshots the connection's settings into immutable
+`operator_params`. Operators derive an `expression_query_policy` from that snapshot and
+pass it to their evaluators. Scan materialization and residual filtering forward the
+same policy explicitly; pin operations supply their own settings snapshot.
+
+Each evaluator owns a constant copy of both the execution strategy and the regex JIT
+flag. Evaluation therefore uses the settings captured at construction, including when
+it runs on a different worker thread. It does not consult thread-local settings or
+mutable process globals. Standalone callers may omit the policy to use fixed defaults
+(`AST_INTERPRET`, regex JIT enabled), or pass an explicit policy.
 
 ## Supported Expression Types
 
@@ -244,6 +257,16 @@ reproduces DuckDB's `RoundOperatorPrecision`: the value is rounded in double pre
 zero. A non-finite result yields the input for `n >= 0` and 0 for `n < 0`. The output is bit
 identical to DuckDB. The precision must be a constant INTEGER.
 DECIMAL and integer inputs and a column precision fall back to the CPU at plan time.
+
+### Absolute value
+
+`abs(x)` on FLOAT, DOUBLE, DECIMAL and the integer types other than HUGEINT maps to
+`function_id::abs` and runs `cudf::unary_operation` with `ABS`. NaN and infinities are preserved and
+`abs(-0.0)` is `0.0`. The result has the input's type. The absolute value of the smallest value of a
+signed integer type wraps in cuDF, where DuckDB raises an overflow error, so the evaluator checks
+with `cudf::contains` whether the input holds that value and throws. The query then falls back to the
+CPU, which raises DuckDB's error. Unsigned integers have no such value and are returned as they are.
+HUGEINT falls back at plan time.
 
 ### Logical AND/OR NULL semantics
 

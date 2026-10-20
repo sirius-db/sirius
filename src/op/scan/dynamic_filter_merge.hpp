@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "expression_evaluator/query_policy.hpp"
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/table/table.hpp>
@@ -330,7 +331,8 @@ class dynamic_filter_consumer {
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     bool like_swar_fastpath                                           = false,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr) const;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
+    expression_query_policy policy                                    = {}) const;
 
   /**
    * @brief Commits optional hints without producing a receipt.

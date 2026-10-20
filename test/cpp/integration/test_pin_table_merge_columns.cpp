@@ -223,10 +223,8 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
     REQUIRE_FALSE(sum_w->HasError());
     REQUIRE(sum_w->Collection().GetValue(0, 0).ToString() == std::to_string(expected_w_sum));
 
-    // A re-pin whose chunk shape disagrees with the existing entry must report the merge
-    // mismatch itself. A host pin holds no chunk_memory_spaces, so re-pinning the same name on
-    // the GPU tier fails the very first merge guard; the storage-matrix shape check runs after
-    // the guards, so the diagnosis names the boundary disagreement and not a matrix shape.
+    // A host pin cannot be extended by the column-major GPU merge path. Report that storage
+    // incompatibility explicitly, before any chunk-boundary or storage-matrix shape check.
     auto host_pin = con.Query("CALL pin_table('" + parquet_path.string() +
                               "', tier='host', name='tier_swap', cols=['k']);");
     REQUIRE(host_pin);
@@ -238,7 +236,8 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
     REQUIRE(gpu_repin);
     REQUIRE(gpu_repin->HasError());
     UNSCOPED_INFO("re-pin error: " << gpu_repin->GetError());
-    REQUIRE(gpu_repin->GetError().find("merge mismatch") != std::string::npos);
+    REQUIRE(gpu_repin->GetError().find("existing pin does not use column-major GPU storage") !=
+            std::string::npos);
     REQUIRE(gpu_repin->GetError().find("column_storage") == std::string::npos);
 
     auto unpin_swap = con.Query("CALL unpin_table('tier_swap');");

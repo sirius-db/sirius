@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 
 namespace cje = codegen::encode::jit;
@@ -108,8 +109,8 @@ int main()
   }
 
   // --- 1. Cold compile of spec_a. ------------------------------------
-  const cjj::CompiledKernel* k1 = nullptr;
-  double cold_ms                = 0;
+  std::shared_ptr<const cjj::CompiledKernel> k1;
+  double cold_ms = 0;
   try {
     cold_ms =
       timed_ms([&] { k1 = cache.get_or_compile_plain(spec_a.source, spec_a.entry_symbol, opts); });
@@ -123,8 +124,8 @@ int main()
   if (cache.size() != 1) return report_fail("cache size != 1 after first insert");
 
   // --- 2. Warm lookup of spec_a — same pointer, fast. ----------------
-  const cjj::CompiledKernel* k2 = nullptr;
-  double warm_ms                = 0;
+  std::shared_ptr<const cjj::CompiledKernel> k2;
+  double warm_ms = 0;
   try {
     warm_ms =
       timed_ms([&] { k2 = cache.get_or_compile_plain(spec_a.source, spec_a.entry_symbol, opts); });
@@ -138,7 +139,7 @@ int main()
   if (cache.size() != 1) return report_fail("cache size grew on warm hit");
 
   // --- 3. Different dtype -> new slot. -------------------------------
-  const cjj::CompiledKernel* k3 = nullptr;
+  std::shared_ptr<const cjj::CompiledKernel> k3;
   try {
     k3 = cache.get_or_compile_plain(spec_b.source, spec_b.entry_symbol, opts);
   } catch (const std::exception& e) {
@@ -151,7 +152,7 @@ int main()
   // --- 4. SAME source, DIFFERENT num_chunks -> SAME slot. ------------
   // Validates the bridge's optimisation that a single compile serves
   // every num_rows for a given (tree, dtype) pair.
-  const cjj::CompiledKernel* k4 = nullptr;
+  std::shared_ptr<const cjj::CompiledKernel> k4;
   try {
     k4 = cache.get_or_compile_plain(spec_a_bigger.source, spec_a_bigger.entry_symbol, opts);
   } catch (const std::exception& e) {
@@ -196,7 +197,7 @@ int main()
   }
 
   // Compile the FOR encode kernels and verify distinct cache slots.
-  const cjj::CompiledKernel* k_for_i32 = nullptr;
+  std::shared_ptr<const cjj::CompiledKernel> k_for_i32;
   try {
     k_for_i32 =
       cache.get_or_compile_plain(spec_for_bp_i32.source, spec_for_bp_i32.entry_symbol, opts);
@@ -209,7 +210,7 @@ int main()
     return report_fail("For{Bitpack}<int32_t> compile returned null");
   }
 
-  const cjj::CompiledKernel* k_for_i64 = nullptr;
+  std::shared_ptr<const cjj::CompiledKernel> k_for_i64;
   try {
     k_for_i64 =
       cache.get_or_compile_plain(spec_for_bp_i64.source, spec_for_bp_i64.entry_symbol, opts);

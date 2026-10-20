@@ -108,9 +108,8 @@ KernelCache& KernelCache::instance()
   return c;
 }
 
-const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& source,
-                                                        const std::string& entry_symbol,
-                                                        const CompileOptions& opts)
+std::shared_ptr<const CompiledKernel> KernelCache::get_or_compile_plain(
+  const std::string& source, const std::string& entry_symbol, const CompileOptions& opts)
 {
   const detail::CompilationRequest request(source, entry_symbol, opts);
   const auto key = detail::request_identity(request.identity_view());
@@ -118,7 +117,7 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
     std::lock_guard<std::mutex> lock(mu_);
     if (auto it = table_.find(key); it != table_.end()) {
       ++g_jit_hits;
-      return &it->second;
+      return it->second;
     }
   }
 
@@ -133,12 +132,13 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
     std::vector<char> bytes;
     if (read_cubin_file(path, bytes)) {
       try {
-        CompiledKernel loaded = load_kernel_from_cubin(std::move(bytes), entry_symbol, source);
+        auto loaded = std::make_shared<const CompiledKernel>(
+          load_kernel_from_cubin(std::move(bytes), entry_symbol, source));
         ++g_jit_disk_hits;
         std::lock_guard<std::mutex> lock(mu_);
         auto [it, inserted] = table_.emplace(std::move(key), std::move(loaded));
         (void)inserted;
-        return &it->second;
+        return it->second;
       } catch (...) {
         // fall through to recompile below
       }
@@ -155,10 +155,11 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
 
   if (!path.empty()) write_cubin_file_atomic(path, fresh.cubin);
 
+  auto kernel = std::make_shared<const CompiledKernel>(std::move(fresh));
   std::lock_guard<std::mutex> lock(mu_);
-  auto [it, inserted] = table_.emplace(std::move(key), std::move(fresh));
+  auto [it, inserted] = table_.emplace(std::move(key), std::move(kernel));
   (void)inserted;
-  return &it->second;
+  return it->second;
 }
 
 std::size_t KernelCache::size() const

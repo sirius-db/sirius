@@ -50,7 +50,7 @@ std::optional<std::vector<cudf::data_type>> try_native_physical_schema(
   std::vector<cudf::data_type> schema;
   schema.reserve(op.types.size());
   for (auto const& type : op.types) {
-    auto const native = sirius::try_get_cudf_type(type);
+    auto const native = sirius::get_cudf_type(type);
     if (!native) { return std::nullopt; }
     schema.push_back(*native);
   }
@@ -60,7 +60,7 @@ std::optional<std::vector<cudf::data_type>> try_native_physical_schema(
 bool native_physical_schema_is_mappable(sirius::op::sirius_physical_operator const& op)
 {
   return std::ranges::all_of(
-    op.types, [](auto const& type) { return sirius::try_get_cudf_type(type).has_value(); });
+    op.types, [](auto const& type) { return sirius::get_cudf_type(type).has_value(); });
 }
 
 bool is_delim_join(sirius::op::sirius_physical_operator const& op) noexcept

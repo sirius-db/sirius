@@ -33,6 +33,8 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/buffer>
+#include <cuda/utility>
 #include <cuda_runtime.h>
 
 #include <api/simpatico_codegen.hpp>
@@ -44,10 +46,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::late_mat {
@@ -286,13 +292,15 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
 
 /// Buffers released from a column on another GPU. They stay alive here until
 /// the copies that read them have been ordered ahead of their frees.
-using retired_buffers = std::vector<std::unique_ptr<rmm::device_buffer>>;
+using retired_buffer  = std::variant<std::unique_ptr<rmm::device_buffer>,
+                                     std::unique_ptr<::cuda::device_buffer<std::byte>>>;
+using retired_buffers = std::vector<retired_buffer>;
 
 /// What a remote gather allocated on the owning GPU: the gather map and, once
 /// handed to the peer copies, the gathered column's buffers.
 ///
 /// The owner's stream reads the consumer's selection indices; the consumer's
-/// stream reads the owner's gathered buffers; rmm frees each buffer on the
+/// stream reads the owner's gathered buffers; each buffer is freed on the
 /// stream it was allocated on. So before anything is freed, on every exit path
 /// including a throw mid-way, each stream is ordered behind the other's queued
 /// reads. All no-throw; if an event fails, the stream waited for is
@@ -313,8 +321,9 @@ class owner_scratch {
   owner_scratch(owner_scratch const&)            = delete;
   owner_scratch& operator=(owner_scratch const&) = delete;
 
-  rmm::device_buffer map;   ///< batch-local indices, copied to the owner
-  retired_buffers retired;  ///< the gathered column's buffers, after release()
+  rmm::device_buffer map;                  ///< batch-local indices, copied to the owner
+  retired_buffers retired;                 ///< the gathered column's buffers, after release()
+  std::unique_ptr<cudf::column> gathered;  ///< owner-device column, until its buffers are retired
 
   /// Order each stream behind the other, then free the owner's buffers. Idempotent.
   void release() noexcept
@@ -332,6 +341,7 @@ class owner_scratch {
     }
     (void)cudaGetLastError();
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{_owner_device}};
+    gathered.reset();
     retired.clear();
     map = rmm::device_buffer{};
   }
@@ -365,19 +375,42 @@ class owner_scratch {
   bool _released = false;
 };
 
-std::unique_ptr<rmm::device_buffer> peer_copy(std::unique_ptr<rmm::device_buffer> source,
-                                              int source_device,
-                                              int destination_device,
-                                              ::cuda::stream_ref stream,
-                                              rmm::device_async_resource_ref mr,
-                                              retired_buffers& retire)
+template <typename Buffer>
+std::unique_ptr<Buffer> peer_copy(std::unique_ptr<Buffer> source,
+                                  int source_device,
+                                  int destination_device,
+                                  ::cuda::stream_ref stream,
+                                  rmm::device_async_resource_ref mr,
+                                  retired_buffers& retire)
 {
-  auto const bytes = source ? source->size() : std::size_t{0};
-  auto copy        = std::make_unique<rmm::device_buffer>(bytes, stream, mr);
-  // Hand the source to the scratch BEFORE queueing a read of it, so a throw
-  // here leaves nothing queued against a buffer about to be freed.
-  rmm::device_buffer const* retained = nullptr;
-  if (source) { retained = retire.emplace_back(std::move(source)).get(); }
+  if constexpr (!std::is_same_v<Buffer, rmm::device_buffer>) {
+    static_assert(std::is_same_v<typename Buffer::value_type, std::byte>,
+                  "peer_copy only supports the cudf null-mask byte buffer type");
+  }
+  auto const bytes       = source ? source->size() : std::size_t{0};
+  Buffer const* retained = nullptr;
+  {
+    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{source_device}};
+    retained = source.get();
+    // Retire first so a later failure leaves the source alive until its readers are ordered.
+    try {
+      if (source) { retire.emplace_back(std::move(source)); }
+    } catch (...) {
+      source.reset();
+      throw;
+    }
+  }
+
+  // Keep a partially allocated consumer buffer inside its device guard so an
+  // exception destroys it with the device that owns its allocation current.
+  rmm::cuda_set_device_raii const destination_guard{rmm::cuda_device_id{destination_device}};
+  auto copy = [&] {
+    if constexpr (std::is_same_v<Buffer, rmm::device_buffer>) {
+      return std::make_unique<Buffer>(bytes, stream, mr);
+    } else {
+      return std::make_unique<Buffer>(stream, mr, bytes, ::cuda::no_init);
+    }
+  }();
   if (bytes > 0) {
     CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
       copy->data(), destination_device, retained->data(), source_device, bytes, stream.get()));
@@ -395,23 +428,44 @@ std::unique_ptr<cudf::column> transfer_column(std::unique_ptr<cudf::column> colu
                                               rmm::device_async_resource_ref mr,
                                               retired_buffers& retire)
 {
-  auto const type       = column->type();
-  auto const size       = column->size();
-  auto const null_count = column->null_count();
-  auto contents         = column->release();
+  rmm::cuda_set_device_raii const destination_guard{rmm::cuda_device_id{destination_device}};
+  cudf::data_type type{};
+  cudf::size_type size{};
+  cudf::size_type null_count{};
+  cudf::column::contents contents;
+  decltype(contents.null_mask) null_mask;
+  {
+    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{source_device}};
+    type       = column->type();
+    size       = column->size();
+    null_count = column->null_count();
+    contents   = column->release();
+  }
 
   std::vector<std::unique_ptr<cudf::column>> children;
-  children.reserve(contents.children.size());
-  for (auto& child : contents.children) {
-    children.push_back(
-      transfer_column(std::move(child), source_device, destination_device, stream, mr, retire));
+  std::unique_ptr<rmm::device_buffer> data;
+  try {
+    children.reserve(contents.children.size());
+    for (auto& child : contents.children) {
+      children.push_back(
+        transfer_column(std::move(child), source_device, destination_device, stream, mr, retire));
+    }
+    data =
+      peer_copy(std::move(contents.data), source_device, destination_device, stream, mr, retire);
+    null_mask = peer_copy(
+      std::move(contents.null_mask), source_device, destination_device, stream, mr, retire);
+    return std::make_unique<cudf::column>(
+      type, size, std::move(*data), std::move(*null_mask), null_count, std::move(children));
+  } catch (...) {
+    children.clear();
+    data.reset();
+    null_mask.reset();
+    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{source_device}};
+    contents.children.clear();
+    contents.data.reset();
+    contents.null_mask.reset();
+    throw;
   }
-  auto data =
-    peer_copy(std::move(contents.data), source_device, destination_device, stream, mr, retire);
-  auto null_mask =
-    peer_copy(std::move(contents.null_mask), source_device, destination_device, stream, mr, retire);
-  return std::make_unique<cudf::column>(
-    type, size, std::move(*data), std::move(*null_mask), null_count, std::move(children));
 }
 
 /// A batch pinned on another GPU: gather its survivors where it lives, then
@@ -450,15 +504,15 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
   cucascade::cuda::cuda_event selection_ready;
   selection_ready.record(stream);
 
-  // Outlives `gathered`, so buffers not yet handed over are freed first.
+  // Owns the gathered column until its buffers have been retired safely.
   owner_scratch scratch{owner_device, owner_stream, consumer_device, stream};
-  std::unique_ptr<cudf::column> gathered;
   std::optional<cucascade::cuda::cuda_event> gathered_ready;
   {
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{owner_device}};
     selection_ready.wait(owner_stream);
     if (selection.dense) {
-      gathered = std::make_unique<cudf::column>(source.uncompressed, owner_stream, owner_mr);
+      scratch.gathered =
+        std::make_unique<cudf::column>(source.uncompressed, owner_stream, owner_mr);
     } else {
       auto const map_bytes = static_cast<std::size_t>(selection.survivors) * sizeof(std::int32_t);
       scratch.map          = rmm::device_buffer(map_bytes, owner_stream, owner_mr);
@@ -468,7 +522,7 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
                                              consumer_device,
                                              map_bytes,
                                              owner_stream.get()));
-      gathered = gather_one(
+      scratch.gathered = gather_one(
         source.uncompressed, int32_map(scratch.map, selection.survivors), owner_stream, owner_mr);
     }
     gathered_ready.emplace();
@@ -477,7 +531,7 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
 
   gathered_ready->wait(stream);
   auto local = transfer_column(
-    std::move(gathered), owner_device, consumer_device, stream, mr, scratch.retired);
+    std::move(scratch.gathered), owner_device, consumer_device, stream, mr, scratch.retired);
   scratch.release();
   return local;
 }

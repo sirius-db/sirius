@@ -319,6 +319,11 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
    * Returns 0 for splits with no a-priori size estimate.
    */
   [[nodiscard]] virtual std::size_t estimated_bytes() const noexcept { return 0; }
+  // Additive decoded work retained from preparation until the consumer takes its batch.
+  [[nodiscard]] virtual std::size_t preparation_bytes() const noexcept
+  {
+    return estimated_working_set_bytes();
+  }
 
   /**
    * @brief Estimated decoded column buffers needed to materialize the split.

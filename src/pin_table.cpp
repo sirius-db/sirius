@@ -153,7 +153,7 @@ cudf::data_type pin_native_type(cudf::data_type decoded_type,
                                 duckdb::LogicalType const* declared_type)
 {
   if (declared_type == nullptr) { return decoded_type; }
-  auto const native = sirius::try_get_cudf_type(sirius::from_duckdb(*declared_type));
+  auto const native = sirius::get_cudf_type(sirius::from_duckdb(*declared_type));
   return native.value_or(decoded_type);
 }
 
@@ -308,7 +308,8 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // post_filter_and_project (which would only apply a row filter or re-project to a
     // query's output layout, neither of which a pin needs). `batch` is borrowed by const
     // ref and outlives the call.
-    auto materialized     = ingestible.materialize_metadata_to_table(*batch, *target, stream);
+    auto materialized = ingestible.materialize_metadata_to_table(
+      *batch, *target, stream, false, nullptr, options.expression_policy);
     auto tbl              = materialized.table.release(stream, target->get_default_allocator());
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
@@ -385,7 +386,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // A pin reads its fixed ingestible on the one ioctx it was given; route every file to it.
     auto task = ingestible.next_split_provider([io_ctx_sp](std::string_view) { return io_ctx_sp; });
     if (!task) { continue; }
-    auto info = task();
+    auto info = task({});
     if (!info) { continue; }
     for (auto& b : coalescer->push(std::move(info))) {
       handle_batch(std::move(b));
@@ -435,9 +436,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   return {};
 }
 
-// Streams for cross-column encode parallelism, one pool per thread and device —
-// the same accessor the decode path uses, so a thread that both pins and
-// decodes holds one pool rather than two.
+// Streams for cross-column encode parallelism, one pool per thread and device.
 simpatico::stream_pool& compress_pool() { return simpatico::thread_device_stream_pool(4); }
 
 // Diagnostic for a compression failure inside a pin sink, shared by both drivers. Reports the real

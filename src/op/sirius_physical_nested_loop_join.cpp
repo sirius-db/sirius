@@ -208,7 +208,9 @@ std::string_view sirius_physical_nested_loop_join::input_port_for(
   sirius_physical_operator const& producer) const
 {
   if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
-    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+    if (children.size() == 2 && children[1].get() == &producer) { return "build"; }
+    if (children.size() == 2 && children[0].get() == &producer) { return "default"; }
+    throw std::logic_error("Join CONCAT producer is not a wired input child");
   }
   return sirius_physical_operator::input_port_for(producer);
 }
@@ -726,7 +728,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       if (expr.holds<sirius::ast::reference>()) {
         auto const& ref   = expr.get<sirius::ast::reference>();
         auto const column = table.column(ref.column_index);
-        if (column.type() == sirius::get_cudf_type(ref.return_type())) {
+        if (column.type() == sirius::require_cudf_type(ref.return_type())) {
           col_views.push_back(column);
           return join_input_index;
         }
@@ -734,7 +736,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       sirius::expression_evaluator evaluator(&expr,
                                              mr,
                                              stream,
-                                             strategy_from_config(),
+                                             expression_policy(),
                                              expression_evaluator::default_min_ast_size,
                                              like_swar_fastpath_enabled(),
                                              like_cache());
