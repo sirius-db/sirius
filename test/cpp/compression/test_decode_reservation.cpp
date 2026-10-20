@@ -353,8 +353,7 @@ TEST_CASE("Compressed facade spreads decode lanes only under per-thread tracking
       CHECK(recorded == task_stream.value());
     } else {
       CHECK(recorded != task_stream.value());
-      CHECK(std::ranges::any_of(pool.streams,
-                                [recorded](auto lane) { return lane.get() == recorded; }));
+      CHECK(std::ranges::find(pool.streams, recorded) != pool.streams.end());
     }
   }
   CHECK(allocator->get_allocated_bytes(task_stream_ref) == 0);

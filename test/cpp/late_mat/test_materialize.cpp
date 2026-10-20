@@ -35,6 +35,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/bit.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
