@@ -15,6 +15,7 @@ use substrait::proto::{
     rel, rel_common, sort_field,
 };
 
+use crate::agg_phase::{self, AggPhase, PartialState};
 use crate::descriptor_table::{DescriptorTable, SlotKey};
 use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
@@ -75,6 +76,10 @@ struct PlanContext<'a> {
     consumed_above: HashMap<i32, Vec<i32>>,
     /// Common-expr columns projects emitted past their descriptor row.
     carried: HashSet<SlotKey>,
+    /// Partial-state column types of the exchanges that feed merge aggregations, keyed by
+    /// exchange node id, then by the slot each measure's state is read through. Computed by
+    /// [`merge_state_columns`] before translation starts.
+    state_columns: HashMap<i32, HashMap<SlotKey, Vec<substrait::proto::Type>>>,
 }
 
 impl<'a> PlanContext<'a> {
@@ -95,6 +100,7 @@ impl<'a> PlanContext<'a> {
             stream_inputs: Vec::new(),
             consumed_above: HashMap::new(),
             carried: HashSet::new(),
+            state_columns: HashMap::new(),
         }
     }
 
@@ -116,6 +122,7 @@ impl TranslatePlan for TPlan {
             return Err(TranslateError::malformed("TPlan.nodes is empty"));
         }
         ctx.consumed_above = common_slots_consumed_above(self, ctx.desc)?;
+        ctx.state_columns = merge_state_columns(self)?;
         let mut cursor = PlanNodeCursor::new(&self.nodes);
         let translated = cursor.translate_next(ctx)?;
         cursor.ensure_consumed()?;
@@ -205,6 +212,10 @@ fn translate_plan_node(
         TPlanNodeType::SORT_NODE => translate_sort(node, children, ctx),
         TPlanNodeType::HASH_JOIN_NODE => translate_hash_join(node, children, ctx),
         TPlanNodeType::NESTLOOP_JOIN_NODE => translate_nestloop_join(node, children, ctx),
+        // ANALYTIC_EVAL_NODE (window functions) is not translated. When it is, follow the BE
+        // (`Analytor::_output_result_chunk`): the node emits its child's row and then its result
+        // tuple (`TAnalyticNode.output_tuple_id`), and window function i fills that tuple's
+        // slot i, counted in descriptor order, as aggregates do in `translate_aggregation`.
         _ => Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
             node_type: node.node_type,
@@ -581,6 +592,74 @@ pub(crate) fn translate_plan(
     })
 }
 
+/// Partial-state column types, per exchange node, for the exchanges that feed merge
+/// aggregations.
+///
+/// The exchange is translated before the merge aggregation above it, but it has to declare
+/// its stream with the columns the partial fragment emits ([`agg_phase::partial_state`]), not
+/// the descriptor's slot types. A measure's first column takes the place of its slot; AVG's
+/// count follows it. In preorder a merge aggregation's only child is the next node; any other
+/// child would hand it partial states this rule cannot type, so that plan is refused.
+fn merge_state_columns(
+    plan: &TPlan,
+) -> Result<HashMap<i32, HashMap<SlotKey, Vec<substrait::proto::Type>>>> {
+    let mut columns = HashMap::new();
+    for (index, node) in plan.nodes.iter().enumerate() {
+        if node.node_type != TPlanNodeType::AGGREGATION_NODE {
+            continue;
+        }
+        // A node without agg_node fails in translate_aggregation with its own error.
+        let Some(agg) = node.agg_node.as_ref() else {
+            continue;
+        };
+        if agg_phase::classify(node.node_id, node.node_type, agg)? != AggPhase::Merge {
+            continue;
+        }
+        let unsupported = |reason| TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason,
+        };
+        let exchange = plan
+            .nodes
+            .get(index + 1)
+            .filter(|child| child.node_type == TPlanNodeType::EXCHANGE_NODE)
+            .ok_or_else(|| {
+                unsupported("a merge aggregation must read its partial states from an exchange")
+            })?;
+        let mut states = HashMap::with_capacity(agg.aggregate_functions.len());
+        for expr in &agg.aggregate_functions {
+            let state = agg_phase::partial_state(
+                node.node_id,
+                node.node_type,
+                agg_phase::measure_function(expr)?,
+            )?;
+            let slot = merge_state_slot(expr).ok_or_else(|| {
+                unsupported("a merge aggregate must read exactly one partial-state slot")
+            })?;
+            if states.insert(slot, state.columns()).is_some() {
+                return Err(unsupported(
+                    "two merge aggregates read the same partial-state slot",
+                ));
+            }
+        }
+        columns.insert(exchange.node_id, states);
+    }
+    Ok(columns)
+}
+
+/// The slot a merge measure reads its partial state through: its only argument, a bare slot
+/// reference.
+fn merge_state_slot(expr: &TExpr) -> Option<SlotKey> {
+    match expr.nodes.as_slice() {
+        [_, argument] if argument.node_type == TExprNodeType::SLOT_REF => argument
+            .slot_ref
+            .as_ref()
+            .map(|slot| SlotKey::new(slot.tuple_id, slot.slot_id)),
+        _ => None,
+    }
+}
+
 /// Common-expr slots, per `PROJECT_NODE`, that an ancestor reads even though no output tuple
 /// materializes them.
 fn common_slots_consumed_above(
@@ -701,11 +780,45 @@ fn translate_exchange(
     let mut schema = ctx
         .desc
         .named_struct_for_tuples(&exchange.input_row_tuples)?;
-    let output_width = schema
-        .r#struct
-        .as_ref()
-        .map(|structure| structure.types.len())
-        .unwrap_or(0);
+    let mut layout = RowLayout::from_tuples(ctx.desc, &exchange.input_row_tuples)?;
+    // Partial states feeding a merge aggregation take their types from the partial-state rule
+    // the sender used, not from the descriptor, and AVG's count adds a column after its slot
+    // (see `merge_state_columns`).
+    if let Some(states) = ctx.state_columns.get(&node.node_id)
+        && let Some(structure) = schema.r#struct.as_mut()
+    {
+        // The merge's slot refs resolve like any other (`RowLayout::resolve`), so they may name
+        // the exchange's slots through another tuple.
+        let mut by_column = HashMap::with_capacity(states.len());
+        for (key, columns) in states {
+            if by_column.insert(layout.resolve(*key)?, columns).is_some() {
+                return Err(TranslateError::UnsupportedPlanNode {
+                    node_id: node.node_id,
+                    node_type: node.node_type,
+                    reason: "two merge aggregates read the same partial-state column",
+                });
+            }
+        }
+        let mut types = Vec::with_capacity(structure.types.len());
+        let mut bindings = Vec::with_capacity(layout.len());
+        for (index, (ty, binding)) in structure.types.drain(..).zip(layout.columns()).enumerate() {
+            match by_column.get(&index) {
+                Some(columns) => {
+                    for (position, column) in columns.iter().enumerate() {
+                        types.push(column.clone());
+                        bindings.push(binding.filter(|_| position == 0));
+                    }
+                }
+                None => {
+                    types.push(ty);
+                    bindings.push(binding);
+                }
+            }
+        }
+        structure.types = types;
+        layout = RowLayout::new(bindings);
+    }
+    let output_width = layout.len();
     if input.names.len() != output_width {
         return Err(TranslateError::descriptor(format!(
             "row layout {:?} has {} fields but exchange input has {} names",
@@ -742,7 +855,7 @@ fn translate_exchange(
 
     let mut translated = TranslatedRel {
         rel: stream_read_rel(schema, &input.stream_view),
-        layout: RowLayout::from_tuples(ctx.desc, &exchange.input_row_tuples)?,
+        layout,
     };
     if let Some(sort_info) = &exchange.sort_info {
         let sorts = sort_fields(sort_info, &translated, ctx)?;
@@ -767,9 +880,12 @@ fn stream_read_rel(schema: substrait::proto::NamedStruct, stream_view: &str) -> 
 
 /// Translates an `AGGREGATION_NODE` into a Substrait aggregate relation.
 ///
-/// The node's phase (one-shot / partial / merge, see [`crate::agg_phase::classify`]) decides whether
-/// two-phase SUM is accepted. One-phase accepts every supported aggregate; partial and merge
-/// accept **SUM only**. The output row layout is the aggregation output tuple.
+/// The node's phase (one-shot / partial / merge, see [`agg_phase::classify`]) decides what
+/// each measure becomes. One-phase accepts every supported aggregate. Partial and merge
+/// accept SUM, COUNT, MIN, MAX and AVG: a partial measure emits its partial state and a merge
+/// measure combines partial states, both as [`agg_phase::partial_state`] says. The output row
+/// layout is the tuple the node emits: its output tuple, or its intermediate tuple when it
+/// doesn't finalize. A partial AVG adds an unbound count column after its slot's.
 fn translate_aggregation(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
@@ -781,15 +897,16 @@ fn translate_aggregation(
         context: "AGGREGATION_NODE",
         field: "agg_node",
     })?;
-    let phase = crate::agg_phase::classify(node.node_id, node.node_type, agg)?;
-    if agg.intermediate_tuple_id != agg.output_tuple_id {
-        return Err(TranslateError::UnsupportedPlanNode {
-            node_id: node.node_id,
-            node_type: node.node_type,
-            reason: "aggregation node has distinct intermediate and output tuples",
-        });
-    }
-    let output_tuple = agg.output_tuple_id;
+    let phase = agg_phase::classify(node.node_id, node.node_type, agg)?;
+    // Like the BE (`Aggregator::_build_output_chunk`), a finalizing node emits its output tuple
+    // and a non-finalizing one its intermediate tuple. Grouping key i is that tuple's
+    // materialized slot i and aggregate i its slot `keys + i`, counted in descriptor order, not
+    // by slot id. The FE's planner gives both ids the same tuple today.
+    let output_tuple = if agg.need_finalize {
+        agg.output_tuple_id
+    } else {
+        agg.intermediate_tuple_id
+    };
 
     let grouping_exprs = agg.grouping_exprs.as_deref().unwrap_or_default();
     let mut grouping_expressions = Vec::with_capacity(grouping_exprs.len());
@@ -837,12 +954,23 @@ fn translate_aggregation(
         }
     }
 
+    let keys = grouping_expressions.len();
     let mut measures = Vec::with_capacity(agg.aggregate_functions.len());
-    for (expr, slot_id) in agg
-        .aggregate_functions
-        .iter()
-        .zip(&output_slots[grouping_expressions.len()..])
-    {
+    // What the node emits past its keys, per output column; see `finish_aggregation`.
+    let mut outputs = Vec::with_capacity(agg.aggregate_functions.len());
+    for (expr, slot_id) in agg.aggregate_functions.iter().zip(&output_slots[keys..]) {
+        let slot = SlotKey::new(output_tuple, *slot_id);
+        let function = agg_phase::measure_function(expr)?;
+        // A two-phase measure's partial state (and so its merge function) comes from one rule
+        // both fragments share; see `agg_phase::partial_state`.
+        let state = match phase {
+            AggPhase::OneShot => None,
+            AggPhase::Partial | AggPhase::Merge => Some(agg_phase::partial_state(
+                node.node_id,
+                node.node_type,
+                function,
+            )?),
+        };
         let mut expr_ctx = ctx.expr_context(&child.layout);
         let call = expr_translator::aggregate_call(expr, &mut expr_ctx)?;
         // The GPU ungrouped-aggregate operator rejects every distinct aggregate, so a
@@ -854,52 +982,156 @@ fn translate_aggregation(
                 reason: "distinct aggregates without grouping keys are not supported",
             });
         }
-        if phase != crate::agg_phase::AggPhase::OneShot && (call.distinct || call.name != "sum") {
-            return Err(TranslateError::UnsupportedPlanNode {
-                node_id: node.node_id,
-                node_type: node.node_type,
-                reason: "two-phase aggregation supports SUM only",
-            });
-        }
-        let output_type = ctx
-            .desc
-            .slot(output_tuple, *slot_id)?
-            .substrait_type
-            .clone()
-            .ok_or(TranslateError::MissingField {
-                context: "aggregate output slot",
-                field: "slotType",
-            })?;
-        // `count` lives in the generic aggregate extension; sum/avg/min/max are declared by
-        // the arithmetic extension.
-        let urn = if call.name == "count" {
-            URN_AGGREGATE
-        } else {
-            URN_ARITHMETIC
+        let final_type = || {
+            ctx.desc
+                .slot(output_tuple, *slot_id)?
+                .substrait_type
+                .clone()
+                .ok_or(TranslateError::MissingField {
+                    context: "aggregate output slot",
+                    field: "slotType",
+                })
         };
-        let anchor = ctx.registry.register_function(urn, &call.name);
-        measures.push(aggregate_rel::Measure {
-            measure: Some(AggregateFunction {
-                function_reference: anchor,
-                arguments: call
-                    .arguments
-                    .into_iter()
-                    .map(|expr| substrait::proto::FunctionArgument {
-                        arg_type: Some(function_argument::ArgType::Value(expr)),
-                    })
-                    .collect(),
-                output_type: Some(output_type),
-                invocation: if call.distinct {
-                    substrait::proto::aggregate_function::AggregationInvocation::Distinct as i32
+        match (phase, state) {
+            (AggPhase::Partial, Some(PartialState::Average { sum })) => {
+                // AVG ships the sum of its input and then its count. A decimal input is summed
+                // as it is, exactly; any other is cast to FP64 first.
+                let [argument] = <[Expression; 1]>::try_from(call.arguments)
+                    .map_err(|_| TranslateError::malformed("avg must have exactly one argument"))?;
+                let argument = if is_decimal(&sum) {
+                    argument
                 } else {
-                    substrait::proto::aggregate_function::AggregationInvocation::All as i32
-                },
-                ..Default::default()
-            }),
-            filter: None,
-        });
+                    cast_to(type_mapper::fp64_type(true), argument)
+                };
+                // The count has no slot of its own.
+                for (name, ty, binding) in [
+                    ("sum", sum, Some(slot)),
+                    ("count", type_mapper::i64_type(true), None),
+                ] {
+                    measures.push(aggregate_measure(
+                        ctx.registry,
+                        name,
+                        vec![argument.clone()],
+                        ty,
+                        false,
+                    ));
+                    let column = keys + measures.len() - 1;
+                    outputs.push((MeasureOutput::Column { column, cast: None }, binding));
+                }
+            }
+            (AggPhase::Merge, Some(PartialState::Average { sum })) => {
+                // The exchange carries the sum in the slot's column and the count in the next
+                // one (see `translate_exchange`). Sum each, then divide.
+                let sum_column =
+                    child.layout.resolve(merge_state_slot(expr).ok_or_else(|| {
+                        TranslateError::malformed("a merge avg must read one partial-state slot")
+                    })?)?;
+                for (column, ty) in [
+                    (sum_column, sum),
+                    (sum_column + 1, type_mapper::i64_type(true)),
+                ] {
+                    measures.push(aggregate_measure(
+                        ctx.registry,
+                        "sum",
+                        vec![field_selection(column as i32)],
+                        ty,
+                        false,
+                    ));
+                }
+                outputs.push((
+                    MeasureOutput::Average {
+                        sum: keys + measures.len() - 2,
+                        count: keys + measures.len() - 1,
+                        ty: final_type()?,
+                    },
+                    Some(slot),
+                ));
+            }
+            // A one-phase AVG over decimals: StarRocks' exact DECIMAL128(38, s+6) average is
+            // the decimal sum divided by the count, rounded (see `finish_aggregation`). DuckDB's
+            // avg(DECIMAL) would return DOUBLE.
+            (AggPhase::OneShot, None) if call.name == "avg" && is_decimal(&final_type()?) => {
+                let [argument] = <[Expression; 1]>::try_from(call.arguments)
+                    .map_err(|_| TranslateError::malformed("avg must have exactly one argument"))?;
+                for (name, ty) in [
+                    (
+                        "sum",
+                        agg_phase::average_sum_type(node.node_id, node.node_type, function)?,
+                    ),
+                    ("count", type_mapper::i64_type(true)),
+                ] {
+                    measures.push(aggregate_measure(
+                        ctx.registry,
+                        name,
+                        vec![argument.clone()],
+                        ty,
+                        false,
+                    ));
+                }
+                outputs.push((
+                    MeasureOutput::Average {
+                        sum: keys + measures.len() - 2,
+                        count: keys + measures.len() - 1,
+                        ty: final_type()?,
+                    },
+                    Some(slot),
+                ));
+            }
+            (phase, state) => {
+                let (function_name, output_type) = match (phase, state) {
+                    (AggPhase::Partial, Some(PartialState::Column { ty, .. })) => {
+                        // MIN/MAX emit their argument's type. The merge fragment declares the
+                        // exchange column with the rule's type, so the two have to agree.
+                        if matches!(call.name.as_str(), "min" | "max") {
+                            let emitted = match expr.nodes.get(1) {
+                                Some(argument) => Some(type_mapper::duckdb_type_name(
+                                    &type_mapper::map_type_desc(&argument.type_, true)?,
+                                )?),
+                                None => None,
+                            };
+                            if emitted != Some(type_mapper::duckdb_type_name(&ty)?) {
+                                return Err(TranslateError::UnsupportedPlanNode {
+                                    node_id: node.node_id,
+                                    node_type: node.node_type,
+                                    reason: "two-phase MIN/MAX whose argument type differs from \
+                                             its return type is not supported",
+                                });
+                            }
+                        }
+                        (call.name.clone(), ty)
+                    }
+                    // The merge step applies the rule's merge function (COUNT merges as SUM)
+                    // and returns the final value the output slot declares.
+                    (AggPhase::Merge, Some(PartialState::Column { merge_function, .. })) => {
+                        (merge_function.to_string(), final_type()?)
+                    }
+                    _ => (call.name.clone(), final_type()?),
+                };
+                // Some sums are cast to their declared type; see `finish_aggregation`.
+                let cast = ((phase != AggPhase::OneShot
+                    && function_name == "sum"
+                    && is_integer(&output_type))
+                    || (function_name == "sum" && is_decimal(&output_type)))
+                .then(|| output_type.clone());
+                measures.push(aggregate_measure(
+                    ctx.registry,
+                    &function_name,
+                    call.arguments,
+                    output_type,
+                    call.distinct,
+                ));
+                outputs.push((
+                    MeasureOutput::Column {
+                        column: keys + measures.len() - 1,
+                        cast,
+                    },
+                    Some(slot),
+                ));
+            }
+        }
     }
 
+    let measure_count = measures.len();
     let groupings = if grouping_expressions.is_empty() {
         Vec::new()
     } else {
@@ -920,14 +1152,179 @@ fn translate_aggregation(
                 ..Default::default()
             }))),
         },
+        // `finish_aggregation` binds the measure columns.
         layout: RowLayout::new(
-            output_slots
-                .into_iter()
-                .map(|slot_id| Some(SlotKey::new(output_tuple, slot_id))),
+            output_slots[..keys]
+                .iter()
+                .map(|slot_id| Some(SlotKey::new(output_tuple, *slot_id)))
+                .chain(std::iter::repeat_n(None, measure_count)),
         ),
     };
+    let finished = finish_aggregation(aggregated, keys, outputs, ctx)?;
     // Node conjuncts evaluate over the aggregation output (HAVING predicates).
-    apply_conjuncts(aggregated, node, ctx)
+    apply_conjuncts(finished, node, ctx)
+}
+
+/// One output column of an aggregation past its grouping keys.
+enum MeasureOutput {
+    /// Aggregate column `column`, cast to `cast` when set.
+    Column {
+        column: usize,
+        cast: Option<substrait::proto::Type>,
+    },
+    /// A merged AVG: the summed sums in column `sum` divided by the summed counts in column
+    /// `count`, as `ty`.
+    Average {
+        sum: usize,
+        count: usize,
+        ty: substrait::proto::Type,
+    },
+}
+
+/// Builds one aggregate measure.
+fn aggregate_measure(
+    registry: &mut ExtensionRegistry,
+    name: &str,
+    arguments: Vec<Expression>,
+    output_type: substrait::proto::Type,
+    distinct: bool,
+) -> aggregate_rel::Measure {
+    // `count` lives in the generic aggregate extension; sum/avg/min/max are declared by the
+    // arithmetic extension.
+    let urn = if name == "count" {
+        URN_AGGREGATE
+    } else {
+        URN_ARITHMETIC
+    };
+    let anchor = registry.register_function(urn, name);
+    aggregate_rel::Measure {
+        measure: Some(AggregateFunction {
+            function_reference: anchor,
+            arguments: arguments
+                .into_iter()
+                .map(|expr| substrait::proto::FunctionArgument {
+                    arg_type: Some(function_argument::ArgType::Value(expr)),
+                })
+                .collect(),
+            output_type: Some(output_type),
+            invocation: if distinct {
+                substrait::proto::aggregate_function::AggregationInvocation::Distinct as i32
+            } else {
+                substrait::proto::aggregate_function::AggregationInvocation::All as i32
+            },
+            ..Default::default()
+        }),
+        filter: None,
+    }
+}
+
+/// Binds the aggregate's columns to the node's output row, projecting them into it when they
+/// aren't it already.
+///
+/// - DuckDB binds `sum` over an integer column to HUGEINT whatever output type the plan
+///   declares, and cuDF has no 128-bit integer: an exchange typed BIGINT then refuses the
+///   column, and a HUGEINT literal can't reach the GPU. StarRocks sums integers into BIGINT, so
+///   a two-phase plan casts each integer `sum` (including COUNT's merge, a `sum` of counts) back
+///   to the type the shared partial-state rule declares.
+/// - A decimal `sum` is cast to the FE's `DECIMAL128(38,s)`. DuckDB's exact decimal sum returns
+///   the same type, so this only pins it.
+/// - A decimal AVG, one-phase or merged, is its decimal sum divided by its count with
+///   `sirius_decimal_divide` at the FE's result scale: StarRocks' exact `DECIMAL128(38, s+6)`,
+///   rounded half away from zero. A merged count is a sum of counts, cast back to BIGINT the same
+///   way.
+/// - A merged AVG over integers or doubles divides in FP64, as DuckDB's avg does.
+fn finish_aggregation(
+    aggregated: TranslatedRel,
+    keys: usize,
+    outputs: Vec<(MeasureOutput, Option<SlotKey>)>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    let unchanged = outputs.len() + keys == aggregated.layout.len()
+        && outputs.iter().enumerate().all(|(index, (output, _))| {
+            matches!(output, MeasureOutput::Column { column, cast: None } if *column == keys + index)
+        });
+    if unchanged {
+        let layout = RowLayout::new(
+            aggregated
+                .layout
+                .columns()
+                .take(keys)
+                .chain(outputs.into_iter().map(|(_, binding)| binding)),
+        );
+        return Ok(TranslatedRel {
+            layout,
+            ..aggregated
+        });
+    }
+    let key_columns: Vec<_> = aggregated.layout.columns().take(keys).collect();
+    let mut columns: Vec<_> = key_columns
+        .into_iter()
+        .enumerate()
+        .map(|(column, binding)| (field_selection(column as i32), binding))
+        .collect();
+    for (output, binding) in outputs {
+        let expression = match output {
+            MeasureOutput::Column { column, cast } => {
+                let field = field_selection(column as i32);
+                match cast {
+                    Some(ty) => cast_to(ty, field),
+                    None => field,
+                }
+            }
+            MeasureOutput::Average { sum, count, ty } if is_decimal(&ty) => {
+                let count = cast_to(type_mapper::i64_type(true), field_selection(count as i32));
+                expr_translator::decimal_divide(
+                    ctx.registry,
+                    field_selection(sum as i32),
+                    count,
+                    &ty,
+                )?
+            }
+            MeasureOutput::Average { sum, count, ty } => {
+                let fp64 = type_mapper::fp64_type(true);
+                let count = cast_to(
+                    fp64.clone(),
+                    cast_to(type_mapper::i64_type(true), field_selection(count as i32)),
+                );
+                let anchor = ctx.registry.register_function(URN_ARITHMETIC, "divide");
+                let average = expr_translator::scalar_function(
+                    anchor,
+                    vec![field_selection(sum as i32), count],
+                    fp64.clone(),
+                );
+                if ty.kind == fp64.kind {
+                    average
+                } else {
+                    cast_to(ty, average)
+                }
+            }
+        };
+        columns.push((expression, binding));
+    }
+    Ok(project_rel(aggregated, columns))
+}
+
+/// A throwing cast of `input` to `ty`.
+fn cast_to(ty: substrait::proto::Type, input: Expression) -> Expression {
+    Expression {
+        rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+            r#type: Some(ty),
+            input: Some(Box::new(input)),
+            failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+        }))),
+    }
+}
+
+fn is_decimal(ty: &substrait::proto::Type) -> bool {
+    matches!(ty.kind, Some(substrait::proto::r#type::Kind::Decimal(_)))
+}
+
+fn is_integer(ty: &substrait::proto::Type) -> bool {
+    use substrait::proto::r#type::Kind;
+    matches!(
+        ty.kind,
+        Some(Kind::I8(_) | Kind::I16(_) | Kind::I32(_) | Kind::I64(_))
+    )
 }
 
 /// Translates a `SORT_NODE` into a Substrait sort (plus the fetch added by `apply_fetch` for
@@ -1532,7 +1929,18 @@ fn project_exprs_with_context(
     let mut expressions = Vec::with_capacity(exprs.len());
     for expr in exprs {
         let mut expr_ctx = ctx.expr_context(&input.layout);
-        expressions.push(expr.translate(&mut expr_ctx)?);
+        let mut expression = expr.translate(&mut expr_ctx)?;
+        // A decimal output is cast to the type the FE declared for it, so the result carries
+        // StarRocks' precision and scale and prints as that decimal (#1687).
+        if let Some(root) = expr.nodes.first()
+            && expr_translator::is_decimal(&root.type_)?
+        {
+            let ty = type_mapper::map_type_desc(&root.type_, root.is_nullable.unwrap_or(true))?;
+            if !expr_translator::is_typed_as(&expression, &ty, ctx.registry) {
+                expression = expr_translator::cast(ty, expression);
+            }
+        }
+        expressions.push(expression);
     }
     let bindings = exprs.iter().map(|expr| match expr.nodes.as_slice() {
         [node] if node.node_type == TExprNodeType::SLOT_REF => node

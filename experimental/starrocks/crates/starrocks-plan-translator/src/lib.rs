@@ -31,7 +31,7 @@
 //! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
 //! | `SELECT_NODE`        | `FilterRel`        |
 //! | `PROJECT_NODE`       | `ProjectRel` (common slots materialized first as hidden `ProjectRel`s) |
-//! | `AGGREGATION_NODE`   | `AggregateRel` (one-phase, or two-phase `SUM` via `agg_phase`) |
+//! | `AGGREGATION_NODE`   | `AggregateRel` (one-phase, or two-phase `SUM`/`COUNT`/`MIN`/`MAX`/`AVG` via `agg_phase`) |
 //! | `EXCHANGE_NODE`      | `ReadRel` (named table = the engine's `sirius_stream_<node_id>` view) |
 //! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
 //! | `HASH_JOIN_NODE`      | `JoinRel` (inner/outer/left-semi; left/right anti as outer join + `is_null` filter, null-aware left anti as mark join + `not`) |
@@ -51,15 +51,18 @@
 //! | `COMPOUND_PRED`   | boolean function (`and`, `or`, `not`) |
 //! | `CAST_EXPR`       | cast (throwing failure behavior) |
 //! | `IS_NULL_PRED`    | `is_null` / `is_not_null` |
-//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply`/`divide`/`modulus` (decimal operands in FP64) |
+//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply` (decimal: exact, cast to the FE type), `divide` (decimal: exact `sirius_decimal_divide`), `modulus` (decimal: FP64, zero divisor gives NULL) |
 //! | `IN_PRED`         | singular-or-list (wrapped in `not` for `NOT IN`) |
 //! | `CASE_EXPR`       | if-then chain (no leading case operand) |
 //! | `FUNCTION_CALL`   | allowlisted scalar functions (`like`, `if`, `substring`, `year`, ...) |
 //!
 //! Aggregate functions (`sum`, `count`, `min`, `max`, `avg`, and the
 //! `multi_distinct_*` distinct forms) are decomposed by `expr_translator::aggregate_call` for
-//! `AggregateRel` measures. Two-phase plans accept **SUM only** (partial and merge both stay
-//! `sum`); every other aggregate, distinct forms included, is rejected in a partial/merge node.
+//! `AggregateRel` measures. Two-phase plans accept SUM, COUNT, MIN, MAX and AVG: the partial
+//! step emits each measure's partial-state columns and the merge step combines them (`sum`,
+//! `sum` of the counts, `min`, `max`, and for AVG a sum and a BIGINT count that the merge sums
+//! and divides); `agg_phase::partial_state` types those columns for both fragments.
+//! Distinct in a partial/merge node is rejected.
 //!
 //! Type mapping lives in `type_mapper`. Intentional v1 omissions return
 //! [`TranslateError::UnsupportedType`]: `LARGEINT` (128-bit), `DECIMAL256` and
@@ -67,11 +70,16 @@
 //! non-scalar type nodes. `JSON`/`VARIANT` are surfaced as strings until richer
 //! support lands.
 //!
-//! Decimal arithmetic is **not exact**. `ARITHMETIC_EXPR` over decimal operands, and decimal
-//! `sum`/`avg`, are evaluated in FP64 because the GPU expression and aggregate paths cannot
-//! consume decimal arithmetic; decimal slots of precision &gt; 18 likewise map to FP64. Results
-//! are not cast back, so a column the frontend declared DECIMAL can arrive as a double and
-//! differ from StarRocks in its final digits.
+//! Decimals stay DECIMAL(p,s) at every precision up to 38. Decimal `+ - *`, SUM, MIN, MAX and
+//! comparisons are exact, and each arithmetic result and decimal SUM is cast to the type the
+//! frontend declared, which DuckDB's binder would otherwise narrow. A product the frontend types
+//! wider than 18 digits is computed in DECIMAL128, as StarRocks does. The decimal outputs of a
+//! result fragment are cast to the frontend's types too, so they print as StarRocks' decimals.
+//! Decimal AVG and `/` are exact too, although DuckDB computes them only in DOUBLE: a decimal
+//! AVG is its exact sum and count, and both divide with Sirius' `sirius_decimal_divide` at the
+//! frontend's result scale, rounded half away from zero, as StarRocks computes them. Decimal MOD
+//! runs in FP64, cast to the declared decimal type; that cast must round, which needs
+//! sirius-db/sirius#2124.
 //!
 //! # Adding a node
 //!
@@ -481,6 +489,13 @@ impl ExtensionRegistry {
         });
         self.function_map.insert(function_key, function_anchor);
         function_anchor
+    }
+
+    /// The anchor of a function already registered, if any.
+    pub(crate) fn function_anchor(&self, urn: &str, name: &str) -> Option<u32> {
+        self.function_map
+            .get(&(urn.to_string(), name.to_string()))
+            .copied()
     }
 
     /// Registers or reuses a URN anchor for an extension URN.
