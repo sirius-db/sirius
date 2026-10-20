@@ -41,7 +41,6 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/null_mask.hpp>
-#include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/search.hpp>
 #include <cudf/strings/attributes.hpp>
@@ -65,7 +64,6 @@
 // standard library
 #include <algorithm>
 #include <cstddef>
-#include <cstdint>
 #include <limits>
 #include <optional>
 #include <regex>
@@ -79,26 +77,25 @@ using evaluate_result = expression_evaluator::evaluate_result;
 
 namespace {
 
-// Whether a signed integer column holds the minimum of its type, the one value whose negation
-// does not fit. DuckDB raises an error there instead of wrapping. DECIMAL and floating point
-// values always negate. Reading the reduction synchronizes the stream.
+// Whether a signed integer column holds its type's minimum, whose negation and abs overflow.
+// Synchronizes the stream.
 bool holds_signed_minimum(cudf::column_view const& column,
                           ::cuda::stream_ref stream,
                           rmm::device_async_resource_ref mr)
 {
-  auto const holds = [&]<typename T>() {
-    auto const min = cudf::reduce(
-      column, *cudf::make_min_aggregation<cudf::reduce_aggregation>(), column.type(), stream, mr);
-    auto const& typed = static_cast<cudf::numeric_scalar<T> const&>(*min);
-    return typed.is_valid(stream) && typed.value(stream) == std::numeric_limits<T>::min();
-  };
-  switch (column.type().id()) {
-    case cudf::type_id::INT8: return holds.template operator()<int8_t>();
-    case cudf::type_id::INT16: return holds.template operator()<int16_t>();
-    case cudf::type_id::INT32: return holds.template operator()<int32_t>();
-    case cudf::type_id::INT64: return holds.template operator()<int64_t>();
-    default: return false;
+  if (!cudf::is_integral(column.type()) || cudf::is_unsigned(column.type()) || column.is_empty()) {
+    return false;
   }
+  auto const lowest =
+    cudf::type_dispatcher(column.type(), [&]<typename T>() -> std::unique_ptr<cudf::scalar> {
+      if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
+        return std::make_unique<cudf::numeric_scalar<T>>(
+          std::numeric_limits<T>::lowest(), true, stream, mr);
+      } else {
+        throw internal_exception("holds_signed_minimum needs a signed integer type");
+      }
+    });
+  return cudf::contains(column, *lowest, stream);
 }
 
 }  // namespace
@@ -511,26 +508,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       input = evaluate_result(
         cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
     }
-    // In cuDF the absolute value of the smallest value of a signed integer type wraps to a negative
-    // value. DuckDB raises an overflow error, so we check for the smallest value of the type
-    // and throw manually here to match DuckDB.
+    // cuDF wraps abs of a signed minimum; fall back so DuckDB raises its overflow error.
     auto const column = input.get_column_view();
-    if (cudf::is_integral(column.type()) && !cudf::is_unsigned(column.type()) &&
-        column.size() > 0) {
-      auto const lowest =
-        cudf::type_dispatcher(column.type(), [&]<typename T>() -> std::unique_ptr<cudf::scalar> {
-          if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
-            return std::make_unique<cudf::numeric_scalar<T>>(
-              std::numeric_limits<T>::lowest(), true, _stream, _mr);
-          } else {
-            throw internal_exception("abs overflow check needs a signed integer type");
-          }
-        });
-      if (cudf::contains(column, *lowest, _stream)) {
-        throw not_implemented_exception(
-          "[expression_evaluator:function] abs overflows for the smallest value of a signed "
-          "integer type, expected to fall back to CPU execution");
-      }
+    if (holds_signed_minimum(column, _stream, _mr)) {
+      throw not_implemented_exception(
+        "[expression_evaluator:function] abs overflows for the smallest value of a signed "
+        "integer type, expected to fall back to CPU execution");
     }
     return evaluate_result(cudf::unary_operation(column, cudf::unary_operator::ABS, _stream, _mr));
   }

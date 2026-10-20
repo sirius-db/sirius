@@ -568,14 +568,22 @@ namespace {
 
 // DuckDB binds unary minus and unary plus as one-argument "-" and "+" on the operand's type.
 duckdb::unique_ptr<BoundFunctionExpression> make_unary_arithmetic(std::string const& name,
-                                                                  LogicalType const& type)
+                                                                  LogicalType const& type,
+                                                                  LogicalType const& return_type)
 {
   auto expr = duckdb::make_uniq<BoundFunctionExpression>(
-    duckdb::BoundScalarFunction(ScalarFunction(duckdb::Identifier(name), {type}, type, nullptr)),
+    duckdb::BoundScalarFunction(
+      ScalarFunction(duckdb::Identifier(name), {type}, return_type, nullptr)),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
     nullptr);
   expr->GetChildrenMutable().push_back(duckdb::make_uniq<BoundReferenceExpression>(type, 0));
   return expr;
+}
+
+duckdb::unique_ptr<BoundFunctionExpression> make_unary_arithmetic(std::string const& name,
+                                                                  LogicalType const& type)
+{
+  return make_unary_arithmetic(name, type, type);
 }
 
 }  // namespace
@@ -619,6 +627,16 @@ TEST_CASE("ast_from_duckdb - one-argument '-' on a type the GPU cannot negate re
                              LogicalType(LogicalType::INTERVAL));
   CAPTURE(type.ToString());
   REQUIRE_FALSE(sirius::ast::from_duckdb(*make_unary_arithmetic("-", type)));
+}
+
+TEST_CASE(
+  "ast_from_duckdb - one-argument '-' with a result type wider than its operand returns "
+  "nullptr",
+  "[ast_from_duckdb][negate]")
+{
+  // cuDF's negation keeps the operand type, so it cannot produce a wider result.
+  REQUIRE_FALSE(sirius::ast::from_duckdb(
+    *make_unary_arithmetic("-", LogicalType::TINYINT, LogicalType::SMALLINT)));
 }
 
 TEST_CASE("ast_from_duckdb - one-argument '+' translates to its operand",

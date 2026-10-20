@@ -241,9 +241,7 @@ class gpu_expression_translator {
   std::optional<expr_ref> add_function_expression(sirius::ast::function_call const& alt,
                                                   cudf::ast::table_reference const table_src)
   {
-    // This helper builds a binary cuDF operation. Its callers pass only the
-    // arithmetic ids, which function_call constructs with exactly two arguments
-    // (unary negation is function_id::negate).
+    // Binary arithmetic only; function_call guarantees two arguments.
     // Translate children
     auto left_expr  = add_expression(*alt.arguments()[0], table_src);
     auto right_expr = add_expression(*alt.arguments()[1], table_src);
