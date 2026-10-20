@@ -42,7 +42,7 @@
 // `ast_op_count >= _min_ast_size` check.
 //
 // The method name carries the cuDF coupling: counts are tied to cuDF's
-// ast_operator set, supported_ast_cast_types, supported_ast_functions, and
+// ast_operator set, cast::lowers_to_cudf_ast, supported_ast_functions, and
 // known cuDF AST limitations (no CASE, no COALESCE, decimal-intermediate bug,
 // etc.). A new AST backend would need its own equivalent method, not a
 // generic rename.
@@ -85,14 +85,46 @@ std::size_t between::cudf_ast_op_count() const
   return 3 + input->cudf_ast_op_count() + lower->cudf_ast_op_count() + upper->cudf_ast_op_count();
 }
 
+bool cast::lowers_to_cudf_ast() const
+{
+  // CAST_TO_* ops convert like static_cast: they truncate floats toward zero and wrap integers,
+  // where DuckDB rounds and range-checks. An integer target therefore takes only BOOLEAN and
+  // integer sources whose values all fit; HUGEINT and UHUGEINT run as INT64 and UINT64 on the GPU.
+  if (kind != cast_kind::semantic) { return false; }
+  auto const source = child->return_type().id();
+  switch (target_type.id()) {
+    case type_id::DOUBLE: return true;
+    case type_id::BIGINT:
+      switch (source) {
+        case type_id::BOOLEAN:
+        case type_id::TINYINT:
+        case type_id::SMALLINT:
+        case type_id::INTEGER:
+        case type_id::BIGINT:
+        case type_id::HUGEINT:
+        case type_id::UTINYINT:
+        case type_id::USMALLINT:
+        case type_id::UINTEGER: return true;
+        default: return false;
+      }
+    case type_id::UBIGINT:
+      switch (source) {
+        case type_id::BOOLEAN:
+        case type_id::UTINYINT:
+        case type_id::USMALLINT:
+        case type_id::UINTEGER:
+        case type_id::UBIGINT:
+        case type_id::UHUGEINT: return true;
+        default: return false;
+      }
+    default: return false;
+  }
+}
+
 std::size_t cast::cudf_ast_op_count() const
 {
-  // Only target types in supported_ast_cast_types_native lower to a single
-  // CAST_TO_* cuDF AST op; others force materialize.
-  bool const supported = std::find(supported_ast_cast_types_native.begin(),
-                                   supported_ast_cast_types_native.end(),
-                                   target_type.id()) != supported_ast_cast_types_native.end();
-  return supported ? 1 + child->cudf_ast_op_count() : 0;
+  // Casts that do not lower to a single CAST_TO_* cuDF AST op force materialize.
+  return lowers_to_cudf_ast() ? 1 + child->cudf_ast_op_count() : 0;
 }
 
 std::size_t unary_op::cudf_ast_op_count() const
