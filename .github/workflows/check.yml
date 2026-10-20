@@ -193,7 +193,7 @@ jobs:
           && matrix.build.cudf-channel == 'stable'
         run: |
           set -o pipefail
-          pixi run --locked run-clang-tidy -p build/clang-debug -j 4 \
+          pixi run --locked run-clang-tidy -p build/clang-debug -j "$(nproc)" \
             -checks='-*,misc-include-cleaner' \
             "$PWD/src/.*[.](c|cc|cpp|cxx)$" 2>&1 | tee /tmp/includes.log
 

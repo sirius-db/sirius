@@ -111,13 +111,6 @@ extern "C" int cudaProfilerStop();
 // configurations (enforced by sirius_config::enforce_sirius_backend_for_multi_gpu()).
 // Single-GPU users may still opt out via backend=kvikio; the
 // pin pipeline always routes through ioctx when one is available.
-//
-// Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
-// transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
-// macro that collides with the BLOCK_SIZE static member in
-// <blockingconcurrentqueue.h> (used by pipeline / duckdb
-// connection_manager). All consumers of blockingconcurrentqueue.h must
-// precede this include.
 #include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
 
