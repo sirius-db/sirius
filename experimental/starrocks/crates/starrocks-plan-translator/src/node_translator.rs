@@ -1526,6 +1526,10 @@ fn translate_hash_join(
         TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, JoinOutput::Both),
         TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, JoinOutput::Both),
         TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, JoinOutput::Left),
+        // The FE's EXISTS / IN with the subquery on the probe side. DuckDB's Substrait
+        // consumer maps `RIGHT_SEMI` to its own RIGHT_SEMI join, which keeps only the build
+        // side's columns, and the GPU hash join runs it (with other join conjuncts too).
+        TJoinOp::RIGHT_SEMI_JOIN => (join_rel::JoinType::RightSemi, JoinOutput::Right),
         TJoinOp::LEFT_ANTI_JOIN => (join_rel::JoinType::Left, JoinOutput::LeftAnti),
         TJoinOp::RIGHT_ANTI_JOIN => (join_rel::JoinType::Right, JoinOutput::RightAnti),
         TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN => {
@@ -1654,6 +1658,7 @@ fn translate_hash_join(
 enum JoinOutput {
     Both,
     Left,
+    Right,
     LeftAnti,
     RightAnti,
     NullAwareLeftAnti,
@@ -2059,6 +2064,7 @@ fn join_rel(
 ) -> Result<TranslatedRel> {
     let layout = match kind {
         join_rel::JoinType::LeftSemi => left.layout,
+        join_rel::JoinType::RightSemi => right.layout,
         join_rel::JoinType::LeftMark => {
             let mut layout = left.layout;
             layout.append(None);
@@ -2249,7 +2255,7 @@ mod tests {
                 input(),
                 input(),
                 i32_literal(1),
-                join_rel::JoinType::RightSemi
+                join_rel::JoinType::RightAnti
             )
             .is_err()
         );
