@@ -102,7 +102,8 @@ partition_strategy strategy(uint64_t total_bytes,
                             uint64_t hash_partition_bytes         = kBigPartitionBytes,
                             uint64_t max_build_hash_table_bytes   = kMaxBuildBytes,
                             uint64_t max_broadcast_join_size      = kMaxBroadcastBytes,
-                            double estimated_probe_to_build_ratio = 0.0)
+                            double estimated_probe_to_build_ratio = 0.0,
+                            std::optional<uint64_t> other_side_bytes_estimate = std::nullopt)
 {
   auto result = compute_hash_join_partition_strategy(total_bytes,
                                                      is_build_side,
@@ -114,7 +115,8 @@ partition_strategy strategy(uint64_t total_bytes,
                                                      max_broadcast_join_size,
                                                      join_type,
                                                      join_mode,
-                                                     estimated_probe_to_build_ratio);
+                                                     estimated_probe_to_build_ratio,
+                                                     other_side_bytes_estimate);
   // Every strategy places exactly the partitions it asks for.
   REQUIRE(result.placement.num_partitions() == static_cast<std::size_t>(result.num_partitions));
   return result;
@@ -531,6 +533,203 @@ TEST_CASE("compute_hash_join_partition_strategy - a lone BUILD_PROBE partition r
   REQUIRE(s.build_probe);
   REQUIRE_FALSE(s.broadcast);
   REQUIRE(s.placement.device_for(0) == 3);
+}
+
+//===----------------------------------------------------------------------===//
+// larger-side sizing (compute_hash_join_partition_strategy / larger_side_num_partitions)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// A STANDARD join: the build cannot fold (no build-side CONCAT), so BUILD_PROBE is never taken
+// and the count is the STANDARD one whatever the sizes.
+partition_strategy standard(uint64_t build_bytes,
+                            std::optional<uint64_t> probe_estimate,
+                            int num_gpus                  = 1,
+                            uint64_t hash_partition_bytes = kBigPartitionBytes)
+{
+  return strategy(build_bytes,
+                  /*is_build_side=*/true,
+                  /*build_foldable=*/false,
+                  num_gpus,
+                  duckdb::JoinType::INNER,
+                  HASH_JOIN_MODE::STANDARD,
+                  hash_partition_bytes,
+                  kMaxBuildBytes,
+                  kMaxBroadcastBytes,
+                  /*estimated_probe_to_build_ratio=*/0.0,
+                  probe_estimate);
+}
+
+}  // namespace
+
+TEST_CASE("larger_side_num_partitions - unknown or smaller other side keeps the natural count",
+          "[hash_join][partition][unit]")
+{
+  using sirius::op::larger_side_num_partitions;
+  CHECK(larger_side_num_partitions(4 * kBigPartitionBytes, std::nullopt, kBigPartitionBytes, 4) ==
+        4);
+  CHECK(larger_side_num_partitions(
+          4 * kBigPartitionBytes, 2 * kBigPartitionBytes, kBigPartitionBytes, 4) == 4);
+  CHECK(larger_side_num_partitions(
+          4 * kBigPartitionBytes, 4 * kBigPartitionBytes, kBigPartitionBytes, 4) == 4);
+  // The multi-GPU floor already folded into `natural` is preserved.
+  CHECK(larger_side_num_partitions(k100MB, 2 * k100MB, kBigPartitionBytes, 4) == 4);
+  CHECK_THROWS_AS(larger_side_num_partitions(1, 2, 0, 1), std::invalid_argument);
+}
+
+TEST_CASE("larger_side_num_partitions - a larger other side raises the count to its batch count",
+          "[hash_join][partition][unit]")
+{
+  using sirius::op::larger_side_num_partitions;
+  // Build 2 batches, probe 8 batches: 8 partitions make every partition one batch per side.
+  CHECK(larger_side_num_partitions(
+          2 * kBigPartitionBytes, 8 * kBigPartitionBytes, kBigPartitionBytes, 2) == 8);
+  // Partial batches round up.
+  CHECK(larger_side_num_partitions(
+          2 * kBigPartitionBytes, 8 * kBigPartitionBytes + 1, kBigPartitionBytes, 2) == 9);
+}
+
+TEST_CASE("larger_side_num_partitions - an over-estimated other side is capped by the sizing side",
+          "[hash_join][partition][unit]")
+{
+  using sirius::op::larger_side_num_partitions;
+  // The sizing side's partitions never shrink below hash_partition_bytes / divisor, so a 1 GiB
+  // build caps at 1 GiB / (512 MiB / 16) = 32 partitions however large the other side claims.
+  auto const divisor     = sirius::config::JOIN_LARGER_SIDE_MIN_PARTITION_DIVISOR;
+  uint64_t const build   = 2 * kBigPartitionBytes;
+  int const expected_cap = static_cast<int>(2 * divisor);
+  CHECK(larger_side_num_partitions(build, 1ull << 40, kBigPartitionBytes, 2) == expected_cap);
+  // A zero-byte sizing side stays at the natural count: nothing to split.
+  CHECK(larger_side_num_partitions(0, 1ull << 40, kBigPartitionBytes, 1) == 1);
+  // A tiny sizing side (under one minimum partition) stays at the natural count too.
+  CHECK(larger_side_num_partitions(k100MB / 10, 1ull << 40, kBigPartitionBytes, 1) == 1);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - STANDARD build-driven join sizes from the probe",
+          "[hash_join][partition][partition_placement][unit]")
+{
+  // 2 build batches, probe estimated at 8 batches: 8 pinned partitions, STANDARD.
+  auto const s = standard(2 * kBigPartitionBytes, 8 * kBigPartitionBytes);
+  REQUIRE_FALSE(s.build_probe);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.num_partitions == 8);
+  CHECK(s.placement == partition_placement::round_robin(8, {0}));
+
+  // Without an estimate the natural count stands.
+  CHECK(standard(2 * kBigPartitionBytes, std::nullopt).num_partitions == 2);
+  // A probe no bigger than the build changes nothing.
+  CHECK(standard(2 * kBigPartitionBytes, kBigPartitionBytes).num_partitions == 2);
+  // Multi-GPU: the raised count is spread round-robin over the admitted GPUs.
+  auto const m = standard(2 * kBigPartitionBytes, 8 * kBigPartitionBytes, /*num_gpus=*/4);
+  REQUIRE(m.num_partitions == 8);
+  CHECK(m.placement == partition_placement::round_robin(8, {0, 1, 2, 3}));
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - larger-side sizing leaves BUILD_PROBE and "
+  "broadcast alone",
+  "[hash_join][partition][unit]")
+{
+  // Small foldable build with a huge probe estimate: still one BUILD_PROBE slot on one GPU.
+  auto const bp = strategy(k100MB,
+                           true,
+                           true,
+                           1,
+                           duckdb::JoinType::INNER,
+                           HASH_JOIN_MODE::STANDARD,
+                           kBigPartitionBytes,
+                           kMaxBuildBytes,
+                           kMaxBroadcastBytes,
+                           0.0,
+                           /*other_side_bytes_estimate=*/1ull << 40);
+  REQUIRE(bp.build_probe);
+  REQUIRE(bp.num_partitions == 1);
+
+  // Multi-GPU small build broadcasts: one slot per GPU regardless of the probe estimate.
+  auto const bc = strategy(1024 * 1024,
+                           true,
+                           true,
+                           4,
+                           duckdb::JoinType::INNER,
+                           HASH_JOIN_MODE::STANDARD,
+                           kBigPartitionBytes,
+                           kMaxBuildBytes,
+                           kMaxBroadcastBytes,
+                           0.0,
+                           /*other_side_bytes_estimate=*/1ull << 40);
+  REQUIRE(bc.broadcast);
+  REQUIRE(bc.num_partitions == 4);
+
+  // MARK single-GPU is clamped to one partition however large the probe is.
+  auto const mark = strategy(k100MB,
+                             true,
+                             true,
+                             1,
+                             duckdb::JoinType::MARK,
+                             HASH_JOIN_MODE::STANDARD,
+                             kBigPartitionBytes,
+                             kMaxBuildBytes,
+                             kMaxBroadcastBytes,
+                             0.0,
+                             /*other_side_bytes_estimate=*/1ull << 40);
+  REQUIRE(mark.build_probe);
+  REQUIRE(mark.num_partitions == 1);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - probe-driven joins size from the build estimate",
+          "[hash_join][partition][partition_placement][unit]")
+{
+  // RIGHT-family joins size from the probe; a build estimated at 8 batches raises the count.
+  auto const s = strategy(2 * kBigPartitionBytes,
+                          /*is_build_side=*/false,
+                          /*build_foldable=*/true,
+                          1,
+                          duckdb::JoinType::RIGHT,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          0.0,
+                          /*other_side_bytes_estimate=*/8 * kBigPartitionBytes);
+  REQUIRE_FALSE(s.build_probe);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.num_partitions == 8);
+  CHECK(s.placement == partition_placement::round_robin(8, {0}));
+
+  // A lone probe-driven partition stays unpinned when the build is not larger. One GPU: above the
+  // small-table threshold the natural count floors to the GPU count, which is not what this checks.
+  auto const lone = strategy(k100MB,
+                             false,
+                             true,
+                             1,
+                             duckdb::JoinType::RIGHT,
+                             HASH_JOIN_MODE::STANDARD,
+                             kBigPartitionBytes,
+                             kMaxBuildBytes,
+                             kMaxBroadcastBytes,
+                             0.0,
+                             /*other_side_bytes_estimate=*/k100MB / 2);
+  REQUIRE(lone.num_partitions == 1);
+  CHECK_FALSE(lone.placement.any_pinned());
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - MIXED_JOIN uses larger-side sizing too",
+          "[hash_join][partition][unit]")
+{
+  auto const s = strategy(2 * kBigPartitionBytes,
+                          true,
+                          true,
+                          1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::MIXED_JOIN,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          0.0,
+                          /*other_side_bytes_estimate=*/6 * kBigPartitionBytes);
+  REQUIRE_FALSE(s.build_probe);
+  REQUIRE(s.num_partitions == 6);
 }
 
 //===----------------------------------------------------------------------===//

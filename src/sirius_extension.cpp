@@ -2767,6 +2767,18 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
+static void SetEnableJoinLargerSidePartitioning(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                    = lock_operator_params_slot(context);
+  params->enable_join_larger_side_partitioning = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_JOIN_LARGER_SIDE_PARTITIONING to {}",
+                   params->enable_join_larger_side_partitioning);
+}
+
 static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                                                SetScope scope,
                                                Value& parameter)
@@ -3259,6 +3271,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
                     SetEnableRuntimeDistinctBuildProbe);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_join_larger_side_partitioning",
+                    "size STANDARD hash-join partitions from the larger join side",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_join_larger_side_partitioning),
+                    SetEnableJoinLargerSidePartitioning);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_dense_count_join",

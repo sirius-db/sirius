@@ -409,6 +409,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_decimal_sum_stats_bound", opt.enable_decimal_sum_stats_bound);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.optional("enable_dense_count_join", opt.enable_dense_count_join);
+  r.optional("enable_join_larger_side_partitioning", opt.enable_join_larger_side_partitioning);
   if (r.has("dense_count_join_max_bytes")) {
     throw std::runtime_error(
       "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "

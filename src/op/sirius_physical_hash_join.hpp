@@ -132,6 +132,15 @@ struct build_probe_decision {
 /// query spread across GPUs; a single STANDARD partition is unpinned, and multiple partitions
 /// use `round_robin` over `active_gpu_ids`. An empty
 /// `active_gpu_ids` yields unpinned placements.
+///
+/// Larger-side sizing (`other_side_bytes_estimate`): a STANDARD / MIXED_JOIN partition schedules
+/// one task per (build batch, probe batch) pair and rebuilds its hash table in every task, so a
+/// partition whose streamed side spans p CONCAT batches builds the same table p times. When the
+/// other side's total is known or estimated and exceeds `total_bytes`, the count is raised to
+/// `ceil(other / hash_partition_bytes)` so both sides of a partition fit one batch (CONCAT's batch
+/// target shares the hash_partition_bytes default), capped so the sizing side's partitions never
+/// fall below `hash_partition_bytes / JOIN_LARGER_SIDE_MIN_PARTITION_DIVISOR`. Broadcast and
+/// BUILD_PROBE outcomes ignore it (they build once already). `nullopt` keeps the natural count.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
   bool is_build_side,
@@ -143,7 +152,18 @@ struct build_probe_decision {
   uint64_t max_broadcast_join_size,
   duckdb::JoinType join_type,
   HASH_JOIN_MODE join_mode,
-  double estimated_probe_to_build_ratio);
+  double estimated_probe_to_build_ratio,
+  std::optional<uint64_t> other_side_bytes_estimate = std::nullopt);
+
+/// The STANDARD-mode partition count under larger-side sizing: `natural` when the other side is
+/// unknown or not larger than `total_bytes`, else `ceil(other_side_bytes / hash_partition_bytes)`
+/// clamped to [natural, max(natural, ceil(total_bytes / (hash_partition_bytes /
+/// JOIN_LARGER_SIDE_MIN_PARTITION_DIVISOR)))]. A zero-byte sizing side therefore stays at
+/// `natural`. Pure; exposed for tests.
+[[nodiscard]] int larger_side_num_partitions(uint64_t total_bytes,
+                                             std::optional<uint64_t> other_side_bytes,
+                                             uint64_t hash_partition_bytes,
+                                             int natural);
 
 /// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
 /// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
@@ -308,6 +328,15 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! left/output side) instead of filtered_join (build on the right side). Switch when
   //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
+
+  //! Size STANDARD / MIXED_JOIN partitions from the larger join side so each partition is one
+  //! build batch x one probe batch and its hash table is built once (see
+  //! compute_hash_join_partition_strategy). Set from operator_params at planning time.
+  bool larger_side_partitioning = config::DEFAULT_ENABLE_JOIN_LARGER_SIDE_PARTITIONING;
+
+  //! Bytes charged per variable-width column value when the other join side's size has to be
+  //! estimated from planner cardinality (see larger_side_partitioning). Set from operator_params.
+  uint64_t avg_variable_column_bytes = config::DEFAULT_AVG_VARIABLE_COLUMN_BYTES;
 
   //! Join Keys statistics (optional)
 
