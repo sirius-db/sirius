@@ -355,12 +355,13 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowArray* array,
       }
       columns.push_back(std::move(column));
     }
+    // The async copies read the producer's buffers, which it may free once we return.
+    stream.synchronize();
+    return std::make_unique<cudf::table>(std::move(columns));
   } catch (...) {
-    // The async copies may still read the producer's buffers, which it may free once we return.
     stream.synchronize_no_throw();
     throw;
   }
-  return std::make_unique<cudf::table>(std::move(columns));
 }
 
 }  // namespace sirius

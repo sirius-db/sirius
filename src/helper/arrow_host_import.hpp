@@ -46,14 +46,15 @@ namespace sirius {
  * their copy. A `decimal128` is narrowed to the declared width before the next column is copied.
  * The struct's `offset`/`length` window is honoured, which `cudf::from_arrow_column` ignores.
  *
- * The input is never released. A throw after a copy started syncs `stream` first.
+ * The input is never released. `stream` is synced before every return or throw after a copy
+ * started, so the producer may release the structs once this returns.
  *
  * @param array The batch, a struct array; read only during the call.
  * @param schema Its schema.
  * @param error_prefix Prefix of every error message, naming the batch.
  * @param names Declared column names, used in messages.
  * @param types Declared column types; as many as `names`.
- * @param stream Runs the copies; sync it before the producer releases the structs.
+ * @param stream Runs the copies.
  * @param mr Allocates the returned columns.
  * @throws sirius::invalid_input_exception on a refused batch, naming the column.
  * @throws sirius::internal_exception when `names` and `types` differ in length.

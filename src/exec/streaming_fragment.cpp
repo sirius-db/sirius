@@ -445,7 +445,6 @@ void streaming_fragment::push_arrow(stream_id_t id,
                             declared.types,
                             stream,
                             gpu.get_default_allocator());
-  stream.sync();
   push(id, make_data_batch(std::move(table), gpu, stream, telemetry::batch_telemetry_info{}));
 }
 
