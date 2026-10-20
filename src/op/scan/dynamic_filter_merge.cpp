@@ -970,7 +970,8 @@ void apply_cached(application_result_state& result,
     result.deferred.row_ids = cudf::sequence(input.num_rows(), *result.zero, stream, mr);
     std::vector<cudf::column_view> columns(projected.begin(), projected.end());
     columns.push_back(result.deferred.row_ids->view());
-    result.scratch_table = sirius::apply_retention_mask(cudf::table_view{columns}, keep, stream, mr);
+    result.scratch_table =
+      sirius::apply_retention_mask(cudf::table_view{columns}, keep, stream, mr);
     result.columns       = result.scratch_table->release();
     result.row_positions = std::move(result.columns.back());
     result.columns.pop_back();
