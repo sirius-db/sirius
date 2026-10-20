@@ -53,27 +53,6 @@ class concat_input_data final : public partitioned_operator_data {
       }
     }
     partitioned_operator_data::prepare_for_processing(target, stream);
-
-    // Preparation owns the input contract: validate the actual GPU tables after transfers
-    // and decoding, before execute() can forward or concatenate any batch.
-    auto const batches = get_read_only_batches();
-    if (batches.empty()) { return; }
-    auto* space = batches.front().get_memory_space();
-    if (space == nullptr) { throw std::runtime_error("CONCAT prepared input has no memory space"); }
-    constexpr auto row_limit =
-      static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
-    std::size_t rows = 0;
-    for (auto const& batch : batches) {
-      if (batch.get_memory_space() != space) {
-        throw std::runtime_error("CONCAT input was not prepared on one memory space");
-      }
-      auto const batch_rows = static_cast<std::size_t>(get_cudf_table_view(batch).num_rows());
-      // Check before adding so the sum cannot overflow either size_t or cuDF's row index.
-      if (batch_rows > row_limit - rows) {
-        throw std::overflow_error("CONCAT partition exceeds the cuDF row-count limit");
-      }
-      rows += batch_rows;
-    }
   }
 
   [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_data_batches(
@@ -236,6 +215,21 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   }
 
   cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
+  if (space == nullptr) { throw std::runtime_error("sirius_physical_concat: space is nullptr"); }
+  // Validate the actual GPU tables even when callers supply plain partitioned_operator_data
+  // or a representation had no row-count metadata during group selection.
+  constexpr auto row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
+  std::size_t rows         = 0;
+  for (auto const& batch : input_batches) {
+    if (batch.get_memory_space() != space) {
+      throw std::runtime_error("CONCAT input was not prepared on one memory space");
+    }
+    auto const batch_rows = static_cast<std::size_t>(get_cudf_table_view(batch).num_rows());
+    if (batch_rows > row_limit - rows) {
+      throw std::overflow_error("CONCAT partition exceeds the cuDF row-count limit");
+    }
+    rows += batch_rows;
+  }
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(1);
   if (input_batches.size() == 1) {

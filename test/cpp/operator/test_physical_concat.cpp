@@ -1645,6 +1645,53 @@ TEST_CASE("bounded CONCAT hints and claims split groups at the row-count limit",
         std::vector<std::shared_ptr<data_batch>>{tail});
 }
 
+TEST_CASE("CONCAT execute validates row counts on plain partitioned input", "[physical_concat]")
+{
+  bool const overflow = GENERATE(false, true);
+  auto* space         = get_shared_mem_space();
+  auto const types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat(types, 0, true);
+  concat.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+  auto owner         = make_int32_batch(*space, 1);
+  auto const ro      = owner->to_read_only();
+  auto const pointer = sirius::get_cudf_table_view(ro).column(0).data<int32_t>();
+  cudf::column_view column(cudf::data_type{cudf::type_id::INT32},
+                           std::numeric_limits<cudf::size_type>::max(),
+                           pointer,
+                           nullptr,
+                           0);
+  auto repr = std::make_unique<cucascade::gpu_table_representation>(
+    cudf::table_view{{column}}, owner, sizeof(int32_t), *space, default_stream());
+  auto large = data_batch::make(sirius::get_next_batch_id(), std::move(repr));
+  std::vector<std::shared_ptr<data_batch>> batches{large};
+  if (overflow) { batches.push_back(make_int32_batch(*space, 1)); }
+  auto input = unpinned_partition(std::move(batches), 0);
+  // Synthetic large views must never be read: only singleton forwarding or early rejection
+  // may run. These calls intentionally bypass the CONCAT claim and preparation hooks.
+  if (overflow) {
+    CHECK_THROWS_AS(concat.execute(input, default_stream()), std::overflow_error);
+  } else {
+    auto output = concat.execute(input, default_stream());
+    CHECK(dynamic_cast<partitioned_operator_data&>(*output).get_data_batches() ==
+          std::vector<std::shared_ptr<data_batch>>{large});
+  }
+}
+
+TEST_CASE("CONCAT execute rejects inputs from different memory spaces", "[physical_concat]")
+{
+  auto const types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat(types, 0, true);
+  concat.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+  auto input = unpinned_partition(
+    {make_int32_batch(*get_shared_mem_space(), 1), make_host_metadata_batch(1)}, 0);
+  CHECK_THROWS_WITH(concat.execute(input, default_stream()),
+                    "CONCAT input was not prepared on one memory space");
+}
+
 TEST_CASE("CONCAT rejects impossible decoded input before GPU preparation", "[physical_concat]")
 {
   auto manager     = sirius::test::operator_utils::initialize_memory_manager();
