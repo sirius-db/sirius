@@ -7,6 +7,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -81,7 +82,8 @@ inline rmm::device_buffer copy_bitmask_as_data(cudf::column_view const& source,
 {
   auto mask = cudf::copy_bitmask(source, stream, mr);
 #if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
-  return rmm::device_buffer(mask.data(), mask.size(), stream, mr);
+  // CUDA mask buffers count elements, while the sidecar and column data count bytes.
+  return rmm::device_buffer(mask.data(), mask.size() * sizeof(*mask.data()), stream, mr);
 #else
   return mask;
 #endif

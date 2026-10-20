@@ -10,6 +10,7 @@
 #include "api/simpatico_codegen.hpp"
 #include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/plan/leaf_desc.hpp"
+#include "codegen/plan/validity.hpp"
 #include "test_utils.hpp"
 
 #include <cudf/table/table.hpp>
@@ -767,11 +768,13 @@ void test_validity_sidecar_roundtrip()
   auto stream = cudf::get_default_stream();
   auto mr     = rmm::mr::get_current_device_resource_ref();
 
-  // Mixed validity: a real bitmask is written to the payload region.
-  auto mixed = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT32}, 128, cudf::mask_state::ALL_VALID, stream, mr);
-  std::vector<std::int32_t> host(128);
-  for (int r = 0; r < 128; ++r)
+  // Cross the first quarter of a padded mask allocation and end on a partial word.
+  // Treating a typed CUDA mask's element count as bytes loses the trailing nulls.
+  constexpr cudf::size_type num_rows = 4097;
+  auto mixed                         = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::ALL_VALID, stream, mr);
+  std::vector<std::int32_t> host(num_rows);
+  for (int r = 0; r < num_rows; ++r)
     host[static_cast<std::size_t>(r)] = static_cast<std::int32_t>((r * 31 + 7) % 5000);
   if (cudaMemcpy(mixed->mutable_view().head<std::int32_t>(),
                  host.data(),
@@ -780,10 +783,28 @@ void test_validity_sidecar_roundtrip()
     throw std::runtime_error("validity_sidecar: cudaMemcpy failed");
   cudf::set_null_mask(mixed->mutable_view().null_mask(), 3, 4, /*valid=*/false, stream);
   cudf::set_null_mask(mixed->mutable_view().null_mask(), 70, 96, /*valid=*/false, stream);
-  mixed->set_null_count(27);
+  cudf::set_null_mask(
+    mixed->mutable_view().null_mask(), num_rows - 1, num_rows, /*valid=*/false, stream);
+  mixed->set_null_count(28);
   cudf::table_view mixed_tbl({mixed->view()});
   io_roundtrip("validity_mixed", mixed_tbl, "input -> delta -> differences\n");
   memory_roundtrip("validity_mixed_mem", mixed_tbl, "input -> delta -> differences\n");
+
+  // Rebase a mask starting mid-word, then reattach it twice without consuming the sidecar.
+  auto const input = mixed->view();
+  cudf::column_view sliced(
+    input.type(), num_rows - 3, input.head<void>(), input.null_mask(), input.null_count(), 3);
+  simpatico::validity_sidecar sidecar;
+  auto const stripped = simpatico::strip_validity(sliced, sidecar, stream, mr);
+  expect(sidecar.mask.size() == cudf::bitmask_allocation_size_bytes(sliced.size()),
+         "validity_sliced: sidecar size is in bytes");
+  cudf::column expected(sliced, stream, mr);
+  for (int iteration = 0; iteration < 2; ++iteration) {
+    cudf::column restored(stripped, stream, mr);
+    simpatico::attach_validity(restored, sidecar, stream, mr);
+    expect(columns_equal(expected.view(), restored.view()),
+           "validity_sliced: repeated reattachment preserves data and validity");
+  }
 
   // All null: nothing is written to the payload, so this also checks that the
   // reader rebuilds the mask from the kind alone.
