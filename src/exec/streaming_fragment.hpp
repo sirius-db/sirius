@@ -120,6 +120,18 @@ class streaming_fragment {
                          stream_id_t input_stream_id,
                          sender_id_t sender_id);
 
+  /// Push one batch into input `id`, for batches that arrive from outside this process. Does not
+  /// close a sender. A batch on the GPU must carry the input's declared column types.
+  /// @return false when the input already ended; the batch is dropped.
+  /// @throws sirius::invalid_input_exception on what require_pushable() refuses, or on a batch
+  ///         whose columns differ from the declared ones.
+  [[nodiscard]] bool push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch);
+
+  /// Throws what push() refuses before it looks at the batch.
+  /// @throws sirius::invalid_input_exception before build(), after run() started, or on an
+  ///         undeclared input.
+  void require_pushable(stream_id_t id) const;
+
   /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
@@ -127,6 +139,14 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before run() or on an unknown id.
   /// @throws the output's poison error, which after a failed run() is that run's cause.
   std::optional<std::shared_ptr<cucascade::data_batch>> pull(stream_id_t id);
+
+  /// The stream behind output `id`, for a consumer that exports batches while run() is still
+  /// producing them: classify() tells "nothing yet" from the end of the stream, which pull()
+  /// cannot before run() returns. The stream outlives this fragment. One that is destroyed
+  /// without having run poisons its outputs, so a consumer waiting on them is released.
+  /// @throws sirius::invalid_input_exception before build(), on an unknown id, or on a result
+  ///         fragment.
+  [[nodiscard]] std::shared_ptr<batch_stream> output_stream(stream_id_t id) const;
 
   /// False while batches remain, before EOS, and on a poisoned output.
   /// @throws sirius::invalid_input_exception before build() or on an unknown id.
@@ -147,9 +167,10 @@ class streaming_fragment {
   ///         any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(stream_id_t id) const;
 
-  /// Total rows parked on output stream `id`, without draining it.
-  /// @throws sirius::invalid_input_exception before build(), on an unknown id, or on a parked
-  ///         batch that is not GPU-resident.
+  /// Total rows parked on output stream `id`, without draining it. Each batch's rows are
+  /// recorded when it is parked, so the count holds after batches spill to host.
+  /// @throws sirius::invalid_input_exception before build(), on an unknown id, or when a batch
+  ///         reached the stream already off the GPU.
   [[nodiscard]] std::uint64_t output_row_count(stream_id_t id) const;
 
   [[nodiscard]] bool is_result() const { return _spec.outputs.empty(); }
@@ -158,6 +179,9 @@ class streaming_fragment {
   enum class phase : std::uint8_t { declared, build_failed, built, running, ran, run_failed };
 
   void require_built(const char* what) const;
+  /// The declared spec of input `id`.
+  /// @throws sirius::invalid_input_exception on an undeclared input.
+  [[nodiscard]] const stream_input_spec& input_spec(stream_id_t id) const;
   duckdb::unique_ptr<op::sirius_physical_operator> make_streaming_sink(
     duckdb::unique_ptr<op::sirius_physical_operator> subtree);
   duckdb::unique_ptr<op::sirius_physical_operator> make_result_collector(

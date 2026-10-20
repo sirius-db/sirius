@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -97,9 +98,38 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
                                          ::cuda::stream_ref stream) override;
 
   /// N=1: native push. N>1: hash-partition; skip empty slices. Refused push = silent drop.
+  /// Hash mode partitions each input batch in row pieces of at most the max piece bytes,
+  /// all of them before publishing any, so an OOM publishes nothing and can be retried.
   void sink(const operator_data& input_data, ::cuda::stream_ref stream) override;
 
-  /// 0 if N==1; ~2× when partitioned (hash_partition holds reorder + slices).
+  /// Hash mode publishes only once every piece is partitioned.
+  [[nodiscard]] bool sink_publishes_on_success_only() const override
+  {
+    return _outputs.size() > 1 && _spec.mode == partition_mode::hash;
+  }
+
+  /// The largest piece of an input batch hash_partition sees at once by default: it peaks at
+  /// about three times its input (the input, a reordered copy, the per-destination slices).
+  static constexpr std::size_t default_max_piece_bytes = std::size_t{256} << 20;
+
+  /// Overrides default_max_piece_bytes (tests).
+  void set_max_piece_bytes(std::size_t bytes)
+  {
+    _max_piece_bytes = std::max<std::size_t>(1, bytes);
+  }
+
+  /// Hash mode: each destination's slices are held until they add up to @p bytes, then
+  /// published as one batch, so an exchange ships and spills fewer, larger batches. 0 (the
+  /// default, unless SIRIUS_CN_EXCHANGE_BATCH_BYTES says otherwise) publishes every slice.
+  void set_combine_bytes(std::size_t bytes) { _combine_bytes = bytes; }
+
+  /// The row ranges [begin, end) an input of @p rows rows and @p bytes bytes is partitioned in,
+  /// each at most @p max_piece bytes (one range when it already fits, or on one row).
+  [[nodiscard]] static std::vector<std::pair<std::size_t, std::size_t>> partition_pieces(
+    std::size_t rows, std::size_t bytes, std::size_t max_piece);
+
+  /// 0 if N==1; when partitioned, the slices of the whole input plus hash_partition's reorder of
+  /// one piece (~2x for an input of one piece).
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
@@ -125,6 +155,11 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   /// @throws sirius::invalid_input_exception when `index` is out of range.
   [[nodiscard]] exec::batch_stream::availability availability(std::size_t index = 0) const;
 
+  /// The stream behind output `index`, for a consumer that drains it from its own thread while
+  /// the fragment runs.
+  /// @throws sirius::invalid_input_exception when `index` is out of range.
+  [[nodiscard]] std::shared_ptr<exec::batch_stream> output_stream(std::size_t index) const;
+
   /// Poison every output stream (S2 / P1–P4). First failure wins. Sink has no on_data — wait()
   /// wakes via the stream CV.
   void fail_output(std::exception_ptr error);
@@ -141,6 +176,21 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
 
   /// Empty key_columns is valid only for N==1 (native push, no hash_partition).
   partition_spec _spec;
+
+  std::size_t _max_piece_bytes = default_max_piece_bytes;
+
+ private:
+  /// Publishes @p batches to output @p index, as one batch when there are several and the
+  /// GPU has room to combine them, else one by one.
+  void publish_combined(std::size_t index,
+                        std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                        ::cuda::stream_ref stream);
+
+  std::size_t _combine_bytes;
+  std::mutex _pending_mutex;
+  /// Per output, slices held until they reach _combine_bytes, and their bytes.
+  std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> _pending;
+  std::vector<std::size_t> _pending_bytes;
 };
 
 }  // namespace sirius::op

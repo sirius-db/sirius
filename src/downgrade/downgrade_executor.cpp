@@ -36,6 +36,18 @@
 namespace sirius {
 namespace parallel {
 
+/// Wakes a task waiting in @p space's make_reservation(): a spill freed bytes there. Freeing a
+/// batch's memory posts nothing to the space's waiters, only a released reservation does, so
+/// release an empty one.
+static void wake_reservation_waiters(cucascade::memory::memory_space* space) noexcept
+{
+  if (space == nullptr) { return; }
+  try {
+    static_cast<void>(space->make_reservation_upto(0));
+  } catch (...) {
+  }
+}
+
 static std::string tier_to_string(cucascade::memory::Tier tier)
 {
   switch (tier) {
@@ -172,6 +184,8 @@ void downgrade_executor::processing_loop()
       std::atomic<size_t> bytes{0};
     };
     target_tier_stats host_target_stats, disk_target_stats;
+    // What the sweep found and passed over, by reason: why spilling may free less than asked.
+    spill_skip_counts skips;
 
     // Resolve the source memory space for filtering candidates
     auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
@@ -273,13 +287,17 @@ void downgrade_executor::processing_loop()
     auto const managers   = _data_repo_registry.candidates();
     for (auto const& [victim_id, manager] : std::views::reverse(managers)) {
       auto borrow = _query_lifecycle.try_acquire_work(victim_id);
-      if (!borrow) { continue; }
+      if (!borrow) {
+        skips.add(spill_skip::borrow_refused, 0);
+        continue;
+      }
       if (req->satisfied.load() || pool_interrupted || target_completed()) break;
       auto repos = manager->get_repositories();
       for (auto* repo : repos) {
         if (req->satisfied.load() || target_completed()) break;
 
         convertible_data_batch_provider provider(repo);
+        provider.count_skips(&skips);
         auto candidates = provider.get_all_convertible(
           source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
 
@@ -309,7 +327,10 @@ void downgrade_executor::processing_loop()
           // victim claim into each candidate before handing it to another thread.
 
           auto work = _query_lifecycle.try_acquire_work(victim_id);
-          if (!work) { break; }
+          if (!work) {
+            skips.add(spill_skip::borrow_refused, candidate_bytes);
+            break;
+          }
           candidate->retain_work(std::move(work));
 
           auto slot = _pool->reserve();
@@ -339,6 +360,8 @@ void downgrade_executor::processing_loop()
              &repo_stats,
              &host_target_stats,
              &disk_target_stats,
+             &skips,
+             source_space,
              predicate_satisfied]() mutable {
               absl::Cleanup rollback = [&planned_bytes, candidate_bytes]() {
                 planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
@@ -353,6 +376,7 @@ void downgrade_executor::processing_loop()
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                   repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
                   repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  wake_reservation_waiters(source_space);
                   for (size_t i = 0; i < result->size(); ++i) {
                     if ((*result)[i] == 0) continue;
                     if (i < host_end_idx) {
@@ -364,6 +388,8 @@ void downgrade_executor::processing_loop()
                     }
                   }
                   predicate_satisfied(req_ptr);
+                } else if (auto const why = cand->skipped()) {
+                  skips.add(*why, candidate_bytes);
                 }
               } catch (const std::exception& e) {
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
@@ -420,6 +446,7 @@ void downgrade_executor::processing_loop()
            &pipeline_queue_stats,
            &host_target_stats,
            &disk_target_stats,
+           source_space,
            predicate_satisfied]() mutable {
             absl::Cleanup rollback = [&]() {
               planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
@@ -436,6 +463,7 @@ void downgrade_executor::processing_loop()
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                 pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
                 pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                wake_reservation_waiters(source_space);
                 for (size_t i = 0; i < result->size(); ++i) {
                   if ((*result)[i] == 0) continue;
                   if (i < host_end_idx) {
@@ -471,6 +499,7 @@ void downgrade_executor::processing_loop()
     }
 
     // === Logging ===
+    _skip_totals.add(skips);
     auto total_bytes   = req->bytes_freed.load(std::memory_order_relaxed);
     auto total_batches = req->batches_downgraded.load(std::memory_order_relaxed);
     auto duration_ms =
@@ -487,7 +516,7 @@ void downgrade_executor::processing_loop()
       // spill directory (every convert threw, nothing was freed, no warning).
       SIRIUS_LOG_INFO(
         "[downgrade][monitor] [{}] request done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s), "
-        "satisfied={} | to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
+        "satisfied={} | to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes | skipped: {}",
         _source_label,
         total_batches,
         total_bytes,
@@ -497,14 +526,22 @@ void downgrade_executor::processing_loop()
         host_target_stats.batches.load(std::memory_order_relaxed),
         host_target_stats.bytes.load(std::memory_order_relaxed),
         disk_target_stats.batches.load(std::memory_order_relaxed),
-        disk_target_stats.bytes.load(std::memory_order_relaxed));
+        disk_target_stats.bytes.load(std::memory_order_relaxed),
+        skips.to_string());
+    } else if (!req->satisfied.load() && skips.total() > 0) {
+      SIRIUS_LOG_INFO(
+        "[downgrade] [{}] request unsatisfied: {} batches, {} bytes freed | skipped: {}",
+        _source_label,
+        total_batches,
+        total_bytes,
+        skips.to_string());
     }
 
     SIRIUS_LOG_DEBUG(
       "[downgrade] [{}] request {}done: {} batches, {} bytes (target {}, planned {}) in "
       "{:.2f} ms ({:.1f} MB/s) | "
       "repos: {}/{} batches/bytes, pipeline_queue: {}/{} | "
-      "to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
+      "to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes | skipped: {}",
       _source_label,
       request_label,
       total_batches,
@@ -520,7 +557,8 @@ void downgrade_executor::processing_loop()
       host_target_stats.batches.load(std::memory_order_relaxed),
       host_target_stats.bytes.load(std::memory_order_relaxed),
       disk_target_stats.batches.load(std::memory_order_relaxed),
-      disk_target_stats.bytes.load(std::memory_order_relaxed));
+      disk_target_stats.bytes.load(std::memory_order_relaxed),
+      skips.to_string());
 
     // Fulfill the promise
     req->result.set_value(total_bytes);
@@ -655,14 +693,18 @@ void downgrade_executor::set_pipeline_task_queue(
 
 // --- Public request API ---
 
-std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
+std::future<size_t> downgrade_executor::request_free_memory(size_t bytes,
+                                                            std::function<bool()> satisfied)
 {
   auto req          = std::make_unique<downgrade_request>();
   req->target_bytes = bytes;
-  req->predicate    = [&freed = req->bytes_freed, bytes]() {
-    return freed.load(std::memory_order_relaxed) >= bytes;
-  };
-  auto future = req->result.get_future();
+  if (!satisfied) {
+    satisfied = [&freed = req->bytes_freed, bytes]() {
+      return freed.load(std::memory_order_relaxed) >= bytes;
+    };
+  }
+  req->predicate = std::move(satisfied);
+  auto future    = req->result.get_future();
   if (!_request_queue.push(std::move(req))) {
     SIRIUS_LOG_WARN(
       "[downgrade] request_free_memory: queue inactive, dropping request for {} bytes", bytes);
@@ -673,6 +715,12 @@ std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
 size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
 {
   return request_free_memory(bytes).get();
+}
+
+size_t downgrade_executor::request_free_memory_and_wait(size_t bytes,
+                                                        std::function<bool()> satisfied)
+{
+  return request_free_memory(bytes, std::move(satisfied)).get();
 }
 
 std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)

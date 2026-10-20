@@ -51,17 +51,30 @@ mod engine;
 mod file_schema;
 mod fragment_executor;
 mod local_exchange;
+// The sender half is used only by the NIXL transport.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+mod nixl_chunk;
 #[cfg(any(test, feature = "sirius-engine"))]
 mod parked_registry;
 mod proto;
 mod prpc;
 mod result_encoder;
 mod result_store;
+#[cfg(feature = "nixl-transport")]
+mod ring_nixl;
+// The loop runs only with NIXL; without it the tests drive it over an in-process fabric.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+mod ring_transport;
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+mod ring_wire;
 
 pub use brpc::BrpcServer;
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
+pub use nixl_chunk::NixlEndpoint;
+#[cfg(feature = "nixl-transport")]
+pub use ring_nixl::{ring_options_from_env, start_ring_transport};
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 

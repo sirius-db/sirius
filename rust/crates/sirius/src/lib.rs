@@ -70,6 +70,28 @@ impl SiriusContext {
         })
     }
 
+    /// Bring up a context with a ring exchange (see [`RingExchange`]), configured from the YAML
+    /// file at `path`, or from built-in defaults without one. The rings are allocated on the
+    /// current CUDA device before the engine's GPU pool.
+    pub fn with_ring(path: Option<&Path>, ring: &RingOptions) -> Result<Self, Exception> {
+        let_cxx_string!(
+            config_path = path
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+        Ok(Self {
+            inner: RefCell::new(sirius_sys::make_context_with_ring(
+                &config_path,
+                ring.frame_bytes,
+                ring.send_bytes,
+                ring.recv_bytes,
+                ring.gpu_landing_fraction,
+                ring.host_landing_bytes,
+                ring.disk_writers,
+            )?),
+        })
+    }
+
     /// Start a new [`Fragment`] on this context. The fragment borrows the context, so it cannot
     /// outlive the engine it runs on.
     pub fn fragment(&self) -> Result<Fragment<'_>, Exception> {
@@ -112,6 +134,19 @@ impl SiriusContext {
         }
         // Drain fully while `self` is alive (conversion dereferences the context).
         collect_arrow_stream(stream)
+    }
+
+    /// This context's [`ExchangeInbox`], or `None` unless it has one GPU memory space.
+    pub fn exchange_inbox(&self) -> Option<ExchangeInbox> {
+        let inner = self.inner.borrow().exchange_inbox();
+        (!inner.is_null()).then_some(ExchangeInbox { inner })
+    }
+
+    /// This context's [`RingExchange`], or `None` unless it was made by
+    /// [`with_ring`](Self::with_ring).
+    pub fn ring_exchange(&self) -> Option<RingExchange> {
+        let inner = self.inner.borrow().ring_exchange();
+        (!inner.is_null()).then_some(RingExchange { inner })
     }
 }
 
@@ -227,6 +262,35 @@ impl Fragment<'_> {
         )
     }
 
+    /// The next batch parked on output `stream_id` as a [`RingJob`], or `None` once the stream is
+    /// drained.
+    pub fn export_ring(&mut self, stream_id: u64) -> Result<Option<RingJob>, Exception> {
+        let (mut token, mut rows, mut stream_bytes) = (0, 0, 0);
+        let header = self.inner.pin_mut().export_ring(
+            stream_id,
+            &mut token,
+            &mut rows,
+            &mut stream_bytes,
+        )?;
+        Ok(RingJob::from_ffi(token, rows, stream_bytes, header))
+    }
+
+    /// A handle that exports output stream `stream_id` from any thread, including while
+    /// [`run`](Fragment::run) executes, so the output ships as it is produced. Take it after
+    /// [`build`](Fragment::build) and before `run`. A fragment dropped without running fails it.
+    pub fn output_drain(&self, stream_id: u64) -> Result<OutputDrain, Exception> {
+        Ok(OutputDrain {
+            inner: self.inner.output_drain(stream_id)?,
+        })
+    }
+
+    /// Push the batch received under `token` into input stream `stream_id`, consuming the token
+    /// unless the call fails before reading it: before `build`, after `run` started, or on an
+    /// undeclared input. A batch whose columns differ from the declared ones is refused.
+    pub fn push_received(&mut self, stream_id: u64, token: u64) -> Result<(), Exception> {
+        self.inner.pin_mut().push_received(stream_id, token)
+    }
+
     /// Close `sender_id` on input stream `stream_id`: the end of stream for a sender that is not
     /// a local fragment ([`relay_from`](Fragment::relay_from) closes its own). Idempotent.
     pub fn close_input(&mut self, stream_id: u64, sender_id: u32) -> Result<(), Exception> {
@@ -274,6 +338,260 @@ impl Fragment<'_> {
             .iter()
             .map(|ty| ty.to_string_lossy().into_owned())
             .collect())
+    }
+}
+
+/// Exports one output stream of a [`Fragment`] while it runs, from [`Fragment::output_drain`].
+/// The full contract is documented on the C++ `sirius::ffi::OutputDrain`.
+pub struct OutputDrain {
+    inner: UniquePtr<sirius_sys::OutputDrain>,
+}
+
+// SAFETY: the C++ handle shares only the output's batch stream, which locks its own state, and
+// the exchanges, which serialize their calls and set the CUDA device themselves.
+unsafe impl Send for OutputDrain {}
+
+/// What [`OutputDrain::next_ring`] found within its timeout.
+#[derive(Debug)]
+pub enum RingDrainNext {
+    Job(RingJob),
+    /// Nothing yet; the fragment may still produce more.
+    Waiting,
+    /// The stream ended and every batch was exported.
+    End,
+}
+
+impl OutputDrain {
+    /// The next batch with rows as a [`RingJob`], waiting up to `timeout` for the fragment to
+    /// produce one. Errors once the fragment's run failed.
+    pub fn next_ring(&mut self, timeout: std::time::Duration) -> Result<RingDrainNext, Exception> {
+        let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        let (mut ended, mut token, mut rows, mut stream_bytes) = (false, 0, 0, 0);
+        let header = self.inner.export_ring_next(
+            timeout_ms,
+            &mut ended,
+            &mut token,
+            &mut rows,
+            &mut stream_bytes,
+        )?;
+        if let Some(job) = RingJob::from_ffi(token, rows, stream_bytes, header) {
+            return Ok(RingDrainNext::Job(job));
+        }
+        Ok(if ended {
+            RingDrainNext::End
+        } else {
+            RingDrainNext::Waiting
+        })
+    }
+}
+
+impl std::fmt::Debug for OutputDrain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OutputDrain")
+    }
+}
+
+/// Sizes of a context's ring exchange, for [`SiriusContext::with_ring`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RingOptions {
+    pub frame_bytes: u64,
+    pub send_bytes: u64,
+    pub recv_bytes: u64,
+    /// Share of the GPU space that landed batches may hold until their receivers take them.
+    pub gpu_landing_fraction: f64,
+    /// Host bytes that landed batches may hold until their receivers take them.
+    pub host_landing_bytes: u64,
+    /// Threads writing batches that land on disk.
+    pub disk_writers: u64,
+}
+
+/// One batch exported for the ring exchange: a job on the sender's [`RingExchange`].
+#[derive(Clone, Debug)]
+pub struct RingJob {
+    /// Released on the sender's [`RingExchange`] once every frame was written.
+    pub token: u64,
+    pub rows: u64,
+    /// Bytes the job's frames carry.
+    pub stream_bytes: u64,
+    /// What the receiver passes to [`RingExchange::begin`].
+    pub header: Vec<u8>,
+}
+
+impl RingJob {
+    /// The job an export's out-parameters describe, or `None` for a null header.
+    fn from_ffi(
+        token: u64,
+        rows: u64,
+        stream_bytes: u64,
+        header: UniquePtr<cxx::CxxVector<u8>>,
+    ) -> Option<Self> {
+        (!header.is_null()).then(|| RingJob {
+            token,
+            rows,
+            stream_bytes,
+            header: header.as_slice().to_vec(),
+        })
+    }
+}
+
+/// Where a batch is landing on its receiver, from [`RingExchange::begin`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Landing {
+    pub id: u64,
+    /// 0 GPU, 1 host, 2 disk.
+    pub tier: u8,
+    pub rows: u64,
+    pub frames: u32,
+}
+
+/// The engine's ends of the ring exchange, from [`SiriusContext::ring_exchange`]. The full
+/// contract is documented on the C++ `sirius::ffi::RingExchange`.
+pub struct RingExchange {
+    inner: UniquePtr<sirius_sys::RingExchange>,
+}
+
+// SAFETY: the C++ handle shares the context's ring exchange, which serializes its state on its
+// own mutexes and sets the CUDA device itself, so nothing behind it is tied to a thread.
+unsafe impl Send for RingExchange {}
+unsafe impl Sync for RingExchange {}
+
+impl RingExchange {
+    /// The CUDA device of both rings.
+    pub fn device(&self) -> i32 {
+        self.inner.device()
+    }
+
+    /// Base address and length of the send ring.
+    pub fn send_region(&self) -> (usize, u64) {
+        (self.inner.send_base(), self.inner.send_len())
+    }
+
+    /// Base address and length of the receive ring.
+    pub fn recv_region(&self) -> (usize, u64) {
+        (self.inner.recv_base(), self.inner.recv_len())
+    }
+
+    pub fn frame_bytes(&self) -> u64 {
+        self.inner.frame_bytes()
+    }
+
+    /// A free send frame, or `None` when every one is leased.
+    pub fn lease_send(&self) -> Result<Option<u32>, Exception> {
+        Ok(u32::try_from(self.inner.lease_send()?).ok())
+    }
+
+    /// A free receive frame, or `None` when every one is leased.
+    pub fn lease_recv(&self) -> Result<Option<u32>, Exception> {
+        Ok(u32::try_from(self.inner.lease_recv()?).ok())
+    }
+
+    pub fn release_send(&self, frame: u32) -> Result<(), Exception> {
+        self.inner.release_send(frame)
+    }
+
+    pub fn release_recv(&self, frame: u32) -> Result<(), Exception> {
+        self.inner.release_recv(frame)
+    }
+
+    /// Copies frame `k` of job `token` into send frame `frame`; returns a ticket for
+    /// [`done`](Self::done).
+    pub fn stage(&self, token: u64, k: u32, frame: u32) -> Result<u64, Exception> {
+        self.inner.stage(token, k, frame)
+    }
+
+    /// Frees what job `token` holds once its frames were written.
+    pub fn release_job(&self, token: u64) -> Result<(), Exception> {
+        self.inner.release_job(token)
+    }
+
+    /// Starts landing the batch whose header is `header`, without waiting for memory.
+    pub fn begin(&self, header: &[u8]) -> Result<Landing, Exception> {
+        let (mut tier, mut rows, mut frames) = (0, 0, 0);
+        // SAFETY: the address and length name `header`, borrowed for the whole call.
+        let id = unsafe {
+            self.inner.begin(
+                header.as_ptr() as usize,
+                header.len(),
+                &mut tier,
+                &mut rows,
+                &mut frames,
+            )?
+        };
+        Ok(Landing {
+            id,
+            tier,
+            rows,
+            frames,
+        })
+    }
+
+    /// Copies `len` bytes of receive frame `frame`, the stream's frame `k`, to `landing`; returns
+    /// a ticket for [`done`](Self::done).
+    pub fn copy_out(&self, landing: u64, k: u32, frame: u32, len: u64) -> Result<u64, Exception> {
+        self.inner.copy_out(landing, k, frame, len)
+    }
+
+    /// Hands a landing whose copies are all done to the exchange inbox; returns its token.
+    pub fn seal(&self, landing: u64) -> Result<u64, Exception> {
+        self.inner.seal(landing)
+    }
+
+    /// Frees a landing that will not be sealed.
+    pub fn abort(&self, landing: u64) -> Result<(), Exception> {
+        self.inner.abort(landing)
+    }
+
+    /// Whether a ticket's copies finished, without waiting; `true` consumes it.
+    pub fn done(&self, ticket: u64) -> Result<bool, Exception> {
+        self.inner.done(ticket)
+    }
+
+    /// Batches and bytes sent and landed, and the rings' peak occupancy, as one log line.
+    pub fn stats_line(&self) -> String {
+        self.inner
+            .stats_line()
+            .map(|line| line.to_string_lossy().into_owned())
+            .unwrap_or_else(|err| err.what().to_string())
+    }
+}
+
+impl std::fmt::Debug for RingExchange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RingExchange")
+            .field("device", &self.device())
+            .field("send", &self.send_region())
+            .field("recv", &self.recv_region())
+            .finish()
+    }
+}
+
+/// Holds batches a transport received until [`Fragment::push_received`] takes them by token, from
+/// [`SiriusContext::exchange_inbox`]. The full contract is documented on the C++
+/// `sirius::ffi::ExchangeInbox`.
+pub struct ExchangeInbox {
+    inner: UniquePtr<sirius_sys::ExchangeInbox>,
+}
+
+// SAFETY: the C++ handle shares the context's token table, which serializes every call on one
+// mutex and sets the CUDA device itself, so no state behind it is tied to a thread.
+unsafe impl Send for ExchangeInbox {}
+unsafe impl Sync for ExchangeInbox {}
+
+impl ExchangeInbox {
+    /// Free what `token` holds. Unknown and consumed tokens are ignored.
+    pub fn release(&self, token: u64) -> Result<(), Exception> {
+        self.inner.release(token)
+    }
+
+    /// Tokens neither released nor consumed.
+    pub fn outstanding(&self) -> Result<usize, Exception> {
+        self.inner.outstanding()
+    }
+}
+
+impl std::fmt::Debug for ExchangeInbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExchangeInbox")
     }
 }
 

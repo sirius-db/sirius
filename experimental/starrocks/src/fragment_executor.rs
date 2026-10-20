@@ -1,16 +1,19 @@
 //! Execution of a translated fragment.
 //!
 //! A result fragment returns Arrow batches for `fetch_data`; a sender fragment parks its native
-//! GPU output under [`SenderSlot`]s for a same-CN receiver to relay in. A [`StubExecutor`] stands
-//! in for the GPU engine so the StarRocks dispatch and result-return plumbing can be exercised end
-//! to end without a build tree or a GPU.
+//! GPU output under [`SenderSlot`]s for a same-CN receiver to relay in, or for the NIXL transport
+//! to export to a remote one. A [`StubExecutor`] stands in for the GPU engine so the StarRocks
+//! dispatch and result-return plumbing can be exercised end to end without a build tree or a GPU.
 
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use starrocks_plan_translator::TranslatedPlan;
 
+use crate::local_exchange::RemoteBatch;
 use crate::result_store::FragmentInstanceId;
 
 /// Where one sender fragment's output is parked until its receiver runs.
@@ -25,6 +28,46 @@ pub struct SenderSlot {
     pub(crate) node_id: i32,
     /// Sender ordinal within that exchange's sender set.
     pub(crate) sender_id: i32,
+}
+
+/// One parked or streamed batch exported for the ring exchange: a job on this CN's ring, held
+/// until released there.
+#[derive(Clone, Debug)]
+pub struct RingJob {
+    pub token: u64,
+    pub rows: u64,
+    /// Bytes the job's frames carry.
+    pub stream_bytes: u64,
+    /// What the receiver lands the frames by.
+    pub header: Vec<u8>,
+}
+
+/// What [`OutputDrain::next_ring`] found within its timeout.
+#[derive(Debug)]
+pub enum RingNext {
+    Job(RingJob),
+    /// Nothing yet; the fragment may still produce more.
+    Waiting,
+    /// The stream ended and every batch was exported.
+    End,
+}
+
+/// Exports one output stream of a sender fragment while it runs, from any thread.
+pub trait OutputDrain: Send + std::fmt::Debug {
+    /// The next batch as a ring job, waiting up to `timeout` for one. Errors once the fragment
+    /// failed.
+    fn next_ring(&mut self, timeout: Duration) -> Result<RingNext, String>;
+}
+
+/// Asks the executor to hand out drains for some output streams before it runs the fragment,
+/// so those outputs ship while the fragment produces them.
+#[derive(Debug)]
+pub struct DrainHandoff {
+    /// Output stream indices (positions in [`FragmentRun::outputs`]) to drain.
+    pub streams: Vec<usize>,
+    /// Receives one drain per stream, in `streams` order, just before the run starts. Dropped
+    /// unsent when the executor does not stream or the fragment fails before running.
+    pub respond: Sender<Vec<Box<dyn OutputDrain>>>,
 }
 
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
@@ -53,12 +96,16 @@ pub struct FragmentRun<'a> {
     pub plan: &'a TranslatedPlan,
     /// Parked sender outputs to relay into this fragment, keyed by receiver exchange node id.
     pub inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Batches remote senders wrote into this CN, as `(exchange node id, sender id, batches)`.
+    pub remote_inputs: Vec<(i32, i32, Vec<RemoteBatch>)>,
     /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
     pub outputs: Vec<SenderSlot>,
     /// Every destination receives the full output (a broadcast sink).
     pub broadcast: bool,
     /// Hash-partition key columns for a hash fan-out (empty otherwise).
     pub hash_keys: Vec<usize>,
+    /// Outputs to drain while the fragment runs; the rest stay parked until it finishes.
+    pub drains: Option<DrainHandoff>,
 }
 
 /// Runs a translated fragment, either parking its output for a downstream fragment or returning
@@ -83,6 +130,14 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
             return Ok(None);
         }
         self.execute(run.plan).map(Some)
+    }
+
+    /// Exports the next batch parked under `slot` as a ring job; `None` once drained. The caller
+    /// owns the job and must release it on this CN's ring exchange.
+    fn export_ring_next(&self, slot: SenderSlot) -> Result<Option<RingJob>, String> {
+        Err(format!(
+            "this executor cannot export the output parked under {slot:?}"
+        ))
     }
 
     /// Drops one destination's claim on parked output, which is freed with the last claim. The

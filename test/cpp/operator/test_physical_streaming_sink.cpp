@@ -38,6 +38,7 @@
 #include <memory>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -501,6 +502,45 @@ TEST_CASE("streaming_sink PART-1: partitioned fan-out preserves every row exactl
   REQUIRE(seen == expected);
 }
 
+TEST_CASE("streaming_sink PART-1b: slices are combined up to the target bytes", "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  auto [op, repos] = make_partitioned_sink(2);
+  // More than the whole input: every destination's slices wait for finalize.
+  op->set_combine_bytes(std::size_t{1} << 30);
+  std::vector<std::pair<int64_t, int32_t>> expected;
+  for (int b = 0; b < 3; ++b) {
+    std::vector<int64_t> keys;
+    std::vector<int32_t> vals;
+    for (int i = 0; i < 8; ++i) {
+      const auto key = static_cast<int64_t>(b * 8 + i);
+      keys.push_back(key);
+      vals.push_back(static_cast<int32_t>(key * 10));
+      expected.emplace_back(key, static_cast<int32_t>(key * 10));
+    }
+    sink_one(*op,
+             make_two_column_batch<int64_t, int32_t>(*gpu_space, keys, vals, cudf::type_id::INT32));
+  }
+  for (std::size_t i = 0; i < 2; ++i) {
+    CHECK(op->availability(i) == availability::WAITING);
+  }
+  op->finalize_operator();
+
+  std::vector<std::pair<int64_t, int32_t>> seen;
+  for (std::size_t i = 0; i < 2; ++i) {
+    // One combined batch per destination.
+    CHECK(repos[i]->get_batch_ids().size() == 1);
+    auto rows = drain_rows(*op, i);
+    seen.insert(seen.end(), rows.begin(), rows.end());
+  }
+  std::sort(seen.begin(), seen.end());
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(seen == expected);
+}
+
 // ============================================================================
 // PART-2: equal keys are co-located — the property a shuffle actually needs
 // ============================================================================
@@ -834,4 +874,84 @@ TEST_CASE("streaming_sink PART-9: broadcast clones are independent batches", "[s
   REQUIRE(ids[0] == original_id);
   std::sort(ids.begin(), ids.end());
   REQUIRE(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
+}
+
+// ============================================================================
+// PART-10: a batch larger than a piece is partitioned piece by piece (R6)
+// ============================================================================
+
+TEST_CASE("streaming_sink PART-10: pieces cover every row once and stay under the bound",
+          "[streaming_sink]")
+{
+  using pieces_t = std::vector<std::pair<std::size_t, std::size_t>>;
+  REQUIRE(sirius_physical_streaming_sink::partition_pieces(1000, 100, 256) == pieces_t{{0, 1000}});
+  REQUIRE(sirius_physical_streaming_sink::partition_pieces(1, 1 << 20, 256) == pieces_t{{0, 1}});
+  REQUIRE(sirius_physical_streaming_sink::partition_pieces(0, 1 << 20, 256) == pieces_t{{0, 0}});
+  for (auto const [rows, bytes, piece] : {std::tuple{1000u, 4096u, 256u},
+                                          std::tuple{7u, 1000u, 100u},
+                                          std::tuple{1u << 20, 3u << 28, 1u << 28}}) {
+    auto const pieces = sirius_physical_streaming_sink::partition_pieces(rows, bytes, piece);
+    std::size_t next  = 0;
+    for (auto const& [begin, end] : pieces) {
+      REQUIRE(begin == next);
+      REQUIRE(end > begin);
+      // At the batch's average row width, each piece fits the bound.
+      REQUIRE((end - begin) * bytes <= std::size_t{piece} * rows + bytes);
+      next = end;
+    }
+    REQUIRE(next == rows);
+  }
+}
+
+TEST_CASE("streaming_sink PART-11: a batch partitioned in pieces keeps every row and its routing",
+          "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  std::vector<int64_t> keys;
+  std::vector<int32_t> vals;
+  std::vector<std::pair<int64_t, int32_t>> expected;
+  for (int i = 0; i < 1000; ++i) {
+    keys.push_back(i % 97);
+    vals.push_back(i);
+    expected.emplace_back(i % 97, i);
+  }
+  auto collect = [&](std::size_t piece) {
+    auto [op, repos] = make_partitioned_sink(3);
+    op->set_max_piece_bytes(piece);
+    sink_one(*op,
+             make_two_column_batch<int64_t, int32_t>(*gpu_space, keys, vals, cudf::type_id::INT32));
+    op->finalize_operator();
+    std::vector<std::vector<std::pair<int64_t, int32_t>>> out;
+    for (std::size_t i = 0; i < 3; ++i) {
+      auto rows = drain_rows(*op, i);
+      std::sort(rows.begin(), rows.end());
+      out.push_back(rows);
+    }
+    return out;
+  };
+  // Whole, and in pieces of a few hundred bytes (~20 pieces): same rows at the same destinations.
+  auto const whole  = collect(sirius_physical_streaming_sink::default_max_piece_bytes);
+  auto const pieces = collect(600);
+  REQUIRE(pieces == whole);
+  std::vector<std::pair<int64_t, int32_t>> seen;
+  for (auto const& rows : pieces) {
+    seen.insert(seen.end(), rows.begin(), rows.end());
+  }
+  std::sort(seen.begin(), seen.end());
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(seen == expected);
+}
+
+TEST_CASE("streaming_sink PART-12: only the hash fan-out may be retried after an OOM",
+          "[streaming_sink]")
+{
+  auto [single, repo] = make_sink();
+  REQUIRE_FALSE(single->sink_publishes_on_success_only());
+  auto [hash, repos] = make_partitioned_sink(2);
+  REQUIRE(hash->sink_publishes_on_success_only());
+  auto [broadcast, brepos] = make_broadcast_sink(2);
+  REQUIRE_FALSE(broadcast->sink_publishes_on_success_only());
 }

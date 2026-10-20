@@ -27,6 +27,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "exec/exchange_staging.hpp"
 #include "exec/stream_bind_catalog.hpp"
 #include "helper/transaction_utils.hpp"
 #include "log/duckdb_sink.hpp"
@@ -1285,6 +1286,16 @@ sirius::data::data_repository_manager_registry& SiriusContext::get_data_reposito
 {
   throw_if_not_initialized();
   return data_repository_registry_;
+}
+
+sirius::exec::exchange_staging& SiriusContext::get_exchange_staging()
+{
+  throw_if_not_initialized();
+  std::call_once(exchange_staging_once_, [this] {
+    exchange_staging_ = std::make_unique<sirius::exec::exchange_staging>(data_repository_registry_,
+                                                                         &query_lifecycle_);
+  });
+  return *exchange_staging_;
 }
 
 sirius::pipeline::task_scheduler& SiriusContext::get_task_scheduler()

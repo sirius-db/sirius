@@ -24,14 +24,12 @@ pub(crate) struct ExchangeKey {
 }
 
 /// One batch a remote sender delivered into this CN's memory.
-// Fed by the cross-node transport, which this build does not have yet.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RemoteBatch {
+pub struct RemoteBatch {
     /// Names the receive allocation holding the batch.
-    pub(crate) token: u64,
+    pub token: u64,
     /// Exact row count, for the receiver's declared input cardinality.
-    pub(crate) rows: u64,
+    pub rows: u64,
 }
 
 /// One sender's output, and where it sits.
@@ -106,7 +104,6 @@ const HANDED_OVER: usize = 4096;
 /// What became of one remote frame. Returned once per frame, so the large accepted variant is
 /// not worth boxing.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum RemoteFrame {
     /// Kept; the receiver, if this frame completed its sender set.
@@ -114,6 +111,17 @@ pub(crate) enum RemoteFrame {
     /// A replay of a frame already kept, dropped without keeping its batch again. A resent frame
     /// may name the very buffer its first copy delivered, so freeing it is the transport's call.
     Duplicate,
+}
+
+impl RemoteFrame {
+    /// The receiver this frame completed, if any. A duplicate completes nothing, and its batch is
+    /// not the caller's to free: it may name the very buffer its first copy delivered.
+    pub(crate) fn into_ready(self) -> Option<ReadyFragment> {
+        match self {
+            Self::Accepted(ready) => ready,
+            Self::Duplicate => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -132,7 +140,7 @@ impl RemoteFrame {
 pub(crate) struct Purged {
     /// Parked same-CN sender outputs, each released with `drop_parked`.
     pub(crate) slots: Vec<SenderSlot>,
-    /// Direct-exchange receive buffers remote senders filled, each released by token.
+    /// Batches remote senders landed in the exchange inbox, each released by token.
     pub(crate) tokens: Vec<u64>,
 }
 
@@ -259,7 +267,6 @@ impl LocalExchange {
     /// sender; a replayed `seq` is dropped as [`RemoteFrame::Duplicate`] and a skipped one fails
     /// the sender. Only an accepted frame advances `seq`, so a frame refused here can be resent.
     /// A refused frame's batch is not kept and is the caller's to free.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn push_remote_frame(
         &self,
         key: ExchangeKey,
