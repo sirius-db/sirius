@@ -36,8 +36,10 @@
 #include <utils/sirius_test_env.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <memory>
 #include <set>
@@ -1450,5 +1452,172 @@ TEST_CASE_METHOD(fragment_fixture,
       con->Rollback();
       throw;
     }
+  }
+}
+
+// ============================================================================
+// FRAG-STREAM: an output drained on its own thread while run() produces it
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-STREAM: an output stream drains from another thread during run()",
+                 "[integration][streaming_fragment]")
+{
+  using availability = batch_stream::availability;
+  auto make_leaf     = [&] {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+    spec.outputs     = {0};
+    return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+  };
+  // Drains `stream` until it ends; rethrows the fragment's error.
+  auto drain = [](batch_stream& stream) {
+    std::vector<std::int32_t> values;
+    for (;;) {
+      switch (stream.wait_for(std::chrono::milliseconds(50))) {
+        case availability::END_OF_STREAM: std::sort(values.begin(), values.end()); return values;
+        case availability::WAITING: break;
+        case availability::HAS_DATA:
+          if (auto batch = stream.try_pull()) {
+            auto view = sirius::get_cudf_table_view(*batch);
+            auto col =
+              sirius::test::operator_utils::copy_column_to_host<std::int32_t>(view.column(0));
+            values.insert(values.end(), col.begin(), col.end());
+          }
+          break;
+      }
+    }
+  };
+
+  con->BeginTransaction();
+  try {
+    SECTION("a stream taken before run() waits, then delivers every batch and its end")
+    {
+      auto fragment = make_leaf();
+      REQUIRE_THROWS_WITH(fragment->output_stream(0), ContainsSubstring("requires build()"));
+      fragment->build();
+      REQUIRE_THROWS_WITH(fragment->output_stream(1), ContainsSubstring("no output stream"));
+      auto stream = fragment->output_stream(0);
+      REQUIRE(stream->classify() == availability::WAITING);
+      REQUIRE(stream->wait_for(std::chrono::milliseconds(1)) == availability::WAITING);
+
+      std::vector<std::int32_t> drained;
+      std::exception_ptr consumer_error;
+      std::thread consumer([&] {
+        try {
+          drained = drain(*stream);
+        } catch (...) {
+          consumer_error = std::current_exception();
+        }
+      });
+      fragment->run();
+      consumer.join();
+      REQUIRE_FALSE(consumer_error);
+      REQUIRE(drained == std::vector<std::int32_t>{1, 2, 3, 4, 5});
+      REQUIRE(fragment->drained(0));
+    }
+
+    SECTION("a failed run() releases the consumer with its cause")
+    {
+      auto fragment = make_leaf();
+      fragment->build();
+      auto stream = fragment->output_stream(0);
+      std::exception_ptr consumer_error;
+      std::thread consumer([&] {
+        try {
+          static_cast<void>(drain(*stream));
+        } catch (...) {
+          consumer_error = std::current_exception();
+        }
+      });
+      con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+        ->get_scan_manager()
+        .bump_pin_registry_epoch_for_testing();
+      REQUIRE_THROWS_WITH(fragment->run(), ContainsSubstring("pinned or unpinned"));
+      consumer.join();
+      REQUIRE(consumer_error);
+      REQUIRE_THROWS_WITH(std::rethrow_exception(consumer_error),
+                          ContainsSubstring("pinned or unpinned"));
+    }
+
+    SECTION("a fragment destroyed without running fails a stream it handed out")
+    {
+      auto fragment = make_leaf();
+      fragment->build();
+      auto stream = fragment->output_stream(0);
+      fragment.reset();
+      REQUIRE(stream->classify() == availability::HAS_DATA);
+      REQUIRE_THROWS_WITH(stream->try_pull(), ContainsSubstring("destroyed without running"));
+    }
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-17: an interrupt from another thread stops a run retrying out-of-memory
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-17: an interrupt stops a run retrying out-of-memory, and the next run works",
+                 "[integration][streaming_fragment][interrupt]")
+{
+  auto set = [&](const std::string& sql) {
+    auto result = con->Query(sql);
+    REQUIRE_FALSE(result->HasError());
+  };
+  // Uninterrupted, the run would retry for about 20 s before giving up.
+  set("SET sirius_test_inject_gpu_task_oom=1000000");
+  set("SET sirius_test_gpu_task_retry_limit=2000");
+  set("SET sirius_test_gpu_task_retry_backoff_ms=10");
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  auto tasks_started = sirius_ctx->window_task_counter();
+
+  con->BeginTransaction();
+  try {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+    spec.outputs     = {0};
+    streaming_fragment stuck(*con->context, std::move(spec));
+    stuck.build();
+
+    auto const tasks_before = tasks_started->load();
+    auto run                = std::async(std::launch::async, [&] { stuck.run(); });
+    auto const deadline     = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (tasks_started->load() < tasks_before + 3 &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(tasks_started->load() >= tasks_before + 3);  // retrying out-of-memory
+
+    auto const interrupted_at = std::chrono::steady_clock::now();
+    con->Interrupt();
+    REQUIRE(run.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    CHECK(std::chrono::steady_clock::now() - interrupted_at < std::chrono::seconds(2));
+    REQUIRE_THROWS_AS(run.get(), duckdb::InterruptException);
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+
+  set("SET sirius_test_inject_gpu_task_oom=0");
+  con->BeginTransaction();
+  try {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+    spec.outputs     = {0};
+    streaming_fragment next(*con->context, std::move(spec));
+    next.build();
+    next.run();
+    REQUIRE(drain_row_count(next, 0) == kLeafRows);
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
   }
 }

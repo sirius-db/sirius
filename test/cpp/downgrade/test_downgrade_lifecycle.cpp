@@ -162,6 +162,35 @@ TEST_CASE("start_stop_cycle", "[downgrade_lifecycle]")
   REQUIRE_NOTHROW(executor.stop());
 }
 
+TEST_CASE("a sweep over a closed lifecycle id counts a borrow refused skip",
+          "[downgrade_lifecycle]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto batch     = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+  // The query is ending: its batches can no longer be borrowed for a spill.
+  lifecycle.quiesce(kTestQueryId);
+
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+  REQUIRE(executor.request_free_memory_and_wait(1ull << 30) == 0);
+  auto const& skips = executor.skip_totals();
+  REQUIRE(skips.count(sirius::spill_skip::borrow_refused) == 1);
+  REQUIRE(skips.total() == 1);
+  REQUIRE(skips.to_string() == "borrow_refused 1 (0.00 GiB)");
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::GPU);
+  executor.stop();
+}
+
 TEST_CASE("drain_clears_pending_requests", "[downgrade_lifecycle]")
 {
   auto mem_mgr    = make_test_memory_manager();

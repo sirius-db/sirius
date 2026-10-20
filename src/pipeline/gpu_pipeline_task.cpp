@@ -769,13 +769,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     // operators.size() means "the loop already ran; only the sink is left" (compute_task's loop is
     // a no-op for that index, see the guard on first_op above).
     if (output_data) {
-      // ONLY the restoration is retryable. A sink publishes incrementally — a partition writes
-      // batches to its repositories as it goes — so an OOM inside sink() has already committed
-      // some of them, and replaying the whole sink input would emit those rows twice. The
-      // reschedule window therefore closes before sink() is entered; an OOM there propagates.
-      try {
-        materialized = materialize_sink_input(*output_data, stream);
-      } catch (const rmm::out_of_memory& oom) {
+      auto const reschedule = [&](rmm::out_of_memory const& oom, std::string reason) {
         auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
         auto const bytes_to_materialize_input =
           local_state.get_reservation_size_info()->bytes_to_materialize_input;
@@ -789,10 +783,10 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
           global_usage    = cc_oom->global_usage;
         }
         SIRIUS_LOG_WARN(
-          "Pipeline {}: OOM restoring a deferral at the sink, requested {} bytes ({:.2f} MB), "
-          "global usage {} bytes ({:.2f} MB), peak allocated {} bytes ({:.2f} MB), rescheduling "
-          "task {}",
+          "Pipeline {}: {}, requested {} bytes ({:.2f} MB), global usage {} bytes ({:.2f} MB), "
+          "peak allocated {} bytes ({:.2f} MB), rescheduling task {}",
           pipeline->get_pipeline_id(),
+          reason,
           requested_bytes,
           static_cast<double>(requested_bytes) / (1024.0 * 1024.0),
           global_usage,
@@ -802,10 +796,27 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
           get_task_id());
         auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
         global.get_memory_history().record_on_failure(input_basis, peak_bytes);
-        throw oom_reschedule_exception(
-          std::move(output_data), operators.size(), "OOM restoring a deferral at the sink");
+        materialized.reset();
+        throw oom_reschedule_exception(std::move(output_data), operators.size(), std::move(reason));
+      };
+      // ONLY the restoration is retryable. A sink publishes incrementally — a partition writes
+      // batches to its repositories as it goes — so an OOM inside sink() has already committed
+      // some of them, and replaying the whole sink input would emit those rows twice. The
+      // reschedule window therefore closes before sink() is entered; an OOM there propagates.
+      try {
+        materialized = materialize_sink_input(*output_data, stream);
+      } catch (const rmm::out_of_memory& oom) {
+        reschedule(oom, "OOM restoring a deferral at the sink");
       }
-      publish_output(*output_data, materialized.get(), stream);
+      try {
+        publish_output(*output_data, materialized.get(), stream);
+      } catch (const rmm::out_of_memory& oom) {
+        // A sink that publishes nothing unless it returns (a partitioned STREAMING_SINK) is
+        // retried like an operator: none of its input reached a repository yet.
+        auto sink_op = pipeline->get_sink();
+        if (!sink_op || !sink_op->sink_publishes_on_success_only()) { throw; }
+        reschedule(oom, std::format("OOM in sink {} (nothing published)", sink_op->get_name()));
+      }
     }
 
     // Record memory metrics for future reservation estimates. Measured after publish_output, not

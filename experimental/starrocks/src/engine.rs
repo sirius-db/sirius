@@ -3,34 +3,89 @@
 //! [`sirius::SiriusContext`] is `!Send`/`!Sync` and the engine serializes queries through a single
 //! process-global context, so the context is created, used, and dropped on one dedicated thread.
 //! [`SiriusEngine`] talks to that thread over channels — which are `Send`/`Sync` and carry only
-//! owned data (`Vec<u8>` in, `Vec<RecordBatch>` out) — so it satisfies `dyn FragmentExecutor:
-//! Send + Sync` without ever moving the context across threads.
+//! owned data — so it satisfies `dyn FragmentExecutor: Send + Sync` without ever moving the
+//! context across threads.
 //!
-//! The seam is synchronous (see [`FragmentExecutor`]): `execute()` blocks the caller until the
-//! engine thread returns the result. `exec_plan_fragment` runs it on a `spawn_blocking` worker, so
-//! the BRPC current-thread runtime stays free to serve `fetch_data`, connection cleanup, and
-//! shutdown cancellation while a query runs. The single-fragment limitations are elsewhere: the
-//! whole result is materialized before dispatch returns, and the single process-global context
-//! serializes queries — both lifted by the streaming evolution.
+//! The seam is synchronous (see [`FragmentExecutor`]): `run_fragment` blocks the caller until the
+//! engine thread returns. `exec_plan_fragment` runs it on a `spawn_blocking` worker, so the BRPC
+//! current-thread runtime stays free to serve `fetch_data`, connection cleanup, and shutdown
+//! cancellation while a query runs. A sender fragment's output stays parked on the GPU, owned by
+//! the engine thread, until a same-CN receiver relays it in or the NIXL transport exports it to a
+//! remote one. Every fragment is materialized before dispatch returns, and the single
+//! process-global context serializes queries — both lifted by the streaming evolution.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use arrow_array::RecordBatch;
 use sirius::SiriusContext;
-use starrocks_plan_translator::TranslatedPlan;
-use tracing::info;
+use starrocks_plan_translator::{StreamInputSchema, TranslatedPlan};
+use tracing::{info, warn};
 
-use crate::fragment_executor::{FragmentExecutor, FragmentResult};
+use crate::fragment_executor::{
+    DrainHandoff, FilterKeys, FilterRun, FragmentExecutor, FragmentResult, FragmentRun, KeySource,
+    KeyStats, OutputDrain, RingJob, RingNext, SenderSlot,
+};
+use crate::local_exchange::RemoteBatch;
+use crate::parked_registry::ParkedRegistry;
+use crate::result_store::FragmentInstanceId;
+use crate::running_query::{PendingFree, PendingFrees, RunningQuery};
 
-/// One execution request handed to the engine thread.
+/// One fragment execution handed to the engine thread.
 struct ExecuteRequest {
     /// Serialized Substrait plan bytes.
     plan: Vec<u8>,
+    /// Schema of every exchange this plan reads as a stream.
+    stream_inputs: Vec<StreamInputSchema>,
+    /// Parked sender outputs to relay in, keyed by receiver exchange node id.
+    inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Batches remote senders wrote into this CN, as `(exchange node id, sender id, batches)`.
+    remote_inputs: Vec<(i32, i32, Vec<RemoteBatch>)>,
+    /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
+    outputs: Vec<SenderSlot>,
+    /// Every destination receives the full output (a broadcast sink).
+    broadcast: bool,
+    /// Hash-partition key columns for a hash fan-out (empty otherwise).
+    hash_keys: Vec<usize>,
+    /// Outputs to hand out as drains just before the run, so they ship while it runs.
+    drains: Option<DrainHandoff>,
+    /// Runtime filters whose key streams `plan` reads.
+    filters: Vec<FilterRun>,
+    /// The plan and stream schemas without the runtime filters, run instead when their keys
+    /// cannot be copied.
+    fallback: Option<(Vec<u8>, Vec<StreamInputSchema>)>,
+    /// The query the fragment belongs to, so a purge of it can stop the run.
+    query: Option<FragmentInstanceId>,
     /// Channel the engine thread sends the result (or a flattened error) back on.
-    respond: Sender<Result<Vec<RecordBatch>, String>>,
+    respond: Sender<Result<Option<FragmentResult>, String>>,
+}
+
+/// One request to the engine thread, the only one that touches the context.
+// `Run` carries a whole fragment request and outweighs the others. A request lives only until the
+// engine thread takes it, so boxing it would buy nothing.
+#[allow(clippy::large_enum_variant)]
+enum EngineRequest {
+    Run(ExecuteRequest),
+    /// Export the next batch parked under `slot` as a ring job.
+    ExportRing {
+        slot: SenderSlot,
+        respond: Sender<Result<Option<RingJob>, String>>,
+    },
+    /// Rows, minimum and maximum of a runtime filter's keys, read in place.
+    KeyStats {
+        keys: FilterKeys,
+        respond: Sender<Result<KeyStats, String>>,
+    },
+    /// Drop one destination's claim on parked output. Without `respond` nobody waits for it, and
+    /// `pending` marks the drop done once the engine thread got to it.
+    DropParked {
+        slot: SenderSlot,
+        respond: Option<Sender<Result<(), String>>>,
+        pending: Option<PendingFree>,
+    },
 }
 
 /// GPU-backed [`FragmentExecutor`] running plans on an embedded Sirius engine.
@@ -42,46 +97,142 @@ struct ExecuteRequest {
 pub struct SiriusEngine {
     /// Sender to the engine thread. `Mutex<Option<..>>` makes the `!Sync` sender shareable and
     /// lets `Drop` close the channel before joining; sends are brief (the thread serializes work).
-    requests: Mutex<Option<Sender<ExecuteRequest>>>,
+    requests: Mutex<Option<Sender<EngineRequest>>>,
     /// Engine thread handle, taken and joined on drop.
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// The context's exchange inbox, present when its GPU pool is a slab or it has a ring.
+    exchange_inbox: Option<Arc<sirius::ExchangeInbox>>,
+    /// Parked sender fragments, published by the engine thread after every request so a reader
+    /// never waits behind a running fragment.
+    parked: Arc<AtomicUsize>,
+    /// The query of the run in progress, so a purge interrupts that run and no other.
+    running: Arc<RunningQuery>,
+    /// Stops the run in progress from any thread.
+    interrupter: Arc<Interrupter>,
+    /// Parked output whose drop is queued, and interrupted runs that have not returned.
+    frees: Arc<PendingFrees>,
 }
+
+/// The engine's [`sirius::Interrupter`], which has no `Debug` of its own.
+struct Interrupter(sirius::Interrupter);
+
+impl std::fmt::Debug for Interrupter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Interrupter")
+    }
+}
+
+/// How often a purge repeats its interrupt while the run it targets has not returned: one that
+/// lands before the run's gate opens is dropped.
+const INTERRUPT_EVERY: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// How long a purge goes on interrupting a run that does not return (one blocked waiting for a
+/// memory reservation, say), so its pending free is not held for good.
+const INTERRUPT_FOR: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl SiriusEngine {
     /// Brings up the engine on a dedicated thread (fail-fast) and returns a handle.
     ///
     /// Blocks until the context is initialized — or bring-up fails — so a bad config or GPU
     /// failure surfaces here, before any RPC is served. `config` is the optional Sirius YAML path
-    /// (built-in defaults when `None`).
-    pub fn start(config: Option<PathBuf>) -> Result<Self, String> {
-        let (request_tx, request_rx) = channel::<ExecuteRequest>();
-        let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+    /// (built-in defaults when `None`). With `ring`, the context also gets a ring exchange of that
+    /// size, allocated before the engine's GPU pool and returned for the transport that registers
+    /// its rings.
+    pub fn start(
+        config: Option<PathBuf>,
+        ring: Option<sirius::RingOptions>,
+    ) -> Result<(Self, Option<sirius::RingExchange>), String> {
+        let (request_tx, request_rx) = channel::<EngineRequest>();
+        let (ready_tx, ready_rx) = channel();
+        let parked = Arc::new(AtomicUsize::new(0));
+        let published = Arc::clone(&parked);
+        let running = Arc::new(RunningQuery::default());
+        let engine_running = Arc::clone(&running);
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
-            .spawn(move || engine_thread(config, request_rx, ready_tx))
+            .spawn(move || {
+                engine_thread(
+                    config,
+                    ring,
+                    request_rx,
+                    ready_tx,
+                    published,
+                    engine_running,
+                )
+            })
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                requests: Mutex::new(Some(request_tx)),
-                thread: Mutex::new(Some(thread)),
-            }),
+            Ok(Ok(ready)) => Ok((
+                Self {
+                    requests: Mutex::new(Some(request_tx)),
+                    thread: Mutex::new(Some(thread)),
+                    exchange_inbox: ready.exchange_inbox.map(Arc::new),
+                    parked,
+                    running,
+                    interrupter: Arc::new(Interrupter(ready.interrupter)),
+                    frees: Arc::default(),
+                },
+                ready.ring_exchange,
+            )),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
         }
     }
+
+    /// The context's exchange inbox, or `None` unless its GPU pool is a slab or it has a ring.
+    pub fn exchange_inbox(&self) -> Option<Arc<sirius::ExchangeInbox>> {
+        self.exchange_inbox.clone()
+    }
+
+    /// Sends one request to the engine thread and waits for its answer.
+    fn call<T>(
+        &self,
+        request: impl FnOnce(Sender<Result<T, String>>) -> EngineRequest,
+    ) -> Result<T, String> {
+        let (respond_tx, respond_rx) = channel();
+        self.send(request(respond_tx))?;
+        respond_rx
+            .recv()
+            .map_err(|_| "sirius-engine thread dropped the response".to_string())?
+    }
+
+    /// Queues one request for the engine thread.
+    fn send(&self, request: EngineRequest) -> Result<(), String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .ok_or_else(|| "sirius-engine is shutting down".to_string())?
+            .send(request)
+            .map_err(|_| "sirius-engine thread is not running".to_string())
+    }
+}
+
+struct Ready {
+    exchange_inbox: Option<sirius::ExchangeInbox>,
+    ring_exchange: Option<sirius::RingExchange>,
+    interrupter: sirius::Interrupter,
 }
 
 /// Engine-thread body: bring up the context, signal readiness, then serve requests until the
 /// request channel closes. The context is dropped here, on this thread, when the loop ends.
 fn engine_thread(
     config: Option<PathBuf>,
-    requests: Receiver<ExecuteRequest>,
-    ready: Sender<Result<(), String>>,
+    ring: Option<sirius::RingOptions>,
+    requests: Receiver<EngineRequest>,
+    ready: Sender<Result<Ready, String>>,
+    published: Arc<AtomicUsize>,
+    running: Arc<RunningQuery>,
 ) {
-    let mut context = match build_context(config) {
+    let context = match build_context(config, ring) {
         Ok(context) => {
+            let handles = Ready {
+                exchange_inbox: context.exchange_inbox(),
+                ring_exchange: context.ring_exchange(),
+                interrupter: context.interrupter(),
+            };
             // A send error means the caller is already gone; nothing to serve.
-            if ready.send(Ok(())).is_err() {
+            if ready.send(Ok(handles)).is_err() {
                 return;
             }
             context
@@ -92,26 +243,499 @@ fn engine_thread(
         }
     };
     info!("sirius-engine thread ready");
-    // One query at a time until the handle (and its sender) is dropped.
+    // Declared after `context` so parked fragments, which borrow it, drop first.
+    let mut parked = ParkedRegistry::new();
+    // One request at a time until the handle (and its sender) is dropped. Ignore a send error on
+    // a response: the waiting caller may have been dropped/cancelled.
     while let Ok(request) = requests.recv() {
-        // `execute_substrait` drains the Arrow stream and drops the context-referencing wrapper
-        // here, on the engine thread, returning owned batches whose buffers are released via their
-        // own Arrow C release callbacks — independent of the context. So the batches are safe to
-        // send to, and drop on, the caller's thread.
-        let result = context
-            .execute_substrait(&request.plan)
-            .map_err(|err| err.to_string());
-        // Ignore a send error: the waiting fragment may have been dropped/cancelled.
-        let _ = request.respond.send(result);
+        match request {
+            EngineRequest::Run(request) => {
+                let planned = PlanToRun {
+                    bytes: &request.plan,
+                    stream_inputs: &request.stream_inputs,
+                    filters: &request.filters,
+                };
+                let result = running
+                    .run_as(request.query, || {
+                        match (
+                            run_fragment(&context, &mut parked, &request, planned),
+                            &request.fallback,
+                        ) {
+                            (Err(RunError::Filter(err)), Some((bytes, stream_inputs))) => {
+                                // Nothing was consumed yet: the keys are copied before any input
+                                // moves.
+                                warn!(
+                                    error = %err,
+                                    "runtime filter keys unavailable; running unfiltered"
+                                );
+                                let unfiltered = PlanToRun {
+                                    bytes,
+                                    stream_inputs,
+                                    filters: &[],
+                                };
+                                run_fragment(&context, &mut parked, &request, unfiltered)
+                            }
+                            (result, _) => result,
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        Err(RunError::Failed(
+                            "the fragment's query was purged before it ran".to_string(),
+                        ))
+                    })
+                    .map_err(String::from);
+                if result.is_err() {
+                    // A failed fragment may stop before relaying every input; release them all so
+                    // the senders' GPU batches are freed. An input already relayed is gone and
+                    // just errors.
+                    for slot in request.inputs.iter().flat_map(|(_, slots)| slots) {
+                        let _ = parked.release(slot);
+                    }
+                }
+                // Published before the reply, so a caller that reads the count after its answer
+                // sees this request's effect.
+                published.store(parked.len(), Ordering::Relaxed);
+                let _ = request.respond.send(result);
+            }
+            EngineRequest::ExportRing { slot, respond } => {
+                let _ = respond.send(export_ring(&mut parked, &slot));
+            }
+            EngineRequest::KeyStats { keys, respond } => {
+                let _ = respond.send(key_stats(&context, &mut parked, &keys));
+            }
+            EngineRequest::DropParked {
+                slot,
+                respond,
+                pending,
+            } => {
+                let released = parked.release(&slot);
+                published.store(parked.len(), Ordering::Relaxed);
+                match respond {
+                    Some(respond) => {
+                        let _ = respond.send(released);
+                    }
+                    None => {
+                        if let Err(err) = released {
+                            warn!(?slot, error = %err, "failed to drop a purged query's parked output");
+                        }
+                    }
+                }
+                drop(pending);
+            }
+        }
     }
     info!("sirius-engine thread shutting down");
 }
 
-/// Brings up a [`SiriusContext`] from an optional config path (built-in defaults when `None`).
-fn build_context(config: Option<PathBuf>) -> Result<SiriusContext, String> {
-    let context = match config {
-        Some(path) => SiriusContext::from_config_file(&path),
-        None => SiriusContext::new(),
+fn export_ring(
+    parked: &mut ParkedRegistry<sirius::Fragment<'_>>,
+    slot: &SenderSlot,
+) -> Result<Option<RingJob>, String> {
+    let (fragment, stream) = parked.claim(slot, "export")?;
+    let job = fragment
+        .export_ring(stream)
+        .map_err(|err| format!("failed to export a batch of output stream {stream}: {err}"))?;
+    Ok(job.map(ring_job))
+}
+
+fn ring_job(job: sirius::RingJob) -> RingJob {
+    RingJob {
+        token: job.token,
+        rows: job.rows,
+        stream_bytes: job.stream_bytes,
+        header: job.header,
+    }
+}
+
+/// The plan one attempt at a fragment runs, with the runtime filters it reads.
+#[derive(Clone, Copy)]
+struct PlanToRun<'r> {
+    bytes: &'r [u8],
+    stream_inputs: &'r [StreamInputSchema],
+    filters: &'r [FilterRun],
+}
+
+/// Why a fragment did not run.
+enum RunError {
+    /// A runtime filter's keys could not be copied. Nothing else was consumed, so the fragment can
+    /// still run without its filters.
+    Filter(String),
+    Failed(String),
+}
+
+impl From<String> for RunError {
+    fn from(err: String) -> Self {
+        Self::Failed(err)
+    }
+}
+
+impl From<RunError> for String {
+    fn from(err: RunError) -> Self {
+        match err {
+            RunError::Filter(err) | RunError::Failed(err) => err,
+        }
+    }
+}
+
+/// Rows, minimum and maximum of `keys`, read where they sit.
+fn key_stats(
+    context: &SiriusContext,
+    parked: &mut ParkedRegistry<sirius::Fragment<'_>>,
+    keys: &FilterKeys,
+) -> Result<KeyStats, String> {
+    let column =
+        u32::try_from(keys.column).map_err(|_| format!("key column {} overflows", keys.column))?;
+    let mut stats = sirius::KeyStats::default();
+    for source in &keys.sources {
+        match source {
+            KeySource::Parked(slot) => {
+                let (sender, stream) = parked.claim(slot, "read the keys of")?;
+                sender
+                    .output_key_stats(stream, column, &mut stats)
+                    .map_err(|err| format!("failed to read runtime filter keys: {err}"))?;
+            }
+            KeySource::Received(tokens) => {
+                let exchange = context
+                    .exchange_inbox()
+                    .ok_or("runtime filter keys arrived without an exchange inbox")?;
+                for &token in tokens {
+                    exchange
+                        .key_stats(token, column, &mut stats)
+                        .map_err(|err| format!("failed to read runtime filter keys: {err}"))?;
+                }
+            }
+        }
+    }
+    Ok(KeyStats {
+        rows: stats.rows,
+        min: stats.min,
+        max: stats.max,
+    })
+}
+
+/// Copies every runtime filter's keys into its stream and closes it, before any input moves.
+fn copy_filter_keys(
+    fragment: &mut sirius::Fragment<'_>,
+    parked: &mut ParkedRegistry<sirius::Fragment<'_>>,
+    filters: &[FilterRun],
+) -> Result<(), String> {
+    for filter in filters {
+        let column = u32::try_from(filter.keys.column)
+            .map_err(|_| format!("key column {} overflows", filter.keys.column))?;
+        let mut batches = 0;
+        for source in &filter.keys.sources {
+            match source {
+                KeySource::Parked(slot) => {
+                    let (sender, stream) = parked.claim(slot, "copy the keys of")?;
+                    batches += fragment
+                        .copy_output_column(sender, stream, filter.stream_id, column)
+                        .map_err(|err| format!("failed to copy runtime filter keys: {err}"))?;
+                }
+                KeySource::Received(tokens) => {
+                    for &token in tokens {
+                        fragment
+                            .copy_received_column(filter.stream_id, token, column)
+                            .map_err(|err| format!("failed to copy runtime filter keys: {err}"))?;
+                        batches += 1;
+                    }
+                }
+            }
+        }
+        fragment
+            .close_input(filter.stream_id, 0)
+            .map_err(|err| format!("failed to close runtime filter stream: {err}"))?;
+        info!(
+            stream_id = filter.stream_id,
+            rows = filter.rows,
+            batches,
+            "copied runtime filter keys"
+        );
+    }
+    Ok(())
+}
+
+/// Runs one fragment on the engine thread: declare its streams, build, relay parked sender output
+/// in, run, then park the output for its receivers or return the rows.
+fn run_fragment<'ctx>(
+    context: &'ctx SiriusContext,
+    parked: &mut ParkedRegistry<sirius::Fragment<'ctx>>,
+    request: &ExecuteRequest,
+    planned: PlanToRun<'_>,
+) -> Result<Option<FragmentResult>, RunError> {
+    let start_us = unix_us();
+    let started = Instant::now();
+    let mut fragment = context
+        .fragment()
+        .map_err(|err| format!("failed to create fragment: {err}"))?;
+
+    let mut sender_rows = Vec::with_capacity(planned.stream_inputs.len());
+    for schema in planned.stream_inputs {
+        let stream_id = stream_id_of(schema.node_id)?;
+        for column in &schema.columns {
+            fragment
+                .declare_input_column(stream_id, &column.name, &column.ty)
+                .map_err(|err| {
+                    format!(
+                        "failed to declare column {} of stream {stream_id}: {err}",
+                        column.name
+                    )
+                })?;
+        }
+        let senders = senders_of(request, schema.node_id);
+        let remote = remote_senders_of(request, schema.node_id);
+        let sender_ids = senders
+            .iter()
+            .map(|slot| slot.sender_id)
+            .chain(remote.clone().map(|(sender_id, _)| sender_id));
+        for sender_id in sender_ids {
+            fragment
+                .declare_input_sender(stream_id, sender_id_of(sender_id)?)
+                .map_err(|err| format!("failed to declare sender on stream {stream_id}: {err}"))?;
+        }
+        if let Some(filter) = planned
+            .filters
+            .iter()
+            .find(|filter| filter.stream_id == stream_id)
+        {
+            sender_rows.push(vec![Some(filter.rows)]);
+            continue;
+        }
+        sender_rows.push(
+            senders
+                .iter()
+                .map(|slot| {
+                    let (sender, sender_stream) = parked.claim(slot, "count").ok()?;
+                    sender.output_row_count(sender_stream).ok()
+                })
+                .chain(remote.map(|(_, batches)| {
+                    batches
+                        .iter()
+                        .try_fold(0u64, |rows, batch| rows.checked_add(batch.rows))
+                }))
+                .collect(),
+        );
+    }
+    match exact_cardinalities(sender_rows) {
+        Some(rows) => {
+            for (schema, rows) in planned.stream_inputs.iter().zip(rows) {
+                let stream_id = stream_id_of(schema.node_id)?;
+                fragment
+                    .declare_input_cardinality(stream_id, rows)
+                    .map_err(|err| {
+                        format!("failed to declare cardinality of stream {stream_id}: {err}")
+                    })?;
+                info!(stream_id, rows, "declared input stream cardinality");
+            }
+        }
+        None => warn!("an input stream row count is unknown; planning without cardinalities"),
+    }
+
+    for stream in 0..request.outputs.len() as u64 {
+        fragment
+            .declare_output(stream)
+            .map_err(|err| format!("failed to declare fragment output stream {stream}: {err}"))?;
+    }
+    if request.broadcast {
+        fragment
+            .declare_output_broadcast()
+            .map_err(|err| format!("failed to declare the broadcast output mode: {err}"))?;
+    }
+    for &key in &request.hash_keys {
+        let key = u32::try_from(key).map_err(|_| format!("hash key column {key} overflows"))?;
+        fragment
+            .declare_output_hash_key(key)
+            .map_err(|err| format!("failed to declare hash key column {key}: {err}"))?;
+    }
+
+    fragment
+        .build(planned.bytes)
+        .map_err(|err| format!("failed to plan fragment: {err}"))?;
+    let built = started.elapsed();
+
+    copy_filter_keys(&mut fragment, parked, planned.filters).map_err(RunError::Filter)?;
+
+    for schema in planned.stream_inputs {
+        let stream_id = stream_id_of(schema.node_id)?;
+        for slot in senders_of(request, schema.node_id) {
+            let sender_id = sender_id_of(slot.sender_id)?;
+            let (sender, sender_stream) = parked.claim(slot, "relay")?;
+            let moved = fragment
+                .relay_from(sender, sender_stream, stream_id, sender_id)
+                .map_err(|err| format!("failed to relay sender {sender_id}: {err}"))?;
+            parked.release(slot)?;
+            info!(
+                stream_id,
+                sender_id,
+                batches = moved,
+                "relayed native batches across a fragment boundary"
+            );
+        }
+    }
+    for (node_id, sender_id, batches) in &request.remote_inputs {
+        let stream_id = stream_id_of(*node_id)?;
+        for batch in batches {
+            fragment
+                .push_received(stream_id, batch.token)
+                .map_err(|err| {
+                    format!("failed to push a batch from remote sender {sender_id}: {err}")
+                })?;
+        }
+        fragment
+            .close_input(stream_id, sender_id_of(*sender_id)?)
+            .map_err(|err| {
+                format!("failed to close remote sender {sender_id} on stream {stream_id}: {err}")
+            })?;
+        info!(
+            stream_id,
+            sender_id,
+            batches = batches.len(),
+            "received remote packed batches"
+        );
+    }
+    let relayed = started.elapsed();
+
+    // Hand the drains out last: once taken, a failure before the run ends their streams (a
+    // fragment dropped without running fails its outputs), and the shipper sees that error.
+    let streamed = match &request.drains {
+        Some(handoff) => {
+            let drains = handoff
+                .streams
+                .iter()
+                .map(|&stream| {
+                    fragment
+                        .output_drain(stream as u64)
+                        .map(|drain| Box::new(EngineDrain(drain)) as Box<dyn OutputDrain>)
+                        .map_err(|err| format!("failed to drain output stream {stream}: {err}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // A closed channel means the shipper gave up; the output then stays parked.
+            let _ = handoff.respond.send(drains);
+            handoff.streams.len()
+        }
+        None => 0,
+    };
+
+    fragment
+        .run()
+        .map_err(|err| format!("failed to execute fragment: {err}"))?;
+    let ran = started.elapsed();
+
+    let result = if request.outputs.is_empty() {
+        // `result_to_arrow` drains the Arrow stream here, on the engine thread, returning owned
+        // batches whose buffers are released via their own Arrow C release callbacks —
+        // independent of the context. So the batches are safe to send to, and drop on, the
+        // caller's thread.
+        let result = fragment.result_to_arrow().map_err(|err| err.to_string())?;
+        Some(FragmentResult::new(result.batches))
+    } else {
+        parked.park(&request.outputs, fragment)?;
+        None
+    };
+    if timing_enabled() {
+        info!(
+            start_us,
+            end_us = unix_us(),
+            build_us = built.as_micros() as u64,
+            inputs_us = (relayed - built).as_micros() as u64,
+            run_us = (ran - relayed).as_micros() as u64,
+            outputs = request.outputs.len(),
+            streamed,
+            "fragment timing"
+        );
+    }
+    Ok(result)
+}
+
+/// An engine [`sirius::OutputDrain`] behind the executor seam.
+#[derive(Debug)]
+struct EngineDrain(sirius::OutputDrain);
+
+impl OutputDrain for EngineDrain {
+    fn next_ring(&mut self, timeout: std::time::Duration) -> Result<RingNext, String> {
+        Ok(
+            match self
+                .0
+                .next_ring(timeout)
+                .map_err(|err| format!("failed to export a streamed batch: {err}"))?
+            {
+                sirius::RingDrainNext::Job(job) => RingNext::Job(ring_job(job)),
+                sirius::RingDrainNext::Waiting => RingNext::Waiting,
+                sirius::RingDrainNext::End => RingNext::End,
+            },
+        )
+    }
+}
+
+/// The parked sender outputs feeding exchange `node_id`.
+fn senders_of(request: &ExecuteRequest, node_id: i32) -> &[SenderSlot] {
+    request
+        .inputs
+        .iter()
+        .find(|(id, _)| *id == node_id)
+        .map(|(_, senders)| senders.as_slice())
+        .unwrap_or_default()
+}
+
+/// The remote senders feeding exchange `node_id`, with the batches each wrote into this CN.
+fn remote_senders_of(
+    request: &ExecuteRequest,
+    node_id: i32,
+) -> impl Iterator<Item = (i32, &[RemoteBatch])> + Clone {
+    request
+        .remote_inputs
+        .iter()
+        .filter(move |(id, _, _)| *id == node_id)
+        .map(|(_, sender_id, batches)| (*sender_id, batches.as_slice()))
+}
+
+/// Each stream's exact row count summed over its senders, or `None` when any count is unknown.
+/// All or none: an undeclared stream plans as cardinality 1, so declaring only some streams would
+/// make an unknown one look smallest and become the hash join build side.
+fn exact_cardinalities(sender_rows: Vec<Vec<Option<u64>>>) -> Option<Vec<u64>> {
+    sender_rows
+        .into_iter()
+        .map(|rows| {
+            rows.into_iter()
+                .try_fold(0u64, |total, rows| total.checked_add(rows?))
+        })
+        .collect()
+}
+
+fn stream_id_of(node_id: i32) -> Result<u64, String> {
+    u64::try_from(node_id).map_err(|_| format!("negative exchange node id {node_id}"))
+}
+
+fn sender_id_of(sender_id: i32) -> Result<u32, String> {
+    u32::try_from(sender_id).map_err(|_| format!("negative sender id {sender_id}"))
+}
+
+/// `SIRIUS_CN_TIMING` set to anything but empty or `0` logs one `fragment timing` line per
+/// fragment.
+fn timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SIRIUS_CN_TIMING").is_ok_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+/// Wall-clock microseconds since the Unix epoch, so timing lines from several CNs line up.
+fn unix_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+/// Brings up a [`SiriusContext`] from an optional config path (built-in defaults when `None`),
+/// with a ring exchange when `ring` is set.
+fn build_context(
+    config: Option<PathBuf>,
+    ring: Option<sirius::RingOptions>,
+) -> Result<SiriusContext, String> {
+    let context = match (config, ring) {
+        (config, Some(ring)) => SiriusContext::with_ring(config.as_deref(), &ring),
+        (Some(path), None) => SiriusContext::from_config_file(&path),
+        (None, None) => SiriusContext::new(),
     }
     .map_err(|err| format!("failed to bring up Sirius engine: {err}"))?;
     info!("Sirius engine context created");
@@ -120,22 +744,104 @@ fn build_context(config: Option<PathBuf>) -> Result<SiriusContext, String> {
 
 impl FragmentExecutor for SiriusEngine {
     fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
-        let (respond_tx, respond_rx) = channel();
-        let request = ExecuteRequest {
-            plan: translated.to_substrait_bytes(),
-            respond: respond_tx,
+        self.run_fragment(FragmentRun {
+            plan: translated,
+            inputs: Vec::new(),
+            remote_inputs: Vec::new(),
+            outputs: Vec::new(),
+            broadcast: false,
+            hash_keys: Vec::new(),
+            drains: None,
+            filters: Vec::new(),
+            fallback: None,
+            query: None,
+        })?
+        .ok_or_else(|| "result fragment returned no rows".to_string())
+    }
+
+    fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+        self.call(|respond| {
+            EngineRequest::Run(ExecuteRequest {
+                plan: run.plan.to_substrait_bytes(),
+                stream_inputs: run.plan.stream_inputs.clone(),
+                inputs: run.inputs,
+                remote_inputs: run.remote_inputs,
+                outputs: run.outputs,
+                broadcast: run.broadcast,
+                hash_keys: run.hash_keys,
+                drains: run.drains,
+                filters: run.filters,
+                fallback: run
+                    .fallback
+                    .map(|plan| (plan.to_substrait_bytes(), plan.stream_inputs.clone())),
+                query: run.query,
+                respond,
+            })
+        })
+    }
+
+    fn export_ring_next(&self, slot: SenderSlot) -> Result<Option<RingJob>, String> {
+        self.call(|respond| EngineRequest::ExportRing { slot, respond })
+    }
+
+    fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
+        self.call(|respond| EngineRequest::DropParked {
+            slot,
+            respond: Some(respond),
+            pending: None,
+        })
+    }
+
+    fn drop_parked_later(&self, slot: SenderSlot) {
+        let request = EngineRequest::DropParked {
+            slot,
+            respond: None,
+            pending: Some(self.frees.begin()),
         };
-        self.requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .ok_or_else(|| "sirius-engine is shutting down".to_string())?
-            .send(request)
-            .map_err(|_| "sirius-engine thread is not running".to_string())?;
-        let batches = respond_rx
-            .recv()
-            .map_err(|_| "sirius-engine thread dropped the response".to_string())??;
-        Ok(FragmentResult::new(batches))
+        if let Err(err) = self.send(request) {
+            warn!(?slot, error = %err, "failed to queue a parked output's drop");
+        }
+    }
+
+    fn interrupt(&self, query: FragmentInstanceId) {
+        self.running.purge(query);
+        if !self.running.is_running(query) {
+            return;
+        }
+        let (running, interrupter) = (Arc::clone(&self.running), Arc::clone(&self.interrupter));
+        let pending = self.frees.begin();
+        let spawned = std::thread::Builder::new()
+            .name("engine-interrupt".to_string())
+            .spawn(move || {
+                let started = Instant::now();
+                let sent =
+                    running.interrupt_while_running(query, INTERRUPT_EVERY, INTERRUPT_FOR, || {
+                        interrupter.0.interrupt()
+                    });
+                drop(pending);
+                info!(
+                    %query,
+                    interrupts = sent,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "interrupted a purged query's run"
+                );
+            });
+        if let Err(err) = spawned {
+            warn!(%query, error = %err, "cannot interrupt a purged query's run");
+        }
+    }
+
+    fn pending_frees(&self) -> Option<Arc<PendingFrees>> {
+        Some(Arc::clone(&self.frees))
+    }
+
+    fn key_stats(&self, keys: &FilterKeys) -> Result<KeyStats, String> {
+        let keys = keys.clone();
+        self.call(|respond| EngineRequest::KeyStats { keys, respond })
+    }
+
+    fn parked_fragments(&self) -> usize {
+        self.parked.load(Ordering::Relaxed)
     }
 }
 
@@ -163,7 +869,7 @@ impl Drop for SiriusEngine {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
+    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
 
@@ -279,6 +985,43 @@ mod tests {
         }
     }
 
+    /// Like [`local_files_plan_with_base_schema`] but reads exchange `node_id`'s input stream, as
+    /// the translator lowers an `EXCHANGE_NODE`.
+    fn stream_read_plan(node_id: i32, columns: &[(&str, bool)]) -> TranslatedPlan {
+        use starrocks_plan_translator::StreamInputColumn;
+        use substrait::proto::read_rel::{NamedTable, ReadType};
+        use substrait::proto::{plan_rel, rel};
+
+        let mut translated = local_files_plan_with_base_schema("", columns);
+        let stream_view = sirius::stream_view_name(node_id as u64);
+        let Some(plan_rel::RelType::Root(root)) = &mut translated.plan.relations[0].rel_type else {
+            panic!("plan has a root relation");
+        };
+        let Some(rel::RelType::Read(read)) = root
+            .input
+            .as_mut()
+            .and_then(|input| input.rel_type.as_mut())
+        else {
+            panic!("root reads a table");
+        };
+        read.read_type = Some(ReadType::NamedTable(NamedTable {
+            names: vec![stream_view.clone()],
+            ..Default::default()
+        }));
+        translated.stream_inputs = vec![StreamInputSchema {
+            node_id,
+            stream_view,
+            columns: columns
+                .iter()
+                .map(|(name, is_string)| StreamInputColumn {
+                    name: name.to_string(),
+                    ty: if *is_string { "VARCHAR" } else { "BIGINT" }.to_string(),
+                })
+                .collect(),
+        }];
+        translated
+    }
+
     /// Replays a Substrait plan dumped via `SIRIUS_CN_DUMP_FRAGMENTS` (path in
     /// `SIRIUS_SUBSTRAIT_PLAN`) against the engine — a debug harness for diagnosing a captured
     /// plan in isolation, outside the FE/CN loop.
@@ -287,7 +1030,7 @@ mod tests {
     fn engine_replays_dumped_substrait_plan() {
         let path = std::env::var("SIRIUS_SUBSTRAIT_PLAN").expect("SIRIUS_SUBSTRAIT_PLAN not set");
         let plan = std::fs::read(&path).expect("read dumped substrait plan");
-        let engine = SiriusEngine::start(None).expect("bring up sirius engine");
+        let (engine, _) = SiriusEngine::start(None, None).expect("bring up sirius engine");
         let (respond_tx, respond_rx) = channel();
         engine
             .requests
@@ -295,20 +1038,49 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .send(ExecuteRequest {
+            .send(EngineRequest::Run(ExecuteRequest {
                 plan,
+                stream_inputs: Vec::new(),
+                inputs: Vec::new(),
+                remote_inputs: Vec::new(),
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: Vec::new(),
+                drains: None,
+                filters: Vec::new(),
+                fallback: None,
+                query: None,
                 respond: respond_tx,
-            })
+            }))
             .unwrap();
-        let batches = respond_rx
+        let result = respond_rx
             .recv()
             .expect("engine response")
-            .expect("execute");
-        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            .expect("execute")
+            .expect("result fragment returned rows");
+        let rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
         eprintln!("plan {path} returned {rows} row(s)");
-        for batch in &batches {
+        for batch in &result.batches {
             eprintln!("{batch:?}");
         }
+    }
+
+    #[test]
+    fn cardinalities_are_declared_for_every_stream_or_none() {
+        assert_eq!(
+            exact_cardinalities(vec![vec![Some(2), Some(3)], vec![Some(4)]]),
+            Some(vec![5, 4])
+        );
+        assert_eq!(
+            exact_cardinalities(vec![vec![Some(2)], vec![Some(4), None]]),
+            None,
+            "one unknown sender leaves every stream undeclared"
+        );
+        assert_eq!(
+            exact_cardinalities(vec![vec![Some(u64::MAX), Some(1)]]),
+            None
+        );
+        assert_eq!(exact_cardinalities(Vec::new()), Some(Vec::new()));
     }
 
     /// End-to-end: drive a `local_files` parquet plan through the engine actor and read the rows
@@ -338,10 +1110,36 @@ mod tests {
             vec!["id".to_string(), "name".to_string()],
         );
 
-        let engine = SiriusEngine::start(None).expect("bring up sirius engine");
+        let (engine, _) = SiriusEngine::start(None, None).expect("bring up sirius engine");
         let result = engine.execute(&plan).expect("execute fragment on GPU");
         let total_rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
+
+        // A purged query's runs never start, and other queries' still run. Checked here rather
+        // than in a test of its own: two engines in one process don't fit the GPU together.
+        let run = |query| {
+            engine.run_fragment(FragmentRun {
+                plan: &plan,
+                inputs: Vec::new(),
+                remote_inputs: Vec::new(),
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: Vec::new(),
+                drains: None,
+                filters: Vec::new(),
+                fallback: None,
+                query: Some(query),
+            })
+        };
+        engine.interrupt(FragmentInstanceId::from_halves(90, 0));
+        let refused = run(FragmentInstanceId::from_halves(90, 5)).unwrap_err();
+        assert!(refused.contains("purged before it ran"), "{refused}");
+        let result = run(FragmentInstanceId::from_halves(91, 5))
+            .expect("another query still runs")
+            .expect("a result fragment returns rows");
+        let rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 3);
+        assert_eq!(engine.pending_frees().unwrap().pending(), 0);
 
         // A `base_schema` that prunes and reorders the file's columns must bind by name, not by
         // file position (exercises the Substrait reader's `local_files` projection). The fixture
@@ -397,5 +1195,135 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("second output column is the int64 id column");
         assert_eq!(id_col.value(0), 1);
+
+        // Park-then-relay: a sender parks the scan for one receiver, which reads it back as a
+        // stream with a declared cardinality.
+        let slot = SenderSlot {
+            fragment_instance_id: crate::result_store::FragmentInstanceId::from_halves(1, 2),
+            node_id: 7,
+            sender_id: 0,
+        };
+        let parked = engine
+            .run_fragment(FragmentRun {
+                plan: &plan,
+                inputs: Vec::new(),
+                remote_inputs: Vec::new(),
+                outputs: vec![slot],
+                broadcast: false,
+                hash_keys: Vec::new(),
+                drains: None,
+                filters: Vec::new(),
+                fallback: None,
+                query: None,
+            })
+            .expect("park the sender output");
+        assert!(parked.is_none(), "a sender fragment returns no rows");
+        let receiver = stream_read_plan(7, &[("id", false), ("name", true)]);
+        let relayed = engine
+            .run_fragment(FragmentRun {
+                plan: &receiver,
+                inputs: vec![(7, vec![slot])],
+                remote_inputs: Vec::new(),
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: Vec::new(),
+                drains: None,
+                filters: Vec::new(),
+                fallback: None,
+                query: None,
+            })
+            .expect("relay into the receiver")
+            .expect("the receiver returns rows");
+        let relayed_rows: usize = relayed.batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(relayed_rows, 3);
+
+        // A receiver that fails before relaying still releases its input, so the slot parks again.
+        let park = || {
+            engine.run_fragment(FragmentRun {
+                plan: &plan,
+                inputs: Vec::new(),
+                remote_inputs: Vec::new(),
+                outputs: vec![slot],
+                broadcast: false,
+                hash_keys: Vec::new(),
+                drains: None,
+                filters: Vec::new(),
+                fallback: None,
+                query: None,
+            })
+        };
+        park().expect("park the sender output");
+        engine
+            .run_fragment(FragmentRun {
+                plan: &receiver,
+                inputs: vec![(7, vec![slot])],
+                remote_inputs: Vec::new(),
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: vec![usize::MAX],
+                drains: None,
+                filters: Vec::new(),
+                fallback: None,
+                query: None,
+            })
+            .expect_err("an overflowing hash key fails the receiver");
+        park().expect("the failed receiver released its input");
+
+        // Fan-out to two receivers: broadcast copies every row to each, a hash on `id` splits
+        // the rows between them without overlap.
+        let fan_out = |instance: i64, broadcast: bool, hash_keys: Vec<usize>| {
+            let slots = [0, 1].map(|sender_id| SenderSlot {
+                fragment_instance_id: crate::result_store::FragmentInstanceId::from_halves(
+                    instance, sender_id,
+                ),
+                node_id: 7,
+                sender_id: 0,
+            });
+            engine
+                .run_fragment(FragmentRun {
+                    plan: &plan,
+                    inputs: Vec::new(),
+                    remote_inputs: Vec::new(),
+                    outputs: slots.to_vec(),
+                    broadcast,
+                    hash_keys,
+                    drains: None,
+                    filters: Vec::new(),
+                    fallback: None,
+                    query: None,
+                })
+                .expect("park the fan-out");
+            slots.map(|slot| {
+                let rows = engine
+                    .run_fragment(FragmentRun {
+                        plan: &receiver,
+                        inputs: vec![(7, vec![slot])],
+                        remote_inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        broadcast: false,
+                        hash_keys: Vec::new(),
+                        drains: None,
+                        filters: Vec::new(),
+                        fallback: None,
+                        query: None,
+                    })
+                    .expect("relay one destination")
+                    .expect("the receiver returns rows");
+                rows.batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+            })
+        };
+        // The earlier slot is still parked from `park()` above.
+        assert_eq!(engine.parked_fragments(), 1);
+        assert_eq!(fan_out(3, true, Vec::new()), [3, 3]);
+        let [left, right] = fan_out(4, false, vec![0]);
+        assert_eq!(left + right, 3);
+        assert_eq!(
+            engine.parked_fragments(),
+            1,
+            "both fan-outs were fully relayed"
+        );
     }
 }

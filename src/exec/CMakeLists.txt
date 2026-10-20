@@ -3,6 +3,11 @@ target_sources(
   PRIVATE admission_control.cpp
           arrow_result_stream.cpp
           batch_stream.cpp
+          exchange_inbox.cpp
+          exchange_staging.cpp
+          exchange_ring.cpp
+          exchange_ring_ends.cpp
+          exchange_ring_wire.cpp
           stream_session.cpp
           stream_bind_catalog.cpp
           stream_plan_bindings.cpp

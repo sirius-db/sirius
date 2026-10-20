@@ -4,10 +4,15 @@
 //! This crate wraps the low-level [`sirius-sys`][sirius_sys] cxx bindings in safe Rust types
 //! — the entry point for driving Sirius from Rust.
 //!
-//! Today it binds just enough to prove the toolchain links against the real
-//! Sirius library: constructing a [`SiriusContext`] from defaults or a YAML
-//! config file. More of the API surface is added in later PRs.
+//! Two entry points:
+//!
+//! * [`SiriusContext`] — an initialized engine, constructed from defaults or a
+//!   YAML config file, able to execute a whole Substrait plan in one call.
+//! * [`Fragment`] — one plan fragment of a multi-fragment query, for driving a
+//!   distributed plan a piece at a time.
 
+use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::path::Path;
 
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
@@ -29,7 +34,12 @@ use cxx::{Exception, UniquePtr, let_cxx_string};
 /// is not yet supported (enforcement is a follow-up).
 pub struct SiriusContext {
     // RAII handle owning the C++ engine context for its lifetime.
-    inner: UniquePtr<sirius_sys::Context>,
+    //
+    // Behind a `RefCell` because every call into C++ needs `Pin<&mut Context>`, yet a distributed
+    // plan keeps several fragments alive at once (senders parked until their receiver relays from
+    // them), each borrowing the context through `&self`. Every call borrows mutably only for its
+    // own duration.
+    inner: RefCell<UniquePtr<sirius_sys::Context>>,
 }
 
 /// Fully materialized output of one Substrait execution.
@@ -45,7 +55,7 @@ impl SiriusContext {
     /// built-in defaults.
     pub fn new() -> Result<Self, Exception> {
         Ok(Self {
-            inner: sirius_sys::make_context()?,
+            inner: RefCell::new(sirius_sys::make_context()?),
         })
     }
 
@@ -56,7 +66,38 @@ impl SiriusContext {
         // one from the (lossy) UTF-8 form of the platform path.
         let_cxx_string!(config_path = path.to_string_lossy().as_ref());
         Ok(Self {
-            inner: sirius_sys::make_context_from_config(&config_path)?,
+            inner: RefCell::new(sirius_sys::make_context_from_config(&config_path)?),
+        })
+    }
+
+    /// Bring up a context with a ring exchange (see [`RingExchange`]), configured from the YAML
+    /// file at `path`, or from built-in defaults without one. The rings are allocated on the
+    /// current CUDA device before the engine's GPU pool.
+    pub fn with_ring(path: Option<&Path>, ring: &RingOptions) -> Result<Self, Exception> {
+        let_cxx_string!(
+            config_path = path
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+        Ok(Self {
+            inner: RefCell::new(sirius_sys::make_context_with_ring(
+                &config_path,
+                ring.frame_bytes,
+                ring.send_bytes,
+                ring.recv_bytes,
+                ring.gpu_landing_fraction,
+                ring.host_landing_bytes,
+                ring.disk_writers,
+            )?),
+        })
+    }
+
+    /// Start a new [`Fragment`] on this context. The fragment borrows the context, so it cannot
+    /// outlive the engine it runs on.
+    pub fn fragment(&self) -> Result<Fragment<'_>, Exception> {
+        Ok(Fragment {
+            inner: sirius_sys::make_fragment(self.inner.borrow_mut().pin_mut())?,
+            _context: PhantomData,
         })
     }
 
@@ -71,15 +112,12 @@ impl SiriusContext {
     /// Arrow stream converts each batch using this context's client state, so the
     /// stream is drained while the context is alive; the returned batches own
     /// their buffers and are independent of the context's lifetime.
-    pub fn execute_substrait(&mut self, plan: &[u8]) -> Result<Vec<RecordBatch>, SiriusError> {
+    pub fn execute_substrait(&self, plan: &[u8]) -> Result<Vec<RecordBatch>, SiriusError> {
         Ok(self.execute_substrait_result(plan)?.batches)
     }
 
     /// Execute a serialized Substrait plan and retain its Arrow schema for empty results.
-    pub fn execute_substrait_result(
-        &mut self,
-        plan: &[u8],
-    ) -> Result<SubstraitResult, SiriusError> {
+    pub fn execute_substrait_result(&self, plan: &[u8]) -> Result<SubstraitResult, SiriusError> {
         // The engine writes a self-owning Arrow C Data Interface stream into
         // `stream`; the FFI takes its address as an integer (a `uintptr_t`).
         let mut stream = FFI_ArrowArrayStream::empty();
@@ -89,21 +127,594 @@ impl SiriusContext {
         // `FFI_ArrowArrayStream` owned by this stack frame for the call's duration.
         unsafe {
             self.inner
+                .borrow_mut()
                 .pin_mut()
                 .execute_substrait(&plan, out_stream_addr)
                 .map_err(SiriusError::Engine)?;
         }
         // Drain fully while `self` is alive (conversion dereferences the context).
-        let reader = ArrowArrayStreamReader::try_new(stream).map_err(SiriusError::Arrow)?;
-        let schema = reader.schema();
-        let batches = reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(SiriusError::Arrow)?;
-        Ok(SubstraitResult { schema, batches })
+        collect_arrow_stream(stream)
+    }
+
+    /// This context's [`ExchangeInbox`], or `None` unless it has one GPU memory space.
+    pub fn exchange_inbox(&self) -> Option<ExchangeInbox> {
+        let inner = self.inner.borrow().exchange_inbox();
+        (!inner.is_null()).then_some(ExchangeInbox { inner })
+    }
+
+    /// This context's [`RingExchange`], or `None` unless it was made by
+    /// [`with_ring`](Self::with_ring).
+    pub fn ring_exchange(&self) -> Option<RingExchange> {
+        let inner = self.inner.borrow().ring_exchange();
+        (!inner.is_null()).then_some(RingExchange { inner })
+    }
+
+    /// A handle that cancels this context's run in progress from another thread.
+    ///
+    /// `SiriusContext` stays on the thread that runs queries; hand the returned
+    /// [`Interrupter`] to the threads that need to cancel them.
+    pub fn interrupter(&self) -> Interrupter {
+        Interrupter {
+            inner: self.inner.borrow().interrupter(),
+        }
     }
 }
 
-/// Error returned by [`SiriusContext::execute_substrait`].
+/// Cancels the query running on the [`SiriusContext`] it came from, from any thread.
+///
+/// The cancelled call stops within one GPU task, including one retrying out of
+/// memory, and returns DuckDB's interrupt error ("Interrupted!"); the context stays
+/// usable. With no call in progress [`Interrupter::interrupt`] does nothing, so an
+/// interrupt never carries over to a later query. The handle may outlive its
+/// context, after which it does nothing.
+pub struct Interrupter {
+    inner: UniquePtr<sirius_sys::Interrupter>,
+}
+
+// SAFETY: the C++ `Interrupter` holds only a shared pointer to a mutex-guarded
+// gate; `interrupt()` locks it and sets DuckDB's atomic interrupt flag, and is
+// documented as callable from any thread. Destroying the handle on any thread
+// only releases that shared pointer.
+unsafe impl Send for Interrupter {}
+unsafe impl Sync for Interrupter {}
+
+impl Interrupter {
+    /// Cancel the query in progress on this handle's context, if any.
+    pub fn interrupt(&self) {
+        self.inner.interrupt();
+    }
+}
+
+fn collect_arrow_stream(stream: FFI_ArrowArrayStream) -> Result<SubstraitResult, SiriusError> {
+    let reader = ArrowArrayStreamReader::try_new(stream).map_err(SiriusError::Arrow)?;
+    let schema = reader.schema();
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(SiriusError::Arrow)?;
+    Ok(SubstraitResult { schema, batches })
+}
+
+/// The name of the view a plan must read to consume input stream `stream_id`.
+pub fn stream_view_name(stream_id: u64) -> String {
+    sirius_sys::stream_view_name(stream_id)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// One plan fragment of a multi-fragment query.
+///
+/// A fragment declaring one or more output streams parks its results on the GPU as native batches
+/// for a downstream fragment to take with [`Fragment::relay_from`]. A fragment declaring none is a
+/// result fragment and produces Arrow via [`Fragment::result_to_arrow`].
+///
+/// Calls are ordered: declare, [`build`](Fragment::build), close every input sender,
+/// [`run`](Fragment::run), then drain. Any number of fragments may be built before any runs.
+/// The full contract of each method is documented on the C++ `sirius::ffi::Fragment`.
+pub struct Fragment<'ctx> {
+    inner: UniquePtr<sirius_sys::Fragment>,
+    _context: PhantomData<&'ctx SiriusContext>,
+}
+
+impl Fragment<'_> {
+    /// Declare one column of input stream `stream_id`, in plan order. `ty` is a DuckDB type name
+    /// (`BIGINT`, `DECIMAL(15,2)`, `DATE`, …).
+    pub fn declare_input_column(
+        &mut self,
+        stream_id: u64,
+        name: &str,
+        ty: &str,
+    ) -> Result<(), Exception> {
+        let_cxx_string!(name = name);
+        let_cxx_string!(ty = ty);
+        self.inner
+            .pin_mut()
+            .declare_input_column(stream_id, &name, &ty)
+    }
+
+    /// Declare a sender that must close input stream `stream_id` before it ends. With none
+    /// declared the stream expects the single sender `0`.
+    pub fn declare_input_sender(
+        &mut self,
+        stream_id: u64,
+        sender_id: u32,
+    ) -> Result<(), Exception> {
+        self.inner
+            .pin_mut()
+            .declare_input_sender(stream_id, sender_id)
+    }
+
+    /// Declare the row count of input stream `stream_id`, summed over its senders, so the
+    /// optimizer can pick a join's build side. Undeclared streams plan as 1 row.
+    pub fn declare_input_cardinality(
+        &mut self,
+        stream_id: u64,
+        rows: u64,
+    ) -> Result<(), Exception> {
+        self.inner
+            .pin_mut()
+            .declare_input_cardinality(stream_id, rows)
+    }
+
+    /// Declare an output stream. A fragment with no output stream is a result fragment; one with
+    /// two or more needs [`declare_output_broadcast`](Fragment::declare_output_broadcast) or
+    /// [`declare_output_hash_key`](Fragment::declare_output_hash_key), or `build` fails.
+    pub fn declare_output(&mut self, stream_id: u64) -> Result<(), Exception> {
+        self.inner.pin_mut().declare_output(stream_id)
+    }
+
+    /// Every declared output stream receives the full fragment output.
+    pub fn declare_output_broadcast(&mut self) -> Result<(), Exception> {
+        self.inner.pin_mut().declare_output_broadcast()
+    }
+
+    /// Declare one hash-partition key column; the `i`-th declared output stream takes partition
+    /// `i`. Call once per key, in partition-expression order.
+    pub fn declare_output_hash_key(&mut self, column_index: u32) -> Result<(), Exception> {
+        self.inner.pin_mut().declare_output_hash_key(column_index)
+    }
+
+    /// Plan `substrait_plan` against the declared streams.
+    pub fn build(&mut self, substrait_plan: &[u8]) -> Result<(), Exception> {
+        let_cxx_string!(plan = substrait_plan);
+        self.inner.pin_mut().build(&plan)
+    }
+
+    /// Move every batch parked on `source`'s output stream into this fragment's input stream as
+    /// native GPU batches, then close `sender_id`. Returns the number of batches moved. `source`
+    /// must have finished [`run`](Fragment::run).
+    pub fn relay_from(
+        &mut self,
+        source: &mut Fragment<'_>,
+        source_stream_id: u64,
+        input_stream_id: u64,
+        sender_id: u32,
+    ) -> Result<usize, Exception> {
+        self.inner.pin_mut().relay_from(
+            source.inner.pin_mut(),
+            source_stream_id,
+            input_stream_id,
+            sender_id,
+        )
+    }
+
+    /// The next batch parked on output `stream_id` as a [`RingJob`], or `None` once the stream is
+    /// drained.
+    pub fn export_ring(&mut self, stream_id: u64) -> Result<Option<RingJob>, Exception> {
+        let (mut token, mut rows, mut stream_bytes) = (0, 0, 0);
+        let header = self.inner.pin_mut().export_ring(
+            stream_id,
+            &mut token,
+            &mut rows,
+            &mut stream_bytes,
+        )?;
+        Ok(RingJob::from_ffi(token, rows, stream_bytes, header))
+    }
+
+    /// A handle that exports output stream `stream_id` from any thread, including while
+    /// [`run`](Fragment::run) executes, so the output ships as it is produced. Take it after
+    /// [`build`](Fragment::build) and before `run`. A fragment dropped without running fails it.
+    pub fn output_drain(&self, stream_id: u64) -> Result<OutputDrain, Exception> {
+        Ok(OutputDrain {
+            inner: self.inner.output_drain(stream_id)?,
+        })
+    }
+
+    /// Add the non-null rows, minimum and maximum of signed integer column `column` over every
+    /// batch parked on output stream `stream_id` to `stats`, without draining it.
+    pub fn output_key_stats(
+        &self,
+        stream_id: u64,
+        column: u32,
+        stats: &mut KeyStats,
+    ) -> Result<(), Exception> {
+        self.inner.output_key_stats(
+            stream_id,
+            column,
+            &mut stats.rows,
+            &mut stats.min,
+            &mut stats.max,
+        )
+    }
+
+    /// Push a copy of column `column` of every batch parked on `source`'s output stream into
+    /// input stream `input_stream_id`, leaving the source as it was. Does not close a sender.
+    /// Returns the number of batches copied.
+    pub fn copy_output_column(
+        &mut self,
+        source: &mut Fragment<'_>,
+        source_stream_id: u64,
+        input_stream_id: u64,
+        column: u32,
+    ) -> Result<usize, Exception> {
+        self.inner.pin_mut().copy_output_column(
+            source.inner.pin_mut(),
+            source_stream_id,
+            input_stream_id,
+            column,
+        )
+    }
+
+    /// Push a copy of column `column` of the sealed batch under `token` into input stream
+    /// `input_stream_id`. The token stays for its receiver.
+    pub fn copy_received_column(
+        &mut self,
+        input_stream_id: u64,
+        token: u64,
+        column: u32,
+    ) -> Result<(), Exception> {
+        self.inner
+            .pin_mut()
+            .copy_received_column(input_stream_id, token, column)
+    }
+
+    /// Push the batch received under `token` into input stream `stream_id`, consuming the token
+    /// unless the call fails before reading it: before `build`, after `run` started, or on an
+    /// undeclared input. A batch whose columns differ from the declared ones is refused.
+    pub fn push_received(&mut self, stream_id: u64, token: u64) -> Result<(), Exception> {
+        self.inner.pin_mut().push_received(stream_id, token)
+    }
+
+    /// Close `sender_id` on input stream `stream_id`: the end of stream for a sender that is not
+    /// a local fragment ([`relay_from`](Fragment::relay_from) closes its own). Idempotent.
+    pub fn close_input(&mut self, stream_id: u64, sender_id: u32) -> Result<(), Exception> {
+        self.inner.pin_mut().close_input(stream_id, sender_id)
+    }
+
+    /// Execute the fragment. Blocks until its pipelines finish.
+    pub fn run(&mut self) -> Result<(), Exception> {
+        self.inner.pin_mut().run()
+    }
+
+    /// Collect a result fragment's rows over the Arrow C Data Interface, after
+    /// [`run`](Fragment::run). Consumes the fragment: the rows can be collected only once.
+    pub fn result_to_arrow(mut self) -> Result<SubstraitResult, SiriusError> {
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let out_stream_addr = std::ptr::addr_of_mut!(stream) as usize;
+        // SAFETY: `out_stream_addr` is the address of `stream`, a live, writable
+        // `FFI_ArrowArrayStream` owned by this stack frame for the call's duration.
+        unsafe {
+            self.inner
+                .pin_mut()
+                .result_to_arrow(out_stream_addr)
+                .map_err(SiriusError::Engine)?;
+        }
+        collect_arrow_stream(stream)
+    }
+
+    /// Batches currently parked on output stream `stream_id`.
+    pub fn output_batch_count(&self, stream_id: u64) -> Result<usize, Exception> {
+        self.inner.output_batch_count(stream_id)
+    }
+
+    /// Total rows parked on output stream `stream_id`, without draining it.
+    pub fn output_row_count(&self, stream_id: u64) -> Result<u64, Exception> {
+        self.inner.output_row_count(stream_id)
+    }
+
+    /// DuckDB type names of this built intermediate fragment's output columns (an error on a
+    /// result fragment), in the form
+    /// [`declare_input_column`](Fragment::declare_input_column) accepts.
+    pub fn output_types(&self) -> Result<Vec<String>, Exception> {
+        Ok(self
+            .inner
+            .output_types()?
+            .iter()
+            .map(|ty| ty.to_string_lossy().into_owned())
+            .collect())
+    }
+}
+
+/// Non-null rows, minimum and maximum of an integer key column, accumulated over batches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyStats {
+    pub rows: u64,
+    pub min: i64,
+    pub max: i64,
+}
+
+impl Default for KeyStats {
+    /// No rows yet: `min` and `max` start at the ends of the range.
+    fn default() -> Self {
+        Self {
+            rows: 0,
+            min: i64::MAX,
+            max: i64::MIN,
+        }
+    }
+}
+
+/// Exports one output stream of a [`Fragment`] while it runs, from [`Fragment::output_drain`].
+/// The full contract is documented on the C++ `sirius::ffi::OutputDrain`.
+pub struct OutputDrain {
+    inner: UniquePtr<sirius_sys::OutputDrain>,
+}
+
+// SAFETY: the C++ handle shares only the output's batch stream, which locks its own state, and
+// the exchanges, which serialize their calls and set the CUDA device themselves.
+unsafe impl Send for OutputDrain {}
+
+/// What [`OutputDrain::next_ring`] found within its timeout.
+#[derive(Debug)]
+pub enum RingDrainNext {
+    Job(RingJob),
+    /// Nothing yet; the fragment may still produce more.
+    Waiting,
+    /// The stream ended and every batch was exported.
+    End,
+}
+
+impl OutputDrain {
+    /// The next batch with rows as a [`RingJob`], waiting up to `timeout` for the fragment to
+    /// produce one. Errors once the fragment's run failed.
+    pub fn next_ring(&mut self, timeout: std::time::Duration) -> Result<RingDrainNext, Exception> {
+        let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        let (mut ended, mut token, mut rows, mut stream_bytes) = (false, 0, 0, 0);
+        let header = self.inner.export_ring_next(
+            timeout_ms,
+            &mut ended,
+            &mut token,
+            &mut rows,
+            &mut stream_bytes,
+        )?;
+        if let Some(job) = RingJob::from_ffi(token, rows, stream_bytes, header) {
+            return Ok(RingDrainNext::Job(job));
+        }
+        Ok(if ended {
+            RingDrainNext::End
+        } else {
+            RingDrainNext::Waiting
+        })
+    }
+}
+
+impl std::fmt::Debug for OutputDrain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OutputDrain")
+    }
+}
+
+/// Sizes of a context's ring exchange, for [`SiriusContext::with_ring`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RingOptions {
+    pub frame_bytes: u64,
+    pub send_bytes: u64,
+    pub recv_bytes: u64,
+    /// Share of the GPU space that landed batches may hold until their receivers take them.
+    pub gpu_landing_fraction: f64,
+    /// Host bytes that landed batches may hold until their receivers take them.
+    pub host_landing_bytes: u64,
+    /// Threads writing batches that land on disk.
+    pub disk_writers: u64,
+}
+
+/// One batch exported for the ring exchange: a job on the sender's [`RingExchange`].
+#[derive(Clone, Debug)]
+pub struct RingJob {
+    /// Released on the sender's [`RingExchange`] once every frame was written.
+    pub token: u64,
+    pub rows: u64,
+    /// Bytes the job's frames carry.
+    pub stream_bytes: u64,
+    /// What the receiver passes to [`RingExchange::begin`].
+    pub header: Vec<u8>,
+}
+
+impl RingJob {
+    /// The job an export's out-parameters describe, or `None` for a null header.
+    fn from_ffi(
+        token: u64,
+        rows: u64,
+        stream_bytes: u64,
+        header: UniquePtr<cxx::CxxVector<u8>>,
+    ) -> Option<Self> {
+        (!header.is_null()).then(|| RingJob {
+            token,
+            rows,
+            stream_bytes,
+            header: header.as_slice().to_vec(),
+        })
+    }
+}
+
+/// Where a batch is landing on its receiver, from [`RingExchange::begin`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Landing {
+    pub id: u64,
+    /// 0 GPU, 1 host, 2 disk.
+    pub tier: u8,
+    pub rows: u64,
+    pub frames: u32,
+}
+
+/// The engine's ends of the ring exchange, from [`SiriusContext::ring_exchange`]. The full
+/// contract is documented on the C++ `sirius::ffi::RingExchange`.
+pub struct RingExchange {
+    inner: UniquePtr<sirius_sys::RingExchange>,
+}
+
+// SAFETY: the C++ handle shares the context's ring exchange, which serializes its state on its
+// own mutexes and sets the CUDA device itself, so nothing behind it is tied to a thread.
+unsafe impl Send for RingExchange {}
+unsafe impl Sync for RingExchange {}
+
+impl RingExchange {
+    /// The CUDA device of both rings.
+    pub fn device(&self) -> i32 {
+        self.inner.device()
+    }
+
+    /// Base address and length of the send ring.
+    pub fn send_region(&self) -> (usize, u64) {
+        (self.inner.send_base(), self.inner.send_len())
+    }
+
+    /// Base address and length of the receive ring.
+    pub fn recv_region(&self) -> (usize, u64) {
+        (self.inner.recv_base(), self.inner.recv_len())
+    }
+
+    pub fn frame_bytes(&self) -> u64 {
+        self.inner.frame_bytes()
+    }
+
+    /// A free send frame, or `None` when every one is leased.
+    pub fn lease_send(&self) -> Result<Option<u32>, Exception> {
+        Ok(u32::try_from(self.inner.lease_send()?).ok())
+    }
+
+    /// A free receive frame, or `None` when every one is leased.
+    pub fn lease_recv(&self) -> Result<Option<u32>, Exception> {
+        Ok(u32::try_from(self.inner.lease_recv()?).ok())
+    }
+
+    pub fn release_send(&self, frame: u32) -> Result<(), Exception> {
+        self.inner.release_send(frame)
+    }
+
+    pub fn release_recv(&self, frame: u32) -> Result<(), Exception> {
+        self.inner.release_recv(frame)
+    }
+
+    /// Copies frame `k` of job `token` into send frame `frame`; returns a ticket for
+    /// [`done`](Self::done).
+    pub fn stage(&self, token: u64, k: u32, frame: u32) -> Result<u64, Exception> {
+        self.inner.stage(token, k, frame)
+    }
+
+    /// Frees what job `token` holds once its frames were written.
+    pub fn release_job(&self, token: u64) -> Result<(), Exception> {
+        self.inner.release_job(token)
+    }
+
+    /// Starts landing the batch whose header is `header`, without waiting for memory.
+    pub fn begin(&self, header: &[u8]) -> Result<Landing, Exception> {
+        let (mut tier, mut rows, mut frames) = (0, 0, 0);
+        // SAFETY: the address and length name `header`, borrowed for the whole call.
+        let id = unsafe {
+            self.inner.begin(
+                header.as_ptr() as usize,
+                header.len(),
+                &mut tier,
+                &mut rows,
+                &mut frames,
+            )?
+        };
+        Ok(Landing {
+            id,
+            tier,
+            rows,
+            frames,
+        })
+    }
+
+    /// Copies `len` bytes of receive frame `frame`, the stream's frame `k`, to `landing`; returns
+    /// a ticket for [`done`](Self::done).
+    pub fn copy_out(&self, landing: u64, k: u32, frame: u32, len: u64) -> Result<u64, Exception> {
+        self.inner.copy_out(landing, k, frame, len)
+    }
+
+    /// Hands a landing whose copies are all done to the exchange inbox; returns its token.
+    pub fn seal(&self, landing: u64) -> Result<u64, Exception> {
+        self.inner.seal(landing)
+    }
+
+    /// Frees a landing that will not be sealed.
+    pub fn abort(&self, landing: u64) -> Result<(), Exception> {
+        self.inner.abort(landing)
+    }
+
+    /// Whether a ticket's copies finished, without waiting; `true` consumes it.
+    pub fn done(&self, ticket: u64) -> Result<bool, Exception> {
+        self.inner.done(ticket)
+    }
+
+    /// Batches and bytes sent and landed, and the rings' peak occupancy, as one log line.
+    pub fn stats_line(&self) -> String {
+        self.inner
+            .stats_line()
+            .map(|line| line.to_string_lossy().into_owned())
+            .unwrap_or_else(|err| err.what().to_string())
+    }
+}
+
+impl std::fmt::Debug for RingExchange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RingExchange")
+            .field("device", &self.device())
+            .field("send", &self.send_region())
+            .field("recv", &self.recv_region())
+            .finish()
+    }
+}
+
+/// Holds batches a transport received until [`Fragment::push_received`] takes them by token, from
+/// [`SiriusContext::exchange_inbox`]. The full contract is documented on the C++
+/// `sirius::ffi::ExchangeInbox`.
+pub struct ExchangeInbox {
+    inner: UniquePtr<sirius_sys::ExchangeInbox>,
+}
+
+// SAFETY: the C++ handle shares the context's token table, which serializes every call on one
+// mutex and sets the CUDA device itself, so no state behind it is tied to a thread.
+unsafe impl Send for ExchangeInbox {}
+unsafe impl Sync for ExchangeInbox {}
+
+impl ExchangeInbox {
+    /// Free what `token` holds. Unknown and consumed tokens are ignored.
+    pub fn release(&self, token: u64) -> Result<(), Exception> {
+        self.inner.release(token)
+    }
+
+    /// Tokens neither released nor consumed.
+    pub fn outstanding(&self) -> Result<usize, Exception> {
+        self.inner.outstanding()
+    }
+
+    /// Add the non-null rows, minimum and maximum of signed integer column `column` of the sealed
+    /// batch under `token` to `stats`, leaving the batch for its receiver.
+    pub fn key_stats(
+        &self,
+        token: u64,
+        column: u32,
+        stats: &mut KeyStats,
+    ) -> Result<(), Exception> {
+        self.inner.key_stats(
+            token,
+            column,
+            &mut stats.rows,
+            &mut stats.min,
+            &mut stats.max,
+        )
+    }
+}
+
+impl std::fmt::Debug for ExchangeInbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExchangeInbox")
+    }
+}
+
+/// Error returned by [`SiriusContext::execute_substrait`] and [`Fragment::result_to_arrow`].
 #[derive(Debug)]
 pub enum SiriusError {
     /// The engine failed to translate or execute the plan (a C++ exception).
@@ -139,8 +750,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use prost::Message;
+    use substrait::proto::{Plan, PlanRel, ReadRel, Rel, RelRoot, plan_rel, rel};
 
-    use super::{SiriusContext, SubstraitResult};
+    use super::{SiriusContext, SubstraitResult, stream_view_name};
 
     /// The engine keeps process-global GPU state, so at most one context may be
     /// live at a time; context-constructing tests hold this for their duration.
@@ -167,7 +779,6 @@ mod tests {
             FileFormat, ParquetReadOptions, PathType,
         };
         use substrait::proto::read_rel::{LocalFiles, ReadType};
-        use substrait::proto::{Plan, PlanRel, ReadRel, Rel, RelRoot, plan_rel, rel};
 
         let read = Rel {
             rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
@@ -187,6 +798,52 @@ mod tests {
                 ..Default::default()
             }))),
         };
+        root_plan(read, names)
+    }
+
+    /// Encodes a plan that reads input stream `stream_id` as `(id BIGINT, name VARCHAR)`.
+    fn stream_read_plan(stream_id: u64) -> Vec<u8> {
+        use substrait::proto::read_rel::{NamedTable, ReadType};
+        use substrait::proto::r#type::{self, Kind, Nullability};
+        use substrait::proto::{NamedStruct, Type};
+
+        let nullability = Nullability::Nullable as i32;
+        let types = vec![
+            Type {
+                kind: Some(Kind::I64(r#type::I64 {
+                    type_variation_reference: 0,
+                    nullability,
+                })),
+            },
+            Type {
+                kind: Some(Kind::String(r#type::String {
+                    type_variation_reference: 0,
+                    nullability,
+                })),
+            },
+        ];
+        let names = vec!["id".to_string(), "name".to_string()];
+        let read = Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                base_schema: Some(NamedStruct {
+                    names: names.clone(),
+                    r#struct: Some(r#type::Struct {
+                        types,
+                        type_variation_reference: 0,
+                        nullability: Nullability::Required as i32,
+                    }),
+                }),
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec![stream_view_name(stream_id)],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+        };
+        root_plan(read, names)
+    }
+
+    fn root_plan(read: Rel, names: Vec<String>) -> Vec<u8> {
         Plan {
             relations: vec![PlanRel {
                 rel_type: Some(plan_rel::RelType::Root(RelRoot {
@@ -248,6 +905,21 @@ mod tests {
         rows
     }
 
+    /// Writes rows (1, "a"), (2, "b"), (3, "c") as `(id BIGINT, name VARCHAR)` parquet.
+    fn write_users_parquet(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, names]).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
     /// End-to-end: execute a `local_files` parquet plan on the GPU and read the
     /// result rows back over the Arrow C Data Interface. Requires a GPU.
     #[test]
@@ -256,22 +928,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
 
-        // Write a tiny parquet fixture.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("users.parquet");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
-        let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![ids, names]).unwrap();
-        {
-            let file = std::fs::File::create(&path).unwrap();
-            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
-            writer.write(&batch).unwrap();
-            writer.close().unwrap();
-        }
+        write_users_parquet(&path);
 
         let plan = local_files_plan(
             path.to_str().unwrap(),
@@ -281,7 +940,7 @@ mod tests {
         // Execute twice on one context to verify standalone query state is reset,
         // then drop it before inspecting the returned owned results.
         let results = {
-            let mut ctx = SiriusContext::new().expect("bring up sirius context");
+            let ctx = SiriusContext::new().expect("bring up sirius context");
             vec![
                 ctx.execute_substrait_result(&plan)
                     .expect("execute first substrait plan"),
@@ -316,7 +975,7 @@ mod tests {
         let p = path.to_str().unwrap();
         let names = || vec!["id".to_string(), "name".to_string()];
 
-        let mut ctx = SiriusContext::new().expect("bring up sirius context");
+        let ctx = SiriusContext::new().expect("bring up sirius context");
         let whole = ctx
             .execute_substrait_result(&local_files_plan(p, names()))
             .expect("whole-file plan");
@@ -360,6 +1019,113 @@ mod tests {
             .execute_substrait_result(&local_files_plan_ranged(&[(p, 10, 5)], names()))
             .expect("empty split plan");
         assert_eq!(rows(&empty).len(), 0);
+    }
+
+    /// A hash-partitioned scan fragment feeds both partitions into one stream-read fragment
+    /// through `relay_from`, while a third declared sender closes empty as a remote sender would.
+    /// Requires a GPU.
+    #[test]
+    fn fragment_relays_hash_partitioned_scan() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.declare_output(1).unwrap();
+        sender.declare_output_hash_key(0).unwrap();
+        sender
+            .build(&local_files_plan(
+                path.to_str().unwrap(),
+                vec!["id".to_string(), "name".to_string()],
+            ))
+            .unwrap();
+        assert_eq!(sender.output_types().unwrap(), vec!["BIGINT", "VARCHAR"]);
+        sender.run().unwrap();
+        let partition_rows = [0, 1].map(|stream| sender.output_row_count(stream).unwrap());
+        assert!(
+            partition_rows.iter().all(|&rows| rows > 0),
+            "both partitions must own rows: {partition_rows:?}"
+        );
+        let parked_rows = partition_rows.iter().sum();
+        assert_eq!(parked_rows, 3);
+
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        for sender_id in 0..3 {
+            receiver.declare_input_sender(0, sender_id).unwrap();
+        }
+        receiver.declare_input_cardinality(0, parked_rows).unwrap();
+        receiver.build(&stream_read_plan(0)).unwrap();
+        for stream in 0..2 {
+            let parked = sender.output_batch_count(stream).unwrap();
+            let moved = receiver
+                .relay_from(&mut sender, stream, 0, stream as u32)
+                .unwrap();
+            assert_eq!(moved, parked, "stream {stream}");
+            assert_eq!(
+                sender.output_batch_count(stream).unwrap(),
+                0,
+                "stream {stream} drained"
+            );
+        }
+        receiver.close_input(0, 2).unwrap();
+        receiver.run().unwrap();
+        assert_eq!(
+            rows(&receiver.result_to_arrow().unwrap()),
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string()),
+            ]
+        );
+    }
+
+    /// An `Interrupter` can be handed to another thread; the context cannot.
+    #[test]
+    fn interrupter_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::Interrupter>();
+    }
+
+    /// An interrupt from another thread with no query running does not cancel
+    /// the next query, and the handle may outlive its context. Requires a GPU.
+    #[test]
+    fn idle_interrupt_does_not_cancel_the_next_query() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ids.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids]).unwrap();
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let plan = local_files_plan(path.to_str().unwrap(), vec!["id".to_string()]);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let interrupter = ctx.interrupter();
+        std::thread::scope(|scope| {
+            scope.spawn(|| interrupter.interrupt());
+        });
+        let batches = ctx
+            .execute_substrait(&plan)
+            .expect("execute after an idle interrupt");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+
+        drop(ctx);
+        interrupter.interrupt();
     }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`

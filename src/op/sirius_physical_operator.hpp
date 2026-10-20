@@ -719,6 +719,11 @@ class sirius_physical_operator {
             _parent_op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
   }
 
+  //! Whether sink() publishes nothing unless it returns: an OOM inside it leaves no output behind,
+  //! so its task may be rescheduled with the whole sink input, like an OOM in an operator. Sinks
+  //! that publish as they go (most) keep the default, and their OOM fails the task.
+  virtual bool sink_publishes_on_success_only() const { return false; }
+
   //! Whether or not the sink operator depends on the order of the input chunks
   //! If this is set to true, we cannot do things like caching intermediate vectors
   virtual bool sink_order_dependent() const { return false; }

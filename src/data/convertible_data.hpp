@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/spill_skips.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 
 #include <cuda/stream>
@@ -96,6 +97,9 @@ class convertible_data {
    * @return The size in bytes, or 0 if not in that space.
    */
   virtual std::size_t bytes_in_space(cucascade::memory::memory_space* space) const = 0;
+
+  /// Why the last convert() returned nullopt, when the implementation tracks it.
+  [[nodiscard]] virtual std::optional<spill_skip> skipped() const noexcept { return std::nullopt; }
 };
 
 /**

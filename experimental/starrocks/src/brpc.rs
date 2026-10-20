@@ -5,8 +5,10 @@ use std::{
 };
 
 use crate::{
+    ComputeNodeConfig, Host,
     compute_node_service::SiriusComputeNodeService,
     fragment_executor::{FragmentExecutor, StubExecutor},
+    nixl_chunk::NixlEndpoint,
     proto::starrocks::p_internal_service_brpc::PInternalServiceRouter,
     prpc,
 };
@@ -34,14 +36,28 @@ struct BrpcServiceServer<S> {
 impl BrpcServer {
     /// Builds a BRPC server with the placeholder stub executor (no GPU engine).
     pub fn new() -> Self {
-        Self::with_executor(Arc::new(StubExecutor))
+        Self::with_executor(
+            Arc::new(StubExecutor),
+            &ComputeNodeConfig::default(),
+            None,
+            None,
+        )
     }
 
     /// Builds a BRPC server that dispatches fragments to `executor` (the GPU-backed
-    /// `SiriusEngine`, or a stub).
-    pub fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
-        let service =
-            PInternalServiceRouter::new(SiriusComputeNodeService::with_executor(executor));
+    /// `SiriusEngine`, or a stub) for the CN `compute_node` advertises, exchanging with remote
+    /// CNs through `nixl` when it has one. Instances report their end only to an FE on
+    /// `frontend_host`, the configured one (`None` trusts any).
+    pub fn with_executor(
+        executor: Arc<dyn FragmentExecutor>,
+        compute_node: &ComputeNodeConfig,
+        nixl: Option<Arc<dyn NixlEndpoint>>,
+        frontend_host: Option<Host>,
+    ) -> Self {
+        let service = PInternalServiceRouter::new(
+            SiriusComputeNodeService::with_executor(executor, compute_node, nixl)
+                .reporting_to(frontend_host),
+        );
         Self {
             inner: BrpcServiceServer::with_service(service),
         }
