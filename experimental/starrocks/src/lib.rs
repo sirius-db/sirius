@@ -59,6 +59,7 @@ mod nixl_chunk;
 mod parked_registry;
 mod proto;
 mod prpc;
+mod recent_queries;
 mod result_encoder;
 mod result_store;
 #[cfg(feature = "nixl-transport")]
