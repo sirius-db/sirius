@@ -43,6 +43,7 @@
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
 
 // cuda / standard library
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <array>
@@ -172,10 +173,10 @@ TEST_CASE("expression strategy survives thread handoff and caller policy changes
 {
   auto expr  = make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(1));
   auto input = make_int32_table({1, 2, 3});
-  cudf::get_default_stream().sync();
+  ::cuda::stream_ref const stream{cudf::get_default_stream()};
+  stream.sync();
   auto policy = sirius::expression_query_policy{};
   auto mr     = cudf::get_current_device_resource_ref();
-  auto stream = cudf::get_default_stream();
   sirius::expression_evaluator ast(*expr, mr, stream, policy, 1);
   policy.strategy = sirius::expression_evaluator_strategy::MATERIALIZE;
   sirius::expression_evaluator materialized(*expr, mr, stream, policy, 1);
