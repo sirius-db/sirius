@@ -197,6 +197,7 @@ impl SiriusContext {
         let_cxx_string!(schema = spec.schema.as_deref().unwrap_or(""));
         let summary = self
             .inner
+            .get_mut()
             .pin_mut()
             .pin_table(&path, &tier, &name, &cols, &format, &schema)?;
         Ok(summary.to_string_lossy().into_owned())
@@ -206,7 +207,7 @@ impl SiriusContext {
     /// contract as [`pin_table`](Self::pin_table).
     pub fn unpin_table(&mut self, name: &str) -> Result<String, Exception> {
         let_cxx_string!(name = name);
-        let summary = self.inner.pin_mut().unpin_table(&name)?;
+        let summary = self.inner.get_mut().pin_mut().unpin_table(&name)?;
         Ok(summary.to_string_lossy().into_owned())
     }
 }
