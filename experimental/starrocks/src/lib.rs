@@ -60,6 +60,8 @@ mod proto;
 mod prpc;
 mod result_encoder;
 mod result_store;
+#[cfg(feature = "nixl-transport")]
+mod ring_nixl;
 // The loop runs only with NIXL; without it the tests drive it over an in-process fabric.
 #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 mod ring_transport;
@@ -71,6 +73,8 @@ pub use brpc::BrpcServer;
 pub use engine::SiriusEngine;
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
 pub use nixl_chunk::NixlEndpoint;
+#[cfg(feature = "nixl-transport")]
+pub use ring_nixl::{ring_options_from_env, start_ring_transport};
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 

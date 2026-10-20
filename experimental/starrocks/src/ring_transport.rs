@@ -69,8 +69,6 @@ const STATS_EVERY: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Landing {
     pub id: u64,
-    /// 0 GPU, 1 host, 2 disk.
-    pub tier: u8,
     pub rows: u64,
     pub frames: u32,
 }
@@ -78,8 +76,7 @@ pub(crate) struct Landing {
 /// The engine's ends of the ring: frames, copies in and out, and the token table batches land in.
 pub(crate) trait RingEngine: Send + Sync + std::fmt::Debug {
     fn frame_bytes(&self) -> u64;
-    /// `(device, base, length)` of the send and receive rings.
-    fn send_region(&self) -> (i32, usize, u64);
+    /// `(device, base, length)` of the receive ring.
     fn recv_region(&self) -> (i32, usize, u64);
     fn lease_send(&self) -> Result<Option<u32>, String>;
     fn release_send(&self, frame: u32) -> Result<(), String>;
@@ -1737,9 +1734,6 @@ mod tests {
         fn frame_bytes(&self) -> u64 {
             FRAME
         }
-        fn send_region(&self) -> (i32, usize, u64) {
-            (0, 0, self.node.send.lock().unwrap().len() as u64)
-        }
         fn recv_region(&self) -> (i32, usize, u64) {
             (0, 0, self.node.recv.lock().unwrap().len() as u64)
         }
@@ -1794,7 +1788,6 @@ mod tests {
             state.landings.insert(id, (rows, vec![0; len as usize]));
             Ok(Landing {
                 id,
-                tier: 0,
                 rows,
                 frames: len.div_ceil(FRAME) as u32,
             })

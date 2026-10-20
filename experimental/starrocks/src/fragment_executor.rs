@@ -6,12 +6,14 @@
 //! dispatch and result-return plumbing can be exercised end to end without a build tree or a GPU.
 
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use starrocks_plan_translator::TranslatedPlan;
 
+use crate::local_exchange::RemoteBatch;
 use crate::result_store::FragmentInstanceId;
 
 /// Where one sender fragment's output is parked until its receiver runs.
@@ -57,6 +59,17 @@ pub trait OutputDrain: Send + std::fmt::Debug {
     fn next_ring(&mut self, timeout: Duration) -> Result<RingNext, String>;
 }
 
+/// Asks the executor to hand out drains for some output streams before it runs the fragment,
+/// so those outputs ship while the fragment produces them.
+#[derive(Debug)]
+pub struct DrainHandoff {
+    /// Output stream indices (positions in [`FragmentRun::outputs`]) to drain.
+    pub streams: Vec<usize>,
+    /// Receives one drain per stream, in `streams` order, just before the run starts. Dropped
+    /// unsent when the executor does not stream or the fragment fails before running.
+    pub respond: Sender<Vec<Box<dyn OutputDrain>>>,
+}
+
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
 #[derive(Clone, Debug)]
 pub struct FragmentResult {
@@ -83,12 +96,16 @@ pub struct FragmentRun<'a> {
     pub plan: &'a TranslatedPlan,
     /// Parked sender outputs to relay into this fragment, keyed by receiver exchange node id.
     pub inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Batches remote senders wrote into this CN, as `(exchange node id, sender id, batches)`.
+    pub remote_inputs: Vec<(i32, i32, Vec<RemoteBatch>)>,
     /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
     pub outputs: Vec<SenderSlot>,
     /// Every destination receives the full output (a broadcast sink).
     pub broadcast: bool,
     /// Hash-partition key columns for a hash fan-out (empty otherwise).
     pub hash_keys: Vec<usize>,
+    /// Outputs to drain while the fragment runs; the rest stay parked until it finishes.
+    pub drains: Option<DrainHandoff>,
 }
 
 /// Runs a translated fragment, either parking its output for a downstream fragment or returning
