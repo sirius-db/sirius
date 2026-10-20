@@ -394,6 +394,39 @@ TEST_CASE_METHOD(UnionFixture,
 }
 
 TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution distinct UNION with an empty arm",
+                 "[integration][gpu_execution][union]")
+{
+  compare_gpu_vs_cpu("SELECT k, v FROM ua UNION SELECT k, v FROM uempty");
+  compare_gpu_vs_cpu("SELECT k, v FROM uempty UNION SELECT k, v FROM ua");
+  // Every arm empty: the dedup runs over zero input rows.
+  compare_gpu_vs_cpu("SELECT k FROM uempty UNION SELECT k FROM uempty");
+  compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT k FROM uempty UNION SELECT k FROM uempty) t");
+}
+
+TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution UNION casts DECIMAL and date-time arms to the union type",
+                 "[integration][gpu_execution][union][union_all]")
+{
+  // The binder casts each arm to the union's type inside the arm: DECIMAL(15,2) and DECIMAL(10,4)
+  // meet at DECIMAL(17,4), DATE widens to TIMESTAMP. Each table pairs a value equal across arms
+  // after the cast with one that is not, so the distinct UNION must merge exactly one.
+  run_ok("CREATE TABLE udec2 (d DECIMAL(15,2));");
+  run_ok("CREATE TABLE udec4 (d DECIMAL(10,4));");
+  run_ok("CREATE TABLE udate (t DATE);");
+  run_ok("CREATE TABLE uts (t TIMESTAMP);");
+  run_ok("INSERT INTO udec2 VALUES (1.50), (1234567890123.25), (NULL);");
+  run_ok("INSERT INTO udec4 VALUES (1.5000), (2.0001), (NULL);");
+  run_ok("INSERT INTO udate VALUES ('2024-01-01'), ('2024-02-29'), (NULL);");
+  run_ok("INSERT INTO uts VALUES ('2024-01-01 00:00:00'), ('2024-01-01 12:30:00'), (NULL);");
+
+  compare_gpu_vs_cpu("SELECT d FROM udec2 UNION ALL SELECT d FROM udec4");
+  compare_gpu_vs_cpu("SELECT d FROM udec2 UNION SELECT d FROM udec4");
+  compare_gpu_vs_cpu("SELECT t FROM udate UNION ALL SELECT t FROM uts");
+  compare_gpu_vs_cpu("SELECT t FROM udate UNION SELECT t FROM uts");
+}
+
+TEST_CASE_METHOD(UnionFixture,
                  "gpu_execution distinct UNION over a collated VARCHAR key falls back at plan time",
                  "[integration][gpu_execution][union]")
 {
