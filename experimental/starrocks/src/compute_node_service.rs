@@ -52,6 +52,9 @@ use thrift::{
 };
 use tracing::{info, instrument, warn};
 
+/// How long a purge's frees are watched for, to log when they finished.
+const PURGE_WATCH: Duration = Duration::from_secs(600);
+
 /// Bounds a `fetch_data` wait on a result fragment whose exchange senders never finish. Short
 /// under test, so a readiness regression fails a test instead of hanging it for ten minutes.
 const RESULT_WAIT: Duration = Duration::from_secs(if cfg!(test) { 5 } else { 600 });
@@ -1099,6 +1102,7 @@ impl SiriusComputeNodeService {
                     drains: None,
                     filters: filters.filters,
                     fallback: filters.fallback,
+                    query: Self::query_id(params),
                 })?
                 .ok_or_else(|| "result fragment returned no rows".to_string())?;
             let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
@@ -1175,6 +1179,7 @@ impl SiriusComputeNodeService {
             drains: None,
             filters: filters.filters,
             fallback: filters.fallback,
+            query: Self::query_id(params),
         };
         let shipped = if remote.is_empty() || !stream_output_enabled() {
             self.executor.run_fragment(run)?;
@@ -1415,10 +1420,17 @@ impl SiriusComputeNodeService {
     }
 
     fn purge(&self, query: FragmentInstanceId, error: &str, failed: bool) {
+        let started = std::time::Instant::now();
         self.results.fail_query(query, error);
         self.forget_descriptor_table(query);
         let deferred = self.filters.purge_query(query);
         let purged = self.exchanges.purge_query(query, error);
+        // A failed query's run in progress holds GPU memory and works for nothing: stop it, now
+        // that its cause is recorded, so the interrupted fragment reports that cause first. A
+        // finished query has nothing left running.
+        if failed {
+            self.executor.interrupt(query);
+        }
         for params in deferred
             .iter()
             .map(|scan| &scan.params)
@@ -1434,11 +1446,12 @@ impl SiriusComputeNodeService {
                 nixl.release(token);
             }
         }
+        // Not waited for: a drop runs on the engine thread, which may be busy with another
+        // fragment. Until it ran, a receive allocation that finds the pool full waits for it.
         for &slot in &purged.slots {
-            if let Err(err) = self.executor.drop_parked(slot) {
-                warn!(?slot, error = %err, "failed to drop a purged query's parked output");
-            }
+            self.executor.drop_parked_later(slot);
         }
+        self.watch_frees(query, started);
         let (remote_batches, dropped_parked) = (purged.tokens.len(), purged.slots.len());
         let (dropped_receivers, deferred_scans) = (purged.receivers.len(), deferred.len());
         if failed {
@@ -1464,13 +1477,46 @@ impl SiriusComputeNodeService {
         }
     }
 
+    /// Logs, on another thread, when what a purge of `query` asked the engine to free is free, and
+    /// what the CN holds then: the drops and the interrupted run finish after the purge returns.
+    fn watch_frees(&self, query: FragmentInstanceId, started: std::time::Instant) {
+        let Some(frees) = self
+            .executor
+            .pending_frees()
+            .filter(|frees| frees.pending() > 0)
+        else {
+            return;
+        };
+        let service = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("purge-watch".to_string())
+            .spawn(move || {
+                let freed = frees.wait_for_none(PURGE_WATCH);
+                info!(
+                    %query,
+                    freed,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "a purge's frees finished"
+                );
+                service.log_leak_counters("purge drained");
+            });
+    }
+
     /// Ends `params`' remote hops with a failure frame unless the transport already ended them,
-    /// and returns the error.
+    /// and returns the error. A fragment of a query that failed here while it ran (interrupted,
+    /// say, or refused its turn on the engine) fails because of that: its error leads with the
+    /// query's cause, so whichever reply or report reaches the FE first names the cause.
     fn end_hops(&self, params: &TExecPlanFragmentParams, failure: FragmentFailure) -> String {
+        let error = match Self::query_id(params).and_then(|query| self.exchanges.failure(query)) {
+            Some(cause) if !failure.error.starts_with(cause.as_str()) => {
+                format!("{cause} ({})", failure.error)
+            }
+            _ => failure.error,
+        };
         if !failure.hops_ended {
-            self.fail_remote_hops(params, &failure.error);
+            self.fail_remote_hops(params, &error);
         }
-        failure.error
+        error
     }
 
     /// Sends a failure frame to every remote destination of `params`' DATA_STREAM_SINK, in place
@@ -1985,6 +2031,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        fragment_executor::PendingFrees,
         fragment_executor::{FragmentResult, OutputDrain, RingJob, RingNext},
         local_exchange::ExchangeCounts,
         proto::starrocks::{
@@ -4090,6 +4137,169 @@ mod tests {
         assert!(cached(74));
         cancel_with(&service, 74, Some(Reason::UserCancel), None);
         eventually("the purge", || !cached(74));
+    }
+
+    /// Stands in for the engine thread: parks like the stub, records what it is asked to
+    /// interrupt, and runs queued drops only once `busy` is cleared, as a busy engine thread would.
+    #[derive(Debug, Default)]
+    struct BusyEngine {
+        interrupted: Mutex<Vec<FragmentInstanceId>>,
+        /// The service, to read what it recorded about a query when asked to interrupt it.
+        service: Mutex<Option<SiriusComputeNodeService>>,
+        /// The query's recorded cause at each interrupt.
+        cause_when_interrupted: Mutex<Vec<Option<String>>>,
+        busy: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
+        frees: Arc<PendingFrees>,
+        dropped: Arc<Mutex<Vec<SenderSlot>>>,
+    }
+
+    impl BusyEngine {
+        fn set_busy(&self, busy: bool) {
+            *self.busy.0.lock().unwrap() = busy;
+            self.busy.1.notify_all();
+        }
+    }
+
+    impl FragmentExecutor for BusyEngine {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn drop_parked(&self, _slot: SenderSlot) -> Result<(), String> {
+            panic!("a purge must not wait for the engine thread");
+        }
+
+        fn drop_parked_later(&self, slot: SenderSlot) {
+            let (pending, busy, dropped) = (
+                self.frees.begin(),
+                Arc::clone(&self.busy),
+                Arc::clone(&self.dropped),
+            );
+            std::thread::spawn(move || {
+                let mut engine_busy = busy.0.lock().unwrap();
+                while *engine_busy {
+                    engine_busy = busy.1.wait(engine_busy).unwrap();
+                }
+                dropped.lock().unwrap().push(slot);
+                drop(pending);
+            });
+        }
+
+        fn interrupt(&self, query: FragmentInstanceId) {
+            self.interrupted.lock().unwrap().push(query);
+            let service = self.service.lock().unwrap().clone();
+            if let Some(service) = service {
+                self.cause_when_interrupted
+                    .lock()
+                    .unwrap()
+                    .push(service.exchanges.failure(query));
+            }
+        }
+
+        fn pending_frees(&self) -> Option<Arc<PendingFrees>> {
+            Some(Arc::clone(&self.frees))
+        }
+    }
+
+    /// Query `query` with a sender's output parked for a receiver that waits for a second sender.
+    fn parked_for_a_waiting_receiver(service: &SiriusComputeNodeService, query: i64) {
+        let mut result = query_fragment(query, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 2);
+        exec_ok(service, &result);
+        let mut sender = query_fragment(query, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 8060);
+        exec_ok(service, &sender);
+        assert_eq!(service.exchanges.counts().parked_senders, 1);
+    }
+
+    #[test]
+    fn a_failure_purge_interrupts_its_query_and_a_normal_end_does_not() {
+        let engine = Arc::new(BusyEngine::default());
+        let service = SiriusComputeNodeService::with_executor(
+            engine.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        *engine.service.lock().unwrap() = Some(service.clone());
+        service.fail_and_purge(FragmentInstanceId::from_halves(80, 3), "scan exploded");
+        service.release_query(
+            FragmentInstanceId::from_halves(81, 0),
+            "the query ended normally (QUERY_FINISHED)",
+        );
+        assert_eq!(
+            *engine.interrupted.lock().unwrap(),
+            [FragmentInstanceId::from_halves(80, 3)]
+        );
+        // Recorded first, so the interrupted fragment reports the cause rather than its
+        // interruption.
+        assert_eq!(
+            *engine.cause_when_interrupted.lock().unwrap(),
+            [Some("scan exploded".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_purge_returns_while_the_engine_thread_is_busy() {
+        let engine = Arc::new(BusyEngine::default());
+        let service = SiriusComputeNodeService::with_executor(
+            engine.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        parked_for_a_waiting_receiver(&service, 82);
+        engine.set_busy(true);
+        let started = std::time::Instant::now();
+        service.fail_and_purge(FragmentInstanceId::from_halves(82, 0), "scan exploded");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            engine.frees.pending(),
+            1,
+            "the drop waits for the engine thread"
+        );
+        assert!(engine.dropped.lock().unwrap().is_empty());
+        engine.set_busy(false);
+        assert!(engine.frees.wait_for_none(Duration::from_secs(10)));
+        assert_eq!(engine.dropped.lock().unwrap().len(), 1);
+        assert!(idle(&service));
+    }
+
+    /// Fails every run after its query failed on this CN meanwhile, as an interrupted run does.
+    #[derive(Debug, Default)]
+    struct InterruptedRuns {
+        service: Mutex<Option<SiriusComputeNodeService>>,
+    }
+
+    impl FragmentExecutor for InterruptedRuns {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            let service = self.service.lock().unwrap().clone().unwrap();
+            service
+                .exchanges
+                .mark_failed(run.query.unwrap(), "scan exploded on cn2");
+            Err("Interrupted!".to_string())
+        }
+    }
+
+    #[test]
+    fn a_run_stopped_by_its_querys_failure_reports_the_cause_first() {
+        let executor = Arc::new(InterruptedRuns::default());
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        *executor.service.lock().unwrap() = Some(service.clone());
+        let mut leaf = query_fragment(84, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut leaf, 10, 8060);
+        let status = exec(&service, &leaf);
+        assert_eq!(
+            status.error_msgs,
+            ["scan exploded on cn2 (Interrupted!)"],
+            "{status:?}"
+        );
     }
 
     #[test]
