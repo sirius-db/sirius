@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -237,7 +238,9 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
                                    std::size_t bytes_needed) noexcept override;
 
   /// Report that @p task, emitted under @p operator_id, reached @p stage.
-  /// Wakes the worker so a freed slot is refilled.
+  /// The split is owned by shared_ptr, as in register_scan_task. Its stage must
+  /// be published via set_scan_stage before this notification. Wakes the worker
+  /// so a freed slot is refilled.
   void update_scan_state(std::size_t operator_id,
                          const op::scan::scan_info* task,
                          io::cache::scan_stage stage);
@@ -293,13 +296,25 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   prefetch_candidate get_next_prefetching_candidate();
 
-  /// Classify and record one settled prefetch, then hand its slot back.
-  /// @p split is weak: a completion firing after the split was consumed still
-  /// has to release the slot, and "gone" is itself an answer.
-  void on_prefetch_complete(std::size_t operator_id,
-                            std::weak_ptr<op::scan::scan_info> const& split,
-                            bool issued_io,
-                            bool allocation_failed);
+  /// Both budgets have one owner per split. A prefetch publishes this before
+  /// preparing/issuing IO; demand joins it rather than charging another ticket.
+  /// A covered entry holds no capacity, but remembers success until disposal.
+  struct scan_ticket {
+    enum class phase { prefetching, demand, covered };
+    phase owner{phase::prefetching};
+    bool demand_started{false};
+    shared_scan_budget::token shared;
+  };
+  using split_key = std::weak_ptr<const op::scan::scan_info>;
+
+  void on_prefetch_complete(split_key const& split,
+                            std::shared_ptr<scan_ticket> const& ticket,
+                            op::scan::scan_info::prefetch_outcome out);
+  /// Release capacity, or transfer it to an overlapping demand read if prefetch
+  /// failed/was abandoned. Called only after preparation/IO has settled.
+  void settle_prefetch(split_key const& split,
+                       std::shared_ptr<scan_ticket> const& ticket,
+                       bool covered);
 
   void arm_prefetching();
 
@@ -383,8 +398,10 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   query_id_t _query_id{make_query_id(0)};
   std::shared_ptr<shared_scan_budget> _shared_budget;
   std::optional<std::size_t> _budget_override;
-  std::mutex _demand_mutex;
-  std::unordered_map<const op::scan::scan_info*, shared_scan_budget::token> _demand_tickets;
+  std::mutex _tickets_mutex;
+  // Ownership identity avoids confusing a late completion with a new split
+  // allocated at the same address. Neither the map nor callbacks retain splits.
+  std::map<split_key, std::shared_ptr<scan_ticket>, std::owner_less<>> _tickets;
   shared_scan_budget::token acquire_shared_ticket(const op::scan::scan_info& task, bool demand);
   std::atomic<bool> _prefetching_started{false};
   std::atomic<size_t> _cursor{0};

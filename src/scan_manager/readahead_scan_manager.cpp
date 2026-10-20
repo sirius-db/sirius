@@ -237,28 +237,26 @@ void readahead_scan_manager::update_scan_state(std::size_t,
   // A zero budget means the backend opted out, so there is no readahead for this
   // read to compete with and no budget to charge it against.
   if (task == nullptr || _budget == 0) { return; }
-  // const_cast: the ticket flag is the split's own bookkeeping, and every other
-  // caller of update() hands us a const view of the split it is reporting on.
-  auto* split = const_cast<op::scan::scan_info*>(task);
+  if (stage != io::cache::scan_stage::reading && stage != io::cache::scan_stage::disposed) return;
+  auto key = task->weak_from_this();
+  std::lock_guard lock(_tickets_mutex);
+  auto it = _tickets.find(key);
 
   if (stage == io::cache::scan_stage::reading) {
-    // A split whose prefetch DID start is already paying for its IO out of the
-    // ticket that prefetch holds; charging it twice would throttle the readahead
-    // for work it is doing itself.
-    if (split->get_prefetch_state() == op::scan::scan_info::prefetch_state::prefetched) { return; }
-    // Nothing was prefetched, so this read is about to do the IO itself. It
-    // spends from the same budget the readahead does -- and never waits for it.
-    if (!split->take_readahead_ticket()) { return; }
-    if (_shared_budget) {
-      try {
-        auto ticket = acquire_shared_ticket(*task, true);
-        std::lock_guard lock(_demand_mutex);
-        _demand_tickets.emplace(task, std::move(ticket));
-      } catch (...) {
-        split->give_back_readahead_ticket();
-        throw;
-      }
+    // Stage publication precedes this call. Do not recreate an entry if a
+    // disposal overtook this report while it was waiting for the mutex.
+    if (task->get_scan_stage() == io::cache::scan_stage::disposed) return;
+    if (it != _tickets.end()) {
+      it->second->demand_started = true;
+      return;
     }
+    auto ticket            = std::make_shared<scan_ticket>();
+    ticket->owner          = scan_ticket::phase::demand;
+    ticket->demand_started = true;
+    // Demand acquisition never waits for budget capacity. Serialize it with
+    // ownership publication so prefetch cannot install a second charge.
+    if (_shared_budget) ticket->shared = acquire_shared_ticket(*task, true);
+    _tickets.emplace(key, std::move(ticket));
     _counters.cold_read_tickets.fetch_add(1, std::memory_order_relaxed);
     if (_gatekeeper.acquire_or_borrow()) {
       _counters.borrowed.fetch_add(1, std::memory_order_relaxed);
@@ -266,13 +264,14 @@ void readahead_scan_manager::update_scan_state(std::size_t,
     return;
   }
 
-  if (stage == io::cache::scan_stage::disposed) {
-    // The read is over, so give the ticket back -- paying down any debt first.
-    if (split->give_back_readahead_ticket()) {
+  if (stage == io::cache::scan_stage::disposed && it != _tickets.end()) {
+    // An in-flight prefetch still owns both credits until its completion, even
+    // if its consumer is disposed or the manager is destroyed in the meantime.
+    if (it->second->owner == scan_ticket::phase::demand) {
+      it->second->shared.reset();
       _gatekeeper.release();
-      std::lock_guard lock(_demand_mutex);
-      _demand_tickets.erase(task);
     }
+    _tickets.erase(it);
   }
 }
 
@@ -322,24 +321,43 @@ readahead_scan_manager::prefetch_candidate readahead_scan_manager::get_next_pref
   return {};
 }
 
-void readahead_scan_manager::on_prefetch_complete(std::size_t,
-                                                  std::weak_ptr<op::scan::scan_info> const& split,
-                                                  bool issued_io,
-                                                  bool allocation_failed)
+void readahead_scan_manager::settle_prefetch(split_key const& split,
+                                             std::shared_ptr<scan_ticket> const& ticket,
+                                             bool covered)
 {
-  // Judged at completion, not at issue: issue time says only what the readahead
-  // intended, completion time says whether it actually got there first.  The
-  // split carries its own stage, so no per-split bookkeeping is needed here.
-  auto const task = split.lock();
-  _counters.record(
-    classify_prefetch(allocation_failed,
-                      task != nullptr,
-                      issued_io,
-                      task ? task->get_scan_stage() : io::cache::scan_stage::disposed));
-  // Pairs with the acquire in worker_loop.  The slot is free once the IO
-  // settles, not once the split is finally read: the budget caps concurrent IO,
-  // and a landed prefetch is doing none.
+  std::lock_guard lock(_tickets_mutex);
+  auto it             = _tickets.find(split);
+  auto task           = split.lock();
+  bool const retained = it != _tickets.end() && it->second == ticket && task &&
+                        task->get_scan_stage() != io::cache::scan_stage::disposed;
+  if (retained && !covered && ticket->demand_started) {
+    // Failure or partial coverage leaves demand IO outstanding. Transfer the
+    // existing charge; disposal will release it, without a gap or double count.
+    ticket->owner = scan_ticket::phase::demand;
+    return;
+  }
+  ticket->shared.reset();
   _gatekeeper.release();
+  if (retained && covered) {
+    ticket->owner = scan_ticket::phase::covered;
+  } else if (it != _tickets.end() && it->second == ticket) {
+    _tickets.erase(it);
+  }
+}
+
+void readahead_scan_manager::on_prefetch_complete(split_key const& split,
+                                                  std::shared_ptr<scan_ticket> const& ticket,
+                                                  op::scan::scan_info::prefetch_outcome out)
+{
+  auto const task = split.lock();
+  // Only complete, successful coverage eliminates future demand IO. Merely
+  // issuing one datasource says nothing about the rest of this split.
+  settle_prefetch(split, ticket, out.ok && out.declined == 0);
+  _counters.record(
+    classify_prefetch(out.declined_memory_pressure > 0,
+                      task != nullptr,
+                      out.issued > 0,
+                      task ? task->get_scan_stage() : io::cache::scan_stage::disposed));
 }
 
 void readahead_scan_manager::worker_loop(const std::stop_token& st)
@@ -351,88 +369,96 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   constexpr auto k_idle_wait = std::chrono::milliseconds{10};
 
   enum class issue_result { issued, finished, memory_pressure };
-  // Only issued transfers the local slot to the completion. Memory pressure lets
-  // the outer loop release both budgets before one bounded delayed retry.
-  auto try_issue = [&](prefetch_candidate const& candidate, bool delayed_retry) {
-    if (candidate.task->has_fallen_behind()) {
-      _counters.record(prefetch_outcome_kind::skipped_fell_behind);
-      return issue_result::finished;
-    }
-    shared_scan_budget::token shared_ticket;
-    try {
-      if (_shared_budget) {
-        shared_ticket = acquire_shared_ticket(*candidate.task, false);
-        if (!shared_ticket) {
-          _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
-          return issue_result::finished;
-        }
-      }
-    } catch (...) {
-      _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
-      return issue_result::finished;
-    }
-    bool evict_on_failure = delayed_retry;
-    while (!st.stop_requested()) {
+  auto try_issue =
+    [&](prefetch_candidate const& candidate, bool delayed_retry, bool& slot_transferred) {
       if (candidate.task->has_fallen_behind()) {
         _counters.record(prefetch_outcome_kind::skipped_fell_behind);
         return issue_result::finished;
       }
-
-      if (evict_on_failure) _counters.memory_retries.fetch_add(1, std::memory_order_relaxed);
-      op::scan::scan_info::prepare_outcome prep;
-      // This runs on a jthread, so an escaping exception is std::terminate for
-      // the whole process -- far too much for a best-effort prefetcher.  Both
-      // calls allocate (the fan-in completion here, the evictor's latch inside
-      // prepare), so bad_alloc is reachable exactly when the readahead is
-      // earning its keep.  A throw is treated as "not issued": prefetch can only
-      // throw before its prefetch_completion exists, because everything from
-      // there on is noexcept and the report is what hands the slot over, so the
-      // slot is still the worker's and returning finished releases it exactly once.
+      std::shared_ptr<scan_ticket> ticket;
+      split_key split = candidate.task;
       try {
-        prep = candidate.task->prepare_for_prefetching(evict_on_failure);
-        if (prep.ready()) {
-          candidate.task->prefetch([shared_ticket,
-                                    weak  = weak_from_this(),
-                                    op_id = candidate.operator_id,
-                                    split = std::weak_ptr{candidate.task}](
-                                     op::scan::scan_info::prefetch_outcome out) noexcept {
-            // weak, not shared: a completion firing after the query tore the
-            // manager down must not resurrect it.
-            if (auto self = weak.lock()) {
-              self->on_prefetch_complete(
-                op_id, split, out.issued > 0, out.declined_memory_pressure > 0);
-            }
-          });
-          return issue_result::issued;
+        ticket = std::make_shared<scan_ticket>();
+        if (_shared_budget) {
+          ticket->shared = acquire_shared_ticket(*candidate.task, false);
+          if (!ticket->shared) {
+            _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+            return issue_result::finished;
+          }
         }
-      } catch (std::exception const& e) {
-        SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: {}", e.what());
-        _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
-        return issue_result::finished;
+        // The shared-budget wait above must not hold the bookkeeping mutex:
+        // demand can win while we wait, and must never wait for speculative IO.
+        std::lock_guard lock(_tickets_mutex);
+        if (candidate.task->has_fallen_behind() || !_tickets.emplace(split, ticket).second) {
+          _counters.record(prefetch_outcome_kind::skipped_fell_behind);
+          return issue_result::finished;
+        }
+        slot_transferred = true;
       } catch (...) {
-        SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: unknown exception");
         _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
         return issue_result::finished;
       }
-      if (prep.fell_behind > 0 || candidate.task->has_fallen_behind()) {
-        _counters.record(prefetch_outcome_kind::skipped_fell_behind);
+      auto attempt = [&] {
+        bool evict_on_failure = delayed_retry;
+        while (!st.stop_requested()) {
+          if (candidate.task->has_fallen_behind()) {
+            _counters.record(prefetch_outcome_kind::skipped_fell_behind);
+            return issue_result::finished;
+          }
+
+          if (evict_on_failure) _counters.memory_retries.fetch_add(1, std::memory_order_relaxed);
+          op::scan::scan_info::prepare_outcome prep;
+          // This runs on a jthread, so an escaping exception is std::terminate for
+          // the whole process -- far too much for a best-effort prefetcher.  Both
+          // calls allocate (the fan-in completion here, the evictor's latch inside
+          // prepare), so bad_alloc is reachable exactly when the readahead is
+          // earning its keep.  A throw is treated as "not issued": prefetch can only
+          // throw before its prefetch_completion exists, because everything from
+          // there on is noexcept and the report is what hands the slot over, so the
+          // accounting is settled below on every non-issued path.
+          try {
+            prep = candidate.task->prepare_for_prefetching(evict_on_failure);
+            if (prep.ready()) {
+              candidate.task->prefetch([ticket, weak = weak_from_this(), split](
+                                         op::scan::scan_info::prefetch_outcome out) noexcept {
+                // weak, not shared: a completion firing after the query tore the
+                // manager down must not resurrect it.
+                if (auto self = weak.lock()) { self->on_prefetch_complete(split, ticket, out); }
+              });
+              return issue_result::issued;
+            }
+          } catch (std::exception const& e) {
+            SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: {}", e.what());
+            _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+            return issue_result::finished;
+          } catch (...) {
+            SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: unknown exception");
+            _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+            return issue_result::finished;
+          }
+          if (prep.fell_behind > 0 || candidate.task->has_fallen_behind()) {
+            _counters.record(prefetch_outcome_kind::skipped_fell_behind);
+            return issue_result::finished;
+          }
+          // Nothing was refused for want of memory, so there is nothing to wait for:
+          // this split has no request to prepare at all.
+          if (prep.failed == 0) {
+            _counters.record(prefetch_outcome_kind::nothing_to_issue);
+            return issue_result::finished;
+          }
+          // First retry with synchronous eviction. A further attempt must yield
+          // capacity and back off, and is allowed only once by the outer loop.
+          if (evict_on_failure) return issue_result::memory_pressure;
+          evict_on_failure = true;
+        }
+        // Stopped mid-preparation: the pool never satisfied it.
+        _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
         return issue_result::finished;
-      }
-      // Nothing was refused for want of memory, so there is nothing to wait for:
-      // this split has no request to prepare at all.
-      if (prep.failed == 0) {
-        _counters.record(prefetch_outcome_kind::nothing_to_issue);
-        return issue_result::finished;
-      }
-      // First retry with synchronous eviction. A further attempt must yield
-      // capacity and back off, and is allowed only once by the outer loop.
-      if (evict_on_failure) return issue_result::memory_pressure;
-      evict_on_failure = true;
-    }
-    // Stopped mid-preparation: the pool never satisfied it.
-    _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
-    return issue_result::finished;
-  };
+      };
+      auto result = attempt();
+      if (result != issue_result::issued) settle_prefetch(split, ticket, false);
+      return result;
+    };
 
   prefetch_candidate retry;
   while (!st.stop_requested()) {
@@ -464,9 +490,10 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
     }
 
     if (!delayed_retry) _counters.candidates_taken.fetch_add(1, std::memory_order_relaxed);
-    auto const result = try_issue(candidate, delayed_retry);
+    bool slot_transferred = false;
+    auto const result     = try_issue(candidate, delayed_retry, slot_transferred);
     if (result == issue_result::issued) continue;
-    _gatekeeper.release();
+    if (!slot_transferred) _gatekeeper.release();
     if (result == issue_result::memory_pressure) {
       if (delayed_retry) {
         _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
