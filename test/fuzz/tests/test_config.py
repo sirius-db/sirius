@@ -50,7 +50,6 @@ class ConfigTests(unittest.TestCase):
         f = cfg.features
         for switch in (
             f.window_functions,
-            f.distinct,
             f.grouping_sets,
             f.full_join,
             f.cross_join,

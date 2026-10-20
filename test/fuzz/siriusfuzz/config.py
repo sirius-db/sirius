@@ -163,7 +163,7 @@ class Complexity:
 @dataclass
 class Features:
     window_functions: bool = gap_switch(False)
-    distinct: bool = gap_switch(False)
+    distinct: bool = True
     grouping_sets: bool = gap_switch(False)
     full_join: bool = gap_switch(False)
     cross_join: bool = gap_switch(False)

@@ -13,7 +13,7 @@
 
 [features]
 window_functions = false
-distinct = false          # SELECT DISTINCT -> LogicalDistinct falls back today
+distinct = true
 grouping_sets = false
 full_join = false
 cross_join = false
