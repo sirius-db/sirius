@@ -24,6 +24,7 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <catch.hpp>
+#include <cucascade/cudf/host_table_packed.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
@@ -1692,37 +1693,54 @@ TEST_CASE("CONCAT execute rejects inputs from different memory spaces", "[physic
                     "CONCAT input was not prepared on one memory space");
 }
 
-TEST_CASE("CONCAT rejects impossible decoded input before GPU preparation", "[physical_concat]")
+TEST_CASE("CONCAT can claim input without row-count metadata", "[physical_concat]")
 {
-  auto manager     = sirius::test::operator_utils::initialize_memory_manager();
-  auto const hosts = manager->get_memory_spaces_for_tier(Tier::HOST);
-  REQUIRE_FALSE(hosts.empty());
-  auto* host = const_cast<memory_space*>(hosts.front());
-  auto* gpu  = manager->get_memory_space(Tier::GPU, 0);
-  REQUIRE(gpu != nullptr);
+  bool const concat_all = GENERATE(false, true);
+  auto known            = make_host_metadata_batch(std::numeric_limits<cudf::size_type>::max());
+  auto* host            = known->to_read_only().get_memory_space();
+  // Packed representations expose bytes but no row count. Metadata-only input must not be
+  // uploaded: selection may claim it, leaving exact validation to execute after decoding.
+  auto table = std::make_unique<cucascade::memory::host_table_packed_allocation>(
+    nullptr, std::make_unique<std::vector<uint8_t>>(), sizeof(int32_t));
+  auto repr = std::make_unique<cucascade::host_data_packed_representation>(std::move(table), host);
+  auto unknown = data_batch::make(sirius::get_next_batch_id(), std::move(repr));
   auto const types =
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
-  sirius_physical_concat concat(types, 0, true);
+  sirius_physical_concat concat(types, 0, concat_all);
   concat.set_placement(
     std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
   cucascade::shared_data_repository repo;
-  attach_concat_port(concat, repo);
-  // No buffers are allocated: preparation must reject the decoded footprint before attempting
-  // to upload any payload. The claimed task retains the original host owner after failure.
-  cucascade::memory::column_metadata column{};
-  column.type_id  = static_cast<int32_t>(cudf::type_id::INT32);
-  column.num_rows = 1;
-  auto table =
-    cucascade::memory::host_table_allocation::create({}, {column}, gpu->get_max_memory() + 1);
-  auto repr  = std::make_unique<cucascade::host_data_representation>(std::move(table), host);
-  auto batch = data_batch::make(sirius::get_next_batch_id(), std::move(repr));
-  repo.add_data_batch(batch, 0);
-  auto input = concat.get_next_task_input_data();
-  REQUIRE(input != nullptr);
-  CHECK_THROWS_WITH(input->prepare_for_processing(gpu, default_stream()),
-                    "CONCAT partition input exceeds GPU memory capacity");
-  CHECK(batch->to_read_only().get_memory_space() == host);
-  CHECK(dynamic_cast<pipelineable_operator_data&>(*input).get_data_batches()[0] == batch);
+  auto input = claim_concat_input(concat, repo, {known, unknown}, 0);
+  CHECK(dynamic_cast<partitioned_operator_data&>(*input).get_data_batches() ==
+        std::vector<std::shared_ptr<data_batch>>{known, unknown});
+  CHECK(unknown->to_read_only().get_memory_space() == host);
+}
+
+TEST_CASE("partitioned input replacement preserves partition and device metadata",
+          "[physical_concat][operator_data]")
+{
+  bool const indexed = GENERATE(false, true);
+  bool const pinned  = GENERATE(false, true);
+  auto original      = make_host_metadata_batch(3);
+  auto replacement   = make_host_metadata_batch(3);
+  std::unique_ptr<partitioned_operator_data> input;
+  if (indexed) {
+    auto layout =
+      pinned ? partition_placement::round_robin(4, {2, 5}) : partition_placement::unpinned(4);
+    input = std::make_unique<partitioned_operator_data>(
+      std::vector<std::shared_ptr<data_batch>>{original}, 3, layout);
+  } else {
+    input = std::make_unique<partitioned_operator_data>(
+      std::vector<std::shared_ptr<data_batch>>{original});
+    if (pinned) { input->set_preferred_device_id(5); }
+  }
+  auto rebuilt      = input->with_batches_preserving_rows({replacement});
+  auto* partitioned = dynamic_cast<partitioned_operator_data*>(rebuilt.get());
+  REQUIRE(partitioned != nullptr);
+  CHECK(partitioned->get_partition_idx() == input->get_partition_idx());
+  CHECK(partitioned->get_preferred_device_id() == input->get_preferred_device_id());
+  CHECK(partitioned->get_data_batches() == std::vector<std::shared_ptr<data_batch>>{replacement});
+  CHECK(input->get_data_batches() == std::vector<std::shared_ptr<data_batch>>{original});
 }
 
 TEST_CASE("BUILD_PROBE rejects a missing explicit build concatenation path",

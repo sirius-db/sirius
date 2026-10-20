@@ -25,48 +25,6 @@
 
 namespace sirius {
 namespace op {
-namespace {
-
-// Keep the complete input owned by the task through normal preparation and retries. Checking
-// the target's hard limit before uploading avoids retrying an input that can never fit.
-class concat_input_data final : public partitioned_operator_data {
- public:
-  concat_input_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
-                    std::size_t partition,
-                    std::shared_ptr<const partition_placement> placement)
-    : partitioned_operator_data(std::move(batches), partition, *placement),
-      _placement(std::move(placement))
-  {
-  }
-
-  void prepare_for_processing(cucascade::memory::memory_space const* target,
-                              ::cuda::stream_ref stream) override
-  {
-    if (target != nullptr) {
-      std::size_t bytes = 0;
-      for (auto const& batch : get_data_batches()) {
-        bytes = memory::saturating_add(bytes, get_batch_rows_and_bytes(*batch).bytes);
-      }
-      // All decoded inputs must fit together; output and workspace use the normal OOM path.
-      if (bytes > target->get_max_memory()) {
-        throw std::runtime_error("CONCAT partition input exceeds GPU memory capacity");
-      }
-    }
-    partitioned_operator_data::prepare_for_processing(target, stream);
-  }
-
-  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_data_batches(
-    std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
-  {
-    return std::make_unique<concat_input_data>(
-      std::move(batches), *get_partition_idx(), _placement);
-  }
-
- private:
-  std::shared_ptr<const partition_placement> _placement;
-};
-
-}  // namespace
 
 sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_type> types,
                                                std::size_t estimated_cardinality,
@@ -186,7 +144,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
       input_batch.push_back(port_ptr->repo->pop_data_batch_by_id(batch_id, i));
     }
     // Preserve the existing partition placement for the downstream consumer.
-    return std::make_unique<concat_input_data>(std::move(input_batch), i, placement);
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), i, *placement);
   }
   return nullptr;
 }

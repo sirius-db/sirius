@@ -434,7 +434,9 @@ The caller selects the grouping requirement:
 
 Group selection also checks available row-count metadata before claiming or transferring input.
 Bounded groups stop before exceeding the cuDF row-count limit; a complete partition above the
-limit is rejected. Representations without row-count metadata are checked after preparation.
+limit is rejected. Execution checks the actual prepared tables, including representations
+without row-count metadata. Input preparation and allocation failures use the standard
+partitioned task and executor OOM path.
 
 ### `sirius_physical_passthrough_sink` — `PASSTHROUGH_SINK`
 **File:** `src/include/op/sirius_physical_passthrough_sink.hpp`
