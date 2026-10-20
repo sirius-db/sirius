@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "exec/scoped_dispatcher.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
@@ -103,7 +104,7 @@ class contract_table_info final : public sirius::op::scan::ingestible_table_info
   bool allows_cached_rows() const override { return cache_allowed; }
 };
 
-class contract_ingestible final : public sirius::op::scan::gpu_ingestible {
+class contract_ingestible : public sirius::op::scan::gpu_ingestible {
  public:
   std::shared_ptr<sirius::scan_manager::preparation_admission> admission;
   std::shared_ptr<sirius::scan_manager::preparation_ledger> attached;
@@ -119,7 +120,7 @@ class contract_ingestible final : public sirius::op::scan::gpu_ingestible {
   bool has_processed_all_metadata() const override { return false; }
   metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver) override
   {
-    return [] { return std::make_unique<sirius::op::scan::scan_info>(); };
+    return [](std::stop_token) { return std::make_unique<sirius::op::scan::scan_info>(); };
   }
   sirius::op::scan::filtered_table materialize_metadata_to_table(
     sirius::op::scan::scan_info const&,
@@ -161,13 +162,13 @@ class contract_ingestible final : public sirius::op::scan::gpu_ingestible {
   preparation_claim claim_preparation(sirius::io::ioctx_resolver) override
   {
     ++claim_calls;
-    auto work = [] { return std::make_unique<sirius::op::scan::scan_info>(); };
+    auto work = [](std::stop_token) { return std::make_unique<sirius::op::scan::scan_info>(); };
     return {work,
             [this, work](std::stop_token stop) mutable {
               custom_stop_seen = true;
               if (stop.stop_requested())
                 throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-              return work();
+              return work(stop);
             },
             {},
             {}};
@@ -265,6 +266,82 @@ TEST_CASE("Preparation claim uses the adapter capability without an admission",
   CHECK_THROWS_AS(claim.stop_work(source.get_token()), std::system_error);
   CHECK(adapter.custom_stop_seen);
 }
+TEST_CASE("Ordinary split provider cancellation drains queued and running metadata",
+          "[scan_preparation][split_provider][r4]")
+{
+  class cancellable_ingestible final : public contract_ingestible {
+   public:
+    metadata_scan_task_t work;
+    bool claimed = false;
+    bool has_processed_all_metadata() const override { return claimed; }
+    metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver) override
+    {
+      claimed = true;
+      return std::move(work);
+    }
+  } adapter;
+  bool queued = false;
+  SECTION("queued task is discarded before any IO") { queued = true; }
+  SECTION("running IO receives stop before opening the datasource") {}
+
+  std::promise<void> entered, release;
+  auto entered_future = entered.get_future();
+  auto released       = release.get_future().share();
+  unsigned work_calls = 0, datasource_opens = 0, completions = 0, results = 0;
+  std::exception_ptr error;
+  split_connector connector;
+  adapter.work = [&](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+    ++work_calls;
+    entered.set_value();
+    released.wait();
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+    ++datasource_opens;
+    return std::make_unique<sirius::op::scan::scan_info>();
+  };
+  sirius::exec::static_thread_pool pool(1);
+  sirius::exec::scoped_dispatcher dispatcher(pool, 1);
+  split_provider provider(adapter, {});
+  if (queued) {
+    dispatcher.enqueue([&] {
+      entered.set_value();
+      released.wait();
+    });
+  }
+  provider.run(dispatcher, [&](split_provider::value_type&& item) {
+    if (item.is_empty()) {
+      ++completions;
+      connector.close();
+    } else if (item.has_exception()) {
+      error = item.exception();
+      connector.close(error);
+    } else {
+      ++results;
+    }
+  });
+  auto status = entered_future.wait_for(std::chrono::seconds(5));
+  dispatcher.request_stop();
+  release.set_value();
+  dispatcher.wait_for_all();
+  CHECK(status == std::future_status::ready);
+  CHECK(work_calls == (queued ? 0 : 1));
+  CHECK(datasource_opens == 0);
+  CHECK(results == 0);
+  CHECK(completions == 1);
+  if (queued) {
+    CHECK_FALSE(error);
+    CHECK_FALSE(connector.get_next_split());
+  } else {
+    REQUIRE(error);
+    try {
+      std::rethrow_exception(error);
+    } catch (std::system_error const& e) {
+      CHECK(e.code() == std::make_error_code(std::errc::operation_canceled));
+    }
+    CHECK_THROWS_AS(connector.get_next_split(), std::system_error);
+  }
+}
+
 TEST_CASE("Admission sums retained results across scans and accounts for allocation granularity",
           "[scan_preparation][ledger]")
 {

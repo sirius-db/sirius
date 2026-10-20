@@ -261,6 +261,27 @@ TEST_CASE("Identity replacement invalidates entries for a path", "[metadata_stor
   CHECK(store.statistics().entries == 0);
 }
 
+TEST_CASE("Identity replacement retires every metadata profile for a path", "[metadata_store]")
+{
+  cache::metadata_store store;
+  fake_object first("file", "file:v1", tag("v1"));
+  auto canonical = std::make_shared<value>(100);
+  auto iceberg   = std::make_shared<value>(200);
+  auto extra     = std::make_shared<value>(300);
+  store.register_metadata(first, canonical, "");
+  store.register_metadata(first, iceberg, "iceberg_flat_v1");
+  store.register_metadata(first, extra, "other");
+  CHECK(store.statistics().entries == 3);
+
+  fake_object replacement("file", "file:v2", tag("v2"));
+  store.open_observed(replacement);
+
+  CHECK_FALSE(store.get_metadata(first, ""));
+  CHECK_FALSE(store.get_metadata(first, "iceberg_flat_v1"));
+  CHECK_FALSE(store.get_metadata(first, "other"));
+  CHECK(store.statistics().entries == 0);
+}
+
 TEST_CASE("Metadata store supports concurrent publication", "[metadata_store]")
 {
   cache::metadata_store store;

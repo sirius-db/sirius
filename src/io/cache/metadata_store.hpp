@@ -71,6 +71,7 @@ class metadata_store {
  private:
   struct entry {
     std::string key;
+    std::string path;
     uint64_t generation;
     object_identity identity;
     std::shared_ptr<io_object_metadata> value;

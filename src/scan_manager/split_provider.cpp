@@ -47,11 +47,7 @@ op::scan::gpu_ingestible::preparation_claim split_provider::claim_preparation()
   auto claim = _ingestible->claim_preparation(_resolve);
   if (claim.work && !claim.stop_work) {
     auto work       = claim.work;
-    claim.stop_work = [work = std::move(work)](std::stop_token stop) mutable {
-      if (stop.stop_requested())
-        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-      return work();
-    };
+    claim.stop_work = [work = std::move(work)](std::stop_token stop) mutable { return work(stop); };
   }
   return claim;
 }
@@ -65,12 +61,13 @@ void split_provider::run(Scheduler& scheduler, const push_callback_t& on_split)
   _completion_token =
     ctrl.on_completion([on_split] { on_split(exec::make_empty_try<split_type>()); });
   while (has_more_splits()) {
-    auto work = next_split_provider();
+    // 普通 metadata/IO task 必须接收 dispatcher 的取消信号。
+    auto work = _ingestible->next_split_provider_with_stop(_resolve);
     if (!work) { continue; }
     scheduler.enqueue(
       [on_split, work = std::move(work), token = ctrl.acquire()](std::stop_token stop) mutable {
         try {
-          auto split = work();
+          auto split = work(stop);
           on_split(std::move(split));
         } catch (...) {
           on_split(std::current_exception());

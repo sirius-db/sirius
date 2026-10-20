@@ -117,6 +117,15 @@ TEST_CASE("R4 Arrow layout rejects unsupported metadata and inconsistent buffers
   int released = 0;
   arrow_fixture f(released);
   REQUIRE(validate_arrow_host_flat(f.schema, f.array).size() == 1);
+  f.root_buffers[0] = &f.validity;
+  REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+  f.child.null_count = 0;
+  f.buffers[0]       = nullptr;
+  REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+  f.buffers[0] = &f.validity;
+  f.validity   = 0;
+  REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+  f.validity         = 5;
   f.child.null_count = -1;
   REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
   f.child.n_buffers = 0;
@@ -431,6 +440,66 @@ TEST_CASE("R4 Arrow nullable slice retains values and rejects schema drift", "[r
   REQUIRE(values[1] == 30);
 }
 
+TEST_CASE("R4 Arrow all-valid slices ignore absent or unused bitmaps", "[r4][scan]")
+{
+  rmm::cuda_stream stream;
+  sirius::exec::retire_lane lane(stream.value());
+  for (bool bitmap : {false, true}) {
+    for (bool sliced : {false, true}) {
+      int released        = 0;
+      auto f              = std::make_shared<arrow_fixture>(released);
+      f->child.null_count = 0;
+      f->validity         = 0;
+      f->buffers[0]       = bitmap ? &f->validity : nullptr;
+      f->root_buffers[0]  = &f->validity;
+      f->array.offset     = sliced ? 1 : 0;
+      f->array.length     = sliced ? 2 : 3;
+      auto owner          = owned_fixture(f);
+      materialization_program program{42, 1, {cudf::data_type{cudf::type_id::INT32}}, 0, false};
+      program.input_types = program.output_types;
+      auto batch = import_arrow_host(owner, program, lane, cudf::get_current_device_resource_ref());
+      REQUIRE(lane.quiesce() == cudaSuccess);
+      REQUIRE(batch.table.view().column(0).null_count() == 0);
+      int32_t values[3]{};
+      REQUIRE(cudaMemcpy(values,
+                         batch.table.view().column(0).head<int32_t>(),
+                         batch.rows * sizeof(int32_t),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+      REQUIRE(values[0] == (sliced ? 20 : 10));
+      REQUIRE(values[batch.rows - 1] == 30);
+    }
+  }
+}
+
+TEST_CASE("R4 Arrow metadata uses separate bounds and rejects every truncated prefix", "[r4][scan]")
+{
+  int released = 0;
+  arrow_fixture f(released);
+  std::string metadata;
+  auto integer = [&](int32_t n) { metadata.append(reinterpret_cast<char const*>(&n), sizeof(n)); };
+  integer(1);
+  integer(1);
+  metadata += 'k';
+  integer(3);
+  metadata += "abc";
+  std::string root(4, '\0');
+  f.schema.metadata       = root.data();
+  f.child_schema.metadata = metadata.data();
+  arrow_metadata_lengths bounds{{root.data(), root.size()}, {metadata.data(), metadata.size()}};
+  REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array, bounds));
+  for (std::size_t bytes = 0; bytes < metadata.size(); ++bytes) {
+    INFO("metadata bytes: " << bytes);
+    bounds[metadata.data()] = bytes;
+    REQUIRE_THROWS_AS(validate_arrow_host_flat(f.schema, f.array, bounds), std::invalid_argument);
+  }
+  bounds.erase(metadata.data());
+  REQUIRE_THROWS_AS(validate_arrow_host_flat(f.schema, f.array, bounds), std::invalid_argument);
+  f.array.null_count = -1;
+  f.root_buffers[0]  = &f.validity;
+  f.schema.metadata = f.child_schema.metadata = nullptr;
+  REQUIRE_THROWS_AS(validate_arrow_host_flat(f.schema, f.array), std::invalid_argument);
+}
+
 TEST_CASE("R4 Arrow decimal imports normalize the approved carrier", "[r4][scan]")
 {
   rmm::cuda_stream stream;
@@ -576,12 +645,34 @@ TEST_CASE("R4 Arrow metadata and UTF8 offsets are qualified before import", "[r4
   integer(1);
   entry("description", "plain column");
   f.child_schema.metadata = metadata.data();
-  REQUIRE_NOTHROW(validate_arrow_host_flat(f.schema, f.array));
+  REQUIRE_NOTHROW(
+    validate_arrow_host_flat(f.schema, f.array, {{metadata.data(), metadata.size()}}));
   metadata.clear();
   integer(1);
   entry("ARROW:extension:name", "opaque");
   f.child_schema.metadata = metadata.data();
-  REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array));
+  REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array, {{metadata.data(), metadata.size()}}));
+  f.child_schema.metadata = metadata.data();
+  REQUIRE_THROWS(
+    validate_arrow_host_flat(f.schema, f.array, {{metadata.data(), metadata.size() - 1}}));
+  metadata.assign(1, '\x01');
+  f.child_schema.metadata = metadata.data();
+  REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array, {{metadata.data(), metadata.size()}}));
+  int32_t entries    = 1;
+  int32_t key_length = 100;
+  metadata.clear();
+  metadata.append(reinterpret_cast<char*>(&entries), sizeof(entries));
+  metadata.append(reinterpret_cast<char*>(&key_length), sizeof(key_length));
+  f.child_schema.metadata = metadata.data();
+  REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array, {{metadata.data(), metadata.size()}}));
+  metadata.clear();
+  integer(1);
+  integer(1);
+  metadata.push_back('k');
+  int32_t value_length = 100;
+  integer(value_length);
+  f.child_schema.metadata = metadata.data();
+  REQUIRE_THROWS(validate_arrow_host_flat(f.schema, f.array, {{metadata.data(), metadata.size()}}));
   f.child_schema.metadata = nullptr;
   int32_t offsets[]{0, 2, 1, 3};
   void const* buffers[]{&f.validity, offsets, "abc"};
@@ -722,7 +813,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
   auto prepare    = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-  auto prepared    = prepare();
+  auto prepared    = prepare({});
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
   REQUIRE(file.field_mapping);
   REQUIRE(file.row_groups.empty());
@@ -780,7 +871,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
   auto prepare    = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-  auto prepared = prepare();
+  auto prepared = prepare({});
   REQUIRE(prepared);
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
   REQUIRE(file.field_mapping);

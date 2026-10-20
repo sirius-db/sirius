@@ -205,7 +205,7 @@ routing_observations collect_routing_observations(
   while (ingestible.has_processed_all_metadata() == false) {
     auto task = ingestible.next_split_provider(resolver);
     if (!task) { continue; }
-    auto scan = task();
+    auto scan = task({});
     REQUIRE(scan != nullptr);
     auto* file_scan = dynamic_cast<sirius::op::scan::parquet_file_scan_info*>(scan.get());
     REQUIRE(file_scan != nullptr);
@@ -828,7 +828,7 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
   while (provider.has_more_splits()) {
     auto task = provider.next_split_provider();
     if (!task) { continue; }
-    auto scan = task();
+    auto scan = task({});
     REQUIRE(scan != nullptr);
     auto* file_scan = dynamic_cast<sirius::op::scan::parquet_file_scan_info*>(scan.get());
     REQUIRE(file_scan != nullptr);

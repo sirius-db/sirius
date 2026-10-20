@@ -3302,8 +3302,11 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
 
   std::size_t total_bytes = 0;
   for (auto const& path : file_paths) {
-    auto const io_ctx = ioctx_for_path(path);
-    auto datasource   = create_datasource(path, sirius::io::open_hint::parquet_footer_probe);
+    auto const io_ctx        = ioctx_for_path(path);
+    auto const footer_cached = io_ctx && io_ctx->metadata_store().has_path(path);
+    auto datasource          = create_datasource(
+      path,
+      footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe);
     if (!datasource) {
       throw std::runtime_error("[pin_table] no backend supports parquet path: " + path);
     }

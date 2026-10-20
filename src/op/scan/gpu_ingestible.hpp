@@ -95,8 +95,8 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     _execution_completion = std::move(completion);
   }
 
-  using metadata_scan_task_t           = std::function<std::unique_ptr<scan_info>()>;
-  using stoppable_metadata_scan_task_t = std::function<std::unique_ptr<scan_info>(std::stop_token)>;
+  using metadata_scan_task_t           = std::function<std::unique_ptr<scan_info>(std::stop_token)>;
+  using stoppable_metadata_scan_task_t = metadata_scan_task_t;
 
   struct preparation_claim {
     metadata_scan_task_t work;
@@ -119,7 +119,10 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     auto stop_work = next_split_provider_with_stop(resolve);
     if (!stop_work) return {};
     auto work = stop_work;
-    return {[work = std::move(work)] { return work({}); }, std::move(stop_work), {}, {}};
+    return {[work = std::move(work)](std::stop_token stop) { return work(stop); },
+            std::move(stop_work),
+            {},
+            {}};
   }
 
   virtual stoppable_metadata_scan_task_t next_split_provider_with_stop(io::ioctx_resolver resolve)
@@ -129,7 +132,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     return [work = std::move(work)](std::stop_token stop) mutable {
       if (stop.stop_requested())
         throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-      return work();
+      return work(stop);
     };
   }
 

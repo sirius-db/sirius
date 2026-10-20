@@ -10,14 +10,23 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <unordered_map>
 
 namespace sirius::op::scan {
+// Trusted readable lengths, keyed by the exact metadata buffer in the schema tree.
+using arrow_metadata_lengths = std::unordered_map<char const*, std::size_t>;
+
 // Ownership of the entire schema/array tree is transferred here. The producer must
 // detach any statement-affine release callbacks before publication. Capacity retains
 // the producer's input/staging reservation until the last asynchronous input read.
 class owned_arrow_batch {
  public:
-  owned_arrow_batch(ArrowSchema& schema, ArrowArray& array, std::shared_ptr<void> capacity);
+  // Every non-null metadata pointer requires its own trusted byte length.
+  // Arrow C Data itself carries no metadata lengths.
+  owned_arrow_batch(ArrowSchema& schema,
+                    ArrowArray& array,
+                    std::shared_ptr<void> capacity,
+                    arrow_metadata_lengths metadata_lengths = {});
   ~owned_arrow_batch();
   owned_arrow_batch(owned_arrow_batch const&)            = delete;
   owned_arrow_batch& operator=(owned_arrow_batch const&) = delete;
@@ -32,9 +41,11 @@ class owned_arrow_batch {
   ArrowSchema schema{};
   ArrowArray array{};
   std::shared_ptr<void> capacity;
+  arrow_metadata_lengths metadata_lengths;
 };
 
-std::vector<cudf::data_type> validate_arrow_host_flat(ArrowSchema const&, ArrowArray const&);
+std::vector<cudf::data_type> validate_arrow_host_flat(
+  ArrowSchema const&, ArrowArray const&, arrow_metadata_lengths const& metadata_lengths = {});
 // The caller owns/drains the completion lane and its stream for the entire attempt.
 // Output device reservations are the same task reservation used for Parquet decode.
 materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch>,

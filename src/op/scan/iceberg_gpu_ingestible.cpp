@@ -261,9 +261,7 @@ void attach_delete_set(parquet_file_scan_info& file, std::shared_ptr<iceberg_del
 gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider(
   io::ioctx_resolver resolve)
 {
-  auto stop_work = next_split_provider_with_stop(std::move(resolve));
-  if (!stop_work) return {};
-  return [stop_work = std::move(stop_work)]() mutable { return stop_work({}); };
+  return next_split_provider_with_stop(std::move(resolve));
 }
 
 gpu_ingestible::stoppable_metadata_scan_task_t
@@ -383,7 +381,10 @@ gpu_ingestible::preparation_claim iceberg_gpu_ingestible::claim_preparation(
   auto stop_work = next_split_provider_with_stop(std::move(resolve));
   if (!stop_work) return {};
   auto work = stop_work;
-  return {[work = std::move(work)] { return work({}); }, std::move(stop_work), key, required};
+  return {[work = std::move(work)](std::stop_token stop) { return work(stop); },
+          std::move(stop_work),
+          key,
+          required};
 }
 
 scan_manager::unit_key iceberg_gpu_ingestible::next_preparation_unit() const

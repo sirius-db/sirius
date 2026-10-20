@@ -122,12 +122,14 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
     if (!provider.has_more_splits()) return {};
     auto claim = provider.claim_preparation();
     if (!claim.work) return {};
+    auto work        = std::move(claim.work);
+    auto legacy_work = [work = std::move(work)] { return work({}); };
     if (!claim.key)
-      return preparation_coordinator::job{std::move(claim.work), {}, std::move(claim.stop_work)};
+      return preparation_coordinator::job{std::move(legacy_work), {}, std::move(claim.stop_work)};
     auto unit = coordinator.admit_unit(*claim.key, claim.required);
     if (!unit) return {};
     return bind_preparation_unit(
-      std::move(claim.work), std::move(claim.stop_work), std::move(unit), claim.required);
+      std::move(legacy_work), std::move(claim.stop_work), std::move(unit), claim.required);
   };
   source.construct = [slot](std::unique_ptr<op::scan::scan_info> batch) {
     auto device = slot->balancer->get_next_gpu(slot->pipeline_id);

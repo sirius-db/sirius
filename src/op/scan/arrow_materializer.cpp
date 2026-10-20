@@ -12,8 +12,11 @@
 #include <string_view>
 
 namespace sirius::op::scan {
-owned_arrow_batch::owned_arrow_batch(ArrowSchema& s, ArrowArray& a, std::shared_ptr<void> permit)
-  : capacity(std::move(permit))
+owned_arrow_batch::owned_arrow_batch(ArrowSchema& s,
+                                     ArrowArray& a,
+                                     std::shared_ptr<void> permit,
+                                     arrow_metadata_lengths metadata_lengths)
+  : capacity(std::move(permit)), metadata_lengths(std::move(metadata_lengths))
 {
   if (!s.release || !a.release || !capacity)
     throw std::invalid_argument("Arrow input requires ownership and capacity");
@@ -64,15 +67,25 @@ cudf::data_type type_for(std::string_view f)
   }
   invalid();
 }
-void validate_metadata(char const* metadata)
+void validate_metadata(char const* metadata, arrow_metadata_lengths const& metadata_lengths)
 {
   if (!metadata) return;
-  // Like the C Data buffers, metadata is producer-owned readable memory. Bound
-  // lengths before traversing it and refuse Arrow extension semantics.
+  auto const bound = metadata_lengths.find(metadata);
+  if (bound == metadata_lengths.end()) invalid();
+  auto const* cursor = reinterpret_cast<std::uint8_t const*>(metadata);
+  auto remaining     = bound->second;
+  auto require       = [&](std::size_t bytes) {
+    if (bytes > remaining) invalid();
+  };
+  auto advance = [&](std::size_t bytes) {
+    cursor += bytes;
+    remaining -= bytes;
+  };
   auto integer = [&]() {
+    require(sizeof(int32_t));
     int32_t n;
-    std::memcpy(&n, metadata, sizeof(n));
-    metadata += sizeof(n);
+    std::memcpy(&n, cursor, sizeof(n));
+    advance(sizeof(n));
     if (n < 0 || n > (1 << 20)) invalid();
     return n;
   };
@@ -80,36 +93,42 @@ void validate_metadata(char const* metadata)
   if (entries > 4096) invalid();
   for (int32_t i = 0; i < entries; ++i) {
     auto key_length = integer();
-    std::string_view key(metadata, key_length);
-    metadata += key_length;
+    require(static_cast<std::size_t>(key_length));
+    std::string_view key(reinterpret_cast<char const*>(cursor), key_length);
+    advance(key_length);
     auto value_length = integer();
-    metadata += value_length;
+    require(static_cast<std::size_t>(value_length));
+    advance(value_length);
     if (key == "ARROW:extension:name" || key == "ARROW:extension:metadata") invalid();
   }
 }
-void common(ArrowSchema const& s, ArrowArray const& a)
+void common(ArrowSchema const& s,
+            ArrowArray const& a,
+            arrow_metadata_lengths const& metadata_lengths)
 {
   if (!s.format || !s.release || !a.release || s.dictionary || a.dictionary || a.length < 0 ||
       a.length > std::numeric_limits<cudf::size_type>::max() || a.offset < 0 ||
       a.offset > std::numeric_limits<int64_t>::max() - a.length || a.n_buffers < 1 ||
       a.null_count < -1 || a.null_count > a.length || !a.buffers)
     invalid();
-  validate_metadata(s.metadata);
+  validate_metadata(s.metadata, metadata_lengths);
   if (a.null_count > 0 && !a.buffers[0]) invalid();
 }
 }  // namespace
 
-std::vector<cudf::data_type> validate_arrow_host_flat(ArrowSchema const& schema,
-                                                      ArrowArray const& array)
+std::vector<cudf::data_type> validate_arrow_host_flat(
+  ArrowSchema const& schema,
+  ArrowArray const& array,
+  arrow_metadata_lengths const& metadata_lengths)
 {
   if constexpr (std::endian::native != std::endian::little) invalid();
-  common(schema, array);
+  common(schema, array, metadata_lengths);
   if (std::string_view(schema.format) != "+s" || schema.n_children < 0 ||
       schema.n_children != array.n_children || array.n_buffers != 1 ||
       (array.n_children && (!array.children || !schema.children)))
     invalid();
   if (array.null_count > 0) invalid();
-  if (array.buffers[0]) {
+  if (array.null_count != 0 && array.buffers[0]) {
     auto bits = static_cast<uint8_t const*>(array.buffers[0]);
     for (int64_t i = array.offset; i < array.offset + array.length; ++i)
       if (!(bits[i / 8] & (1U << (i % 8)))) invalid();
@@ -119,7 +138,7 @@ std::vector<cudf::data_type> validate_arrow_host_flat(ArrowSchema const& schema,
     if (!array.children[i] || !schema.children[i]) invalid();
     auto const& a = *array.children[i];
     auto const& s = *schema.children[i];
-    common(s, a);
+    common(s, a, metadata_lengths);
     if (a.n_children || s.n_children || a.length < array.offset + array.length) invalid();
     auto type    = type_for(s.format);
     bool strings = type.id() == cudf::type_id::STRING;
@@ -145,7 +164,7 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
 {
   if (!input || !input->capacity || !program.contract || !program.generation)
     throw std::invalid_argument("Arrow import requires admitted input and program");
-  auto types = validate_arrow_host_flat(input->schema, input->array);
+  auto types = validate_arrow_host_flat(input->schema, input->array, input->metadata_lengths);
   if (!program.input_types || types != *program.input_types)
     throw std::invalid_argument("Arrow schema does not match its bound program");
   for (std::size_t i = 0; i < types.size(); ++i) {
@@ -179,7 +198,7 @@ materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch> input,
     if (input->array.offset || child.length != input->array.length) {
       child.offset += input->array.offset;
       child.length     = input->array.length;
-      child.null_count = child.buffers[0] ? -1 : 0;
+      child.null_count = child.null_count == 0 || !child.buffers[0] ? 0 : -1;
     }
     view->children.push_back(child);
   }

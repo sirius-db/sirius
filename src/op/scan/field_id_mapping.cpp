@@ -222,7 +222,10 @@ bool field_id_mapping::compatible_with(field_id_mapping const& other) const
     if (a.field.missing_value && !same_default(*a.field.missing_value, *b.field.missing_value))
       return false;
   }
-  return true;
+  // The coalesced reader uses the first mapping's physical projection for every
+  // source in the run. Keep a run together only when reader positions and source
+  // types are identical as well.
+  return read_indices_ == other.read_indices_ && read_types_ == other.read_types_;
 }
 
 std::size_t field_id_mapping::additional_bytes(std::size_t rows) const
@@ -362,11 +365,13 @@ void append_lineage(materialized_batch& batch,
 {
   auto file_index = batch.lineage.files.size();
   batch.lineage.files.push_back({mapping.identity(), source.metadata->num_rows});
+  std::vector<int64_t> row_group_prefix(source.metadata->row_groups.size() + 1, 0);
+  for (std::size_t i = 0; i < source.metadata->row_groups.size(); ++i) {
+    row_group_prefix[i + 1] = row_group_prefix[i] + source.metadata->row_groups[i].num_rows;
+  }
   for (auto group : source.row_group_indices) {
-    int64_t file_offset = 0;
-    for (std::size_t i = 0; i < group; ++i)
-      file_offset += source.metadata->row_groups.at(i).num_rows;
-    auto count = source.metadata->row_groups.at(group).num_rows;
+    int64_t file_offset = row_group_prefix.at(static_cast<std::size_t>(group));
+    auto count          = source.metadata->row_groups.at(group).num_rows;
     batch.lineage.runs.push_back(
       {mapping.identity(), file_offset, batch_offset, count, file_index});
     batch_offset += count;

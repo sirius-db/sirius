@@ -445,9 +445,13 @@ class parquet_batch_coalescer : public batch_coalescer {
     bool const schema_changed =
       !file->row_groups.empty() && !_slices.empty() &&
       (_run_original_schema != file->original_schema || _run_arrow_schema != file->arrow_schema);
+    bool const mapping_changed =
+      !_slices.empty() &&
+      ((_run_mapping && file->field_mapping) ? !_run_mapping->compatible_with(*file->field_mapping)
+                                             : _run_mapping != file->field_mapping);
     if (!_slices.empty() && (schema_changed || _partition_values != file->partition_values ||
                              _disable_pushdown != file->disable_filter_pushdown ||
-                             _run_reader_options != file->reader_options)) {
+                             _run_reader_options != file->reader_options || mapping_changed)) {
       auto batch = emit_current();
       if (schema_changed && _counters)
         _counters->split_flushed_for_schema.fetch_add(1, std::memory_order_relaxed);
@@ -977,7 +981,7 @@ bool parquet_scan_core::has_processed_all_metadata() const
 parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
   io::ioctx_resolver resolve)
 {
-  return next_split_provider(std::move(resolve), {});
+  return next_split_provider_with_stop(std::move(resolve));
 }
 
 parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
@@ -985,7 +989,7 @@ parquet_scan_core::metadata_scan_task_t parquet_scan_core::next_split_provider(
 {
   auto task = next_split_provider_with_stop(std::move(resolve));
   if (!task) return {};
-  return [task = std::move(task), stop]() mutable { return task(stop); };
+  return [task = std::move(task), stop](std::stop_token) mutable { return task(stop); };
 }
 
 parquet_scan_core::stoppable_metadata_scan_task_t parquet_scan_core::next_split_provider_with_stop(
@@ -1069,6 +1073,8 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   bool const footer_cached = io_ctx->metadata_store().has_path(file_path);
   std::shared_ptr<io::sirius_datasource> sirius_ds;
   {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     sirius_ds = io_ctx->open_datasource(
       file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
   }

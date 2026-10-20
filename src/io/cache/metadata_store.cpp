@@ -47,10 +47,11 @@ void metadata_store::observe_locked(io_object const& obj, entries& retired)
     if (obj.open_generation() <= it->second.generation) return;
     it->second = observation{std::move(identity), obj.open_generation()};
   }
-  auto current = _index.find(cache_key(obj.object_path()));
-  if (current != _index.end()) {
+  for (auto entry = _entries.begin(); entry != _entries.end();) {
+    auto current = entry++;
+    if (current->path != obj.object_path()) continue;
     ++_stats.replacements;
-    retire(current->second, retired);
+    retire(current, retired);
   }
 }
 
@@ -172,7 +173,7 @@ bool metadata_store::put_identity(std::string const& path,
     if (current != _observed.end() && current->second.identity != identity) {
       ++_stats.bypasses;
       ++_stats.stale;
-      retired.push_back({{}, generation, {}, std::move(value)});
+      retired.push_back({{}, {}, generation, {}, std::move(value)});
       return false;
     }
   }
@@ -181,7 +182,7 @@ bool metadata_store::put_identity(std::string const& path,
   auto defer_value = [&] {
     // Keep discarded payloads alive until the caller releases _mutex. Metadata
     // destructors are allowed to inspect their owning ioctx.
-    retired.push_back({{}, generation, {}, std::move(value)});
+    retired.push_back({{}, {}, generation, {}, std::move(value)});
   };
   auto found = _index.find(lookup);
   if (found != _index.end()) {
@@ -201,7 +202,7 @@ bool metadata_store::put_identity(std::string const& path,
     ++_stats.replacements;
     retire(it, retired);
   }
-  _entries.push_front({std::move(lookup), generation, std::move(identity), std::move(value)});
+  _entries.push_front({std::move(lookup), path, generation, std::move(identity), std::move(value)});
   try {
     _index.emplace(_entries.front().key, _entries.begin());
   } catch (...) {
