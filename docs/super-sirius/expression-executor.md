@@ -116,10 +116,10 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 | `between` | `sirius::ast::between` | `BETWEEN … AND …` |
 | `case_expr` | `sirius::ast::case_expr` | `CASE WHEN … THEN … ELSE … END` |
 | `cast` | `sirius::ast::cast` | `CAST(x AS T)` |
-| `unary_op` | `sirius::ast::unary_op` | `NOT x`, `-x`, arithmetic binary ops (`+`, `-`, `*`, `/`) |
+| `unary_op` | `sirius::ast::unary_op` | `NOT x`, `x IS NULL`, `x IS NOT NULL` |
 | `coalesce` | `sirius::ast::coalesce` | `COALESCE(a, b, 0)` |
 | `in_list` | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
-| `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) — `sirius::function_id` enum |
+| `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) and arithmetic (`a + b`, `-x`) — `sirius::function_id` enum |
 | `aggregate` | `sirius::ast::aggregate` | Aggregate function (`SUM`, `COUNT`, etc.) — `sirius::aggregate_id` enum |
 
 **Translation boundary:** `sirius::ast::from_duckdb(expr)` produces a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders (and at the scan boundary for pushdown filters); the resulting node is owned by the operator and never re-translated.
@@ -193,7 +193,8 @@ mutable process globals. Standalone callers may omit the policy to use fixed def
 | Constant | `sirius::ast::constant` | `42`, `'hello'` |
 | Comparison | `sirius::ast::comparison` | `a > b`, `x = 10`, `a IS NOT DISTINCT FROM b` |
 | Conjunction | `sirius::ast::conjunction` | `a AND b`, `x OR y` |
-| Arithmetic / unary | `sirius::ast::unary_op` | `a + b`, `NOT x`, `-x` |
+| Arithmetic | `sirius::ast::function_call` | `a + b`, `-x` |
+| Unary predicate | `sirius::ast::unary_op` | `NOT x`, `x IS NULL` |
 | COALESCE | `sirius::ast::coalesce` | `COALESCE(a, b, 0)` |
 | IN-list | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
 | Function call | `sirius::ast::function_call` | `UPPER(name)`, `YEAR(date)`, `a \|\| b` |
@@ -284,6 +285,19 @@ whose values all fit. The evaluator, the AST op counter, the hash join's null-sa
 `gpu_expression_translator` all use it.
 
 The SQL comparisons against DuckDB are tagged `[decimal_cast]` and `[integer_cast]`.
+
+### Arity and negation
+
+`from_duckdb_function_name` resolves a (name, argument count) pair against one signature table
+in `function_id.cpp`: a one-argument `-` is `function_id::negate`, a two-argument `-` is
+`function_id::sub`, and an arity no GPU handler takes stays on the CPU. A one-argument `+`
+translates to its operand. The `function_call` constructor throws on a mismatched arity.
+
+`negate` runs `cudf::unary_operation(NEGATE)` on signed integers, FLOAT, DOUBLE and DECIMAL,
+keeping the input type (`-0.0` matches DuckDB). Negating a signed integer's minimum raises
+DuckDB's `Overflow in negation of numeric value!`; the check is a `cudf::contains` shared with
+`abs` (one stream sync). Unsigned, HUGEINT and INTERVAL negation, and a result type that differs
+from the operand's, stay on the CPU. `negate` is an AST breaker. Tests are tagged `[negate]`.
 
 ### Rounding
 
