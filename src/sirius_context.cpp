@@ -538,9 +538,12 @@ void SiriusContext::throw_runtime_unavailable() const
   // IS-A ExecutorException: deliberately non-invalidating (INTERNAL/FATAL
   // would invalidate the whole DatabaseInstance and defeat "CPU queries
   // continue"). Typed so entry points can classify it without text matching.
-  throw SiriusRuntimeUnavailableException(
+  std::string message =
     "Sirius GPU runtime is unavailable after a mandatory cleanup failure or fatal device error; "
-    "CPU execution continues. Restart the process to restore GPU execution.");
+    "CPU execution continues. Restart the process to restore GPU execution.";
+  auto cause = query_lifecycle_.runtime_failure_message();
+  if (!cause.empty()) message += " First fatal CUDA failure: " + cause;
+  throw SiriusRuntimeUnavailableException(message);
 }
 
 void SiriusContext::begin_execution_window(ClientContext& context,

@@ -41,6 +41,7 @@ bool await_condition(auto predicate)
 void check_admission(sirius::exec::query_lifecycle_registry& lifecycle, bool fatal)
 {
   CHECK(lifecycle.runtime_failed() == fatal);
+  CHECK(lifecycle.runtime_failure_message().empty() == !fatal);
   CHECK(lifecycle.accepts_work(sirius::make_query_id(1)) == !fatal);
   CHECK(lifecycle.accepts_work(sirius::make_query_id(2)) == !fatal);
   if (fatal)

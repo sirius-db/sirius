@@ -618,6 +618,11 @@ TEST_CASE("GPU executor reports CCCL and Thrust task failures before completion"
     CHECK(std::current_exception() == failure);
   }
   CHECK(f.lifecycle.runtime_failed() == (status == cudaErrorIllegalAddress));
+  // This fixture has no completion observer: the worker must record its owner
+  // before publishing shared health failure or signaling completion.
+  auto diagnostics = f.lifecycle.diagnostics();
+  REQUIRE(diagnostics.size() == 1);
+  CHECK_FALSE(diagnostics.front().error.empty());
   sirius::test::retire_scheduler_query(f.lifecycle, *f.executor, sirius::make_query_id(0));
   f.executor->stop();
 }

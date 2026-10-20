@@ -922,6 +922,13 @@ static void check_runtime_failure_fallback(std::string_view failure_point)
   auto before = runtime->get_transparent_execution_stats();
   auto result = prepared->Execute();
   REQUIRE(sink->injected.load());
+  try {
+    runtime->throw_runtime_unavailable();
+  } catch (duckdb::SiriusRuntimeUnavailableException const& error) {
+    CHECK(std::string(error.what()).find("cudaErrorIllegalAddress") != std::string::npos);
+    CHECK(std::string(error.what()).find("synthetic fatal failure during window admission") !=
+          std::string::npos);
+  }
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : ""));
   REQUIRE_FALSE(result->HasError());

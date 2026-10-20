@@ -609,3 +609,64 @@ TEST_CASE("retaining null resources fails without consuming registration", "[que
   REQUIRE(owner.use_count() == 1);
   registry.close(q);
 }
+
+TEST_CASE("a health poll cannot replace the originating query error",
+          "[query_lifecycle_gate][device_health]")
+{
+  query_lifecycle_registry registry;
+  auto id = make_query_id(1);
+  registry.open_query(id);
+  auto poll = std::async(std::launch::async, [&] {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!registry.runtime_failed() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    auto cause = registry.runtime_failure_message();
+    // The completion observer has not run yet. Model the health poll reporting first.
+    registry.report_failure(
+      std::make_exception_ptr(std::runtime_error("runtime unavailable: " + cause)), id);
+    return cause;
+  });
+  auto original =
+    std::make_exception_ptr(cudf::cuda_error("original task failure", cudaErrorIllegalAddress));
+  CHECK(registry.report_failure(original, id));
+  auto cause = poll.get();
+  CHECK(cause.find("cudaErrorIllegalAddress") != std::string::npos);
+  CHECK(cause.find("original task failure") != std::string::npos);
+  registry.record_error(id, original);  // delayed completion observer
+  auto diagnostic = registry.diagnostics();
+  REQUIRE(diagnostic.size() == 1);
+  CHECK(diagnostic.front().error == "original task failure");
+}
+
+TEST_CASE("first fatal runtime cause survives query retirement without retaining resources",
+          "[query_lifecycle_gate][device_health]")
+{
+  query_lifecycle_registry registry;
+  auto id = make_query_id(1);
+  registry.open_query(id);
+  auto ordinary = std::make_exception_ptr(std::runtime_error("earlier query-local failure"));
+  CHECK_FALSE(registry.report_failure(ordinary, id));
+  CHECK(registry.runtime_failure_message().empty());
+
+  struct fatal_with_resource : cudf::cuda_error {
+    std::shared_ptr<int> resource;
+    explicit fatal_with_resource(std::shared_ptr<int> resource)
+      : cudf::cuda_error("background worker failure", cudaErrorIllegalAddress),
+        resource(std::move(resource))
+    {
+    }
+  };
+  auto resource           = std::make_shared<int>(1);
+  std::weak_ptr<int> weak = resource;
+  // No query ID, as with a prefetch worker. No status name in the exception's text.
+  CHECK(registry.report_failure(std::make_exception_ptr(fatal_with_resource(std::move(resource)))));
+  CHECK(weak.expired());
+  auto cause = registry.runtime_failure_message();
+  CHECK(cause == "cudaErrorIllegalAddress: background worker failure");
+  CHECK(registry.report_failure(
+    std::make_exception_ptr(cudf::cuda_error("later fatal failure", cudaErrorUnknown)), id));
+  CHECK(registry.runtime_failure_message() == cause);
+  registry.close(id);
+  CHECK(registry.diagnostics().front().error == "earlier query-local failure");
+  CHECK(registry.runtime_failure_message() == cause);
+}

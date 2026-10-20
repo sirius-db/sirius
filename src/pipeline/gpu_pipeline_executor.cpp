@@ -160,6 +160,7 @@ void gpu_pipeline_executor::process_task(
   // Resolved as soon as the task is known so every failure path below — including an unexpected
   // throw — fails THIS task's query rather than the engine.
   std::shared_ptr<completion_handler> iteration_completion;
+  std::optional<query_id_t> iteration_query;
   try {
     auto* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
     if (!gpu_task) {
@@ -177,6 +178,7 @@ void gpu_pipeline_executor::process_task(
     // lease protects its resources even if cancellation races this advisory check.
     auto const* pipe    = gpu_task->get_pipeline();
     auto const query_id = pipe ? pipe->get_query_id() : make_query_id(0);
+    iteration_query     = query_id;
     if (!_query_lifecycle.accepts_work(query_id)) { return; }
     // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
     // another device, which prepare clones into this space) are counted in the reservation.
@@ -413,11 +415,12 @@ void gpu_pipeline_executor::process_task(
       std::move(slot),
       query_id,
       std::move(work),
-      [this, iteration_completion](std::exception_ptr error) noexcept {
-        _query_lifecycle.report_failure(error);
+      [this, iteration_completion, query_id](std::exception_ptr error) noexcept {
+        _query_lifecycle.report_failure(error, query_id);
         if (iteration_completion) { iteration_completion->report_error(error); }
       },
       [this,
+       query_id,
        task       = std::move(pipeline_task),
        exc_stream = std::move(exc_stream),
        consumers  = std::move(output_consumers),
@@ -588,7 +591,7 @@ void gpu_pipeline_executor::process_task(
           }
         } catch (...) {
           auto error = std::current_exception();
-          _query_lifecycle.report_failure(error);
+          _query_lifecycle.report_failure(error, query_id);
           if (completion)
             completion->report_error(error, transparent::late_failure_cause::gpu_error);
           log::log_noexcept([&] {
@@ -603,14 +606,14 @@ void gpu_pipeline_executor::process_task(
         }
       });
   } catch (const std::exception& e) {
-    _query_lifecycle.report_failure(std::current_exception());
+    _query_lifecycle.report_failure(std::current_exception(), iteration_query);
     if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
     log::log_noexcept([&] {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception while preparing task for dispatch: {}",
                        e.what());
     });
   } catch (...) {
-    _query_lifecycle.report_failure(std::current_exception());
+    _query_lifecycle.report_failure(std::current_exception(), iteration_query);
     if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
     log::log_noexcept([] {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error while preparing task for dispatch");

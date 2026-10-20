@@ -75,6 +75,7 @@ class query_lifecycle_registry {
   struct diagnostic {
     query_id_t query_id{};
     std::chrono::steady_clock::time_point admitted{}, retiring{}, completed{}, first_memory_wait{};
+    // Outstanding counts, not lifetime totals. Retired submissions/work are necessarily zero.
     std::size_t submissions{}, work{}, memory_waiters{};
     std::string error;
   };
@@ -256,13 +257,7 @@ class query_lifecycle_registry {
       if (!c) return;
       std::lock_guard lock(c->mutex);
       if (!c->status.error.empty()) return;
-      try {
-        if (error) std::rethrow_exception(error);
-      } catch (std::exception const& e) {
-        c->status.error = e.what();
-      } catch (...) {
-        c->status.error = "non-standard query exception";
-      }
+      c->status.error = exception_message(error);
     } catch (...) {
     }  // Diagnostics must never interfere with completion/retirement.
   }
@@ -272,8 +267,22 @@ class query_lifecycle_registry {
   bool report_failure(std::exception_ptr error, std::optional<query_id_t> id = {}) noexcept
   {
     if (id) record_error(*id, error);
-    if (!fatal_device_exception(error)) return false;
-    runtime_failed_.store(true, std::memory_order_release);
+    auto status = fatal_device_status(error);
+    if (!status) return false;
+    // Format outside the registry lock. Retain text/status, not an exception_ptr
+    // whose custom exception could keep query resources alive after retirement.
+    auto message = exception_message(error);
+    try {
+      std::lock_guard lock(mutex_);
+      if (!runtime_failed()) {
+        runtime_failure_status_  = *status;
+        runtime_failure_message_ = std::move(message);
+        // Publish only after the originating diagnostic is available to health polls.
+        runtime_failed_.store(true, std::memory_order_release);
+      }
+    } catch (...) {
+      runtime_failed_.store(true, std::memory_order_release);
+    }
     try {
       quiesce_all();
     } catch (...) {
@@ -282,6 +291,15 @@ class query_lifecycle_registry {
     return true;
   }
   bool runtime_failed() const noexcept { return runtime_failed_.load(std::memory_order_acquire); }
+
+  /// First fatal cause, including its status even when the exception text omits it.
+  /// Survives query retirement; empty when no fatal CUDA failure has been reported.
+  std::string runtime_failure_message() const
+  {
+    std::lock_guard lock(mutex_);
+    if (runtime_failure_status_ == cudaSuccess) return {};
+    return std::string(cudaGetErrorName(runtime_failure_status_)) + ": " + runtime_failure_message_;
+  }
 
   /// Live owners plus the last 128 retired owners. No plans/buffers are retained by history.
   std::vector<diagnostic> diagnostics() const
@@ -502,6 +520,21 @@ class query_lifecycle_registry {
   }
 
  private:
+  static std::string exception_message(std::exception_ptr error) noexcept
+  {
+    try {
+      try {
+        if (error) std::rethrow_exception(error);
+      } catch (std::exception const& e) {
+        return e.what();
+      } catch (...) {
+        return "non-standard query exception";
+      }
+    } catch (...) {
+    }  // Diagnostic allocation must not interfere with completion/retirement.
+    return {};
+  }
+
   [[nodiscard]] std::shared_ptr<query_control> find(sirius::query_id_t query_id) const
   {
     // This mutex protects map membership, not the control's state/counters. Keep its scope
@@ -535,6 +568,8 @@ class query_lifecycle_registry {
   // Lock order: registry -> query control. Handles only lock their control; no queue or callback
   // runs under either mutex. Waiters release the registry lock before waiting on a query's CV.
   std::atomic<bool> runtime_failed_{false};
+  cudaError_t runtime_failure_status_{cudaSuccess};  // protected by mutex_
+  std::string runtime_failure_message_;              // protected by mutex_
   std::array<std::optional<diagnostic>, 128> history_;
   std::uint64_t completed_{0};
   mutable std::mutex mutex_;

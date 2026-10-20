@@ -177,24 +177,23 @@ TEST_CASE("fatal device classification requires CUDA exception evidence", "[devi
   CHECK(sirius::fatal_cuda_status(cudaErrorAssert));
   CHECK_FALSE(sirius::fatal_cuda_status(cudaErrorMemoryAllocation));
   CHECK_FALSE(sirius::fatal_cuda_status(cudaErrorInvalidValue));
-  CHECK_FALSE(sirius::fatal_device_exception({}));
+  CHECK_FALSE(sirius::fatal_device_status({}));
   for (auto message :
        {"cudaErrorUnknown",
         "CUDA failure: cudaErrorIllegalAddress",
         "CUDA error at: input.sql:42: cudaErrorAssert device-side assert triggered"}) {
-    CHECK_FALSE(
-      sirius::fatal_device_exception(std::make_exception_ptr(std::runtime_error(message))));
+    CHECK_FALSE(sirius::fatal_device_status(std::make_exception_ptr(std::runtime_error(message))));
   }
-  CHECK(sirius::fatal_device_exception(std::make_exception_ptr(
+  CHECK(sirius::fatal_device_status(std::make_exception_ptr(
     cudf::cuda_error("no error name in this message", cudaErrorIllegalAddress))));
-  CHECK_FALSE(sirius::fatal_device_exception(
+  CHECK_FALSE(sirius::fatal_device_status(
     std::make_exception_ptr(cudf::cuda_error("cudaErrorIllegalAddress", cudaErrorInvalidValue))));
-  CHECK(sirius::fatal_device_exception(
+  CHECK(sirius::fatal_device_status(
     std::make_exception_ptr(sirius::fatal_device_error(cudaErrorAssert))));
-  CHECK_FALSE(sirius::fatal_device_exception(std::make_exception_ptr(std::bad_alloc())));
-  CHECK_FALSE(sirius::fatal_device_exception(
+  CHECK_FALSE(sirius::fatal_device_status(std::make_exception_ptr(std::bad_alloc())));
+  CHECK_FALSE(sirius::fatal_device_status(
     std::make_exception_ptr(rmm::cuda_error("operator input contains cudaErrorAssert"))));
-  CHECK_FALSE(sirius::fatal_device_exception(std::make_exception_ptr(rmm::cuda_error(
+  CHECK_FALSE(sirius::fatal_device_status(std::make_exception_ptr(rmm::cuda_error(
     "CUDA error at: cudaErrorAssert.cu:7: cudaErrorInvalidValue invalid argument"))));
 }
 
@@ -219,7 +218,8 @@ TEST_CASE("RMM CUDA macro errors preserve fatal status without a last-error prob
     auto check = [&](auto operation) {
       auto error = capture(operation);
       REQUIRE(error);
-      CHECK(sirius::fatal_device_exception(error) == sirius::fatal_cuda_status(status));
+      CHECK(sirius::fatal_device_status(error).value_or(cudaSuccess) ==
+            (sirius::fatal_cuda_status(status) ? status : cudaSuccess));
     };
     check([&] { RMM_CUDA_TRY(status); });
     check([&] { RMM_CUDA_TRY_ALLOC(status); });
@@ -234,13 +234,14 @@ TEST_CASE("CCCL and Thrust failures classify by CUDA status and category", "[dev
                       cudaErrorMemoryAllocation,
                       cudaErrorInvalidValue}) {
     INFO("status=" << static_cast<int>(status));
-    CHECK(sirius::fatal_device_exception(std::make_exception_ptr(::cuda::cuda_error(
-            status, "stream synchronization"))) == sirius::fatal_cuda_status(status));
-    CHECK(sirius::fatal_device_exception(std::make_exception_ptr(
-            thrust::system_error(status, thrust::cuda_category(), "device operation"))) ==
-          sirius::fatal_cuda_status(status));
+    CHECK(sirius::fatal_device_status(
+            std::make_exception_ptr(::cuda::cuda_error(status, "stream synchronization")))
+            .value_or(cudaSuccess) == (sirius::fatal_cuda_status(status) ? status : cudaSuccess));
+    CHECK(sirius::fatal_device_status(std::make_exception_ptr(thrust::system_error(
+                                        status, thrust::cuda_category(), "device operation")))
+            .value_or(cudaSuccess) == (sirius::fatal_cuda_status(status) ? status : cudaSuccess));
     // A matching numeric value and CUDA-looking text in another category prove nothing.
-    CHECK_FALSE(sirius::fatal_device_exception(std::make_exception_ptr(
+    CHECK_FALSE(sirius::fatal_device_status(std::make_exception_ptr(
       thrust::system_error(status, thrust::generic_category(), "cudaErrorIllegalAddress"))));
   }
 }

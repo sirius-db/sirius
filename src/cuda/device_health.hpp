@@ -25,6 +25,7 @@
 #include <thrust/system_error.h>
 
 #include <exception>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -70,15 +71,15 @@ inline void check_cuda_health(cudaError_t status)
 namespace detail {
 // RMM's pinned version does not retain cudaError_t. Decode only its CUDA macro's
 // status field, and only for RMM exception types. Never inspect arbitrary SQL/error text.
-inline bool fatal_rmm_cuda_message(std::string_view message) noexcept
+inline std::optional<cudaError_t> fatal_rmm_cuda_status(std::string_view message) noexcept
 {
   constexpr std::string_view allocation_prefix = "std::bad_alloc: ";
   if (message.starts_with(allocation_prefix)) message.remove_prefix(allocation_prefix.size());
   if (!message.starts_with("CUDA error at: ") &&
       !message.starts_with("CUDA error (failed to allocate "))
-    return false;
+    return std::nullopt;
   auto const status_start = message.rfind(": ");
-  if (status_start == std::string_view::npos) return false;
+  if (status_start == std::string_view::npos) return std::nullopt;
   message.remove_prefix(status_start + 2);
   auto const status_end = message.find(' ');
   auto const name       = message.substr(0, status_end);
@@ -95,33 +96,36 @@ inline bool fatal_rmm_cuda_message(std::string_view message) noexcept
                       cudaErrorECCUncorrectable,
                       cudaErrorContextIsDestroyed,
                       cudaErrorUnknown}) {
-    if (name == cudaGetErrorName(status)) return true;
+    if (name == cudaGetErrorName(status)) return status;
   }
-  return false;
+  return std::nullopt;
 }
 }  // namespace detail
 
-inline bool fatal_device_exception(std::exception_ptr error) noexcept
+// Return the fatal status as well as recognizing it, so health diagnostics never
+// have to recover a code from an arbitrary exception message.
+inline std::optional<cudaError_t> fatal_device_status(std::exception_ptr error) noexcept
 {
+  auto status = cudaSuccess;
   try {
     if (error) std::rethrow_exception(error);
   } catch (fatal_device_error const& e) {
-    return fatal_cuda_status(e.error_code());
+    status = e.error_code();
   } catch (cudf::cuda_error const& e) {
-    return fatal_cuda_status(e.error_code());
+    status = e.error_code();
   } catch (::cuda::cuda_error const& e) {
-    return fatal_cuda_status(static_cast<cudaError_t>(e.status()));
+    status = static_cast<cudaError_t>(e.status());
   } catch (thrust::system_error const& e) {
     // Other backends can reuse the same numeric values; only CUDA codes apply.
-    return e.code().category() == thrust::cuda_category() &&
-           fatal_cuda_status(static_cast<cudaError_t>(e.code().value()));
+    if (e.code().category() == thrust::cuda_category())
+      status = static_cast<cudaError_t>(e.code().value());
   } catch (rmm::cuda_error const& e) {
-    return detail::fatal_rmm_cuda_message(e.what());
+    return detail::fatal_rmm_cuda_status(e.what());
   } catch (rmm::bad_alloc const& e) {
     // RMM_CUDA_TRY_ALLOC also uses bad_alloc for non-OOM CUDA failures.
-    return detail::fatal_rmm_cuda_message(e.what());
+    return detail::fatal_rmm_cuda_status(e.what());
   } catch (...) {
   }
-  return false;
+  return fatal_cuda_status(status) ? std::optional{status} : std::nullopt;
 }
 }  // namespace sirius
