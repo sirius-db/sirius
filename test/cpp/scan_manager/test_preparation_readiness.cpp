@@ -701,11 +701,16 @@ TEST_CASE("Discarded dispatcher captures coalesce nested stop notifications",
              if (next == releases.size()) return {};
              auto token =
                std::make_shared<notify_on_release>(f.coordinator, active, peak, releases[next++]);
-             return preparation_coordinator::job{[token = std::move(token), &work_calls] {
-                                                   ++work_calls;
-                                                   return std::make_unique<tagged>(1);
-                                                 },
-                                                 {}};
+             return preparation_coordinator::job{
+               [token, &work_calls] {
+                 ++work_calls;
+                 return std::make_unique<tagged>(1);
+               },
+               {},
+               [token = std::move(token), &work_calls](std::stop_token) {
+                 ++work_calls;
+                 return std::make_unique<tagged>(1);
+               }};
            });
   f.start();
   auto deadline = std::chrono::steady_clock::now() + 2s;
@@ -769,7 +774,8 @@ TEST_CASE("Preparation cancel retirement and stop bookkeeping allocate no host m
 TEST_CASE("Rejected and abandoned job settlement allocate no host memory",
           "[.][host_allocation_fault][preparation_allocation_fault]")
 {
-  using fault = sirius::test::scoped_host_allocation_fault;
+  auto dual_callbacks = GENERATE(false, true);
+  using fault         = sirius::test::scoped_host_allocation_fault;
   REQUIRE(fault::available());
   enum class path { rejected, abandoned, submission_error };
   auto mode            = GENERATE(path::rejected, path::abandoned, path::submission_error);
@@ -852,7 +858,12 @@ TEST_CASE("Rejected and abandoned job settlement allocate no host memory",
   }
   f.source(std::make_shared<accumulator>(1),
            std::make_shared<sink>(),
-           single_job(std::move(work), std::move(unit)));
+           [claim = single_job(std::move(work), std::move(unit)), dual_callbacks]() mutable {
+             auto job = claim();
+             if (job && dual_callbacks)
+               job->stop_work = [work = job->work](std::stop_token) { return work(); };
+             return job;
+           });
   if (mode == path::submission_error) {
     auto original = std::make_exception_ptr(std::runtime_error("submission failed before enqueue"));
     f.coordinator.before_submission_for_testing([original] { std::rethrow_exception(original); });
@@ -1205,6 +1216,165 @@ TEST_CASE("Publication is refused after cancellation wins during input construct
   CHECK(out->preparations == 0);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
+
+TEST_CASE("Normal EOS does not report worker operation_canceled as a query error",
+          "[scan_preparation][coordinator]")
+{
+  auto gpu_completion = GENERATE(false, true);
+  fixture f;
+  auto out = std::make_shared<sink>();
+  std::promise<void> started;
+  auto ready   = started.get_future();
+  bool claimed = false;
+  f.source(
+    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
+      if (std::exchange(claimed, true)) return {};
+      preparation_coordinator::job job;
+      job.stop_work =
+        [&started](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+        started.set_value();
+        while (!stop.stop_requested())
+          std::this_thread::yield();
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      };
+      return job;
+    });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(ready.wait_for(1s) == std::future_status::ready);
+  if (gpu_completion)
+    f.completion.mark_completed();
+  else
+    f.coordinator.request_stop(stop_reason::normal_eos);
+  f.finish();
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("Stop-aware work takes precedence and releases both callbacks before settlement",
+          "[scan_preparation][coordinator][preparation_cleanup]")
+{
+  fixture f(1, 1);
+  auto out  = std::make_shared<sink>();
+  auto seen = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  std::atomic<bool> checked{false}, released_before_settlement{true}, token_forwarded{false};
+  struct checked_input : tagged {
+    std::function<void()> inspect;
+    explicit checked_input(std::function<void()> inspect) : tagged(1), inspect(std::move(inspect))
+    {
+    }
+    size_t preparation_bytes() const noexcept override
+    {
+      inspect();
+      return 1;
+    }
+  };
+  f.source(std::make_shared<accumulator>(1),
+           out,
+           [&, claimed = false]() mutable -> std::optional<preparation_coordinator::job> {
+             if (std::exchange(claimed, true)) return {};
+             auto capture = [seen] {
+               return std::shared_ptr<int>(new int, [seen](int* value) {
+                 seen->release();
+                 delete value;
+               });
+             };
+             auto legacy = capture(), aware = capture();
+             auto inspect = [&, legacy = std::weak_ptr(legacy), aware = std::weak_ptr(aware)] {
+               if (!legacy.expired() || !aware.expired()) released_before_settlement = false;
+               checked = true;
+             };
+             return preparation_coordinator::job{
+               [legacy = std::move(legacy)]() -> std::unique_ptr<sirius::op::scan::scan_info> {
+                 throw std::runtime_error("legacy callback must not run");
+               },
+               {},
+               [&, aware = std::move(aware), inspect](std::stop_token stop) {
+                 token_forwarded = stop.stop_possible();
+                 return std::make_unique<checked_input>(inspect);
+               }};
+           });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(out->await(1));
+  out->consume();
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  CHECK_FALSE(f.completion.has_error());
+  CHECK(token_forwarded);
+  CHECK(checked);
+  CHECK(released_before_settlement);
+  CHECK(seen->releases == 2);
+  CHECK(seen->outside == 2);
+  CHECK(seen->errors == 0);
+}
+
+TEST_CASE("Worker operation_canceled is not suppressed after user or failure stop",
+          "[scan_preparation][coordinator]")
+{
+  auto reason = GENERATE(stop_reason::user_cancel, stop_reason::failure_induced);
+  CAPTURE(static_cast<int>(reason));
+  fixture f;
+  auto done = f.completion.get_awaitable();
+  auto held = f.make_hold();
+  std::promise<void> started;
+  auto ready = started.get_future();
+  f.source(std::make_shared<accumulator>(1),
+           std::make_shared<sink>(),
+           [&, claimed = false]() mutable -> std::optional<preparation_coordinator::job> {
+             if (std::exchange(claimed, true)) return {};
+             return preparation_coordinator::job{
+               {}, {}, [&](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+                 started.set_value();
+                 while (!stop.stop_requested())
+                   std::this_thread::yield();
+                 held->wait();
+                 throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+               }};
+           });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(ready.wait_for(1s) == std::future_status::ready);
+  f.coordinator.request_stop(reason);
+  REQUIRE(held->await());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  held->release();
+  f.finish();
+  CHECK_FALSE(f.owner_error);
+  REQUIRE(f.completion.has_error());
+  if (reason == stop_reason::user_cancel)
+    CHECK_THROWS_AS(done.get(), duckdb::InterruptException);
+  else
+    CHECK_THROWS_AS(done.get(), std::system_error);
+}
+
+TEST_CASE("Normal EOS still reports a real late worker error", "[scan_preparation][coordinator]")
+{
+  fixture f;
+  auto out = std::make_shared<sink>();
+  std::promise<void> started;
+  auto ready   = started.get_future();
+  bool claimed = false;
+  f.source(
+    std::make_shared<accumulator>(1), out, [&]() -> std::optional<preparation_coordinator::job> {
+      if (std::exchange(claimed, true)) return {};
+      preparation_coordinator::job job;
+      job.stop_work =
+        [&started](std::stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+        started.set_value();
+        while (!stop.stop_requested())
+          std::this_thread::yield();
+        throw std::runtime_error("late worker failure");
+      };
+      return job;
+    });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(ready.wait_for(1s) == std::future_status::ready);
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  f.finish();
+  CHECK(f.completion.has_error());
+}
+
 TEST_CASE("Unresolved typed input forbids scan input construction until the whole unit is ready",
           "[scan_preparation][coordinator]")
 {

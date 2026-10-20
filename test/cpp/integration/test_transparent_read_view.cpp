@@ -7,6 +7,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/main/config.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
@@ -15,7 +16,24 @@
 #include <filesystem>
 #include <string>
 
-using ReadViewFixture = sirius::test::GpuExecutionFixture;
+class ReadViewFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  ReadViewFixture()
+    : original_optimizers(duckdb::DBConfig::GetConfig(*con->context).options.disabled_optimizers)
+  {
+  }
+  ~ReadViewFixture()
+  {
+    // disabled_optimizers is database-global. RESET inside these tests clears
+    // Sirius's load-time mask too; restore it before another fixture borrows
+    // this database, including when an assertion unwinds the test early.
+    duckdb::DBConfig::GetConfig(*con->context).options.disabled_optimizers =
+      std::move(original_optimizers);
+  }
+
+ private:
+  duckdb::set<duckdb::OptimizerType> original_optimizers;
+};
 
 namespace {
 struct read_view_settings_guard {

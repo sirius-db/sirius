@@ -22,6 +22,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <system_error>
 
 namespace sirius::scan_manager {
 struct preparation_coordinator::state {
@@ -68,6 +69,7 @@ struct preparation_coordinator::state {
   size_t jobs = 0, results = 0, output = 0, external = 0;
   size_t next_deadline_source = 0;
   statistics stats;
+  std::optional<stop_reason> stop_requested;
   std::function<void()> before_submit;
   std::function<op::scan::batch_coalescer::clock::time_point()> now =
     op::scan::batch_coalescer::clock::now;
@@ -85,7 +87,7 @@ struct preparation_coordinator::state {
 
   struct job_ticket {
     std::shared_ptr<state> st;
-    std::function<std::unique_ptr<op::scan::scan_info>()> work;
+    job work;
     size_t index = 0;
     bool active = false, completed = false;
     ~job_ticket()
@@ -95,12 +97,13 @@ struct preparation_coordinator::state {
       if (active && !completed) st->abandon(index);
     }
   };
-  void stop() noexcept
+  void stop(stop_reason reason = stop_reason::failure_induced) noexcept
   {
     preparation_gate::callback_use use(gate);
     lock_type lock(gate->mutex);
     // finish() drained accepted callbacks; late notifications need no dispatcher.
     if (phase == lifecycle::quiescent) return;
+    if (!gate->closed) stop_requested = reason;
     gate->closed = true;
     gate->cv.notify_all();
     // A release may notify stop again. One sweep owns cancellation and discarded
@@ -124,6 +127,11 @@ struct preparation_coordinator::state {
     lock.lock();
     stopping = false;
     gate->cv.notify_all();
+  }
+  bool normal_eos_requested() const noexcept
+  {
+    std::lock_guard lock(gate->mutex);
+    return stop_requested == stop_reason::normal_eos;
   }
   void reserve_slot(size_t index, size_t source_id)
   {
@@ -333,8 +341,9 @@ void preparation_coordinator::arm()
       state_->phase = lifecycle::armed;
     }
     std::weak_ptr<state> weak = state_;
-    state_->completion->set_preparation_stop_callback([weak](bool) {
-      if (auto st = weak.lock()) st->stop();
+    state_->completion->set_preparation_stop_callback([weak](bool error) {
+      if (auto st = weak.lock())
+        st->stop(error ? stop_reason::failure_induced : stop_reason::normal_eos);
     });
     std::optional<preparation_failure> existing;
     {
@@ -401,7 +410,7 @@ void preparation_coordinator::request_stop(stop_reason reason) noexcept
       state_->completion->report_error(std::current_exception());
     }
   }
-  state_->stop();
+  state_->stop(reason);
 }
 void preparation_coordinator::drain()
 {
@@ -624,26 +633,37 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
   reserve_slot(index, static_cast<size_t>(source - sources.begin()));
   ticket->active = true;
   lock.unlock();
-  auto work = source->hooks.claim();
-  if (work) {
+  auto claimed = source->hooks.claim();
+  if (claimed) {
     // Workers cannot see this slot until enqueue; source registration is already frozen.
-    slots[index].unit = std::move(work->unit);
-    ticket->work      = std::move(work->work);
+    slots[index].unit = std::move(claimed->unit);
+    ticket->work      = std::move(*claimed);
     if (before_submit) before_submit();
     {
       std::lock_guard check(gate->mutex);
       gate->check_interrupted();
     }
-    dispatcher->enqueue([ticket = std::move(ticket)]() mutable {
+    dispatcher->enqueue([ticket = std::move(ticket)](std::stop_token stop) mutable {
       auto& owner = *ticket->st;
       std::unique_ptr<op::scan::scan_info> value;
       try {
-        value = ticket->work();
+        value = ticket->work.stop_work ? ticket->work.stop_work(stop) : ticket->work.work();
       } catch (...) {
-        owner.completion->report_error(std::current_exception());
-        owner.stop();
+        auto error               = std::current_exception();
+        bool expected_normal_eos = false;
+        try {
+          std::rethrow_exception(error);
+        } catch (std::system_error const& e) {
+          expected_normal_eos =
+            e.code() == std::errc::operation_canceled && owner.normal_eos_requested();
+        } catch (...) {
+        }
+        if (!expected_normal_eos) {
+          owner.completion->report_error(error);
+          owner.stop();
+        }
       }
-      ticket->work      = {};  // Release physical-input captures before the job ticket is returned.
+      ticket->work      = {};  // Release both callbacks before returning the job credit.
       ticket->completed = true;
       owner.settle(ticket->index, std::move(value));
     });

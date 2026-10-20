@@ -75,7 +75,9 @@
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/substrait_scan_ranges.hpp"
 #include "scan_manager/preparation_ledger.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -88,7 +90,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
+#include <set>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -134,6 +138,27 @@ std::vector<std::string> resolve_parquet_scan_file_paths(
 
 namespace {
 std::atomic<uint64_t> next_standalone_plan_generation{1};
+
+std::string_view bare_path(std::string_view path)
+{
+  return path.starts_with("file://") ? path.substr(7) : path;
+}
+
+bool descriptor_targets_selected_file(sirius::op::scan::IcebergDeleteFileEntry const& descriptor,
+                                      std::vector<std::string> const& selected_paths)
+{
+  auto const target = bare_path(descriptor.referenced_data_file);
+  for (auto const& selected : selected_paths) {
+    auto const path = bare_path(selected);
+    if (target == path) return true;
+    auto const longer  = target.size() >= path.size() ? target : path;
+    auto const shorter = target.size() >= path.size() ? path : target;
+    if (!shorter.empty() && longer.ends_with(shorter) && longer.size() > shorter.size() &&
+        longer[longer.size() - shorter.size() - 1] == '/')
+      return true;
+  }
+  return false;
+}
 
 uint64_t reserve_standalone_plan_generation()
 {
@@ -185,8 +210,30 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
-//! Build a `parquet_ingestible_table_info` from a TABLE_SCAN. Destructive: `table_filters`
-//! is moved out of the scan.
+//! Attach the plan-carried byte ranges to the scan's files, claiming each file's ranges from the
+//! per-plan registry. A file keeps ONE entry holding all its ranges: the bound read view requires
+//! one entry per bound file. If the bind kept repeated occurrences of a ranged path, the first
+//! carries the ranges and the repeats own nothing, so no row group is read twice.
+void attach_byte_ranges(sirius::op::scan::parquet_ingestible_table_info& info,
+                        sirius::planner::scan_byte_ranges_state& ranges)
+{
+  // A range of length 0 owns no row group (parquet_byte_range.hpp), and unlike (0,0) it is not a
+  // whole-file read.
+  static constexpr std::pair<std::uint64_t, std::uint64_t> kOwnsNothing{
+    std::numeric_limits<std::uint64_t>::max(), 0};
+  info.resolved_file_ranges.assign(info.resolved_file_paths.size(), {});
+  std::set<std::string> claimed;
+  for (std::size_t i = 0; i < info.resolved_file_paths.size(); ++i) {
+    auto const& path = info.resolved_file_paths[i];
+    if (!ranges.has(path)) { continue; }
+    if (claimed.insert(path).second) {
+      info.resolved_file_ranges[i] = ranges.claim(path);
+    } else {
+      info.resolved_file_ranges[i] = {kOwnsNothing};
+    }
+  }
+}
+
 //! Fill the parquet bind data from a TABLE_SCAN. Split out from
 //! `build_parquet_table_info` so the iceberg path can populate the same fields into its own
 //! subclass — an iceberg table's data files are parquet, so every field here applies unchanged.
@@ -422,13 +469,50 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
   };
   visit(root);
   if (scans.empty()) return;
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) throw duckdb::InternalException("iceberg scan requires a SiriusContext");
+  struct remote_puffin {
+    scan_contract_id contract;
+    std::string path;
+    std::string scheme;
+    bool backend_available;
+  };
+  std::vector<remote_puffin> remote_puffins;
+  auto const& scan_manager   = sirius_ctx->get_scan_manager();
+  auto inspect_remote_puffin = [&](scan_contract_id contract, auto const& dv) {
+    bool remote = false;
+    std::string scheme;
+    try {
+      auto const parsed = sirius::io::parse(dv.file_path);
+      scheme            = parsed.scheme;
+      remote            = parsed.scheme != "file";
+    } catch (std::invalid_argument const&) {
+      // Preserve the legacy handling for bare local paths. A malformed URI
+      // is remote only when it has an explicit scheme marker.
+      remote = dv.file_path.find("://") != std::string::npos;
+    }
+    if (!remote) return;
+    auto const backend           = scan_manager.planning_io_backend(dv.file_path);
+    auto const backend_available = scheme == "s3" && backend.has_value() &&
+                                   (*backend == sirius::io::io_context_type::restful ||
+                                    *backend == sirius::io::io_context_type::kvikio);
+    remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
+  };
   std::vector<scan_dv_count> counts;
   std::vector<scan_envelope> envelopes;
   bool qualified = true;
   for (auto const& c : scans) {
     if (c.discovery->positional_delete_files.empty()) validate_deletion_vector_claims(*c.discovery);
+    // The manifest can carry descriptors for data files pruned from this scan.  Keep only the
+    // descriptors that belong to the final file list so unsupported sidecars cannot reject or
+    // later get opened by an otherwise valid plan.
+    auto& descriptors = c.discovery->deletion_vector_entries;
+    std::erase_if(descriptors, [&](auto const& dv) {
+      return !descriptor_targets_selected_file(dv, c.info->resolved_file_paths);
+    });
     uint64_t total = 0;
-    for (auto const& dv : c.discovery->deletion_vector_entries) {
+    for (auto const& dv : descriptors) {
+      inspect_remote_puffin(c.scan->contract_id, dv);
       if (dv.record_count < 0 ||
           static_cast<uint64_t>(dv.record_count) > std::numeric_limits<uint64_t>::max() - total) {
         qualified = false;
@@ -450,7 +534,15 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       qualified = false;
     }
   }
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (auto const unsupported =
+        std::ranges::find_if(remote_puffins, [](auto const& p) { return !p.backend_available; });
+      unsupported != remote_puffins.end()) {
+    sirius_ctx->record_semantic_decline(verdict_reason::iceberg_puffin_uri_unsupported);
+    throw scan_verdict_declined(
+      "iceberg_scan declines the GPU path: Puffin URI '" + unsupported->path +
+        "' has no planning-capable remote backend",
+      {{unsupported->contract, verdict_reason::iceberg_puffin_uri_unsupported}});
+  }
   host_reservation_provider provider(sirius_ctx->get_memory_manager(),
                                      std::make_shared<decltype(sirius_ctx)>(sirius_ctx));
   auto counters  = sirius_ctx->physical_counters();
@@ -503,11 +595,32 @@ void prepare_iceberg_statement(sirius::op::sirius_physical_operator& root,
       for (auto& c : scans)
         c.info->deferred.reset();
       ledger.reset();
+      // The admission decision is only valid while all deferred arenas exist.
+      // Clear it with the ledger so a remote Puffin cannot fall through to the
+      // eager payload path after a deferred allocation failure.
+      decision = {};
     } catch (std::bad_alloc const&) {
       route_reason = "arena_allocation";
       for (auto& c : scans)
         c.info->deferred.reset();
       ledger.reset();
+      decision = {};
+    }
+  }
+  if (!remote_puffins.empty()) {
+    // Check each remote scan's final route; statement-level admission can leave a
+    // mixed positional/DV statement partly eager.
+    auto const eager_remote = std::ranges::find_if(remote_puffins, [&](auto const& remote) {
+      auto const scan = std::ranges::find_if(scans, [&](auto const& candidate) {
+        return candidate.scan->contract_id == remote.contract;
+      });
+      return scan == scans.end() || !scan->info->deferred;
+    });
+    if (eager_remote != remote_puffins.end()) {
+      sirius_ctx->record_semantic_decline(verdict_reason::iceberg_puffin_remote_eager);
+      throw scan_verdict_declined(
+        "iceberg_scan declines the GPU path: remote Puffin requires deferred preparation",
+        {{eager_remote->contract, verdict_reason::iceberg_puffin_remote_eager}});
     }
   }
   if (counters->track_units && counters->iceberg_statement_route_for_testing)
@@ -1650,6 +1763,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
   // resolved file later, so install the matching secret snapshot for each path before the bind
   // data moves into the GPU ingestible.
   install_parquet_s3_configs(*table_info, context, sirius_ctx.get());
+  // Remote paths never carry ranges here: extract_scan_byte_ranges refuses them.
+  if (auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
+        sirius::planner::scan_byte_ranges_state::kStateKey)) {
+    attach_byte_ranges(*table_info, *byte_ranges);
+  }
   return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
 }
 
@@ -2094,6 +2212,13 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw;
   }
   set_parent_ops(*plan, /*parent=*/nullptr);
+
+  // A plan-carried byte range that no scan consumed would degrade to a whole-file read and
+  // duplicate rows across splits — fail here, before anything executes.
+  if (auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
+        sirius::planner::scan_byte_ranges_state::kStateKey)) {
+    byte_ranges->assert_all_consumed();
+  }
 
   return plan;
 }

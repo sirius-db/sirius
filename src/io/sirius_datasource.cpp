@@ -67,6 +67,7 @@ sirius_datasource::sirius_datasource(std::shared_ptr<ioctx> io_ctx,
                                      std::shared_ptr<io_object> io_obj)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_obj))
 {
+  if (_io_ctx && _io_object) _io_ctx->metadata_store().open_observed(*_io_object);
 }
 
 sirius_datasource::~sirius_datasource() {}
@@ -74,8 +75,7 @@ sirius_datasource::~sirius_datasource() {}
 std::shared_ptr<io_object_metadata> sirius_datasource::metadata() const
 {
   if (!_io_ctx || !_io_object) { return nullptr; }
-  auto& cache = _io_ctx->metadata_store();
-  return cache.get_metadata(*_io_object);
+  return _io_ctx->metadata_store().get_metadata(*_io_object);
 }
 
 [[nodiscard]] bool sirius_datasource::store_metadata(std::shared_ptr<io_object_metadata> metadata)
