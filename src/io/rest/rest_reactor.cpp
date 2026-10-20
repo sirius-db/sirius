@@ -1905,15 +1905,6 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
           request->needs_staging = slice.needs_staging();
           request->logical_bytes = intersect(slice.rng, io_rng).size;
           logical_bytes += request->logical_bytes;
-          if (route_reuse_enabled(_config) && !conditional_tag(file).empty()) {
-            if (auto route = file->route(_ctx)) {
-              request->delegated_url        = *route;
-              request->route_snapshot       = std::move(route);
-              request->route_cached         = true;
-              request->route_started_cached = true;
-              _route_hits.fetch_add(1, std::memory_order_relaxed);
-            }
-          }
           request->op = std::move(op);
           expanded.push_back(std::move(request));
         }
@@ -2014,6 +2005,23 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       slot.started = std::chrono::steady_clock::now();
     };
 
+    // Keep allocating route selection inside the slot's completion/error boundary.
+    auto select_route = [&](rest_io_op_request& request) {
+      if (!route_reuse_enabled(_config) || !request.delegated_url.empty() ||
+          request.route_refreshed || request.attempt != 0 || request.auth_attempt != 0) {
+        return;
+      }
+      auto const* file = dynamic_cast<rest_io_object const*>(request.op->obj.get());
+      if (file == nullptr || conditional_tag(file).empty()) return;
+      if (auto route = file->route(_ctx)) {
+        request.delegated_url        = *route;
+        request.route_snapshot       = std::move(route);
+        request.route_cached         = true;
+        request.route_started_cached = true;
+        _route_hits.fetch_add(1, std::memory_order_relaxed);
+      }
+    };
+
     int running  = 0;
     int inflight = 0;
     auto submit  = [&] {
@@ -2043,6 +2051,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         slot.req         = std::move(request);
         try {
           allocate_staging(*slot.req);
+          select_route(*slot.req);
           setup_easy(slot);
           auto const status = curl_multi_add_handle(multi.get(), slot.easy.get());
           if (status != CURLM_OK) {

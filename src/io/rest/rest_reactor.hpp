@@ -433,7 +433,7 @@ class rest_reactor {
   struct redirect_counters {
     std::uint64_t followed{0};
     std::uint64_t refused{0};
-    /// Route publications, cached-route selections at request construction, and
+    /// Route publications, cached-route selections at first submission, and
     /// refresh decisions admitted by the operation budget. These independent
     /// observations do not prove wire submission or completion.
     std::uint64_t route_seeds{0};
