@@ -37,11 +37,12 @@
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
 #include "exec/arrow_result_stream.hpp"
-#include "exec/exchange_inbox.hpp"            // sirius::exec::exchange_inbox
-#include "exec/exchange_ring_ends.hpp"        // sirius::exec::ring_exchange
-#include "exec/stream_bind_catalog.hpp"       // sirius::exec::stream_bind_catalog
-#include "exec/stream_plan_bindings.hpp"      // sirius::exec::register_stream_source_function
-#include "exec/streaming_fragment.hpp"        // sirius::exec::streaming_fragment, fragment_spec
+#include "exec/exchange_inbox.hpp"        // sirius::exec::exchange_inbox
+#include "exec/exchange_ring_ends.hpp"    // sirius::exec::ring_exchange
+#include "exec/stream_bind_catalog.hpp"   // sirius::exec::stream_bind_catalog
+#include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
+#include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
+#include "expression/decimal_divide_function.hpp"  // sirius::register_decimal_divide_function
 #include "from_substrait.hpp"                 // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"        // sirius::from_duckdb
 #include "log/logging.hpp"                    // SIRIUS_LOG_INFO
@@ -412,6 +413,8 @@ struct Context::Impl {
       auto& catalog    = duckdb::Catalog::GetSystemCatalog(*db->instance);
       duckdb::SiriusRegistration::RegisterPinTableFunctions(transaction, catalog);
     }
+    // Fragment plans compute DECIMAL `/` and AVG with sirius_decimal_divide().
+    sirius::register_decimal_divide_function(*db->instance);
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);

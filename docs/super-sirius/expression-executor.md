@@ -305,6 +305,28 @@ with `cudf::contains` whether the input holds that value and throws. The query t
 CPU, which raises DuckDB's error. Unsigned integers have no such value and are returned as they are.
 HUGEINT falls back at plan time.
 
+### Exact decimal division
+
+DuckDB's `/` on DECIMAL returns DOUBLE, and cuDF's fixed-point DIV truncates. Sirius registers its
+own scalar function, `sirius_decimal_divide(dividend, divisor, result_scale)`
+(`src/expression/decimal_divide_function.cpp`), for the StarRocks compute node's DECIMAL `/` and AVG:
+
+- The operands are DECIMAL or integer values; `result_scale` is an integer constant from 0 to 38.
+  The bind returns `DECIMAL(38, result_scale)` and casts the operands so they are 32-, 64- or
+  128-bit (narrow integers to INTEGER, DECIMAL of precision 4 or less to precision 9).
+- The quotient is exact and rounded half away from zero. The dividend is scaled by
+  `10^(result_scale + divisor scale - dividend scale)` in 256 bits, so it never overflows where the
+  quotient fits.
+- A NULL operand or a zero divisor gives NULL. A quotient that needs more than 38 digits raises an
+  error: DuckDB's `OutOfRangeException` on the CPU, `sirius::invalid_input_exception` on the GPU.
+  The GPU call synchronizes its stream to read the null and overflow counts.
+
+The GPU dispatches it as `function_id::decimal_divide` to `sirius::decimal_divide()`
+(`src/cuda/decimal_divide.cu`), one row per thread, with the validity mask built from warp ballots.
+The CPU function and the kernel share the arithmetic in `src/helper/decimal_divide.hpp`. Both the
+extension and the FFI's embedded DuckDB register the function, so Substrait plans resolve it by
+name. The SQL tests are tagged `[decimal_divide]`.
+
 ### Logical AND/OR NULL semantics
 
 SQL `AND`/`OR` use Kleene three-valued logic (`TRUE OR NULL = TRUE`, `FALSE AND NULL = FALSE`), so conjunctions map to cuDF's Kleene operators — `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR` as AST operators and `cudf::binary_operator::NULL_LOGICAL_*` on the materialize path — never the null-propagating `LOGICAL_*` variants. The plain `LOGICAL_AND` still appears for internal structural conjunctions where operands cannot be NULL, such as the BETWEEN lowering and the AND that combines multi-condition join predicates.
