@@ -86,6 +86,11 @@ Rules of thumb:
   `scan_task_batch_size` of the *pinned subset*, so a narrow pin concentrates a column's
   chars in each batch.
 
+With nvCOMP 6, `nvcomp_cascaded` plans are unavailable because the old configurable Cascaded
+options were removed. ANS payloads also changed format: files containing nvCOMP 6 ANS use
+`.hpln` version 13, while other files retain version 12. ANS payloads from nvCOMP 5 and 6
+cannot be decoded interchangeably; incompatible files and frame markers are rejected.
+
 ## Filtering while decompressing (experimental)
 
 A scan can hand its row filter to the decompressor instead of evaluating it afterwards. Where
