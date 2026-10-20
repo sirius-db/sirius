@@ -1579,6 +1579,218 @@ TEST_CASE("dynamic_filter_gate serializes concurrent stale and re-armed decision
   REQUIRE(all_stayed_active);
 }
 
+TEST_CASE("an undecided consumer attaches decode probes and asks the decode to measure them",
+          "[dynamic_filter][scan_merge][decode_gate]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto filters              = std::make_shared<sirius_dynamic_filter_set>();
+  std::vector<binding> const bindings{{0, 0}};
+  dynamic_filter_consumer consumer(filters, {}, bindings);
+  auto& gate     = consumer_test_access::gate(consumer);
+  auto producer  = filters->register_producer({0});
+  auto selective = make_in_list_prefix(2, stream);
+  REQUIRE(producer.push_filter(0, selective));
+
+  // Before any measurement, decode applies the filter instead of leaving every batch decoded before
+  // the first endpoint sample unfiltered.
+  REQUIRE(gate_test_access::needs_combined_sample(gate, filters->snapshot()));
+  REQUIRE(gate_test_access::decode_trains(gate, filters->snapshot()));
+  auto const selection = consumer.select_for_decode(bindings);
+  REQUIRE(selection.steps.size() == 1);
+  REQUIRE(selection.steps.front().representative.filter == selective);
+  REQUIRE(selection.generation == 1);
+  REQUIRE(selection.measure);
+  REQUIRE(selection.complete);
+
+  SECTION("a filter the decode cannot apply makes the selection incomplete")
+  {
+    REQUIRE(producer.push_filter(0, make_zone_map(0, 10)));
+    auto const mixed = consumer.select_for_decode(bindings);
+    REQUIRE(mixed.steps.size() == 1);
+    REQUIRE(mixed.measure);
+    REQUIRE_FALSE(mixed.complete);
+  }
+  SECTION("a filter on a column the decoder does not produce makes the selection incomplete")
+  {
+    auto other_column = filters->register_producer({1});
+    REQUIRE(other_column.push_filter(1, make_in_list_prefix(2, stream)));
+    auto const partial = consumer.select_for_decode(bindings);
+    REQUIRE(partial.steps.size() == 1);
+    REQUIRE(partial.measure);
+    REQUIRE_FALSE(partial.complete);
+  }
+}
+
+TEST_CASE("a selective decode measurement activates the gate",
+          "[dynamic_filter][scan_merge][decode_gate]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto filters              = std::make_shared<sirius_dynamic_filter_set>();
+  std::vector<binding> const bindings{{0, 0}};
+  dynamic_filter_consumer consumer(filters, {}, bindings);
+  auto& gate    = consumer_test_access::gate(consumer);
+  auto producer = filters->register_producer({0});
+  REQUIRE(producer.push_filter(0, make_in_list_prefix(2, stream)));
+
+  // Even a decode that applied only some of the filters proves the whole set selective.
+  auto const complete = GENERATE(false, true);
+  consumer.record_decode_keep_ratio(/*rows_before=*/100, /*rows_after=*/20, 1, complete);
+
+  REQUIRE(gate_test_access::applicable(gate, filters->snapshot()));
+  REQUIRE_FALSE(gate_test_access::needs_combined_sample(gate, filters->snapshot()));
+  REQUIRE_FALSE(gate_test_access::decode_trains(gate, filters->snapshot()));
+  auto const selection = consumer.select_for_decode(bindings);
+  REQUIRE(selection.steps.size() == 1);
+  REQUIRE_FALSE(selection.measure);
+
+  // An active gate is final: a later unselective report, measured or not, changes nothing.
+  consumer.record_decode_keep_ratio(100, 100, 1, true);
+  consumer.record_unmeasured_decode();
+  REQUIRE_FALSE(gate_test_access::needs_combined_sample(gate, filters->snapshot()));
+  REQUIRE(consumer.select_for_decode(bindings).steps.size() == 1);
+}
+
+TEST_CASE("a complete unselective decode measurement disables the filters",
+          "[dynamic_filter][scan_merge][decode_gate]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto filters              = std::make_shared<sirius_dynamic_filter_set>();
+  std::vector<binding> const bindings{{0, 0}};
+  dynamic_filter_consumer consumer(filters, {}, bindings);
+  auto& gate    = consumer_test_access::gate(consumer);
+  auto producer = filters->register_producer({0});
+  REQUIRE(producer.push_filter(0, make_in_list_prefix(10, stream)));
+
+  consumer.record_decode_keep_ratio(/*rows_before=*/100, /*rows_after=*/95, 1, /*complete=*/true);
+
+  REQUIRE_FALSE(gate_test_access::applicable(gate, filters->snapshot()));
+  REQUIRE(consumer.select_for_decode(bindings).steps.empty());
+  std::shared_ptr<cudf::table> table = make_int64_sequence_table(10, stream);
+  REQUIRE(apply_consumer(consumer, table, stream) == nullptr);
+
+  // A new filter reopens the gate for a clean endpoint sample, not for another decode measurement.
+  REQUIRE(producer.push_filter(0, make_in_list_prefix(2, stream)));
+  REQUIRE(gate_test_access::applicable(gate, filters->snapshot()));
+  REQUIRE(gate_test_access::needs_combined_sample(gate, filters->snapshot()));
+  REQUIRE_FALSE(gate_test_access::decode_trains(gate, filters->snapshot()));
+  REQUIRE(consumer.select_for_decode(bindings).steps.empty());
+}
+
+TEST_CASE("an inconclusive decode leaves the decision to a clean endpoint sample",
+          "[dynamic_filter][scan_merge][decode_gate]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto filters              = std::make_shared<sirius_dynamic_filter_set>();
+  std::vector<binding> const bindings{{0, 0}};
+  dynamic_filter_consumer consumer(filters, {}, bindings);
+  auto& gate    = consumer_test_access::gate(consumer);
+  auto producer = filters->register_producer({0});
+  REQUIRE(producer.push_filter(0, make_in_list_prefix(2, stream)));
+
+  SECTION("an unselective measurement of part of the filters")
+  {
+    consumer.record_decode_keep_ratio(100, 95, 1, /*complete=*/false);
+  }
+  SECTION("a decode that measured nothing") { consumer.record_unmeasured_decode(); }
+
+  // Still undecided, but decodes stop attaching so that the endpoint sees a clean batch.
+  REQUIRE(gate_test_access::applicable(gate, filters->snapshot()));
+  REQUIRE(gate_test_access::needs_combined_sample(gate, filters->snapshot()));
+  REQUIRE_FALSE(gate_test_access::decode_trains(gate, filters->snapshot()));
+  REQUIRE(consumer.select_for_decode(bindings).steps.empty());
+
+  // The scan's receipt shows that decode attached nothing to this batch, so the endpoint samples.
+  std::shared_ptr<cudf::table> table = make_int64_sequence_table(10, stream);
+  batch_receipt const clean{filters, 0, {}, {}};
+  auto const identity = sirius::op::scan::identity_bindings(1);
+  auto program = consumer.prepare({.source = table->view(), .bindings = identity, .prior = &clean});
+  REQUIRE(program.has_value());
+  auto result = consumer_test_access::apply(consumer,
+                                            std::move(*program),
+                                            std::shared_ptr<cudf::table const>(table),
+                                            stream,
+                                            cudf::get_current_device_resource_ref());
+  auto out    = result.take_output();
+  static_cast<void>(consumer.finish(std::move(result), 0));
+  stream.sync();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 2);
+  REQUIRE_FALSE(gate_test_access::needs_combined_sample(gate, filters->snapshot()));
+  auto const selection = consumer.select_for_decode(bindings);
+  REQUIRE(selection.steps.size() == 1);
+  REQUIRE_FALSE(selection.measure);
+}
+
+TEST_CASE("concurrent decode measurements settle the gate exactly once",
+          "[dynamic_filter][scan_merge][decode_gate][concurrent]")
+{
+  // Batches decoded concurrently all start from an undecided gate and report at about the same
+  // time, while other tasks keep selecting. The first conclusive report decides; later reports
+  // must neither change that verdict nor leave the gate undecided.
+  sirius_dynamic_filter_set filters;
+  auto filters_producer = filters.register_producer({0});
+  REQUIRE(filters_producer.push_filter(0, std::make_shared<stub_runtime_only_filter>()));
+
+  constexpr std::size_t rounds        = 256;
+  constexpr std::size_t reporters     = 6;
+  constexpr std::size_t readers       = 2;
+  constexpr std::size_t total_workers = reporters + readers;
+  std::vector<std::unique_ptr<sirius::op::scan::dynamic_filter_gate>> gates;
+  gates.reserve(rounds);
+  for (std::size_t i = 0; i < rounds; ++i) {
+    gates.push_back(std::make_unique<sirius::op::scan::dynamic_filter_gate>());
+  }
+
+  std::barrier phase{static_cast<std::ptrdiff_t>(total_workers + 1)};
+  std::vector<std::thread> workers;
+  workers.reserve(total_workers);
+  for (std::size_t worker_idx = 0; worker_idx < reporters; ++worker_idx) {
+    workers.emplace_back([&, worker_idx] {
+      for (auto const& gate : gates) {
+        phase.arrive_and_wait();
+        switch (worker_idx % 3) {
+          case 0: gate->record_decode_keep_ratio(100, 10, 1, /*complete=*/false); break;
+          case 1: gate->record_decode_keep_ratio(100, 100, 1, /*complete=*/true); break;
+          default: gate->record_unmeasured_decode(); break;
+        }
+        phase.arrive_and_wait();
+      }
+    });
+  }
+  for (std::size_t worker_idx = 0; worker_idx < readers; ++worker_idx) {
+    workers.emplace_back([&] {
+      for (auto const& gate : gates) {
+        phase.arrive_and_wait();
+        static_cast<void>(gate_test_access::decode_trains(*gate, filters.snapshot()));
+        phase.arrive_and_wait();
+      }
+    });
+  }
+
+  bool all_settled = true;
+  for (auto const& gate : gates) {
+    phase.arrive_and_wait();
+    phase.arrive_and_wait();
+    auto const active = gate_test_access::applicable(*gate, filters.snapshot()) &&
+                        !gate_test_access::needs_combined_sample(*gate, filters.snapshot());
+    auto const disabled = !gate_test_access::applicable(*gate, filters.snapshot());
+    // An unmeasured report may arrive first, but the conclusive reports of the same round still
+    // decide an undecided gate.
+    all_settled = all_settled && (active || disabled);
+    // Whatever was decided stays decided.
+    gate->record_decode_keep_ratio(100, active ? 100 : 10, 1, true);
+    gate->record_unmeasured_decode();
+    all_settled = all_settled &&
+                  active == (gate_test_access::applicable(*gate, filters.snapshot()) &&
+                             !gate_test_access::needs_combined_sample(*gate, filters.snapshot()));
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+
+  REQUIRE(all_settled);
+}
+
 TEST_CASE("cascaded membership filters produce the conjunction of all filters",
           "[dynamic_filter][scan_merge]")
 {
@@ -2429,7 +2641,10 @@ TEST_CASE("consumer decode alias history suppresses attached sampling but permit
   REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {attached.get(), 1}, 3));
   REQUIRE(gate_test_access::filter_keep_ratio(gate, {fresh.get(), 0}, 3) == Approx(0.25));
   REQUIRE(gate_test_access::needs_combined_sample(gate, channel->snapshot()));
-  REQUIRE(consumer.select_for_decode(bindings).steps.empty());
+  // Still undecided, so decode keeps applying the filters and measuring them.
+  auto const undecided = consumer.select_for_decode(bindings);
+  REQUIRE_FALSE(undecided.steps.empty());
+  REQUIRE(undecided.measure);
 }
 
 TEST_CASE("consumer with decode bindings filters but does not train on input of unknown history",
@@ -2502,7 +2717,7 @@ TEST_CASE("consumer isolates binding ratios and subtracts proven aliases only",
   REQUIRE_FALSE(consumer.prepare({input->view(), aliases, std::nullopt, &receipt}));
 }
 
-TEST_CASE("consumer destruction does not commit and clean decode opportunity persists",
+TEST_CASE("consumer destruction does not commit and the gate stays undecided",
           "[dynamic_filter][scan_merge][consumer_commit]")
 {
   ::cuda::stream_ref stream                = cudf::get_default_stream();
@@ -2520,12 +2735,15 @@ TEST_CASE("consumer destruction does not commit and clean decode opportunity per
   auto& gate = consumer_test_access::gate(consumer);
   REQUIRE(gate_test_access::needs_combined_sample(gate, channel->snapshot()));
   REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {filter.get(), 0}, 1));
-  auto clean = consumer.select_for_decode(bindings);
-  REQUIRE(clean.generation == 1);
-  REQUIRE(clean.steps.empty());
+  auto undecided = consumer.select_for_decode(bindings);
+  REQUIRE(undecided.generation == 1);
+  REQUIRE(undecided.steps.size() == 1);
+  REQUIRE(undecided.measure);
   auto result = run_owned(consumer, input, bindings, stream);
   (void)consumer.finish(std::move(result), 1);
-  REQUIRE(consumer.select_for_decode(bindings).steps.size() == 1);
+  auto const decided = consumer.select_for_decode(bindings);
+  REQUIRE(decided.steps.size() == 1);
+  REQUIRE_FALSE(decided.measure);
   REQUIRE_FALSE(consumer.prepare({input->view(), {}}));
   auto empty = make_int64_sequence_table(0, stream);
   REQUIRE_FALSE(consumer.prepare({empty->view(), bindings}));

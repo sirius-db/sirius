@@ -69,7 +69,8 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
                                                std::size_t n_slots)
 {
   membership_snapshot snap;
-  snap.generation = selection.generation;
+  snap.generation  = selection.generation;
+  snap.measurement = {.measure = selection.measure, .complete = selection.complete};
   snap.probes.resize(n_slots);
   for (std::size_t order = 0; order < selection.steps.size(); ++order) {
     auto const& step       = selection.steps[order];
@@ -126,8 +127,9 @@ std::optional<detail::membership_refresh> detail::refresh_membership_probes(
     current
       ? current
       : std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
-  return membership_refresh{base->with_membership_probes(std::move(snap.probes), snap.generation),
-                            std::move(snap.attached)};
+  return membership_refresh{
+    base->with_membership_probes(std::move(snap.probes), snap.generation, snap.measurement),
+    std::move(snap.attached)};
 }
 
 scan_operator_input::scan_operator_input(
@@ -381,6 +383,7 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
   }
   auto const* decoded =
     dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(data);
+  report_membership_keep(decoded ? decoded->outcome().membership_keep : std::nullopt);
   if (decoded == nullptr) { return; }
   // The converter reports what the decode did as a value on the representation. row_filtered
   // means the whole table-filter conjunction was applied and every column is compacted to the
@@ -416,6 +419,22 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
       "incompatible with an unconsumed mvcc keep-mask; the attach must compose the "
       "visibility mask on masked chunks");
   }
+}
+
+void scan_operator_input::report_membership_keep(
+  std::optional<pushdown_outcome::membership_keep_observation> const& observation) const noexcept
+{
+  // Only a decode that carried this consumer's probes has anything to report. The consumer ignores
+  // reports once it has decided, so a decode selected after the decision reports harmlessly.
+  if (!consumer || decode_attached.empty()) { return; }
+  if (!observation) {
+    consumer->record_unmeasured_decode();
+    return;
+  }
+  consumer->record_decode_keep_ratio(observation->rows_before,
+                                     observation->rows_after,
+                                     static_cast<std::size_t>(observation->generation),
+                                     observation->complete);
 }
 
 std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converted_table(

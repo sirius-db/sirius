@@ -623,7 +623,15 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // tightened mask. A declining probe leaves `combined` untouched, the AND identity. The scratch
     // strip is written and read only on s0, so its stream-ordered free cannot race a reader.
     std::optional<decode_session> cascade;
+    // Rows the membership probes are evaluated on: every row when they are the only sources,
+    // otherwise the survivors of the other sources, counted before the cascade narrows them.
+    int64_t membership_rows_in = num_rows;
     if (sequential_membership) {
+      if (request.measure_membership) {
+        sc::selection_mask before_membership{
+          combined, num_rows, -1, static_cast<std::uint32_t*>(result.chunk_offsets.data())};
+        membership_rows_in = sc::run_selection_cnt(before_membership, s0, mr);
+      }
       cascade.emplace(std::span{&s0, 1}, mr);
       rmm::device_buffer membership_scratch(mask_bytes, s0, mr);
       auto* member_words = static_cast<std::uint32_t*>(membership_scratch.data());
@@ -677,6 +685,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     bool8_full = wave1.finish();
     if (cascade) (void)cascade->finish();
     result.survivor_count = sel.survivor_count;
+    if (request.measure_membership && declined_members < k_member) {
+      result.membership_rows_in        = membership_rows_in;
+      result.membership_rows_out       = sel.survivor_count;
+      result.membership_probes_applied = k_member - declined_members;
+    }
     per_filter.clear();
     keep_mask_dev = rmm::device_buffer{};  // combine consumed it; CNT synced s0
 
@@ -721,7 +734,15 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                      static_cast<long long>(sel.survivor_count),
                      static_cast<long long>(num_rows));
       }
+      // The membership measurement stays valid: the probes ran on every row before the decode gave
+      // compaction up.
+      auto const measured_rows_in  = result.membership_rows_in;
+      auto const measured_rows_out = result.membership_rows_out;
+      auto const measured_probes   = result.membership_probes_applied;
       reset_result(sc::scan_filter_status::declined_unselective);
+      result.membership_rows_in        = measured_rows_in;
+      result.membership_rows_out       = measured_rows_out;
+      result.membership_probes_applied = measured_probes;
       return std::nullopt;
     }
 

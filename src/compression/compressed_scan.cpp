@@ -326,6 +326,17 @@ constexpr std::size_t kMaxSelectionSources = 8;
 /// scan's residual filter reads a boolean instead of re-comparing strings.
 ///
 /// @p keep_mask is one additional AND source, keeping a masked chunk compactable.
+/// Every membership probe the request carries, including any on columns past the decode's
+/// selection.
+std::size_t requested_membership_probes(pushdown_request const& request) noexcept
+{
+  std::size_t count = 0;
+  for (auto const& column : request.columns) {
+    count += column.membership.size();
+  }
+  return count;
+}
+
 std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_table const& chunk,
                                                       std::span<const std::size_t> selected,
                                                       pushdown_request const& request,
@@ -407,7 +418,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   }
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decompression-pushdown] wave-1 sources, ascending expected keep:{}", order_echo);
-  wave_request.source_generation = request.membership_generation;
+  wave_request.source_generation  = request.membership_generation;
+  wave_request.measure_membership = request.membership_measurement.measure;
   // Safe as a raw pointer: the source representation owns the words, and
   // decompress_scan_filter synchronizes on every return path.
   if (keep_mask.has_mask()) {
@@ -445,6 +457,24 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   // predicated rerun, which drops no rows.
   outcome.predicates_enforced     = result.applied && !wave_request.bool8_filters.empty();
   outcome.visibility_mask_applied = result.keep_mask_applied;
+  if (result.membership_rows_in >= 0 && result.membership_rows_out >= 0) {
+    // A probe the decoder capped or declined did not filter these rows, so the ratio describes
+    // the whole requested set only when every probe ran.
+    outcome.membership_keep = pushdown_outcome::membership_keep_observation{
+      .generation  = request.membership_generation,
+      .rows_before = static_cast<std::size_t>(result.membership_rows_in),
+      .rows_after  = static_cast<std::size_t>(result.membership_rows_out),
+      .complete    = request.membership_measurement.complete &&
+                  result.membership_probes_applied == wave_request.membership_filters.size() &&
+                  wave_request.membership_filters.size() == requested_membership_probes(request)};
+    SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+      "[decompression-pushdown] join filters kept {}/{} rows ({} of {} probe(s) ran, complete={})",
+      outcome.membership_keep->rows_after,
+      outcome.membership_keep->rows_before,
+      result.membership_probes_applied,
+      requested_membership_probes(request),
+      outcome.membership_keep->complete);
+  }
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decompression-pushdown] decode {} (status={} generation={}): ranges={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
@@ -486,7 +516,9 @@ decompression_pushdown_scan::without_row_selection() const
 
 std::shared_ptr<const decompression_pushdown_scan>
 decompression_pushdown_scan::with_membership_probes(
-  std::vector<std::vector<membership_probe>> probes, std::uint64_t generation) const
+  std::vector<std::vector<membership_probe>> probes,
+  std::uint64_t generation,
+  membership_measurement_request measurement) const
 {
   auto refreshed = _request;
   if (refreshed.columns.size() < probes.size()) { refreshed.columns.resize(probes.size()); }
@@ -494,7 +526,8 @@ decompression_pushdown_scan::with_membership_probes(
     refreshed.columns[i].membership =
       i < probes.size() ? std::move(probes[i]) : std::vector<membership_probe>{};
   }
-  refreshed.membership_generation = generation;
+  refreshed.membership_generation  = generation;
+  refreshed.membership_measurement = measurement;
   return std::make_shared<const decompression_pushdown_scan>(std::move(refreshed));
 }
 

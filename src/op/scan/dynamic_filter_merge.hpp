@@ -156,6 +156,12 @@ struct decode_selection {
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set const> endpoint;
   std::size_t generation = 0;
   std::vector<decode_step> steps;  ///< The preferred probe order for this decode request.
+  /// The consumer has not yet decided whether these filters are worth applying, and the decode
+  /// should report what they kept (`dynamic_filter_consumer::record_decode_keep_ratio`).
+  bool measure = false;
+  /// The steps cover every filter of the snapshot, so a measurement that covers every step
+  /// describes them all.
+  bool complete = false;
 };
 
 namespace detail {
@@ -256,8 +262,34 @@ class dynamic_filter_consumer {
    * Steps are ordered by measured keep ratio. Filters with equal or unknown ratios follow the
    * `sirius::membership_probe` static signal (small IN-list, hash IN-list, then Bloom; fewer build
    * keys first), then snapshot order.
+   *
+   * Before the consumer has measured whether its filters are selective, it optimistically selects
+   * them and asks the decode to measure them (`decode_selection::measure`). The selection is empty
+   * once the filters have proven unselective, and also while the consumer waits for a clean
+   * batch at the endpoint because a decode could not measure them.
    */
   [[nodiscard]] decode_selection select_for_decode(std::span<binding const> bindings) const;
+
+  /**
+   * @brief Reports what the filters of a measuring decode selection kept.
+   *
+   * @param rows_before Rows the filters were evaluated on
+   * @param rows_after Rows that every filter which ran kept
+   * @param generation `decode_selection::generation` of the selection
+   * @param complete Every filter of a complete selection (`decode_selection::complete`) ran
+   */
+  void record_decode_keep_ratio(std::size_t rows_before,
+                                std::size_t rows_after,
+                                std::size_t generation,
+                                bool complete) noexcept;
+
+  /**
+   * @brief Reports that a decode which carried filters from this consumer measured nothing.
+   *
+   * If the consumer was still measuring, later decodes attach no filters until a clean batch at
+   * the endpoint has been measured.
+   */
+  void record_unmeasured_decode() noexcept;
 
   /**
    * @brief Capture available filters and policy decisions for this attempt in an application

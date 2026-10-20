@@ -1036,7 +1036,12 @@ decode_selection dynamic_filter_consumer::select_for_decode(std::span<binding co
   gate_selection selection{};
   auto candidates = capture_candidates(snapshot, _gate, bindings, selection);
   decode_selection result{_channel, snapshot.generation(), {}};
-  if (!selection.applicable || selection.needs_combined_sample) { return result; }
+  // An undecided gate lets the decode apply the filters and measure them; waiting for a clean
+  // endpoint sample instead would leave every batch decoded before that sample unfiltered.
+  if (!selection.applicable || (selection.needs_combined_sample && !selection.decode_trains)) {
+    return result;
+  }
+  auto const bound_entries = candidates.size();
   for (auto& current : candidates) {
     current.prior = static_selectivity_of(*current.identity.filter);
   }
@@ -1046,6 +1051,10 @@ decode_selection dynamic_filter_consumer::select_for_decode(std::span<binding co
              current.identity.filter.get()) ||
            (current.expected_keep && skip_measured_filter(*current.expected_keep, std::nullopt));
   });
+  if (candidates.empty()) { return result; }
+  result.measure  = selection.decode_trains;
+  result.complete = selection.decode_trains && bound_entries == snapshot.entries().size() &&
+                    candidates.size() == bound_entries;
   // Sorting first makes each group's first member its preferred representative.
   for (auto const& aliases : group_aliases(candidates)) {
     decode_step step{aliases.front()->identity, aliases.front()->column_index, {}};
@@ -1056,6 +1065,19 @@ decode_selection dynamic_filter_consumer::select_for_decode(std::span<binding co
     result.steps.push_back(std::move(step));
   }
   return result;
+}
+
+void dynamic_filter_consumer::record_decode_keep_ratio(std::size_t rows_before,
+                                                       std::size_t rows_after,
+                                                       std::size_t generation,
+                                                       bool complete) noexcept
+{
+  _gate.record_decode_keep_ratio(rows_before, rows_after, generation, complete);
+}
+
+void dynamic_filter_consumer::record_unmeasured_decode() noexcept
+{
+  _gate.record_unmeasured_decode();
 }
 
 std::optional<application_program> dynamic_filter_consumer::prepare(
@@ -1374,7 +1396,45 @@ gate_selection dynamic_filter_gate::capture(sirius::op::dynamic_filter_snapshot 
   for (std::size_t i = 0; i < keys.size(); ++i) {
     estimates[i] = current_keep_ratio(keys[i], filters.generation());
   }
-  return {applicable, applicable && current != state::ACTIVE};
+  return {
+    applicable,
+    applicable && current != state::ACTIVE,
+    applicable && current == state::UNKNOWN && !_decode_undecided.load(std::memory_order_relaxed)};
+}
+
+void dynamic_filter_gate::record_decode_keep_ratio(std::size_t rows_before,
+                                                   std::size_t rows_after,
+                                                   std::size_t observed_filter_count,
+                                                   bool complete) noexcept
+{
+  if (rows_before == 0 || rows_after > rows_before) { return; }
+  try {
+    std::scoped_lock decision_lock(_decision_mu);
+    if (_state.load(std::memory_order_relaxed) != state::UNKNOWN) { return; }
+    auto const kept = static_cast<double>(rows_after) / static_cast<double>(rows_before);
+    if (kept <= _keep_threshold || complete) {
+      _decided_filter_count.store(observed_filter_count, std::memory_order_relaxed);
+      _state.store(kept > _keep_threshold ? state::DISABLED : state::ACTIVE,
+                   std::memory_order_relaxed);
+    } else {
+      // The filters the decode skipped might still be selective.
+      _decode_undecided.store(true, std::memory_order_relaxed);
+    }
+  } catch (...) {
+    // Failure to acquire optional decision state leaves its previous verdict intact.
+  }
+}
+
+void dynamic_filter_gate::record_unmeasured_decode() noexcept
+{
+  try {
+    std::scoped_lock decision_lock(_decision_mu);
+    if (_state.load(std::memory_order_relaxed) == state::UNKNOWN) {
+      _decode_undecided.store(true, std::memory_order_relaxed);
+    }
+  } catch (...) {
+    // Failure to acquire optional decision state leaves its previous verdict intact.
+  }
 }
 
 void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
@@ -1409,6 +1469,12 @@ bool detail::gate_test_access::needs_combined_sample(
   dynamic_filter_gate const& gate, sirius::op::dynamic_filter_snapshot const& filters)
 {
   return gate.capture(filters, {}, {}).needs_combined_sample;
+}
+
+bool detail::gate_test_access::decode_trains(dynamic_filter_gate const& gate,
+                                             sirius::op::dynamic_filter_snapshot const& filters)
+{
+  return gate.capture(filters, {}, {}).decode_trains;
 }
 
 std::optional<double> detail::gate_test_access::filter_keep_ratio(dynamic_filter_gate const& gate,

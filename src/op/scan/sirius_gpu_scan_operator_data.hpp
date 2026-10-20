@@ -66,6 +66,9 @@ struct membership_snapshot {
     probes;                      ///< Parallel to selected slots; closures retain filters.
   std::uint64_t generation = 0;  ///< Channel generation captured with these probes.
   std::vector<applied_entry> attached;
+  /// Whether the decode reports the probes' keep ratio (`decode_selection::measure` and
+  /// `decode_selection::complete`).
+  sirius::membership_measurement_request measurement;
 };
 
 /**
@@ -399,6 +402,11 @@ class scan_operator_input : public op::operator_data {
   ///
   /// @throws std::runtime_error if the decode compacted rows but left an mvcc keep-mask unconsumed.
   void record_decode_outcome(::cucascade::idata_representation const* data);
+
+  /// Reports the keep ratio a decode measured for the membership probes attached from `consumer`,
+  /// or that it measured nothing, so an undecided consumer can decide without a clean batch.
+  void report_membership_keep(
+    std::optional<pushdown_outcome::membership_keep_observation> const& observation) const noexcept;
 
   /// Whether the input has already been decoded for a retry (preserve dynamic filter history)
   bool _decoded_input_reused{false};

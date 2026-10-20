@@ -199,6 +199,10 @@ struct scan_filter_request {
   // non-applied return holds every selected column. Execution failures throw without publishing
   // output.
   std::optional<std::size_t> delivered_prefix;
+  // Report how many rows the membership probes kept (scan_filter_result::membership_rows_*). When
+  // the batch also has a range, BOOL8 or keep-mask source, this costs one extra survivor count, so
+  // callers ask only while they still need the measurement.
+  bool measure_membership = false;
 };
 
 // Outcome of a decompress_scan_filter call. `declined_unselective` is worth remembering
@@ -230,6 +234,13 @@ struct scan_filter_result {
   rmm::device_buffer chunk_offsets;  // uint32 x (ChunksFor(num_rows)+1)
   rmm::device_buffer row_indices;    // int32 x survivor_count (empty when no
                                      // tier_b output or survivor_count == 0)
+  // Filled only for scan_filter_request::measure_membership when at least one membership probe ran
+  // and the selection was counted (status applied or declined_unselective): the rows the probes
+  // were evaluated on (those surviving every other source), the rows that also passed every probe
+  // that ran, and how many probes ran. Capped or declined probes are not counted.
+  int64_t membership_rows_in       = -1;
+  int64_t membership_rows_out      = -1;
+  size_t membership_probes_applied = 0;
 
   selection_mask view()
   {

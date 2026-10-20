@@ -333,10 +333,11 @@ sirius::decompress_result decompress_with_probes(
   sirius::pushdown_request request,
   slot_probes probes,
   ::cuda::stream_ref stream,
-  sirius::decode_visibility_mask const& keep_mask = {})
+  sirius::decode_visibility_mask const& keep_mask    = {},
+  sirius::membership_measurement_request measurement = {})
 {
   auto const scan = sirius::decompression_pushdown_scan{std::move(request)}.with_membership_probes(
-    std::move(probes), /*generation=*/1);
+    std::move(probes), /*generation=*/1, measurement);
   return sirius::decompress_chunk(chunk,
                                   kSelected,
                                   scan.get(),
@@ -738,6 +739,83 @@ TEST_CASE("join filters past the decode's cap leave the drop in place",
     return in_filter_range(i) && in_key_set(i % 100) && in_key_set(i % 50, 2);
   });
   require_columns(decoded.table->view(), expected, kOutputWidth, stream);
+}
+
+TEST_CASE("a measuring decode reports what its join filters kept",
+          "[fused_scan_filter][delivery][membership_measurement]")
+{
+  if (gate_off()) { return; }
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  decode_environment environment{stream};
+  auto const ct = compress_range_source(stream);
+  sirius::membership_measurement_request const measure{.measure = true, .complete = true};
+  auto const count_rows = [](auto predicate) { return rows_where(predicate).v.size(); };
+
+  SECTION("a join filter that is the only source is evaluated on every row")
+  {
+    sirius::pushdown_request request;
+    request.columns.resize(kSelected.size());
+    auto const decoded = decompress_with_probes(environment,
+                                                ct,
+                                                std::move(request),
+                                                one_probe(0, key_set_probe(make_key_set(stream))),
+                                                stream,
+                                                {},
+                                                measure);
+    REQUIRE(decoded.outcome.membership_keep.has_value());
+    CHECK(decoded.outcome.membership_keep->generation == 1);
+    CHECK(decoded.outcome.membership_keep->rows_before == static_cast<std::size_t>(kRows));
+    CHECK(decoded.outcome.membership_keep->rows_after ==
+          count_rows([](cudf::size_type i) { return in_key_set(i % 100); }));
+    CHECK(decoded.outcome.membership_keep->complete);
+  }
+  SECTION("a join filter after a range is evaluated on the range's survivors")
+  {
+    auto const decoded = decompress_with_probes(environment,
+                                                ct,
+                                                covered_request(kOutputWidth),
+                                                one_probe(0, key_set_probe(make_key_set(stream))),
+                                                stream,
+                                                {},
+                                                measure);
+    REQUIRE(decoded.outcome.membership_keep.has_value());
+    CHECK(decoded.outcome.membership_keep->rows_before == count_rows(in_filter_range));
+    CHECK(decoded.outcome.membership_keep->rows_after ==
+          count_rows([](cudf::size_type i) { return in_filter_range(i) && in_key_set(i % 100); }));
+    CHECK(decoded.outcome.membership_keep->complete);
+  }
+  SECTION("a declined join filter makes the measurement incomplete")
+  {
+    slot_probes probes(kSelected.size());
+    probes[0].push_back(key_set_probe(make_key_set(stream)));
+    probes[1].push_back(declining_probe());
+    auto const decoded = decompress_with_probes(
+      environment, ct, covered_request(kOutputWidth), std::move(probes), stream, {}, measure);
+    REQUIRE(decoded.outcome.membership_keep.has_value());
+    CHECK(decoded.outcome.membership_keep->rows_after ==
+          count_rows([](cudf::size_type i) { return in_filter_range(i) && in_key_set(i % 100); }));
+    CHECK_FALSE(decoded.outcome.membership_keep->complete);
+  }
+  SECTION("a decode whose every join filter declined measures nothing")
+  {
+    auto const decoded = decompress_with_probes(environment,
+                                                ct,
+                                                covered_request(kOutputWidth),
+                                                one_probe(0, declining_probe()),
+                                                stream,
+                                                {},
+                                                measure);
+    CHECK_FALSE(decoded.outcome.membership_keep.has_value());
+  }
+  SECTION("a decode that was not asked measures nothing")
+  {
+    auto const decoded = decompress_with_probes(environment,
+                                                ct,
+                                                covered_request(kOutputWidth),
+                                                one_probe(0, key_set_probe(make_key_set(stream))),
+                                                stream);
+    CHECK_FALSE(decoded.outcome.membership_keep.has_value());
+  }
 }
 
 TEST_CASE("a decode carrying part of the filter keeps every column",
