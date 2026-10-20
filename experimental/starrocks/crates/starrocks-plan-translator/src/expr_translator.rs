@@ -868,6 +868,28 @@ fn integer_literal_type(
     }
 }
 
+/// A width-matched integer literal of a StarRocks integer type.
+pub(crate) fn integer_literal(value: i64, primitive: TPrimitiveType) -> Result<Expression> {
+    integer_literal_type(value, primitive).map(literal)
+}
+
+/// An integer literal matching the Substrait integer type `ty`.
+pub(crate) fn integer_literal_of(value: i64, ty: &Type) -> Result<Expression> {
+    use substrait::proto::r#type::Kind;
+    let primitive = match ty.kind {
+        Some(Kind::I8(_)) => TPrimitiveType::TINYINT,
+        Some(Kind::I16(_)) => TPrimitiveType::SMALLINT,
+        Some(Kind::I32(_)) => TPrimitiveType::INT,
+        Some(Kind::I64(_)) => TPrimitiveType::BIGINT,
+        _ => {
+            return Err(TranslateError::malformed(
+                "an integer literal needs an integer type",
+            ));
+        }
+    };
+    integer_literal(value, primitive)
+}
+
 /// Builds a Substrait scalar-function expression from already translated children.
 pub(crate) fn scalar_function(
     anchor: u32,
