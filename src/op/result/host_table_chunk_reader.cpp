@@ -21,7 +21,6 @@
 
 // cucascade
 #include <cucascade/cudf/host_data_representation.hpp>
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 // duckdb
 #include <duckdb/common/types/decimal.hpp>

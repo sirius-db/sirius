@@ -11,14 +11,11 @@
 #include "decode/decode_session.hpp"
 
 #include <cudf/column/column.hpp>
-#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -29,8 +26,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#ifndef SIMPATICO_USE_CUCASCADE_STREAM_POOL
 #include <map>
 #include <mutex>
+#endif
 #include <numeric>
 #include <optional>
 #include <ranges>

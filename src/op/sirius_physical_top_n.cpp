@@ -29,7 +29,6 @@
 
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/cudf_utils.hpp>
 #include <cudf/sorting.hpp>
 
 #include <rmm/resource_ref.hpp>

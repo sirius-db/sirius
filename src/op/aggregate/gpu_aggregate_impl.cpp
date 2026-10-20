@@ -34,7 +34,6 @@
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
-#include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>

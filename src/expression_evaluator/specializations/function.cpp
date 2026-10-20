@@ -15,12 +15,10 @@
  */
 
 // sirius
-#include <config.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>
 #include <expression/substring_slice.hpp>
-#include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
@@ -68,7 +66,6 @@
 #include <regex>
 #include <string>
 #include <tuple>
-#include <variant>
 #include <vector>
 
 namespace sirius {

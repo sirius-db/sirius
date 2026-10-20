@@ -34,22 +34,23 @@
 #
 # We need to verify that broken checks are still broken
 Checks:
-      'modernize-*,
-       -modernize-use-equals-default,
+      'clang-analyzer-*,
+       -clang-analyzer-cplusplus.NewDeleteLeaks,
+       -clang-analyzer-optin.core.EnumCastOutOfRange,
+       -clang-analyzer-optin.cplusplus.UninitializedObject,
+       misc-include-cleaner,
+       modernize-*,
        -modernize-concat-nested-namespaces,
-       -modernize-use-trailing-return-type,
        -modernize-return-braced-init-list,
        -modernize-use-bool-literals,
        -modernize-use-constraints,
-       -modernize-use-ranges,
        -modernize-use-designated-initializers,
+       -modernize-use-equals-default,
+       -modernize-use-ranges,
+       -modernize-use-trailing-return-type,
        performance-for-range-copy,
        performance-unnecessary-copy-initialization,
-       performance-unnecessary-value-param,
-       clang-analyzer-*,
-       -clang-analyzer-cplusplus.NewDeleteLeaks,
-       -clang-analyzer-optin.core.EnumCastOutOfRange,
-       -clang-analyzer-optin.cplusplus.UninitializedObject'
+       performance-unnecessary-value-param'
 
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*cudf/cpp/(src|include).*'
@@ -66,4 +67,20 @@ CheckOptions:
    value:           llvm
  - key:             modernize-use-nullptr.NullMacros
    value:           'NULL'
+ - key:             misc-include-cleaner.UnusedIncludes
+   value:           'true'
+ - key:             misc-include-cleaner.MissingIncludes
+   value:           'false'
+ # These public headers are required but incorrectly reported as unused.
+ - key:             misc-include-cleaner.IgnoreHeaders
+   value: '
+     cuda/stream$;
+     cuda/memory_resource$;
+     cuda/buffer$;
+     cuda/std/utility$;
+     cuda_runtime\.h$;
+     cuda_runtime_api\.h$;
+     duckdb/common/shared_ptr\.hpp$;
+     sys/uio\.h$
+   '
 ...

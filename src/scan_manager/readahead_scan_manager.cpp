@@ -16,7 +16,6 @@
 
 #include "scan_manager/readahead_scan_manager.hpp"
 
-#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"

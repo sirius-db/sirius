@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <expression/ast/node.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/date_cast.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>

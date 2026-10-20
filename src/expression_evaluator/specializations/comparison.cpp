@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <expression/ast/node.hpp>
 #include <expression/join_condition.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
@@ -23,7 +22,6 @@
 // cudf
 #include <cudf/ast/ast_operator.hpp>
 #include <cudf/binaryop.hpp>
-#include <cudf/scalar/scalar.hpp>
 
 // standard library
 #include <memory>

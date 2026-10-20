@@ -42,6 +42,8 @@ add_custom_target(simpatico_embedded_headers DEPENDS "${EMBED_JIT_HEADERS_OUT}")
 set(EMBED_CCCL_HEADERS_OUT
     "${CMAKE_CURRENT_BINARY_DIR}/generated/codegen/jit/cccl_embedded_headers.cpp"
 )
+set_source_files_properties("${EMBED_CCCL_HEADERS_OUT}" PROPERTIES SKIP_LINTING
+                                                                   ON)
 set(EMBED_CCCL_HEADERS_DEPFILE "${EMBED_CCCL_HEADERS_OUT}.d")
 # CCCL::CCCL's transitive include directories are resolved at generate time; the
 # cmake -P embedder cannot evaluate their generator expressions itself. Pass the

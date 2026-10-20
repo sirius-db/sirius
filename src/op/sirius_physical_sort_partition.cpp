@@ -16,7 +16,7 @@
 
 #include "op/sirius_physical_sort_partition.hpp"
 
-#include "cudf/cudf_utils.hpp"
+#include "cudf/cudf_utils.hpp"  // IWYU pragma: keep
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"

@@ -19,7 +19,6 @@
 #include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <helper/timestamp_semantics.hpp>

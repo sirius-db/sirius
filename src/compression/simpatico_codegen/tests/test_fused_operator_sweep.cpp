@@ -56,7 +56,6 @@
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/kernel_cache.hpp"
 #include "jit_decode.hpp"
-#include "test_utils.hpp"
 
 #include <cuda.h>
 

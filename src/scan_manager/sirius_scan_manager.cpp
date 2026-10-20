@@ -17,7 +17,6 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include "compression/decompression_pushdown_policy.hpp"
-#include "compression/device_compressed_blob.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
@@ -29,10 +28,8 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/uri_parser.hpp"
-#include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
-#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
@@ -41,10 +38,8 @@
 #include "op/scan/parquet_materialize.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/scan_filter_analysis.hpp"
-#include "op/scan/scan_utils.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
-#include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
@@ -52,25 +47,16 @@
 #include "sirius_context.hpp"
 
 #include <cudf/column/column_view.hpp>
-#include <cudf/io/datasource.hpp>
-#include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
-#include <cudf/io/parquet_io_utils.hpp>
-#include <cudf/io/parquet_schema.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/span.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
-#include <rmm/cuda_device.hpp>
-
-#include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/column_metadata.hpp>
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/main/attached_database.hpp>

@@ -22,7 +22,6 @@
 #include <telemetry/nvtx.hpp>
 
 // cucascade
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 
 // standard library

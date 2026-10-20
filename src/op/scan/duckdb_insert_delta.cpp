@@ -25,7 +25,6 @@
 #include <duckdb/common/vector_size.hpp>
 #include <duckdb/function/compression_function.hpp>
 #include <duckdb/function/partition_stats.hpp>
-#include <duckdb/main/attached_database.hpp>
 #include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/buffer_manager.hpp>
 #include <duckdb/storage/data_table.hpp>

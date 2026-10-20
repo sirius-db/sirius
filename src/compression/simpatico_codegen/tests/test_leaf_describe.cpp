@@ -1,17 +1,14 @@
 #include "api/simpatico_codegen.hpp"
-#include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/plan/leaf_desc.hpp"
 #include "codegen/plan/representation.hpp"
 #include "test_utils.hpp"
 
-#include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
-#include <stdexcept>
 #include <string>
 #include <vector>
 

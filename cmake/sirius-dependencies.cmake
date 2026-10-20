@@ -139,12 +139,6 @@ endforeach()
 # the SIRIUS_NVTX_DOMAIN_NAME compile definition both include trees consume.
 set(SIRIUS_NVTX_DOMAIN_NAME "${PROJECT_NAME}")
 
-# Simpatico GPU compression engine Tests disabled here — run them via the
-# standalone simpatico_codegen build. Benchmark harness
-# (compress_with_plan_benchmark) is built by default.
-add_subdirectory(src/compression/simpatico_codegen
-                 "${CMAKE_BINARY_DIR}/simpatico_codegen" EXCLUDE_FROM_ALL)
-
 if(VCPKG_BUILD)
   # cucascade's topology discovery gained rmm includes (NUMA capacity
   # detection), so it needs the same vcpkg-over-toolkit include priority as

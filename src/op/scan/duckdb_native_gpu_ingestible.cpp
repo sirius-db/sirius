@@ -27,11 +27,9 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
-#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
-#include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <sirius_context.hpp>
 
 // duckdb
@@ -42,7 +40,6 @@
 // cudf
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>

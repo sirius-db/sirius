@@ -22,7 +22,6 @@
 #include "duckdb/planner/joinside.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
-#include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 
 #include <cstdint>

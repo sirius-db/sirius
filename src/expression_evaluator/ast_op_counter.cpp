@@ -34,7 +34,6 @@
 // standard library
 #include <algorithm>
 #include <cstddef>
-#include <variant>
 
 // Single source of truth for "how many cuDF AST operators does this Sirius AST
 // alternative lower to, recursively." Drives the AST-vs-MATERIALIZE strategy

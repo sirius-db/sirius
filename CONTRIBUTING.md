@@ -57,6 +57,28 @@ pre-commit run -a
 Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `codespell`, and
 `rumdl` (Markdown links and anchors).
 
+CI runs clang-tidy with the repository's `.clang-tidy` configuration on C/C++
+sources in Sirius-owned targets during the Linux Clang debug build, including
+tests and benchmarks. Findings are reported as
+warnings; compiler errors still fail the build. CUDA translation units, generated
+sources, and third-party sources are excluded. Enable the same checks locally:
+
+```bash
+pixi run --locked cmake --preset clang-debug -DSIRIUS_ENABLE_CLANG_TIDY=ON
+pixi run --locked cmake --build --preset clang-debug
+```
+
+Incremental builds check only sources being rebuilt. To check all configured
+sources under `src/` after building:
+
+```bash
+pixi run --locked run-clang-tidy -p build/clang-debug -j 4 \
+  -warnings-as-errors='-*' "$PWD/src/.*[.](c|cc|cpp|cxx)$"
+```
+
+Public re-exports can be declared using Clang's
+`IWYU pragma: export` and `IWYU pragma: begin_exports` / `end_exports` annotations.
+
 ## Submodules
 
 The `duckdb/` and `sirius-duckdb/vcpkg/` directories are third-party submodules. Their `CONTRIBUTING.md` files apply to contributing to those upstream projects, not to Sirius. Do not modify submodule contents directly.

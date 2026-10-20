@@ -16,8 +16,6 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 
-#include "config.hpp"
-#include "cudf/aggregation.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
@@ -25,25 +23,21 @@
 #include "cudf/join/mark_join.hpp"
 #include "cudf/join/mixed_join.hpp"
 #include "cudf/null_mask.hpp"
-#include "cudf/reduction.hpp"
 #include "cudf/reduction/distinct_count.hpp"
 #include "cudf/table/table_view.hpp"
 #include "cudf/transform.hpp"
 #include "cudf/types.hpp"
 #include "cudf/unary.hpp"
 #include "cudf/utilities/memory_resource.hpp"
-#include "cudf/version_config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
 #include "expression_evaluator/ast_supported_types.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
-#include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
-#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/join_key_preparation.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
@@ -54,11 +48,9 @@
 #include "telemetry/nvtx.hpp"
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
 
-#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>

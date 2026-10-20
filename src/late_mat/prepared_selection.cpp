@@ -21,7 +21,6 @@
 #include <codegen/selection/row_id_space.hpp>
 
 #include <stdexcept>
-#include <string>
 #include <utility>
 
 namespace sirius::late_mat {

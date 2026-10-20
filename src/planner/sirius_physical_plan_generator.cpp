@@ -16,7 +16,6 @@
 
 #include "planner/sirius_physical_plan_generator.hpp"
 
-#include "config.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
@@ -41,7 +40,6 @@
 #include "io/s3/duckdb_secret_config.hpp"
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
-#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
@@ -77,7 +75,6 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/substrait_scan_ranges.hpp"
 #include "scan_manager/preparation_ledger.hpp"
-#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"

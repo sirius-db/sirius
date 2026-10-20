@@ -24,7 +24,6 @@
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
-#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <cmath>

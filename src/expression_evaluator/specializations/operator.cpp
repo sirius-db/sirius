@@ -18,8 +18,6 @@
 #include <expression/ast/node.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
-#include <helper/logical_type.hpp>
-#include <log/logging.hpp>
 #include <sirius/exception.hpp>
 
 // duckdb
@@ -28,7 +26,7 @@
 // cudf
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
-#include <cudf/cudf_utils.hpp>
+#include <cudf/cudf_utils.hpp>  // IWYU pragma: keep
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/replace.hpp>
@@ -42,7 +40,6 @@
 // standard library
 #include <algorithm>
 #include <string>
-#include <variant>
 
 namespace {
 

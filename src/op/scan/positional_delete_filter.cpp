@@ -22,7 +22,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <log/logging.hpp>
 #include <op/scan/iceberg_delete_filter.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 

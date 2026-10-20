@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <config.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
@@ -30,7 +29,6 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
-#include <cucascade/memory/memory_reservation_manager.hpp>
 
 // sirius exceptions
 #include "sirius/exception.hpp"

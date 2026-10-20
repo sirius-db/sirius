@@ -17,7 +17,6 @@
 #include "io/cache/metadata_store.hpp"
 
 #include <algorithm>
-#include <iterator>
 #include <sstream>
 #include <system_error>
 #include <utility>

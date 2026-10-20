@@ -17,10 +17,7 @@
 
 #include <cudf/copying.hpp>
 #include <cudf/strings/strings_column_view.hpp>
-#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/traits.hpp>
-
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
 

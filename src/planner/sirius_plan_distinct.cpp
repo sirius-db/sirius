@@ -18,7 +18,6 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"

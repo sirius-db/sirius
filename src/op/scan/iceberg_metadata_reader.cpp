@@ -15,7 +15,6 @@
  */
 
 #include "io/io_context.hpp"
-#include "io/types.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/io/datasource.hpp>
@@ -25,12 +24,10 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <duckdb/common/types/vector.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/query_result_stream.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
-#include <io/sirius_datasource.hpp>
 #include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
@@ -41,7 +38,6 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
-#include <mutex>
 #include <numeric>
 #include <set>
 #include <stdexcept>

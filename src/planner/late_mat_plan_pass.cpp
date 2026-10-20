@@ -19,7 +19,6 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
-#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"

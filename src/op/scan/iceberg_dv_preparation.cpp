@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#include <new>
 
 namespace sirius::op::scan {
 namespace {

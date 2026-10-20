@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_partition.hpp"
 
-#include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"

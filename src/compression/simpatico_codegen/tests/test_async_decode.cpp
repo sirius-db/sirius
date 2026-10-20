@@ -19,7 +19,6 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/error.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda/memory_resource>
 

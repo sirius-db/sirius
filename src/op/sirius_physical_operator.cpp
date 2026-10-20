@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_operator.hpp"
 
-#include "config.hpp"
 #include "cucascade/utils/overloaded.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
@@ -26,7 +25,6 @@
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/memory/error.hpp>
 
 #include <algorithm>
 #include <memory>
