@@ -47,6 +47,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_query_lifecycle_registry.cpp
     test/cpp/exec/test_scoped_dispatcher.cpp
+    test/cpp/exec/test_exchange_inbox.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp

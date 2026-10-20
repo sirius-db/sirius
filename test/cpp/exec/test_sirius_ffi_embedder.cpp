@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-// Public sirius::ffi Context and Fragment methods only.
+// Public sirius::ffi Context, Fragment and ExchangeInbox methods only.
 // Builds Substrait in the test because the FFI has no SQL helper.
 // Covers a result fragment, a relay_from chain, several fragments built before any runs (on one
 // and on two threads), build() and run()/drop on different threads, drop after build(), a build()
-// that fails after setup, and execute_substrait. Spec errors and failed-build rollback live in
-// test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
+// that fails after setup, execute_substrait, and the ExchangeInbox handle. Spec errors and
+// failed-build rollback live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
 
 #include "sirius/exception.hpp"
 #include "sirius/ffi.hpp"
@@ -365,4 +365,26 @@ TEST_CASE("FFI concurrent run() and execute_substrait on one Context wait for ea
   REQUIRE(result_i64s(*first) == expected);
   REQUIRE(result_i64s(*second) == expected);
   REQUIRE(collect_i64_column(direct) == expected);
+}
+
+TEST_CASE("FFI ExchangeInbox refuses unknown tokens and every call after its Context",
+          "[isolated_context][sirius_ffi]")
+{
+  auto ctx      = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto exchange = ctx->exchange_inbox();
+  REQUIRE(exchange != nullptr);
+  REQUIRE(exchange->outstanding() == 0);
+  exchange->release(7);
+
+  auto receiver = sirius::ffi::make_fragment(*ctx);
+  receiver->declare_input_column(0, "a", "BIGINT");
+  receiver->declare_input_sender(0, 0);
+  receiver->build(stream_read_plan(0));
+  REQUIRE_THROWS_WITH(receiver->push_received(0, 7),
+                      Catch::Matchers::ContainsSubstring("holds no received batch"));
+
+  receiver.reset();
+  ctx.reset();
+  REQUIRE_THROWS(exchange->release(1));
+  REQUIRE_THROWS(exchange->outstanding());
 }

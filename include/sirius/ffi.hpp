@@ -38,8 +38,13 @@
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
 #endif
 
+namespace sirius::exec {
+class exchange_inbox;
+}
+
 namespace sirius::ffi {
 
+class ExchangeInbox;
 class Fragment;
 
 /// RAII handle to a Sirius engine context.
@@ -72,12 +77,37 @@ class SIRIUS_FFI_EXPORT Context {
   /// released; its last release can tear down the engine on the releasing thread.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
+  /// A handle to this Context's exchange inbox, or null unless the Context has one GPU memory
+  /// space.
+  [[nodiscard]] std::unique_ptr<ExchangeInbox> exchange_inbox() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 
   friend class Fragment;
   friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
+};
+
+/// Holds batches a transport received from another process until Fragment::push_received
+/// takes them by token.
+///
+/// Callable from any thread. After its Context is destroyed every call throws.
+class SIRIUS_FFI_EXPORT ExchangeInbox {
+ public:
+  /// Free the received batch `token` holds, one that will not be pushed. Unknown and consumed
+  /// tokens are ignored.
+  void release(std::uint64_t token) const;
+
+  /// Tokens neither released nor consumed.
+  [[nodiscard]] std::size_t outstanding() const;
+
+ private:
+  explicit ExchangeInbox(std::shared_ptr<sirius::exec::exchange_inbox> exchange);
+
+  std::shared_ptr<sirius::exec::exchange_inbox> exchange_;
+
+  friend class Context;
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
@@ -158,6 +188,13 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint64_t source_stream_id,
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
+
+  /// Push the batch received under `token` into input stream `stream_id`. Consumes the token
+  /// unless it throws before reading it: before build(), without a ExchangeInbox, after run()
+  /// started, or on an undeclared input.
+  /// @throws also on a token that holds no received batch, on a schema mismatch, or when the
+  /// input already ended.
+  void push_received(std::uint64_t stream_id, std::uint64_t token);
 
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
   /// (relay_from closes its own sender). Idempotent per sender.

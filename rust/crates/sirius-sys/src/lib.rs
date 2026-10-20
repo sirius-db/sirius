@@ -57,6 +57,18 @@ mod ffi {
             out_stream_addr: usize,
         ) -> Result<()>;
 
+        /// Holds batches a transport received until a fragment takes them by
+        /// token. Callable from any thread; the contract of every method is
+        /// documented on the C++ class.
+        type ExchangeInbox;
+
+        /// This context's exchange inbox, or null unless it has one GPU memory
+        /// space.
+        fn exchange_inbox(self: &Context) -> UniquePtr<ExchangeInbox>;
+
+        fn release(self: &ExchangeInbox, token: u64) -> Result<()>;
+        fn outstanding(self: &ExchangeInbox) -> Result<usize>;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches) or none (a result fragment, which produces Arrow). The
@@ -116,6 +128,9 @@ mod ffi {
             sender_id: u32,
         ) -> Result<usize>;
 
+        /// Push the batch received under `token` into an input stream.
+        fn push_received(self: Pin<&mut Fragment>, stream_id: u64, token: u64) -> Result<()>;
+
         /// Close `sender_id` on input stream `stream_id`, for a sender that is
         /// not a local fragment.
         fn close_input(self: Pin<&mut Fragment>, stream_id: u64, sender_id: u32) -> Result<()>;
@@ -144,5 +159,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    Context, Fragment, make_context, make_context_from_config, make_fragment, stream_view_name,
+    Context, ExchangeInbox, Fragment, make_context, make_context_from_config, make_fragment,
+    stream_view_name,
 };

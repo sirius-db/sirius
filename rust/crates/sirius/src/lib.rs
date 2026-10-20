@@ -113,6 +113,12 @@ impl SiriusContext {
         // Drain fully while `self` is alive (conversion dereferences the context).
         collect_arrow_stream(stream)
     }
+
+    /// This context's [`ExchangeInbox`], or `None` unless it has one GPU memory space.
+    pub fn exchange_inbox(&self) -> Option<ExchangeInbox> {
+        let inner = self.inner.borrow().exchange_inbox();
+        (!inner.is_null()).then_some(ExchangeInbox { inner })
+    }
 }
 
 fn collect_arrow_stream(stream: FFI_ArrowArrayStream) -> Result<SubstraitResult, SiriusError> {
@@ -227,6 +233,13 @@ impl Fragment<'_> {
         )
     }
 
+    /// Push the batch received under `token` into input stream `stream_id`, consuming the token
+    /// unless the call fails before reading it: before `build`, after `run` started, or on an
+    /// undeclared input. A batch whose columns differ from the declared ones is refused.
+    pub fn push_received(&mut self, stream_id: u64, token: u64) -> Result<(), Exception> {
+        self.inner.pin_mut().push_received(stream_id, token)
+    }
+
     /// Close `sender_id` on input stream `stream_id`: the end of stream for a sender that is not
     /// a local fragment ([`relay_from`](Fragment::relay_from) closes its own). Idempotent.
     pub fn close_input(&mut self, stream_id: u64, sender_id: u32) -> Result<(), Exception> {
@@ -274,6 +287,36 @@ impl Fragment<'_> {
             .iter()
             .map(|ty| ty.to_string_lossy().into_owned())
             .collect())
+    }
+}
+
+/// Holds batches a transport received until [`Fragment::push_received`] takes them by token, from
+/// [`SiriusContext::exchange_inbox`]. The full contract is documented on the C++
+/// `sirius::ffi::ExchangeInbox`.
+pub struct ExchangeInbox {
+    inner: UniquePtr<sirius_sys::ExchangeInbox>,
+}
+
+// SAFETY: the C++ handle shares the context's token table, which serializes every call on one
+// mutex and sets the CUDA device itself, so no state behind it is tied to a thread.
+unsafe impl Send for ExchangeInbox {}
+unsafe impl Sync for ExchangeInbox {}
+
+impl ExchangeInbox {
+    /// Free what `token` holds. Unknown and consumed tokens are ignored.
+    pub fn release(&self, token: u64) -> Result<(), Exception> {
+        self.inner.release(token)
+    }
+
+    /// Tokens neither released nor consumed.
+    pub fn outstanding(&self) -> Result<usize, Exception> {
+        self.inner.outstanding()
+    }
+}
+
+impl std::fmt::Debug for ExchangeInbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExchangeInbox")
     }
 }
 
