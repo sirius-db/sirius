@@ -175,7 +175,7 @@ jobs:
           matrix.build.arch == 'x64' && matrix.build.compiler == 'clang'
           && matrix.build.build-type == 'debug' && matrix.build.environment == 'default'
           && matrix.build.cudf-channel == 'stable'
-        run: pixi run --locked cmake --preset clang-debug -DSIRIUS_ENABLE_CLANG_TIDY=ON
+        run: cmake --preset clang-debug -DSIRIUS_ENABLE_CLANG_TIDY=ON
         env:
           CUDAARCHS: "100"
 
