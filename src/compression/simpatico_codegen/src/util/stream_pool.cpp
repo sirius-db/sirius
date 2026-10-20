@@ -3,11 +3,60 @@
 
 #include <algorithm>
 #include <cstdio>
+#ifdef SIMPATICO_USE_CUCASCADE_STREAM_POOL
+#include <cucascade/memory/stream_pool.hpp>
+#endif
+
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace simpatico {
+
+struct stream_pool::lease_state {
+#ifdef SIMPATICO_USE_CUCASCADE_STREAM_POOL
+  std::vector<cucascade::memory::borrowed_stream> streams;
+#endif
+};
+
+#ifdef SIMPATICO_USE_CUCASCADE_STREAM_POOL
+namespace {
+cucascade::memory::exclusive_stream_pool& device_pool(int device)
+{
+  // Returned columns retain their allocation stream for asynchronous frees.
+  // Keep the owners alive even after a lease or its submitting thread ends.
+  struct registry {
+    std::mutex mutex;
+    std::map<int, std::unique_ptr<cucascade::memory::exclusive_stream_pool>> pools;
+  };
+  static auto* owners = new registry;
+  std::lock_guard lock(owners->mutex);
+  auto& pool = owners->pools[device];
+  if (!pool) {
+    pool = std::make_unique<cucascade::memory::exclusive_stream_pool>(rmm::cuda_device_id{device});
+  }
+  return *pool;
+}
+}  // namespace
+#endif
+
+stream_pool::stream_pool() = default;
+stream_pool::~stream_pool() { shutdown(); }
+stream_pool::stream_pool(stream_pool&& other) noexcept
+  : streams(std::exchange(other.streams, {})), leases_(std::move(other.leases_))
+{
+}
+stream_pool& stream_pool::operator=(stream_pool&& other) noexcept
+{
+  if (this != &other) {
+    shutdown();
+    streams = std::exchange(other.streams, {});
+    leases_ = std::move(other.leases_);
+  }
+  return *this;
+}
 
 stream_pool& thread_device_stream_pool(size_t n)
 {
@@ -31,6 +80,23 @@ stream_pool& thread_device_stream_pool(size_t n)
 bool stream_pool::init(size_t n)
 {
   if (!streams.empty()) return true;  // Already initialized
+#ifdef SIMPATICO_USE_CUCASCADE_STREAM_POOL
+  if (n == 0) return true;
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) return false;
+  auto& owner = device_pool(device);
+  auto leases = std::make_unique<lease_state>();
+  leases->streams.reserve(n);
+  streams.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    // Blocking while holding part of a multi-stream lease could deadlock
+    // concurrent callers. Grow just as the pipeline executor does.
+    leases->streams.push_back(
+      owner.acquire_stream(cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW));
+    streams.push_back(leases->streams.back().get().get());
+  }
+  leases_ = std::move(leases);
+#else
   streams.resize(n);
   for (size_t i = 0; i < n; ++i) {
     cudaError_t err = cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking);
@@ -42,15 +108,20 @@ bool stream_pool::init(size_t n)
       return false;
     }
   }
+#endif
   return true;
 }
 
 void stream_pool::shutdown()
 {
+  (void)sync_all();
+#ifdef SIMPATICO_USE_CUCASCADE_STREAM_POOL
+  leases_.reset();
+#else
   for (auto& stream : streams) {
-    cudaStreamSynchronize(stream);
     cudaStreamDestroy(stream);
   }
+#endif
   streams.clear();
 }
 
