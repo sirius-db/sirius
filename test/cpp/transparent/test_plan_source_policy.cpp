@@ -871,8 +871,7 @@ TEST_CASE("Transparent execution preserves GPU errors before non-S3 replay vetoe
 }
 
 #if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_INFO
-TEST_CASE("Runtime failure after slot acquisition preserves CPU fallback",
-          "[integration][policy][device_health]")
+static void check_runtime_failure_fallback(std::string_view failure_point)
 {
   if (sirius::test::run_isolated()) return;
   sirius::test::GpuExecutionFixture fixture;
@@ -887,13 +886,18 @@ TEST_CASE("Runtime failure after slot acquisition preserves CPU fallback",
   auto prepared = con.Prepare("SELECT sum(i) FROM health_race");
   REQUIRE_FALSE(prepared->HasError());
 
-  // The begin log is emitted after slot acquisition, before begin_execution_window.
+  // Exercise both sides of the health check: window begin is before it, while
+  // QueryBegin is after it and before lifecycle registration.
   // Use the existing log-sink interface to force the race without a production test hook.
   struct failure_at_begin_sink final : sirius::log::sink {
     duckdb::SiriusContext& runtime;
     std::shared_ptr<sirius::log::sink> previous = sirius::log::get_sink();
     std::atomic<bool> injected{false};
-    explicit failure_at_begin_sink(duckdb::SiriusContext& runtime) : runtime(runtime) {}
+    std::string_view failure_point;
+    failure_at_begin_sink(duckdb::SiriusContext& runtime, std::string_view failure_point)
+      : runtime(runtime), failure_point(failure_point)
+    {
+    }
     void set_level(sirius::log::level level) override { previous->set_level(level); }
     bool should_log(sirius::log::level) const override { return true; }
     bool flush() override { return previous->flush(); }
@@ -901,7 +905,7 @@ TEST_CASE("Runtime failure after slot acquisition preserves CPU fallback",
              std::source_location const& location,
              std::string_view message) override
     {
-      if (message.starts_with("[window] begin ") && !injected.exchange(true)) {
+      if (message.starts_with(failure_point) && !injected.exchange(true)) {
         runtime.get_query_lifecycle_registry().report_failure(
           std::make_exception_ptr(cudf::cuda_error(
             "synthetic fatal failure during window admission", cudaErrorIllegalAddress)));
@@ -909,7 +913,7 @@ TEST_CASE("Runtime failure after slot acquisition preserves CPU fallback",
       previous->log(level, location, message);
     }
   };
-  auto sink = std::make_shared<failure_at_begin_sink>(*runtime);
+  auto sink = std::make_shared<failure_at_begin_sink>(*runtime, failure_point);
   struct restore_sink {
     std::shared_ptr<sirius::log::sink> previous;
     ~restore_sink() { sirius::log::set_sink(std::move(previous)); }
@@ -929,5 +933,16 @@ TEST_CASE("Runtime failure after slot acquisition preserves CPU fallback",
   CHECK_FALSE(runtime->is_query_lifecycle_active());
   CHECK(runtime->get_query_lifecycle_registry().size() == 0);
   CHECK_FALSE(runtime->get_scan_manager().holds_any_checkpoint_key());
+}
+TEST_CASE("Runtime failure after slot acquisition preserves CPU fallback",
+          "[integration][policy][device_health]")
+{
+  check_runtime_failure_fallback("[window] begin ");
+}
+
+TEST_CASE("Runtime failure during lifecycle registration preserves CPU fallback",
+          "[integration][policy][device_health]")
+{
+  check_runtime_failure_fallback("QueryBegin: transparent_execution");
 }
 #endif

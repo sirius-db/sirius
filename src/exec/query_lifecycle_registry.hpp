@@ -62,6 +62,16 @@ enum class query_submission_status : std::uint8_t { accepted, quiescing, unknown
  */
 class query_lifecycle_registry {
  public:
+  // Distinguish a health refusal before registration from an initialization failure.
+  // Front ends translate this into their own runtime-unavailable/fallback exception.
+  class runtime_unavailable_error : public std::runtime_error {
+   public:
+    runtime_unavailable_error()
+      : std::runtime_error("Sirius GPU runtime is unavailable after a fatal device error")
+    {
+    }
+  };
+
   struct diagnostic {
     query_id_t query_id{};
     std::chrono::steady_clock::time_point admitted{}, retiring{}, completed{}, first_memory_wait{};
@@ -308,8 +318,7 @@ class query_lifecycle_registry {
   void open_query(sirius::query_id_t query_id)
   {
     std::lock_guard lock(mutex_);
-    if (runtime_failed())
-      throw std::runtime_error("Sirius GPU runtime is unavailable after a fatal device error");
+    if (runtime_failed()) throw runtime_unavailable_error();
     if (queries_.contains(query_id)) {
       throw std::logic_error("query lifecycle already registered");
     }

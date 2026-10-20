@@ -575,7 +575,8 @@ TEST_CASE("failed runtime closes existing publishers and refuses late initializa
   CHECK(registry.report_failure(fatal));  // Idempotent; also works without a query owner.
   CHECK_FALSE(registry.accepts_work(make_query_id(2)));
   CHECK_FALSE(registry.try_begin_submission(make_query_id(1)));
-  CHECK_THROWS(registry.open_query(make_query_id(3)));
+  CHECK_THROWS_AS(registry.open_query(make_query_id(3)),
+                  query_lifecycle_registry::runtime_unavailable_error);
   already_publishing.finish();
   registry.wait_for_work(make_query_id(1));
   registry.close(make_query_id(1));

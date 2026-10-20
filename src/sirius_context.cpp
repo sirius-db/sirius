@@ -566,7 +566,14 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   }
   // Open the enqueue gate before anything can schedule. Every producer consults it, so this must
   // precede repository/task_creator registration.
-  query_lifecycle_.open_query(query_id);
+  try {
+    query_lifecycle_.open_query(query_id);
+  } catch (sirius::exec::query_lifecycle_registry::runtime_unavailable_error const&) {
+    // Health can fail after the check above. Nothing was registered by this refusal;
+    // discard the options snapshot and preserve the normal CPU fallback path.
+    if (connection_state) connection_state->execution_options.reset();
+    throw_runtime_unavailable();
+  }
   // Register this query's repository manager up front
   data_repository_registry_.create_for_query(query_id);
   // Registers this query's task_creator state. No reset of a previous query here: each query
@@ -790,8 +797,8 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
     lease_release_.state = lease_release_state::cleanup_failed;
   } catch (SiriusRuntimeUnavailableException&) {
-    // begin_execution_window checks health before any initialization mutation. Preserve
-    // the typed refusal so a failure racing slot acquisition can still fall back to CPU.
+    // Both the initial health check and a refused lifecycle registration precede
+    // query resource registration. Preserve the typed refusal for CPU fallback.
     state_ = scope_state::FAILED;
     {
       std::lock_guard lock(ctx_.window_completions_mutex_);
