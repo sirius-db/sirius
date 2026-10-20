@@ -279,7 +279,7 @@ TEST_CASE("Compressed facade spreads decode lanes only under per-thread tracking
   task_stream.synchronize();
   auto compressed = simpatico::compress_with_plan(
     input.view(), "input -> identity\n---\ninput -> identity\n", task_stream_ref, input_resource);
-  int device      = -1;
+  int device = -1;
   REQUIRE(cudaGetDevice(&device) == cudaSuccess);
   gpu_memory_space_config config;
   config.device_id              = device;
