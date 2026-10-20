@@ -86,7 +86,8 @@ pub enum SkipReason {
     Skew,
     /// The probing scan is in the join's own fragment.
     SameFragment,
-    /// The probing scan is in another fragment that reads exchanges.
+    /// The probing scan is in another fragment that reads exchanges, and the filter can't be
+    /// waited for there (a partitioned join's).
     NonLeafFragment,
     /// The target is a join, exchange or aggregation node; only scans apply filters.
     TargetNotScan,
@@ -171,28 +172,48 @@ pub enum ProbeKeys {
     Range { min: i64, max: i64 },
 }
 
-/// Join filters the scans of `params`' fragment probe, in plan order.
+/// Join filters the scans of `params`' fragment probe, in plan order, except those a join of
+/// the same fragment builds ([`SkipReason::SameFragment`]).
 pub fn probed_filters(params: &TExecPlanFragmentParams) -> Vec<ProbedFilter> {
-    plan_nodes(params)
+    let nodes = plan_nodes(params);
+    let built_here = filters_built_in(nodes);
+    nodes
         .iter()
         .filter(|node| is_scan(node))
         .flat_map(|node| {
-            probe_filters_of(node).filter_map(move |filter| {
-                Some(ProbedFilter {
-                    filter_id: filter.filter_id?,
-                    scan_node_id: node.node_id,
-                    distribution: BuildDistribution::of(filter),
-                    merge_node: merge_node(filter),
-                    shares: filter
-                        .layout
-                        .as_ref()
-                        .and_then(|layout| layout.num_instances)
-                        .and_then(|instances| usize::try_from(instances).ok())
-                        .filter(|&instances| instances > 0),
-                    key_type: probe_key_type(filter, node.node_id),
+            let built_here = &built_here;
+            probe_filters_of(node)
+                .filter(move |filter| {
+                    filter
+                        .filter_id
+                        .is_some_and(|filter_id| !built_here.contains(&filter_id))
                 })
-            })
+                .filter_map(move |filter| {
+                    Some(ProbedFilter {
+                        filter_id: filter.filter_id?,
+                        scan_node_id: node.node_id,
+                        distribution: BuildDistribution::of(filter),
+                        merge_node: merge_node(filter),
+                        shares: filter
+                            .layout
+                            .as_ref()
+                            .and_then(|layout| layout.num_instances)
+                            .and_then(|instances| usize::try_from(instances).ok())
+                            .filter(|&instances| instances > 0),
+                        key_type: probe_key_type(filter, node.node_id),
+                    })
+                })
         })
+        .collect()
+}
+
+/// Every join filter the hash joins of `nodes` build.
+fn filters_built_in(nodes: &[TPlanNode]) -> Vec<i32> {
+    nodes
+        .iter()
+        .filter_map(|node| node.hash_join_node.as_ref()?.build_runtime_filters.as_ref())
+        .flatten()
+        .filter_map(|filter| filter.filter_id)
         .collect()
 }
 
@@ -278,19 +299,11 @@ pub fn skipped_builds(params: &TExecPlanFragmentParams) -> Result<Vec<SkippedFil
 }
 
 /// Probe targets in `params`' fragment that a compute node never filters: a target that isn't a
-/// scan, and a scan in a fragment that reads exchanges. Scans of a leaf fragment aren't listed;
-/// whether they're filtered is decided when they run ([`probed_filters`]).
+/// scan, and a scan probing a filter a join of its own fragment builds. Other scans aren't
+/// listed; whether they're filtered is decided when they run ([`probed_filters`]).
 pub fn skipped_probes(params: &TExecPlanFragmentParams) -> Vec<SkippedFilter> {
     let nodes = plan_nodes(params);
-    let reads_exchanges = nodes
-        .iter()
-        .any(|node| node.node_type == TPlanNodeType::EXCHANGE_NODE);
-    let built_here: Vec<i32> = nodes
-        .iter()
-        .filter_map(|node| node.hash_join_node.as_ref()?.build_runtime_filters.as_ref())
-        .flatten()
-        .filter_map(|filter| filter.filter_id)
-        .collect();
+    let built_here = filters_built_in(nodes);
     let built_here = &built_here;
     nodes
         .iter()
@@ -299,12 +312,10 @@ pub fn skipped_probes(params: &TExecPlanFragmentParams) -> Vec<SkippedFilter> {
                 let filter_id = filter.filter_id?;
                 let reason = if !is_scan(node) {
                     SkipReason::TargetNotScan
-                } else if !reads_exchanges {
-                    return None;
                 } else if built_here.contains(&filter_id) {
                     SkipReason::SameFragment
                 } else {
-                    SkipReason::NonLeafFragment
+                    return None;
                 };
                 Some(SkippedFilter {
                     filter_id,
