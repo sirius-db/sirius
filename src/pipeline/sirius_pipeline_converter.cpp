@@ -131,7 +131,7 @@ void reorder_pipelines_topologically(std::vector<std::shared_ptr<sirius_pipeline
     }
     auto build_sink = pipeline->dependencies[0]->get_sink();
     D_ASSERT(build_sink->type == op::SiriusPhysicalOperatorType::CONCAT &&
-             build_sink->Cast<op::sirius_physical_concat>().is_build_concat());
+             pipeline->get_source()->input_port_for(*build_sink) == "build");
   }
 #endif
 }
@@ -349,7 +349,7 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
         (locked_parent->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
          locked_parent->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) &&
         pipeline->sink->type == op::SiriusPhysicalOperatorType::CONCAT &&
-        pipeline->sink->Cast<op::sirius_physical_concat>().is_build_concat();
+        locked_parent->source->input_port_for(*pipeline->sink) == "build";
       if (build_side_of_join) {
         locked_parent->dependencies.insert(locked_parent->dependencies.begin(), pipeline);
       } else {
@@ -395,9 +395,8 @@ void sirius_pipeline_converter::link_join_partition_siblings()
       // Positional roles are guaranteed by finalize_pipeline_structure() (tree path) /
       // emission order (legacy). A swap here mislinks sibling partitions and, for
       // right-family joins, drives_partition_count.
-      D_ASSERT(
-        build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
-        build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>().is_build_concat());
+      D_ASSERT(build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
+               pipeline->source->input_port_for(*build_concat_pipeline->get_sink()) == "build");
       bool const inner_join_of_rdj =
         pipeline->source->get_parent_op() != nullptr &&
         pipeline->source->get_parent_op()->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
@@ -412,6 +411,11 @@ void sirius_pipeline_converter::link_join_partition_siblings()
         build_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
       auto& probe_partition_op =
         probe_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
+      build_partition_op.set_join_concat(
+        &build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>());
+      probe_partition_op.set_join_concat(
+        &probe_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>());
+      D_ASSERT(pipeline->source->input_port_for(*probe_concat_pipeline->get_sink()) == "default");
       build_partition_op.set_sibling_partition_op(&probe_partition_op);
       probe_partition_op.set_sibling_partition_op(&build_partition_op);
       if (probe_drives_partition_count) {
