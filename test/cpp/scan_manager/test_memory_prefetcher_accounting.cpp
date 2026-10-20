@@ -481,6 +481,10 @@ TEST_CASE("Resident certificate refusal is invisible to an active memory prefetc
 TEST_CASE("runtime streams remain exclusive beyond the raw pool size",
           "[memory_prefetcher][runtime_streams]")
 {
+  using stream_pool = cucascade::memory::exclusive_stream_pool;
+  // CUDA stream creation under GROW may fail; callers must be able to catch it.
+  static_assert(!noexcept(
+    std::declval<stream_pool&>().acquire_stream(stream_pool::stream_acquire_policy::GROW)));
   prefetcher_env e;
   std::vector<sirius::memory::runtime_stream_pool::lease> leases;
   std::vector<cudaStream_t> streams;
@@ -495,6 +499,22 @@ TEST_CASE("runtime streams remain exclusive beyond the raw pool size",
   // Streams survive the borrowing operation for buffers that retain a deallocation stream.
   for (auto stream : streams)
     REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+}
+
+TEST_CASE("prefetcher rejects multiple target spaces before starting workers",
+          "[memory_prefetcher][scan_manager]")
+{
+  prefetcher_env e;
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto batch     = make_host_batch(e, 4096, 7);
+  auto connector = make_loaded_connector({batch});
+  // Two entries are sufficient to test the cardinality guard on a one-GPU host.
+  // No second device is dereferenced and no workers should be launched.
+  std::vector<cucascade::memory::memory_space*> targets{e.gpu_space, e.gpu_space};
+  REQUIRE_THROWS_AS(memory_prefetcher(memory_prefetcher_config{}, {connector}, targets, lifecycle),
+                    std::invalid_argument);
+  CHECK(batch_tier(*batch) == cucascade::memory::Tier::HOST);
+  CHECK(connector->peek_resident_batches().size() == 1);
 }
 
 TEST_CASE("runtime stream leases retain their pools after manager teardown",

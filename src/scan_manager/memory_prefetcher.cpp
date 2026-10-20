@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <stdexcept>
 
 namespace sirius::scan_manager {
 
@@ -56,6 +57,9 @@ memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
     _connectors(std::move(connectors)),
     _gpu_spaces(std::move(gpu_spaces))
 {
+  if (_gpu_spaces.size() > 1) {
+    throw std::invalid_argument("Memory prefetch requires exactly one eligible GPU");
+  }
   if (_gpu_spaces.empty() || _connectors.empty()) {
     _running.store(false);
     return;
@@ -67,7 +71,7 @@ memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
   try {
     _workers.reserve(_config.num_threads);
     for (std::size_t i = 0; i < _config.num_threads; ++i) {
-      _workers.emplace_back([this, i] { worker_loop(i); });
+      _workers.emplace_back([this] { worker_loop(); });
     }
   } catch (...) {
     stop();
@@ -103,13 +107,12 @@ void memory_prefetcher::stop()
   _workers.clear();
 }
 
-void memory_prefetcher::worker_loop(std::size_t worker_index)
+void memory_prefetcher::worker_loop()
 {
-  std::size_t round = worker_index;
   while (_running.load(std::memory_order_relaxed)) {
     std::size_t converted = 0;
     try {
-      auto* space = _gpu_spaces[round++ % _gpu_spaces.size()];
+      auto* space = _gpu_spaces.front();
       rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
       auto lease = sirius::memory::runtime_stream_pool::acquire(*space);
       converted  = sweep(lease.get(), space);

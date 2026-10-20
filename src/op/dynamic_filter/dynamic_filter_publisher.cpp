@@ -35,6 +35,7 @@
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
@@ -875,10 +876,12 @@ void dynamic_filter_publication_session::observe_whole_build(
     auto const ready =
       writer ? cudaStreamWaitEvent(stream.get(), writer, 0) : cudaDeviceSynchronize();
     if (ready != cudaSuccess) {
-      throw std::runtime_error(
+      // Preserve CUDA evidence for the runtime-health reporter in the execution owner.
+      throw cudf::cuda_error(
         std::string(
           "[dynamic_filter_publication_session::observe_whole_build] source readiness failed: ") +
-        cudaGetErrorString(ready));
+          cudaGetErrorString(ready),
+        ready);
     }
 
     dynamic_filter_publication_outcome outcome;

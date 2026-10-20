@@ -47,9 +47,10 @@ namespace sirius::scan_manager {
  * the same order the task creator drains them) and convert pending resident
  * batches to GPU tier early, gated on GPU memory headroom. When the scan task
  * later runs, prepare_for_processing sees the batch already GPU-resident and
- * skips the upload (and the task creator's cached-scan locality derivation
- * reads the batch's post-conversion space, so device dispatch stays
- * consistent).
+ * skips the upload. Only queries with one eligible GPU may use this prefetcher:
+ * a task may already have latched its device before conversion, so a batch lock
+ * alone cannot coordinate placement on multiple GPUs. Multi-GPU queries upload
+ * on their scan tasks' assigned devices.
  *
  * Why worker threads (rather than one async stream of copies): a conversion is
  * not a bare cudaMemcpyAsync — convert_to allocates the device table,
@@ -107,7 +108,7 @@ class memory_prefetcher {
   }
 
  private:
-  void worker_loop(std::size_t worker_index);
+  void worker_loop();
 
   /// Attempt one sweep over all connectors; returns the number of batches converted.
   std::size_t sweep(::cuda::stream_ref stream, cucascade::memory::memory_space* gpu_space);

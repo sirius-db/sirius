@@ -525,10 +525,12 @@ sirius:
 
 Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
 worker threads walk the pending splits in scan execution order and convert
-resident batches to GPU tier ahead of task creation, gated on GPU memory
-headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default. Workers rotate over
-the query's admitted GPUs, use per-device reservations and exclusive stream leases, and release
-those leases before parking. Multi-GPU concurrency still requires actual hardware qualification.
+resident batches to GPU tier ahead of task execution, gated on GPU memory
+headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default. Background memory
+prefetch runs only when the query has exactly one eligible GPU after admission filtering.
+Workers use that device's reservations and exclusive stream leases, releasing leases before
+parking. With multiple eligible GPUs, scan tasks perform their own uploads on their assigned
+devices; independent background placement could conflict with a task's already selected device.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

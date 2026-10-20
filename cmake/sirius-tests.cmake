@@ -108,6 +108,12 @@ add_dependencies(sirius_unittest sirius_nvtx_startup)
 target_link_options(sirius_unittest PRIVATE
                     "LINKER:--allow-multiple-definition")
 
+# Test-only wrappers let readiness regressions return a CUDA status without
+# poisoning the real device. Production targets never link these wrappers.
+target_sources(sirius_unittest PRIVATE test/cpp/utils/cuda_status_fault.cpp)
+target_link_options(sirius_unittest PRIVATE "LINKER:--wrap=cudaStreamWaitEvent"
+                    "LINKER:--wrap=cudaDeviceSynchronize")
+
 # Isolated opt-in host allocation fault tests; the runner supplies exact
 # call-site ranges.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
