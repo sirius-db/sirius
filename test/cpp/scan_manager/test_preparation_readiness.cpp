@@ -1254,8 +1254,10 @@ TEST_CASE("Stop-aware work takes precedence and releases both callbacks before s
           "[scan_preparation][coordinator][preparation_cleanup]")
 {
   fixture f(1, 1);
-  auto out  = std::make_shared<sink>();
-  auto seen = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  auto out          = std::make_shared<sink>();
+  auto seen         = std::make_shared<test::cleanup_observation>(f.coordinator.publication_gate());
+  auto disposing    = f.make_hold();
+  seen->after_probe = [disposing] { disposing->wait(); };
   std::atomic<bool> checked{false}, released_before_settlement{true}, token_forwarded{false};
   struct checked_input : tagged {
     std::function<void()> inspect;
@@ -1295,6 +1297,10 @@ TEST_CASE("Stop-aware work takes precedence and releases both callbacks before s
            });
   auto guard = f.shutdown_guard();
   f.start();
+  REQUIRE(disposing->await());
+  CHECK_FALSE(checked);
+  CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  disposing->release();
   REQUIRE(out->await(1));
   out->consume();
   f.finish();
