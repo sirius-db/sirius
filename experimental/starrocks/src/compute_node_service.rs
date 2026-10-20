@@ -429,6 +429,8 @@ impl SiriusComputeNodeService {
             ) {
                 self.filters.record_topology(query, topology);
             }
+            // After the topology: a merge node's own holders find their probers there.
+            self.release_unbuilt_probers(&params);
         }
         let expected_senders = Self::receiver_exchanges(&params)?;
         if !expected_senders.is_empty() {
@@ -463,6 +465,9 @@ impl SiriusComputeNodeService {
                                 "key_type",
                                 &filter.column_type,
                             );
+                            if let Some(merge_node) = filter.merge_node {
+                                self.release_probers(query, filter.filter_id, merge_node);
+                            }
                         }
                         self.filters.record_builds(id, broadcast);
                         self.filters
@@ -538,6 +543,55 @@ impl SiriusComputeNodeService {
                 skip.reason.as_str(),
                 "",
             );
+        }
+    }
+
+    /// Tells the probers of every partitioned join filter `params`' fragment builds but no CN can
+    /// that this holder's share won't come. They would otherwise wait for it until the limit.
+    fn release_unbuilt_probers(&self, params: &TExecPlanFragmentParams) {
+        let Some(query) = Self::query_id(params) else {
+            return;
+        };
+        let unbuilt = runtime_filter::unbuilt_shares(params).unwrap_or_else(|err| {
+            warn!(error = %err, "cannot read a fragment's runtime filters");
+            Vec::new()
+        });
+        for filter in unbuilt {
+            self.release_probers(query, filter.filter_id, filter.merge_node);
+        }
+    }
+
+    /// Tells every prober of `query`'s partitioned join filter `filter_id`, found through its
+    /// merge node, that this CN's share won't come. Runs off the caller's thread: the merge node
+    /// may be another CN.
+    fn release_probers(
+        &self,
+        query: FragmentInstanceId,
+        filter_id: i32,
+        merge_node: TNetworkAddress,
+    ) {
+        let service = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("filter-release".to_string())
+            .spawn(move || {
+                match service.filter_topology(query, &merge_node, filter_id) {
+                    Ok(topology) => {
+                        info!(
+                            %query,
+                            filter_id,
+                            probers = topology.probers.len(),
+                            "releasing a runtime filter's probers: no share comes from this CN"
+                        );
+                        service.abandon_share(filter_id, &topology.probers);
+                    }
+                    // Without the probers there is no one to tell: they wait out their limit.
+                    Err(err) => {
+                        warn!(%query, filter_id, error = %err, "cannot release a runtime filter's probers");
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            warn!(%query, filter_id, error = %err, "cannot release a runtime filter's probers");
         }
     }
 
@@ -752,13 +806,14 @@ impl SiriusComputeNodeService {
             // No holder sends a share of a key it can't read.
             return Err(("key_type", column_type));
         }
+        // Holders find their probers through the merge node: without one, no share ever comes.
+        let merge_node = probe
+            .merge_node
+            .as_ref()
+            .ok_or(("no_merge_node", String::new()))?;
         let shares = match probe.shares {
             Some(shares) => shares,
             None => {
-                let merge_node = probe
-                    .merge_node
-                    .as_ref()
-                    .ok_or(("no_merge_node", String::new()))?;
                 self.filter_topology(query, merge_node, probe.filter_id)
                     .map_err(|err| ("shares_unknown", err))?
                     .shares
@@ -3556,6 +3611,95 @@ mod tests {
         assert_eq!(status.status_code, TStatusCode::OK.0);
         let runs = runs_within_3s(&executor, 1);
         assert_eq!(runs, vec![(Vec::new(), Vec::new(), false)]);
+    }
+
+    /// `share_holder`, building `share_filter` from another join's output instead of an
+    /// exchange: no CN can build it.
+    fn unbuilt_share_holder(query: i64, sender: i32, shares: i32) -> TExecPlanFragmentParams {
+        let mut params = share_holder(query, sender, shares);
+        let plan = params.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        let mut build = plan.nodes[0].clone();
+        build.node_id = 6;
+        build.num_children = 0;
+        build.hash_join_node.as_mut().unwrap().build_runtime_filters = None;
+        plan.nodes[2] = build;
+        params
+    }
+
+    #[test]
+    fn a_holder_that_cannot_build_its_share_releases_its_probers_at_once() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        let mut root = unbuilt_share_holder(54, 0, 2);
+        root.params.as_mut().unwrap().runtime_filter_params =
+            Some(filter_topology(2, &[(54, 3, local_brpc())]));
+        exec_ok(&service, &root);
+        exec_ok(&service, &share_probing_scan(54, 2));
+        exec_ok(&service, &unbuilt_share_holder(54, 1, 2));
+        // The scan, unfiltered, without a share run or the wait.
+        let runs = runs_within_3s(&executor, 1);
+        assert_eq!(runs, vec![(Vec::new(), Vec::new(), false)]);
+        assert_eq!(service.filters.deferred(), 0);
+    }
+
+    #[test]
+    fn a_holder_that_cannot_build_its_share_tells_a_remote_prober() {
+        let (holder_cn, nixl) = nixl_service(Arc::new(FilterRecorder::new(sparse_keys())));
+        let peer = TNetworkAddress::new("127.0.0.1".to_string(), 8061);
+        nixl.topologies.lock().unwrap().insert(
+            0,
+            FilterTopology {
+                shares: 2,
+                probers: vec![(FragmentInstanceId::from_halves(56, 3), peer.clone())],
+            },
+        );
+        let mut holder = unbuilt_share_holder(56, 1, 2);
+        let plan = holder.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0]
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .build_runtime_filters
+            .as_mut()
+            .unwrap()[0]
+            .runtime_filter_merge_nodes = Some(vec![peer]);
+        exec_ok(&holder_cn, &holder);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while nixl.controls.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The prober the merge node lists hears that no share comes from this CN.
+        assert_eq!(
+            *nixl.controls.lock().unwrap(),
+            vec![(
+                "127.0.0.1:8061".parse().unwrap(),
+                NixlEnvelope::ShareAbandoned {
+                    instance: FragmentInstanceId::from_halves(56, 3),
+                    filter_id: 0,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn a_scan_does_not_wait_for_a_partitioned_filter_without_a_merge_node() {
+        let executor = Arc::new(FilterRecorder::new(sparse_keys()));
+        let service = short_wait_service(executor.clone());
+        let mut scan = share_probing_scan(55, 2);
+        let plan = scan.fragment.as_mut().unwrap().plan.as_mut().unwrap();
+        plan.nodes[0].probe_runtime_filters.as_mut().unwrap()[0].runtime_filter_merge_nodes =
+            Some(Vec::new());
+        let logs = captured_logs(|| service.run_or_register(&scan).unwrap());
+        assert!(
+            logs.contains(r#"filter_id=0 node=0 outcome="skipped" reason="no_merge_node""#),
+            "{logs}"
+        );
+        assert_eq!(service.filters.deferred(), 0);
+        assert_eq!(
+            executor.runs.lock().unwrap().len(),
+            1,
+            "the scan ran at once"
+        );
     }
 
     #[test]
