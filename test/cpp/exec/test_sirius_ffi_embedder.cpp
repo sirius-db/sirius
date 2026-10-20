@@ -25,18 +25,23 @@
 #include "sirius/ffi.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/arrow/arrow.hpp>
 #include <substrait/plan.pb.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <memory>
 #include <source_location>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -387,4 +392,100 @@ TEST_CASE("FFI ExchangeInbox refuses unknown tokens and every call after its Con
   ctx.reset();
   REQUIRE_THROWS(exchange->release(1));
   REQUIRE_THROWS(exchange->outstanding());
+}
+
+TEST_CASE("FFI copies a key column out of parked and received batches without taking them",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_key_copy");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+  constexpr std::uint64_t frame = 1ull << 20;
+  auto ctx                      = sirius::ffi::make_context_with_ring(
+    isolated_memory_config_path().string(), frame, 4 * frame, 4 * frame, 0.5, 64 * frame, 1);
+  auto exchange = ctx->exchange_inbox();
+  auto ring     = ctx->ring_exchange();
+  REQUIRE(exchange != nullptr);
+  REQUIRE(ring != nullptr);
+  auto const scan = [&] {
+    auto fragment = sirius::ffi::make_fragment(*ctx);
+    fragment->declare_output(0);
+    fragment->build(local_files_plan(path));
+    fragment->run();
+    return fragment;
+  };
+
+  // A parked sender's output.
+  auto parked        = scan();
+  std::uint64_t rows = 0;
+  std::int64_t min   = std::numeric_limits<std::int64_t>::max();
+  std::int64_t max   = std::numeric_limits<std::int64_t>::min();
+  parked->output_key_stats(0, 0, rows, min, max);
+  CHECK(std::tuple{rows, min, max} ==
+        std::tuple{std::uint64_t{5}, std::int64_t{1}, std::int64_t{5}});
+  CHECK_THROWS_WITH(parked->output_key_stats(0, 1, rows, min, max),
+                    Catch::Matchers::ContainsSubstring("out of range"));
+
+  // A batch received from a remote sender and landed, as the CN does on arrival: here the
+  // context's ring ships to itself, one frame at a time.
+  auto sent            = scan();
+  std::uint64_t remote = 0;
+  {
+    std::uint64_t token = 0, sent_rows = 0, stream_bytes = 0;
+    auto const header = sent->export_ring(0, token, sent_rows, stream_bytes);
+    REQUIRE(header);
+    std::uint8_t tier    = 0;
+    std::uint32_t frames = 0;
+    auto const landing   = ring->begin(
+      reinterpret_cast<std::uintptr_t>(header->data()), header->size(), tier, sent_rows, frames);
+    auto const wait = [&](std::uint64_t ticket) {
+      while (!ring->done(ticket)) {}
+    };
+    for (std::uint32_t k = 0; k < frames; ++k) {
+      auto const send = ring->lease_send();
+      auto const recv = ring->lease_recv();
+      REQUIRE(send >= 0);
+      REQUIRE(recv >= 0);
+      wait(ring->stage(token, k, static_cast<std::uint32_t>(send)));
+      auto const len = std::min(frame, stream_bytes - std::uint64_t{k} * frame);
+      REQUIRE(cudaMemcpy(reinterpret_cast<void*>(ring->recv_base() +
+                                                 static_cast<std::uint64_t>(recv) * frame),
+                         reinterpret_cast<void const*>(ring->send_base() +
+                                                       static_cast<std::uint64_t>(send) * frame),
+                         len,
+                         cudaMemcpyDeviceToDevice) == cudaSuccess);
+      REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+      ring->release_send(static_cast<std::uint32_t>(send));
+      wait(ring->copy_out(landing, k, static_cast<std::uint32_t>(recv), len));
+      ring->release_recv(static_cast<std::uint32_t>(recv));
+    }
+    ring->release_job(token);
+    remote = ring->seal(landing);
+  }
+  rows = 0;
+  min  = std::numeric_limits<std::int64_t>::max();
+  max  = std::numeric_limits<std::int64_t>::min();
+  exchange->key_stats(remote, 0, rows, min, max);
+  CHECK(std::tuple{rows, min, max} ==
+        std::tuple{std::uint64_t{5}, std::int64_t{1}, std::int64_t{5}});
+
+  // A receiver reads both copies; the sources keep their batches.
+  auto receiver = sirius::ffi::make_fragment(*ctx);
+  receiver->declare_input_column(0, "a", "BIGINT");
+  receiver->build(stream_read_plan(0));
+  CHECK(receiver->copy_output_column(*parked, 0, 0, 0) == parked->output_batch_count(0));
+  receiver->copy_received_column(0, remote, 0);
+  receiver->close_input(0, 0);
+  receiver->run();
+  auto copied = result_i64s(*receiver);
+  std::sort(copied.begin(), copied.end());
+  CHECK(copied == std::vector<std::int64_t>{1, 1, 2, 2, 3, 3, 4, 4, 5, 5});
+  CHECK(parked->output_row_count(0) == 5);
+  rows = 0;
+  exchange->key_stats(remote, 0, rows, min, max);
+  CHECK(rows == 5);
+  CHECK_THROWS_WITH(exchange->key_stats(remote + 1, 0, rows, min, max),
+                    Catch::Matchers::ContainsSubstring("holds no received batch"));
+  exchange->release(remote);
+  CHECK(exchange->outstanding() == 0);
 }

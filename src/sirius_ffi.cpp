@@ -518,6 +518,19 @@ void ExchangeInbox::release(std::uint64_t token) const { exchange_->release(toke
 
 std::size_t ExchangeInbox::outstanding() const { return exchange_->outstanding(); }
 
+void ExchangeInbox::key_stats(std::uint64_t token,
+                              std::uint32_t column,
+                              std::uint64_t& rows,
+                              std::int64_t& min,
+                              std::int64_t& max) const
+{
+  sirius::exec::exchange_inbox::key_stats stats{rows, min, max};
+  exchange_->add_key_stats(*exchange_->peek_batch(token), static_cast<int>(column), stats);
+  rows = stats.rows;
+  min  = stats.min;
+  max  = stats.max;
+}
+
 OutputDrain::OutputDrain(std::shared_ptr<sirius::exec::batch_stream> stream,
                          std::shared_ptr<sirius::exec::exchange_inbox> exchange,
                          std::shared_ptr<sirius::exec::ring_exchange> ring)
@@ -652,6 +665,16 @@ struct Fragment::Impl {
       resolved.emplace(id, std::move(spec));
     }
     return resolved;
+  }
+
+  // Push a copied batch, on the GPU, into input `stream_id`; push() checks it against the
+  // declared schema.
+  void push_copy(std::uint64_t stream_id, std::shared_ptr<cucascade::data_batch> batch)
+  {
+    if (!fragment->push(stream_id, std::move(batch))) {
+      throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
+                                            " refused a copied batch; it had already ended");
+    }
   }
 
   // CREATE OR REPLACE VIEW sirius_stream_<id> AS SELECT * FROM sirius_stream_source(<id>)
@@ -812,6 +835,49 @@ std::unique_ptr<OutputDrain> Fragment::output_drain(std::uint64_t stream_id) con
   }
   return std::make_unique<OutputDrain>(
     impl_->fragment->output_stream(stream_id), impl_->ctx.exchange, impl_->ctx.ring);
+}
+
+void Fragment::output_key_stats(std::uint64_t stream_id,
+                                std::uint32_t column,
+                                std::uint64_t& rows,
+                                std::int64_t& min,
+                                std::int64_t& max) const
+{
+  impl_->require_built("output_key_stats()");
+  auto& exchange = impl_->ctx.require_exchange();
+  sirius::exec::exchange_inbox::key_stats stats{rows, min, max};
+  for (auto const& batch : impl_->fragment->peek_output(stream_id)) {
+    exchange.add_key_stats(*batch, static_cast<int>(column), stats);
+  }
+  rows = stats.rows;
+  min  = stats.min;
+  max  = stats.max;
+}
+
+std::size_t Fragment::copy_output_column(Fragment& source,
+                                         std::uint64_t source_stream_id,
+                                         std::uint64_t input_stream_id,
+                                         std::uint32_t column)
+{
+  impl_->require_built("copy_output_column()");
+  source.impl_->require_built("copy_output_column()");
+  auto& exchange     = impl_->ctx.require_exchange();
+  std::size_t copied = 0;
+  for (auto const& batch : source.impl_->fragment->peek_output(source_stream_id)) {
+    impl_->push_copy(input_stream_id, exchange.copy_column(*batch, static_cast<int>(column)));
+    ++copied;
+  }
+  return copied;
+}
+
+void Fragment::copy_received_column(std::uint64_t input_stream_id,
+                                    std::uint64_t token,
+                                    std::uint32_t column)
+{
+  impl_->require_built("copy_received_column()");
+  auto& exchange = impl_->ctx.require_exchange();
+  impl_->push_copy(input_stream_id,
+                   exchange.copy_column(*exchange.peek_batch(token), static_cast<int>(column)));
 }
 
 void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)

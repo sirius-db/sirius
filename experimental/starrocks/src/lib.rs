@@ -67,6 +67,7 @@ mod ring_nixl;
 mod ring_transport;
 #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 mod ring_wire;
+mod runtime_filters;
 
 pub use brpc::BrpcServer;
 #[cfg(feature = "sirius-engine")]

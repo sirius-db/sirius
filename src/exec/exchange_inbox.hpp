@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -82,6 +83,23 @@ class exchange_inbox {
   /// The batch @p token holds, left in place for its receiver.
   /// @throws sirius::invalid_input_exception on a token that holds no received batch.
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> peek_batch(std::uint64_t token) const;
+
+  /// Non-null rows, minimum and maximum of one integer column.
+  struct key_stats {
+    std::uint64_t rows{0};
+    std::int64_t min{std::numeric_limits<std::int64_t>::max()};
+    std::int64_t max{std::numeric_limits<std::int64_t>::min()};
+  };
+
+  /// Adds column @p column of @p batch to @p stats, bringing the batch back to the GPU first.
+  /// @throws sirius::invalid_input_exception on a column that is out of range or not an integer.
+  void add_key_stats(cucascade::data_batch& batch, int column, key_stats& stats);
+
+  /// A new GPU batch holding a copy of column @p column of @p batch, which is left as it was
+  /// (but back on the GPU).
+  /// @throws sirius::invalid_input_exception on a column that is out of range.
+  [[nodiscard]] std::shared_ptr<cucascade::data_batch> copy_column(cucascade::data_batch& batch,
+                                                                   int column);
 
   /// Frees what @p token holds; an unknown or consumed token is ignored.
   void release(std::uint64_t token);
