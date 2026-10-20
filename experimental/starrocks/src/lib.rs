@@ -60,6 +60,9 @@ mod proto;
 mod prpc;
 mod result_encoder;
 mod result_store;
+// The loop runs only with NIXL; without it the tests drive it over an in-process fabric.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+mod ring_transport;
 #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 mod ring_wire;
 
