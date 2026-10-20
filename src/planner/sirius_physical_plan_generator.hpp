@@ -25,6 +25,7 @@
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -149,6 +150,12 @@ class sirius_physical_plan_generator {
   [[nodiscard]] static bool plans_declared_type(sirius::logical_type const& planned,
                                                 duckdb::LogicalType const& declared);
 
+  //! Throws NotImplementedException (CPU fallback) unless each @p planned column passes
+  //! `plans_declared_type` for its @p declared one; @p subject names the input in the message.
+  static void require_planned_schema(std::span<sirius::logical_type const> planned,
+                                     duckdb::vector<duckdb::LogicalType> const& declared,
+                                     std::string_view subject);
+
  protected:
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
 
@@ -236,6 +243,13 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
     duckdb::LogicalSetOperation& op);
+
+  //! A zero-aggregate grouped aggregate over @p child keyed on its @p key_columns, in that order;
+  //! its output is exactly those columns.
+  static duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_dedup(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+    std::span<duckdb::idx_t const> key_columns,
+    duckdb::idx_t estimated_cardinality);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);

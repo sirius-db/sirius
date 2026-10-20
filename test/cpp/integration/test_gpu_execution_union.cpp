@@ -266,21 +266,17 @@ TEST_CASE_METHOD(UnionFixture,
 }
 
 TEST_CASE_METHOD(UnionFixture,
-                 "gpu_execution keeps a non-recursive WITH RECURSIVE UNION on the CPU",
+                 "gpu_execution deduplicates a non-recursive WITH RECURSIVE UNION",
                  "[integration][gpu_execution][union]")
 {
   // With no self-reference the binder plans a bare distinct UNION with no DISTINCT above it, so the
-  // set-operation builder's refusal is all that stands between this query and duplicate rows.
+  // set-operation builder deduplicates it.
   std::string const cte = "WITH RECURSIVE c AS (SELECT k FROM ua UNION SELECT k FROM ub) ";
-  expect_plan_fallback_matches_cpu(cte + "SELECT * FROM c");
-  {
-    sirius::test::scoped_sirius_setting no_fallback{*con, "enable_duckdb_fallback", false};
-    auto const result = con->Query(cte + "SELECT * FROM c");
-    REQUIRE(result);
-    REQUIRE(result->HasError());
-    REQUIRE_THAT(result->GetError(),
-                 Catch::Matchers::ContainsSubstring("WITH RECURSIVE body with no self-reference"));
-  }
+  compare_gpu_vs_cpu(cte + "SELECT * FROM c");
+  compare_gpu_vs_cpu(
+    "WITH RECURSIVE c AS (SELECT k, v FROM ua UNION SELECT k, v FROM ub) "
+    "SELECT * FROM c");
+  compare_gpu_vs_cpu(cte + "SELECT count(*) FROM c");
 
   // Four distinct keys and one NULL out of six input rows: the shape does need a dedup.
   run_ok("SET gpu_execution = false;");
@@ -289,6 +285,20 @@ TEST_CASE_METHOD(UnionFixture,
   REQUIRE(count);
   REQUIRE_FALSE(count->HasError());
   REQUIRE(count->Collection().GetValue(0, 0).GetValue<int64_t>() == 5);
+}
+
+TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution non-recursive WITH RECURSIVE UNION ignores default_collation",
+                 "[integration][gpu_execution][union]")
+{
+  // DuckDB groups this shape on the raw values with no collation pushed, so under nocase 'A' and
+  // 'a' stay apart on the CPU, and the GPU must keep them apart too.
+  run_ok("CREATE TABLE ucase (v VARCHAR);");
+  run_ok("INSERT INTO ucase VALUES ('A'), ('a'), ('A');");
+  sirius::test::scoped_sirius_setting collation{*con, "default_collation", "nocase"};
+  compare_gpu_vs_cpu(
+    "WITH RECURSIVE c AS (SELECT v FROM ucase UNION SELECT v FROM ucase) "
+    "SELECT * FROM c");
 }
 
 TEST_CASE_METHOD(UnionFixture,

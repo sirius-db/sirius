@@ -19,6 +19,7 @@
 #include "op/sirius_physical_union.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <numeric>
 #include <string>
 
 namespace sirius::planner {
@@ -43,17 +44,17 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   // DISTINCT above it and sets `setop_all`, so the node itself always concatenates. The exception
   // is a WITH RECURSIVE body that never references itself and has no USING KEY: it binds to this
   // node with `setop_all` false and nothing above it to deduplicate (duckdb
-  // `Binder::BindNode(RecursiveCTENode&)`). This throw keeps that shape from returning duplicate
-  // rows.
+  // `Binder::BindNode(RecursiveCTENode&)`), so this builder adds the dedup itself, at the end.
+  //
+  // The dedup groups on every column, and a group key cannot be nested; refuse before planning.
   if (!op.setop_all) {
-    throw duckdb::NotImplementedException(
-      "UNION that must deduplicate itself (a WITH RECURSIVE body with no self-reference) is not "
-      "supported on the GPU (falling back to CPU)");
+    for (duckdb::idx_t i = 0; i < op.types.size(); i++) {
+      reject_nested_column_type(op.types[i], "column " + std::to_string(i), "UNION");
+    }
   }
 
   // `allow_out_of_order == false` requires output in arm order, which this operator does not
-  // guarantee. It arrives with `setop_all == true`, so the guard above does not catch it, and the
-  // result would be silently mis-ordered rather than an error.
+  // guarantee, so the result would be silently mis-ordered rather than an error.
   if (!op.allow_out_of_order) {
     throw duckdb::NotImplementedException(
       "UNION with ordered arms (allow_out_of_order = false) is not supported on the GPU (falling "
@@ -73,26 +74,18 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     duckdb::make_uniq<sirius::op::sirius_physical_union>(declared_types, op.estimated_cardinality);
 
   for (duckdb::idx_t arm_index = 0; arm_index < op.children.size(); arm_index++) {
-    auto arm                  = create_plan(*op.children[arm_index]);
-    auto const& planned_types = arm->get_types();
-    if (planned_types.size() != declared_types.size()) {
-      throw duckdb::NotImplementedException(
-        "UNION: input column count does not match the set operation output (falling back to "
-        "CPU)");
-    }
+    auto arm = create_plan(*op.children[arm_index]);
     // Arms are forwarded unconverted, so each must plan the declared type or, below an
     // aggregate, its `planned_aggregate_type`.
-    for (duckdb::idx_t i = 0; i < declared_types.size(); i++) {
-      if (plans_declared_type(planned_types[i], op.types[i])) { continue; }
-      throw duckdb::NotImplementedException(
-        "UNION: arm " + std::to_string(arm_index) + " plans " + planned_types[i].to_string() +
-        " for column " + std::to_string(i) + " but the union declares " +
-        declared_types[i].to_string() + " (falling back to CPU)");
-    }
+    require_planned_schema(arm->get_types(), op.types, "UNION arm " + std::to_string(arm_index));
     union_op->children.push_back(std::move(arm));
   }
 
-  return union_op;
+  if (op.setop_all) { return union_op; }
+  // Group on every column with no aggregates, as DuckDB's own planner does for `!setop_all`.
+  duckdb::vector<duckdb::idx_t> key_columns(declared_types.size());
+  std::iota(key_columns.begin(), key_columns.end(), duckdb::idx_t{0});
+  return plan_dedup(std::move(union_op), key_columns, op.estimated_cardinality);
 }
 
 }  // namespace sirius::planner

@@ -330,13 +330,13 @@ in what DuckDB's binder puts around it. `UNION ALL` is the node alone, and
 a `DISTINCT` over that same node, which Sirius lowers to a grouped aggregate.
 `create_plan(LogicalSetOperation&)` rejects `EXCEPT` and `INTERSECT`.
 
-The plan builder (`plan_union` in `src/planner/sirius_plan_set_operation.cpp`) sends three more
+The plan builder (`plan_union` in `src/planner/sirius_plan_set_operation.cpp`) sends two more
 shapes to the CPU. The first is `allow_out_of_order = false`, which requires output in arm order.
 The second is an arm that plans a column type other than the declared one, since arms are
 forwarded unconverted. The aggregate builder's HUGEINT→BIGINT narrowing
-(`planned_aggregate_type()`) is the one difference allowed. The third is `setop_all = false`, which
-is what a `WITH RECURSIVE` body with no self-reference binds to. That union must deduplicate
-itself, and no `DISTINCT` sits above it to do so.
+(`planned_aggregate_type()`) is the one difference allowed. A `WITH RECURSIVE` body with no
+self-reference binds to `setop_all = false` with no `DISTINCT` above it, so `plan_union` puts the
+DISTINCT lowering's grouped aggregate over the union itself, keyed on every column.
 
 - **One port per arm.** `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, feeding a distinct
   `"union_{i}"` port. The distinct names are required: `add_port` is last-writer-wins and the

@@ -2308,6 +2308,22 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a non-recursive WITH RECURSIVE UNION dedups over the union",
+                 "[plan_tree_shape][union][isolated_context]")
+{
+  auto plan = generate_sirius_plan(
+    *con,
+    "WITH RECURSIVE c AS (SELECT id FROM big_left UNION SELECT rid FROM small_right) "
+    "SELECT * FROM c");
+  INFO(tree_to_string(plan.get()));
+
+  auto* aggregate = require_distinct_wrap_chain(plan.get());
+  CHECK(aggregate->group_idx == std::vector<int>{0});
+  REQUIRE(aggregate->children.size() == 1);
+  CHECK(aggregate->children[0]->type == SiriusPhysicalOperatorType::UNION);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - a UNION arm planning another type than the union declares is "
                  "rejected",
                  "[plan_tree_shape][union][isolated_context]")
@@ -2340,8 +2356,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     using sirius_physical_plan_generator::sirius_physical_plan_generator;
   } generator(*con->context);
   CHECK_THROWS_WITH(generator.create_plan(set_operation->Cast<duckdb::LogicalSetOperation>()),
-                    Catch::Matchers::ContainsSubstring("UNION: arm 0 plans") &&
-                      Catch::Matchers::ContainsSubstring("for column 0 but the union declares"));
+                    Catch::Matchers::ContainsSubstring("UNION arm 0: the planned input has") &&
+                      Catch::Matchers::ContainsSubstring("for column 0 but the node declares"));
   auto rollback = con->Query("ROLLBACK");
   REQUIRE(rollback);
   REQUIRE_FALSE(rollback->HasError());

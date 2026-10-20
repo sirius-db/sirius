@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -67,20 +68,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   // op.types normally equals the planned child's schema, but a child built by another arm can
   // narrow a type without its parents re-resolving, so compare element types and not only width.
   auto const& planned_types = plan->get_types();
-  auto const declared_types = sirius::from_duckdb_vec(op.types);
-  if (planned_types.size() != declared_types.size()) {
-    throw duckdb::NotImplementedException(
-      "DISTINCT: the planned child produces " + std::to_string(planned_types.size()) +
-      (planned_types.size() == 1 ? " column" : " columns") + " but the DISTINCT node declares " +
-      std::to_string(declared_types.size()) + " (falling back to CPU)");
-  }
-  for (duckdb::idx_t i = 0; i < declared_types.size(); i++) {
-    if (plans_declared_type(planned_types[i], op.types[i])) { continue; }
-    throw duckdb::NotImplementedException("DISTINCT: the planned child produces " +
-                                          planned_types[i].to_string() + " for column " +
-                                          std::to_string(i) + " but the DISTINCT node declares " +
-                                          declared_types[i].to_string() + " (falling back to CPU)");
-  }
+  require_planned_schema(planned_types, op.types, "DISTINCT");
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups;
   duckdb::vector<std::unique_ptr<sirius::ast::node>> projections;
@@ -164,25 +152,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
     }
   }
 
-  // With zero aggregates the operator's output is exactly its group key columns.
-  duckdb::vector<sirius::logical_type> group_types;
-  duckdb::vector<std::unique_ptr<sirius::ast::node>> group_nodes;
-  group_types.reserve(groups.size());
-  group_nodes.reserve(groups.size());
+  duckdb::vector<duckdb::idx_t> key_columns;
+  key_columns.reserve(groups.size());
   for (auto const& group : groups) {
-    auto const index = group->Cast<duckdb::BoundReferenceExpression>().Index();
-    group_types.push_back(planned_types[index]);
-    group_nodes.push_back(std::make_unique<sirius::ast::node>(
-      sirius::ast::reference{static_cast<std::uint32_t>(index), planned_types[index]}));
+    key_columns.push_back(group->Cast<duckdb::BoundReferenceExpression>().Index());
   }
-
-  auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
-                                         sirius::op::sirius_physical_grouped_aggregate>(
-    std::move(group_types),
-    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
-    std::move(group_nodes),
-    op.estimated_cardinality);
-  group_by->children.push_back(std::move(plan));
+  auto group_by = plan_dedup(std::move(plan), key_columns, op.estimated_cardinality);
 
   if (!requires_projection) { return group_by; }
 
@@ -191,6 +166,33 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   auto const estimated_cardinality = group_by->estimated_cardinality;
   return push_projection(
     std::move(group_by), planned_types, std::move(projections), estimated_cardinality);
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::plan_dedup(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+  std::span<duckdb::idx_t const> key_columns,
+  duckdb::idx_t estimated_cardinality)
+{
+  // With zero aggregates the operator's output is exactly its group key columns.
+  auto const& child_types = child->get_types();
+  duckdb::vector<sirius::logical_type> group_types;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> group_nodes;
+  group_types.reserve(key_columns.size());
+  group_nodes.reserve(key_columns.size());
+  for (auto const index : key_columns) {
+    group_types.push_back(child_types[index]);
+    group_nodes.push_back(std::make_unique<sirius::ast::node>(
+      sirius::ast::reference{static_cast<std::uint32_t>(index), child_types[index]}));
+  }
+
+  auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
+                                         sirius::op::sirius_physical_grouped_aggregate>(
+    std::move(group_types),
+    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
+    std::move(group_nodes),
+    estimated_cardinality);
+  group_by->children.push_back(std::move(child));
+  return group_by;
 }
 
 }  // namespace sirius::planner
