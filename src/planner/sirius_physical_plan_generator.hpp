@@ -145,13 +145,8 @@ class sirius_physical_plan_generator {
   //! The type an aggregate result declared as @p type is planned as; HUGEINT narrows to BIGINT.
   [[nodiscard]] static duckdb::LogicalType planned_aggregate_type(duckdb::LogicalType const& type);
 
-  //! Whether a child column planned as @p planned can stand for one declared as @p declared:
-  //! the same type, or `planned_aggregate_type` of it from an aggregate below.
-  [[nodiscard]] static bool plans_declared_type(sirius::logical_type const& planned,
-                                                duckdb::LogicalType const& declared);
-
-  //! Throws NotImplementedException (CPU fallback) unless each @p planned column passes
-  //! `plans_declared_type` for its @p declared one; @p subject names the input in the message.
+  //! Throws NotImplementedException (CPU fallback) unless each @p planned column is its @p declared
+  //! type, or `planned_aggregate_type` of it; @p subject names the input in the message.
   static void require_planned_schema(std::span<sirius::logical_type const> planned,
                                      duckdb::vector<duckdb::LogicalType> const& declared,
                                      std::string_view subject);

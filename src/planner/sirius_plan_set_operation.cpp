@@ -75,8 +75,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
 
   for (duckdb::idx_t arm_index = 0; arm_index < op.children.size(); arm_index++) {
     auto arm = create_plan(*op.children[arm_index]);
-    // Arms are forwarded unconverted, so each must plan the declared type or, below an
-    // aggregate, its `planned_aggregate_type`.
+    // Arms are forwarded unconverted, so each must plan the declared schema.
     require_planned_schema(arm->get_types(), op.types, "UNION arm " + std::to_string(arm_index));
     union_op->children.push_back(std::move(arm));
   }

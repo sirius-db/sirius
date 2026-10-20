@@ -765,13 +765,6 @@ duckdb::LogicalType sirius_physical_plan_generator::planned_aggregate_type(
   return type == duckdb::LogicalType::HUGEINT ? duckdb::LogicalType::BIGINT : type;
 }
 
-bool sirius_physical_plan_generator::plans_declared_type(sirius::logical_type const& planned,
-                                                         duckdb::LogicalType const& declared)
-{
-  return planned == sirius::from_duckdb(declared) ||
-         planned == sirius::from_duckdb(planned_aggregate_type(declared));
-}
-
 void sirius_physical_plan_generator::require_planned_schema(
   std::span<sirius::logical_type const> planned,
   duckdb::vector<duckdb::LogicalType> const& declared,
@@ -784,7 +777,12 @@ void sirius_physical_plan_generator::require_planned_schema(
       std::to_string(declared.size()) + " (falling back to CPU)");
   }
   for (duckdb::idx_t i = 0; i < declared.size(); i++) {
-    if (plans_declared_type(planned[i], declared[i])) { continue; }
+    // BIGINT may stand for a declared HUGEINT: the aggregate builder narrows its own output types
+    // and its parents keep DuckDB's.
+    if (planned[i] == sirius::from_duckdb(declared[i]) ||
+        planned[i] == sirius::from_duckdb(planned_aggregate_type(declared[i]))) {
+      continue;
+    }
     throw duckdb::NotImplementedException(
       std::string(subject) + ": the planned input has " + planned[i].to_string() + " for column " +
       std::to_string(i) + " but the node declares " + sirius::from_duckdb(declared[i]).to_string() +

@@ -76,6 +76,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1851,18 +1852,24 @@ TEST_CASE("planned_aggregate_type narrows HUGEINT only", "[plan_tree_shape]")
         LogicalType::DECIMAL(38, 0));
 }
 
-TEST_CASE("plans_declared_type accepts the declared type or its aggregate narrowing",
+TEST_CASE("require_planned_schema accepts the declared type or its aggregate narrowing",
           "[plan_tree_shape]")
 {
   using generator    = sirius::planner::sirius_physical_plan_generator;
   auto const bigint  = sirius::from_duckdb(LogicalType::BIGINT);
   auto const hugeint = sirius::from_duckdb(LogicalType::HUGEINT);
-  CHECK(generator::plans_declared_type(hugeint, LogicalType::HUGEINT));
-  CHECK(generator::plans_declared_type(bigint, LogicalType::HUGEINT));
-  CHECK(generator::plans_declared_type(bigint, LogicalType::BIGINT));
-  CHECK_FALSE(generator::plans_declared_type(hugeint, LogicalType::BIGINT));
-  CHECK_FALSE(
-    generator::plans_declared_type(sirius::from_duckdb(LogicalType::INTEGER), LogicalType::BIGINT));
+  auto const integer = sirius::from_duckdb(LogicalType::INTEGER);
+  auto require       = [](sirius::logical_type const& planned, LogicalType const& declared) {
+    generator::require_planned_schema(std::span{&planned, 1}, {declared}, "probe");
+  };
+  CHECK_NOTHROW(require(hugeint, LogicalType::HUGEINT));
+  CHECK_NOTHROW(require(bigint, LogicalType::HUGEINT));
+  CHECK_NOTHROW(require(bigint, LogicalType::BIGINT));
+  CHECK_THROWS_WITH(require(hugeint, LogicalType::BIGINT),
+                    Catch::Matchers::ContainsSubstring("probe: the planned input has"));
+  CHECK_THROWS_AS(require(integer, LogicalType::BIGINT), duckdb::NotImplementedException);
+  CHECK_THROWS_WITH(generator::require_planned_schema(std::span{&bigint, 1}, {}, "probe"),
+                    Catch::Matchers::ContainsSubstring("has 1 column but the node declares 0"));
 }
 
 //===----------------------------------------------------------------------===//

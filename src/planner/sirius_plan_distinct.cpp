@@ -65,8 +65,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   }
 
   auto plan = create_plan(*op.children[0]);
-  // op.types normally equals the planned child's schema, but a child built by another arm can
-  // narrow a type without its parents re-resolving, so compare element types and not only width.
+  // The dedup's output types are the child's, so the child must plan the declared schema.
   auto const& planned_types = plan->get_types();
   require_planned_schema(planned_types, op.types, "DISTINCT");
 
