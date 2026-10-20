@@ -28,6 +28,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
 {
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_UNION: return plan_union(op);
+    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
+    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
+      throw duckdb::NotImplementedException(
+        "EXCEPT and INTERSECT are not supported on the GPU (falling back to CPU)");
     default: throw duckdb::InternalException("Unrecognized operator type for LogicalSetOperation");
   }
 }
@@ -56,7 +60,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
       "back to CPU)");
   }
 
-  // N-ary: `a UNION ALL b UNION ALL c` binds to one node with three children.
+  // N-ary: a chain of one kind, `a UNION b UNION c` or all `UNION ALL`, binds to one node with
+  // three children. A mixed chain nests.
   D_ASSERT(op.children.size() >= 2);
   if (op.children.size() < 2) {
     throw duckdb::NotImplementedException(

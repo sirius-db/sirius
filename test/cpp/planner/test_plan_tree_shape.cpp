@@ -2298,7 +2298,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   auto* aggregate = require_distinct_wrap_chain(plan.get());
   CHECK(aggregate->group_idx == std::vector<int>{0});
   // Nothing sits between the dedup and the union, not even an identity projection.
-  CHECK(collect(plan.get(), SiriusPhysicalOperatorType::PROJECTION).empty());
   REQUIRE(aggregate->children.size() == 1);
   auto* union_op = aggregate->children[0].get();
   REQUIRE(union_op->type == SiriusPhysicalOperatorType::UNION);

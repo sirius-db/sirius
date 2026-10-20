@@ -327,8 +327,8 @@ and `execute` is the identity. N-ary: every path loops over `children`.
 **How SQL reaches it.** SQL `UNION` and `UNION ALL` both plan a `LOGICAL_UNION`. They differ only
 in what DuckDB's binder puts around it. `UNION ALL` is the node alone, and
 `a UNION ALL b UNION ALL c` binds to one node with three children. `UNION` and `UNION BY NAME` are
-a `DISTINCT` over that same node, which Sirius lowers to a grouped aggregate. The generator's
-dispatch switch rejects `EXCEPT` and `INTERSECT`.
+a `DISTINCT` over that same node, which Sirius lowers to a grouped aggregate.
+`create_plan(LogicalSetOperation&)` rejects `EXCEPT` and `INTERSECT`.
 
 The plan builder (`plan_union` in `src/planner/sirius_plan_set_operation.cpp`) sends three more
 shapes to the CPU. The first is `allow_out_of_order = false`, which requires output in arm order.

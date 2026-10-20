@@ -203,8 +203,7 @@ class sirius_physical_plan_generator {
   // create_plan(duckdb::LogicalCopyToFile &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalExplain
   // &op);
-  //! Dispatches a set operation on its type. EXCEPT / INTERSECT share the same DuckDB node but
-  //! keep their own throwing case in the dispatch switch, so they never arrive.
+  //! Dispatches a set operation on its type; EXCEPT / INTERSECT throw, so they run on the CPU.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalSetOperation& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalUpdate
