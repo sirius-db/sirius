@@ -21,15 +21,21 @@
 #include <catch.hpp>
 
 namespace sirius::test {
-// One-shot CUDA readiness failure on the calling thread, armed only after test
-// setup. These wrappers are linked into the test executable, never production.
+// One-shot CUDA failure, armed only after test setup. Readiness faults target
+// the calling thread; acquisition faults target the next worker acquisition.
+// These wrappers are linked into the isolated test executable, never production.
 class scoped_cuda_status_fault {
  public:
-  enum operation { wait_event = 1, synchronize_device = 2 };
+  // acquire_stream targets the next pool acquisition on any thread, allowing
+  // a prefetch worker to observe a typed failure without poisoning the device.
+  enum operation { wait_event = 1, synchronize_device = 2, acquire_stream = 3 };
   scoped_cuda_status_fault(operation op, cudaError_t status);
   ~scoped_cuda_status_fault();
   scoped_cuda_status_fault(scoped_cuda_status_fault const&)            = delete;
   scoped_cuda_status_fault& operator=(scoped_cuda_status_fault const&) = delete;
   bool consumed();
+
+ private:
+  operation operation_;
 };
 }  // namespace sirius::test

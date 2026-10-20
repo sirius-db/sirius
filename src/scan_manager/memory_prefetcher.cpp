@@ -116,7 +116,8 @@ void memory_prefetcher::handle_error(std::exception_ptr error) noexcept
 
 void memory_prefetcher::worker_loop()
 {
-  while (_running.load(std::memory_order_relaxed)) {
+  // Another query or worker can poison the shared runtime while this worker is idle.
+  while (_running.load(std::memory_order_relaxed) && !_lifecycle.runtime_failed()) {
     std::size_t converted = 0;
     try {
       auto* space = _gpu_spaces.front();
@@ -159,7 +160,9 @@ std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream,
   // data lands on the GPU first.
   for (std::size_t ci = 0; ci < _connectors.size(); ++ci) {
     const auto& connector = _connectors[ci];
-    if (!_running.load(std::memory_order_relaxed)) { return converted; }
+    if (!_running.load(std::memory_order_relaxed) || _lifecycle.runtime_failed()) {
+      return converted;
+    }
 
     // Actively-draining connector: its scan tasks convert their own popped
     // batches on 1 stream per pipeline thread, so racing them near the pop
@@ -202,7 +205,9 @@ std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream,
       // For a quiet connector, back off to tail-first within one batch of the
       // scan starting to drain it (the next sweep re-plans with the margin).
       if (!draining && connector->is_draining(_config.drain_quiet_ms)) { break; }
-      if (!_running.load(std::memory_order_relaxed)) { return converted; }
+      if (!_running.load(std::memory_order_relaxed) || _lifecycle.runtime_failed()) {
+        return converted;
+      }
 
       // Cheap pre-check under a shared lock; skip GPU-resident batches. Must
       // be NON-blocking: a sibling worker converting this batch holds its

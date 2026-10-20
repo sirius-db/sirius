@@ -114,7 +114,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(
     sirius_cuda_fault_test
     test/cpp/operator/test_dynamic_filter_readiness_fault.cpp
-    test/cpp/utils/cuda_status_fault.cpp src/sirius_extension_entry.cpp
+    test/cpp/scan_manager/test_memory_prefetcher_health.cpp
+    test/cpp/utils/cuda_status_fault.cpp
+    src/sirius_extension_entry.cpp
     test/cpp/utils/sirius_extension_loader.cpp)
   target_include_directories(
     sirius_cuda_fault_test BEFORE
@@ -128,8 +130,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             ${SIRIUS_CURL_TARGET} ${CMAKE_DL_LIBS})
   sirius_link_duckdb_extensions(sirius_cuda_fault_test PRIVATE)
   target_link_options(
-    sirius_cuda_fault_test PRIVATE "LINKER:--allow-multiple-definition"
-    "LINKER:--wrap=cudaStreamWaitEvent" "LINKER:--wrap=cudaDeviceSynchronize")
+    sirius_cuda_fault_test
+    PRIVATE
+    "LINKER:--allow-multiple-definition"
+    "LINKER:--wrap=cudaStreamWaitEvent"
+    "LINKER:--wrap=cudaDeviceSynchronize"
+    "LINKER:--wrap=_ZN9cucascade6memory21exclusive_stream_pool14acquire_streamENS1_21stream_acquire_policyE"
+  )
   set_target_properties(
     sirius_cuda_fault_test
     PROPERTIES ENABLE_EXPORTS ON
