@@ -587,3 +587,14 @@ TEST_CASE("runtime stream registrations preserve replacements when moved or rese
   REQUIRE_THROWS_AS(pool::acquire(*e.gpu_space), std::logic_error);
   REQUIRE(cudaStreamSynchronize(lease.get().get()) == cudaSuccess);
 }
+
+TEST_CASE("memory prefetch rejects null device entries before starting workers",
+          "[memory_prefetcher]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  REQUIRE_THROWS_AS(memory_prefetcher(memory_prefetcher_config{},
+                                      {},
+                                      std::vector<cucascade::memory::memory_space*>{nullptr},
+                                      lifecycle),
+                    std::invalid_argument);
+}

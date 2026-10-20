@@ -875,14 +875,9 @@ void dynamic_filter_publication_session::observe_whole_build(
     auto const writer         = source.get_writer_event();
     auto const ready =
       writer ? cudaStreamWaitEvent(stream.get(), writer, 0) : cudaDeviceSynchronize();
-    if (ready != cudaSuccess) {
-      // Preserve CUDA evidence for the runtime-health reporter in the execution owner.
-      throw cudf::cuda_error(
-        std::string(
-          "[dynamic_filter_publication_session::observe_whole_build] source readiness failed: ") +
-          cudaGetErrorString(ready),
-        ready);
-    }
+    // Use cuDF's standard clearing/sticky-error probe while retaining CUDA status
+    // for the runtime-health reporter in the execution owner.
+    CUDF_CUDA_TRY(ready);
 
     dynamic_filter_publication_outcome outcome;
     try {

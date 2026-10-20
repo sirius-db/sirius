@@ -2058,15 +2058,27 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
     if (state.active_gpu_ids.empty() ||
         std::find(state.active_gpu_ids.begin(),
                   state.active_gpu_ids.end(),
-                  space->get_device_id()) != state.active_gpu_ids.end())
-      gpu_spaces.push_back(_reservation_manager.get_memory_space(cucascade::memory::Tier::GPU,
-                                                                 space->get_device_id()));
+                  space->get_device_id()) != state.active_gpu_ids.end()) {
+      if (auto* mutable_space = _reservation_manager.get_memory_space(cucascade::memory::Tier::GPU,
+                                                                      space->get_device_id())) {
+        gpu_spaces.push_back(mutable_space);
+      } else {
+        SIRIUS_LOG_WARN("[memory_prefetcher] GPU {} has no mutable memory space; skipping",
+                        space->get_device_id());
+      }
+    }
   }
   // Admission determines the allowed devices, not each scan task's placement.
   // A task can latch its device while a batch is still on the host; prefetching
   // it onto another allowed GPU would leave that task with a foreign-device table.
   // Keep background conversion on a single eligible GPU until placement is shared.
-  if (gpu_spaces.size() != 1) return;
+  if (gpu_spaces.size() != 1) {
+    SIRIUS_LOG_WARN(
+      "[memory_prefetcher] enabled but skipped: query has {} eligible GPUs; exactly one is "
+      "required",
+      gpu_spaces.size());
+    return;
+  }
 
   std::vector<std::shared_ptr<split_connector>> connectors;
   connectors.reserve(state.scans.size());

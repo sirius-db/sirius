@@ -282,7 +282,7 @@ TEST_CASE("whole-build readiness failures retain CUDA status and finish the publ
     FAIL("readiness failure must propagate");
   } catch (cudf::cuda_error const& error) {
     CHECK(error.error_code() == status);
-    CHECK(std::string(error.what()).find("source readiness failed") != std::string::npos);
+    CHECK(std::string(error.what()).find(cudaGetErrorName(status)) != std::string::npos);
   }
   REQUIRE(injection.consumed());
   CHECK(fixture.stats.publication_attempts.load() == 1);

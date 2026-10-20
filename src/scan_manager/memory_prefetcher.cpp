@@ -57,8 +57,9 @@ memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
     _connectors(std::move(connectors)),
     _gpu_spaces(std::move(gpu_spaces))
 {
-  if (_gpu_spaces.size() > 1) {
-    throw std::invalid_argument("Memory prefetch requires exactly one eligible GPU");
+  if (_gpu_spaces.size() > 1 ||
+      std::find(_gpu_spaces.begin(), _gpu_spaces.end(), nullptr) != _gpu_spaces.end()) {
+    throw std::invalid_argument("Memory prefetch requires one non-null eligible GPU");
   }
   if (_gpu_spaces.empty() || _connectors.empty()) {
     _running.store(false);
