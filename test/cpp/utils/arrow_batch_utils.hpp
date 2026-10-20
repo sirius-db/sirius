@@ -16,12 +16,12 @@
 
 #pragma once
 
+#include "exec/arrow_result_stream.hpp"     // sirius::exec::export_arrow_result
 #include "utils/parquet_fixture_utils.hpp"  // sirius::test::scoped_sirius_disable
 
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/arrow/arrow.hpp>
-#include <duckdb/common/arrow/result_arrow_wrapper.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -57,10 +57,12 @@ inline std::unique_ptr<arrow_batch> arrow_batch_from_sql(const std::string& sql)
   REQUIRE_FALSE(result->HasError());
   // Above any test's row count, so the first batch holds the whole result.
   constexpr duckdb::idx_t rows_per_batch = 1 << 20;
-  duckdb::ResultArrowArrayStreamWrapper wrapper(std::move(result), rows_per_batch);
+  ArrowArrayStream stream{};
+  sirius::exec::export_arrow_result(std::move(result), stream, rows_per_batch);
   auto batch = std::make_unique<arrow_batch>();
-  REQUIRE(wrapper.stream.get_schema(&wrapper.stream, &batch->schema) == 0);
-  REQUIRE(wrapper.stream.get_next(&wrapper.stream, &batch->array) == 0);
+  REQUIRE(stream.get_schema(&stream, &batch->schema) == 0);
+  REQUIRE(stream.get_next(&stream, &batch->array) == 0);
+  stream.release(&stream);
   REQUIRE(batch->array.release != nullptr);
   return batch;
 }

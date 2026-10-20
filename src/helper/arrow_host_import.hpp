@@ -37,7 +37,7 @@ namespace sirius {
 
 /**
  * @brief Copy one host Arrow record batch (a struct array) to the device as a `cudf::table` whose
- * column types equal `get_cudf_type(types[i])`. Columns bind by position.
+ * column types equal `require_cudf_type(types[i])`. Columns bind by position.
  *
  * Refused before any copy: dictionary encoding, 64-bit offsets, timezone-aware timestamps,
  * `decimal256`, struct-level nulls, a column declared `HUGEINT`, `UHUGEINT` or nested, a scalar

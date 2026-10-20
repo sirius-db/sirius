@@ -283,8 +283,9 @@ std::vector<cudf::data_type> check_columns(const ArrowSchema& schema,
     refuse_unsupported_shape(error_prefix, i, names[i], child, decimal);
     // No 128-bit integer on the GPU, and nested children are not type-checked.
     const auto declared = types[i].id();
-    if (declared == type_id::HUGEINT || declared == type_id::UHUGEINT ||
-        cudf::is_nested(expected.emplace_back(get_cudf_type(types[i])))) {
+    const auto native   = get_cudf_type(types[i]);
+    if (declared == type_id::HUGEINT || declared == type_id::UHUGEINT || !native ||
+        cudf::is_nested(expected.emplace_back(*native))) {
       throw invalid_input_exception("{}: column {} ({}) is declared {}, which cannot be imported",
                                     error_prefix,
                                     i,

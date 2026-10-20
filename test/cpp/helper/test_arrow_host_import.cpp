@@ -81,7 +81,7 @@ TEST_CASE("arrow_host_import: DuckDB's scalar types import at the declared cudf 
 
   REQUIRE(table->num_rows() == 5);
   for (cudf::size_type i = 0; i < table->num_columns(); ++i) {
-    REQUIRE(table->get_column(i).type() == sirius::get_cudf_type(types[i]));
+    REQUIRE(table->get_column(i).type() == sirius::require_cudf_type(types[i]));
   }
   REQUIRE(table->get_column(0).null_count() == 1);
   // Decimal128 narrowed to DECIMAL64 by the declared precision; unscaled values are i * 125.
