@@ -29,6 +29,7 @@
 // clang-format on
 #include "operator/operator_test_utils.hpp"
 #include "utils/host_allocation_fault.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/test_validation_utility.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -52,7 +53,6 @@
 #include <catch.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <cucascade/memory/null_device_memory_resource.hpp>
 #include <data/data_batch_utils.hpp>
 #include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
 #include <op/dynamic_filter/detail/accumulation_failure.hpp>
@@ -2986,21 +2986,11 @@ class any_device_filter final : public sirius_dynamic_filter,
   std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> _inner;
 };
 
-/// Host memory space whose ID names @p device_id, so a batch placed in it reports that device while
-/// its table stays on the current one. It reserves no memory.
-std::unique_ptr<cucascade::memory::memory_space> make_space_naming_device(int device_id)
-{
-  return std::make_unique<cucascade::memory::memory_space>(
-    cucascade::memory::host_memory_space_config{
-      .numa_id = device_id, .initial_number_pools = 0, .mr_factory_fn = [](int, std::size_t) {
-        return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
-          cucascade::memory::null_device_memory_resource{}};
-      }});
-}
 }  // namespace
 
-TEST_CASE("consumer passes a batch on another device through without filtering or claims",
-          "[dynamic_filter][scan_merge][consumer_device]")
+TEST_CASE(
+  "consumer passes a program prepared for another device through without filtering or claims",
+  "[dynamic_filter][scan_merge][consumer_device]")
 {
   ::cuda::stream_ref stream                = cudf::get_default_stream();
   std::shared_ptr<cudf::table const> input = make_int64_sequence_table(10, stream);
@@ -3036,25 +3026,11 @@ TEST_CASE("consumer passes a batch on another device through without filtering o
     REQUIRE(stats.snapshot().applications_skipped_other_device == 1);
   };
 
-  SECTION("the batch's memory space names another device")
-  {
-    // The program is prepared for the current device, so only the batch's memory space differs.
-    auto const space = make_space_naming_device(other_device);
-    auto batch       = batch_for(*space);
-    auto program     = prepare_identity(consumer, input->view());
-    REQUIRE(program.has_value());
-    auto source = batch->to_read_only();
-    require_passed_through(
-      consumer_test_access::apply(consumer, std::move(*program), std::move(source), stream, mr));
-  }
-  SECTION("the program was prepared for another device")
-  {
-    // The bare table has no memory space, so only the program names the other device.
-    auto program = prepare_identity(consumer, input->view(), std::nullopt, other_device);
-    REQUIRE(program.has_value());
-    require_passed_through(
-      consumer_test_access::apply(consumer, std::move(*program), input, stream, mr));
-  }
+  // The bare table has no memory space, so only the program names the other device.
+  auto program = prepare_identity(consumer, input->view(), std::nullopt, other_device);
+  REQUIRE(program.has_value());
+  require_passed_through(
+    consumer_test_access::apply(consumer, std::move(*program), input, stream, mr));
 
   // The same batch on the current device filters, so the filter itself is not what declined.
   auto batch = batch_for(*gpu_space);
@@ -3066,6 +3042,66 @@ TEST_CASE("consumer passes a batch on another device through without filtering o
   REQUIRE(filter->requested_devices == std::vector<int>{current_device});
   consumer.commit(std::move(filtered));
   REQUIRE(stats.snapshot().applications_skipped_other_device == 1);
+}
+
+TEST_CASE("consumer passes a batch on another device through without filtering or claims",
+          "[dynamic_filter][scan_merge][consumer_device][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  auto manager         = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto* consumer_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* source_space   = manager->get_memory_space(cucascade::memory::Tier::GPU, 1);
+  REQUIRE(consumer_space != nullptr);
+  REQUIRE(source_space != nullptr);
+
+  // Construct the remote representation with memory and a writer stream on its actual owner.
+  std::shared_ptr<cucascade::data_batch> remote;
+  {
+    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{1}};
+    auto const owner_stream = source_space->acquire_stream();
+    remote                  = sirius::make_data_batch(
+      make_int64_sequence_table(10, owner_stream), *source_space, owner_stream, {});
+    owner_stream.sync();
+  }
+
+  rmm::cuda_set_device_raii const consumer_guard{rmm::cuda_device_id{0}};
+  auto const stream = consumer_space->acquire_stream();
+  auto const mr     = consumer_space->get_default_allocator();
+  auto input        = make_int64_sequence_table(10, stream);
+  auto channel      = std::make_shared<sirius_dynamic_filter_set>();
+  auto producer     = channel->register_producer({0});
+  auto filter       = std::make_shared<any_device_filter>(make_in_list_prefix(4, stream));
+  REQUIRE(producer.push_filter(0, filter));
+  sirius::op::dynamic_filter_stats stats;
+  dynamic_filter_consumer consumer(channel, {.stats = &stats}, {});
+  auto program = prepare_identity(consumer, input->view());
+  REQUIRE(program.has_value());
+  auto result =
+    consumer_test_access::apply(consumer, std::move(*program), remote->to_read_only(), stream, mr);
+  REQUIRE(result.take_output() == nullptr);
+  REQUIRE(result.prefix_counts().empty());
+  REQUIRE(filter->requested_devices.empty());
+  auto const storage = consumer_test_access::storage(result);
+  REQUIRE_FALSE(storage.completed);
+  REQUIRE_FALSE(storage.has_source);
+  auto receipt = consumer.finish(std::move(result), 1);
+  REQUIRE(receipt.endpoint == nullptr);
+  REQUIRE(receipt.applied.empty());
+  auto& gate = consumer_test_access::gate(consumer);
+  REQUIRE_FALSE(gate_test_access::filter_keep_ratio(gate, {filter.get(), 0}, 1).has_value());
+  REQUIRE(gate_test_access::needs_combined_sample(gate, channel->snapshot()));
+  REQUIRE(stats.snapshot().applications_skipped_other_device == 1);
+
+  auto local = prepare_identity(consumer, input->view());
+  REQUIRE(local.has_value());
+  auto batch = sirius::make_data_batch(std::move(input), *consumer_space, stream, {});
+  auto filtered =
+    consumer_test_access::apply(consumer, std::move(*local), batch->to_read_only(), stream, mr);
+  REQUIRE(filtered.take_output()->num_rows() == 4);
+  REQUIRE(filter->requested_devices == std::vector<int>{0});
+  consumer.commit(std::move(filtered));
+  REQUIRE(stats.snapshot().applications_skipped_other_device == 1);
+  stream.sync();
 }
 
 TEST_CASE("decode selection ranks unmeasured filters by kind and key count after measured ones",
