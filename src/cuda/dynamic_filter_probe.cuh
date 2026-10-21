@@ -306,7 +306,7 @@ struct membership_probe_functor {
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
     // clang-format off
-    out[idx] = prior_mask_keeps(prior_words, idx) && 
+    out[idx] = prior_mask_keeps(prior_words, idx) &&
                prior_mask_keeps(prior_keep, idx) &&
                membership_row_keeps(adapt, lookup, valid, idx);
     // clang-format on

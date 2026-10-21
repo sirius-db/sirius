@@ -407,7 +407,6 @@ class dynamic_filter_consumer {
   std::vector<binding> decode_bindings,
   sirius::op::dynamic_filter_stats* stats);
 
-
 //===--------------------------------------------------------------------===//
 // TEST SEAMS
 //===--------------------------------------------------------------------===//
