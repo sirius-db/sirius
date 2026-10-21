@@ -276,7 +276,6 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/pipeline/test_union_build_pipelines.cpp
     test/cpp/scan/bench_decode_codecs.cpp
-    test/cpp/scan/bench_fused_membership.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_insert_delta.cpp

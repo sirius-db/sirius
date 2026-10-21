@@ -28,7 +28,6 @@
 #include <cudf/ast/expressions.hpp>
 // clang-format on
 #include "operator/operator_test_utils.hpp"
-#include "scan/dynamic_filter_mask_test_utils.hpp"
 #include "utils/host_allocation_fault.hpp"
 #include "utils/test_validation_utility.hpp"
 
@@ -41,6 +40,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/span.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -85,6 +85,8 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -97,8 +99,6 @@ using sirius::op::zone_map_entry;
 using sirius::op::scan::dynamic_filter_apply_mode;
 using sirius::op::scan::merge_dynamic_filters_into_ast;
 using sirius::op::scan::scan_plan;
-using sirius::test::dynamic_filter_mask::cached_layout;
-using sirius::test::dynamic_filter_mask::counts_of;
 
 namespace {
 
@@ -2244,6 +2244,11 @@ TEST_CASE("wide rows skip measured filters that keep more than sixty percent",
 }
 
 namespace {
+std::vector<cudf::size_type> counts_of(application_result const& result)
+{
+  return {result.prefix_counts().begin(), result.prefix_counts().end()};
+}
+
 application_result run_owned(dynamic_filter_consumer& consumer,
                              std::shared_ptr<cudf::table const> input,
                              std::span<binding const> bindings,
@@ -3194,6 +3199,18 @@ std::shared_ptr<cudf::table const> make_cached_residual_input(cudf::size_type ro
   return std::make_shared<cudf::table>(std::move(columns));
 }
 
+cached_view_layout cached_layout(bool residual = false)
+{
+  cached_view_layout layout;
+  layout.output_columns    = {0};
+  layout.projected_columns = {0};
+  if (residual) {
+    layout.residual = std::make_unique<sirius::ast::node>(
+      sirius::ast::reference{1, sirius::logical_type::make(sirius::type_id::BOOLEAN)});
+  }
+  return layout;
+}
+
 application_result run_cached(dynamic_filter_consumer& consumer,
                               std::shared_ptr<cudf::table const> const& input,
                               std::span<binding const> bindings,
@@ -4075,11 +4092,74 @@ TEST_CASE("cached projected nullable string and nested payload matches manual su
 namespace {
 using sirius::op::fused_membership_input;
 using sirius::op::sirius_mask_applicable;
-using sirius::test::dynamic_filter_mask::copy_to_host;
-using sirius::test::dynamic_filter_mask::fuse_membership;
-using sirius::test::dynamic_filter_mask::lone_mask;
-using sirius::test::dynamic_filter_mask::make_device_column;
-using sirius::test::dynamic_filter_mask::make_membership_filter;
+
+/// Copies @p values into a new device column of @p type without a null mask.
+template <class T>
+std::unique_ptr<cudf::column> make_device_column(std::vector<T> const& values,
+                                                 cudf::data_type type,
+                                                 ::cuda::stream_ref stream)
+{
+  auto column = cudf::make_fixed_width_column(
+    type, static_cast<cudf::size_type>(values.size()), cudf::mask_state::UNALLOCATED, stream);
+  if (!values.empty()) {
+    RMM_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().data<T>(),
+                                 values.data(),
+                                 values.size() * sizeof(T),
+                                 cudaMemcpyHostToDevice,
+                                 stream.get()));
+    stream.sync();
+  }
+  return column;
+}
+
+template <class T>
+std::vector<T> copy_to_host(T const* data, std::size_t count, ::cuda::stream_ref stream)
+{
+  std::vector<T> result(count);
+  if (count != 0) {
+    RMM_CUDA_TRY(cudaMemcpyAsync(
+      result.data(), data, count * sizeof(T), cudaMemcpyDeviceToHost, stream.get()));
+  }
+  stream.sync();
+  return result;
+}
+
+/// Builds a hash-set IN-list (@p kind 0), Bloom (1) or small IN-list (2) filter over @p keys.
+std::unique_ptr<sirius::op::sirius_mask_applicable> make_membership_filter(
+  int kind, cudf::column_view keys, ::cuda::stream_ref stream)
+{
+  auto const mr = cudf::get_current_device_resource_ref();
+  switch (kind) {
+    case 0: return std::make_unique<sirius::op::sirius_dynamic_in_list_filter>(keys, stream, mr);
+    case 1: return std::make_unique<sirius::op::sirius_dynamic_bloom_filter>(keys, stream, mr);
+    default:
+      return std::make_unique<sirius::op::sirius_dynamic_small_in_list_filter>(keys, stream, mr);
+  }
+}
+
+/// Runs `try_fused_membership_mask` on the current device and returns its submitted round count.
+std::size_t fuse_membership(std::span<sirius::op::fused_membership_input const> steps,
+                            cudf::mutable_column_view running,
+                            std::optional<cudf::column_view> residual,
+                            cudf::device_span<cudf::size_type> counts,
+                            ::cuda::stream_ref stream)
+{
+  std::size_t rounds = 0;
+  sirius::op::try_fused_membership_mask(
+    steps, rmm::get_current_cuda_device().value(), running, residual, counts, rounds, stream);
+  return rounds;
+}
+
+/// The BOOL8 values `filter.compute_mask` produces for @p probe on the current device.
+std::vector<std::uint8_t> lone_mask(sirius::op::sirius_mask_applicable const& filter,
+                                    cudf::column_view probe,
+                                    ::cuda::stream_ref stream)
+{
+  auto const mask = filter.compute_mask(
+    probe, rmm::get_current_cuda_device().value(), stream, cudf::get_current_device_resource_ref());
+  return copy_to_host(
+    mask->view().data<std::uint8_t>(), static_cast<std::size_t>(mask->size()), stream);
+}
 
 void set_single_null(cudf::column& column, cudf::size_type row, ::cuda::stream_ref stream)
 {

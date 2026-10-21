@@ -30,7 +30,6 @@
 // declared schema surfaces far from the scan that produced it.
 
 #include "operator/operator_test_utils.hpp"
-#include "scan/resident_scan_test_utils.hpp"
 #include "utils/test_validation_utility.hpp"
 
 #include <cudf/column/column.hpp>
@@ -96,14 +95,31 @@
 #include <utility>
 #include <vector>
 
-using sirius::test::resident_scan::admit_fixture_resident_input;
-using sirius::test::resident_scan::env;
-using sirius::test::resident_scan::resident_column;
-using sirius::test::resident_scan::resident_columns;
-using sirius::test::resident_scan::resident_parquet_info;
-using sirius::test::resident_scan::test_env;
-
 namespace {
+
+struct test_env {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mgr;
+  cucascade::memory::memory_space* gpu_space;
+  cucascade::memory::memory_space* host_space;
+  rmm::cuda_stream conv_stream;
+
+  test_env()
+    : mgr(sirius::test::operator_utils::initialize_memory_manager()),
+      gpu_space(mgr->get_memory_space(cucascade::memory::Tier::GPU, 0)),
+      host_space(mgr->get_memory_space(cucascade::memory::Tier::HOST, 0)),
+      conv_stream()
+  {
+  }
+
+  ::cuda::stream_ref stream() { return conv_stream; }
+};
+
+test_env& env()
+{
+  sirius::test::operator_utils::ensure_converter_registry();
+  static test_env e;
+  return e;
+}
 
 std::unique_ptr<cudf::column> make_column(cucascade::memory::memory_space& space,
                                           cudf::data_type type,
@@ -275,6 +291,14 @@ sirius::op::scan::sirius_gpu_scan_operator make_bigint_scan(
 }
 
 constexpr std::size_t kRows = 8;
+
+void admit_fixture_resident_input(sirius::op::scan::scan_operator_input& input)
+{
+  sirius::op::scan::pin_validation validation;
+  validation.identity = validation.layout = validation.structure = {true, true};
+  input.resident_contract_id                                     = 1;
+  input.resident_validation                                      = validation;
+}
 
 /// Serves one batch, then reports exhaustion.
 class queued_provider final : public sirius::scan_manager::databatch_provider {
@@ -1136,6 +1160,68 @@ TEST_CASE("decode history at a deferred ordinal keeps the endpoint from sampling
 namespace {
 
 namespace scan = sirius::op::scan;
+
+std::unique_ptr<scan::parquet_ingestible_table_info> resident_parquet_info(
+  std::vector<std::size_t> const& columns,
+  std::size_t output_arity,
+  std::optional<std::size_t> positive_filter = std::nullopt)
+{
+  auto info   = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->names = {"key", "payload", "keep"};
+  for (std::size_t i = 0; i < info->names.size(); ++i) {
+    info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+  }
+  for (auto column : columns) {
+    info->column_ids.emplace_back(column);
+    info->projection_ids.push_back(info->projection_ids.size());
+  }
+  info->projected_output_count = output_arity;
+  if (positive_filter) {
+    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info->table_filters->PushFilter(
+      duckdb::ProjectionIndex(*positive_filter),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                    duckdb::Value::BIGINT(0)));
+  }
+  return info;
+}
+
+template <typename T>
+std::unique_ptr<cudf::column> resident_column(
+  std::vector<T> const& values,
+  cudf::type_id type,
+  std::optional<cudf::size_type> null_row = std::nullopt)
+{
+  auto& e     = env();
+  auto column = cudf::make_numeric_column(
+    cudf::data_type{type},
+    static_cast<cudf::size_type>(values.size()),
+    null_row ? cudf::mask_state::ALL_VALID : cudf::mask_state::UNALLOCATED,
+    e.stream(),
+    e.gpu_space->get_default_allocator());
+  if (!values.empty()) {
+    REQUIRE(cudaMemcpyAsync(column->mutable_view().data<T>(),
+                            values.data(),
+                            values.size() * sizeof(T),
+                            cudaMemcpyHostToDevice,
+                            e.stream().get()) == cudaSuccess);
+  }
+  if (null_row) {
+    cudf::set_null_mask(
+      column->mutable_view().null_mask(), *null_row, *null_row + 1, false, e.stream());
+    column->set_null_count(1);
+  }
+  e.stream().sync();
+  return column;
+}
+
+std::shared_ptr<cucascade::data_batch> resident_columns(
+  std::vector<std::unique_ptr<cudf::column>> columns)
+{
+  auto& e = env();
+  return sirius::make_data_batch(
+    std::make_unique<cudf::table>(std::move(columns)), *e.gpu_space, e.stream(), {});
+}
 
 template <typename T>
 void require_resident_values(cudf::column_view column,
