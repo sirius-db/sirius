@@ -151,6 +151,31 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Sorted-Key Grouped Aggregation
+
+**Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted, with about four rows per key; the per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.
+
+**Mechanism:** Before building the `cudf::groupby` object, `grouped_aggregate_table()` checks whether the batch has a single fixed-width, null-free, non-dictionary key and no COLLECT_SET aggregate. If so, it verifies with `cudf::is_sorted` that the key is ascending and, when it is, constructs the group-by with `cudf::sorted::YES`, so cuDF finds runs of equal keys and reduces each run instead of hashing. The check runs on every eligible batch; an unsorted batch keeps the hash path, so correctness never depends on the data layout. When the keys are verified sorted, the stable STDDEV_SAMP path skips its own sort. Keys of parquet tables are sorted in practice when the table was pinned in key order (see [Natural-Order Parquet Pinning](#natural-order-parquet-pinning)).
+
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `grouped_aggregate_table()`
+
+**Config:** Always on. TPC-H SF1000 on a GB300, together with natural-order pinning: q18 1.148 s → 0.830 s.
+
+### Order-Preserving Partition and Sorted Merge
+
+**Motivation:** After a sorted-key partial aggregation, each partial result is sorted, and with a table pinned in key order the partials cover consecutive key ranges. `cudf::hash_partition` scatters rows without keeping their order, so the merge still had to hash and re-aggregate everything (q18: 352 ms of merge kernels at SF1000).
+
+**Mechanism:** Two parts behind one option, so every producer and consumer agree on each key's partition:
+1. **Partition:** `stable_hash_partition()` assigns rows to partitions by MurmurHash3 row hash modulo the partition count, but keeps the input order within each partition (stable radix sort of partition id and row index, then a gather). PARTITION and the partitioned streaming sink read the option from the query's operator-options snapshot, so every hash partition of a query switches together.
+2. **Merge:** for a single INT64 group key, `merge_grouped_aggregate()` orders the incoming partials by their first key before concatenating, verifies the concatenation with `cudf::is_sorted`, and uses the sorted-keys group-by when the check passes. Any other input keeps the hash merge.
+
+**Code path:**
+- `src/cuda/stable_hash_partition.cu`, `src/op/partition/stable_hash_partition.hpp` — order-preserving partition
+- `src/op/partition/gpu_partition_impl.cpp` — dispatch in `hash_partition()`
+- `src/op/merge/gpu_merge_impl.cpp` — `merge_grouped_aggregate()`
+
+**Config:** `enable_order_preserving_partition` (default: `true`, under `sirius.operator_params`; see [Configuration](configuration.md#operator-parameters)). TPC-H SF1000 on a GB300, on top of the sorted-key aggregation: q18 0.830 s → 0.639 s; no other query moved by more than run-to-run noise.
+
 ### Distinct Hash Join (PR #558)
 
 **Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.
@@ -343,6 +368,16 @@ result materialization restore native carriers.
 **Config:** `enable_compressed_materialization` (default: `true`), settable through YAML under
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
+
+### Natural-Order Parquet Pinning
+
+**Motivation:** `pin_table` receives local parquet files from `GlobFiles` in directory order, and each pinned chunk packs several files. A table stored sorted across numbered files (`part.0`, `part.1`, …) therefore pinned into chunks whose rows are out of order: at TPC-H SF1000 only 3 of q18's 39 lineitem batches were in `l_orderkey` order.
+
+**Mechanism:** `pin_table` sorts the file list in natural order (digit runs compared numerically, so `part.2` precedes `part.10`) before materializing. Chunks then hold consecutive files, and a table whose files are each sorted and cover consecutive key ranges pins into sorted chunks. Nothing relies on this ordering for correctness: the consumers verify sortedness themselves (see [Sorted-Key Grouped Aggregation](#sorted-key-grouped-aggregation) and [Order-Preserving Partition and Sorted Merge](#order-preserving-partition-and-sorted-merge)), and matching a scan's files to a pinned entry ignores order. The cost is one sort of the file-name list.
+
+**Code path:** `src/sirius_extension.cpp` — pin file list; `src/helper/natural_sort.hpp` — `natural_less()`
+
+**Config:** Always on. On its own it changes little; it lets the sorted aggregation paths apply, with which all 39 q18 batches are sorted.
 
 ### Late Materialization (unreleased, experimental)
 

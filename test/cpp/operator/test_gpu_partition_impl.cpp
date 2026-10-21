@@ -21,7 +21,12 @@
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/filling.hpp>
+#include <cudf/scalar/scalar.hpp>
+
 #include <cucascade/memory/memory_space.hpp>
+
+#include <map>
 
 using namespace sirius;
 using namespace cucascade;
@@ -165,6 +170,56 @@ TEST_CASE("Hash partition basic", "[operator][hash_partition]")
       ro, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space);
   }
   validate_hash_partition(*input_batch, output_batches, num_partitions);
+}
+
+TEST_CASE("Hash partition keeps the input order when asked", "[operator][hash_partition]")
+{
+  auto* mem_space                           = get_shared_mem_space();
+  constexpr int num_input_rows              = 1000;
+  constexpr int num_partitions              = 4;
+  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32}};
+  // Column 0 is replaced with the row index below, so its range does not matter.
+  std::vector<std::optional<std::pair<int, int>>> ranges = {std::nullopt, std::pair{0, 50}};
+  auto random_batch =
+    create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
+  auto stream = cudf::get_default_stream();
+  auto row_index =
+    cudf::sequence(num_input_rows, cudf::numeric_scalar<int64_t>(0, true, stream), stream);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(row_index));
+  columns.push_back(
+    std::make_unique<cudf::column>(sirius::get_cudf_table_view(*random_batch).column(1), stream));
+  auto input_batch = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                             *mem_space,
+                                             stream,
+                                             sirius::telemetry::batch_telemetry_info{});
+
+  std::vector<std::shared_ptr<data_batch>> output_batches;
+  {
+    auto ro        = input_batch->to_read_only();
+    output_batches = gpu_partition_impl::hash_partition(ro,
+                                                        /*partition_key_idx=*/{1},
+                                                        /*partition_key_cast_types=*/{},
+                                                        num_partitions,
+                                                        /*preserve_input_order=*/true,
+                                                        stream,
+                                                        *mem_space);
+  }
+  validate_hash_partition(*input_batch, output_batches, num_partitions);
+
+  std::map<int64_t, int> partition_of_key;
+  for (int partition_idx = 0; partition_idx < num_partitions; ++partition_idx) {
+    std::vector<std::vector<int64_t>> rows;
+    copy_data_to_host_by_rows(sirius::get_cudf_table_view(*output_batches[partition_idx]), rows);
+    for (std::size_t row_idx = 1; row_idx < rows.size(); ++row_idx) {
+      REQUIRE(rows[row_idx - 1][0] < rows[row_idx][0]);
+    }
+    for (auto const& row : rows) {
+      auto const [it, inserted] = partition_of_key.emplace(row[1], partition_idx);
+      REQUIRE(it->second == partition_idx);
+    }
+  }
 }
 
 TEST_CASE("Hash partition with invalid input", "[operator][hash_partition]")

@@ -548,6 +548,11 @@ class sirius_physical_operator {
 
   [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept;
 
+  /// Whether hash partitions keep their input order and grouped-aggregate merges look for sorted
+  /// partials (`operator_params::enable_order_preserving_partition`). Every operator of a query
+  /// reads the same per-query snapshot, so all hash partitions of a query agree.
+  [[nodiscard]] bool order_preserving_partition_enabled() const noexcept;
+
   [[nodiscard]] std::shared_ptr<like_multiliteral_cache const> like_cache() const noexcept;
 
   //! Install a complete physical output schema. Callers must supply one entry per logical column;

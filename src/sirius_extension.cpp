@@ -96,6 +96,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
+#include "helper/natural_sort.hpp"
 #include "helper/type_conversions.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
@@ -1188,6 +1189,14 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     if (file_paths.empty()) {
       throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
     }
+    // GlobFiles returns local files in directory order, and pinned chunks pack several files
+    // each, so a table stored sorted across numbered files (part.0, part.1, ...) would pin into
+    // chunks whose rows are not in order. A natural sort, comparing digit runs numerically, keeps
+    // such tables sorted within and across chunks, which lets sorted-key aggregation apply to
+    // their scans. Nothing relies on this order for correctness.
+    std::sort(file_paths.begin(), file_paths.end(), [](auto const& lhs, auto const& rhs) {
+      return sirius::natural_less(lhs, rhs);
+    });
 
     // tier='parquet' pins the undecoded bytes and stops there: there is no
     // decode, no GPU materialisation and no pinned_entry, because the residency
@@ -2784,6 +2793,16 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
 }
 
+static void SetEnableOrderPreservingPartition(ClientContext& context,
+                                              SetScope scope,
+                                              Value& parameter)
+{
+  auto* params                              = get_operator_params(context, scope);
+  params->enable_order_preserving_partition = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_ORDER_PRESERVING_PARTITION to {}",
+                   params->enable_order_preserving_partition);
+}
+
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
@@ -3266,6 +3285,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_dense_count_join),
                     SetEnableDenseCountJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_order_preserving_partition",
+                    "runtime override for order-preserving hash partitions and the sorted merge",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_order_preserving_partition),
+                    SetEnableOrderPreservingPartition);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",

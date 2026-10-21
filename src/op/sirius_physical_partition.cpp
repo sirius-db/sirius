@@ -252,6 +252,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                                _partition_keys,
                                                                _partition_key_cast_types,
                                                                _num_partitions.value(),
+                                                               order_preserving_partition_enabled(),
                                                                stream,
                                                                *space,
                                                                batch_telemetry());
