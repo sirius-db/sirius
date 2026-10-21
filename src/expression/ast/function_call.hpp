@@ -22,6 +22,7 @@
 
 // standard library
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sirius::ast {
@@ -64,6 +65,7 @@ class function_call {
   }
   [[nodiscard]] sirius::logical_type const& return_type() const noexcept { return return_type_; }
 
+  [[nodiscard]] std::optional<date_arithmetic_operation> date_operation() const;
   [[nodiscard]] std::size_t cudf_ast_op_count() const;
 
  private:

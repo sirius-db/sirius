@@ -410,6 +410,27 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           decimal_sums_to_widen(view, candidates, stream, space->get_default_allocator());
       }
     }
+    // DECIMAL128 SUM and AVG inputs whose values in this batch provably keep the sum within 64
+    // bits (see decimal_sums_to_narrow) are reduced over DECIMAL64 at the same scale, and the
+    // one-row partial is cast back to the input type, so the merge sees the same types as before
+    // and combines the partials at 128 bits.
+    std::unordered_set<int> narrowed_decimal_inputs;
+    {
+      std::vector<decimal_sum_candidate> candidates;
+      for (size_t k = 0; k < layout.aggregates.size(); ++k) {
+        auto const& spec = layout.aggregates[k];
+        if (spec.kind != aggregate_kind::SUM && spec.kind != aggregate_kind::AVG) { continue; }
+        auto const col_type = view.column(static_cast<cudf::size_type>(spec.input_idx)).type();
+        if (!narrowed_decimal_sum_type(col_type)) { continue; }
+        candidates.push_back(
+          {spec.input_idx,
+           k < aggregate_input_max_abs.size() ? aggregate_input_max_abs[k] : std::nullopt});
+      }
+      if (!candidates.empty()) {
+        narrowed_decimal_inputs =
+          decimal_sums_to_narrow(view, candidates, stream, space->get_default_allocator());
+      }
+    }
 
     for (auto const& spec : layout.aggregates) {
       switch (spec.kind) {
@@ -477,7 +498,8 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           // For AVG we apply the return type in the merge step (SUM/COUNT).
           // For SUM and AVG, decimals that could overflow the input width in this batch are
           // widened before the aggregation. Otherwise the reduction runs at the input width and
-          // the one-row partial is widened to DECIMAL128 afterwards.
+          // the one-row partial is widened to DECIMAL128 afterwards. A DECIMAL128 input that fits
+          // 64 bits in this batch is reduced over DECIMAL64 and its partial cast back.
           bool is_decimal = cudf::is_fixed_point(col.type());
 
           std::unique_ptr<cudf::column> casted_col;
@@ -492,6 +514,13 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
               } else {
                 widen_partial_to = wide;
               }
+            } else if (narrowed_decimal_inputs.contains(static_cast<int>(spec.input_idx))) {
+              widen_partial_to = col.type();
+              casted_col       = cudf::cast(col,
+                                      *narrowed_decimal_sum_type(col.type()),
+                                      stream,
+                                      space->get_default_allocator());
+              col              = casted_col->view();
             }
           }
           if (is_decimal) {
