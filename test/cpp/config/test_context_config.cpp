@@ -207,4 +207,22 @@ TEST_CASE("configuration resolver applies YAML GPU limits", "[context_config][co
       CHECK(gpu_space(config).memory_capacity == static_cast<std::size_t>(total * fraction));
     }
   }
+  SECTION("a pool cap lowers a fraction limit and keeps a byte limit")
+  {
+    constexpr std::size_t cap = 256ULL << 20;
+    auto fraction             = sirius::parsed_sirius_config::from_node(
+                      YAML::Load("sirius: {topology: {num_gpus: 1}, memory: {gpu: "
+                                             "{usage_limit_fraction: 1.0}}}"))
+                      .with_gpu_pool_cap(cap)
+                      .resolve(topology);
+    CHECK(gpu_space(fraction).memory_capacity == cap);
+    CHECK(fraction.get_operator_params().scan_task_batch_size == cap / 40);
+
+    auto bytes = sirius::parsed_sirius_config::from_node(
+                   YAML::Load("sirius: {topology: {num_gpus: 1}, memory: {gpu: "
+                              "{usage_limit_bytes: 512Mi}}}"))
+                   .with_gpu_pool_cap(cap)
+                   .resolve(topology);
+    CHECK(gpu_space(bytes).memory_capacity == 2 * cap);
+  }
 }

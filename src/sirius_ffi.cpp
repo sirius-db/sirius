@@ -278,6 +278,7 @@ struct Context::Impl {
                 std::optional<Context::RingOptions> ring_options = std::nullopt)
   {
     install_log_sink_from_env();
+    std::optional<std::size_t> pool_cap;
     if (ring_options) {
       // Before the engine's pool, so the rings are not carved out of its budget.
       int device = 0;
@@ -301,9 +302,19 @@ struct Context::Impl {
         opts.return_spilled = std::string_view{value} == "1";
       }
       ring = std::make_shared<sirius::exec::ring_exchange>(device, opts);
+      if (cudaMemGetInfo(&free_bytes, &device_bytes) != cudaSuccess) {
+        static_cast<void>(cudaGetLastError());
+        throw sirius::internal_exception("Context: cannot read the device's memory for the pool");
+      }
+      pool_cap = sirius::exec::ring_exchange::pool_cap_after_rings(free_bytes);
+      SIRIUS_LOG_INFO(
+        "ring exchange: {} B of the GPU free after the rings; a pool sized by a "
+        "fraction may take {} B",
+        free_bytes,
+        *pool_cap);
     }
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
-    context->initialize(config);
+    context->initialize(pool_cap ? config.with_gpu_pool_cap(*pool_cap) : config);
     auto& memory    = context->get_memory_manager();
     auto const gpus = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     if (gpus.size() == 1) {

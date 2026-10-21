@@ -752,6 +752,7 @@ struct parsed_sirius_config::Impl {
   std::filesystem::path source_path;
   bool use_effective_gpu_capacity = false;
   std::vector<uint64_t operator_params::*> explicit_batch_settings;
+  std::optional<std::size_t> gpu_pool_cap;
 };
 
 parsed_sirius_config::parsed_sirius_config() : impl_(std::make_shared<Impl>()) {}
@@ -771,6 +772,12 @@ const compression_config& parsed_sirius_config::get_compression_config() const n
 const telemetry_config& parsed_sirius_config::get_telemetry_config() const noexcept
 {
   return impl_->settings.get_telemetry_config();
+}
+parsed_sirius_config parsed_sirius_config::with_gpu_pool_cap(std::size_t max_bytes) const
+{
+  auto impl          = std::make_shared<Impl>(*impl_);
+  impl->gpu_pool_cap = max_bytes;
+  return parsed_sirius_config{std::move(impl)};
 }
 
 namespace {
@@ -972,6 +979,17 @@ try {
       }
     }
     settings._memory_space_configs = builder.build(hw_topology);
+    if (impl_->gpu_pool_cap && std::holds_alternative<double>(gpu_cfg.usage_limit)) {
+      for (auto& space : settings._memory_space_configs) {
+        auto* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+        if (gpu == nullptr || gpu->memory_capacity <= *impl_->gpu_pool_cap) { continue; }
+        SIRIUS_LOG_INFO("GPU {}: pool of {} B capped at {} B, what is free less headroom",
+                        gpu->device_id,
+                        gpu->memory_capacity,
+                        *impl_->gpu_pool_cap);
+        gpu->memory_capacity = *impl_->gpu_pool_cap;
+      }
+    }
   }
 
   const auto defaults =

@@ -441,6 +441,9 @@ class parsed_sirius_config {
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
   [[nodiscard]] sirius_config resolve(
     const cucascade::memory::system_topology_info& topology) const;
+  /// A copy whose GPU pools sized by usage_limit_fraction are at most @p max_bytes each, before
+  /// the operator defaults derive from them. A pool set by usage_limit_bytes is kept.
+  [[nodiscard]] parsed_sirius_config with_gpu_pool_cap(std::size_t max_bytes) const;
 
  private:
   struct Impl;

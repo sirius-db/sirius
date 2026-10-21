@@ -317,6 +317,19 @@ TEST_CASE("landings may hold half the host tier unless the embedder sets a size"
   CHECK(ring_exchange::default_host_landing_bytes(0) == 0);
 }
 
+TEST_CASE("a GPU pool sized by a fraction keeps headroom once the rings are allocated",
+          "[exchange_ring][ends]")
+{
+  constexpr std::size_t GiB = std::size_t{1} << 30;
+  // GB200: 0.85 of 185 GiB is 157 GiB, under the cap, so its pool does not change.
+  CHECK(ring_exchange::pool_cap_after_rings(181 * GiB) == 177 * GiB);
+  CHECK(ring_exchange::pool_cap_after_rings(181 * GiB) > 185 * GiB * 85 / 100);
+  // 32 GiB: 0.84 of it is 26.9 GiB, over the cap.
+  CHECK(ring_exchange::pool_cap_after_rings(30 * GiB) == 26 * GiB);
+  CHECK(ring_exchange::pool_cap_after_rings(6 * GiB) == 3 * GiB);
+  CHECK(ring_exchange::pool_cap_after_rings(0) == 0);
+}
+
 TEST_CASE("a GPU batch lands on the GPU through the rings", "[exchange_ring][ends]")
 {
   auto sender         = make_ring();

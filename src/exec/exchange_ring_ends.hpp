@@ -107,6 +107,14 @@ class ring_exchange {
     return host_tier_bytes / 2;
   }
 
+  /// The most a GPU pool sized by a fraction of the device may take once the rings are allocated:
+  /// @p free_bytes less 4 GiB, or less half of it on a small GPU, for the CUDA context, cuDF and
+  /// NIXL. A GB200's pool fraction stays below it.
+  [[nodiscard]] static std::size_t pool_cap_after_rings(std::size_t free_bytes) noexcept
+  {
+    return free_bytes - std::min(free_bytes / 2, std::size_t{4} << 30);
+  }
+
   /// Allocates both rings on @p device. Call before the engine's pool is built, so the rings are
   /// not carved out of its budget.
   ring_exchange(int device, options const& opts);
