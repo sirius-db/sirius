@@ -28,6 +28,7 @@
 #include "sirius/exception.hpp"
 
 #include <algorithm>
+#include <string>
 
 namespace sirius::op {
 namespace {
@@ -81,7 +82,8 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
       // keeps whole-build publication open.
       if (strategy.build_probe || strategy.broadcast) {
         if (!build_concat) {
-          throw std::logic_error("BUILD_PROBE or broadcast requires a bound build CONCAT");
+          throw std::logic_error(std::string(strategy.build_probe ? "BUILD_PROBE" : "broadcast") +
+                                 " requires a bound build CONCAT");
         }
         build_concat->set_concat_all(true);
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
