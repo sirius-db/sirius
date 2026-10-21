@@ -326,8 +326,12 @@ step trace_through(sirius_physical_operator const& node,
       // deferral. Payloads keep their positions and can carry rowids through this stage.
       auto const* partition =
         dynamic_cast<op::sirius_physical_partition const*>(node.get_parent_op());
-      if (node.children.size() != 1 || node.children.front().get() != &from ||
-          partition == nullptr) {
+      auto const* concat = partition != nullptr ? partition->get_parent_op() : nullptr;
+      auto const* join   = concat != nullptr && concat->type == SiriusPhysicalOperatorType::CONCAT
+                             ? concat->get_parent_op()
+                             : nullptr;
+      bool const under_build_input = join != nullptr && join->input_port_for(*concat) == "build";
+      if (node.children.size() != 1 || node.children.front().get() != &from || !under_build_input) {
         return step::reads();
       }
       return step::to(in_pos);

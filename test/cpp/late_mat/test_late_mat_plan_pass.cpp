@@ -955,6 +955,46 @@ TEST_CASE("build publication carries payloads while its partition withholds join
   }
 }
 
+TEST_CASE("a build publication above a probe input reads its columns",
+          "[late_mat][lifetime][build_filter]")
+{
+  duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
+  stub.types = duckdb::vector<duckdb::LogicalType>(6, duckdb::LogicalType::VARCHAR);
+  duckdb::vector<sirius::join_condition> conditions;
+  sirius::join_condition condition;
+  condition.left  = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  condition.right = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  conditions.push_back(std::move(condition));
+  auto join        = duckdb::make_uniq<test_join>(stub,
+                                           duckdb::make_uniq<wide_scan>(3),
+                                           duckdb::make_uniq<wide_scan>(3),
+                                           std::move(conditions),
+                                           duckdb::JoinType::RIGHT_SEMI,
+                                           duckdb::vector<std::size_t>{},
+                                           duckdb::vector<std::size_t>{},
+                                           duckdb::vector<sirius::logical_type>{},
+                                           1);
+  auto* const scan = static_cast<wide_scan*>(join->children[0].get());
+  auto publication = duckdb::make_uniq<sirius::op::sirius_physical_build_filter>(
+    make_string_types(3), 0, join->dynamic_filter_session());
+  auto* const publication_ptr = publication.get();
+  publication->children.push_back(std::move(join->children[0]));
+  auto partition = duckdb::make_uniq<test_partition>(
+    make_string_types(3), 0, sirius::test::operator_utils::hash_partition_spec(*join, false));
+  partition->children.push_back(std::move(publication));
+  auto concat = duckdb::make_uniq<test_concat>(make_string_types(3), 0, join.get(), true);
+  concat->children.push_back(std::move(partition));
+  join->children[0] = std::move(concat);
+  opaque_op reader(6);
+  reader.children.push_back(std::move(join));
+  sirius::planner::sirius_physical_plan_generator::set_parent_ops(reader, nullptr);
+
+  // The publication sits under the probe input, so it is not a build stage and reads every column.
+  for (auto const& life : analyze_column_lifetimes(*scan)) {
+    REQUIRE(life.first_reader == publication_ptr);
+  }
+}
+
 TEST_CASE("build publication without a build partition remains opaque to deferral",
           "[late_mat][lifetime][build_filter]")
 {
