@@ -244,11 +244,12 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::UPDATE_EXTENSIONS:
     case SiriusPhysicalOperatorType::CREATE_SECRET:
     // Feeders are added after discovery in `insert_gpu_pipeline_operators()`: the join child's
-    // CONCAT -> PARTITION -> existing child, and the UNION arm's PASSTHROUGH_SINK -> existing
-    // child. Targets therefore end up below the wrappers either way, even though each wrapper is
-    // terminal if encountered here.
+    // CONCAT -> PARTITION -> optional BUILD_FILTER -> existing child, and the UNION arm's
+    // PASSTHROUGH_SINK -> existing child. Targets therefore end up below the wrappers either way,
+    // even though each wrapper is terminal if encountered here.
     case SiriusPhysicalOperatorType::PARTITION:
     case SiriusPhysicalOperatorType::CONCAT:
+    case SiriusPhysicalOperatorType::BUILD_FILTER:
     case SiriusPhysicalOperatorType::PASSTHROUGH_SINK:
     case SiriusPhysicalOperatorType::MERGE_SORT:
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY:

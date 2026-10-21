@@ -511,6 +511,17 @@ void sirius_physical_partition::apply_partition_strategy(
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()
 {
   std::lock_guard<std::mutex> guard(lock);
+  // A right-family build can publish before the complete probe fixes partition sizing.
+  // Follow only the installed build stage; do not add a dependency through probe targets.
+  if (_is_build && !_drives_partition_count && !_num_partitions.has_value() &&
+      children.size() == 1 && children.front()->type == SiriusPhysicalOperatorType::BUILD_FILTER &&
+      ports.size() == 1) {
+    auto const* input = ports.begin()->second;
+    if (input->src_pipeline && !input->src_pipeline->is_pipeline_finished()) {
+      auto* producer = &(input->src_pipeline->get_operators()[0].get());
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    }
+  }
   // Consumers that size from both inputs cannot be measured until both sides have stopped
   // producing, and the driving partition's own readiness says nothing about the sibling's.
   if (_sizing_requires_sibling_input && !_num_partitions.has_value() &&
@@ -769,9 +780,8 @@ bool sirius_physical_partition::decide_accumulation()
       declined = "the build input has no source pipeline";
     } else if (!input->src_pipeline->is_pipeline_finished()) {
       return false;
-    } else if (auto inventory = _arrival_ledger.certify(
-                 {.repository_batches = input->repo->size(0),
-                  .partition_count    = static_cast<std::size_t>(*_num_partitions)});
+    } else if (auto inventory =
+                 _arrival_ledger.certify({.repository_batches = input->repo->size(0)});
                !inventory) {
       declined = "the arrival ledger does not match the build input";
     } else if (session.try_begin_accumulation(std::move(inventory))) {
