@@ -94,6 +94,13 @@ void validate_operator_output_types(const op::operator_data* data,
                                         ? sirius::require_cudf_type(expected_types[c])
                                         : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
+      // Whole-partition integer SUM carries exact HUGEINT values in DECIMAL128(scale=0).
+      // Passthrough projections and sorting retain that carrier. Do not diagnose it against
+      // the legacy generic HUGEINT -> INT64 mapping as though it were corrupted output.
+      if (expected_types[c].id() == sirius::type_id::HUGEINT &&
+          actual == cudf::data_type{cudf::type_id::DECIMAL128, 0}) {
+        continue;
+      }
       if (actual != expected_cudf &&
           !op.is_alternate_physical_type(static_cast<std::size_t>(c), actual)) {
         SIRIUS_LOG_WARN(
