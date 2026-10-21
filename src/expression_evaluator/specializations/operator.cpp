@@ -405,8 +405,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
   }
 
   D_ASSERT(!alt.values.empty());
-  auto test = evaluate(*alt.probe, evaluation_mode::MATERIALIZE);
-  D_ASSERT(!test.is_scalar());  // IN with scalar LHS should have been already resolved
+  auto test = evaluate_as_column(*alt.probe);
 
   auto const output_type      = cudf::data_type{cudf::type_id::BOOL8};
   auto const negate_if_needed = [&](std::unique_ptr<cudf::column> in_result) {
