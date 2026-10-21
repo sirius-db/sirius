@@ -167,6 +167,8 @@ pub struct StreamHop {
     pub slot: SenderSlot,
     pub names: Vec<String>,
     pub drain: Box<dyn OutputDrain>,
+    /// The query's deadline, which bounds the hop's waits; `None` when it has none.
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// Where the ring transport hands a batch it landed whole: `token` holds it in this CN's direct
