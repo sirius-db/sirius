@@ -1588,19 +1588,16 @@ void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op, bool probe
 }
 
 //! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
-//! chain: probe = children[0], build = children[1]. A missing side is skipped.
+//! chain (probe = children[0], build = children[1]) and bind the two inputs.
 void wrap_join(sirius::op::sirius_physical_operator& join_op,
                const sirius::operator_params& op_params,
                duckdb::SiriusContext* compressed_materialization_observer)
 {
-  if (join_op.children.size() >= 1) {
-    wrap_join_child(
-      join_op, /*child_idx=*/0, /*is_build=*/false, op_params, compressed_materialization_observer);
-  }
-  if (join_op.children.size() >= 2) {
-    wrap_join_child(
-      join_op, /*child_idx=*/1, /*is_build=*/true, op_params, compressed_materialization_observer);
-  }
+  if (join_op.children.size() != 2) { throw std::logic_error("partitioned join needs two inputs"); }
+  wrap_join_child(
+    join_op, /*child_idx=*/0, /*is_build=*/false, op_params, compressed_materialization_observer);
+  wrap_join_child(
+    join_op, /*child_idx=*/1, /*is_build=*/true, op_params, compressed_materialization_observer);
   bool const probe_drives = join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN &&
                             join_op.Cast<sirius::op::sirius_physical_hash_join>().is_right_family();
   bind_wrapped_join(join_op, probe_drives);
