@@ -169,9 +169,18 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
         add(i);
       }
     } else if (routing->mode == partition_mode::local) {
-      auto const device = space != nullptr && space->get_tier() == cucascade::memory::Tier::GPU
-                            ? routing->placement->first_partition_for_device(space->get_device_id())
-                            : std::nullopt;
+      std::optional<std::size_t> device;
+      if (space != nullptr && space->get_tier() == cucascade::memory::Tier::GPU) {
+        device = routing->placement->first_partition_for_device(space->get_device_id());
+        if (!device) {
+          SIRIUS_LOG_WARN(
+            "sirius_physical_partition id {}: batch on GPU {} has no slot in local placement {}; "
+            "using slot 0",
+            this->get_operator_id(),
+            space->get_device_id(),
+            routing->placement->to_string());
+        }
+      }
       add(device.value_or(0));
     } else {
       add(0);
