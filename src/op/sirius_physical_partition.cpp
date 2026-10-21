@@ -380,8 +380,10 @@ std::optional<task_creation_hint> sirius_physical_partition::sizing_hint()
   std::lock_guard guard(lock);
   if (_enable_size_estimation && !estimated_total_input_bytes() && !input_complete()) {
     auto* source = ports.begin()->second->src_pipeline.get();
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
-                              &source->get_operators()[0].get()};
+    if (source != nullptr) {
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
+                                &source->get_operators()[0].get()};
+    }
   }
   return sirius_physical_operator::get_next_task_hint();
 }
