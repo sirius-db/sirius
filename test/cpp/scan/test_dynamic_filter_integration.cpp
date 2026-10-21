@@ -277,7 +277,7 @@ class inspected_converter {
   {
     sirius::converter_registry::get()
       .register_converter<representation, cucascade::gpu_table_representation>(
-        [](cucascade::idata_representation& source,
+        [](const cucascade::idata_representation& source,
            cucascade::memory::memory_space const* target,
            ::cuda::stream_ref stream,
            cucascade::memory::reservation*) -> std::unique_ptr<cucascade::idata_representation> {
