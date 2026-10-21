@@ -3040,8 +3040,13 @@ TEST_CASE("consumer passes a batch on another device through without filtering o
   {
     // The program is prepared for the current device, so only the batch's memory space differs.
     auto const space = make_space_naming_device(other_device);
-    auto batch       = batch_for(*space);
-    auto program     = prepare_identity(consumer, input->view());
+    // This synthetic space cannot own the current device's writer stream. Keep the real table
+    // alive through a view with an unknown writer; the consumer must decline before GPU access.
+    auto representation = std::make_unique<cucascade::gpu_table_representation>(
+      input->view(), input, input->alloc_size(), *space, ::cuda::stream_ref{cudaStream_t{nullptr}});
+    auto batch =
+      cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(representation));
+    auto program = prepare_identity(consumer, input->view());
     REQUIRE(program.has_value());
     auto source = batch->to_read_only();
     require_passed_through(
