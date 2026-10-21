@@ -277,6 +277,17 @@ bool dispatch_probe_adapter(membership_key_domain const& domain,
 // Probe kernel
 //===----------------------------------------------------------------------===//
 
+template <class Adapter, class Lookup>
+__device__ __forceinline__ bool membership_row_keeps(Adapter const& adapt,
+                                                     Lookup const& lookup,
+                                                     probe_validity valid,
+                                                     cudf::size_type row) noexcept
+{
+  if (!valid(row)) { return false; }
+  typename Adapter::key_type key;
+  return adapt(row, key) && lookup(key);
+}
+
 /// The per-row probe shared by the three filters. A row the prior keep-mask killed or whose probe
 /// key is null is a definite non-member (null build slots were compacted out and the join never
 /// matches nulls); so is a value the adapter cannot represent in the key domain, since every
@@ -294,12 +305,11 @@ struct membership_probe_functor {
 
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
-    if (!prior_mask_keeps(prior_words, idx) || !prior_mask_keeps(prior_keep, idx) || !valid(idx)) {
-      out[idx] = false;
-      return;
-    }
-    key_type key;
-    out[idx] = adapt(idx, key) && lookup(key);
+    // clang-format off
+    out[idx] = prior_mask_keeps(prior_words, idx) && 
+               prior_mask_keeps(prior_keep, idx) &&
+               membership_row_keeps(adapt, lookup, valid, idx);
+    // clang-format on
   }
 };
 

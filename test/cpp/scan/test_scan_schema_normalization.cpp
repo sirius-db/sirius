@@ -30,6 +30,7 @@
 // declared schema surfaces far from the scan that produced it.
 
 #include "operator/operator_test_utils.hpp"
+#include "scan/resident_scan_test_utils.hpp"
 #include "utils/test_validation_utility.hpp"
 
 #include <cudf/column/column.hpp>
@@ -94,31 +95,14 @@
 #include <utility>
 #include <vector>
 
+using sirius::test::resident_scan::admit_fixture_resident_input;
+using sirius::test::resident_scan::env;
+using sirius::test::resident_scan::resident_column;
+using sirius::test::resident_scan::resident_columns;
+using sirius::test::resident_scan::resident_parquet_info;
+using sirius::test::resident_scan::test_env;
+
 namespace {
-
-struct test_env {
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mgr;
-  cucascade::memory::memory_space* gpu_space;
-  cucascade::memory::memory_space* host_space;
-  rmm::cuda_stream conv_stream;
-
-  test_env()
-    : mgr(sirius::test::operator_utils::initialize_memory_manager()),
-      gpu_space(mgr->get_memory_space(cucascade::memory::Tier::GPU, 0)),
-      host_space(mgr->get_memory_space(cucascade::memory::Tier::HOST, 0)),
-      conv_stream()
-  {
-  }
-
-  ::cuda::stream_ref stream() { return conv_stream; }
-};
-
-test_env& env()
-{
-  sirius::test::operator_utils::ensure_converter_registry();
-  static test_env e;
-  return e;
-}
 
 std::unique_ptr<cudf::column> make_column(cucascade::memory::memory_space& space,
                                           cudf::data_type type,
@@ -285,14 +269,6 @@ sirius::op::scan::sirius_gpu_scan_operator make_bigint_scan(
 }
 
 constexpr std::size_t kRows = 8;
-
-void admit_fixture_resident_input(sirius::op::scan::scan_operator_input& input)
-{
-  sirius::op::scan::pin_validation validation;
-  validation.identity = validation.layout = validation.structure = {true, true};
-  input.resident_contract_id                                     = 1;
-  input.resident_validation                                      = validation;
-}
 
 /// Serves one batch, then reports exhaustion.
 class queued_provider final : public sirius::scan_manager::databatch_provider {
@@ -1155,68 +1131,6 @@ namespace {
 
 namespace scan = sirius::op::scan;
 
-std::unique_ptr<scan::parquet_ingestible_table_info> resident_parquet_info(
-  std::vector<std::size_t> const& columns,
-  std::size_t output_arity,
-  std::optional<std::size_t> positive_filter = std::nullopt)
-{
-  auto info   = std::make_unique<scan::parquet_ingestible_table_info>();
-  info->names = {"key", "payload", "keep"};
-  for (std::size_t i = 0; i < info->names.size(); ++i) {
-    info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
-  }
-  for (auto column : columns) {
-    info->column_ids.emplace_back(column);
-    info->projection_ids.push_back(info->projection_ids.size());
-  }
-  info->projected_output_count = output_arity;
-  if (positive_filter) {
-    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-    info->table_filters->PushFilter(
-      duckdb::ProjectionIndex(*positive_filter),
-      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
-                                    duckdb::Value::BIGINT(0)));
-  }
-  return info;
-}
-
-template <typename T>
-std::unique_ptr<cudf::column> resident_column(
-  std::vector<T> const& values,
-  cudf::type_id type,
-  std::optional<cudf::size_type> null_row = std::nullopt)
-{
-  auto& e     = env();
-  auto column = cudf::make_numeric_column(
-    cudf::data_type{type},
-    static_cast<cudf::size_type>(values.size()),
-    null_row ? cudf::mask_state::ALL_VALID : cudf::mask_state::UNALLOCATED,
-    e.stream(),
-    e.gpu_space->get_default_allocator());
-  if (!values.empty()) {
-    REQUIRE(cudaMemcpyAsync(column->mutable_view().data<T>(),
-                            values.data(),
-                            values.size() * sizeof(T),
-                            cudaMemcpyHostToDevice,
-                            e.stream().get()) == cudaSuccess);
-  }
-  if (null_row) {
-    cudf::set_null_mask(
-      column->mutable_view().null_mask(), *null_row, *null_row + 1, false, e.stream());
-    column->set_null_count(1);
-  }
-  e.stream().sync();
-  return column;
-}
-
-std::shared_ptr<cucascade::data_batch> resident_columns(
-  std::vector<std::unique_ptr<cudf::column>> columns)
-{
-  auto& e = env();
-  return sirius::make_data_batch(
-    std::make_unique<cudf::table>(std::move(columns)), *e.gpu_space, e.stream(), {});
-}
-
 template <typename T>
 void require_resident_values(cudf::column_view column,
                              cudf::type_id type,
@@ -1248,24 +1162,28 @@ struct resident_parquet_fixture {
                            std::size_t output_arity,
                            bool cached              = true,
                            duckdb::LogicalType type = duckdb::LogicalType::BIGINT,
-                           bool force_counts        = true)
+                           bool force_counts        = true,
+                           bool fused_membership    = true)
     : resident_parquet_fixture(std::move(info),
                                duckdb::vector<duckdb::LogicalType>(output_arity, type),
                                cached,
-                               force_counts)
+                               force_counts,
+                               fused_membership)
   {
   }
 
   resident_parquet_fixture(std::unique_ptr<scan::parquet_ingestible_table_info> info,
                            duckdb::vector<duckdb::LogicalType> const& output_types,
-                           bool cached       = true,
-                           bool force_counts = true)
+                           bool cached           = true,
+                           bool force_counts     = true,
+                           bool fused_membership = true)
     : ingestible(scan::make_ingestible(std::move(info))),
       consumer(std::make_shared<scan::dynamic_filter_consumer>(
         channel,
         scan::consumer_config{.mode = scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
                               .force_counts     = force_counts,
                               .cached_placement = cached,
+                              .fused_membership = fused_membership,
                               .stats            = &stats},
         scan::scan_decode_bindings(*ingestible, output_types.size()))),
       op(sirius::from_duckdb_vec(output_types), 0, ingestible, 1, nullptr, nullptr, consumer)
@@ -1300,10 +1218,12 @@ struct resident_parquet_fixture {
 TEST_CASE("resident Parquet filters a shared narrow projection before restoring duplicate outputs",
           "[scan_normalization][cached_scan][cached_projection]")
 {
-  bool cached = true;
+  auto const fused = GENERATE(false, true);
+  bool cached      = true;
   SECTION("cached placement") {}
   SECTION("placement disabled") { cached = false; }
-  resident_parquet_fixture f(resident_parquet_info({1, 0, 1, 2}, 3, 3), 3, cached);
+  resident_parquet_fixture f(
+    resident_parquet_info({1, 0, 1, 2}, 3, 3), 3, cached, duckdb::LogicalType::BIGINT, true, fused);
   f.publish(1, {41, 83, 29, 53});
   REQUIRE(f.ingestible->materialized_column_order() == std::vector<std::size_t>{1, 0, 2});
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -1566,7 +1486,10 @@ TEST_CASE("resident Parquet accepts proven dropped filter columns and rejects mi
 TEST_CASE("resident Parquet uses a BOOL8 pure-filter answer only as a residual",
           "[scan_normalization][cached_scan][cached_layout]")
 {
-  resident_parquet_fixture f(resident_parquet_info({0, 1}, 1, 1), 1);
+  // The residual is nullable, which the ordinary fold and the fused rounds resolve separately.
+  auto const fused = GENERATE(false, true);
+  resident_parquet_fixture f(
+    resident_parquet_info({0, 1}, 1, 1), 1, true, duckdb::LogicalType::BIGINT, true, fused);
   f.publish(0, {41, 29, 53});
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(resident_column<std::int32_t>({41, 29, 53, 17}, cudf::type_id::INT32));
@@ -1784,7 +1707,10 @@ TEST_CASE("owned Parquet transfers bypass cached placement and remain filterable
 TEST_CASE("cached Parquet deferral validates original rows and restores source-relative survivors",
           "[scan_normalization][cached_scan][cached_late_mat][assembly_fault][late_mat]")
 {
-  resident_parquet_fixture f(resident_parquet_info({0, 1, 2}, 2, 2), 2);
+  // Positions and retained assembly owners must not depend on how the membership mask was formed.
+  auto const fused = GENERATE(false, true);
+  resident_parquet_fixture f(
+    resident_parquet_info({0, 1, 2}, 2, 2), 2, true, duckdb::LogicalType::BIGINT, true, fused);
   auto filter             = f.publish(0, {41, 83, 29, 53});
   auto handle             = std::make_shared<sirius::late_mat::pin_entry_handle>("resident", 1);
   auto entry              = std::make_shared<sirius::scan_manager::pinned_entry>();

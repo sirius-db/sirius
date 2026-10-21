@@ -46,7 +46,8 @@ namespace sirius::op {
 
 namespace detail {
 class accumulated_bloom_builder;
-}
+struct fused_probe;
+}  // namespace detail
 
 enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
 
@@ -166,6 +167,26 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
 class sirius_mask_applicable {
  public:
   virtual ~sirius_mask_applicable() = default;
+
+  /**
+   * @brief Describes a device-local probe for try_fused_membership_mask
+   *
+   * Unlike compute_mask[_if](),his host-only operation submits no GPU work and allocates no device
+   * storage. It simply describes how a fused kernel should perform a given membership test. A
+   * successful descriptor borrows this filter's replica and the probe column until GPU completion.
+   * False leaves `out` unchanged and does not imply that compute_mask must decline.
+   *
+   * @param probe Keys to probe
+   * @param device_id Device holding the filter replica
+   * @param out Destination for a supported descriptor
+   * @return Whether the descriptor is ready
+   */
+  [[nodiscard]] virtual bool prepare_fused_probe(cudf::column_view const& probe,
+                                                 int device_id,
+                                                 detail::fused_probe& out) const
+  {
+    return false;
+  }
 
   /**
    * @brief Returns `probe.size()` BOOL8 values (`true` keeps), or null for an incompatible probe
@@ -290,6 +311,10 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] bool prepare_fused_probe(cudf::column_view const& probe,
+                                         int device_id,
+                                         detail::fused_probe& out) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
@@ -371,11 +396,15 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] bool prepare_fused_probe(cudf::column_view const& probe,
+                                         int device_id,
+                                         detail::fused_probe& out) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
   [[nodiscard]] std::size_t replica_count() const noexcept;
-  [[nodiscard]] std::size_t size() const noexcept { return _num_keys; }
+  [[nodiscard]] std::size_t size() const noexcept;
   [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
 
@@ -389,7 +418,6 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     rmm::device_async_resource_ref mr) const;
 
   membership_key_domain _domain{};
-  std::size_t _num_keys = 0;
 
   struct needle_store;
   std::unique_ptr<needle_store> _store;
@@ -440,6 +468,10 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     int device_id,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] bool prepare_fused_probe(cudf::column_view const& probe,
+                                         int device_id,
+                                         detail::fused_probe& out) const override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;

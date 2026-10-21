@@ -21,6 +21,7 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
@@ -64,30 +65,28 @@ namespace sirius::op::scan {
 
 namespace {
 
-/**
- * @brief The strategy selection logic.
- *
- * If not every keep ratio is known, and
- *  - the row width is >= k_deferred_minimum_row_width, use DEFERRED_KEYS strategy;
- *  - otherwise, use CASCADE strategy.
- * If the row width is < k_deferred_minimum_row_width, and
- *  - every keep ratio >= k_gather_once_minimum_narrow_keep_ratio,
- *    use GATHER_ONCE strategy;
- *  - otherwise, use CASCADE strategy.
- * If the row width is >= k_deferred_minimum_row_width, and
- *  - any keep ratio <= k_deferred_selective_keep_ratio,
- *    use DEFERRED_KEYS strategy;
- *  - otherwise, use GATHER_ONCE strategy.
- *
- * Measured filters keeping more than dynamic_filter_gate::filter_skippable() allows are skipped
- * before selection, except that rows at least k_deferred_minimum_row_width wide keep filters up to
- * k_wide_row_skip_keep_ratio: gather once applies such weak filters for roughly the cost per
- * removed row that cascade pays at the gate's threshold.
- *
- * See evaluate_compaction_policy() for the implementation.
- * @note These are empirically chosen parameters from experiments on a GB300 machine. They may not
- *       extrapolate perfectly to all architectures.
- */
+/// @brief The strategy selection logic.
+///
+/// If not every keep ratio is known, and
+///  - the row width is >= k_deferred_minimum_row_width, use DEFERRED_KEYS strategy;
+///  - otherwise, use CASCADE strategy.
+/// If the row width is < k_deferred_minimum_row_width, and
+///  - every keep ratio >= k_gather_once_minimum_narrow_keep_ratio,
+///    use GATHER_ONCE strategy;
+///  - otherwise, use CASCADE strategy.
+/// If the row width is >= k_deferred_minimum_row_width, and
+///  - any keep ratio <= k_deferred_selective_keep_ratio,
+///    use DEFERRED_KEYS strategy;
+///  - otherwise, use GATHER_ONCE strategy.
+///
+/// Measured filters keeping more than dynamic_filter_gate::filter_skippable() allows are skipped
+/// before selection, except that rows at least k_deferred_minimum_row_width wide keep filters up to
+/// k_wide_row_skip_keep_ratio: gather once applies such weak filters for roughly the cost per
+/// removed row that cascade pays at the gate's threshold.
+///
+/// See evaluate_compaction_policy() for the implementation.
+/// @note These are empirically chosen parameters from experiments on a GB300 machine. They may not
+///       extrapolate perfectly to all architectures.
 constexpr std::size_t k_deferred_minimum_row_width       = 64;
 constexpr double k_deferred_selective_keep_ratio         = 0.35;
 constexpr double k_gather_once_minimum_narrow_keep_ratio = 0.40;
@@ -107,11 +106,15 @@ struct selected_step {
   std::optional<double> expected_keep;
   bool sample                = false;
   std::size_t snapshot_index = 0;
+
+  [[nodiscard]] bool operator==(selected_step const&) const = default;
 };
 
-/// @brief The state of a program of (possibly) multiple selected filter applications.
-struct application_program_state {
-  sirius::op::dynamic_filter_snapshot snapshot;
+/// @brief The comparable decisions `prepare_state` captures for one program.
+///
+/// `consumer_test_access::same_selection` compares these with the defaulted equality, so a new
+/// decision belongs here unless it is the fusion switch or cannot be compared by value.
+struct application_program_decisions {
   batch_receipt receipt;
   std::vector<selected_step> membership;
   std::vector<selected_step> ast;
@@ -125,7 +128,15 @@ struct application_program_state {
   bool cached             = false;
   bool want_row_positions = false;
   std::vector<cudf::size_type> projected_columns;
-  std::unique_ptr<sirius::ast::node> residual;
+
+  [[nodiscard]] bool operator==(application_program_decisions const&) const = default;
+};
+
+/// @brief The state of a program of (possibly) multiple selected filter applications.
+struct application_program_state : application_program_decisions {
+  sirius::op::dynamic_filter_snapshot snapshot;  ///< Compared by generation.
+  bool fused_membership = false;                 ///< The ablation paired programs differ in.
+  std::unique_ptr<sirius::ast::node> residual;  ///< Each program owns a copy; compared by presence.
 };
 
 /// @brief A key column compacted alongside the survivor row IDs.
@@ -203,6 +214,7 @@ struct application_result_state {
   bool ast_contributed       = false;
   bool counts_read_back      = false;
   bool completed             = false;
+  std::size_t fused_rounds   = 0;
 };
 }  // namespace detail
 
@@ -375,12 +387,10 @@ bool accepts_carrier(sirius::op::sirius_dynamic_filter const& filter, cudf::data
          accepts_carrier<sirius::op::sirius_dynamic_bloom_filter>(filter, type);
 }
 
-/**
- * @brief Expected strength of a membership filter before any measurement, strongest first.
- *
- * Follows the `sirius::membership_probe` ordering signal: exact set forms keep fewer rows than a
- * Bloom filter over the same keys, and fewer build keys keep fewer rows.
- */
+/// @brief Expected strength of a membership filter before any measurement, strongest first.
+///
+/// Follows the `sirius::membership_probe` ordering signal: exact set forms keep fewer rows than a
+/// Bloom filter over the same keys, and fewer build keys keep fewer rows.
 struct static_selectivity {
   /// 0 for a small IN-list, 1 for a hash IN-list, 2 for Bloom; other kinds sort last.
   std::uint8_t kind_rank = std::numeric_limits<std::uint8_t>::max();
@@ -482,12 +492,10 @@ std::vector<std::vector<candidate const*>> group_aliases(std::span<candidate con
   return groups;
 }
 
-/**
- * @brief Selects and orders this batch's filter applications.
- *
- * @p history_known is false when the input may carry decode history it does not report: the steps
- * still execute, but none of them samples, and the batch makes no combined observation.
- */
+/// @brief Selects and orders this batch's filter applications.
+///
+/// @p history_known is false when the input may carry decode history it does not report: the steps
+/// still execute, but none of them samples, and the batch makes no combined observation.
 std::unique_ptr<application_program_state> prepare_state(
   sirius::op::dynamic_filter_snapshot snapshot,
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set const> endpoint,
@@ -510,7 +518,8 @@ std::unique_ptr<application_program_state> prepare_state(
   program->sample_combined = history_known && selection.needs_combined_sample &&
                              program->receipt.decode_attached.empty() &&
                              program->receipt.applied.empty();
-  program->validate = config.validate_deferred_selection;
+  program->validate         = config.validate_deferred_selection;
+  program->fused_membership = config.fused_membership;
   for (auto const& column : input.source) {
     program->types.push_back(column.type());
   }
@@ -614,13 +623,12 @@ void complete_observations(application_result_state& result)
   }
 }
 
-/**
- * @brief Adds the bindings this application proved it ran to the program's receipt.
- *
- * A membership step runs when rows enter it. Without prefix counts only a nonempty output proves
- * that, so an empty output claims no membership coverage. Entries fill the capacity `prepare_state`
- * reserved; an entry that would not fit is dropped, which only loses optional coverage.
- */
+/// @brief Adds the bindings this application proved it ran to the program's receipt.
+///
+/// A membership step runs when rows enter it. Without prefix counts only a nonempty output proves
+/// that, so an empty output claims no membership coverage. Entries fill the capacity
+/// `prepare_state` reserved; an entry that would not fit is dropped, which only loses optional
+/// coverage.
 void add_receipt_coverage(application_result_state& result) noexcept
 {
   auto const& program = *result.program;
@@ -862,13 +870,18 @@ void apply_gather_once(application_result_state& result,
   }
 }
 
-/// @brief Apply a cached program: fold the residual and membership masks over the borrowed source,
-/// then gather the projected payload, with the original positions when requested, once.
+/// @brief Apply a cached program:
+///  - form the conjunction of the residual and membership filters over the borrowed source,
+///  - then gather the projected payload, with the original positions when requested, once.
 ///
-/// At most one probe mask is alive beside the running conjunction: the residual's own column
-/// becomes the conjunction, and each probe mask is freed right after its fold. The probe API
-/// returns a new row-sized mask, so that one mask (1 byte per row) is the checkpoint's only buffer
-/// beyond what the ordinary residual selection holds.
+/// The residual's own column becomes the conjunction. When the program allows fusion and every
+/// selected filter can describe its probe, `try_fused_membership_mask` writes the conjunction in
+/// rounds of up to `fused_round_capacity` filters with no intermediate masks. Otherwise the
+/// ordinary chain folds the residual and then each filter's mask, freeing each mask right after its
+/// fold; the probe API returns a new row-sized mask, so that one mask (1 byte per row) is the
+/// chain's only buffer beyond what the ordinary residual selection holds. Either way the residual's
+/// validity is freed once its nulls are resolved into the values. A lone filter without a residual
+/// skips the conjunction and gathers through its own mask.
 void apply_cached(application_result_state& result,
                   cudf::table_view input,
                   ::cuda::stream_ref stream,
@@ -910,20 +923,8 @@ void apply_cached(application_result_state& result,
     }
     auto* const counts = result.counters ? result.counters->data() : nullptr;
     if (residual) {
-      // Folding the residual into its own column turns null into false in place.
       result.conjunction = std::move(result.residual_result->release().front());
       result.residual_result.reset();
-      auto& conjunction   = *result.conjunction;
-      auto const incoming = conjunction.view();
-      auto const values   = conjunction.mutable_view();
-      auto const nullable = incoming.nullable();
-      sirius::op::fold_dynamic_filter_mask(
-        cudf::mutable_column_view{values.type(), values.size(), values.head(), nullptr, 0},
-        incoming,
-        counts,
-        true,
-        stream);
-      if (nullable) { conjunction.set_null_mask(rmm::device_buffer{}, 0); }
     } else {
       result.conjunction = cudf::make_numeric_column(cudf::data_type{cudf::type_id::BOOL8},
                                                      input.num_rows(),
@@ -931,22 +932,60 @@ void apply_cached(application_result_state& result,
                                                      stream,
                                                      mr);
     }
-    auto* const membership_counts = counts && residual ? counts + 1 : counts;
-    for (std::size_t i = 0; i < program.membership.size(); ++i) {
-      auto const& step      = program.membership[i];
-      auto const probe      = input.column(step.column_index);
-      result.mask           = i != 0 || residual
-                                ? step.mask_source->compute_mask_if(
-                          probe, result.conjunction->view(), program.device_id, stream, mr)
-                                : step.mask_source->compute_mask(probe, program.device_id, stream, mr);
-      result.contributed[i] = result.mask != nullptr;
-      sirius::op::fold_dynamic_filter_mask(
-        result.conjunction->mutable_view(),
-        result.mask ? std::optional{result.mask->view()} : std::nullopt,
-        membership_counts ? membership_counts + i : nullptr,
-        i == 0 && !residual,
+    auto const values = result.conjunction->mutable_view();
+    // running: the conjunction's values, with the residual's validity ignored
+    cudf::mutable_column_view running{
+      values.type(), values.size(), values.head(), nullptr, 0, values.offset()};
+    // incoming: the conjunction's values, with the residual's validity respected, for the first
+    // membership step
+    std::optional<cudf::column_view> const incoming =
+      residual ? std::optional{result.conjunction->view()} : std::nullopt;
+    if (program.fused_membership) {
+      //===----------FUSED membership compaction strategy----------===//
+      std::vector<sirius::op::fused_membership_input> steps;
+      steps.reserve(program.membership.size());
+      for (auto const& step : program.membership) {
+        steps.push_back({step.mask_source, input.column(step.column_index)});
+      }
+      sirius::op::try_fused_membership_mask(
+        steps,
+        program.device_id,
+        running,
+        incoming,
+        counts ? cudf::device_span<cudf::size_type>{counts, device_counts}
+               : cudf::device_span<cudf::size_type>{},
+        result.fused_rounds,
         stream);
-      result.mask.reset();
+    }
+    if (residual && result.fused_rounds == 0) {
+      // Folding the residual into its own column turns null into false in place.
+      sirius::op::fold_dynamic_filter_mask(running, incoming, counts, true, stream);
+    }
+    // Both paths have resolved the residual's nulls into its values. The validity is freed in
+    // stream order, after the work already submitted that reads it.
+    if (result.conjunction->nullable()) {
+      result.conjunction->set_null_mask(rmm::device_buffer{}, 0);
+    }
+    if (result.fused_rounds != 0) {
+      std::fill(result.contributed.begin(), result.contributed.end(), true);
+    } else {
+      auto* const membership_counts = counts && residual ? counts + 1 : counts;
+      for (std::size_t i = 0; i < program.membership.size(); ++i) {
+        auto const& step      = program.membership[i];
+        auto const probe      = input.column(step.column_index);
+        result.mask           = i != 0 || residual
+                                  ? step.mask_source->compute_mask_if(
+                            probe, result.conjunction->view(), program.device_id, stream, mr)
+                                  : step.mask_source->compute_mask(probe, program.device_id, stream, mr);
+        result.contributed[i] = result.mask != nullptr;
+        sirius::op::fold_dynamic_filter_mask(
+          running,
+          result.mask ? std::optional{result.mask->view()} : std::nullopt,
+          membership_counts ? membership_counts + i : nullptr,
+          i == 0 && !residual,
+          stream);
+        result.mask.reset();
+      }
     }
     detail::check_read_checkpoint(detail::read_checkpoint::MASK_FOLD);
     if (program.want_counts) {
@@ -1003,12 +1042,10 @@ void validate_program_input(application_program_state const& program, cudf::tabl
   }
 }
 
-/**
- * @brief The device other than the current one that holds @p result's source or that its program
- * was prepared for, if any
- *
- * A test source held as a bare table has no memory space and lives on the current device.
- */
+/// @brief The device other than the current one that holds @p result's source or that its program
+/// was prepared for, if any
+///
+/// A test source held as a bare table has no memory space and lives on the current device.
 [[nodiscard]] std::optional<int> other_device_of(application_result_state const& result) noexcept
 {
   auto const current = sirius::op::detail::resolve_dynamic_filter_device_id(-1);
@@ -1325,10 +1362,23 @@ batch_receipt dynamic_filter_consumer::finish(application_result&& result,
   return std::move(state->program->receipt);
 }
 
+//===--------------------------------------------------------------------===//
+// TEST SEAMS
+//===--------------------------------------------------------------------===//
 dynamic_filter_gate& detail::consumer_test_access::gate(dynamic_filter_consumer& consumer) noexcept
 {
   return consumer._gate;
 }
+bool detail::consumer_test_access::same_selection(application_program const& left,
+                                                  application_program const& right) noexcept
+{
+  if (!left._state || !right._state) { return !left._state && !right._state; }
+  auto const& a = *left._state;
+  auto const& b = *right._state;
+  return static_cast<application_program_decisions const&>(a) == b &&
+         a.snapshot.generation() == b.snapshot.generation() && bool(a.residual) == bool(b.residual);
+}
+
 namespace {
 detail::retained_storage storage_of(detail::application_result_state const& state) noexcept
 {
@@ -1343,7 +1393,8 @@ detail::retained_storage storage_of(detail::application_result_state const& stat
           state.completed,
           state.readback
             ? std::span<cudf::size_type const>{state.readback->data(), state.readback->size()}
-            : std::span<cudf::size_type const>{}};
+            : std::span<cudf::size_type const>{},
+          state.fused_rounds};
 }
 }  // namespace
 
@@ -1369,13 +1420,11 @@ std::atomic<bool> stalled_stream_deadline_passed{false};
 /// @brief Longest a stalled stream waits for `release_stalled_streams`.
 constexpr std::chrono::seconds stalled_stream_deadline{5};
 
-/**
- * @brief Host function that holds its stream until `release_stalled_streams` is called or
- * `stalled_stream_deadline` passes
- *
- * The deadline turns a wait for the stalled stream inside the code under test into a test failure
- * instead of a hang.
- */
+/// @brief Host function that holds its stream until `release_stalled_streams` is called or
+/// `stalled_stream_deadline` passes
+///
+/// The deadline turns a wait for the stalled stream inside the code under test into a test failure
+/// instead of a hang.
 void CUDART_CB wait_for_stalled_stream_release(void*)
 {
   auto const deadline = std::chrono::steady_clock::now() + stalled_stream_deadline;

@@ -101,6 +101,8 @@ struct batch_receipt {
   std::vector<applied_entry> applied;  ///< Filters known to have executed successfully.
   std::vector<applied_entry>
     decode_attached;  ///< Filters offered to the decoder, which *might* have executed.
+
+  [[nodiscard]] bool operator==(batch_receipt const&) const = default;
 };
 
 /**
@@ -137,6 +139,7 @@ struct consumer_config {
   /// Lets `sirius_gpu_scan_operator` filter borrowed resident batches before their payload is
   /// copied. An internal ablation for tests and measurements, not a user setting.
   bool cached_placement            = true;
+  bool fused_membership            = true;  ///< Internal ablation of cached membership fusion.
   bool validate_deferred_selection = false;
   /// Receives `dynamic_filter_counters::applications_skipped_other_device` and the `cached_*`
   /// counters `dynamic_filter_consumer::record_placement` adds; null counts nothing.
@@ -180,6 +183,9 @@ enum class execution_fault {
 };
 }  // namespace detail
 
+//===--------------------------------------------------------------------===//
+// application_program
+//===--------------------------------------------------------------------===//
 /**
  * @brief Owns the filter choices and execution policy prepared for one input batch.
  *
@@ -207,6 +213,9 @@ class application_program {
   std::unique_ptr<detail::application_program_state> _state;
 };
 
+//===--------------------------------------------------------------------===//
+// application_result
+//===--------------------------------------------------------------------===//
 /**
  * @brief Owns completed output of a dynamic filter application and uncommitted observations
  *
@@ -248,6 +257,9 @@ class application_result {
   std::unique_ptr<detail::application_result_state> _state;
 };
 
+//===--------------------------------------------------------------------===//
+// dynamic_filter_consumer
+//===--------------------------------------------------------------------===//
 /**
  * @brief Shares endpoint selection, sampling and deferred commits across scan checkpoints.
  *
@@ -393,6 +405,10 @@ class dynamic_filter_consumer {
   std::vector<binding> decode_bindings,
   sirius::op::dynamic_filter_stats* stats);
 
+
+//===--------------------------------------------------------------------===//
+// TEST SEAMS
+//===--------------------------------------------------------------------===//
 namespace detail {
 /**
  * @brief Borrows evidence of owning slots in a retained test result
@@ -410,6 +426,7 @@ struct retained_storage {
   bool has_counters;
   bool completed;
   std::span<cudf::size_type const> copied_counts;
+  std::size_t fused_rounds;
 };
 
 /**
@@ -430,6 +447,13 @@ struct retained_storage {
  */
 struct consumer_test_access {
   static dynamic_filter_gate& gate(dynamic_filter_consumer& consumer) noexcept;
+  /**
+   * @brief Compares captured execution decisions except the fusion switch
+   *
+   * The caller supplies the same residual expression when preparing both programs.
+   */
+  static bool same_selection(application_program const& left,
+                             application_program const& right) noexcept;
   static retained_storage storage(application_result const& result) noexcept;
   static std::optional<retained_storage> retained_cached_storage(
     read_retirement_test_hooks const& hooks) noexcept;
