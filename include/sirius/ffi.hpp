@@ -494,6 +494,8 @@ SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(const std::s
 /// engine's GPU pool. Batches landing from peers may hold up to `gpu_landing_fraction` of the GPU
 /// space and `host_landing_bytes` of the host tier until their receivers take them; beyond that
 /// they land on disk, if the configuration has a disk tier, written by `disk_writers` threads.
+/// A size of 0 follows the hardware: the rings from the device's memory
+/// (sirius::exec::ring_exchange::options::sized_for), the host landing from half the host tier.
 SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_with_ring(const std::string& config_path,
                                                                   std::uint64_t frame_bytes,
                                                                   std::uint64_t send_bytes,

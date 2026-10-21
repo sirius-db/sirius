@@ -23,6 +23,7 @@
 
 #include <cucascade/data/data_repository.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <exception>
 #include <memory>
@@ -108,11 +109,21 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
     return _outputs.size() > 1 && _spec.mode == partition_mode::hash;
   }
 
-  /// The largest piece of an input batch hash_partition sees at once by default: it peaks at
-  /// about three times its input (the input, a reordered copy, the per-destination slices).
+  /// The largest piece of an input batch hash_partition sees at once: it peaks at about three
+  /// times its input (the input, a reordered copy, the per-destination slices).
   static constexpr std::size_t default_max_piece_bytes = std::size_t{256} << 20;
 
-  /// Overrides default_max_piece_bytes (tests).
+  /// The piece size for a GPU space of @p pool_bytes: 1/192 of it, within [32 MiB,
+  /// default_max_piece_bytes], so four pipeline threads' peaks stay near 6% of the pool on a
+  /// 32 GB GPU as on a 189 GB one. 0 (an unknown size) gives default_max_piece_bytes.
+  [[nodiscard]] static std::size_t piece_bytes_for_pool(std::size_t pool_bytes) noexcept
+  {
+    if (pool_bytes == 0) { return default_max_piece_bytes; }
+    return std::clamp<std::size_t>(
+      pool_bytes / 192, std::size_t{32} << 20, default_max_piece_bytes);
+  }
+
+  /// Overrides piece_bytes_for_pool (tests).
   void set_max_piece_bytes(std::size_t bytes)
   {
     _max_piece_bytes = std::max<std::size_t>(1, bytes);
@@ -177,7 +188,8 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   /// Empty key_columns is valid only for N==1 (native push, no hash_partition).
   partition_spec _spec;
 
-  std::size_t _max_piece_bytes = default_max_piece_bytes;
+  /// 0 follows the GPU space's size (piece_bytes_for_pool).
+  std::size_t _max_piece_bytes = 0;
 
  private:
   /// Publishes @p batches to output @p index, as one batch when there are several and the

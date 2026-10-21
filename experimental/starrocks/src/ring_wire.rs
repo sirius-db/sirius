@@ -151,11 +151,13 @@ impl LaneGrant {
 }
 
 /// The body of a `RingOpen` request: the sender's agent metadata, so the receiver can send it
-/// credits, and the hop's column names, which every batch the lane delivers carries.
+/// credits, the hop's column names, which every batch the lane delivers carries, and the sender's
+/// frame size, which must be the receiver's: the sender writes its frames into the receiver's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LaneOpen {
     pub md: Vec<u8>,
     pub names: Vec<String>,
+    pub frame_bytes: u64,
 }
 
 impl LaneOpen {
@@ -163,6 +165,7 @@ impl LaneOpen {
         let mut out = Vec::new();
         put_bytes(&mut out, &self.md);
         put_strings(&mut out, &self.names);
+        out.extend_from_slice(&self.frame_bytes.to_le_bytes());
         out
     }
 
@@ -171,6 +174,7 @@ impl LaneOpen {
         let open = Self {
             md: reader.bytes()?.to_vec(),
             names: reader.strings("ring lane name")?,
+            frame_bytes: reader.u64()?,
         };
         reader.finish()?;
         Ok(open)
@@ -386,6 +390,7 @@ mod tests {
         let open = LaneOpen {
             md: vec![9; 300],
             names: vec!["l_orderkey".to_string(), String::new()],
+            frame_bytes: 64 << 20,
         };
         assert_eq!(LaneOpen::decode(&open.encode()).unwrap(), open);
         assert!(LaneOpen::decode(&open.encode()[..10]).is_err());

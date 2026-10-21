@@ -41,12 +41,16 @@ const FAILED_TIMEOUT: Duration = Duration::from_secs(5);
 /// At most this many failure frames are in flight at once, each on its own thread.
 const FAILED_IN_FLIGHT: usize = 64;
 
-/// The engine's ring sizes for the ring exchange, from the environment.
+/// The engine's ring sizes for the ring exchange, from the environment. An unset size is passed
+/// as 0, and the engine derives it from the hardware, so one setting fits a 32 GB and a 189 GB
+/// GPU alike.
 ///
-/// - `SIRIUS_CN_RING_FRAME_BYTES`: frame size, 64 MiB;
-/// - `SIRIUS_CN_RING_SEND_BYTES` / `SIRIUS_CN_RING_RECV_BYTES`: ring sizes, 1 GiB / 1.5 GiB;
-/// - `SIRIUS_CN_RING_GPU_LANDING_FRACTION`: share of the GPU space landed batches may hold, 0.1;
-/// - `SIRIUS_CN_RING_HOST_LANDING_BYTES`: host bytes landed batches may hold, 48 GiB;
+/// - `SIRIUS_CN_RING_FRAME_BYTES`: frame size, 64 MiB; it must be the same on every CN;
+/// - `SIRIUS_CN_RING_SEND_BYTES` / `SIRIUS_CN_RING_RECV_BYTES`: ring sizes; by default 0.6% of the
+///   GPU in whole frames, within [8 frames, 1 GiB], and 1.5 times that;
+/// - `SIRIUS_CN_RING_GPU_LANDING_FRACTION`: share of the GPU space landed batches may hold, 0.2;
+/// - `SIRIUS_CN_RING_HOST_LANDING_BYTES`: host bytes landed batches may hold; by default half the
+///   host tier;
 /// - `SIRIUS_CN_RING_DISK_WRITERS`: threads writing batches that land on disk, 1.
 ///
 /// Sizes take a `KiB`, `MiB` or `GiB` suffix.
@@ -59,7 +63,7 @@ pub fn ring_options_from_env() -> Result<sirius::RingOptions, String> {
             .ok_or_else(|| format!("{name} must be a positive size, not '{value}'")),
     };
     let fraction = match env("SIRIUS_CN_RING_GPU_LANDING_FRACTION") {
-        None => 0.1,
+        None => 0.2,
         Some(value) => value
             .trim()
             .parse::<f64>()
@@ -70,11 +74,11 @@ pub fn ring_options_from_env() -> Result<sirius::RingOptions, String> {
             })?,
     };
     Ok(sirius::RingOptions {
-        frame_bytes: bytes("SIRIUS_CN_RING_FRAME_BYTES", 64 << 20)?,
-        send_bytes: bytes("SIRIUS_CN_RING_SEND_BYTES", 1 << 30)?,
-        recv_bytes: bytes("SIRIUS_CN_RING_RECV_BYTES", 3 << 29)?,
+        frame_bytes: bytes("SIRIUS_CN_RING_FRAME_BYTES", 0)?,
+        send_bytes: bytes("SIRIUS_CN_RING_SEND_BYTES", 0)?,
+        recv_bytes: bytes("SIRIUS_CN_RING_RECV_BYTES", 0)?,
         gpu_landing_fraction: fraction,
-        host_landing_bytes: bytes("SIRIUS_CN_RING_HOST_LANDING_BYTES", 48 << 30)?,
+        host_landing_bytes: bytes("SIRIUS_CN_RING_HOST_LANDING_BYTES", 0)?,
         disk_writers: match env("SIRIUS_CN_RING_DISK_WRITERS") {
             None => 1,
             Some(value) => value

@@ -449,6 +449,14 @@ impl NixlEndpoint for RingTransport {
 
     fn ring_open(&self, request: &PTransmitChunkParams, body: &[u8]) -> Result<Vec<u8>, String> {
         let open = LaneOpen::decode(body)?;
+        let frame_bytes = self.shared.engine.frame_bytes();
+        if open.frame_bytes != frame_bytes {
+            return Err(format!(
+                "a ring sender's frames are {} bytes and this CN's are {frame_bytes}: set \
+                 SIRIUS_CN_RING_FRAME_BYTES to the same size on every CN",
+                open.frame_bytes
+            ));
+        }
         // Before granting: the first credit goes back to this sender as a notification.
         let (respond, loaded) = channel();
         self.request(Request::LoadPeer {
@@ -743,6 +751,7 @@ impl<F: Fabric> RingLoop<F> {
         let body = LaneOpen {
             md: self.shared.local_md.clone(),
             names: hop.names.clone(),
+            frame_bytes: self.shared.engine.frame_bytes(),
         }
         .encode();
         let local_md = self.shared.local_md.clone();
@@ -2221,6 +2230,24 @@ mod tests {
                 .iter()
                 .any(|note| matches!(RingNote::decode(note), Ok(RingNote::Refuse { .. })))
         );
+    }
+
+    #[test]
+    fn a_lane_from_a_cn_with_other_frames_is_refused_before_any_grant() {
+        let cluster = Cluster::default();
+        let b = cluster.cn(2, 4, 4, Behavior::default(), settings());
+        let open = LaneOpen {
+            md: Vec::new(),
+            names: vec!["a".to_string()],
+            frame_bytes: 2 * FRAME,
+        }
+        .encode();
+        let err = b
+            .transport
+            .ring_open(&PTransmitChunkParams::default(), &open)
+            .unwrap_err();
+        assert!(err.contains("SIRIUS_CN_RING_FRAME_BYTES"), "{err}");
+        assert_eq!(b.engine.state.lock().unwrap().recv_free.len(), 4);
     }
 
     #[test]

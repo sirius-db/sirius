@@ -282,6 +282,38 @@ std::pair<ring_exchange::landing, std::uint64_t> ship(ring_exchange& from,
 
 }  // namespace
 
+TEST_CASE("ring sizes follow the device's memory, and the frame stays the same on every GPU",
+          "[exchange_ring][ends]")
+{
+  using sirius::exec::ring_exchange;
+  constexpr std::size_t MiB = std::size_t{1} << 20;
+  constexpr std::size_t GiB = std::size_t{1} << 30;
+  struct expected {
+    std::size_t device, send, recv;
+  };
+  // 189 GB keeps the sizes the GB200 runs used; smaller GPUs keep about the same share.
+  for (auto const& [device, send, recv] : {expected{189 * GiB, 1 * GiB, 1536 * MiB},
+                                           expected{96 * GiB, 576 * MiB, 832 * MiB},
+                                           expected{32 * GiB, 512 * MiB, 768 * MiB},
+                                           expected{8 * GiB, 512 * MiB, 768 * MiB}}) {
+    CAPTURE(device);
+    auto const sized = ring_exchange::options::sized_for(device);
+    CHECK(sized.frame_bytes == 64 * MiB);
+    CHECK(sized.send_bytes == send);
+    CHECK(sized.recv_bytes == recv);
+    CHECK(sized.send_bytes % sized.frame_bytes == 0);
+    CHECK(sized.recv_bytes % sized.frame_bytes == 0);
+  }
+  // A frame set by the embedder is kept, and the rings are whole frames of it.
+  auto const small = ring_exchange::options::sized_for(32 * GiB, 16 * MiB);
+  CHECK(small.frame_bytes == 16 * MiB);
+  CHECK(small.send_bytes == 192 * MiB);
+  CHECK(small.recv_bytes == 288 * MiB);
+
+  CHECK(ring_exchange::default_host_landing_bytes(256 * GiB) == 128 * GiB);
+  CHECK(ring_exchange::default_host_landing_bytes(32 * GiB) == 16 * GiB);
+}
+
 TEST_CASE("a GPU batch lands on the GPU through the rings", "[exchange_ring][ends]")
 {
   auto sender         = make_ring();

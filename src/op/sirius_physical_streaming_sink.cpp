@@ -208,10 +208,12 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
       throw sirius::internal_exception(
         "sirius_physical_streaming_sink: partitioned sink requires a resident input batch");
     }
-    const auto view   = sirius::get_cudf_table_view(input_batch);
-    const auto rows   = static_cast<std::size_t>(view.num_rows());
-    const auto bytes  = input_batch.get_data() ? input_batch.get_data()->get_size_in_bytes() : 0;
-    const auto pieces = partition_pieces(rows, bytes, _max_piece_bytes);
+    const auto view  = sirius::get_cudf_table_view(input_batch);
+    const auto rows  = static_cast<std::size_t>(view.num_rows());
+    const auto bytes = input_batch.get_data() ? input_batch.get_data()->get_size_in_bytes() : 0;
+    const auto max_piece =
+      _max_piece_bytes != 0 ? _max_piece_bytes : piece_bytes_for_pool(space->get_max_memory());
+    const auto pieces = partition_pieces(rows, bytes, max_piece);
     if (pieces.size() == 1) {
       partition(input_batch, *space);
       continue;
@@ -306,7 +308,9 @@ std::size_t sirius_physical_streaming_sink::no_history_peak_memory_estimate(
   if (_spec.mode == partition_mode::broadcast) { return stats.bytes * _outputs.size(); }
   // Hash holds the slices of the whole input, plus hash_partition's reorder buffer for one piece at
   // a time.
-  return stats.bytes + std::min<std::size_t>(stats.bytes, _max_piece_bytes);
+  // Without the GPU space's size here, bound the reorder buffer by the largest piece size.
+  auto const max_piece = _max_piece_bytes != 0 ? _max_piece_bytes : default_max_piece_bytes;
+  return stats.bytes + std::min<std::size_t>(stats.bytes, max_piece);
 }
 
 void sirius_physical_streaming_sink::build_pipelines(pipeline::sirius_pipeline& current,
