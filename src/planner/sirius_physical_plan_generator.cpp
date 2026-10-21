@@ -1588,7 +1588,8 @@ void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op, bool probe
 }
 
 //! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
-//! chain (probe = children[0], build = children[1]) and bind the two inputs.
+//! chain (probe = children[0], build = children[1]) and bind the two inputs. The inner join of a
+//! RIGHT_DELIM_JOIN is sized from its build side even when it is right-family.
 void wrap_join(sirius::op::sirius_physical_operator& join_op,
                const sirius::operator_params& op_params,
                duckdb::SiriusContext* compressed_materialization_observer)
@@ -1598,8 +1599,11 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
     join_op, /*child_idx=*/0, /*is_build=*/false, op_params, compressed_materialization_observer);
   wrap_join_child(
     join_op, /*child_idx=*/1, /*is_build=*/true, op_params, compressed_materialization_observer);
-  bool const probe_drives = join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN &&
-                            join_op.Cast<sirius::op::sirius_physical_hash_join>().is_right_family();
+  bool probe_drives = false;
+  if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+    auto const& hash_join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
+    probe_drives          = hash_join.is_right_family() && !hash_join.is_delim_join_inner();
+  }
   bind_wrapped_join(join_op, probe_drives);
 }
 
@@ -1718,11 +1722,6 @@ void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& s
     auto& right_delim = slot->Cast<sirius::op::sirius_physical_right_delim_join>();
 
     auto* internal_join = delim_base.join.get();
-    if (internal_join &&
-        (internal_join->type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN ||
-         internal_join->type == sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN)) {
-      bind_wrapped_join(*internal_join, false);
-    }
     if (internal_join && internal_join->children.size() >= 2) {
       auto* build_child = internal_join->children[1].get();
       if (build_child && build_child->type == sirius::op::SiriusPhysicalOperatorType::CONCAT &&
