@@ -128,6 +128,19 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 
 **Exchange integration:** The direct and ring exchanges make room through `request_free_memory_and_wait(bytes, predicate)`, a byte-targeted request whose predicate makes the exchange's reservation itself: the bytes a spill frees are the exchange's at once, before any other reserver can take them.
 
+**Ring exchange sizes:** the ring exchange's send and receive rings are allocated before the GPU pool and outside it. Each size the embedder leaves at 0 follows the hardware (`sirius::exec::ring_exchange`):
+
+| Setting | Default |
+|---|---|
+| Frame | 64 MiB. It must be the same on every CN: a sender writes into the receiver's frames, and refuses a lane granted with another size. |
+| Send ring | 0.6% of the device's memory in whole frames, within [8 frames, 1 GiB]. A GB200 gets 1 GiB, a 96 GiB GPU 576 MiB, a 32 GiB or smaller one 512 MiB. |
+| Receive ring | 1.5 times as many frames as the send ring. |
+| GPU pool | When it is sized by `usage_limit_fraction`, it is capped at the memory free after the rings, less 4 GiB. |
+| GPU landings | `gpu_landing_fraction` of the pool. The CN's default is 0.2. |
+| Host landings | Half of the host tier. |
+
+A batch that fits no tier fails the query at once, and the error says how to make room. The CN logs the sizes it got at startup.
+
 **Waking reservation waiters:** `memory_space::make_reservation()` waits on the space's notification channel, which only a released reservation posts; freeing a spilled batch's memory does not. After each conversion the executor therefore releases an empty reservation on the source space, so a task waiting for room retries.
 
 ### Spill Copy Granularity

@@ -45,7 +45,10 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// Sizes take a `KiB`, `MiB` or `GiB` suffix.
 pub fn ring_options_from_env() -> Result<sirius::RingOptions, String> {
-    let env = |name: &str| std::env::var(name).ok();
+    ring_options_from(|name| std::env::var(name).ok())
+}
+
+fn ring_options_from(env: impl Fn(&str) -> Option<String>) -> Result<sirius::RingOptions, String> {
     let bytes = |name: &str, default: u64| match env(name) {
         None => Ok(default),
         Some(value) => parse_bytes(&value)
@@ -486,7 +489,7 @@ pub(crate) fn check_single_visible_device(visible: Option<&str>) -> Result<(), S
 
 #[cfg(test)]
 mod tests {
-    use super::{check_single_visible_device, parse_bytes};
+    use super::{check_single_visible_device, parse_bytes, ring_options_from};
 
     #[test]
     fn one_cn_sees_one_gpu() {
@@ -505,5 +508,34 @@ mod tests {
         assert_eq!(parse_bytes("2KiB"), Some(2048));
         assert_eq!(parse_bytes("lots"), None);
         assert_eq!(parse_bytes("5TB"), None);
+    }
+
+    #[test]
+    fn unset_ring_sizes_are_left_to_the_engine_and_set_ones_must_be_positive() {
+        let unset = ring_options_from(|_| None).unwrap();
+        assert_eq!(
+            (unset.frame_bytes, unset.send_bytes, unset.recv_bytes),
+            (0, 0, 0)
+        );
+        assert_eq!(unset.host_landing_bytes, 0);
+        assert_eq!(unset.gpu_landing_fraction, 0.2);
+        assert_eq!(unset.disk_writers, 1);
+
+        let set = ring_options_from(|name| match name {
+            "SIRIUS_CN_RING_SEND_BYTES" => Some("512MiB".to_string()),
+            "SIRIUS_CN_RING_HOST_LANDING_BYTES" => Some("64GiB".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!((set.frame_bytes, set.send_bytes), (0, 512 << 20));
+        assert_eq!(set.host_landing_bytes, 64 << 30);
+
+        for bad in ["0", "lots"] {
+            let err = ring_options_from(|name| {
+                (name == "SIRIUS_CN_RING_FRAME_BYTES").then(|| bad.to_string())
+            })
+            .unwrap_err();
+            assert!(err.contains("SIRIUS_CN_RING_FRAME_BYTES"), "{err}");
+        }
     }
 }

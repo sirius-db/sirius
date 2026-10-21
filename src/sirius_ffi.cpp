@@ -263,6 +263,15 @@ struct Context::Impl {
         ? opts.host_landing_bytes
         : sirius::exec::ring_exchange::default_host_landing_bytes(tiers.host->get_max_memory());
     ring->attach(exchange, tiers);
+    SIRIUS_LOG_INFO(
+      "ring exchange: frames of {} B, send ring {} B, receive ring {} B; landings may hold {} B "
+      "of GPU and {} B of host, {}",
+      ring->frame_bytes(),
+      ring->send_ring().bytes(),
+      ring->recv_ring().bytes(),
+      tiers.gpu_bytes,
+      tiers.host_bytes,
+      tiers.disk ? "then disk" : "and there is no disk tier");
   }
 
   sirius::exec::exchange_inbox& require_exchange() const
