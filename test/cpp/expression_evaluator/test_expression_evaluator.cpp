@@ -2220,6 +2220,39 @@ TEMPLATE_TEST_CASE("select COALESCE nested in predicate",
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30, 50});
 }
 
+TEMPLATE_TEST_CASE("select COALESCE nested in predicate with a null-free first child",
+                   "[expression_evaluator]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  // WHERE COALESCE(col0, 0) > 20 OR col0 < 0 with no nulls in col0. The OR lifts the tree past
+  // min_ast_size, so the comparison requests COALESCE in AST mode; COALESCE short-circuits on the
+  // reference and must still hand the AST a temp column.
+  std::vector<int32_t> values = {10, 20, 30, 40, 50};
+  std::vector<bool> valids    = {true, true, true, true, true};
+  auto input                  = make_int32_batch_with_nulls(*space, values, valids);
+
+  std::vector<std::unique_ptr<ast_node>> children;
+  children.push_back(make_ref(0));
+  children.push_back(make_int_const(0));
+  auto coalesce = make_coalesce(std::move(children), logical_type::make(type_id::INTEGER));
+
+  std::vector<std::unique_ptr<ast_node>> disjuncts;
+  disjuncts.push_back(
+    make_cmp(sirius::comparison_type::gt, std::move(coalesce), make_int_const(20)));
+  disjuncts.push_back(make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(0)));
+  auto expr = make_conj(sirius::ast::conjunction::kind::op_or, std::move(disjuncts));
+
+  auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
+  REQUIRE(ov.num_rows() == 3);
+  REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == std::vector<int32_t>{30, 40, 50});
+}
+
 TEMPLATE_TEST_CASE("select respects null mask under plain comparison",
                    "[expression_evaluator]",
                    mat_strategy,
