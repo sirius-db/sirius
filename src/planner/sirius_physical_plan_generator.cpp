@@ -78,9 +78,11 @@
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
+#include "op/sirius_physical_window.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/sirius_plan_window.hpp"
 #include "planner/substrait_scan_ranges.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 #include "sirius/exception.hpp"
@@ -1856,6 +1858,16 @@ void insert_gpu_pipeline_operators_recursive(
       }
       break;
     }
+    case sirius::op::SiriusPhysicalOperatorType::WINDOW: {
+      auto const& window = slot->Cast<sirius::op::sirius_physical_window>();
+      std::vector<duckdb::idx_t> keys(window.partition_columns().begin(),
+                                      window.partition_columns().end());
+      slot->children[0] = build_whole_partition_window_exchange(std::move(slot->children[0]),
+                                                                keys,
+                                                                slot->estimated_cardinality,
+                                                                op_params.hash_partition_bytes);
+      break;
+    }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:
       wrap_hash_group_by(slot, op_params, compressed_materialization_observer);
       break;
@@ -2311,7 +2323,8 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   };
   try {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerCreatePlan>();
-    plan       = create_plan(*op);
+    validate_whole_partition_window_consumers(*op);
+    plan = create_plan(*op);
   } catch (duckdb::NotImplementedException const&) {
     // A pre-capture refusal used to throw before parent planning. Preserve
     // that first error if a later ordinary planner decline aborts tree build.
@@ -2419,8 +2432,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       plan = create_plan(op.Cast<duckdb::LogicalAggregate>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_WINDOW:
-      throw duckdb::NotImplementedException("Window not supported");
-      // plan = create_plan(op.Cast<duckdb::LogicalWindow>());
+      plan = create_plan(op.Cast<duckdb::LogicalWindow>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_UNNEST:
       throw duckdb::NotImplementedException("Unnest not supported");

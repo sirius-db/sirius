@@ -88,6 +88,7 @@ target_sources(
           sirius_physical_top_n.cpp
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
+          sirius_physical_window.cpp
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
           replicate/gpu_replicate_impl.cu

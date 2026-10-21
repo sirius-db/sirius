@@ -62,6 +62,7 @@ class LogicalGet;
 class LogicalLimit;
 class LogicalOrder;
 class LogicalTopN;
+class LogicalWindow;
 class LogicalProjection;
 class LogicalSetOperation;
 class LogicalMaterializedCTE;
@@ -207,6 +208,7 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOrder& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalTopN& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalWindow& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   // create_plan(duckdb::LogicalPositionalJoin &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
