@@ -36,7 +36,6 @@
 #include <cuda_runtime.h>
 
 #include <arpa/inet.h>
-#include <config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <log/logging.hpp>
 #include <netinet/in.h>

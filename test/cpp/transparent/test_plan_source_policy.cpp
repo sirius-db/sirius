@@ -17,7 +17,7 @@
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
 #include "sirius_context.hpp"
-#include "sirius_extension.hpp"
+#include "sirius_registration.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/plan_source_policy.hpp"

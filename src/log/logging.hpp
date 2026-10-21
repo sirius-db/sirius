@@ -16,14 +16,31 @@
 
 #pragma once
 
-#include "log/level.hpp"
-#include "log/sink.hpp"
+#include <sirius/log/level.hpp>
+#include <sirius/log/sink.hpp>
 
 #include <concepts>
 #include <format>
 #include <functional>
 #include <source_location>
 #include <utility>
+
+// Compile-time log severity level threshold options.
+#define SIRIUS_LOG_LEVEL_TRACE    0
+#define SIRIUS_LOG_LEVEL_DEBUG    1
+#define SIRIUS_LOG_LEVEL_INFO     2
+#define SIRIUS_LOG_LEVEL_WARN     3
+#define SIRIUS_LOG_LEVEL_ERROR    4
+#define SIRIUS_LOG_LEVEL_CRITICAL 5
+#define SIRIUS_LOG_LEVEL_OFF      6
+
+// Compile-time log severity level threshold.
+//
+// This allows compile-time definitions passed to the compiler to completely
+// compile out all log statements made through SIRIUS_LOG_* macros.
+#ifndef SIRIUS_ACTIVE_LOG_LEVEL
+#define SIRIUS_ACTIVE_LOG_LEVEL SIRIUS_LOG_LEVEL_TRACE
+#endif
 
 namespace sirius::log::detail {
 

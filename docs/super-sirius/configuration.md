@@ -718,13 +718,21 @@ SET delim_join_as_cte = true;
 
 ## DuckDB SET Variables
 
-Registered in `src/sirius_extension.cpp`. The `operator_params` setters, expression settings, and
+Logging options are registered in `sirius-duckdb/src/sirius/sirius_logging.cpp`; other options are
+registered in `src/sirius_extension.cpp`. The `operator_params` setters, expression settings, and
 pin-compression settings are connection-local overrides of the defaults registered for the database;
 GLOBAL writes are rejected and RESET restores the registered default. Each execution uses one
-immutable operator-options snapshot. Logging updates serialize runtime-wide. Hardware decompression
-requires startup configuration.
+immutable operator-options snapshot. Logging settings are database-global; ordinary SET and RESET
+use global scope, and session overrides are rejected. Logging updates configure the process-wide
+sink. Different databases can still replace that shared sink. Hardware decompression requires
+startup configuration.
 
 ### Logging
+
+Sirius logging `SET` and `RESET` statements cannot run concurrently within one database.
+An overlapping logging change fails immediately; unrelated queries can run concurrently.
+For an asynchronous `SET` or `RESET`, complete or close its query result before issuing
+another logging change. If an overlapping change fails, finish the earlier result and retry.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -751,8 +759,7 @@ place. With `spdlog`, an unknown level falls back to `info` and emits a warning.
 backend needs a DuckDB database when the sink is installed, so selecting it in the FFI path
 does not create a sink; this path has no SQL or settings entry point to enable or read DuckDB
 logging. If the selected sink cannot be constructed, such as when the log directory is not
-writable, context construction throws and restores the previous `Config::LOG_*` values while
-leaving the previous sink active.
+writable, context construction throws and leaves the previous sink active.
 
 ### Expression Evaluation
 
@@ -939,28 +946,11 @@ SET enable_runtime_size_estimation = true;   -- off by default
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
 
-## Compile-Time Config Flags
-
-### Static flags
-
-**File:** `src/include/config.hpp`
-
-Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
-
-| Flag | Value | Namespace |
-|------|-------|-----------|
-| `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
-| `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
-| `NUM_GPU` | 1 | `sirius::Config` |
-
-These are compile-time defaults. Runtime configuration via `sirius_config` and DuckDB SET variables takes precedence.
-
 ## Key Files
 
 | File | Purpose |
 |------|---------|
 | `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
-| `src/config.hpp` | Static config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
 | `src/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |

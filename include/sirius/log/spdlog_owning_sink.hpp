@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include "log/sink.hpp"
+#include <sirius/export.hpp>
+#include <sirius/log/sink.hpp>
 
 #include <chrono>
 #include <filesystem>
@@ -42,6 +43,6 @@ struct spdlog_owning_config {
 ///
 /// Throws if the sink cannot be constructed, e.g. because the directory is
 /// not writable.
-std::shared_ptr<sink> make_spdlog_owning_sink(const spdlog_owning_config& config);
+SIRIUS_EXPORT std::shared_ptr<sink> make_spdlog_owning_sink(const spdlog_owning_config& config);
 
 }  // namespace sirius::log

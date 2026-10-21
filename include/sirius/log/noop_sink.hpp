@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,28 +14,17 @@
  * limitations under the License.
  */
 
-#define DUCKDB_EXTENSION_MAIN
+#pragma once
 
-#include "sirius/duckdb.hpp"
-#include "sirius_extension.hpp"
+#include <sirius/export.hpp>
+#include <sirius/log/sink.hpp>
 
-namespace duckdb {
+#include <memory>
 
-void SiriusExtension::Load(ExtensionLoader& loader) { sirius::register_duckdb_extension(loader); }
+namespace sirius::log {
 
-std::string SiriusExtension::Name() { return "sirius"; }
+/// Creates a sink that discards everything. Used as the facade's default until
+/// a real sink is installed.
+SIRIUS_EXPORT std::shared_ptr<sink> make_noop_sink();
 
-std::string SiriusExtension::Version() const
-{
-#ifdef EXT_VERSION_SIRIUS
-  return EXT_VERSION_SIRIUS;
-#else
-  return "";
-#endif
-}
-
-}  // namespace duckdb
-
-extern "C" {
-DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader) { sirius::register_duckdb_extension(loader); }
-}
+}  // namespace sirius::log

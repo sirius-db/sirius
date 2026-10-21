@@ -16,50 +16,35 @@
 
 #pragma once
 
+#include <sirius/export.hpp>
+
 #include <cstdint>
 #include <optional>
 #include <string_view>
 
 namespace sirius::log {
 
-// Compile-time log severity level threshold options.
-#define SIRIUS_LOG_LEVEL_TRACE    0
-#define SIRIUS_LOG_LEVEL_DEBUG    1
-#define SIRIUS_LOG_LEVEL_INFO     2
-#define SIRIUS_LOG_LEVEL_WARN     3
-#define SIRIUS_LOG_LEVEL_ERROR    4
-#define SIRIUS_LOG_LEVEL_CRITICAL 5
-#define SIRIUS_LOG_LEVEL_OFF      6
-
-// Compile-time log severity level threshold.
-//
-// This allows compile-time definitions passed to the compiler to completely
-// compile out all log statements made through SIRIUS_LOG_* macros.
-#ifndef SIRIUS_ACTIVE_LOG_LEVEL
-#define SIRIUS_ACTIVE_LOG_LEVEL SIRIUS_LOG_LEVEL_TRACE
-#endif
-
 /// Run-time log severity levels.
 enum class level : uint8_t {
   /// Fine-grained detail typically useful only to developers.
-  trace = SIRIUS_LOG_LEVEL_TRACE,
+  trace = 0,
   /// Detailed diagnostics which would be noise in normal operation, but may be
   /// useful for users when tracking down unexpected behavior.
-  debug = SIRIUS_LOG_LEVEL_DEBUG,
+  debug = 1,
   /// General progress messages that are informative without being noisy.
-  info = SIRIUS_LOG_LEVEL_INFO,
+  info = 2,
   /// Something may be wrong, but core functionality is unaffected.
-  warn = SIRIUS_LOG_LEVEL_WARN,
+  warn = 3,
   /// Something is definitely wrong and misbehavior is likely, though the
   /// program can continue.
-  error = SIRIUS_LOG_LEVEL_ERROR,
+  error = 4,
   /// So wrong that abnormal termination is likely imminent.
-  critical = SIRIUS_LOG_LEVEL_CRITICAL,
+  critical = 5,
   /// Emit nothing.
-  off = SIRIUS_LOG_LEVEL_OFF,
+  off = 6,
 };
 
 /// Parses a level name into a level, or nullopt for an unrecognized name.
-std::optional<level> string_to_enum(std::string_view name);
+SIRIUS_EXPORT std::optional<level> string_to_enum(std::string_view name);
 
 }  // namespace sirius::log

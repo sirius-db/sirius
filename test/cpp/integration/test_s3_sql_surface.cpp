@@ -18,6 +18,7 @@
 #include "scan_manager/preparation_test_support.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "sirius_registration.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/s3_backend.hpp"

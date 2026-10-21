@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-#include "log/duckdb_sink.hpp"
-
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
+
+#include <sirius/log/duckdb_sink.hpp>
 
 #include <format>
 #include <memory>

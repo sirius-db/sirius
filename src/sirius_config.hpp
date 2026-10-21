@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"

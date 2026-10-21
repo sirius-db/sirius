@@ -62,7 +62,7 @@
 #include <cucascade/memory/stream_pool.hpp>
 #include <glob.h>
 #include <log/logging.hpp>
-#include <log/spdlog_owning_sink.hpp>
+#include <sirius/log/spdlog_owning_sink.hpp>
 
 #include <algorithm>
 #include <array>

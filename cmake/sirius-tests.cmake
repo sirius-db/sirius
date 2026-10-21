@@ -1,6 +1,6 @@
 find_package(Catch2 3 REQUIRED CONFIG)
 
-add_executable(sirius_unittest ${TEST_SOURCES} src/sirius_extension_entry.cpp
+add_executable(sirius_unittest ${TEST_SOURCES}
                                test/cpp/utils/sirius_extension_loader.cpp)
 # Export DuckDB's host API for third-party extensions such as Iceberg.
 set_target_properties(sirius_unittest PROPERTIES ENABLE_EXPORTS ON)
@@ -87,9 +87,8 @@ sirius_link_duckdb_extensions(sirius_unittest)
 # domain handles and mask first-domain capture bugs.
 add_executable(sirius_nvtx_startup test/telemetry/nvtx_startup.cpp)
 target_link_libraries(sirius_nvtx_startup sirius_core duckdb_static ZLIB::ZLIB)
-target_sources(
-  sirius_nvtx_startup PRIVATE src/sirius_extension_entry.cpp
-                              test/cpp/utils/sirius_extension_loader.cpp)
+target_sources(sirius_nvtx_startup
+               PRIVATE test/cpp/utils/sirius_extension_loader.cpp)
 target_include_directories(
   sirius_nvtx_startup
   PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
@@ -495,3 +494,13 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+foreach(target sirius_unittest sirius_nvtx_startup)
+  target_sources(${target} PRIVATE sirius-duckdb/src/sirius/sirius_extension.cpp
+                                   sirius-duckdb/src/sirius/sirius_logging.cpp)
+  target_compile_definitions(${target} PRIVATE SIRIUS_EXTENSION_NAME=sirius
+                                               SIRIUS_EXTENSION_VERSION="")
+  target_include_directories(
+    ${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/sirius-duckdb/src"
+                      "${CMAKE_CURRENT_SOURCE_DIR}/sirius-duckdb/src/include")
+endforeach()

@@ -3,6 +3,7 @@
 #include "sirius_extension.hpp"
 
 #include "sirius/duckdb.hpp"
+#include "sirius_logging.hpp"
 
 #define SIRIUS_STRINGIFY_IMPL(name) #name
 #define SIRIUS_STRINGIFY(name)      SIRIUS_STRINGIFY_IMPL(name)
@@ -23,7 +24,18 @@ static void LoadInternal(ExtensionLoader& loader)
       throw InvalidInputException("Cannot load %s while %s is already loaded", name, other);
     }
   }
+
+  // Grab the logging config from possibly set env variables and install it
+  // before the rest of Sirius starts so all startup logs are included.
+  auto logging = sirius::duckdb_extension::logging_options_from_environment();
+  sirius::duckdb_extension::install_log_sink(logging, &loader.GetDatabaseInstance());
+
   sirius::register_duckdb_extension(loader);
+
+  // After Sirius has booted, ensure that the logging options are exposed as SQL
+  // options in DuckDB, so users can change logging again through DuckDB queries
+  // if they want.
+  sirius::duckdb_extension::register_logging_options(loader.GetDatabaseInstance(), logging);
 }
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }

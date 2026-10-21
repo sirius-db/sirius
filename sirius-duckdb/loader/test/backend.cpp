@@ -17,6 +17,7 @@
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "sirius/duckdb.hpp"
+#include "sirius_logging.hpp"
 
 #include <cstdlib>
 
@@ -37,3 +38,14 @@ void register_duckdb_extension(duckdb::ExtensionLoader& loader)
 }
 
 }  // namespace sirius
+
+namespace sirius::duckdb_extension {
+
+// Loader fixtures exercise backend selection without the engine's logging dependencies.
+logging_options logging_options_from_environment() { return {}; }
+
+void install_log_sink(const logging_options&, duckdb::DatabaseInstance*) {}
+
+void register_logging_options(duckdb::DatabaseInstance&, const logging_options&) {}
+
+}  // namespace sirius::duckdb_extension

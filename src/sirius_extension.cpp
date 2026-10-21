@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
@@ -2452,20 +2451,6 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, reset_sirius_cache_info);
 }
 
-// Process-global Config writes are refused once the Sirius runtime is
-// latched unavailable (stable, session-preserving error). Connection-local
-// settings (gpu_execution, enable_duckdb_fallback, fuse_merge_pipelines,
-// like_swar_fastpath) and operator_params setters are not gated here; the latter
-// use connection-local operator parameters instead.
-static void throw_if_sirius_runtime_unavailable(ClientContext& context)
-{
-  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-      sirius_ctx &&
-      sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE) {
-    sirius_ctx->throw_runtime_unavailable();
-  }
-}
-
 static void ApplyExpressionEvaluatorStrategy(ClientContext& context,
                                              SetScope scope,
                                              const std::string& value)
@@ -2603,82 +2588,6 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
   auto* params              = get_operator_params(context, scope);
   params->sort_sample_bytes = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config SORT_SAMPLE_BYTES to {}", params->sort_sample_bytes);
-}
-
-static void SetLogBackend(ClientContext& context, SetScope scope, Value& parameter)
-{
-  std::lock_guard log_lock(Config::logging_mutex);
-  throw_if_sirius_runtime_unavailable(context);
-  auto backend = StringValue::Get(parameter);
-  if (backend != "duckdb" && backend != "spdlog" && backend != "noop") {
-    throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: duckdb, spdlog, noop)",
-                                backend);
-  }
-  auto const previous_backend = Config::LOG_BACKEND;
-  Config::LOG_BACKEND         = std::move(backend);
-  try {
-    install_configured_log_sink(context.db.get());
-  } catch (...) {
-    Config::LOG_BACKEND = previous_backend;
-    throw;
-  }
-  SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", Config::LOG_BACKEND);
-}
-
-static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
-{
-  std::lock_guard log_lock(Config::logging_mutex);
-  throw_if_sirius_runtime_unavailable(context);
-  auto level_name   = StringValue::Get(parameter);
-  auto parsed_level = sirius::log::string_to_enum(level_name);
-  if (!parsed_level) {
-    throw InvalidInputException(
-      "sirius_log_level must be one of: trace, debug, info, warn, error, critical, off; got '%s'",
-      level_name);
-  }
-  Config::LOG_LEVEL = std::move(level_name);
-  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
-  sirius::log::get_sink()->set_level(*parsed_level);
-  SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
-}
-
-static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
-{
-  std::lock_guard log_lock(Config::logging_mutex);
-  throw_if_sirius_runtime_unavailable(context);
-  auto const previous_log_dir = Config::LOG_DIR;
-  Config::LOG_DIR             = StringValue::Get(parameter);
-  // log_dir only affects the spdlog backend; rebuild it when that one is active.
-  try {
-    if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
-  } catch (...) {
-    Config::LOG_DIR = previous_log_dir;
-    throw;
-  }
-  SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
-}
-
-static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
-{
-  std::lock_guard log_lock(Config::logging_mutex);
-  throw_if_sirius_runtime_unavailable(context);
-  auto const seconds = IntegerValue::Get(parameter);
-  if (seconds < 0) {
-    throw InvalidInputException(
-      "sirius_log_flush_seconds must be non-negative; zero disables periodic flushing; got %d",
-      seconds);
-  }
-  auto const previous_flush_seconds = Config::LOG_FLUSH_SECONDS;
-  Config::LOG_FLUSH_SECONDS         = seconds;
-  // The flush interval is fixed at spdlog-sink construction, so rebuild it (only
-  // the spdlog backend uses it).
-  try {
-    if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
-  } catch (...) {
-    Config::LOG_FLUSH_SECONDS = previous_flush_seconds;
-    throw;
-  }
-  SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
 static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -2965,7 +2874,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                                            const sirius::operator_params& operator_defaults,
                                            const sirius::compression_config& compression_defaults)
 {
-  std::lock_guard log_lock(Config::logging_mutex);
   config.AddExtensionOption(
     "expression_evaluator_strategy",
     "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', or "
@@ -3327,28 +3235,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
     SetMaxSortPartitionMemoryFraction);
 
-  // Logging configuration
-  config.AddExtensionOption("sirius_log_backend",
-                            "Logging backend for Sirius (duckdb, spdlog, noop)",
-                            LogicalType::VARCHAR,
-                            Value(Config::LOG_BACKEND),
-                            SetLogBackend);
-  config.AddExtensionOption("sirius_log_level",
-                            "Log level for Sirius (trace, debug, info, warn, error, critical, off)",
-                            LogicalType::VARCHAR,
-                            Value(Config::LOG_LEVEL),
-                            SetLogLevel);
-  config.AddExtensionOption("sirius_log_dir",
-                            "Directory for Sirius log files",
-                            LogicalType::VARCHAR,
-                            Value(Config::LOG_DIR),
-                            SetLogDir);
-  config.AddExtensionOption("sirius_log_flush_seconds",
-                            "Interval in seconds between automatic log flushes (0 disables)",
-                            LogicalType::INTEGER,
-                            Value::INTEGER(Config::LOG_FLUSH_SECONDS),
-                            SetLogFlushSeconds);
-
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",
                             LogicalType::UBIGINT,
@@ -3591,11 +3477,6 @@ static void LoadInternal(ExtensionLoader& loader)
     callback_ptr->initialize_context();
   }
   config.GetCallbackManager().Register(std::move(callback));
-
-  // The ctor already installed the db-independent backend; reinstall now that the
-  // DatabaseInstance exists so the duckdb backend (which needs it) is built and an
-  // unknown backend name is reported here rather than swallowed by the ctor.
-  install_configured_log_sink(&db);
 
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.

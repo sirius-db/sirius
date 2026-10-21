@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <config.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>

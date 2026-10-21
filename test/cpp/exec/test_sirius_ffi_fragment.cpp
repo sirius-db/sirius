@@ -23,12 +23,12 @@
 // second, independent Fragment cleanly. Valid fragments are covered in
 // test_sirius_ffi_embedder.cpp.
 
-#include "config.hpp"
-#include "log/sink.hpp"
 #include "sirius/ffi.hpp"
 
 #include <catch.hpp>
 #include <duckdb/common/exception/transaction_exception.hpp>
+#include <sirius/log/noop_sink.hpp>
+#include <sirius/log/sink.hpp>
 
 #include <cstdint>
 #include <cstdlib>
@@ -72,9 +72,6 @@ struct logging_state_guard {
 
   ~logging_state_guard()
   {
-    duckdb::Config::LOG_BACKEND.swap(backend);
-    duckdb::Config::LOG_DIR.swap(log_dir);
-    duckdb::Config::LOG_LEVEL.swap(level);
     if (sirius::log::get_sink() != sink) { sirius::log::set_sink(sink); }
     restore_env("SIRIUS_LOG_BACKEND", env_backend);
     restore_env("SIRIUS_LOG_DIR", env_log_dir);
@@ -83,9 +80,6 @@ struct logging_state_guard {
     fs::remove_all(test_root, error);
   }
 
-  std::string backend{duckdb::Config::LOG_BACKEND};
-  std::string log_dir{duckdb::Config::LOG_DIR};
-  std::string level{duckdb::Config::LOG_LEVEL};
   std::shared_ptr<sirius::log::sink> sink{sirius::log::get_sink()};
   std::optional<std::string> env_backend{saved_env("SIRIUS_LOG_BACKEND")};
   std::optional<std::string> env_log_dir{saved_env("SIRIUS_LOG_DIR")};
@@ -164,16 +158,12 @@ TEST_CASE("FFI context restores logging settings when sink construction fails",
   REQUIRE(fs::is_regular_file(blocker));
   auto const invalid_dir = blocker / "child";
 
-  duckdb::Config::LOG_BACKEND = "noop";
-  duckdb::Config::LOG_DIR     = (test_root / "previous").string();
-  duckdb::Config::LOG_LEVEL   = "warn";
+  sirius::log::set_sink(sirius::log::make_noop_sink());
+  auto const staged_sink = sirius::log::get_sink();
   setenv("SIRIUS_LOG_BACKEND", "spdlog", 1);
   setenv("SIRIUS_LOG_DIR", invalid_dir.string().c_str(), 1);
   setenv("SIRIUS_LOG_LEVEL", "debug", 1);
 
   REQUIRE_THROWS(sirius::ffi::make_context_from_config(isolated_memory_config_path().string()));
-  REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
-  REQUIRE(duckdb::Config::LOG_DIR == (test_root / "previous").string());
-  REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
-  REQUIRE(sirius::log::get_sink() == restore.sink);
+  REQUIRE(sirius::log::get_sink() == staged_sink);
 }

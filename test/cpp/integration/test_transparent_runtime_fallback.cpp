@@ -21,7 +21,6 @@
 // failure, distinct from a plan-time (create_plan) fallback.
 
 #include <catch.hpp>
-#include <config.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <fcntl.h>

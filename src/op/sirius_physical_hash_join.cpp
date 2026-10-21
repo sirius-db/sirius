@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 
-#include "config.hpp"
 #include "cudf/aggregation.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/distinct_hash_join.hpp"

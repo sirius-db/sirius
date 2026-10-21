@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "log/noop_sink.hpp"
-#include "log/sink.hpp"
+#include <sirius/log/noop_sink.hpp>
+#include <sirius/log/sink.hpp>
 
 #include <atomic>
 #include <memory>

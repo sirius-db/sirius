@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <config.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
