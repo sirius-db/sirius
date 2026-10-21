@@ -525,17 +525,20 @@ sirius:
 
 Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
 worker threads walk the pending splits in scan execution order and convert
-resident batches to GPU tier ahead of task creation, gated on GPU memory
-headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default;
-single-GPU configurations only (logs a warning and disables itself otherwise).
+resident batches to GPU tier ahead of task execution, gated on GPU memory
+headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default. Background memory
+prefetch runs only when the query has exactly one eligible GPU after admission filtering.
+Workers use that device's reservations and exclusive stream leases, releasing leases before
+parking. With multiple eligible GPUs, scan tasks perform their own uploads on their assigned
+devices; independent background placement could conflict with a task's already selected device.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enable` | bool | false | Master switch for the prefetcher. |
-| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each drives one in-flight batch conversion on its own stream. |
+| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each acquires an exclusive stream lease for a sweep and returns it before parking. |
 | `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
 | `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
-| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
+| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining until this long passes since its last pop. One worker may prefetch it tail-first, leaving four batches at the head for scan tasks; other workers skip it. Must exceed the scan's inter-pop interval. |
 
 ### Programmatic S3 credentials
 

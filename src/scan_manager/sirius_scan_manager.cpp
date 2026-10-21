@@ -1508,6 +1508,7 @@ void sirius_scan_manager::prepare_for_query(
   state->pruning_enabled   = enable_pinned_zone_map_pruning;
   if (!completion) completion = std::make_shared<pipeline::completion_handler>();
   state->completion = completion;
+  state->active_gpu_ids.assign(allocated_gpu_ids.begin(), allocated_gpu_ids.end());
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
   // whole pool. Oversubscription across concurrent queries is absorbed by the dispatcher's
   // pending queue and the pool, not by a per-query cap.
@@ -2051,19 +2052,33 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
   const auto& cfg = _config.memory_prefetcher;
   if (!cfg.enable) { return; }
 
-  // Prototype scope: a single GPU space. Multi-GPU needs the task creator's
-  // NUMA-locality derivation to pick the per-batch target device; converting
-  // to the wrong space would strand data cross-device.
-  auto gpu_spaces = _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  std::vector<cucascade::memory::memory_space*> gpu_spaces;
+  for (auto* space :
+       _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (state.active_gpu_ids.empty() ||
+        std::find(state.active_gpu_ids.begin(),
+                  state.active_gpu_ids.end(),
+                  space->get_device_id()) != state.active_gpu_ids.end()) {
+      if (auto* mutable_space = _reservation_manager.get_memory_space(cucascade::memory::Tier::GPU,
+                                                                      space->get_device_id())) {
+        gpu_spaces.push_back(mutable_space);
+      } else {
+        SIRIUS_LOG_WARN("[memory_prefetcher] GPU {} has no mutable memory space; skipping",
+                        space->get_device_id());
+      }
+    }
+  }
+  // Admission determines the allowed devices, not each scan task's placement.
+  // A task can latch its device while a batch is still on the host; prefetching
+  // it onto another allowed GPU would leave that task with a foreign-device table.
+  // Keep background conversion on a single eligible GPU until placement is shared.
   if (gpu_spaces.size() != 1) {
     SIRIUS_LOG_WARN(
-      "[memory_prefetcher] disabled: prototype supports exactly 1 GPU space (found {})",
+      "[memory_prefetcher] enabled but skipped: query has {} eligible GPUs; exactly one is "
+      "required",
       gpu_spaces.size());
     return;
   }
-  auto* gpu_space = _reservation_manager.get_memory_space(cucascade::memory::Tier::GPU,
-                                                          gpu_spaces.front()->get_device_id());
-  if (gpu_space == nullptr) { return; }
 
   std::vector<std::shared_ptr<split_connector>> connectors;
   connectors.reserve(state.scans.size());
@@ -2071,8 +2086,8 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
     connectors.push_back(scan.op->get_shared_split_connector());
   }
 
-  state.prefetcher =
-    std::make_unique<memory_prefetcher>(cfg, std::move(connectors), gpu_space, _query_lifecycle);
+  state.prefetcher = std::make_unique<memory_prefetcher>(
+    cfg, std::move(connectors), std::move(gpu_spaces), _query_lifecycle);
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(

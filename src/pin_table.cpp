@@ -25,6 +25,7 @@
 #include "io/io_context.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
+#include "memory/runtime_stream_pool.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
@@ -294,12 +295,12 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       placement.get_next_gpu(/*pipeline_id=*/0, /*data=*/nullptr, /*hint=*/{}).value();
     auto* target = space_by_device.at(gpu_id);
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_id}};
-    // Borrow a real (non-default) stream from the target memory_space's pool: the
+    // Borrow a real (non-default) stream from the target's runtime stream pool: the
     // duckdb-native decoder's cudaMemcpyBatchAsync rejects the legacy default
-    // stream. The pool owns the stream for the memory_space's lifetime (which
-    // outlives the pinned data), so the materialized buffers' deallocation stream
-    // stays valid after this call.
-    auto stream = target->acquire_stream();
+    // stream. The manager retains the pool until pinned data is retired, so the
+    // materialized buffers' deallocation stream stays valid after this call.
+    auto stream_lease = sirius::memory::runtime_stream_pool::acquire(*target);
+    auto stream       = stream_lease.get();
 
     // A pin caches the table UNFILTERED: it has no row filter (no WHERE), and the
     // ingestible's projection_ids are identity into column_ids, so the reader already
