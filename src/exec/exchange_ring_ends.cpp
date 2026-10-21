@@ -310,6 +310,21 @@ rmm::cuda_stream stream_on(int device)
 }
 }  // namespace
 
+ring_exchange::options ring_exchange::options::sized_for(std::size_t device_bytes,
+                                                         std::size_t frame_bytes) noexcept
+{
+  constexpr std::size_t max_send        = std::size_t{1} << 30;
+  constexpr std::size_t min_send_frames = 8;
+  options sized;
+  if (frame_bytes != 0) { sized.frame_bytes = frame_bytes; }
+  auto const frame       = sized.frame_bytes;
+  auto const send_frames = std::clamp(
+    device_bytes / 1000 * 6 / frame, min_send_frames, std::max(max_send / frame, min_send_frames));
+  sized.send_bytes = send_frames * frame;
+  sized.recv_bytes = send_frames * 3 / 2 * frame;
+  return sized;
+}
+
 ring_exchange::ring_exchange(int device, options const& opts)
   : _device{device},
     _send{device, frame_ring::frames_in(opts.send_bytes, opts.frame_bytes), opts.frame_bytes},

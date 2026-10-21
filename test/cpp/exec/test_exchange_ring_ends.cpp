@@ -282,6 +282,32 @@ std::pair<ring_exchange::landing, std::uint64_t> ship(ring_exchange& from,
 
 }  // namespace
 
+TEST_CASE("ring sizes follow the device's memory, and the frame stays the same on every GPU",
+          "[exchange_ring][ends]")
+{
+  constexpr std::size_t MiB = std::size_t{1} << 20;
+  constexpr std::size_t GiB = std::size_t{1} << 30;
+  struct expected {
+    std::size_t device, send, recv;
+  };
+  // 189 GiB keeps the sizes the GB200 runs used; smaller GPUs keep about the same share.
+  for (auto const& [device, send, recv] : {expected{189 * GiB, 1 * GiB, 1536 * MiB},
+                                           expected{96 * GiB, 576 * MiB, 832 * MiB},
+                                           expected{32 * GiB, 512 * MiB, 768 * MiB},
+                                           expected{24 * GiB, 512 * MiB, 768 * MiB}}) {
+    CAPTURE(device);
+    auto const sized = ring_exchange::options::sized_for(device);
+    CHECK(sized.frame_bytes == 64 * MiB);
+    CHECK(sized.send_bytes == send);
+    CHECK(sized.recv_bytes == recv);
+  }
+  // A frame set by the embedder is kept, and the rings are whole frames of it.
+  auto const small = ring_exchange::options::sized_for(32 * GiB, 16 * MiB);
+  CHECK(small.frame_bytes == 16 * MiB);
+  CHECK(small.send_bytes == 192 * MiB);
+  CHECK(small.recv_bytes == 288 * MiB);
+}
+
 TEST_CASE("a GPU batch lands on the GPU through the rings", "[exchange_ring][ends]")
 {
   auto sender         = make_ring();

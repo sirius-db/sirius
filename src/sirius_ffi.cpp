@@ -280,10 +280,17 @@ struct Context::Impl {
         static_cast<void>(cudaGetLastError());
         throw sirius::internal_exception("Context: no current CUDA device for the ring exchange");
       }
-      sirius::exec::ring_exchange::options opts;
-      opts.frame_bytes  = ring_options->frame_bytes;
-      opts.send_bytes   = ring_options->send_bytes;
-      opts.recv_bytes   = ring_options->recv_bytes;
+      // A size left at 0 follows the device's memory, so a 32 GB GPU gives the rings the same
+      // share as a 189 GB one.
+      std::size_t free_bytes = 0, device_bytes = 0;
+      if (cudaMemGetInfo(&free_bytes, &device_bytes) != cudaSuccess) {
+        static_cast<void>(cudaGetLastError());
+        throw sirius::internal_exception("Context: cannot read the device's memory for the rings");
+      }
+      auto opts =
+        sirius::exec::ring_exchange::options::sized_for(device_bytes, ring_options->frame_bytes);
+      if (ring_options->send_bytes != 0) { opts.send_bytes = ring_options->send_bytes; }
+      if (ring_options->recv_bytes != 0) { opts.recv_bytes = ring_options->recv_bytes; }
       opts.disk_writers = ring_options->disk_writers;
       if (auto const* value = std::getenv("SIRIUS_CN_RING_RETURN_SPILLED")) {
         opts.return_spilled = std::string_view{value} == "1";

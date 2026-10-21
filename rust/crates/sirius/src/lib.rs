@@ -391,7 +391,8 @@ impl std::fmt::Debug for OutputDrain {
     }
 }
 
-/// Sizes of a context's ring exchange, for [`SiriusContext::with_ring`].
+/// Sizes of a context's ring exchange, for [`SiriusContext::with_ring`]. A frame or ring size of
+/// 0 is derived from the GPU's memory; the frame must be the same on every CN.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RingOptions {
     pub frame_bytes: u64,

@@ -90,6 +90,15 @@ class ring_exchange {
     /// serializes its callers; more each copy a frame to a pinned bounce of their own and write
     /// it from host, so landings' writes overlap.
     std::size_t disk_writers = 1;
+
+    /// Ring sizes for a device with @p device_bytes of memory, so a small GPU gives the rings the
+    /// same share as a large one. The frame stays 64 MiB unless @p frame_bytes sets it: every CN
+    /// must use the same frame, since a sender writes its frames into the receiver's. The send
+    /// ring is 0.6% of the device in whole frames, within [8 frames, 1 GiB], and the receive ring
+    /// holds 1.5 times as many frames. A 189 GB GPU gets 1 GiB and 1.5 GiB, a 96 GB one 576 MiB
+    /// and 832 MiB, a 32 GB or smaller one 512 MiB and 768 MiB.
+    [[nodiscard]] static options sized_for(std::size_t device_bytes,
+                                           std::size_t frame_bytes = 0) noexcept;
   };
 
   /// Allocates both rings on @p device. Call before the engine's pool is built, so the rings are
