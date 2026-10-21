@@ -1634,6 +1634,62 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - join input partitions get their ingress barrier at planning",
+                 "[plan_tree_shape][isolated_context]")
+{
+  using sirius::op::MemoryBarrierType;
+  auto const barriers = [](sirius_physical_operator* join) {
+    auto& probe = join->children[0]->children[0]->Cast<sirius::op::sirius_physical_partition>();
+    auto& build = join->children[1]->children[0]->Cast<sirius::op::sirius_physical_partition>();
+    return std::make_pair(probe.input_barrier(), build.input_barrier());
+  };
+  const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
+                                              OptimizerType::BUILD_SIDE_PROBE_SIDE};
+
+  SECTION("INNER join: the probe streams and the build arrives whole")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid");
+    INFO(tree_to_string(plan.get()));
+    auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(join != nullptr);
+    REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>().join_type == JoinType::INNER);
+    auto const [probe, build] = barriers(join);
+    CHECK(probe == MemoryBarrierType::PARTIAL);
+    CHECK(build == MemoryBarrierType::FULL);
+  }
+
+  SECTION("RIGHT join: the probe drives partition sizing and arrives whole")
+  {
+    auto plan = generate_sirius_plan(
+      *con, "SELECT * FROM big_left l RIGHT JOIN small_right r ON l.id = r.rid", keep_shape);
+    INFO(tree_to_string(plan.get()));
+    auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(join != nullptr);
+    REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>().is_right_family());
+    auto const [probe, build] = barriers(join);
+    CHECK(probe == MemoryBarrierType::FULL);
+    CHECK(build == MemoryBarrierType::FULL);
+  }
+
+  SECTION("RIGHT_DELIM_JOIN: the inner join is sized from its build side")
+  {
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
+      "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
+    INFO(tree_to_string(plan.get()));
+    auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+    REQUIRE(node != nullptr);
+    auto& delim = node->Cast<sirius::op::sirius_physical_right_delim_join>();
+    REQUIRE(delim.join);
+    auto const [probe, build] = barriers(delim.join.get());
+    CHECK(probe == MemoryBarrierType::PARTIAL);
+    CHECK(build == MemoryBarrierType::FULL);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - delim join internal subtrees are rewritten and tagged",
                  "[plan_tree_shape][isolated_context]")
 {
