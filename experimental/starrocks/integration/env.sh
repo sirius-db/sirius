@@ -21,11 +21,6 @@ if [[ -z "${DATA_ROOT:-}" && -d /opt/sirius-ci/datasets ]] &&
     echo "note: /scratch/sirius/datasets is unreachable; using DATA_ROOT=/opt/sirius-ci/datasets" >&2
     export DATA_ROOT=/opt/sirius-ci/datasets
 fi
-# The ring exchange (#2256-#2258) runs on the async_capped pool; the harness's default, slab, is
-# what the direct exchange it replaced needed. Received batches may hold up to this share of the
-# GPU pool before they land on host, then disk (DISK_DIR, unset by default, adds the disk tier).
-export GPU_ALLOCATOR=${GPU_ALLOCATOR:-async_capped}
-export SIRIUS_CN_RING_GPU_LANDING_FRACTION=${SIRIUS_CN_RING_GPU_LANDING_FRACTION:-0.25}
 # ANSI codes in the CN logs break the harness's log checks.
 export NO_COLOR=1
 # All 22 TPC-H queries (the tools default to the 7 join queries).
