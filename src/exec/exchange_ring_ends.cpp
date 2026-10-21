@@ -735,7 +735,8 @@ ring_exchange::landing ring_exchange::begin(std::span<std::uint8_t const> header
     ++_counters.refused;
     throw ring_no_room(std::format(
       "ring exchange: no tier has room for a {}-byte batch of {} rows: GPU needs {} bytes, {} "
-      "available, {} of {} held by landed batches; host {}; disk {}",
+      "available, {} of {} held by landed batches; host {}; disk {}. To make room, configure or "
+      "enlarge the disk tier (sirius.memory.disk), or set SIRIUS_CN_RING_HOST_LANDING_BYTES",
       wire.stream_bytes,
       wire.rows,
       gpu_need,

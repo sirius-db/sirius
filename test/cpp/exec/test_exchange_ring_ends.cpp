@@ -562,20 +562,22 @@ TEST_CASE("disk landings written by several threads overlap", "[exchange_ring][e
   fs::remove_all(dir);
 }
 
-TEST_CASE("I5: no room in any tier is the one failure, with every tier's numbers",
+TEST_CASE("I5: no room in any tier is the one failure, with every tier's numbers and a fix",
           "[exchange_ring][ends]")
 {
   auto sender    = make_ring();
   auto receiver  = make_ring(/*gpu_bytes=*/0, /*host_bytes=*/0, /*host=*/true, /*disk=*/false);
   auto const job = sender->export_batch(gpu_batch(sample_table()));
   REQUIRE(job.has_value());
-  CHECK_THROWS_MATCHES(
-    receiver->begin(job->header),
-    ring_no_room,
-    Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("no tier has room") &&
-                                    Catch::Matchers::ContainsSubstring("GPU needs") &&
-                                    Catch::Matchers::ContainsSubstring("host ") &&
-                                    Catch::Matchers::ContainsSubstring("disk none")));
+  CHECK_THROWS_MATCHES(receiver->begin(job->header),
+                       ring_no_room,
+                       Catch::Matchers::MessageMatches(
+                         Catch::Matchers::ContainsSubstring("no tier has room") &&
+                         Catch::Matchers::ContainsSubstring("GPU needs") &&
+                         Catch::Matchers::ContainsSubstring("host ") &&
+                         Catch::Matchers::ContainsSubstring("disk none") &&
+                         Catch::Matchers::ContainsSubstring("sirius.memory.disk") &&
+                         Catch::Matchers::ContainsSubstring("SIRIUS_CN_RING_HOST_LANDING_BYTES")));
   CHECK(receiver->stats().refused == 1);
   sender->release_job(job->token);
 }
