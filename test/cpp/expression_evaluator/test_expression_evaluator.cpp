@@ -3332,8 +3332,11 @@ TEST_CASE("DATE arithmetic restores narrow inputs before checked execution",
     sirius::ast::function_call{signature < 2 ? sirius::function_id::add : sirius::function_id::sub,
                                std::move(arguments),
                                difference ? logical_type::make(type_id::BIGINT) : date}};
-  exp_executor executor(
-    expression, get_resource_ref(*space), cudf::get_default_stream(), strategy, 1);
+  exp_executor executor(expression,
+                        get_resource_ref(*space),
+                        cudf::get_default_stream(),
+                        sirius::expression_query_policy{strategy},
+                        1);
   auto left = make_carrier_column(
     *space, cudf::data_type{cudf::type_id::INT16}, std::vector<int16_t>{-1, 11016, 32760});
   auto right = make_carrier_column(
@@ -3376,8 +3379,8 @@ TEST_CASE("DATE arithmetic broadcasts native scalar operands to the input row co
   right_values.resize(rows);
   auto left      = make_carrier_column(*space, cudf::data_type{cudf::type_id::INT32}, left_values);
   auto right     = make_carrier_column(*space, cudf::data_type{cudf::type_id::INT32}, right_values);
-  auto left_view = cudf::bit_cast(left->view(), sirius::get_cudf_type(date));
-  auto right_view = cudf::bit_cast(right->view(), sirius::get_cudf_type(right_type));
+  auto left_view = cudf::bit_cast(left->view(), sirius::require_cudf_type(date));
+  auto right_view = cudf::bit_cast(right->view(), sirius::require_cudf_type(right_type));
   std::vector<std::unique_ptr<ast_node>> arguments;
   arguments.push_back(shape == 1 ? make_ref_typed(0, date) : make_date_const(10));
   arguments.push_back(shape == 0   ? make_ref_typed(1, right_type)
@@ -3431,7 +3434,7 @@ TEST_CASE("DATE scalar broadcast preserves NULL and infinity semantics",
                      cudaMemcpyHostToDevice) == cudaSuccess);
   cudf::set_null_mask(input->mutable_view().null_mask(), 2, 3, false, stream);
   input->set_null_count(1);
-  auto date_view = cudf::bit_cast(input->view(), sirius::get_cudf_type(date));
+  auto date_view = cudf::bit_cast(input->view(), sirius::require_cudf_type(date));
   auto evaluate  = [&](std::unique_ptr<ast_node> lhs,
                       std::unique_ptr<ast_node> rhs,
                       sirius::function_id function = sirius::function_id::add) {

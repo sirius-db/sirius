@@ -15,7 +15,6 @@
  */
 
 #include <catch.hpp>
-#include <config.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/types/date.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -30,7 +29,6 @@
 namespace {
 class DateArithmeticFixture : public sirius::test::GpuExecutionFixture {
  public:
-  ~DateArithmeticFixture() { duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY = original_; }
   void strategy(std::string const& value)
   {
     run_ok("SET gpu_execution = false");
@@ -48,9 +46,6 @@ class DateArithmeticFixture : public sirius::test::GpuExecutionFixture {
       "(8,'-infinity','-infinity',0), (9,NULL,'2001-01-01',2147483647)");
     run_ok("CHECKPOINT");
   }
-
- private:
-  sirius::expression_evaluator_strategy original_ = duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY;
 };
 }  // namespace
 
