@@ -412,6 +412,11 @@ arrive through a child-owned pipeline, and a delim join is declined at any depth
 because the operator's task hint can poll a MARK hash join inside the delim subtree before its
 sizing partitions have run.
 
+### Whole-partition window evaluator
+**File:** `src/op/window/whole_partition.hpp`, `src/op/window/whole_partition.cpp`
+
+`evaluate_whole_partition_window()` computes `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the whole partition of one table. It runs a `cudf::groupby()` (a reduction when there are no partition columns) and joins the per-partition values back to the input rows with `cudf::distinct_hash_join`, so it does no sort and the results keep the input row order. `SUM` accumulates exactly in `DECIMAL128` and throws on overflow.
+
 ## Pipeline Breakers (Sirius-Specific)
 
 These operators are injected during pipeline splitting. They don't map to DuckDB logical operators.
