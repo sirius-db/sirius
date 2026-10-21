@@ -25,7 +25,9 @@
 namespace codegen::jit::detail {
 namespace {
 
-constexpr std::string_view magic    = "SIMPJIT3";
+constexpr std::string_view magic = "SIMPJIT2";
+static_assert(magic.substr(7) == kCacheFormatVersion.substr(1),
+              "record marker must match the cache format version");
 constexpr std::size_t length_offset = magic.size();
 constexpr std::size_t digest_offset = length_offset + sizeof(uint64_t);
 constexpr std::size_t header_size   = digest_offset + Digest{}.size();

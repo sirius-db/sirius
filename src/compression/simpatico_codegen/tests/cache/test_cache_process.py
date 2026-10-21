@@ -218,7 +218,7 @@ class CacheProcesses(unittest.TestCase):
         self.assertEqual(self.worker(), (1, 1, 0))
         path = next(self.cache.glob("v2/*/*.cubin"))
         original = path.read_bytes()
-        self.assertTrue(original.startswith(b"SIMPJIT3"))
+        self.assertTrue(original.startswith(b"SIMPJIT2"))
         self.assertEqual(len(original), 32 + int.from_bytes(original[8:16], "big"))
         self.assertEqual(original[16:32], checksum(original[32:]))
         changed = bytearray(original)
@@ -227,7 +227,7 @@ class CacheProcesses(unittest.TestCase):
         # driver's rejection path independently of the storage checksum.
         invalid_image = bytes(4096)
         unloadable = (
-            b"SIMPJIT3"
+            b"SIMPJIT2"
             + len(invalid_image).to_bytes(8, "big")
             + checksum(invalid_image)
             + invalid_image

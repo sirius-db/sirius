@@ -6,13 +6,15 @@ The host-only identity API is in [cache_identity.hpp](src/jit/cache_identity.hpp
 
 One cache-format version, `kCacheFormatVersion` in
 [cache_identity.hpp](src/jit/cache_identity.hpp), controls both identity domains
-and the disk namespace. They always advance together.
+and the disk namespace. The record marker's version must match; they always
+advance together.
 
 | Component | Current version | Canonical definition |
 | --- | --- | --- |
 | Request identity | `simpatico-request-v2` | `request_identity()` |
 | Environment identity | `simpatico-environment-v2` | `environment_identity()` |
 | Disk path layout | `v2/` | `CompilationIdentity::relative_path()` |
+| Disk record marker | `SIMPJIT2` | `disk_cache.cpp` (compile-time version check) |
 
 The domains and path are derived from that constant in
 [cache_identity.cpp](src/jit/cache_identity.cpp).
@@ -106,7 +108,7 @@ shadowing headers regenerate the table.
 ## Storage and maintenance
 
 Each `.cubin` file is a checked record, not a raw ELF image: eight ASCII bytes
-`SIMPJIT3`, an unsigned 64-bit big-endian payload length, 16 canonical bytes of
+`SIMPJIT2`, an unsigned 64-bit big-endian payload length, 16 canonical bytes of
 payload XXH3-128, then that many cubin bytes. A zero-length payload, length/file-size
 mismatch, checksum mismatch, non-regular file, or cubin over 256 MiB is a miss.
 The cap bounds allocation on corrupt input; larger kernels still compile and
@@ -125,7 +127,7 @@ compilation is allowed. No `fsync` or power-failure durability is promised;
 damaged records are rebuilt. Checksums are not authentication: the configured
 cache directory must be trusted.
 
-The record format is independent of the environment identity policy. Header
+The record marker follows the shared cache-format version. Header
 digests and NVRTC major/minor select the directory; payload validation and atomic
 publication are unchanged. A version-query error is propagated outside the
 best-effort storage fallback, not treated as an unreadable cache file.

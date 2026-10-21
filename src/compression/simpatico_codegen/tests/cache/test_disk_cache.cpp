@@ -161,7 +161,7 @@ void publication_and_faults(const fs::path& root)
     std::array<char, header_size> header{};
     std::ifstream input(path, std::ios::binary);
     require(bool(input.read(header.data(), header.size())), "record header read");
-    require(std::string_view(header.data(), 8) == "SIMPJIT3", "record format marker");
+    require(std::string_view(header.data(), 8) == "SIMPJIT2", "record format marker");
     const auto digest = cache::content_identity({original.data(), original.size()});
     require(
       std::equal(
@@ -205,7 +205,7 @@ void publication_and_faults(const fs::path& root)
     fs::resize_file(path, length);
     require(!cache::read_cubin_file(path.string(), bytes), "truncated record accepted");
   }
-  for (const auto offset : {0, 8, 16}) {
+  for (const auto offset : {0, 7, 8, 16}) {
     cache::write_cubin_file_atomic(path.string(), original);
     {
       std::fstream output(path, std::ios::binary | std::ios::in | std::ios::out);
