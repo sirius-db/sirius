@@ -139,7 +139,12 @@ bool column_has_real_nulls(duckdb_column_metadata const& col)
 
 cudf::data_type sirius_to_cudf_type(sirius::logical_type const& t)
 {
-  return duckdb::GetCudfType(sirius::to_duckdb(t));
+  auto const type = sirius::get_cudf_type(sirius::to_duckdb(t));
+  if (!type) {
+    throw duckdb::InvalidInputException("Native scan type %s cannot be mapped to cuDF",
+                                        t.to_string());
+  }
+  return *type;
 }
 
 /// @brief Pinned host bytes for a segment (only for CONSTANT and ROARING validity segments for now)

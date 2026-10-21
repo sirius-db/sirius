@@ -411,7 +411,7 @@ filtered_table materialize_source(sirius_gpu_scan_operator const& scan,
                                   ::cuda::stream_ref stream)
 {
   auto source = scan.get_ingestible().materialize_table(
-    input, stream, scan.like_swar_fastpath_enabled(), scan.like_cache());
+    input, stream, scan.like_swar_fastpath_enabled(), scan.like_cache(), scan.expression_policy());
   if (scan.deferred_output().empty()) { return source; }
   // Installed only where a served batch is one pinned chunk's whole row span, so a batch arriving
   // here without an origin means the install-time conditions and the serve-time stamping have
@@ -492,7 +492,8 @@ row_selection run_cached_checkpoint(sirius_gpu_scan_operator const& scan,
                                                          stream,
                                                          space->get_default_allocator(),
                                                          scan.like_swar_fastpath_enabled(),
-                                                         scan.like_cache()));
+                                                         scan.like_cache(),
+                                                         scan.expression_policy()));
   assembly.output       = result.take_output();
   assembly.survivors    = result.take_row_positions();
   if (!assembly.output) {
@@ -561,7 +562,8 @@ row_selection select_rows(sirius_gpu_scan_operator const& scan,
                                                   scan.like_swar_fastpath_enabled(),
                                                   scan.like_cache(),
                                                   deferred.empty() ? nullptr : &assembly.survivors,
-                                                  deferred.output_positions);
+                                                  deferred.output_positions,
+                                                  scan.expression_policy());
   return selection;
 }
 
@@ -650,7 +652,7 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
   _native_physical_types.reserve(this->types.size());
   for (std::size_t column_idx = 0; column_idx < this->types.size(); ++column_idx) {
     auto const& type  = this->types[column_idx];
-    auto const native = sirius::try_get_cudf_type(type);
+    auto const native = sirius::get_cudf_type(type);
     if (!native) {
       throw internal_exception(
         "[sirius_gpu_scan_operator] output column {} ({}) has no native cuDF carrier",

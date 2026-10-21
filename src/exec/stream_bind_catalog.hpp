@@ -21,9 +21,11 @@
 #include "exec/stream_session.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -39,6 +41,9 @@ struct stream_input_binding {
 
   /// Back-pointer into the engine-owned plan; filled during planning for session registration.
   op::sirius_physical_streaming_source* built = nullptr;
+
+  /// Reported to the optimizer as the scan's cardinality. nullopt keeps DuckDB's default of 1.
+  std::optional<std::uint64_t> estimated_rows;
 };
 
 /// Per-connection declared input streams. ClientContextState so DuckDB bind can resolve schema

@@ -51,7 +51,7 @@ using evaluate_result = expression_evaluator::evaluate_result;
 evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
                                                evaluation_mode mode)
 {
-  auto const cudf_type = sirius::get_cudf_type(alt.return_type());
+  auto const cudf_type = sirius::require_cudf_type(alt.return_type());
   bool const is_valid  = !std::holds_alternative<sirius::null_value>(alt.payload);
 
   switch (cudf_type.id()) {

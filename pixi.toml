@@ -110,13 +110,13 @@ VCPKG_CUDA_VERSION = "13"
 platforms = ["linux-64-cuda12", "linux-aarch64-cuda12"]
 
 [feature.cuda12.dependencies]
-cuda-version = "12.*"
+cuda-version = ">=12.8,<13"
 libcudf = "==26.08.01"
 libcuvs = "==26.08.01"
 
 [feature.cuda12.activation.env]
-# GPU architectures: Turing through Hopper (75, 80, 86, 89, 90a)
-CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real"
+# GPU architectures: Turing through Blackwell (requires CUDA 12.8 or newer)
+CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real;100-real;120-real"
 VCPKG_CUDA_VERSION = "12"
 
 [feature.vcpkg.dependencies]

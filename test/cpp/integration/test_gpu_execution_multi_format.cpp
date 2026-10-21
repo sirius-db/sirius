@@ -3604,7 +3604,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "Production residence publishes ready data before a blocked footer resumes",
+                 "Default preparation coalesces files while a later footer is delayed",
                  "[integration][scan_preparation][iceberg][default_residence]")
 {
   sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
@@ -3612,14 +3612,14 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   preparation_test_state observed(counters);
   std::mutex mutex;
   std::condition_variable changed;
-  bool earlier_decoded = false, overlapped = false;
+  bool earlier_decoded = false, decoded_while_held = false, held_footer = false;
   auto reset                          = reset_after_test(counters->parquet_phase_for_testing);
   counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
     std::unique_lock lock(mutex);
     if (footer && file.ends_with("c.parquet")) {
-      if (!changed.wait_for(lock, std::chrono::seconds(20), [&] { return earlier_decoded; }))
-        throw std::runtime_error("ready data did not decode while the later footer was blocked");
-      overlapped = true;
+      held_footer = true;
+      decoded_while_held =
+        changed.wait_for(lock, std::chrono::milliseconds(50), [&] { return earlier_decoded; });
     } else if (!footer && !file.ends_with("c.parquet")) {
       earlier_decoded = true;
       changed.notify_all();
@@ -3633,13 +3633,16 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_three")),
                       gpu_route::gpu,
                       expected);
-  CHECK(overlapped);
+  CHECK(held_footer);
+  CHECK_FALSE(decoded_while_held);
   REQUIRE(observed.routes.size() == 1);
   CHECK(observed.routes.front().second);
   auto publication = observed.publication();
-  CHECK(publication.partial_emissions > 0);
-  REQUIRE(sirius::scan_manager::k_underfilled_batch_residence);
-  CHECK(publication.max_residence >= *sirius::scan_manager::k_underfilled_batch_residence);
+  CHECK(publication.partial_emissions == 0);
+  auto policy = sirius::scan_manager::preparation_config{}.resolve(1).partial_batch;
+  REQUIRE(policy);
+  CHECK(policy->max_residence == std::chrono::seconds(2));
+  CHECK(publication.max_residence == std::chrono::microseconds(0));
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -3897,6 +3900,21 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     pending.reset();
     prepared.reset();
   }
+  SECTION("abandoned materialized GPU collector does not retain its client context")
+  {
+    duckdb::weak_ptr<duckdb::ClientContext> weak_context = con->context;
+    // Let DuckDB's executor finish initializing its collector before dropping
+    // the handles; this used to expose the collector -> ClientContext cycle.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    con.reset();
+    pending.reset();
+    prepared.reset();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!weak_context.expired() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(weak_context.expired());
+  }
   CHECK(provider->outstanding() == 0);
   CHECK(provider->seen->allocated_bytes == 0);
 }
@@ -4069,9 +4087,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       REQUIRE(result->HasError() == bool(cpu_error));
       if (cpu_error) {
         CAPTURE(missing, fallback, deferred, result->GetError(), *cpu_error);
-        // Deferred fallback can report Interrupted before the CPU reader error (#2145).
-        CHECK((result->GetError().find(*cpu_error) != std::string::npos ||
-               (deferred && result->GetErrorType() == duckdb::ExceptionType::INTERRUPT)));
+        // The CPU reader error, not the interrupt the failed replay raised (#2145).
+        CHECK(result->GetError().find(*cpu_error) != std::string::npos);
       } else
         CHECK(observed.fetch(*result) == cpu_rows);
       bool retained = false;
@@ -4091,6 +4108,52 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     CHECK(after.runtime_fallbacks == before.runtime_fallbacks + (deferred && fallback ? 1 : 0));
     CHECK(after.fallbacks == before.fallbacks + (!deferred && fallback ? 1 : 0));
   }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Unsupported remote Puffin is declined before planning opens the sidecar",
+                 "[integration][scan_preparation][iceberg][planning]")
+{
+  // Only the Puffin URI is remote; metadata, manifests, and data stay local so
+  // discovery can complete without any network access. The unsupported scheme
+  // must be rejected by the planning-only backend lookup.
+  auto table    = inventory_fixture("dv_unsupported_uri");
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  size_t routes = 0;
+  size_t opens  = 0;
+  auto reset    = reset_after_test(counters->iceberg_preparation_route_for_testing,
+                                counters->iceberg_dv_phase_for_testing);
+  counters->iceberg_preparation_route_for_testing = [&](auto, bool) { ++routes; };
+  counters->iceberg_dv_phase_for_testing          = [&](auto const&, bool start) {
+    if (start) ++opens;
+  };
+
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("no planning-capable remote backend") != std::string::npos);
+  CHECK(routes == 0);
+  CHECK(opens == 0);
+
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto reason =
+    static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_puffin_uri_unsupported);
+  CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Unsupported remote Puffin for an unselected data file is ignored",
+                 "[integration][scan_preparation][iceberg][planning]")
+{
+  auto table = inventory_fixture("dv_unused_unsupported_uri");
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table));
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -4141,6 +4204,18 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto three    = GENERATE(false, true);
   auto context  = sirius::test::get_registered_sirius_context(*con);
   auto counters = context->physical_counters();
+  auto dv_limit = GENERATE(std::optional<size_t>{},
+                           std::optional<size_t>{0},
+                           std::optional<size_t>{1},
+                           std::optional<size_t>{8});
+  struct config_restore {
+    sirius::sirius_config& config;
+    sirius::scan_manager::scan_manager_config saved;
+    ~config_restore() { config.set_scan_manager_config(saved); }
+  } restore{context->get_config(), context->get_config().get_scan_manager_config()};
+  auto scan_config                             = restore.saved;
+  scan_config.preparation.max_inflight_dv_jobs = dv_limit;
+  context->get_config().set_scan_manager_config(scan_config);
   REQUIRE_FALSE(counters->preparation_provider_for_testing);
   auto spaces =
     context->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
@@ -4177,11 +4252,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(d.allocation_granularity == block);
   auto const& config    = context->get_config().get_scan_manager_config();
   auto limits           = config.preparation.resolve(config.thread_pool.num_threads);
-  auto expected_permits = std::min<size_t>({three ? 3u : 1u,
-                                            static_cast<size_t>(config.thread_pool.num_threads),
-                                            limits.max_inflight_jobs,
-                                            limits.max_active_units,
-                                            limits.max_pending_results});
+  auto expected_permits = std::min<size_t>(three ? 3u : 1u, config.thread_pool.num_threads);
+  if (limits.max_inflight_dv_jobs)
+    expected_permits = std::min(expected_permits, limits.max_inflight_dv_jobs);
   CHECK(d.c_requested == d.sigma_retained + (scarce ? 1 : expected_permits) * d.w);
   CHECK(d.c_requested % d.allocation_granularity == 0);
   REQUIRE(observed.routes.size() == 1);

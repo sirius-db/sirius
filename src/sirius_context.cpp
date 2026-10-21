@@ -557,6 +557,11 @@ void SiriusContext::begin_execution_window(ClientContext& context,
     SIRIUS_LOG_INFO("QueryBegin: {}", window_label);
   } catch (...) {  // best-effort observability
   }
+  auto connection_state = get_sirius_connection_state(context);
+  if (connection_state) {
+    connection_state->execution_options.reset();
+    connection_state->execution_options = query_operator_options(context);
+  }
   // Open the enqueue gate before anything can schedule. Every producer consults it, so this must
   // precede repository/task_creator registration.
   query_lifecycle_.open_query(query_id);
@@ -1276,13 +1281,6 @@ SiriusContext::get_data_repository_manager(sirius::query_id_t query_id) const
   return data_repository_registry_.get(query_id);
 }
 
-std::vector<sirius::data::data_repository_manager_registry::manager_ptr>
-SiriusContext::get_data_repository_managers() const
-{
-  throw_if_not_initialized();
-  return data_repository_registry_.get_all();
-}
-
 sirius::data::data_repository_manager_registry& SiriusContext::get_data_repository_registry()
 {
   throw_if_not_initialized();
@@ -1397,11 +1395,14 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   task_creator_->prepare_for_query(*query, handler);
   // Reads this query's admitted subset back off task_creator, so this must run after
   // initialize_internal has set it — otherwise scan_manager gets an empty (unnarrowed) set.
-  scan_manager_->prepare_for_query(*query,
-                                   config_.get_operator_params().enable_pinned_zone_map_pruning,
-                                   task_creator_->get_active_gpu_ids(query_id),
-                                   handler,
-                                   std::move(interrupted));
+  scan_manager_->prepare_for_query(
+    *query,
+    query->get_pipelines().empty()
+      ? true
+      : query->get_pipelines().front()->get_operator_params().enable_pinned_zone_map_pruning,
+    task_creator_->get_active_gpu_ids(query_id),
+    handler,
+    std::move(interrupted));
   return query;
 }
 
@@ -1414,6 +1415,32 @@ SiriusConnectionState::SiriusConnectionState()
 {
   static std::atomic<uint64_t> next_connection_id{0};
   connection_id_ = next_connection_id.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+void SiriusConnectionState::record_cpu_replay_error(ErrorData error, string query)
+{
+  if (error.Type() == ExceptionType::INTERRUPT) { return; }  // a real cancellation stays one
+  std::lock_guard lock(cpu_replay_error_mutex_);
+  if (!cpu_replay_error_) { cpu_replay_error_.emplace(std::move(error), std::move(query)); }
+}
+
+void SiriusConnectionState::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
+{
+  std::optional<cpu_replay_error> replay;
+  {
+    std::lock_guard lock(cpu_replay_error_mutex_);
+    replay = std::exchange(cpu_replay_error_, std::nullopt);
+  }
+  if (replay && error && error->HasError() && error->Type() == ExceptionType::INTERRUPT) {
+    try {
+      // Finish the error as DuckDB does for a query error (FailQueryInternal).
+      context.ProcessError(replay->error, replay->query);
+      *error = std::move(replay->error);
+    } catch (...) {
+      // Keep the interrupt: DuckDB must still end the query.
+    }
+  }
+  ClientContextState::QueryEnd(context, error);
 }
 
 shared_ptr<SiriusConnectionState> get_sirius_connection_state(ClientContext& context)
@@ -1493,6 +1520,14 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     physical_counters_->iceberg_dv_manifest_reads.load(std::memory_order_relaxed);
   snapshot.iceberg_delete_payload_loads =
     physical_counters_->iceberg_delete_payload_loads.load(std::memory_order_relaxed);
+  snapshot.iceberg_delete_reader_io_failures =
+    physical_counters_->iceberg_delete_reader_io_failures.load(std::memory_order_relaxed);
+  snapshot.iceberg_delete_identity_failures =
+    physical_counters_->iceberg_delete_identity_failures.load(std::memory_order_relaxed);
+  snapshot.descriptor_mismatches =
+    physical_counters_->descriptor_mismatches.load(std::memory_order_relaxed);
+  snapshot.iceberg_delete_corrupt_inputs =
+    physical_counters_->iceberg_delete_corrupt_inputs.load(std::memory_order_relaxed);
   snapshot.iceberg_inventory_bytes_peak =
     physical_counters_->iceberg_inventory_bytes_peak.load(std::memory_order_relaxed);
   snapshot.split_physical_checks = physical_counters_->checks.load(std::memory_order_relaxed);
@@ -1502,6 +1537,21 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     physical_counters_->type_mismatches.load(std::memory_order_relaxed);
   snapshot.parquet_type_refusals =
     physical_counters_->type_refusals.load(std::memory_order_relaxed);
+  if (scan_manager_) {
+    auto const metadata                       = scan_manager_->metadata_cache_statistics();
+    snapshot.metadata_cache_entries           = metadata.entries;
+    snapshot.metadata_cache_hits              = metadata.hits;
+    snapshot.metadata_cache_misses            = metadata.misses;
+    snapshot.metadata_cache_replacements      = metadata.replacements;
+    snapshot.metadata_cache_bypasses          = metadata.bypasses;
+    snapshot.metadata_cache_joined            = metadata.joined;
+    snapshot.metadata_cache_builds            = metadata.builds;
+    snapshot.metadata_cache_failures          = metadata.failures;
+    snapshot.metadata_cache_cancelled_waiters = metadata.cancelled_waiters;
+    snapshot.metadata_cache_stale             = metadata.stale;
+  }
+  snapshot.metadata_provenance_mismatches =
+    physical_counters_->metadata_provenance_mismatches.load(std::memory_order_relaxed);
   for (std::size_t i = 0; i < snapshot.split_physical_rejections.size(); ++i)
     snapshot.split_physical_rejections[i] =
       physical_counters_->rejections[i].load(std::memory_order_relaxed);
@@ -2100,8 +2150,42 @@ void SiriusContext::release_query_lifecycle_slot() noexcept
 
 // ================= Free Functions ================= //
 
+sirius::operator_params& session_operator_params(ClientContext& context)
+{
+  auto state   = get_sirius_connection_state(context);
+  auto runtime = context.registered_state->Get<SiriusContext>("sirius_state");
+  if (!state)
+    state = context.registered_state->GetOrCreate<SiriusConnectionState>("sirius_connection_state");
+  if (!state->operator_overrides)
+    state->operator_overrides =
+      runtime ? runtime->get_config().get_operator_params() : sirius::operator_params{};
+  return *state->operator_overrides;
+}
+
+sirius::compression_config& session_compression_config(ClientContext& context)
+{
+  auto state   = get_sirius_connection_state(context);
+  auto runtime = context.registered_state->Get<SiriusContext>("sirius_state");
+  if (!state)
+    state = context.registered_state->GetOrCreate<SiriusConnectionState>("sirius_connection_state");
+  if (!state->compression_overrides)
+    state->compression_overrides =
+      runtime ? runtime->get_config().get_compression_config() : sirius::compression_config{};
+  return *state->compression_overrides;
+}
+
+std::shared_ptr<const sirius::operator_params> query_operator_options(ClientContext& context)
+{
+  auto state = get_sirius_connection_state(context);
+  if (state && state->execution_options) return state->execution_options;
+  auto options = std::make_shared<sirius::operator_params>(session_operator_params(context));
+  options->like_swar_fastpath = like_swar_fastpath_enabled(context);
+  return options;
+}
+
 void install_configured_log_sink(DatabaseInstance* db)
 {
+  std::lock_guard log_lock(Config::logging_mutex);
   auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
   auto lvl          = parsed_level.value_or(sirius::log::level::info);
 
@@ -2134,6 +2218,7 @@ void install_configured_log_sink(DatabaseInstance* db)
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   : disabled_(sirius_disabled_by_env())
 {
+  std::lock_guard log_lock(Config::logging_mutex);
   auto const previous_log_backend = Config::LOG_BACKEND;
   auto const previous_log_dir     = Config::LOG_DIR;
   auto const previous_log_level   = Config::LOG_LEVEL;

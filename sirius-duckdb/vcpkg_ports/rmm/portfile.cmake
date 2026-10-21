@@ -10,7 +10,9 @@ vcpkg_from_github(
   SHA512
   0ea7efa882e13431c4faba60bbc805522436735ed91922987448aa5e64137b44937b66fc2d6bcf8658f2bda71f90fcc0f369cc384cdd481848cbefb5b30c0836
   HEAD_REF
-  main)
+  main
+  PATCHES
+  disable-werror.patch)
 
 vcpkg_from_github(
   OUT_SOURCE_PATH

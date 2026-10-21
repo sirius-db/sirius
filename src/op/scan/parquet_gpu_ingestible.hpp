@@ -38,6 +38,7 @@
 #include <cudf/io/text/byte_range_info.hpp>
 
 // standard library
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -48,6 +49,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -80,6 +82,14 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   leaf_set semantic_columns;
   duckdb::vector<sirius::logical_type> returned_types;
   std::vector<std::string> resolved_file_paths;
+  /// Per-file byte ranges `[start, start+length)`, parallel to @ref resolved_file_paths. An
+  /// empty outer vector means every file is read whole; so does an empty list, or one holding
+  /// a `(0,0)` range, for one file. A ranged file reads only the row groups whose start offset
+  /// falls inside one of its ranges (see parquet_byte_range.hpp) — the mechanism behind
+  /// distributed byte-range splits, where N ranges of one file must read every row exactly
+  /// once across scan instances. One file keeps one entry even when this scan owns several of
+  /// its ranges: the bound read view requires one entry per bound file.
+  std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> resolved_file_ranges;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;
@@ -101,6 +111,25 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   std::size_t projected_output_count = 0;
 
   parquet_ingestible_table_info() = default;
+
+  /// True when file @p index is read whole (no ranges, or a `(0,0)` range among them).
+  [[nodiscard]] bool reads_whole_file(std::size_t index) const
+  {
+    if (index >= resolved_file_ranges.size()) { return true; }
+    auto const& ranges = resolved_file_ranges[index];
+    return ranges.empty() || std::any_of(ranges.begin(), ranges.end(), [](auto const& range) {
+             return range.first == 0 && range.second == 0;
+           });
+  }
+
+  /// True when any file is read through byte ranges rather than whole.
+  [[nodiscard]] bool has_byte_ranges() const
+  {
+    for (std::size_t i = 0; i < resolved_file_ranges.size(); ++i) {
+      if (!reads_whole_file(i)) { return true; }
+    }
+    return false;
+  }
 
   [[nodiscard]] std::span<std::string const> column_names() const override { return names; }
 
@@ -206,6 +235,14 @@ class parquet_split_info : public scan_info {
     for (auto const& s : rg_slices) {
       total = memory::saturating_add(total, s.estimated_output_bytes);
     }
+    return total;
+  }
+
+  [[nodiscard]] std::size_t preparation_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& s : rg_slices)
+      total = memory::saturating_add(total, s.estimated_decode_working_bytes);
     return total;
   }
 
@@ -357,7 +394,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     const cucascade::memory::memory_space& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    expression_query_policy policy = {}) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& table,
@@ -366,7 +404,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
     std::unique_ptr<cudf::column>* survivors,
-    std::span<std::size_t const> elided) override;
+    std::span<std::size_t const> elided,
+    expression_query_policy policy = {}) override;
 
   [[nodiscard]] bool can_serve_cached_view() const noexcept override;
 
@@ -401,13 +440,15 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   [[nodiscard]] std::unique_ptr<sirius::ast::node> remaining_residual(
     filtered_table const& input) const;
 
-  /// Read one file's footer, prune its row groups against the filter, and record
-  /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
-  /// Runs on a scan-manager dispatcher thread (the task returned by
-  /// @ref next_split_provider).
+  /// Read one file's footer, prune its row groups against the file's byte ranges
+  /// (@ref parquet_ingestible_table_info::resolved_file_ranges at @p file_index) and the
+  /// filter, and record per-row-group byte accounting. Returns a single
+  /// @c parquet_file_scan_info. Runs on a scan-manager dispatcher thread (the task returned
+  /// by @ref next_split_provider).
   std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
                                                   std::size_t file_index,
-                                                  std::shared_ptr<io::ioctx> const& io_ctx);
+                                                  std::shared_ptr<io::ioctx> const& io_ctx,
+                                                  std::stop_token stop = {});
 
   /// Add the carrier and user-requested virtual columns to a decoded parquet batch.
   [[nodiscard]] std::unique_ptr<cudf::table> append_virtual_columns(

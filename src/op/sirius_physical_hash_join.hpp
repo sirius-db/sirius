@@ -35,6 +35,7 @@
 #include "sirius_config.hpp"
 #include "utils.hpp"
 
+#include <cudf/join/hash_join.hpp>
 #include <cudf/types.hpp>
 
 #include <atomic>

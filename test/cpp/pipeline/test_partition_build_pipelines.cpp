@@ -206,12 +206,12 @@ TEST_CASE_METHOD(partition_build_fixture,
     auto* build_sink = join_pipeline->dependencies[0]->get_sink().get();
     REQUIRE(build_sink != nullptr);
     REQUIRE(build_sink->type == SiriusPhysicalOperatorType::CONCAT);
-    CHECK(build_sink->Cast<sirius::op::sirius_physical_concat>().is_build_concat());
+    CHECK(join_pipeline->get_source()->input_port_for(*build_sink) == "build");
     bool has_probe_concat_dep = false;
     for (const auto& dep : join_pipeline->dependencies) {
       auto* sink = dep->get_sink().get();
       if (sink != nullptr && sink->type == SiriusPhysicalOperatorType::CONCAT &&
-          !sink->Cast<sirius::op::sirius_physical_concat>().is_build_concat()) {
+          join_pipeline->get_source()->input_port_for(*sink) == "default") {
         has_probe_concat_dep = true;
       }
     }

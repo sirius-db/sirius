@@ -40,6 +40,8 @@ class SiriusContext;
 namespace sirius {
 namespace op {
 
+class sirius_physical_concat;
+
 enum class PartitionType { HASH, RANGE, EVENLY, CUSTOM, NONE };
 
 // PartitionType to string
@@ -80,6 +82,9 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
+  /// Non-owning output CONCAT for this join input edge; owned by the physical plan.
+  void set_join_concat(sirius_physical_concat* concat) { _join_concat = concat; }
 
   bool is_build_partition() const;
 
@@ -230,6 +235,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// @pre `lock` held; if there is a sibling, its `lock` held too.
   void apply_partition_strategy(partition_strategy const& strategy,
                                 sirius_physical_partition_consumer_operator& consumer);
+  sirius_physical_concat* _join_concat            = nullptr;
   sirius_physical_operator* _sibling_partition_op = nullptr;
   //! The downstream consumer that decides this partition's count / broadcast (see
   //! set_downstream_consumer_op). Always a partition-sizing consumer (HASH_JOIN / NESTED_LOOP_JOIN

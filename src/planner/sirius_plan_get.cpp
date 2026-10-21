@@ -369,7 +369,7 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   bool changed = false;
   for (std::size_t output_idx = 0; output_idx < op.types.size(); output_idx++) {
     auto const logical = sirius::from_duckdb(op.types[output_idx]);
-    auto const native  = sirius::try_get_cudf_type(logical);
+    auto const native  = sirius::get_cudf_type(logical);
     if (!native) { return {}; }
     result.push_back(*native);
     if (!sirius::is_narrowable_numeric_type(logical)) { continue; }

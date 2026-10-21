@@ -180,7 +180,8 @@ class resident_ingestible final : public gpu_ingestible {
     cucascade::memory::memory_space const&,
     ::cuda::stream_ref,
     bool,
-    std::shared_ptr<sirius::like_multiliteral_cache const>) override
+    std::shared_ptr<sirius::like_multiliteral_cache const>,
+    sirius::expression_query_policy /*policy*/) override
   {
     throw std::logic_error("resident decode outcome test cannot read scan metadata");
   }
@@ -192,7 +193,8 @@ class resident_ingestible final : public gpu_ingestible {
     bool,
     std::shared_ptr<sirius::like_multiliteral_cache const>,
     std::unique_ptr<cudf::column>*,
-    std::span<std::size_t const>) override
+    std::span<std::size_t const>,
+    sirius::expression_query_policy /*policy*/) override
   {
     throw std::logic_error("resident decode outcome test only materializes cached rows");
   }
@@ -224,7 +226,8 @@ class leading_identity_ingestible final : public gpu_ingestible {
     cucascade::memory::memory_space const&,
     ::cuda::stream_ref,
     bool,
-    std::shared_ptr<sirius::like_multiliteral_cache const>) override
+    std::shared_ptr<sirius::like_multiliteral_cache const>,
+    sirius::expression_query_policy /*policy*/) override
   {
     throw std::logic_error("leading identity test ingestible cannot read scan metadata");
   }
@@ -237,7 +240,8 @@ class leading_identity_ingestible final : public gpu_ingestible {
     bool,
     std::shared_ptr<sirius::like_multiliteral_cache const>,
     std::unique_ptr<cudf::column>*,
-    std::span<std::size_t const> elided) override
+    std::span<std::size_t const> elided,
+    sirius::expression_query_policy /*policy*/) override
   {
     auto columns = input.table.release(stream, space.get_default_allocator())->release();
     std::vector<std::unique_ptr<cudf::column>> projected;

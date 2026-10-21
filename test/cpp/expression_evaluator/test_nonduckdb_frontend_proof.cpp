@@ -45,10 +45,13 @@
 // cuda / standard library
 #include <cuda_runtime_api.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -121,8 +124,10 @@ TEST_CASE("nonduckdb proof - hand-built AST projection executes end-to-end",
   for (auto strategy : {sirius::expression_evaluator_strategy::MATERIALIZE,
                         sirius::expression_evaluator_strategy::AST_INTERPRET}) {
     auto exprs = build_cast_add_projection();
-    sirius::expression_evaluator executor(
-      exprs, cudf::get_current_device_resource_ref(), cudf::get_default_stream(), strategy);
+    sirius::expression_evaluator executor(exprs,
+                                          cudf::get_current_device_resource_ref(),
+                                          cudf::get_default_stream(),
+                                          sirius::expression_query_policy{strategy});
 
     auto output = executor.evaluate(input->view());
 
@@ -160,4 +165,42 @@ TEST_CASE("nonduckdb proof - test source includes no duckdb headers", "[nonduckd
 
   INFO("PROOF-01: this test file must directly include zero duckdb/ headers");
   REQUIRE(direct_duckdb_includes == 0);
+}
+
+TEST_CASE("expression strategy survives thread handoff and caller policy changes",
+          "[expression_evaluator][query_options]")
+{
+  auto expr  = make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(1));
+  auto input = make_int32_table({1, 2, 3});
+  cudf::get_default_stream().synchronize();
+  auto policy = sirius::expression_query_policy{};
+  auto mr     = cudf::get_current_device_resource_ref();
+  auto stream = cudf::get_default_stream();
+  sirius::expression_evaluator ast(*expr, mr, stream, policy, 1);
+  policy.strategy = sirius::expression_evaluator_strategy::MATERIALIZE;
+  sirius::expression_evaluator materialized(*expr, mr, stream, policy, 1);
+  // Evaluators must own their policy, even after the caller changes its value.
+  policy.strategy = sirius::expression_evaluator_strategy::AST_JIT;
+  int device{};
+  REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+  auto result =
+    std::async(std::launch::async, [&] {
+      if (cudaSetDevice(device) != cudaSuccess) throw std::runtime_error("cudaSetDevice failed");
+      auto ast_output          = ast.evaluate(input->view());
+      auto materialized_output = materialized.evaluate(input->view());
+      // MATERIALIZE returns a column-reference AST wrapper; AST strategies
+      // retain the comparison operation itself.
+      auto is_operation = [&](sirius::expression_evaluator& evaluator) {
+        auto value = evaluator.evaluate(*expr);
+        return dynamic_cast<cudf::ast::operation const*>(&value.get_expr().get()) != nullptr;
+      };
+      auto first  = is_operation(ast);
+      auto second = is_operation(materialized);
+      // Reusing the same thread for a different policy must not change the first
+      // evaluator.
+      auto third = is_operation(ast);
+      stream.synchronize();
+      return std::array{first, second, third};
+    }).get();
+  REQUIRE(result == std::array{true, false, true});
 }

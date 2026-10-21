@@ -126,7 +126,7 @@ void require_canonical_schedule(duckdb::Connection& con, const std::string& quer
       auto build_sink = pipeline->dependencies[0]->get_sink();
       REQUIRE(build_sink);
       REQUIRE(build_sink->type == sirius::op::SiriusPhysicalOperatorType::CONCAT);
-      CHECK(build_sink->Cast<sirius::op::sirius_physical_concat>().is_build_concat());
+      CHECK(source->input_port_for(*build_sink) == "build");
     }
 
     // Reordering an already-canonical schedule is a no-op.

@@ -45,7 +45,7 @@ jobs:
           cat /tmp/harness.log >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
         with:
           cache: false
           locked: true
@@ -119,12 +119,11 @@ jobs:
       fail-fast: false
     name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }})
     runs-on: >-
-      ${{ matrix.build.environment == 'vcpkg'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-xl"]')
-        || matrix.build.arch == 'x64'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-lg"]')
-        || matrix.build.arch == 'arm64'
-        && fromJSON('["self-hosted", "ubuntu-24.04", "arm-lg"]') }}
+      ${{ fromJSON(format('["self-hosted", "ubuntu-24.04", "{0}{1}"]',
+          github.event_name == 'pull_request' && 'pr-' || '',
+          matrix.build.environment == 'vcpkg' && 'cpu-xl'
+            || matrix.build.arch == 'x64' && 'cpu-lg'
+            || matrix.build.arch == 'arm64' && 'arm-lg')) }}
     timeout-minutes: ${{ case(matrix.build.environment == 'vcpkg', 240, 60) }}
     continue-on-error: ${{ matrix.build.cudf-channel == 'nightly' }}
     steps:
@@ -142,7 +141,7 @@ jobs:
             git -C sirius-duckdb/vcpkg fetch --unshallow
           fi
 
-      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
         with:
           cache: false
           locked: true
@@ -218,7 +217,7 @@ jobs:
         run: |
           set -o pipefail
           pixi run --locked -e vcpkg sirius-duckdb/vcpkg/vcpkg install \
-            --x-manifest-root=sirius-duckdb --x-feature=static \
+            --x-manifest-root=sirius-duckdb \
             --x-install-root=build/static-dependencies --clean-buildtrees-after-build \
             2>&1 | tee /tmp/vcpkg.log
 

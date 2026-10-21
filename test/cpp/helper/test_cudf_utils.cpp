@@ -15,7 +15,7 @@
  */
 
 // Tests for the type-mapping and schema helpers in cudf/cudf_utils.hpp:
-// sirius::estimate_referenced_column_bytes, the get_cudf_type / duckdb::GetCudfType mappings, and
+// sirius::estimate_referenced_column_bytes, the get_cudf_type / sirius::get_cudf_type mappings, and
 // the two sirius::make_empty_table overloads.
 //
 // The estimator only reads column metadata (type, size, nullability) and never dereferences
@@ -25,6 +25,7 @@
 #include "catch.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "helper/logical_type.hpp"
+#include "op/sirius_physical_gpu_values.hpp"
 #include "utils/test_validation_utility.hpp"
 
 #include <cudf/column/column.hpp>
@@ -144,7 +145,7 @@ TEST_CASE("estimate_referenced_column_bytes: averages across multiple variable-w
 
 // Tests for the cuDF type-mapping helpers in cudf/cudf_utils.hpp:
 //   - sirius::get_cudf_type(const sirius::logical_type&)
-//   - duckdb::GetCudfType(const duckdb::LogicalType&)
+//   - sirius::get_cudf_type(const duckdb::LogicalType&)
 //
 // These focus on the ARRAY (fixed-size list) mapping added alongside the
 // ARRAY data type, both helpers must lower ARRAY to a cuDF LIST column.
@@ -156,7 +157,7 @@ TEST_CASE("estimate_referenced_column_bytes: averages across multiple variable-w
 TEST_CASE("get_cudf_type - ARRAY maps to cuDF LIST", "[cudf_utils]")
 {
   auto arr = logical_type::make_array(logical_type::make(type_id::INTEGER), 3);
-  REQUIRE(sirius::get_cudf_type(arr).id() == cudf::type_id::LIST);
+  REQUIRE(sirius::get_cudf_type(arr)->id() == cudf::type_id::LIST);
 }
 
 TEST_CASE("get_cudf_type - ARRAY mapping ignores child type and size", "[cudf_utils]")
@@ -164,39 +165,38 @@ TEST_CASE("get_cudf_type - ARRAY mapping ignores child type and size", "[cudf_ut
   // The cuDF type is always LIST regardless of element type or fixed size;
   // the element type is carried separately on the child column
   REQUIRE(
-    sirius::get_cudf_type(logical_type::make_array(logical_type::make(type_id::DOUBLE), 1)).id() ==
+    sirius::get_cudf_type(logical_type::make_array(logical_type::make(type_id::DOUBLE), 1))->id() ==
     cudf::type_id::LIST);
   REQUIRE(
-    sirius::get_cudf_type(logical_type::make_array(logical_type::make(type_id::BIGINT), 0)).id() ==
+    sirius::get_cudf_type(logical_type::make_array(logical_type::make(type_id::BIGINT), 0))->id() ==
     cudf::type_id::LIST);
   // Nested ARRAY of ARRAYs still maps to a single top-level LIST
   auto nested =
     logical_type::make_array(logical_type::make_array(logical_type::make(type_id::INTEGER), 2), 4);
-  REQUIRE(sirius::get_cudf_type(nested).id() == cudf::type_id::LIST);
+  REQUIRE(sirius::get_cudf_type(nested)->id() == cudf::type_id::LIST);
 }
 
 // ============================================================================
-// duckdb::GetCudfType — ARRAY mapping
+// sirius::get_cudf_type — ARRAY mapping
 // ============================================================================
 
-TEST_CASE("GetCudfType - duckdb ARRAY maps to cuDF LIST", "[cudf_utils]")
+TEST_CASE("get_cudf_type - DuckDB ARRAY maps to cuDF LIST", "[cudf_utils]")
 {
   using duckdb::LogicalType;
 
   auto arr = LogicalType::ARRAY(LogicalType::INTEGER, duckdb::optional_idx(3));
-  REQUIRE(duckdb::GetCudfType(arr).id() == cudf::type_id::LIST);
+  REQUIRE(sirius::get_cudf_type(arr)->id() == cudf::type_id::LIST);
 }
 
-TEST_CASE("GetCudfType - duckdb ARRAY mapping is independent of child and size", "[cudf_utils]")
+TEST_CASE("get_cudf_type - DuckDB ARRAY mapping is independent of child and size", "[cudf_utils]")
 {
   using duckdb::LogicalType;
 
   REQUIRE(
-    duckdb::GetCudfType(LogicalType::ARRAY(LogicalType::DOUBLE, duckdb::optional_idx(1))).id() ==
+    sirius::get_cudf_type(LogicalType::ARRAY(LogicalType::DOUBLE, duckdb::optional_idx(1)))->id() ==
     cudf::type_id::LIST);
-  REQUIRE(
-    duckdb::GetCudfType(LogicalType::ARRAY(LogicalType::BIGINT, duckdb::optional_idx(16))).id() ==
-    cudf::type_id::LIST);
+  REQUIRE(sirius::get_cudf_type(LogicalType::ARRAY(LogicalType::BIGINT, duckdb::optional_idx(16)))
+            ->id() == cudf::type_id::LIST);
 }
 
 // ============================================================================
@@ -270,7 +270,7 @@ TEST_CASE("make_empty_table - the cudf-type overload refuses nested carriers", "
                       Catch::Matchers::ContainsSubstring("logical-type overload"));
 }
 
-TEST_CASE("make_empty_like reproduces nested LIST columns", "[cudf_utils]")
+TEST_CASE("empty_like reproduces nested LIST columns", "[cudf_utils]")
 {
   // The empty rebuild must mirror the input's full per-column type hierarchy, not just the
   // top-level type ids -- a fully pruned ARRAY scan hands TOP-N a 0-row LIST view to emulate.
@@ -279,7 +279,7 @@ TEST_CASE("make_empty_like reproduces nested LIST columns", "[cudf_utils]")
   cols.push_back(cudf::make_empty_lists_column(cudf::data_type{cudf::type_id::FLOAT64}));
   cudf::table const input(std::move(cols));
 
-  auto const empty = duckdb::make_empty_like(input.view());
+  auto const empty = cudf::empty_like(input.view());
   REQUIRE(empty != nullptr);
   REQUIRE(empty->num_columns() == 2);
   REQUIRE(empty->num_rows() == 0);
@@ -412,4 +412,28 @@ TEST_CASE("shared column comparison ignores unused storage and checks row validi
       cudf::column_view{cudf::data_type{cudf::type_id::DECIMAL32, -3}, 0, nullptr, nullptr, 0};
     REQUIRE_FALSE(columns_logically_equal(decimal_lhs, decimal_rhs, stream));
   }
+}
+
+TEST_CASE("cuDF mappings return no type for unsupported inputs", "[cudf_utils][conversion]")
+{
+  for (auto const& type :
+       {logical_type::make(type_id::SQLNULL), logical_type::make_decimal(4, 2)}) {
+    CHECK_FALSE(sirius::get_cudf_type(type).has_value());
+    CHECK_THROWS_AS(sirius::require_cudf_type(type), duckdb::InvalidInputException);
+  }
+  CHECK_FALSE(sirius::get_cudf_type(duckdb::LogicalType::BLOB).has_value());
+  CHECK_FALSE(sirius::get_cudf_type(duckdb::LogicalType::DECIMAL(4, 2)).has_value());
+  CHECK(sirius::get_cudf_type(logical_type::make_decimal(5, 2)) ==
+        cudf::data_type{cudf::type_id::DECIMAL32, -2});
+}
+
+TEST_CASE("GPU VALUES rejects unmappable types during planning", "[cudf_utils][conversion]")
+{
+  using sirius::op::sirius_physical_gpu_values;
+  for (auto const& type :
+       {logical_type::make(type_id::SQLNULL), logical_type::make_decimal(4, 2)}) {
+    CHECK_THROWS(sirius_physical_gpu_values::throw_if_unsupported_types({type}));
+  }
+  CHECK_NOTHROW(
+    sirius_physical_gpu_values::throw_if_unsupported_types({logical_type::make(type_id::INTEGER)}));
 }

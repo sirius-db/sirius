@@ -75,7 +75,14 @@ sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
 namespace {
 
 // Map LogicalType to cudf::data_type using existing utility
-cudf::data_type ToCudfType(const duckdb::LogicalType& t) { return duckdb::GetCudfType(t); }
+cudf::data_type to_cudf_type(const duckdb::LogicalType& t)
+{
+  auto const type = sirius::get_cudf_type(t);
+  if (!type) {
+    throw duckdb::InvalidInputException("Aggregate type %s cannot be mapped to cuDF", t.ToString());
+  }
+  return *type;
+}
 
 template <typename ScalarType>
 ScalarType const& scalar_cast(const cudf::scalar& s)
@@ -294,9 +301,9 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
   // rather than copying scalars to the host and converting through long double.
   // This mirrors sirius_physical_grouped_aggregate_merge and avoids the precision
   // loss of the host-side decimal->long double->decimal round trips.
-  auto out_type = ToCudfType(return_type);
+  auto out_type = to_cudf_type(return_type);
 
-  if (sirius::IsCudfTypeDecimal(out_type)) {
+  if (cudf::is_fixed_point(out_type)) {
     // DECIMAL output: divide directly in fixed-point to preserve precision.
     return cudf::binary_operation(
       sum_view, count_view, cudf::binary_operator::DIV, out_type, stream, memory_resource);
@@ -457,7 +464,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
         case aggregate_kind::MAX:
         case aggregate_kind::AVG: {
           auto col      = view.column(static_cast<cudf::size_type>(spec.input_idx));
-          auto out_type = ToCudfType(spec.return_type);
+          auto out_type = to_cudf_type(spec.return_type);
           std::unique_ptr<cudf::reduce_aggregation> agg_op;
           if (spec.kind == aggregate_kind::MIN) {
             agg_op = cudf::make_min_aggregation<cudf::reduce_aggregation>();
@@ -471,7 +478,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           // For SUM and AVG, decimals that could overflow the input width in this batch are
           // widened before the aggregation. Otherwise the reduction runs at the input width and
           // the one-row partial is widened to DECIMAL128 afterwards.
-          bool is_decimal = sirius::IsCudfTypeDecimal(col.type());
+          bool is_decimal = cudf::is_fixed_point(col.type());
 
           std::unique_ptr<cudf::column> casted_col;
           std::optional<cudf::data_type> widen_partial_to;

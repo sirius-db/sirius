@@ -112,6 +112,11 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after build().
   void declare_input_sender(std::uint64_t stream_id, std::uint32_t sender_id);
 
+  /// Declare the row count of input stream `stream_id`, summed over its senders, so the
+  /// optimizer can pick a join's build side. Undeclared streams plan as 1 row. Last call wins.
+  /// @throws after build().
+  void declare_input_cardinality(std::uint64_t stream_id, std::uint64_t rows);
+
   /// Declare an output stream. A fragment with no output stream is a result fragment; two or
   /// more need declare_output_broadcast() or declare_output_hash_key(), or build() throws.
   /// @throws after build() or on duplicate id.
@@ -175,6 +180,12 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// Batches currently parked on output stream `stream_id`. For diagnostics. 0 before build().
   /// @throws after build() on an unknown id, including any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
+
+  /// Total rows parked on output stream `stream_id`, without draining it. A throw means the
+  /// count is unknown: callers feeding declare_input_cardinality() leave the stream undeclared.
+  /// @throws before build(), on an unknown id, or on a parked batch that is not GPU-resident
+  ///         (a spilled batch's row count is not readable without materializing it).
+  [[nodiscard]] std::uint64_t output_row_count(std::uint64_t stream_id) const;
 
   /// DuckDB type-name strings for each output column. Matches what declare_input_column accepts.
   /// @throws before build() or on a result fragment.

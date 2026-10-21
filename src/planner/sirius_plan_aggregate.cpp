@@ -412,7 +412,8 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
   if (!sirius_ctx) { return nullptr; }
-  auto const& op_params = sirius_ctx->get_config().get_operator_params();
+  auto options          = duckdb::query_operator_options(context);
+  auto const& op_params = *options;
   if (!op_params.enable_dense_count_join) { return nullptr; }
 
   auto const detection = detect_dense_count_join(context, op);
@@ -678,12 +679,11 @@ static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
                                    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
 {
   for (auto& type : types) {
-    if (type == duckdb::LogicalType::HUGEINT) { type = duckdb::LogicalType::BIGINT; }
+    type = sirius_physical_plan_generator::planned_aggregate_type(type);
   }
   for (auto& expr : exprs) {
-    if (expr->GetReturnType() == duckdb::LogicalType::HUGEINT) {
-      expr->SetReturnType(duckdb::LogicalType::BIGINT);
-    }
+    expr->SetReturnType(
+      sirius_physical_plan_generator::planned_aggregate_type(expr->GetReturnType()));
   }
 }
 
@@ -752,11 +752,16 @@ bool decimal_sum_stats_bound_enabled(duckdb::ClientContext& context)
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  return !sirius_ctx ||
-         sirius_ctx->get_config().get_operator_params().enable_decimal_sum_stats_bound;
+  return !sirius_ctx || duckdb::query_operator_options(context)->enable_decimal_sum_stats_bound;
 }
 
 }  // namespace
+
+duckdb::LogicalType sirius_physical_plan_generator::planned_aggregate_type(
+  duckdb::LogicalType const& type)
+{
+  return type == duckdb::LogicalType::HUGEINT ? duckdb::LogicalType::BIGINT : type;
+}
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)

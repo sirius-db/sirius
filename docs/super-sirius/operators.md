@@ -262,7 +262,7 @@ The following table summarizes, per join type, what concat folds, which side str
 | RIGHT_ANTI | probe → 1 | build | ✅ | ✅ | ❌ | STANDARD, MIXED_JOIN† |
 | SINGLE | — | — | — | — | — | unsupported (throws) |
 
-† MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction, and a MARK + null-safe key stays a `UNEQUAL` hash key (a known null-safe limitation). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from the downstream join type (`_concat_all`); partition / broadcast / mode eligibility is decided in `compute_hash_join_partition_strategy`.
+† MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction, and a MARK + null-safe key stays a `UNEQUAL` hash key (a known null-safe limitation). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. Join wrapping chooses the initial `concat_all` flag from the join type; partition / broadcast / mode eligibility remains in `compute_hash_join_partition_strategy`. Runtime partition negotiation strengthens the build CONCAT requirement before publishing input.
 
 #### MARK joins
 A MARK join emits every left row plus a `BOOL8` mark column with SQL three-valued semantics: **true** for a match, **false** for a non-match when the probe key is non-NULL and the build side has no NULL key, and **NULL** otherwise (NULL probe key, or no match while a NULL build key exists — the row *might* have matched it). Both build strategies funnel through `resolve_mark_join_result`, which scatters left-row match indices into the mark column and attaches the null mask: when the build side has a NULL key, validity equals the match flags (`cudf::bools_to_mask`); otherwise validity is the probe keys' row validity (`cudf::bitmask_and`). Build-key nullness is recorded at build time in `_build_has_null` — an atomic that is join-wide because MARK is forced single-partition (or broadcast on multi-GPU, precisely so `_build_has_null` is globally consistent).
@@ -426,10 +426,17 @@ Repartitions data into N buckets based on partition keys. Partition keys are alw
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/op/sirius_physical_concat.hpp`
 
-Reassembles partitioned data back into a linear stream. Behavior depends on join type:
+Groups batches within an existing partition layout and preserves each output partition index.
+The caller selects the grouping requirement:
 
-- `_concat_all = true` (LEFT/ANTI/OUTER joins): waits for all data before emitting
-- `_concat_all = false` (INNER joins): emits tasks when byte threshold (`_concat_batch_bytes`) is met
+- `concat_all = true`: waits for producer completion, then emits one indexed batch per nonempty input partition, forwarding singletons;
+- `concat_all = false`: retains byte-target grouping, including oversized singletons and the final under-target tail.
+
+Group selection also checks available row-count metadata before claiming or transferring input.
+Bounded groups stop before exceeding the cuDF row-count limit; a complete partition above the
+limit is rejected. Execution checks the actual prepared tables, including representations
+without row-count metadata. Input preparation and allocation failures use the standard
+partitioned task and executor OOM path.
 
 ### `sirius_physical_passthrough_sink` — `PASSTHROUGH_SINK`
 **File:** `src/include/op/sirius_physical_passthrough_sink.hpp`

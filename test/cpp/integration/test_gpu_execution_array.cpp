@@ -518,7 +518,7 @@ TEST_CASE_METHOD(ArrayFixture,
 {
   // id >= 1000000 is FILTER_ALWAYS_FALSE for every row group, so the scan serves one
   // schema-correct 0-row split whose ARRAY column is a cuDF LIST. TOP-N then rebuilds an empty
-  // output table from that view (compute_top_n_table -> duckdb::make_empty_like), which must
+  // output table from that view (compute_top_n_table -> cudf::empty_like), which must
   // reproduce the LIST child hierarchy; the fixture's no-fallback delta turns a silent CPU
   // fallback into a failure. statistics_propagation must be off so the provably-false filter is
   // not folded into an EMPTY_RESULT before the scan exists (the standing Sirius mask's

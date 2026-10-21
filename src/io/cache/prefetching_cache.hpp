@@ -23,7 +23,6 @@
 #include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/config.hpp"
-#include "io/cache/metadata_store.hpp"
 #include "io/cache/types.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
@@ -389,9 +388,18 @@ class prefetching_cache {
   /// the requested number of bytes could necessarily be reclaimed.
   void evict_sync(std::size_t bytes_to_free);
 
+  /// Observe totals and activity since the last refresh without advancing the baseline.
   [[nodiscard]] std::string summary() const;
 
-  void prepare_for_query() noexcept;
+  /// Advance the query epoch and close one cache-wide reporting interval. Returns
+  /// the report for that exact sample; concurrent queries may contribute to it.
+  std::string prepare_for_query();
+
+  [[nodiscard]] std::size_t file_entry_count_for_testing() const noexcept
+  {
+    std::shared_lock lock(_map_mtx);
+    return _file_cache.size();
+  }
 
   [[nodiscard]] uint32_t query_epoch() const noexcept
   {
@@ -523,7 +531,7 @@ class prefetching_cache {
 
   // ---- Telemetry counters --------------------------------------------------
   // Global cumulative counts.  @c _last_reported snapshots them on every cache
-  // refresh (prepare_for_query) so summary() can also report per-cycle deltas.
+  // refresh (prepare_for_query). Intervals are cache-wide, not attributed to a query.
   struct counters {
     std::atomic<uint64_t> n_reads{0};    // device read requests served by the cache
     std::atomic<uint64_t> hits{0};       // chunks served from cache (read pin acquired, in_use)
@@ -539,7 +547,12 @@ class prefetching_cache {
     uint64_t evictions{0};
   };
 
+  [[nodiscard]] counters_snapshot sample_counters() const noexcept;
+  [[nodiscard]] static std::string format_summary(counters_snapshot const& sample,
+                                                  counters_snapshot const& baseline);
+
   counters _counters;
+  mutable std::mutex _summary_mutex;
   counters_snapshot _last_reported;
 
   /// One slot per issued cache-backed IO, retained by its physical completion
@@ -568,10 +581,7 @@ class prefetching_cache {
 
   mutable std::shared_mutex _map_mtx;
   std::unordered_map<std::string, std::shared_ptr<cache_generation>> _file_cache;
-  std::unordered_map<std::string,
-                     std::vector<std::weak_ptr<cache_generation>>,
-                     detail::string_hash,
-                     std::equal_to<>>
+  std::unordered_map<std::string, std::vector<std::weak_ptr<cache_generation>>>
     _generations_by_path;
   std::shared_ptr<std::shared_mutex> _retire_mtx;
 
