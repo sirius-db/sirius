@@ -16,6 +16,7 @@
 
 #include "op/partition/partition_exchange.hpp"
 
+#include "log/logging.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
@@ -23,6 +24,20 @@
 #include <stdexcept>
 
 namespace sirius::op {
+namespace {
+
+char const* mode_name(partition_mode mode)
+{
+  switch (mode) {
+    case partition_mode::hash: return "hash";
+    case partition_mode::broadcast: return "broadcast";
+    case partition_mode::single: return "single";
+    case partition_mode::local: return "local";
+  }
+  return "unknown";
+}
+
+}  // namespace
 
 partition_exchange::partition_exchange(std::vector<sirius_physical_partition*> inputs,
                                        std::size_t sizing_input,
@@ -100,6 +115,16 @@ std::optional<task_creation_hint> partition_exchange::prepare_impl(bool resolve)
       throw std::logic_error("partition exchange inputs must share a placement");
     }
   }
+  SIRIUS_LOG_DEBUG(
+    "partition_exchange resolved {} inputs on sizing input {}: {} partitions, mode {}, sized from "
+    "{} bytes and {} rows, placement {}",
+    _inputs.size(),
+    _sizing_input,
+    layouts.front().placement->num_partitions(),
+    mode_name(layouts.front().mode),
+    stats[_sizing_input].bytes,
+    stats[_sizing_input].rows,
+    layouts.front().placement->to_string());
   for (std::size_t i = 0; i < layouts.size(); ++i) {
     _inputs[i]->set_layout(std::move(layouts[i]));
   }
