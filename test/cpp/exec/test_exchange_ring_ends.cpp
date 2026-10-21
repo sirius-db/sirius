@@ -282,6 +282,54 @@ std::pair<ring_exchange::landing, std::uint64_t> ship(ring_exchange& from,
 
 }  // namespace
 
+TEST_CASE("ring sizes follow the device's memory, and the frame stays the same on every GPU",
+          "[exchange_ring][ends]")
+{
+  constexpr std::size_t MiB = std::size_t{1} << 20;
+  constexpr std::size_t GiB = std::size_t{1} << 30;
+  struct expected {
+    std::size_t device, send, recv;
+  };
+  // 189 GiB keeps the sizes the GB200 runs used; smaller GPUs keep about the same share.
+  for (auto const& [device, send, recv] : {expected{189 * GiB, 1 * GiB, 1536 * MiB},
+                                           expected{96 * GiB, 576 * MiB, 832 * MiB},
+                                           expected{32 * GiB, 512 * MiB, 768 * MiB},
+                                           expected{24 * GiB, 512 * MiB, 768 * MiB}}) {
+    CAPTURE(device);
+    auto const sized = ring_exchange::options::sized_for(device);
+    CHECK(sized.frame_bytes == 64 * MiB);
+    CHECK(sized.send_bytes == send);
+    CHECK(sized.recv_bytes == recv);
+  }
+  // A frame set by the embedder is kept, and the rings are whole frames of it.
+  auto const small = ring_exchange::options::sized_for(32 * GiB, 16 * MiB);
+  CHECK(small.frame_bytes == 16 * MiB);
+  CHECK(small.send_bytes == 192 * MiB);
+  CHECK(small.recv_bytes == 288 * MiB);
+}
+
+TEST_CASE("landings may hold half the host tier unless the embedder sets a size",
+          "[exchange_ring][ends]")
+{
+  constexpr std::size_t GiB = std::size_t{1} << 30;
+  CHECK(ring_exchange::default_host_landing_bytes(256 * GiB) == 128 * GiB);
+  CHECK(ring_exchange::default_host_landing_bytes(32 * GiB) == 16 * GiB);
+  CHECK(ring_exchange::default_host_landing_bytes(0) == 0);
+}
+
+TEST_CASE("a GPU pool sized by a fraction keeps headroom once the rings are allocated",
+          "[exchange_ring][ends]")
+{
+  constexpr std::size_t GiB = std::size_t{1} << 30;
+  // GB200: 0.85 of 185 GiB is 157 GiB, under the cap, so its pool does not change.
+  CHECK(ring_exchange::pool_cap_after_rings(181 * GiB) == 177 * GiB);
+  CHECK(ring_exchange::pool_cap_after_rings(181 * GiB) > 185 * GiB * 85 / 100);
+  // 32 GiB: 0.84 of it is 26.9 GiB, over the cap.
+  CHECK(ring_exchange::pool_cap_after_rings(30 * GiB) == 26 * GiB);
+  CHECK(ring_exchange::pool_cap_after_rings(6 * GiB) == 3 * GiB);
+  CHECK(ring_exchange::pool_cap_after_rings(0) == 0);
+}
+
 TEST_CASE("a GPU batch lands on the GPU through the rings", "[exchange_ring][ends]")
 {
   auto sender         = make_ring();
@@ -514,20 +562,22 @@ TEST_CASE("disk landings written by several threads overlap", "[exchange_ring][e
   fs::remove_all(dir);
 }
 
-TEST_CASE("I5: no room in any tier is the one failure, with every tier's numbers",
+TEST_CASE("I5: no room in any tier is the one failure, with every tier's numbers and a fix",
           "[exchange_ring][ends]")
 {
   auto sender    = make_ring();
   auto receiver  = make_ring(/*gpu_bytes=*/0, /*host_bytes=*/0, /*host=*/true, /*disk=*/false);
   auto const job = sender->export_batch(gpu_batch(sample_table()));
   REQUIRE(job.has_value());
-  CHECK_THROWS_MATCHES(
-    receiver->begin(job->header),
-    ring_no_room,
-    Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("no tier has room") &&
-                                    Catch::Matchers::ContainsSubstring("GPU needs") &&
-                                    Catch::Matchers::ContainsSubstring("host ") &&
-                                    Catch::Matchers::ContainsSubstring("disk none")));
+  CHECK_THROWS_MATCHES(receiver->begin(job->header),
+                       ring_no_room,
+                       Catch::Matchers::MessageMatches(
+                         Catch::Matchers::ContainsSubstring("no tier has room") &&
+                         Catch::Matchers::ContainsSubstring("GPU needs") &&
+                         Catch::Matchers::ContainsSubstring("host ") &&
+                         Catch::Matchers::ContainsSubstring("disk none") &&
+                         Catch::Matchers::ContainsSubstring("sirius.memory.disk") &&
+                         Catch::Matchers::ContainsSubstring("SIRIUS_CN_RING_HOST_LANDING_BYTES")));
   CHECK(receiver->stats().refused == 1);
   sender->release_job(job->token);
 }

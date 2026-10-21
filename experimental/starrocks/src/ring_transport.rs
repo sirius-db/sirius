@@ -738,6 +738,7 @@ impl<F: Fabric> RingLoop<F> {
         }
         .encode();
         let local_md = self.shared.local_md.clone();
+        let frame_bytes = self.shared.engine.frame_bytes();
         let spawned = std::thread::Builder::new()
             .name("ring-open".to_string())
             .spawn(move || {
@@ -751,6 +752,21 @@ impl<F: Fabric> RingLoop<F> {
                             &NixlEnvelope::RingOpen(body.clone()),
                         )?;
                         let grant = LaneGrant::decode(&reply)?;
+                        if !grant.frames.is_empty() && grant.frame_bytes != frame_bytes {
+                            // Frames are written at the receiver's frame size: refuse the lane,
+                            // and give its frames back.
+                            let _ = control.call(
+                                peer,
+                                control_params(),
+                                &NixlEnvelope::RingClose(grant.lane),
+                            );
+                            return Err(format!(
+                                "the ring receiver {peer} has frames of {} bytes and this CN's \
+                                 are {frame_bytes}: set SIRIUS_CN_RING_FRAME_BYTES to the same \
+                                 size on every CN",
+                                grant.frame_bytes
+                            ));
+                        }
                         if !grant.frames.is_empty() {
                             return Ok((grant, md));
                         }
@@ -1667,6 +1683,8 @@ mod tests {
         no_room: bool,
         /// Copy-outs never finish.
         stuck: bool,
+        /// Reports frames twice as large as its rings', like a CN set to another frame size.
+        wide_frames: bool,
     }
 
     #[derive(Debug, Default)]
@@ -1732,7 +1750,11 @@ mod tests {
 
     impl RingEngine for MockEngine {
         fn frame_bytes(&self) -> u64 {
-            FRAME
+            if self.behavior.wide_frames {
+                2 * FRAME
+            } else {
+                FRAME
+            }
         }
         fn recv_region(&self) -> (i32, usize, u64) {
             (0, 0, self.node.recv.lock().unwrap().len() as u64)
@@ -2213,6 +2235,28 @@ mod tests {
                 .iter()
                 .any(|note| matches!(RingNote::decode(note), Ok(RingNote::Refuse { .. })))
         );
+    }
+
+    #[test]
+    fn a_receiver_with_other_frames_is_refused_and_gets_its_frames_back() {
+        let cluster = Cluster::default();
+        let a = cluster.cn(1, 4, 4, Behavior::default(), settings());
+        let b = cluster.cn(
+            2,
+            4,
+            4,
+            Behavior {
+                wide_frames: true,
+                ..Behavior::default()
+            },
+            settings(),
+        );
+        let job = a.engine.add_job(1, 3 * FRAME, 1);
+        let err = ship(&a, &b, Jobs(Mutex::new([job].into()))).unwrap_err();
+        assert!(err.contains("SIRIUS_CN_RING_FRAME_BYTES"), "{err}");
+        assert!(b.sink.batches.lock().unwrap().is_empty());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(b.engine.state.lock().unwrap().recv_free.len(), 4);
     }
 
     #[test]

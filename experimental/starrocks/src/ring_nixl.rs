@@ -32,17 +32,23 @@ const ENV_HINT: &str = "source experimental/starrocks/scripts/cn-env.sh (NIXL_PR
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The engine's ring sizes for the ring exchange, from the environment.
+/// The engine's ring sizes for the ring exchange, from the environment. An unset size is passed
+/// as 0, and the engine derives it from the hardware.
 ///
-/// - `SIRIUS_CN_RING_FRAME_BYTES`: frame size, 64 MiB;
-/// - `SIRIUS_CN_RING_SEND_BYTES` / `SIRIUS_CN_RING_RECV_BYTES`: ring sizes, 1 GiB / 1.5 GiB;
-/// - `SIRIUS_CN_RING_GPU_LANDING_FRACTION`: share of the GPU space landed batches may hold, 0.1;
-/// - `SIRIUS_CN_RING_HOST_LANDING_BYTES`: host bytes landed batches may hold, 48 GiB;
+/// - `SIRIUS_CN_RING_FRAME_BYTES`: frame size, 64 MiB; it must be the same on every CN;
+/// - `SIRIUS_CN_RING_SEND_BYTES` / `SIRIUS_CN_RING_RECV_BYTES`: ring sizes; by default 0.6% of the
+///   GPU in whole frames, within [8 frames, 1 GiB], and 1.5 times that;
+/// - `SIRIUS_CN_RING_GPU_LANDING_FRACTION`: share of the GPU space landed batches may hold, 0.2;
+/// - `SIRIUS_CN_RING_HOST_LANDING_BYTES`: host bytes landed batches may hold; by default half the
+///   host tier;
 /// - `SIRIUS_CN_RING_DISK_WRITERS`: threads writing batches that land on disk, 1.
 ///
 /// Sizes take a `KiB`, `MiB` or `GiB` suffix.
 pub fn ring_options_from_env() -> Result<sirius::RingOptions, String> {
-    let env = |name: &str| std::env::var(name).ok();
+    ring_options_from(|name| std::env::var(name).ok())
+}
+
+fn ring_options_from(env: impl Fn(&str) -> Option<String>) -> Result<sirius::RingOptions, String> {
     let bytes = |name: &str, default: u64| match env(name) {
         None => Ok(default),
         Some(value) => parse_bytes(&value)
@@ -50,7 +56,7 @@ pub fn ring_options_from_env() -> Result<sirius::RingOptions, String> {
             .ok_or_else(|| format!("{name} must be a positive size, not '{value}'")),
     };
     let fraction = match env("SIRIUS_CN_RING_GPU_LANDING_FRACTION") {
-        None => 0.1,
+        None => 0.2,
         Some(value) => value
             .trim()
             .parse::<f64>()
@@ -61,11 +67,11 @@ pub fn ring_options_from_env() -> Result<sirius::RingOptions, String> {
             })?,
     };
     Ok(sirius::RingOptions {
-        frame_bytes: bytes("SIRIUS_CN_RING_FRAME_BYTES", 64 << 20)?,
-        send_bytes: bytes("SIRIUS_CN_RING_SEND_BYTES", 1 << 30)?,
-        recv_bytes: bytes("SIRIUS_CN_RING_RECV_BYTES", 3 << 29)?,
+        frame_bytes: bytes("SIRIUS_CN_RING_FRAME_BYTES", 0)?,
+        send_bytes: bytes("SIRIUS_CN_RING_SEND_BYTES", 0)?,
+        recv_bytes: bytes("SIRIUS_CN_RING_RECV_BYTES", 0)?,
         gpu_landing_fraction: fraction,
-        host_landing_bytes: bytes("SIRIUS_CN_RING_HOST_LANDING_BYTES", 48 << 30)?,
+        host_landing_bytes: bytes("SIRIUS_CN_RING_HOST_LANDING_BYTES", 0)?,
         disk_writers: match env("SIRIUS_CN_RING_DISK_WRITERS") {
             None => 1,
             Some(value) => value
@@ -483,7 +489,7 @@ pub(crate) fn check_single_visible_device(visible: Option<&str>) -> Result<(), S
 
 #[cfg(test)]
 mod tests {
-    use super::{check_single_visible_device, parse_bytes};
+    use super::{check_single_visible_device, parse_bytes, ring_options_from};
 
     #[test]
     fn one_cn_sees_one_gpu() {
@@ -502,5 +508,34 @@ mod tests {
         assert_eq!(parse_bytes("2KiB"), Some(2048));
         assert_eq!(parse_bytes("lots"), None);
         assert_eq!(parse_bytes("5TB"), None);
+    }
+
+    #[test]
+    fn unset_ring_sizes_are_left_to_the_engine_and_set_ones_must_be_positive() {
+        let unset = ring_options_from(|_| None).unwrap();
+        assert_eq!(
+            (unset.frame_bytes, unset.send_bytes, unset.recv_bytes),
+            (0, 0, 0)
+        );
+        assert_eq!(unset.host_landing_bytes, 0);
+        assert_eq!(unset.gpu_landing_fraction, 0.2);
+        assert_eq!(unset.disk_writers, 1);
+
+        let set = ring_options_from(|name| match name {
+            "SIRIUS_CN_RING_SEND_BYTES" => Some("512MiB".to_string()),
+            "SIRIUS_CN_RING_HOST_LANDING_BYTES" => Some("64GiB".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!((set.frame_bytes, set.send_bytes), (0, 512 << 20));
+        assert_eq!(set.host_landing_bytes, 64 << 30);
+
+        for bad in ["0", "lots"] {
+            let err = ring_options_from(|name| {
+                (name == "SIRIUS_CN_RING_FRAME_BYTES").then(|| bad.to_string())
+            })
+            .unwrap_err();
+            assert!(err.contains("SIRIUS_CN_RING_FRAME_BYTES"), "{err}");
+        }
     }
 }
