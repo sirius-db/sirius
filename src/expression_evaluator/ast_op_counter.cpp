@@ -129,6 +129,7 @@ std::size_t in_list::cudf_ast_op_count() const
 
 std::size_t function_call::cudf_ast_op_count() const
 {
+  if (date_operation().has_value()) { return 0; }
   // DECIMAL output -> 0 (cuDF AST chokes on intermediate decimal results
   // until https://github.com/rapidsai/cudf/pull/21996 lands).
   if (return_type().id() == sirius::type_id::DECIMAL) { return 0; }

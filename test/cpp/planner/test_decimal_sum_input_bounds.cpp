@@ -87,7 +87,7 @@ struct decimal_bounds_fixture {
       "'partial_aggregate_pushdown,aggregate_function_rewriter,common_aggregate';");
     run("SET delim_join_as_cte = false;");
     // v in [1.00, 50.00] (unscaled 5000), w in [-6.00, 0.00] (600), x in [10.50, 31.50] (3150);
-    // wide is DECIMAL128 on the GPU and never a candidate.
+    // wide is DECIMAL128 on the GPU, in [0.00, 999.00] (99900): a narrowing candidate.
     run(
       "CREATE TABLE fact AS SELECT (i % 3)::INTEGER g, ((i % 50) + 1)::DECIMAL(15,2) v, "
       "(-(i % 7))::DECIMAL(7,2) w, (i % 1000)::DECIMAL(20,2) wide FROM range(3000) r(i);");
@@ -127,12 +127,12 @@ TEST_CASE_METHOD(decimal_bounds_fixture,
   auto const bounds = bounds_in_transaction(
     *con, "SELECT g, sum(v), avg(v), sum(w), sum(wide), count(v), min(v) FROM fact GROUP BY g");
   REQUIRE(bounds.size() == 6);
-  CHECK(bounds[0] == std::uint64_t{5000});  // sum(v)
-  CHECK(bounds[1] == std::uint64_t{5000});  // avg(v) shares v's bound
-  CHECK(bounds[2] == std::uint64_t{600});   // sum(w): the magnitude of -6.00
-  CHECK_FALSE(bounds[3].has_value());       // sum(wide) already runs as DECIMAL128
-  CHECK_FALSE(bounds[4].has_value());       // count cannot overflow
-  CHECK_FALSE(bounds[5].has_value());       // min cannot overflow
+  CHECK(bounds[0] == std::uint64_t{5000});   // sum(v)
+  CHECK(bounds[1] == std::uint64_t{5000});   // avg(v) shares v's bound
+  CHECK(bounds[2] == std::uint64_t{600});    // sum(w): the magnitude of -6.00
+  CHECK(bounds[3] == std::uint64_t{99900});  // sum(wide): DECIMAL128, bounded for narrowing
+  CHECK_FALSE(bounds[4].has_value());        // count cannot overflow
+  CHECK_FALSE(bounds[5].has_value());        // min cannot overflow
 }
 
 TEST_CASE_METHOD(decimal_bounds_fixture,
@@ -206,4 +206,18 @@ TEST_CASE_METHOD(decimal_bounds_fixture,
   auto const after = bounds_in_transaction(*con, "SELECT sum(v) FROM fact");
   REQUIRE(after.size() == 1);
   CHECK(after[0] == std::uint64_t{5000});
+}
+
+TEST_CASE_METHOD(decimal_bounds_fixture,
+                 "decimal sum bounds - a DECIMAL128 bound beyond 64 bits declines",
+                 "[planner][aggregate][decimal_sum_overflow]")
+{
+  // 10^20 does not fit 64 bits, so its bound can neither skip widening nor allow narrowing.
+  run(
+    "CREATE TABLE huge AS SELECT (i * 100000000000000000000)::DECIMAL(38,0) h, "
+    "(i - 2)::DECIMAL(38,0) s FROM range(2) r(i);");
+  auto const bounds = bounds_in_transaction(*con, "SELECT sum(h), sum(s) FROM huge");
+  REQUIRE(bounds.size() == 2);
+  CHECK_FALSE(bounds[0].has_value());
+  CHECK(bounds[1] == std::uint64_t{2});  // s in [-2, -1]: the magnitude of -2
 }

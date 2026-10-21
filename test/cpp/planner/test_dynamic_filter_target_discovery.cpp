@@ -332,11 +332,15 @@ TEST_CASE("join_block_descent refuses a build ordinal past the build block",
 // scan_route_join_type_admissible
 // ---------------------------------------------------------------------------------------------
 
-TEST_CASE("scan_route_join_type_admissible mirrors DuckDB's producer join-type gate",
+TEST_CASE("scan-route producers can discard probe rows with no matching build key",
           "[dynamic_filter][placement][discovery]")
 {
-  for (auto const join_type :
-       {duckdb::JoinType::INNER, duckdb::JoinType::RIGHT, duckdb::JoinType::SEMI}) {
+  for (auto const join_type : {duckdb::JoinType::INNER,
+                               duckdb::JoinType::RIGHT,
+                               duckdb::JoinType::SEMI,
+                               duckdb::JoinType::RIGHT_SEMI,
+                               duckdb::JoinType::RIGHT_ANTI}) {
+    CAPTURE(join_type);
     REQUIRE(scan_route_join_type_admissible(join_type));
   }
   for (auto const join_type : {duckdb::JoinType::LEFT,
@@ -344,9 +348,8 @@ TEST_CASE("scan_route_join_type_admissible mirrors DuckDB's producer join-type g
                                duckdb::JoinType::ANTI,
                                duckdb::JoinType::MARK,
                                duckdb::JoinType::SINGLE,
-                               duckdb::JoinType::RIGHT_SEMI,
-                               duckdb::JoinType::RIGHT_ANTI,
                                duckdb::JoinType::INVALID}) {
+    CAPTURE(join_type);
     REQUIRE_FALSE(scan_route_join_type_admissible(join_type));
   }
 }

@@ -208,7 +208,9 @@ std::string_view sirius_physical_nested_loop_join::input_port_for(
   sirius_physical_operator const& producer) const
 {
   if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
-    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+    if (children.size() == 2 && children[1].get() == &producer) { return "build"; }
+    if (children.size() == 2 && children[0].get() == &producer) { return "default"; }
+    throw std::logic_error("Join CONCAT producer is not a wired input child");
   }
   return sirius_physical_operator::input_port_for(producer);
 }
@@ -234,9 +236,11 @@ bool sirius_physical_nested_loop_join::is_supported(
 partition_strategy sirius_physical_nested_loop_join::get_partition_strategy(
   const partition_sizing_input& /*in*/)
 {
-  // A nested-loop join is never hash-partitioned: it runs on a single partition and streams both
-  // sides through the cross-product, so it never broadcasts or enters build-probe. No GPU state
-  // is shared across tasks; leave the CONCATs and join tasks free to follow input locality.
+  // A nested-loop join is never hash-partitioned: it runs on a single partition and evaluates each
+  // pair of left and right batches as one task, so it never broadcasts or enters build-probe. Join
+  // wrapping folds the side rows are decided against (right for LEFT/SEMI/ANTI/MARK, left for
+  // RIGHT, both for FULL OUTER); INNER streams both. No GPU state is shared across tasks; leave the
+  // CONCATs and join tasks free to follow input locality.
   return partition_strategy{/*num_partitions=*/1,
                             /*broadcast=*/false,
                             /*build_probe=*/false,

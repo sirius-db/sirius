@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "memory/runtime_stream_pool.hpp"
+
 #include <cudf/ast/expressions.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/search.hpp>
@@ -390,7 +392,8 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
 
   // Publication synchronizes construction before replication.
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{_source_device}};
-  auto const source_stream = source->get_gpu_space().acquire_stream();
+  auto source_lease        = sirius::memory::runtime_stream_pool::acquire(source->get_gpu_space());
+  auto const source_stream = source_lease.get();
 
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
@@ -402,7 +405,8 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
 
       {
         rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{device_id}};
-        auto const target_stream = target_space.acquire_stream();
+        auto target_lease        = sirius::memory::runtime_stream_pool::acquire(target_space);
+        auto const target_stream = target_lease.get();
         auto const target_mr     = target_space.get_default_allocator();
         replica->zones.reserve(_zones.size());
         for (auto const& zone : _zones) {

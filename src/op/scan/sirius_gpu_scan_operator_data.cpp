@@ -26,6 +26,7 @@
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <pipeline/batch_lock_utils.hpp>
 #include <scan_manager/readahead_scan_manager.hpp>
 
 #include <algorithm>
@@ -33,6 +34,7 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -237,7 +239,8 @@ void scan_operator_input::prepare_for_processing(
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
 
   if (batch && !stolen_table && !stolen_table_consumed) {
-    bool needs_upload = false;
+    bool needs_upload      = false;
+    bool needs_device_copy = false;
     {
       auto ro          = batch->to_read_only();
       auto const* data = ro.get_data();
@@ -247,7 +250,27 @@ void scan_operator_input::prepare_for_processing(
       auto const* gpu_rep = dynamic_cast<const ::cucascade::gpu_table_representation*>(data);
       needs_upload =
         data != nullptr && (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !gpu_rep);
+      needs_device_copy = gpu_rep && requested_memory_space && ro.get_memory_space() &&
+                          ro.get_memory_space()->get_id() != requested_memory_space->get_id();
       if (!needs_upload && gpu_rep) { record_decode_outcome(data); }
+    }
+    if (needs_device_copy) {
+      // Admission may override the pinned table's locality. Reuse the pipeline
+      // clone path: keep shared pin storage on its original GPU, and bind only
+      // this input to the copy on the executor's device. The helper rechecks
+      // residency under its lock and waits for the source writer before copying.
+      auto prepared = pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream);
+      if (!prepared) throw std::runtime_error("Cannot prepare cached scan on its assigned GPU");
+      std::visit(
+        [&](auto& locked) {
+          record_decode_outcome(locked.ro_lock.get_data());
+          if constexpr (std::is_same_v<std::decay_t<decltype(locked)>,
+                                       pipeline::lock_to_new_batch>) {
+            batch                = locked.new_batch;
+            materialization_info = batch;
+          }
+        },
+        *prepared);
     }
     if (needs_upload && requested_memory_space) {
       auto& registry = ::sirius::converter_registry::get();
@@ -343,6 +366,10 @@ void scan_operator_input::prepare_for_processing(
   if (batch) {
     auto ro          = batch->to_read_only();
     gpu_memory_space = ro.get_memory_space();
+    if (requested_memory_space && gpu_memory_space &&
+        gpu_memory_space->get_id() != requested_memory_space->get_id()) {
+      throw std::runtime_error("Cached scan batch is not on its assigned GPU");
+    }
   }
 }
 

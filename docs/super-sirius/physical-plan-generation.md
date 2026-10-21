@@ -36,6 +36,8 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
 
+`LOGICAL_DELIM_JOIN` reaches Sirius because Sirius loads with DuckDB's `delim_join_as_cte` defaulting to `false`. With the setting at DuckDB v2's own default (`true`), the same subqueries arrive as `LOGICAL_MATERIALIZED_CTE` plus `LOGICAL_CTE_REF` and ordinary semi, anti and mark joins; see [DuckDB Settings Changed by Sirius](configuration.md#duckdb-settings-changed-by-sirius).
+
 **Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
 `LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_RECURSIVE_CTE`
 
@@ -62,7 +64,7 @@ A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, 
 
 - **Ungrouped aggregate** — when no GROUP BY columns exist
 - **Grouped aggregate** — hash-based GROUP BY using cuDF's `groupby()` API
-- **Decimal SUM bounds** — before the child is planned, `resolve_decimal_sum_input_bounds()` (`src/planner/decimal_sum_input_bounds.cpp`) traces each DECIMAL32/DECIMAL64 SUM or AVG input to its base scan with `resolve_scan_column_origin()` (`src/planner/scan_column_origin.cpp`, the tracer the dynamic-filter key-domain estimate also uses) under its value-preserving policy, which accepts bare-reference projections, filters, sorts, limits, DISTINCT, group keys and either side of any join or cross product, then reads the table function's column statistics. The resulting magnitude bound lets the aggregate operators decide widening from the batch row count instead of scanning the batch; unproven inputs keep the per-batch scan. Gated by `sirius.operator_params.enable_decimal_sum_stats_bound`.
+- **Decimal SUM bounds** — before the child is planned, `resolve_decimal_sum_input_bounds()` (`src/planner/decimal_sum_input_bounds.cpp`) traces each decimal SUM or AVG input to its base scan with `resolve_scan_column_origin()` (`src/planner/scan_column_origin.cpp`, the tracer the dynamic-filter key-domain estimate also uses) under its value-preserving policy, which accepts bare-reference projections, filters, sorts, limits, DISTINCT, group keys and either side of any join or cross product, then reads the table function's column statistics. The resulting magnitude bound lets the aggregate operators decide from the batch row count instead of scanning the batch whether a DECIMAL32/DECIMAL64 SUM must be widened or a DECIMAL128 SUM can run over DECIMAL64; unproven inputs keep the per-batch scan, and a bound beyond 64 bits counts as unproven. Gated by `sirius.operator_params.enable_decimal_sum_stats_bound`.
 - **AVG decomposition** — AVG is split into SUM + COUNT_VALID (cuDF doesn't support AVG directly)
 - **COUNT(DISTINCT)** — implemented via `COLLECT_SET` aggregation, then counting unique rows
 - **HUGEINT downcast** — HUGEINT types are downcast to BIGINT (cuDF doesn't support int128)
