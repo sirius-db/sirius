@@ -20,9 +20,11 @@
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "op/aggregate/wide_integer_sum.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <algorithm>
+#include <functional>
 
 namespace sirius {
 namespace op {
@@ -122,6 +124,23 @@ sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 bool sirius_physical_grouped_aggregate::has_stddev_samp() const
 {
   return std::ranges::any_of(aggregate_slots, [](auto const& slot) { return slot.is_stddev_samp; });
+}
+
+std::vector<std::optional<cudf::data_type>>
+sirius_physical_grouped_aggregate::wide_integer_sum_partial_types() const
+{
+  auto const aggregate_offset = num_output_group_columns();
+  if (std::ranges::none_of(cudf_aggregate_is_wide_integer_sum, std::identity{}) ||
+      types.size() != aggregate_offset + cudf_aggregates.size()) {
+    return {};
+  }
+  std::vector<std::optional<cudf::data_type>> alternates(types.size());
+  for (size_t i = 0; i < cudf_aggregate_is_wide_integer_sum.size(); ++i) {
+    if (cudf_aggregate_is_wide_integer_sum[i]) {
+      alternates[aggregate_offset + i] = wide_integer_sum_type();
+    }
+  }
+  return alternates;
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(

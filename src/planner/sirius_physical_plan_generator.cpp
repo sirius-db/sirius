@@ -1306,6 +1306,10 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     } else if (has_supported_count_distinct_layout) {
       hgb_ptr->types = grouped.get_count_distinct_local_output_types();
     }
+    // A wide integer SUM's partials are INT64 or DECIMAL128, batch by batch, until the merge
+    // reconciles them; both the aggregate and PARTITION may emit either.
+    auto alternate_types = grouped.wide_integer_sum_partial_types();
+    hgb_ptr->set_alternate_physical_types(alternate_types);
 
     // Only aggregate-fanout partitions use runtime size estimation.
     auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
@@ -1319,6 +1323,7 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     if (hgb_ptr->has_physical_overrides()) {
       partition->set_physical_types(hgb_ptr->get_physical_types());
     }
+    partition->set_alternate_physical_types(std::move(alternate_types));
     partition->children.push_back(std::move(hgb_op));
 
     // Bind merge sizing independently of the local aggregate's explicit key description.

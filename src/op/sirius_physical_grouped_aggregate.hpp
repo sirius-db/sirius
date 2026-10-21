@@ -113,6 +113,12 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   [[nodiscard]] bool has_stddev_samp() const;
 
+  //! Alternate carriers of the local output, for set_alternate_physical_types(): DECIMAL128 for
+  //! the column of each wide integer SUM, whose partial is INT64 or, where the batch could
+  //! overflow INT64, DECIMAL128. Empty when no SUM is wide or `types` is not one column per cuDF
+  //! aggregate after the group columns.
+  [[nodiscard]] std::vector<std::optional<cudf::data_type>> wide_integer_sum_partial_types() const;
+
   // Source interface
   bool is_source() const override { return true; }
 

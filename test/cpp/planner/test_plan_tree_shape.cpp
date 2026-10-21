@@ -1286,6 +1286,49 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(local->get_types()[1].id() == sirius::type_id::LIST);
   }
 
+  SECTION("a wide integer SUM accepts INT64 or DECIMAL128 partials until the merge")
+  {
+    // The statistics cannot prove the BIGINT sum fits INT64, so the SUM is wide.
+    REQUIRE_FALSE(con->Query("CREATE TABLE wide_sum (k INTEGER, x BIGINT)")->HasError());
+    REQUIRE_FALSE(
+      con->Query("INSERT INTO wide_sum VALUES (1, 4000000000000000000), (1, 4000000000000000000)")
+        ->HasError());
+    auto plan = generate_sirius_plan(*con, "SELECT k, sum(x) FROM wide_sum GROUP BY k");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    CHECK(merge->get_alternate_physical_types().empty());
+    auto* partition = merge->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    auto* local = partition->children[0].get();
+    REQUIRE(local->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+
+    auto const int64      = cudf::data_type{cudf::type_id::INT64};
+    auto const decimal128 = cudf::data_type{cudf::type_id::DECIMAL128, 0};
+    for (auto const* op : {local, partition}) {
+      REQUIRE(op->get_types().size() == 2);
+      CHECK(op->get_types()[1].id() == sirius::type_id::BIGINT);
+      CHECK(op->is_alternate_physical_type(1, decimal128));
+      CHECK_FALSE(op->is_alternate_physical_type(1, int64));
+      CHECK_FALSE(op->is_alternate_physical_type(0, decimal128));
+    }
+  }
+
+  SECTION("a decimal SUM has no alternate partial carrier")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT amount, sum(amount) FROM decimal_values GROUP BY amount");
+    INFO(tree_to_string(plan.get()));
+
+    auto* local = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(local != nullptr);
+    CHECK(local->get_alternate_physical_types().empty());
+    auto* partition = find_first(plan.get(), SiriusPhysicalOperatorType::PARTITION);
+    REQUIRE(partition != nullptr);
+    CHECK(partition->get_alternate_physical_types().empty());
+  }
+
   SECTION("ungrouped aggregate gains MERGE_AGGREGATE with no PARTITION")
   {
     auto plan = generate_sirius_plan(*con, "SELECT sum(val) FROM big_left");

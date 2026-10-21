@@ -570,15 +570,12 @@ std::unique_ptr<cudf::column> narrow_wide_integer_sum(std::unique_ptr<cudf::colu
     throw sirius::internal_exception("narrow_wide_integer_sum: unexpected column type {}",
                                      cudf::type_to_name(type));
   }
-  // A column with no valid value has nothing to check; any other column whose bounds cannot be
-  // established is treated as out of range.
-  if (column->null_count() < column->size()) {
-    auto const range = compute_exact_numeric_range(column->view(), stream, mr);
-    if (!range || range->minimum < std::numeric_limits<int64_t>::min() ||
-        range->maximum > std::numeric_limits<int64_t>::max()) {
-      throw sirius::not_implemented_exception(
-        "SUM result outside the BIGINT range is not supported on GPU (HUGEINT result)");
-    }
+  // DECIMAL64 with scale 0 has INT64's storage range. The check passes a column with no valid
+  // value and fails one whose bounds cannot be established.
+  if (!column_values_fit(
+        column->view(), cudf::data_type{cudf::type_id::DECIMAL64, 0}, stream, mr)) {
+    throw sirius::not_implemented_exception(
+      "SUM result outside the BIGINT range is not supported on GPU (HUGEINT result)");
   }
   return cudf::cast(column->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
 }
