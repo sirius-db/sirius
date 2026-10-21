@@ -1418,8 +1418,7 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
   });
 }
 
-}  // namespace
-
+//! Extract the join's initial whole-partition requirement at the wrapping boundary.
 bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_build)
 {
   using T = sirius::op::SiriusPhysicalOperatorType;
@@ -1436,8 +1435,9 @@ bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_b
       case duckdb::JoinType::RIGHT: return !is_build;
       case duckdb::JoinType::OUTER: return true;
       default:
-        throw std::runtime_error("sirius_physical_concat: unsupported nested loop join type: " +
-                                 duckdb::JoinTypeToString(nested_loop_join.join_type));
+        throw duckdb::NotImplementedException(
+          "sirius_physical_nested_loop_join: unsupported join type: " +
+          duckdb::JoinTypeToString(nested_loop_join.join_type));
     }
   }
   auto const& hash_join = join.Cast<sirius::op::sirius_physical_hash_join>();
@@ -1452,12 +1452,10 @@ bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_b
     case duckdb::JoinType::INNER:
     case duckdb::JoinType::MARK: return false;
     default:
-      throw std::runtime_error("sirius_physical_concat: unsupported join type: " +
-                               duckdb::JoinTypeToString(hash_join.join_type));
+      throw duckdb::NotImplementedException("sirius_physical_hash_join: unsupported join type: " +
+                                            duckdb::JoinTypeToString(hash_join.join_type));
   }
 }
-
-namespace {
 
 //! Wrap `join_op.children[child_idx]` with `CONCAT → PARTITION → original_child`. `is_build`
 //! identifies the join edge; CONCAT receives only the resulting grouping requirement.
