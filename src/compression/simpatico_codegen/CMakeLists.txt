@@ -94,6 +94,7 @@ add_library(
   src/operators/nvcomp_batched_codec.cu
   # Plain-CUDA JIT host
   src/jit/nvrtc_compiler.cpp
+  src/jit/disk_cache.cpp
   src/jit/kernel_cache.cpp
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
@@ -105,6 +106,7 @@ add_library(
   src/plan/operator_registry.cpp
   src/plan/representation_factory.cpp
   src/plan/bitjoin_layout.cpp
+  src/plan/validity.cpp
   src/plan/compress.cpp
   src/plan/decompress.cpp
   src/util/stream_pool.cpp
@@ -175,6 +177,14 @@ target_link_libraries(
          ${SIMPATICO_NVRTC_LIB} CUDA::cuda_driver
   PRIVATE simpatico_cache_identity)
 
+# Sirius already provides cuCascade. Standalone Simpatico keeps its CUDA-only
+# backend and does not acquire a dependency on the rest of the engine.
+if(TARGET cuCascade::cucascade_static)
+  target_link_libraries(simpatico PRIVATE cuCascade::cucascade_static)
+  target_compile_definitions(simpatico
+                             PRIVATE SIMPATICO_USE_CUCASCADE_STREAM_POOL)
+endif()
+
 function(add_codegen_host_test name)
   add_executable(${name} tests/${name}.cpp)
   set_target_properties(${name} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
@@ -198,6 +208,10 @@ add_codegen_host_test(test_operator_sweep)
 add_codegen_host_test(test_representation_contract)
 add_codegen_host_test(test_bitpack_layout_contract)
 add_codegen_host_test(test_multi_gpu_stream_affinity)
+if(TARGET cuCascade::cucascade_static)
+  target_compile_definitions(test_multi_gpu_stream_affinity
+                             PRIVATE SIMPATICO_USE_CUCASCADE_STREAM_POOL)
+endif()
 add_codegen_host_test(test_masked_decode_variants)
 add_codegen_host_test(test_selection_wave)
 add_codegen_host_test(test_chunk_row_set_build)

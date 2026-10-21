@@ -241,3 +241,111 @@ TEST_CASE("decimal sum widening - bounded columns are decided on the host, the r
   // Columns are independent: a measured column beside a bounded one.
   CHECK(to_widen({big->view(), small->view()}, {{0, std::nullopt}, {1, 7}}) == ids({0}));
 }
+
+namespace {
+
+using sirius::op::decimal_sums_to_narrow;
+using sirius::op::narrowed_decimal_sum_type;
+
+std::unique_ptr<cudf::column> d128(std::vector<__int128> const& values)
+{
+  return make_decimal_column<__int128>(cudf::type_id::DECIMAL128, values);
+}
+
+std::unordered_set<int> to_narrow(std::vector<cudf::column_view> const& columns,
+                                  std::vector<decimal_sum_candidate> const& candidates)
+{
+  return decimal_sums_to_narrow(cudf::table_view(columns),
+                                candidates,
+                                cudf::get_default_stream(),
+                                cudf::get_current_device_resource_ref());
+}
+
+/// Whether the measured values of @p column let its SUM run over DECIMAL64.
+bool narrows(std::unique_ptr<cudf::column> const& column)
+{
+  return to_narrow({column->view()}, {{0, std::nullopt}}).contains(0);
+}
+
+}  // namespace
+
+TEST_CASE("decimal sum narrowing - only DECIMAL128 narrows, to DECIMAL64 at the same scale",
+          "[aggregate][decimal_sum_overflow]")
+{
+  CHECK(narrowed_decimal_sum_type(cudf::data_type{cudf::type_id::DECIMAL128, -4}) ==
+        cudf::data_type{cudf::type_id::DECIMAL64, -4});
+  CHECK_FALSE(narrowed_decimal_sum_type(cudf::data_type{cudf::type_id::DECIMAL64, -2}));
+  CHECK_FALSE(narrowed_decimal_sum_type(cudf::data_type{cudf::type_id::INT64}));
+  auto const narrow64 = d64({1, 2});
+  CHECK_THROWS_AS(to_narrow({narrow64->view()}, {{0, std::nullopt}}), sirius::internal_exception);
+}
+
+TEST_CASE("decimal sum narrowing - measured values on the 2^63 - 1 boundary",
+          "[aggregate][decimal_sum_overflow]")
+{
+  __int128 const max64 = kMax64;
+  CHECK(narrows(d128({max64})));             // 1 * (2^63 - 1) == limit
+  CHECK_FALSE(narrows(d128({max64, 0})));    // 2 rows * (2^63 - 1) > limit
+  CHECK_FALSE(narrows(d128({max64 + 1})));   // a value beyond 64 bits
+  CHECK(narrows(d128({-max64})));            // magnitude 2^63 - 1
+  CHECK_FALSE(narrows(d128({-max64 - 1})));  // INT64_MIN: magnitude 2^63
+  CHECK_FALSE(narrows(d128({__int128{1} << 100})));
+  CHECK_FALSE(narrows(d128({-(__int128{1} << 100), 1})));
+  constexpr int64_t half = kMax64 / 2;
+  CHECK(narrows(d128({half, -half})));               // 2 * (2^62 - 1) < limit
+  CHECK_FALSE(narrows(d128({half + 1, half + 1})));  // 2 * 2^62 = 2^63 > limit
+  // TPC-H Q9 profits: four-decimal amounts of a few hundred thousand over many rows.
+  CHECK(narrows(d128({1049999900, -1000000000, 7, 0})));
+}
+
+TEST_CASE("decimal sum narrowing - nulls, empty input and no candidates",
+          "[aggregate][decimal_sum_overflow]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  // Only nulls: the sum is NULL in every group at any width.
+  auto all_null = d128({__int128{1} << 100});
+  all_null->set_null_mask(
+    cudf::create_null_mask(all_null->size(), cudf::mask_state::ALL_NULL, stream, mr),
+    all_null->size());
+  CHECK(narrows(all_null));
+
+  // The huge value is null, so the valid ones decide.
+  auto some_null = d128({__int128{1} << 100, 5, 5});
+  some_null->set_null_mask(
+    cudf::create_null_mask(some_null->size(), cudf::mask_state::ALL_VALID, stream, mr), 0);
+  std::vector<uint32_t> bits{0b110};  // row 0 invalid
+  REQUIRE(cudaMemcpy(some_null->mutable_view().null_mask(),
+                     bits.data(),
+                     sizeof(uint32_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  some_null->set_null_count(1);
+  CHECK(narrows(some_null));
+
+  CHECK_FALSE(narrows(d128({})));  // zero rows: nothing to gain
+  auto column = d128({1, 2});
+  CHECK(to_narrow({column->view()}, {}).empty());
+}
+
+TEST_CASE("decimal sum narrowing - plan-time bounds are decided on the host, the rest measured",
+          "[aggregate][decimal_sum_overflow]")
+{
+  auto const big   = d128({__int128{1} << 100, 0});
+  auto const small = d128({5, 7});
+  auto const ids   = [](std::initializer_list<int> columns) {
+    return std::unordered_set<int>(columns);
+  };
+  // A bound is the planner's promise about the values; the column itself is not read.
+  CHECK(to_narrow({big->view()}, {{0, 7}}) == ids({0}));
+  CHECK(to_narrow({small->view()}, {{0, static_cast<uint64_t>(kMax64)}}).empty());  // 2 rows
+  CHECK(to_narrow({small->view()}, {{0, uint64_t{1} << 63}}).empty());
+  // Without a bound the batch is measured.
+  CHECK(to_narrow({big->view()}, {{0, std::nullopt}}).empty());
+  CHECK(to_narrow({small->view()}, {{0, std::nullopt}}) == ids({0}));
+  // One unproven candidate sends its whole column to measurement.
+  CHECK(to_narrow({big->view()}, {{0, 7}, {0, std::nullopt}}).empty());
+  // Columns are independent.
+  CHECK(to_narrow({big->view(), small->view()}, {{0, std::nullopt}, {1, std::nullopt}}) ==
+        ids({1}));
+}

@@ -464,6 +464,143 @@ TEST_CASE("a compressed pin across two GPUs is declined and the query still come
 
 namespace {
 
+// q10's DuckDB v2 shape in miniature: `nation` joins `customer` first, so its scan is listed
+// before customer's. Both bundles can install on their own, at the same far consumer: nation's
+// one wide name, and customer's three wide strings. The port carries one ride, so the bigger
+// bundle has to own it and the smaller one ride along. The nation name is long enough to clear
+// the value floor by itself, which is what used to let it claim the port first.
+constexpr char const* kRiderQuery =
+  "SELECT c.c_custkey, c.c_name, c.c_address, c.c_comment, n.n_name, count(*) AS n "
+  "FROM read_parquet('{C}') c "
+  "JOIN read_parquet('{N}') n ON c.c_nationkey = n.n_nationkey "
+  "JOIN read_parquet('{O}') o ON c.c_custkey = o.o_custkey "
+  "JOIN read_parquet('{L}') l ON o.o_orderkey = l.l_orderkey "
+  "GROUP BY c.c_custkey, c.c_name, c.c_address, c.c_comment, n.n_name "
+  "ORDER BY c.c_custkey";
+
+struct rider_files {
+  fs::path customer;
+  fs::path nation;
+  fs::path orders;
+  fs::path lines;
+};
+
+std::string rider_query_for(rider_files const& files)
+{
+  std::string sql = kRiderQuery;
+  sql.replace(sql.find("{C}"), 3, files.customer.string());
+  sql.replace(sql.find("{N}"), 3, files.nation.string());
+  sql.replace(sql.find("{O}"), 3, files.orders.string());
+  sql.replace(sql.find("{L}"), 3, files.lines.string());
+  return sql;
+}
+
+void generate_rider_parquet(rider_files const& files)
+{
+  // generate_parquet writes customer as a directory of files; this case writes its own single
+  // customer file below, so point the generator's customer output somewhere unused.
+  generate_parquet(files.customer.parent_path() / "unused_customer", files.orders, files.lines);
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  // Re-write customer with a nation key, and a nation table whose names are wide.
+  auto r = gen.Query(
+    "COPY (SELECT range AS c_custkey, range % 25 AS c_nationkey, "
+    "             'Customer#' || lpad(CAST(range AS VARCHAR), 12, '0') AS c_name, "
+    "             'address-' || repeat(CAST(range % 97 AS VARCHAR), 6) AS c_address, "
+    "             'comment for customer ' || CAST(range AS VARCHAR) AS c_comment "
+    "      FROM range(" +
+    std::to_string(kCustomers) + ")) TO " + sirius::test::sql_literal(files.customer.string()) +
+    " (FORMAT PARQUET);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+  r = gen.Query(
+    "COPY (SELECT range AS n_nationkey, "
+    "             'NATION-' || lpad(CAST(range AS VARCHAR), 40, 'x') AS n_name "
+    "      FROM range(25)) TO " +
+    sirius::test::sql_literal(files.nation.string()) + " (FORMAT PARQUET);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+}
+
+}  // namespace
+
+TEST_CASE("the bigger bundle owns the port and the smaller one rides along",
+          "[late_mat][deferred_query]")
+{
+  if (!sirius::late_mat::late_mat_enabled()) {
+    WARN("SIRIUS_EXP_LATE_MAT unset; skipping the end-to-end rider case");
+    return;
+  }
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  sirius::test::scratch_dir scratch{"late_mat_rider_query"};
+  auto const& tmp = scratch.path();
+  rider_files const files{tmp / "customer.parquet",
+                          tmp / "nation.parquet",
+                          tmp / "orders.parquet",
+                          tmp / "lineitem.parquet"};
+  generate_rider_parquet(files);
+
+  std::vector<std::string> expected;
+  {
+    sirius::test::scoped_sirius_disable disable_sirius;
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    auto r = con.Query(rider_query_for(files));
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+    expected = rows_of(*r);
+  }
+  REQUIRE_FALSE(expected.empty());
+
+  auto yaml_path = tmp / "late_mat_rider_query.yaml";
+  write_config(yaml_path, /*num_gpus=*/1, /*scan_task_batch_size=*/100'000'000);
+  sirius::test::shared_test_env local_env(yaml_path);
+  auto con = local_env.make_connection();
+  auto fb  = con.Query("SET enable_duckdb_fallback = false;");
+  REQUIRE(fb);
+  REQUIRE_FALSE(fb->HasError());
+
+  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey,n_name,n_nationkey", 1);
+  for (auto const& [path, name] : {std::pair{files.customer, "late_mat_rider_customer"},
+                                   std::pair{files.nation, "late_mat_rider_nation"}}) {
+    auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(path.string()) +
+                         ", tier='gpu', name='" + name + "');");
+    REQUIRE(pin);
+    if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
+    REQUIRE_FALSE(pin->HasError());
+  }
+
+  auto const before = sirius::late_mat::deferrals_installed();
+  auto res          = con.Query(rider_query_for(files));
+  REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO("query error: " << res->GetError()); }
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(rows_of(*res) == expected);
+
+  // Both scans deferred: customer's bundle installed at the far consumer and nation's joined it as
+  // a rider. If nation claimed the port first, customer's bundle could not install at all.
+  CHECK(sirius::late_mat::deferrals_installed() >= before + 2);
+
+  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
+  for (auto const* name : {"late_mat_rider_customer", "late_mat_rider_nation"}) {
+    auto unpin = con.Query(std::string("CALL unpin_table('") + name + "');");
+    REQUIRE(unpin);
+    REQUIRE_FALSE(unpin->HasError());
+  }
+}
+
+namespace {
+
 /// The q10 shape over an integer customer table, so that a bitpack plan can compress every pinned
 /// column, and a selective orders filter, so that the join publishes a filter into the customer
 /// scan.

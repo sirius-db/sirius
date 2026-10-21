@@ -503,17 +503,12 @@ void nullable_bool8_declines(simpatico::stream_pool& pool,
     if (i % 31 == 0) valid[i] = false;
   }
   auto nullable = make_strings_column(strings, valid, stream);
-  auto tree     = simpatico::plan_tree_from_dsl("input -> dictionary\n");
-  expect(tree.has_value(), "nullable dictionary fixture plan");
-  // The table compressor rejects nulls; install the nullable dictionary through its codec.
-  tree->nodes[1].rep = simpatico::dictionary_compressor{}.compress(nullable->view(), stream, mr);
-  simpatico::compressed_column column;
-  column.dtype     = nullable->type();
-  column.num_rows  = row_count;
-  column.plan_tree = std::make_unique<simpatico::PlanTree>(std::move(*tree));
-  auto compressed  = simpatico::compress_with_plan(
+  // The validity rides the plan tree's sidecar; the dictionary itself is null-free.
+  auto dictionary = simpatico::compress_with_plan(
+    cudf::table_view{{nullable->view()}}, "input -> dictionary\n", stream, mr);
+  auto compressed = simpatico::compress_with_plan(
     cudf::table_view{{sequence(0, stream, mr)->view()}}, "input -> identity\n", stream, mr);
-  compressed.columns.push_back(std::move(column));
+  compressed.columns.push_back(std::move(dictionary.columns[0]));
   stream.sync();
 
   std::array<std::size_t, 2> selected{1, 0};
@@ -575,16 +570,10 @@ void nullable_full_route_declines(simpatico::stream_pool& pool,
   nullable->set_null_mask(cudf::create_null_mask(row_count, cudf::mask_state::ALL_VALID), 0);
   cudf::set_null_mask(nullable->mutable_view().null_mask(), 3, 4, false);
   nullable->set_null_count(1);
-  // The compressor's null-input policy is separate; an identity leaf stores the nullable column.
-  auto tree = simpatico::plan_tree_from_dsl("input -> identity\n");
-  expect(tree.has_value(), "nullable fixture plan");
-  tree->nodes[1].rep = std::make_unique<simpatico::identity_compressed_representation>(
-    std::make_unique<cudf::column>(nullable->view(), stream, mr));
-  simpatico::compressed_column column;
-  column.dtype     = nullable->type();
-  column.num_rows  = row_count;
-  column.plan_tree = std::make_unique<simpatico::PlanTree>(std::move(*tree));
-  compressed.columns.push_back(std::move(column));
+  // The validity rides the plan tree's sidecar; the identity leaf stores the null-free values.
+  auto stored = simpatico::compress_with_plan(
+    cudf::table_view{{nullable->view()}}, "input -> identity\n", stream, mr);
+  compressed.columns.push_back(std::move(stored.columns[0]));
   stream.sync();
 
   std::array<std::size_t, 2> selected{0, 1};

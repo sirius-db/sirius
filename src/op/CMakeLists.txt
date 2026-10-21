@@ -19,6 +19,7 @@ target_sources(
           scan/host_keep_mask.cpp
           scan/owning_table_view.cpp
           scan/parquet_batch_layout.cpp
+          scan/parquet_byte_range.cpp
           scan/parquet_schema_mapping.cpp
           scan/scan_plan.cpp
           scan/scan_filter_analysis.cpp
@@ -43,6 +44,7 @@ target_sources(
           dynamic_filter/complete_build_inventory.cpp
           dynamic_filter/dynamic_filter_replica_space.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
+          dynamic_filter/sirius_physical_build_filter.cpp
           dynamic_filter/sirius_dynamic_filter.cpp
           sirius_physical_column_data_scan.cpp
           sirius_physical_streaming_sink.cpp

@@ -114,6 +114,7 @@ void validate_column_names(std::vector<std::string> const& column_names, size_t 
   }
 }
 
+#ifndef SIMPATICO_USE_CUCASCADE_STREAM_POOL
 // Process-lifetime cache of CUDA streams for the internal `int column_threads`
 // overloads. These overloads have no caller-owned pool, yet the objects they
 // return (a cudf::table, or a compressed_table whose leaf buffers live in cudf
@@ -167,13 +168,13 @@ stream_cache& global_stream_cache()
   return cache;
 }
 
-// RAII lease of max(1, column_threads) cache streams into a stream_pool for the
-// duration of an internal-parallel call. On destruction the streams are returned
-// to the cache (NOT destroyed), so any buffer allocated on them stays valid for
-// its eventual async free even after this pool is gone. Concurrent leases get
-// disjoint streams (checkout is mutex-guarded and pops distinct handles), so each
-// call's sync_all only touches its own streams.
-// Capture the current device once for both checkout and check-in.
+#endif
+
+// RAII lease of max(1, column_threads) streams for an internal-parallel call.
+// Both backends keep stream owners alive after the call so returned buffers
+// can safely use their recorded allocation streams for asynchronous frees.
+// Concurrent leases get disjoint streams, so sync_all only touches this call's
+// streams. Capture the device for the standalone cache's checkout/check-in.
 struct leased_pool {
   stream_pool pool;
   int device = 0;
@@ -183,19 +184,26 @@ struct leased_pool {
     if (cudaGetDevice(&device) != cudaSuccess)
       throw plan_error("failed to query the current device for the internal stream lease");
 
+#ifdef SIMPATICO_USE_CUCASCADE_STREAM_POOL
+    if (!pool.init(static_cast<size_t>(std::max(1, column_threads))))
+      throw plan_error("failed to lease internal streams");
+#else
     pool.streams =
       global_stream_cache().checkout(device, static_cast<size_t>(std::max(1, column_threads)));
 
     if (pool.streams.empty()) throw plan_error("failed to lease internal streams");
+#endif
   }
 
   ~leased_pool()
   {
     // Completed compression/decode scopes already surfaced asynchronous errors.
     // A lease destructor cannot throw.
+#ifndef SIMPATICO_USE_CUCASCADE_STREAM_POOL
     (void)pool.sync_all();
     global_stream_cache().check_in(
       device, pool.streams);  // leaves pool.streams empty; ~stream_pool is a no-op
+#endif
   }
 
   leased_pool(const leased_pool&)            = delete;
@@ -401,6 +409,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     auto const& col = table.columns[idx];
     if (!col.plan_tree || col.num_rows != num_rows)
       return refuse("selected column missing plan_tree or row-count mismatch");
+    // A compacted decode returns the surviving rows while the stored bitmask
+    // still spans the whole chunk, and nothing on this path compacts one against
+    // the other. Refused here, before any device work, rather than as a
+    // per-column failure that unwinds the whole batch mid-flight.
+    if (!col.plan_tree->validity.empty()) return refuse("selected column is nullable");
   }
   for (auto const& f : request.filters) {
     if (f.column >= selected.size()) return refuse("filter directive column out of range");

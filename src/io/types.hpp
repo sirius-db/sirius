@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exec/invocable.hpp"
+#include "io/object_identity.hpp"
 
 #include <cudf/io/datasource.hpp>
 
@@ -44,6 +45,11 @@ struct cached_chunk;
 }
 
 namespace sirius::io {
+
+class io_object_metadata {
+ public:
+  virtual ~io_object_metadata() = default;
+};
 
 inline constexpr std::size_t IO_BLOCK_SIZE = 4096;
 
@@ -94,7 +100,29 @@ class io_object : public std::enable_shared_from_this<io_object> {
  public:
   virtual ~io_object() = default;
 
-  /// Stable identifier used as the prefetching-cache key.  Often equal to
+  [[nodiscard]] uint64_t open_generation() const noexcept { return _open_generation; }
+
+  /// An absent backend validator is scoped to this owned open, never to a path.
+  [[nodiscard]] virtual object_identity identity() const
+  {
+    auto tag = validation_tag();
+    object_identity result;
+    result.kind    = tag.empty() ? identity_kind::opened_handle : identity_kind::object_tag;
+    result.size    = size();
+    result.version = tag.empty() ? std::to_string(_open_generation) : std::string(tag);
+    return result;
+  }
+
+  [[nodiscard]] std::string identity_cache_key() const
+  {
+    auto const object_identity = identity();
+    auto key                   = object_identity.cache_key(raw_file_cache_id());
+    // A validated local stat identity may be reused across opens; generation
+    // only orders publications.
+    return key;
+  }
+
+  /// Backend locator used as part of the identity-aware prefetching-cache key.  Often equal to
   /// @c object_path() but may differ for backends that need to distinguish
   /// otherwise-equal paths (versioned S3 keys, normalized URLs, …).
   [[nodiscard]] virtual const std::string& raw_file_cache_id() const noexcept = 0;
@@ -112,11 +140,9 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// earlier; an empty tag disables validation-based caching above —
   /// degraded performance, never wrong bytes.
   [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
-};
 
-class io_object_metadata {
- public:
-  virtual ~io_object_metadata() = default;
+ private:
+  uint64_t const _open_generation = next_open_generation();
 };
 
 struct range {

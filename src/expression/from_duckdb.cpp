@@ -251,6 +251,16 @@ bool gpu_supports_round(duckdb::BoundFunctionExpression const& expr)
   return !value.IsNull() && value.type().id() == duckdb::LogicalTypeId::INTEGER;
 }
 
+// The GPU evaluator takes the absolute value of numeric inputs.
+bool gpu_supports_abs(duckdb::BoundFunctionExpression const& expr)
+{
+  if (expr.GetChildren().size() != 1) { return false; }
+  auto const& type = expr.GetChildren()[0]->GetReturnType();
+  // Everything numeric besides HUGEINT and UHUGEINT.
+  return type.IsNumeric() && type.id() != duckdb::LogicalTypeId::HUGEINT &&
+         type.id() != duckdb::LogicalTypeId::UHUGEINT;
+}
+
 std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& expr)
 {
   // Optional scan predicates are hints; the required predicate remains in the plan.
@@ -289,6 +299,7 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   }
   if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
   if (*func_id_opt == function_id::round && !gpu_supports_round(expr)) { return nullptr; }
+  if (*func_id_opt == function_id::abs && !gpu_supports_abs(expr)) { return nullptr; }
   if (*func_id_opt == function_id::regexp_replace) {
     // The GPU implementation supports constant patterns/replacements and DuckDB's default
     // options only. In particular, never silently discard the fourth (options) argument.

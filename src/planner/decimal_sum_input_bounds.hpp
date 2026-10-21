@@ -30,11 +30,12 @@ namespace sirius::planner {
 /**
  * @brief Plan-time magnitude bounds for the decimal SUM inputs of @p op, one per aggregate
  *
- * For SUM and AVG over a DECIMAL input the GPU holds as DECIMAL32 or DECIMAL64, the largest
- * |unscaled value| the input can take, proven from base-table statistics; nullopt for every
- * other aggregate and whenever no proof is available. The aggregate operators use a bound to
- * decide widening from the batch row count instead of measuring the batch
- * (see op::decimal_sums_to_widen).
+ * For SUM and AVG over a DECIMAL input, the largest |unscaled value| the input can take, proven
+ * from base-table statistics; nullopt for every other aggregate, for a bound beyond 64 bits, and
+ * whenever no proof is available. The aggregate operators use a bound to decide from the batch row
+ * count instead of measuring the batch whether a DECIMAL32/64 SUM must be widened
+ * (see op::decimal_sums_to_widen) or a DECIMAL128 SUM can be narrowed
+ * (see op::decimal_sums_to_narrow).
  *
  * @pre Call before the child is planned: planning moves expressions out of the logical subtree.
  */

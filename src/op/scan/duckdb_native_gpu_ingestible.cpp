@@ -54,6 +54,8 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <stop_token>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -441,7 +443,10 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
   // All ranges read the one `.duckdb` file; the resolver returns a valid ioctx or
   // throws if no backend supports the path.
   // Runs on a scan-manager dispatcher thread:
-  return [this, rg_begin, rg_end, resolve = std::move(resolve)]() -> std::unique_ptr<scan_info> {
+  return [this, rg_begin, rg_end, resolve = std::move(resolve)](
+           std::stop_token stop) -> std::unique_ptr<scan_info> {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto io_ctx = resolve(_info->db_path);
     duckdb_native_row_group_range range;
     try {

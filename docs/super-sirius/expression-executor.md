@@ -248,6 +248,18 @@ so sentinel handling has one implementation. The evaluator boundary regressions
 are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
 tagged `[timestamp_extraction]`.
 
+`DATE + INTEGER`, `INTEGER + DATE`, `DATE - INTEGER`, and `DATE - DATE`
+match their already-bound signatures and execute through `date_arithmetic_checked()`.
+The helper uses a libcudf JIT transform with public CCCL overflow helpers and error
+collection; DATE inputs are bitcast to day counts without copying. Scalar operands
+use one-row columns broadcast by `cudf::scalar_column_view`, with the output row
+count passed explicitly so scalar-only and empty inputs retain the input shape.
+Offsets preserve NULLs and infinity and reject finite overflow or infinity-sentinel
+collisions. Date differences widen both day counts before subtraction and return
+BIGINT. These operations materialize under every evaluator strategy; standalone
+cuDF AST translation declines them because it cannot implement the checks.
+The existing reference evaluator restores compressed operands before execution.
+
 ### Numeric casts
 
 `cudf::cast` truncates toward zero and wraps values that do not fit, where DuckDB rounds and
@@ -294,6 +306,16 @@ reproduces DuckDB's `RoundOperatorPrecision`: the value is rounded in double pre
 zero. A non-finite result yields the input for `n >= 0` and 0 for `n < 0`. The output is bit
 identical to DuckDB. The precision must be a constant INTEGER.
 DECIMAL and integer inputs and a column precision fall back to the CPU at plan time.
+
+### Absolute value
+
+`abs(x)` on FLOAT, DOUBLE, DECIMAL and the integer types other than HUGEINT maps to
+`function_id::abs` and runs `cudf::unary_operation` with `ABS`. NaN and infinities are preserved and
+`abs(-0.0)` is `0.0`. The result has the input's type. The absolute value of the smallest value of a
+signed integer type wraps in cuDF, where DuckDB raises an overflow error, so the evaluator checks
+with `cudf::contains` whether the input holds that value and throws. The query then falls back to the
+CPU, which raises DuckDB's error. Unsigned integers have no such value and are returned as they are.
+HUGEINT falls back at plan time.
 
 ### Logical AND/OR NULL semantics
 

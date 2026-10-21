@@ -42,6 +42,7 @@
 #include <cudf/datetime.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/search.hpp>
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/case.hpp>
 #include <cudf/strings/combine.hpp>
@@ -54,6 +55,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 // rmm
 #include <rmm/device_buffer.hpp>
@@ -61,6 +63,7 @@
 // standard library
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <regex>
 #include <string>
@@ -96,7 +99,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   // TODO: Remove this special-case once Sirius pins cuDF >= 26.10 (cuDF PR
   // https://github.com/rapidsai/cudf/pull/21996 merged after the 26.08 cut,
   // so the fix will ship in 26.10).
-  auto const skip_ast      = alt.return_type().id() == sirius::type_id::DECIMAL;
+  auto const date_operation = alt.date_operation();
+  auto const skip_ast =
+    alt.return_type().id() == sirius::type_id::DECIMAL || date_operation.has_value();
   auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
                                                     supported_ast_functions.end(),
                                                     resolved_id) != supported_ast_functions.end();
@@ -149,6 +154,21 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     return materialize_as_ast_column(result.release_column());
   }
   auto const output_type = sirius::require_cudf_type(alt.return_type());
+
+  if (date_operation.has_value()) {
+    auto left               = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto right              = evaluate(*args[1], evaluation_mode::MATERIALIZE);
+    auto as_transform_input = [&](evaluate_result& value) -> cudf::transform_input {
+      if (!value.is_scalar()) { return value.get_column_view(); }
+      // Retain the one-row column in the evaluation result while its view is broadcast.
+      value = evaluate_result(cudf::make_column_from_scalar(value.get_scalar(), 1, _stream, _mr));
+      return cudf::scalar_column_view{value.get_column_view()};
+    };
+    auto const left_input  = as_transform_input(left);
+    auto const right_input = as_transform_input(right);
+    return evaluate_result(temporal::date_arithmetic_checked(
+      left_input, right_input, *date_operation, _input_table.num_rows(), _stream, _mr));
+  }
 
   //----------Numeric Binary Functions----------//
   auto execute_numeric_binary_func = [&](cudf::binary_operator op) -> evaluate_result {
@@ -438,6 +458,37 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
         cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
     }
     return evaluate_result(round_floating_point(input.get_column_view(), precision, _stream, _mr));
+  }
+  if (resolved_id == function_id::abs) {
+    // Planning admits FLOAT, DOUBLE, DECIMAL and integer inputs other than HUGEINT.
+    D_ASSERT(args.size() == 1);
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    // In cuDF the absolute value of the smallest value of a signed integer type wraps to a negative
+    // value. DuckDB raises an overflow error, so we check for the smallest value of the type
+    // and throw manually here to match DuckDB.
+    auto const column = input.get_column_view();
+    if (cudf::is_integral(column.type()) && !cudf::is_unsigned(column.type()) &&
+        column.size() > 0) {
+      auto const lowest =
+        cudf::type_dispatcher(column.type(), [&]<typename T>() -> std::unique_ptr<cudf::scalar> {
+          if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
+            return std::make_unique<cudf::numeric_scalar<T>>(
+              std::numeric_limits<T>::lowest(), true, _stream, _mr);
+          } else {
+            throw internal_exception("abs overflow check needs a signed integer type");
+          }
+        });
+      if (cudf::contains(column, *lowest, _stream)) {
+        throw not_implemented_exception(
+          "[expression_evaluator:function] abs overflows for the smallest value of a signed "
+          "integer type, expected to fall back to CPU execution");
+      }
+    }
+    return evaluate_result(cudf::unary_operation(column, cudf::unary_operator::ABS, _stream, _mr));
   }
   if (resolved_id == function_id::strlen) {
     D_ASSERT(args.size() == 1);
