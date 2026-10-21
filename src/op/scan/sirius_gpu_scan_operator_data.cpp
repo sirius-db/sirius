@@ -84,7 +84,9 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
     // The actual execution device is selected after attachment. The closure retains its filter
     // and resolves the local replica when the decoder invokes it on that device.
     int const use_current_device = -1;
-    // Equal ranks with ascending key counts make the decoder keep the consumer's probe order.
+    // Equal ranks with ascending key counts make the decoder keep the consumer's probe order. The
+    // tag is the position of the step's representative in `attached`, which becomes the batch's
+    // decode history.
     snap.probes[step.column_index].push_back(
       {[f = filter, applicable](cudf::column_view const& keys,
                                 std::uint32_t const* prior_mask_words,
@@ -93,7 +95,8 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
          return applicable->compute_mask(keys, prior_mask_words, use_current_device, stream, mr);
        },
        0,
-       order + 1});
+       order + 1,
+       snap.attached.size()});
     snap.attached.insert(snap.attached.end(), step.represented.begin(), step.represented.end());
   }
   return snap;
@@ -383,8 +386,11 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
   }
   auto const* decoded =
     dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(data);
-  report_membership_keep(decoded ? decoded->outcome().membership_keep : std::nullopt);
   if (decoded == nullptr) { return; }
+  report_membership_keep(decoded->outcome().membership_keep);
+  // Join filters the decode skipped left these rows unfiltered, so the endpoint may sample them
+  // as clean input instead of a decode the filters might have touched.
+  if (decoded->outcome().membership_skipped) { decode_attached.clear(); }
   // The converter reports what the decode did as a value on the representation. row_filtered
   // means the whole table-filter conjunction was applied and every column is compacted to the
   // surviving rows — materialize_table maps it to filter_state::ROW_FILTERED so the filter is
@@ -426,15 +432,16 @@ void scan_operator_input::report_membership_keep(
 {
   // Only a decode that carried this consumer's probes has anything to report. The consumer ignores
   // reports once it has decided, so a decode selected after the decision reports harmlessly.
-  if (!consumer || decode_attached.empty()) { return; }
-  if (!observation) {
-    consumer->record_unmeasured_decode();
-    return;
+  if (!consumer || decode_attached.empty() || !observation) { return; }
+  auto const generation = static_cast<std::size_t>(observation->generation);
+  for (auto const& probe : observation->probes) {
+    // The tag indexes the representative binding of the probe's decode step.
+    if (probe.tag >= decode_attached.size()) { continue; }
+    consumer->record_decode_filter_keep_ratio(
+      decode_attached[probe.tag], probe.rows_before, probe.rows_after, generation);
   }
-  consumer->record_decode_keep_ratio(observation->rows_before,
-                                     observation->rows_after,
-                                     static_cast<std::size_t>(observation->generation),
-                                     observation->complete);
+  consumer->record_decode_keep_ratio(
+    observation->rows_before, observation->rows_after, generation, observation->complete);
 }
 
 std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converted_table(

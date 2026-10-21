@@ -403,8 +403,8 @@ class scan_operator_input : public op::operator_data {
   /// @throws std::runtime_error if the decode compacted rows but left an mvcc keep-mask unconsumed.
   void record_decode_outcome(::cucascade::idata_representation const* data);
 
-  /// Reports the keep ratio a decode measured for the membership probes attached from `consumer`,
-  /// or that it measured nothing, so an undecided consumer can decide without a clean batch.
+  /// Reports the keep ratios a decode measured for the membership probes attached from `consumer`,
+  /// together and per filter, so the consumer can decide without a clean batch.
   void report_membership_keep(
     std::optional<pushdown_outcome::membership_keep_observation> const& observation) const noexcept;
 

@@ -32,6 +32,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace cudf {
@@ -199,9 +200,10 @@ struct scan_filter_request {
   // non-applied return holds every selected column. Execution failures throw without publishing
   // output.
   std::optional<std::size_t> delivered_prefix;
-  // Report how many rows the membership probes kept (scan_filter_result::membership_rows_*). When
-  // the batch also has a range, BOOL8 or keep-mask source, this costs one extra survivor count, so
-  // callers ask only while they still need the measurement.
+  // Report how many rows the membership probes kept, together and one by one
+  // (scan_filter_result::membership_rows_* and membership_probe_rows). The counts are kernels on
+  // the CNT wave's stream that copy back with its one host sync; callers still ask only while they
+  // need the measurement.
   bool measure_membership = false;
 };
 
@@ -234,13 +236,22 @@ struct scan_filter_result {
   rmm::device_buffer chunk_offsets;  // uint32 x (ChunksFor(num_rows)+1)
   rmm::device_buffer row_indices;    // int32 x survivor_count (empty when no
                                      // tier_b output or survivor_count == 0)
-  // Filled only for scan_filter_request::measure_membership when at least one membership probe ran
-  // and the selection was counted (status applied or declined_unselective): the rows the probes
-  // were evaluated on (those surviving every other source), the rows that also passed every probe
-  // that ran, and how many probes ran. Capped or declined probes are not counted.
-  int64_t membership_rows_in       = -1;
-  int64_t membership_rows_out      = -1;
+  // How many membership probes ran (not capped, not declined) on a counted selection (status
+  // applied or declined_unselective); 0 otherwise.
   size_t membership_probes_applied = 0;
+  // Filled only for scan_filter_request::measure_membership when at least one membership probe ran
+  // and the selection was counted: the rows the probes were evaluated on (those surviving every
+  // other source) and the rows that also passed every probe that ran.
+  int64_t membership_rows_in  = -1;
+  int64_t membership_rows_out = -1;
+  // One probe's share of that measurement: the rows it was evaluated on, which passed every
+  // earlier probe in request order, and the rows it kept. -1 for a probe that did not run.
+  struct membership_probe_rows {
+    int64_t rows_in  = -1;
+    int64_t rows_out = -1;
+  };
+  // Parallel to scan_filter_request::membership_filters when membership_rows_in is filled.
+  std::vector<membership_probe_rows> membership_probe_rows;
 
   selection_mask view()
   {
@@ -273,14 +284,32 @@ void combine_masks_and(uint32_t* dst_words,
                        int64_t num_words,
                        ::cuda::stream_ref stream);
 
+// *count += the rows set in the AND of src_words[0..num_srcs), counting the FULL padded strip
+// (num_words = WordsFor(num_rows), so the tail-zero invariant keeps padding out of the count).
+// Asynchronous: the caller zeroes *count first and reads it back later, for example through
+// run_selection_cnt's `counters`. num_srcs in [1, 8].
+void count_masked_rows(uint32_t const* const* src_words,
+                       int num_srcs,
+                       int64_t num_words,
+                       uint32_t* count,
+                       ::cuda::stream_ref stream);
+
+// Device counters to copy back with the CNT wave's host sync: `host.size()` uint32 values at
+// `device`, which the caller filled on the same stream before the call.
+struct counter_readback {
+  uint32_t const* device = nullptr;
+  std::span<uint32_t> host;
+};
+
 // CNT wave: per-chunk popcount (word-per-thread, warp-reduced) + CUB exclusive
 // scan into mask.chunk_offsets (pre-allocated, ChunksFor(num_rows)+1 entries),
 // then a 1-thread tail kernel for the sentinel. Copies the total back to the
 // host — this HOST-SYNCS `stream` once (the survivor count gates wave-2
-// allocations). Fills mask.survivor_count and returns it.
+// allocations) — together with any `counters`. Fills mask.survivor_count and returns it.
 int64_t run_selection_cnt(selection_mask& mask,
                           ::cuda::stream_ref stream,
-                          rmm::device_async_resource_ref mr);
+                          rmm::device_async_resource_ref mr,
+                          counter_readback counters = {});
 
 // Expand the mask to ascending int32 survivor row ids (TierB gather map).
 // Requires run_selection_cnt to have filled chunk_offsets/survivor_count.

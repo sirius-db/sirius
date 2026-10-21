@@ -601,21 +601,25 @@ TEST_CASE("a decode's membership measurement trains the scan's consumer",
   auto consumer = std::make_shared<dynamic_filter_consumer>(
     channel, consumer_config{}, std::vector<binding>{{0, 0}});
   auto const decoded_batch =
-    [&](std::optional<sirius::pushdown_outcome::membership_keep_observation> observation) {
+    [&](std::optional<sirius::pushdown_outcome::membership_keep_observation> observation,
+        bool membership_skipped = false) {
       return cucascade::data_batch::make(
         sirius::get_next_batch_id(),
         std::make_unique<sirius::decompression_pushdown_batch_representation>(
           sequence_table(8, stream),
           *space,
           stream,
-          sirius::pushdown_outcome{.membership_keep = observation}));
+          sirius::pushdown_outcome{.membership_keep    = observation,
+                                   .membership_skipped = membership_skipped}));
     };
+  // Returns the decode history the split keeps for the endpoint.
   auto const prepare = [&](std::shared_ptr<cucascade::data_batch> batch,
                            std::vector<applied_entry> attached) {
     scan_operator_input split(std::move(batch));
     split.consumer        = consumer;
     split.decode_attached = std::move(attached);
     split.prepare_for_processing(space, stream);
+    return split.decode_attached;
   };
 
   SECTION("a selective measurement activates the gate")
@@ -629,11 +633,32 @@ TEST_CASE("a decode's membership measurement trains the scan's consumer",
             {{filter, 0}});
     REQUIRE_FALSE(gate_test_access::applicable(gate(*consumer), channel->snapshot()));
   }
-  SECTION("a decode without a measurement waits for a clean endpoint sample")
+  SECTION("a decode reports each filter's own keep ratio")
   {
-    prepare(decoded_batch(std::nullopt), {{filter, 0}});
+    sirius::pushdown_outcome::membership_keep_observation observation{
+      .generation = 1, .rows_before = 8, .rows_after = 6};
+    // The tag is the filter's position in the decode history; one past it is ignored.
+    observation.probes = {{.tag = 0, .rows_before = 8, .rows_after = 6},
+                          {.tag = 1, .rows_before = 6, .rows_after = 1}};
+    prepare(decoded_batch(observation), {{filter, 0}});
+    REQUIRE(gate_test_access::filter_keep_ratio(gate(*consumer), {filter.get(), 0}, 1) == 0.75);
+    // Its own ratio is too weak to keep applying it at decode.
+    REQUIRE(consumer->select_for_decode(std::vector<binding>{{0, 0}}).steps.empty());
+  }
+  SECTION("a decode that skipped its join filters leaves the batch to the endpoint as clean")
+  {
+    auto const history =
+      prepare(decoded_batch(std::nullopt, /*membership_skipped=*/true), {{filter, 0}});
+    REQUIRE(history.empty());
+    // Nothing was measured, and later decodes still attach and measure the filters.
     REQUIRE(gate_test_access::needs_combined_sample(gate(*consumer), channel->snapshot()));
-    REQUIRE_FALSE(gate_test_access::decode_trains(gate(*consumer), channel->snapshot()));
+    REQUIRE(gate_test_access::decode_trains(gate(*consumer), channel->snapshot()));
+  }
+  SECTION("a decode that applied its join filters keeps them in the history")
+  {
+    auto const history =
+      prepare(decoded_batch({{.generation = 1, .rows_before = 8, .rows_after = 2}}), {{filter, 0}});
+    REQUIRE(history.size() == 1);
   }
   SECTION("a decode that carried no probes reports nothing")
   {
@@ -705,9 +730,9 @@ TEMPLATE_TEST_CASE(
   split.consumer                 = consumer;
   split.decode_attached          = {{filter, 0}};
   split.needs_carrier_conversion = true;
-  // An earlier decode measured nothing, so until the endpoint samples a clean batch, a fresh
-  // decode attaches no membership probes.
-  gate(*consumer).record_unmeasured_decode();
+  // An earlier decode measured part of the filters as unselective, so until the endpoint samples a
+  // clean batch, a fresh decode attaches no membership probes.
+  gate(*consumer).record_decode_keep_ratio(8, 8, 1, /*complete=*/false);
   SECTION("compaction latch survives removal of the last row selection source")
   {
     train_for_decode(*consumer, *filter);

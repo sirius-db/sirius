@@ -95,17 +95,13 @@ class dynamic_filter_gate {
   /// Decoding may apply only part of the channel's filters, which keep at least as many rows as the
   /// whole set would. So a selective ratio always activates the gate, but an unselective one
   /// disables it only when @p complete says the decode applied every filter. Otherwise the decode
-  /// cannot decide, and the gate behaves as after `record_unmeasured_decode`. Ignored once the gate
-  /// has left UNKNOWN; empty decodes do not train.
+  /// cannot decide: later decodes stop attaching filters until the endpoint has measured a clean
+  /// batch, as `capture` then reports through `gate_selection::decode_trains`. Ignored once the
+  /// gate has left UNKNOWN; empty decodes do not train.
   void record_decode_keep_ratio(std::size_t rows_before,
                                 std::size_t rows_after,
                                 std::size_t observed_filter_count,
                                 bool complete) noexcept;
-
-  /// Records that a decode which may have applied filters for an UNKNOWN gate produced no usable
-  /// measurement. Later decodes stop attaching filters until the endpoint has measured a clean
-  /// batch, as `capture` then reports through `gate_selection::decode_trains`.
-  void record_unmeasured_decode() noexcept;
 
   // Marginal ratios measure each filter on rows surviving earlier masks.
 
@@ -145,8 +141,9 @@ class dynamic_filter_gate {
 
   std::atomic<state> _state{state::UNKNOWN};
 
-  // A decode could not decide the UNKNOWN gate, so decodes stop attaching filters and leave
-  // training to a clean endpoint sample. Written under `_decision_mu`.
+  // A decode measured an unselective ratio for only part of the filters, which cannot decide the
+  // UNKNOWN gate, so decodes stop attaching filters and leave training to a clean endpoint sample.
+  // Written under `_decision_mu`.
   std::atomic<bool> _decode_undecided{false};
 
   // Relaxed reads may trigger redundant measurements; decision updates are serialized.

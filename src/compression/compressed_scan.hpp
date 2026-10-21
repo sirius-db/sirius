@@ -105,6 +105,10 @@ struct membership_probe {
   membership_probe_fn probe;
   std::uint8_t selectivity_rank = 255;
   std::uint64_t num_keys        = 0;
+  /// Echoed with this probe's own keep ratio
+  /// (@ref pushdown_outcome::membership_keep_observation::probes), so the caller can tell which
+  /// filter it measured.
+  std::size_t tag = 0;
 };
 
 /// One chunk's MVCC visibility mask: ceil(row_count / 32) packed words in cuDF bitmask
@@ -119,11 +123,10 @@ struct decode_visibility_mask {
 
 /// Whether a decode should report how many rows its join filters kept.
 ///
-/// A scan asks while it is still deciding whether its join filters are worth applying. Measuring
-/// is free when the join filters are a decode's only row-selecting sources; otherwise it costs one
-/// extra survivor count, so a scan asks only until it has decided.
+/// A scan asks while it is still deciding whether its join filters are worth applying, or which of
+/// them are. Measuring adds a few counting kernels to the decode, but no host synchronization.
 struct membership_measurement_request {
-  /// Report the keep ratio on @ref pushdown_outcome::membership_keep.
+  /// Report the keep ratios on @ref pushdown_outcome::membership_keep.
   bool measure = false;
   /// The membership probes are every dynamic filter the scan would otherwise apply after decode,
   /// so a measurement covering every probe describes the whole set.
@@ -273,13 +276,31 @@ struct pushdown_outcome {
     /// Every probe of a complete request ran
     /// (@ref membership_measurement_request::complete), so the ratio covers the whole set.
     bool complete = false;
+    /// One join filter's share of the measurement.
+    struct probe_keep {
+      /// @ref membership_probe::tag of the probe.
+      std::size_t tag = 0;
+      /// Rows the probe was evaluated on: those that passed every other row source and every
+      /// join filter that ran before it.
+      std::size_t rows_before = 0;
+      /// Rows among those that the probe kept.
+      std::size_t rows_after = 0;
+    };
+    /// Every probe that ran, in the order they ran.
+    std::vector<probe_keep> probes;
   };
   std::optional<membership_keep_observation> membership_keep;
+
+  /// The request carried join filters, but none of them removed rows from this batch: the decode
+  /// refused or declined them, or gave compaction up and returned every row. The batch is then
+  /// as unfiltered by them as one decoded without them.
+  bool membership_skipped = false;
 
   [[nodiscard]] bool any() const noexcept
   {
     return row_filtered || selection_unprofitable || !predicate_columns.empty() ||
-           visibility_mask_applied || filter_only_columns_dropped || membership_keep.has_value();
+           visibility_mask_applied || filter_only_columns_dropped || membership_keep.has_value() ||
+           membership_skipped;
   }
 };
 

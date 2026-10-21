@@ -1052,7 +1052,12 @@ decode_selection dynamic_filter_consumer::select_for_decode(std::span<binding co
            (current.expected_keep && skip_measured_filter(*current.expected_keep, std::nullopt));
   });
   if (candidates.empty()) { return result; }
-  result.measure  = selection.decode_trains;
+  // Filters a decode applies get no marginal sample at the endpoint, so the decode measures them
+  // until each has a current estimate, as well as while the gate is undecided.
+  result.measure =
+    selection.decode_trains || std::ranges::any_of(candidates, [](candidate const& current) {
+      return !current.expected_keep.has_value();
+    });
   result.complete = selection.decode_trains && bound_entries == snapshot.entries().size() &&
                     candidates.size() == bound_entries;
   // Sorting first makes each group's first member its preferred representative.
@@ -1075,9 +1080,15 @@ void dynamic_filter_consumer::record_decode_keep_ratio(std::size_t rows_before,
   _gate.record_decode_keep_ratio(rows_before, rows_after, generation, complete);
 }
 
-void dynamic_filter_consumer::record_unmeasured_decode() noexcept
+void dynamic_filter_consumer::record_decode_filter_keep_ratio(applied_entry const& filter,
+                                                              std::size_t rows_before,
+                                                              std::size_t rows_after,
+                                                              std::size_t generation) noexcept
 {
-  _gate.record_unmeasured_decode();
+  if (rows_before == 0 || rows_after > rows_before) { return; }
+  _gate.record_filter_keep_ratio({filter.filter.get(), filter.output_ordinal},
+                                 static_cast<double>(rows_after) / static_cast<double>(rows_before),
+                                 generation);
 }
 
 std::optional<application_program> dynamic_filter_consumer::prepare(
@@ -1418,18 +1429,6 @@ void dynamic_filter_gate::record_decode_keep_ratio(std::size_t rows_before,
                    std::memory_order_relaxed);
     } else {
       // The filters the decode skipped might still be selective.
-      _decode_undecided.store(true, std::memory_order_relaxed);
-    }
-  } catch (...) {
-    // Failure to acquire optional decision state leaves its previous verdict intact.
-  }
-}
-
-void dynamic_filter_gate::record_unmeasured_decode() noexcept
-{
-  try {
-    std::scoped_lock decision_lock(_decision_mu);
-    if (_state.load(std::memory_order_relaxed) == state::UNKNOWN) {
       _decode_undecided.store(true, std::memory_order_relaxed);
     }
   } catch (...) {
