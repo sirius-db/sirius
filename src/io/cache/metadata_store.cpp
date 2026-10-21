@@ -74,7 +74,7 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(
   auto const identity_key = identity.kind == identity_kind::local_stat
                               ? identity.cache_key(obj.raw_file_cache_id())
                               : obj.identity_cache_key();
-  auto const flight_key   = identity_key + ":" + lookup;
+  auto const flight_key   = cache_key(identity_key, lookup);
   std::shared_ptr<flight> work;
   {
     std::unique_lock lock{_mutex};
@@ -126,8 +126,9 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(
 
 std::string metadata_store::cache_key(std::string const& path, std::string_view profile)
 {
-  if (profile.empty()) return path;
-  return path + "\nprofile=" + std::string(profile);
+  // The decimal length frames the exact path bytes; the remainder is the profile.
+  // Frame empty profiles too, so a raw path can never impersonate an encoded tuple.
+  return std::to_string(path.size()) + ":" + path + std::string(profile);
 }
 
 void metadata_store::retire(iterator it, entries& retired)

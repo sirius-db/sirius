@@ -733,10 +733,22 @@ Two reusable entry points additionally exercise this finish contract:
   timezone, and DECIMAL128 (precision 1–38, nonnegative scale no larger than precision).
   It refuses nested, dictionary, extension, binary, large-string, and device arrays.
   Decimal imports normalize to the approved DECIMAL128 carrier. Input buffers and
-  metadata must be readable producer-owned C Data memory; raw pointers do not provide
-  allocation extents. The producer must detach statement-affine callbacks before
-  ownership transfer. Input/staging capacity remains owned through retirement, even
-  if import throws. The caller reserves output/temporary memory and drains the lane.
+  metadata must be readable producer-owned C Data memory. For every non-null metadata
+  buffer on the root or a child schema, the producer supplies a trusted readable byte
+  length in `arrow_metadata_lengths` and keeps that memory alive through import.
+  Arrow C Data carries no allocation extents: a raw pointer, lengths encoded inside
+  metadata, or `strnlen` cannot establish its readable range, and copying from an
+  unknown range cannot establish one either. The consumer rejects non-null metadata
+  without a trusted length and parses it only within that buffer's supplied bound.
+  The consumer owns extension/profile and bound-schema checks, admission, publication,
+  cancellation, and ownership/retirement. The producer must detach statement-affine
+  callbacks before ownership transfer. Input/staging capacity remains owned through
+  retirement, even if import throws. The caller reserves output/temporary memory and
+  drains the lane.
+  The current importer calls cuDF directly after validation. Future integration with
+  the shared host-Arrow conversion in [#2216](https://github.com/sirius-db/sirius/pull/2216)
+  can reuse a conversion leaf that does not inspect metadata; bounded metadata checks
+  and the other consumer responsibilities above remain with this scan consumer.
   `materialize_arrow_stream()` is the internal sequential verifier above this
   single-batch importer. Its source returns independently owned batches with a
   contiguous sequence, declared row/byte envelope, and explicit `nullopt` EOS;

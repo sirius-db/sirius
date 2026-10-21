@@ -167,6 +167,20 @@ bool is_unsafe_for_stats_filter(duckdb::Expression const& expr)
          expression_has_null_predicate(expr);
 }
 
+// Virtual batch slots follow the physical columns and have no footer name or statistics.
+// Drop a whole conjunct if any branch references one, including under OR.
+bool references_virtual_batch_column(duckdb::Expression const& expr, std::size_t physical_columns)
+{
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    return expr.Cast<duckdb::BoundReferenceExpression>().Index() >= physical_columns;
+  }
+  bool found = false;
+  duckdb::ExpressionIterator::EnumerateChildren(expr, [&](duckdb::Expression const& child) {
+    if (!found) found = references_virtual_batch_column(child, physical_columns);
+  });
+  return found;
+}
+
 // cuDF before 26.12 hashes bloom-filter literals using the logical cuDF type
 // instead of the Parquet physical type. That can incorrectly discard row
 // groups for narrow integers, decimals and several other logical types.
@@ -795,6 +809,16 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
         _has_virtual_filter = true;
       }
     }
+    for (auto const& entry : bind.table_filters->GetMultiColumnFilters()) {
+      auto const& filter =
+        duckdb::ExpressionFilter::GetExpressionFilter(*entry, "Parquet virtual-reference guard");
+      for (auto const column_index : filter.column_indexes) {
+        if (column_index < bind.column_ids.size() &&
+            _virtual_types.contains(bind.column_ids[column_index].GetPrimaryIndex())) {
+          _has_virtual_filter = true;
+        }
+      }
+    }
     // Collected from the filters themselves, not the expression built below --
     // see collect_null_prune_predicates. Independent of whether any part of the
     // predicate survives into reader-side pushdown.
@@ -822,23 +846,13 @@ parquet_scan_core::parquet_scan_core(std::unique_ptr<parquet_ingestible_table_in
       // Keep virtual predicates for the residual; prune only on physical conjuncts.
       std::shared_ptr<duckdb::Expression> stats_candidate = _duckdb_filter_expression;
       if (_has_virtual_filter) {
-        auto physical_filters = bind.table_filters->Copy();
-        std::vector<duckdb::ProjectionIndex> remove_columns;
-        for (auto const& entry : *bind.table_filters) {
-          auto const column_index = entry.GetIndex();
-          if (column_index >= bind.column_ids.size() ||
-              _virtual_types.contains(bind.column_ids[column_index].GetPrimaryIndex())) {
-            remove_columns.push_back(column_index);
-          }
-        }
-        for (auto const column_index : remove_columns)
-          physical_filters->RemoveFilterByColumnIndex(column_index);
-        stats_candidate =
-          sirius::op::convert_table_filters_to_expression(*physical_filters,
-                                                          bind.column_ids,
-                                                          bind.returned_types,
-                                                          _plan->batch_position_by_column_id,
-                                                          _plan->partition_primary_indices);
+        // Filter the remapped expression, not a copied TableFilterSet: removing a
+        // single-column entry there does not remove multi-column predicates.
+        stats_candidate = conjuncts_without(
+          *_duckdb_filter_expression,
+          [physical_columns = _plan->data_columns.size()](duckdb::Expression const& conjunct) {
+            return references_virtual_batch_column(conjunct, physical_columns);
+          });
         _static_pushdown_is_complete = false;
       }
 

@@ -1,24 +1,37 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
+#include "io/io_errors.hpp"
 #include "io/kvikio/kvikio_context.hpp"
 #include "op/scan/arrow_materializer.hpp"
 #include "op/scan/field_id_mapping.hpp"
+#include "op/scan/iceberg_dv_preparation.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/positional_visibility.hpp"
+#include "scan_manager/preparation_test_support.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "transparent/replay_admission.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/scalar/scalar.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 #include <catch.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
+#include <utils/table_filter_test_utils.hpp>
 
+#include <algorithm>
+#include <array>
 #include <deque>
 #include <stdexcept>
+#include <system_error>
 
 using namespace sirius::op::scan;
 namespace {
@@ -876,4 +889,287 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
   REQUIRE(file.field_mapping);
   CHECK(file.field_mapping->read_names() == std::vector<std::string>{"old_id"});
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "R4 directly bound virtual multi-column predicates stay out of footer AST",
+                 "[r4][scan][virtual_columns][r4_review][integration]")
+{
+  auto const sibling = GENERATE(0, 1, 2);
+  CAPTURE(sibling);
+  sirius::test::scratch_dir directory("r4_virtual_filter");
+  auto path = directory.file("input.parquet");
+  {
+    sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
+    auto written = con->Query("COPY (SELECT i::INTEGER id FROM range(1,6145) t(i) ORDER BY i) TO " +
+                              directory.file_literal("input.parquet") +
+                              " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    REQUIRE(written);
+    REQUIRE_FALSE(written->HasError());
+  }
+  auto info                    = std::make_unique<parquet_ingestible_table_info>();
+  auto const virtual_id        = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
+  info->resolved_file_paths    = {path};
+  info->names                  = {"id"};
+  info->returned_types         = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+  info->column_ids             = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(virtual_id)};
+  info->projected_output_count = 2;
+  info->approximate_batch_size = std::size_t{1} << 30;
+  info->virtual_columns        = {{virtual_id,
+                                   "file_row_number",
+                                   sirius::logical_type::make(sirius::type_id::BIGINT),
+                                   scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER}};
+  auto filters                 = duckdb::make_uniq<duckdb::TableFilterSet>();
+  // (file_row_number >= 5000 OR id <= 2): the physical branch must not be
+  // extracted from this OR for pruning. Binding is constructed without an optimizer.
+  auto predicate =
+    duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_OR);
+  predicate->GetChildrenMutable().push_back(duckdb::BoundComparisonExpression::Create(
+    duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0),
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::BIGINT(5000))));
+  predicate->GetChildrenMutable().push_back(duckdb::BoundComparisonExpression::Create(
+    duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO,
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1),
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(2))));
+  filters->PushMultiColumnFilter(duckdb::make_uniq<duckdb::ExpressionFilter>(
+    std::move(predicate),
+    duckdb::vector<duckdb::ProjectionIndex>{duckdb::ProjectionIndex(1),
+                                            duckdb::ProjectionIndex(0)}));
+  if (sibling == 1)
+    filters->PushFilter(
+      duckdb::ProjectionIndex(0),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                                    duckdb::Value::INTEGER(4097)));
+  if (sibling == 2)
+    filters->PushFilter(duckdb::ProjectionIndex(1),
+                        sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                                      duckdb::Value::BIGINT(6000)));
+  info->table_filters = std::move(filters);
+  auto ingestible     = make_ingestible(std::move(info));
+  auto ioctx          = std::make_shared<sirius::io::kvikio_context>();
+  auto prepare        = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  REQUIRE(prepare);
+  auto prepared    = prepare({});  // includes the footer AST name-resolution path
+  auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
+  REQUIRE(file.row_groups.size() == (sibling == 1 ? 1 : 3));
+  if (sibling == 1) CHECK(file.row_groups.front().index == 2);
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(prepared));
+  auto tail      = coalescer->flush();
+  for (auto& split : tail)
+    splits.push_back(std::move(split));
+  REQUIRE(splits.size() == 1);
+  auto state  = sirius::test::get_registered_sirius_context(*con);
+  auto* space = state->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto batch = ingestible->materialize_metadata_to_table(
+    *splits.front(), *space, stream.view(), false, nullptr);
+  REQUIRE(batch.state != filter_state::ROW_FILTERED_AND_PROJECTED);
+  auto output        = ingestible->post_filter_and_project(std::move(batch), *space, stream.view());
+  auto expected_rows = sibling == 1 ? 1144 : sibling == 2 ? 1002 : 1146;
+  REQUIRE(output->num_rows() == expected_rows);
+  REQUIRE(output->num_columns() == 2);
+  std::vector<int32_t> ids(expected_rows);
+  std::vector<int64_t> rownums(expected_rows);
+  REQUIRE(cudaMemcpyAsync(ids.data(),
+                          output->view().column(0).head<int32_t>(),
+                          ids.size() * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost,
+                          stream.value()) == cudaSuccess);
+  REQUIRE(cudaMemcpyAsync(rownums.data(),
+                          output->view().column(1).head<int64_t>(),
+                          rownums.size() * sizeof(int64_t),
+                          cudaMemcpyDeviceToHost,
+                          stream.value()) == cudaSuccess);
+  stream.synchronize();
+  for (int i = 0; i < expected_rows; ++i) {
+    auto expected_id = sibling == 1 ? 5001 + i : i < 2 ? i + 1 : 4999 + i;
+    CHECK(ids[i] == expected_id);
+    CHECK(rownums[i] == expected_id - 1);
+  }
+}
+
+namespace {
+// Exercise the production Iceberg wrapper with failures from an actual datasource,
+// after the independent Parquet footer has been prepared successfully.
+class failing_dv_context final : public sirius::io::ioctx {
+ public:
+  enum class failure { corrupt, reader_io, object_changed, descriptor, cancelled, resource };
+  explicit failing_dv_context(failure mode) : mode_(mode) {}
+  ~failing_dv_context() override { pre_destroy(); }
+  sirius::io::io_context_type type() const noexcept override
+  {
+    return sirius::io::io_context_type::kvikio;
+  }
+  void shutdown() noexcept override {}
+  bool supports(std::string_view) const noexcept override { return true; }
+  bool supports_device_read() const noexcept override { return false; }
+  bool supports_host_to_device_read() const noexcept override { return false; }
+  bool supports_vector_host_read() const noexcept override { return false; }
+  bool supports_device_range_read() const noexcept override { return false; }
+  std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
+    std::span<cudf::io::text::byte_range_info const> ranges,
+    std::optional<size_t>) const noexcept override
+  {
+    return {ranges.begin(), ranges.end()};
+  }
+  size_t host_read_io(sirius::io::io_object const& object,
+                      size_t,
+                      size_t bytes,
+                      uint8_t* dst) override
+  {
+    switch (mode_) {
+      case failure::corrupt: std::fill_n(dst, bytes, 0); return bytes;
+      case failure::reader_io:
+        throw sirius::transparent::classified_execution_error(
+          sirius::transparent::late_failure_cause::reader_io, "DV read failed");
+      case failure::object_changed:
+        throw sirius::io::object_changed_error(object.object_path(), "v1", "v2");
+      case failure::cancelled:
+        throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+      case failure::resource: throw std::bad_alloc();
+      case failure::descriptor: throw std::logic_error("descriptor failure should occur at open");
+    }
+    return 0;
+  }
+  sirius::exec::semi_future<size_t> host_read_async_io(sirius::io::io_object const& object,
+                                                       size_t offset,
+                                                       size_t bytes,
+                                                       uint8_t* dst) noexcept override
+  {
+    try {
+      return sirius::exec::make_semi_future<size_t>(host_read_io(object, offset, bytes, dst));
+    } catch (...) {
+      return sirius::exec::make_semi_future<size_t>(std::current_exception());
+    }
+  }
+  sirius::exec::semi_future<size_t> mixed_readv_async_io(
+    sirius::io::io_object const&, std::vector<sirius::io::prepared_io_slice>&&) noexcept override
+  {
+    return sirius::exec::make_semi_future<size_t>(
+      std::make_exception_ptr(std::logic_error("unexpected vectored DV read")));
+  }
+
+ protected:
+  std::shared_ptr<sirius::io::io_object> create_io_object(std::string path) override
+  {
+    if (mode_ == failure::descriptor)
+      throw sirius::io::descriptor_mismatch_error("DV descriptor changed");
+    struct object final : sirius::io::io_object {
+      std::string path;
+      explicit object(std::string name) : path(std::move(name)) {}
+      std::string const& raw_file_cache_id() const noexcept override { return path; }
+      std::string const& object_path() const noexcept override { return path; }
+      size_t size() const noexcept override { return 400; }
+    };
+    return std::make_shared<object>(std::move(path));
+  }
+
+ private:
+  failure mode_;
+};
+}  // namespace
+
+TEST_CASE("R4 Iceberg Puffin wrapper retains failure diagnostics", "[r4][scan][iceberg][r4_review]")
+{
+  using namespace sirius::scan_manager;
+  using failure = failing_dv_context::failure;
+  using cause   = sirius::transparent::late_failure_cause;
+  auto mode     = GENERATE(failure::corrupt,
+                       failure::reader_io,
+                       failure::object_changed,
+                       failure::descriptor,
+                       failure::cancelled,
+                       failure::resource);
+  CAPTURE(static_cast<int>(mode));
+  auto path =
+    std::filesystem::absolute("test/cpp/integration/data/parquet/nation.parquet").string();
+  auto dvpath = path + ".puffin";
+  test::test_reservation_provider provider;
+  provider.grant_bytes = 64 * 1024;
+  auto ledger          = std::make_shared<preparation_ledger>(provider);
+  auto discovery       = std::make_shared<iceberg_delete_discovery>();
+  IcebergDeleteFileEntry dv;
+  dv.file_path             = dvpath;
+  dv.file_format           = "puffin";
+  dv.referenced_data_file  = path;
+  dv.content_offset        = 4;
+  dv.content_size_in_bytes = 44;
+  dv.file_size_in_bytes    = 400;
+  dv.record_count          = 2;
+  discovery->deletion_vector_entries.push_back(std::move(dv));
+  std::vector<std::string> paths{path};
+  auto envelope = iceberg_dv_preparation::envelope(*discovery, paths);
+  REQUIRE(ledger->admit(std::array{envelope}, memory_space_id(cucascade::memory::Tier::HOST, 0))
+            .deferred);
+  auto plan = std::make_shared<iceberg_dv_preparation>(93, "table", paths, discovery, *ledger);
+  auto info = std::make_unique<iceberg_ingestible_table_info>();
+  info->contract_id            = 93;
+  info->table_path             = "table";
+  info->resolved_file_paths    = paths;
+  info->names                  = {"n_nationkey", "n_name", "n_regionkey", "n_comment"};
+  info->returned_types         = {sirius::logical_type::make(sirius::type_id::INTEGER),
+                                  sirius::logical_type::make(sirius::type_id::VARCHAR),
+                                  sirius::logical_type::make(sirius::type_id::INTEGER),
+                                  sirius::logical_type::make(sirius::type_id::VARCHAR)};
+  info->column_ids             = {duckdb::ColumnIndex(0)};
+  info->projected_output_count = 1;
+  info->deferred               = plan;
+  info->profiles               = std::make_shared<physical_profile_table>();
+  auto counters                = std::make_shared<physical_check_counters>();
+  info->profiles->counters     = counters;
+  auto ingestible              = make_ingestible(std::move(info));
+  ingestible->begin_preparation(std::make_shared<iceberg_dv_attempt>(plan, ledger));
+  REQUIRE(ingestible->can_claim_preparation());
+  auto dataio = std::make_shared<sirius::io::kvikio_context>();
+  auto dvio   = std::make_shared<failing_dv_context>(mode);
+  auto work   = ingestible->next_split_provider(
+    [&](std::string_view name) -> std::shared_ptr<sirius::io::ioctx> {
+      return name == dvpath ? std::static_pointer_cast<sirius::io::ioctx>(dvio) : dataio;
+    });
+  REQUIRE(work);
+  try {
+    (void)work({});
+    FAIL("DV failure was not reported");
+  } catch (unsupported_physical_input const& error) {
+    REQUIRE(mode == failure::corrupt);
+    CHECK(error.reason == verdict_reason::iceberg_delete_corrupt);
+    CHECK(std::string(error.what()).find("bad leading magic") != std::string::npos);
+  } catch (preparation_resource_error const& error) {
+    REQUIRE(mode == failure::resource);
+    CHECK(error.cause == cause::resource);
+    CHECK(std::string(error.what()) == "DV preparation control allocation failed");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    REQUIRE((mode == failure::reader_io || mode == failure::object_changed ||
+             mode == failure::descriptor));
+    CHECK(error.cause == cause::reader_io);
+    auto expected = mode == failure::object_changed
+                      ? std::string(sirius::io::object_changed_error(dvpath, "v1", "v2").what())
+                    : mode == failure::descriptor ? "DV descriptor changed"
+                                                  : "DV read failed";
+    CHECK(std::string(error.what()) == expected);
+  } catch (std::system_error const& error) {
+    REQUIRE(mode == failure::cancelled);
+    CHECK(error.code() == std::errc::operation_canceled);
+  }
+  CHECK(counters->iceberg_delete_payload_loads == 1);
+  CHECK(counters->rejections[static_cast<size_t>(verdict_reason::iceberg_delete_corrupt)] ==
+        (mode == failure::corrupt ? 1 : 0));
+  CHECK(counters->iceberg_delete_corrupt_inputs == (mode == failure::corrupt ? 1 : 0));
+  // The open-time descriptor failure passes through the outer classified-error catch;
+  // object-changed conversion is thrown from that catch chain and counted only as identity.
+  CHECK(counters->iceberg_delete_reader_io_failures ==
+        (mode == failure::reader_io || mode == failure::descriptor ? 1 : 0));
+  CHECK(counters->iceberg_delete_identity_failures == (mode == failure::object_changed ? 1 : 0));
+  CHECK(counters->descriptor_mismatches == (mode == failure::descriptor ? 1 : 0));
+  work = {};
+  ingestible->finish_preparation();
+  CHECK(ledger->tracked_units() == 0);
+  ledger->close();
+  ledger.reset();
+  CHECK(provider.outstanding() == 0);
 }

@@ -220,7 +220,11 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
                                        prepared.contract(),
                                        *source);
   } catch (unsupported_physical_input const& error) {
-    if (counters) counters->record(error.reason);
+    if (counters) {
+      counters->record(error.reason);
+      if (error.reason == verdict_reason::iceberg_delete_corrupt)
+        counters->iceberg_delete_corrupt_inputs.fetch_add(1, std::memory_order_relaxed);
+    }
     throw;
   } catch (io::descriptor_mismatch_error const& error) {
     if (counters) ++counters->descriptor_mismatches;
@@ -230,9 +234,10 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   } catch (io::object_changed_error const& error) {
     if (counters) ++counters->iceberg_delete_identity_failures;
     throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      std::string("[puffin] opened object changed: ") + error.what());
-  } catch (sirius::transparent::classified_execution_error const&) {
+      sirius::transparent::late_failure_cause::reader_io, error.what());
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    if (counters && error.cause == sirius::transparent::late_failure_cause::reader_io)
+      counters->iceberg_delete_reader_io_failures.fetch_add(1, std::memory_order_relaxed);
     throw;
   } catch (std::bad_alloc const&) {
     throw scan_manager::preparation_resource_error(

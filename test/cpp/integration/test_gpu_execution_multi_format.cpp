@@ -4164,6 +4164,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE(observed.reads_started.size() == 1);
     CHECK(observed.reads_started.front() == sidecar);
     auto after = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after.iceberg_delete_corrupt_inputs ==
+          before.iceberg_delete_corrupt_inputs + (deferred && !missing ? 1 : 0));
+    CHECK(after.iceberg_delete_reader_io_failures ==
+          before.iceberg_delete_reader_io_failures + (deferred && missing ? 1 : 0));
     auto cause =
       static_cast<size_t>(missing ? sirius::transparent::late_failure_cause::reader_io
                                   : sirius::transparent::late_failure_cause::physical_input);
