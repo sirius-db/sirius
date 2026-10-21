@@ -223,7 +223,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   //! The next task to hand out. Tasks run over partitions, then left batches, then right batches,
   //! then slices.
   pair_task next_task;
-  uint64_t cross_join_task_bytes   = config::DEFAULT_BATCH_SIZE;
+  uint64_t cross_join_task_bytes    = config::DEFAULT_BATCH_SIZE;
   uint64_t _max_broadcast_join_size = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE;
 };
 

@@ -916,8 +916,8 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   // build is copied once per task that lands off its GPU (#2200). Replicate it once per GPU
   // instead, keeping the mode; every slot's tasks then borrow a local copy. RIGHT-family and full
   // OUTER joins emit build rows and would emit them once per replica, so they keep one partition.
-  bool const broadcast_standard = !build_probe && natural == 1 && num_gpus > 1 &&
-                                  build_foldable && !is_right_family && !is_full_outer;
+  bool const broadcast_standard = !build_probe && natural == 1 && num_gpus > 1 && build_foldable &&
+                                  !is_right_family && !is_full_outer;
 
   bool const broadcast = broadcast_candidate && (build_probe || broadcast_standard);
 

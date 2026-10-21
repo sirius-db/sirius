@@ -27,7 +27,6 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
-
 #include <unistd.h>
 
 #include <filesystem>
@@ -51,8 +50,7 @@ using sirius::test::mgpu::write_mgpu_yaml;
 
 fs::path make_tmp(std::string const& tag)
 {
-  return fs::temp_directory_path() /
-         ("sirius-mgpu-nlj-" + tag + "-" + std::to_string(::getpid()));
+  return fs::temp_directory_path() / ("sirius-mgpu-nlj-" + tag + "-" + std::to_string(::getpid()));
 }
 
 /// Whether any log file under @p log_dir contains @p needle. The placement decision is only
