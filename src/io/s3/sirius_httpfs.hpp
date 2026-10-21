@@ -53,10 +53,11 @@ namespace sirius::io::s3 {
 /// @c SiriusContext: the @c ClientFileSystem (@c OpenerFileSystem) layer supplies
 /// the opener even though the parquet reader calls @c OpenFile with a null opener.
 ///
-/// **GPU-only / no CPU fallback:** @ref OpenFile refuses to open an @c s3:// path
-/// unless @c gpu_execution is enabled on the connection. The GPU path reads via
-/// the routed ioctx, so this FileSystem only ever serves the bind-time footer
-/// read; it is never the CPU data path. Read-only: write opens are rejected.
+/// **GPU-only by default:** @ref OpenFile serves a CPU consumer (gpu_execution off,
+/// or a CPU-fallback replay) only under the @c sirius_s3_cpu_fallback admission,
+/// and only on the REST backend; otherwise it refuses. The GPU path reads via the
+/// routed ioctx, so for a GPU scan this FileSystem only serves the bind-time
+/// footer read. Read-only: write opens are rejected.
 class sirius_httpfs : public duckdb::FileSystem {
  public:
   sirius_httpfs() = default;
@@ -110,8 +111,8 @@ class sirius_httpfs : public duckdb::FileSystem {
   bool OnDiskFile(duckdb::FileHandle& /*handle*/) override { return false; }
 
   std::string GetName() const override { return "SiriusHttpFS"; }
-  // Keep Sirius's GPU-only S3 gate in front of httpfs, which DuckDB may
-  // autoload after CREATE SECRET and register as another s3:// filesystem.
+  // Keep Sirius's S3 gate in front of httpfs, which DuckDB may autoload after
+  // CREATE SECRET and register as another s3:// filesystem.
   bool IsManuallySet() override { return true; }
 
  protected:

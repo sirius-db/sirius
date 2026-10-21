@@ -48,6 +48,15 @@ enum class io_context_type { uring, restful, kvikio };
 /// served locally instead of costing extra round-trips.
 enum class open_hint { generic, parquet_footer_probe };
 
+/// Whether a datasource consults the ioctx's prefetching cache.  @c use_cache is
+/// today's behaviour.  A @c bypass_cache datasource never observes the ioctx's
+/// replaceable cache slot and never holds a cache request handle: it
+/// contributes no cache request or cache-backed storage to a cache reset, so
+/// the reset has nothing of its to drain or invalidate.  Its reads go to the
+/// backend, where the per-open footer stash and the conditional-read checks
+/// still apply.  Fixed at construction and inherited by duplicates.
+enum class datasource_cache_mode : std::uint8_t { use_cache, bypass_cache };
+
 namespace cache {
 class prefetching_cache;
 }
@@ -99,18 +108,23 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// @c sirius_datasource bound to this ioctx.  Throws on unsupported /
   /// unreachable paths (callers that want a check-without-open should use
   /// @c supports()).
-  [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path);
+  [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(
+    std::string path, datasource_cache_mode mode = datasource_cache_mode::use_cache);
 
   /// As above, forwarding @p hint to the backend's io_object resolution so it
   /// can, e.g., prefetch a parquet footer in the same round-trip as the size.
-  [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path,
-                                                                   open_hint hint);
+  [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(
+    std::string path,
+    open_hint hint,
+    datasource_cache_mode mode = datasource_cache_mode::use_cache);
 
   /// As above, with the object's size already known (e.g. from an S3
   /// ListObjectsV2 response), so a backend that can act on it skips its size
   /// discovery entirely (no HEAD for object stores).
-  [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path,
-                                                                   std::uint64_t known_size);
+  [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(
+    std::string path,
+    std::uint64_t known_size,
+    datasource_cache_mode mode = datasource_cache_mode::use_cache);
 
   /// Open the backend's connections to whatever serves @p bucket_url, ahead of
   /// the first read, so a query does not pay connection setup on its hot path.
