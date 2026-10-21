@@ -103,6 +103,28 @@ std::unordered_set<int> decimal_sums_to_widen(cudf::table_view const& table,
                                               ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr);
 
+/// The narrower type a SUM over a column of type @p type can be computed in when the batch's values
+/// are small enough: DECIMAL64 at the same scale for DECIMAL128, nullopt otherwise.
+std::optional<cudf::data_type> narrowed_decimal_sum_type(cudf::data_type type);
+
+/// The columns among @p candidates (DECIMAL128) whose SUM over this batch can be computed over
+/// DECIMAL64 and widened back afterwards, with the same result.
+///
+/// DuckDB types some sums wider than their values need. For example, DuckDB v2 types the TPC-H Q9
+/// profit `DECIMAL(18,4) - DECIMAL(18,4)` as DECIMAL(19,4), which the GPU holds as DECIMAL128,
+/// although every value fits 64 bits. cuDF's hash aggregation sums 128-bit values far more slowly
+/// than 64-bit ones, especially over few groups. A column is narrowed only when rows * max|value|
+/// is at most 2^63 - 1, the same exact proof decimal_sums_needing_widening uses, so no value and no
+/// partial sum of any group can leave the DECIMAL64 range. A column whose every candidate carries a
+/// plan-time bound is decided on the host. The others are measured: all cudf::minmax passes are
+/// launched first and come back in one device-to-host copy, so a batch costs a single stream
+/// synchronization. Nulls are skipped. Throws sirius::internal_exception if a candidate is not
+/// DECIMAL128.
+std::unordered_set<int> decimal_sums_to_narrow(cudf::table_view const& table,
+                                               std::vector<decimal_sum_candidate> const& candidates,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr);
+
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded
  * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), all others use one.

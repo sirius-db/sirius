@@ -393,6 +393,16 @@ partition_input_stats sirius_physical_partition::input_statistics(bool use_estim
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()
 {
   if (_exchange) {
+    // A right-family build can publish before the complete probe fixes the layout. Follow only
+    // the installed build stage and do not add a dependency through the sizing input.
+    if (!layout() && !_exchange->is_sizing_input(*this) && children.size() == 1 &&
+        children.front()->type == SiriusPhysicalOperatorType::BUILD_FILTER && ports.size() == 1) {
+      auto const* input = ports.begin()->second;
+      if (input->src_pipeline && !input->src_pipeline->is_pipeline_finished()) {
+        auto* producer = &(input->src_pipeline->get_operators()[0].get());
+        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+      }
+    }
     if (auto readiness = _exchange->hint()) { return readiness; }
   } else {
     auto const fixed = layout();

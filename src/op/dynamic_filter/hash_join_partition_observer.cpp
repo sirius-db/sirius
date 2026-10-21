@@ -63,9 +63,8 @@ bool hash_join_partition_observer::before_claim()
       declined = "the build input has no source pipeline";
     } else if (!input->src_pipeline->is_pipeline_finished()) {
       return false;
-    } else if (auto inventory = _arrival_ledger.certify(
-                 {.repository_batches = input->repo->size(0),
-                  .partition_count    = _input.layout()->placement->num_partitions()});
+    } else if (auto inventory =
+                 _arrival_ledger.certify({.repository_batches = input->repo->size(0)});
                !inventory) {
       declined = "the arrival ledger does not match the build input";
     } else if (session.try_begin_accumulation(std::move(inventory))) {

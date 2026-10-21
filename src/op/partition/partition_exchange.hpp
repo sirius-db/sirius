@@ -46,6 +46,12 @@ class partition_exchange {
                    bool requires_all_inputs,
                    choose_layouts choose);
 
+  /// Whether `input` is the sizing input, the one whose measurement resolves the shared layout.
+  [[nodiscard]] bool is_sizing_input(sirius_physical_partition const& input) const
+  {
+    return _inputs[_sizing_input] == &input;
+  }
+
   /// nullopt means resolved. Otherwise schedule the indicated producer before trying again.
   std::optional<task_creation_hint> prepare();
 

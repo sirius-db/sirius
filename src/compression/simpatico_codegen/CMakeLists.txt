@@ -94,6 +94,7 @@ add_library(
   src/operators/nvcomp_batched_codec.cu
   # Plain-CUDA JIT host
   src/jit/nvrtc_compiler.cpp
+  src/jit/disk_cache.cpp
   src/jit/kernel_cache.cpp
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp

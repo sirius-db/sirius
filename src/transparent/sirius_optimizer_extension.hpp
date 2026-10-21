@@ -21,24 +21,13 @@
 
 namespace sirius::transparent {
 
-/// \brief Pre-optimization hook that derives single-table restrictions out of OR-ed filters.
+/// \brief Pre-optimization hook that classifies the query before optimization can remove scans.
 ///
-/// For a filter `(a1 AND b1) OR (a2 AND b2) OR ...` where the branches span more than one table,
-/// every branch implies the AND of its own single-table conjuncts, so the disjunction implies the
-/// OR of those per-table restrictions. AND-ing that implied restriction onto the filter is
-/// row-preserving and lets DuckDB's own filter pushdown, join-order and build/probe-side passes
-/// push it into the base scans.
-///
-/// DuckDB has this rewrite (JoinDependentFilterRule) but only applies it when the OR is the *root*
-/// of a filter expression. Its DistributivityRule runs first and hoists the conjuncts common to
-/// every branch (for TPC-H q19: the join key, `l_shipmode IN ...`, `l_shipinstruct = ...`) into an
-/// enclosing AND; ExpressionRewriter::ApplyRules then re-runs on the rewritten node with
-/// `is_root = false`, so the surviving OR is never offered to the rule again and nothing is
-/// derived. Running the derivation here — before any built-in optimizer — sidesteps that ordering
-/// entirely; the derived conjuncts then travel through the normal pipeline.
-///
-/// Gated on the `gpu_execution` setting: it applies exactly when the user asked for GPU execution,
-/// leaving `SET gpu_execution = false` CPU baselines byte-for-byte unchanged.
+/// It decides, while every scan is still in the plan, whether the connection and statement may run
+/// on the GPU at all (see should_use_duckdb). It does not change the plan. It used to derive the
+/// single-table restrictions implied by an OR-ed multi-table filter, which DuckDB 1.5 missed for
+/// TPC-H q19; DuckDB v2's JoinDependentFilterRule derives them itself, and deriving them twice
+/// doubled the pushed filters.
 void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
 

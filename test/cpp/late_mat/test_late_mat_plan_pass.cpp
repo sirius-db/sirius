@@ -33,6 +33,7 @@
 #include <expression/ast/comparison.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/ast/reference.hpp>
+#include <op/dynamic_filter/sirius_physical_build_filter.hpp>
 #include <op/scan/sirius_physical_dynamic_filter.hpp>
 #include <op/sirius_physical_concat.hpp>
 #include <op/sirius_physical_filter.hpp>
@@ -42,6 +43,7 @@
 #include <op/sirius_physical_partition.hpp>
 #include <op/sirius_physical_projection.hpp>
 #include <planner/late_mat_plan_pass.hpp>
+#include <planner/sirius_physical_plan_generator.hpp>
 
 #include <memory>
 #include <vector>
@@ -895,6 +897,75 @@ TEST_CASE("duplicate projection references stop before a dynamic-filter endpoint
   REQUIRE(lives[0].reader_input == &scan);
   REQUIRE(lives[1].first_reader == &reader);
   REQUIRE(lives[1].position_at_reader == 2);
+}
+
+TEST_CASE("build publication carries payloads while its partition withholds join keys",
+          "[late_mat][lifetime][build_filter]")
+{
+  auto const join_type =
+    GENERATE(duckdb::JoinType::RIGHT, duckdb::JoinType::RIGHT_SEMI, duckdb::JoinType::RIGHT_ANTI);
+  duckdb::LogicalDummyScan stub(duckdb::TableIndex(0));
+  stub.types = duckdb::vector<duckdb::LogicalType>(6, duckdb::LogicalType::VARCHAR);
+  duckdb::vector<sirius::join_condition> conditions;
+  sirius::join_condition condition;
+  condition.left  = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  condition.right = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  conditions.push_back(std::move(condition));
+  auto join            = duckdb::make_uniq<test_join>(stub,
+                                           duckdb::make_uniq<wide_scan>(3),
+                                           duckdb::make_uniq<wide_scan>(3),
+                                           std::move(conditions),
+                                           join_type,
+                                           duckdb::vector<std::size_t>{},
+                                           duckdb::vector<std::size_t>{},
+                                           duckdb::vector<sirius::logical_type>{},
+                                           1);
+  auto* const join_ptr = join.get();
+  auto* const scan     = static_cast<wide_scan*>(join->children[1].get());
+  auto publication     = duckdb::make_uniq<sirius::op::sirius_physical_build_filter>(
+    make_string_types(3), 0, join->dynamic_filter_session());
+  publication->children.push_back(std::move(join->children[1]));
+  auto partition = duckdb::make_uniq<test_partition>(
+    make_string_types(3), 0, sirius::test::operator_utils::hash_partition_spec(*join, true));
+  auto* const partition_ptr = partition.get();
+  partition->children.push_back(std::move(publication));
+  auto concat = duckdb::make_uniq<test_concat>(make_string_types(3), 0, join.get(), true);
+  concat->children.push_back(std::move(partition));
+  join->children[1] = std::move(concat);
+  opaque_op reader(6);
+  reader.children.push_back(std::move(join));
+  sirius::planner::sirius_physical_plan_generator::set_parent_ops(reader, nullptr);
+
+  auto const lives = analyze_column_lifetimes(*scan);
+  REQUIRE(lives[0].first_reader == partition_ptr);
+  REQUIRE(lives[0].read_as_join_key);
+  auto const* payload_reader = join_type == duckdb::JoinType::RIGHT
+                                 ? static_cast<sirius::op::sirius_physical_operator*>(&reader)
+                                 : join_ptr;
+  REQUIRE(lives[1].first_reader == payload_reader);
+  REQUIRE(lives[2].first_reader == payload_reader);
+  REQUIRE_FALSE(lives[1].read_as_join_key);
+  auto const planned = sirius::planner::plan_deferral(*scan);
+  REQUIRE(planned.join_keys_skipped == 1);
+  if (join_type == duckdb::JoinType::RIGHT) {
+    REQUIRE(planned.installable());
+    REQUIRE(planned.port == &reader);
+    REQUIRE(planned.positions == std::vector<std::size_t>{1, 2});
+    REQUIRE(planned.port_positions == std::vector<std::size_t>{4, 5});
+  }
+}
+
+TEST_CASE("build publication without a build partition remains opaque to deferral",
+          "[late_mat][lifetime][build_filter]")
+{
+  sirius::op::dynamic_filter_publication_session session;
+  sirius::op::sirius_physical_build_filter publication{make_string_types(3), 0, session};
+  publication.children.push_back(duckdb::make_uniq<wide_scan>(3));
+  auto& scan = *publication.children.front();
+  sirius::planner::sirius_physical_plan_generator::set_parent_ops(publication, nullptr);
+  for (auto const& life : analyze_column_lifetimes(scan)) {
+    REQUIRE(life.first_reader == &publication);
+  }
 }
 
 TEST_CASE("a wide bundle over a long ride plans a deferral at its reader", "[late_mat][lifetime]")

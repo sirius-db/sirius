@@ -104,6 +104,8 @@ Two things then decide whether the ride is taken:
 
 One bundle installs per scan (one rowid rides), and arbitration is widest-wins.
 
+A consumer carries one ride as well. When two scans' bundles land at the same consumer, the scan that installs first owns it and the other can only join as a rider (below). The scan manager therefore visits scans in order of what their own bundle would save, net bytes per row times port crossings, largest first, instead of the order the plan lists them. A scan that finds its consumer already taken is offered to the rider pass rather than refused. DuckDB v2 lists q10's `nation` scan before `customer`, because it joins nation to customer first; without the ordering, nation's one-column ride claimed the consumer and customer's five wide columns were materialized early.
+
 ## Riding through a group-by, and riders
 
 If the deferred columns are the GROUP BY keys, the sound stop is the aggregate's input — which

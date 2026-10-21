@@ -37,6 +37,7 @@
 #include "expression_evaluator/ast_supported_types.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_filter.hpp"
@@ -47,6 +48,7 @@
 #include "planner/dynamic_filter/build_key_domain.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
+#include "planner/join_key_nullability.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
@@ -393,6 +395,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     }
   }
 
+  normalize_non_null_join_keys(op);
+
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
@@ -489,9 +493,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // Prefer scan binding; each key uses one route.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
-    bool const discovery_runs     = build_evidence &&
-                                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-                                !gpu_spaces.empty() && !host_spaces.empty();
+    bool const needs_early_publication =
+      op.join_type == duckdb::JoinType::RIGHT_SEMI || op.join_type == duckdb::JoinType::RIGHT_ANTI;
+    bool const discovery_runs =
+      build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+      !gpu_spaces.empty() && !host_spaces.empty() &&
+      (!needs_early_publication || (op_params.enable_dynamic_filter_multi_partition &&
+                                    op_params.max_dynamic_filter_bloom_bytes_per_gpu > 0));
     if (discovery_runs) {
       bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
       descent_policy const policy{.descend_build_blocks = true};
@@ -499,6 +507,12 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
         auto const& key       = admitted_keys[key_index];
         auto const& condition = conditions[key.planner_condition_index];
+        // Right-family partitioning waits for the probe. Only register keys that the
+        // pre-partition accumulator can publish before that scan drains.
+        if (needs_early_publication &&
+            !sirius::op::detail::accumulated_bloom_builder::supports(key.storage_type)) {
+          continue;
+        }
         // Terminal ordinals are local to each terminal, not the probe entry schema.
         auto const terminals =
           trace_probe_key(*left, static_cast<std::size_t>(key.probe_key_ordinal), policy);

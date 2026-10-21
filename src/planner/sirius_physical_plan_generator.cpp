@@ -42,6 +42,7 @@
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/partition/consumer_partition_policy.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
@@ -1424,7 +1425,24 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
 bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_build)
 {
   using T = sirius::op::SiriusPhysicalOperatorType;
-  if (join.type == T::NESTED_LOOP_JOIN) { return false; }
+  if (join.type == T::NESTED_LOOP_JOIN) {
+    // The join runs one task per batch pair, so the side that rows are padded, kept or marked
+    // against must arrive whole.
+    auto const& nested_loop_join = join.Cast<sirius::op::sirius_physical_nested_loop_join>();
+    switch (nested_loop_join.join_type) {
+      case duckdb::JoinType::INNER: return false;
+      case duckdb::JoinType::LEFT:
+      case duckdb::JoinType::SEMI:
+      case duckdb::JoinType::ANTI:
+      case duckdb::JoinType::MARK: return is_build;
+      case duckdb::JoinType::RIGHT: return !is_build;
+      case duckdb::JoinType::OUTER: return true;
+      default:
+        throw duckdb::NotImplementedException(
+          "sirius_physical_nested_loop_join: unsupported join type: " +
+          duckdb::JoinTypeToString(nested_loop_join.join_type));
+    }
+  }
   auto const& hash_join = join.Cast<sirius::op::sirius_physical_hash_join>();
   switch (hash_join.join_type) {
     case duckdb::JoinType::LEFT:
@@ -1437,8 +1455,8 @@ bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_b
     case duckdb::JoinType::INNER:
     case duckdb::JoinType::MARK: return false;
     default:
-      throw std::runtime_error("sirius_physical_concat: unsupported join type: " +
-                               duckdb::JoinTypeToString(hash_join.join_type));
+      throw duckdb::NotImplementedException("sirius_physical_hash_join: unsupported join type: " +
+                                            duckdb::JoinTypeToString(hash_join.join_type));
   }
 }
 
@@ -1468,6 +1486,21 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
       auto est_card       = child_orig->estimated_cardinality;
       auto child_physical = child_orig->has_physical_overrides() ? child_orig->get_physical_types()
                                                                  : std::vector<cudf::data_type>{};
+
+      if (is_build && join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+        auto& join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
+        if (!join.is_delim_join_inner() &&
+            (join.join_type == duckdb::JoinType::RIGHT_SEMI ||
+             join.join_type == duckdb::JoinType::RIGHT_ANTI) &&
+            join.publishes_dynamic_filters() &&
+            join.dynamic_filter_plan().multi_partition_enabled()) {
+          auto publish = duckdb::make_uniq<sirius::op::sirius_physical_build_filter>(
+            child_types, est_card, join.dynamic_filter_session());
+          if (!child_physical.empty()) { publish->set_physical_types(child_physical); }
+          publish->children.push_back(std::move(child_orig));
+          child_orig = std::move(publish);
+        }
+      }
 
       auto concat = duckdb::make_uniq<sirius::op::sirius_physical_concat>(
         child_types, est_card, join_concat_all(join_op, is_build), op_params.concat_batch_bytes);
@@ -2011,6 +2044,8 @@ bool terminal_sink_supports_fusion(const sirius::op::sirius_physical_operator& s
     case T::DENSE_COUNT_JOIN:
     case T::HASH_JOIN:
     case T::NESTED_LOOP_JOIN: return false;
+    // Publication needs its complete-input ledger and a separate source pipeline.
+    case T::BUILD_FILTER: return false;
     // Partition sinks require complete upstream input in a single task.
     case T::PARTITION:
     case T::SORT_PARTITION: return false;
