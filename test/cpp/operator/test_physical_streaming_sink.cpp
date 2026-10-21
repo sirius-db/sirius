@@ -127,6 +127,17 @@ std::vector<std::pair<int64_t, int32_t>> drain_rows(sirius_physical_streaming_si
 // SNK-1: sink() publishes exactly the batches it was given, natively
 // ============================================================================
 
+TEST_CASE("streaming_sink: the partition piece size follows the GPU space", "[streaming_sink]")
+{
+  using sink                = sirius::op::sirius_physical_streaming_sink;
+  constexpr std::size_t MiB = std::size_t{1} << 20;
+  constexpr std::size_t GiB = std::size_t{1} << 30;
+  CHECK(sink::piece_bytes_for_pool(168 * GiB) == sink::default_max_piece_bytes);
+  CHECK(sink::piece_bytes_for_pool(27 * GiB) == 27 * GiB / 192);
+  CHECK(sink::piece_bytes_for_pool(2 * GiB) == 32 * MiB);
+  CHECK(sink::piece_bytes_for_pool(0) == sink::default_max_piece_bytes);
+}
+
 TEST_CASE("streaming_sink SNK-1: sunk batches appear in the output repository in order",
           "[streaming_sink]")
 {
